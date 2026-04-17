@@ -1,0 +1,32 @@
+# Vivado generated build outputs
+*.cache/
+*.runs/
+*.gen/
+*.ip_user_files/
+*.sim/
+*.hw/
+*.str
+.claud/
+
+# Vivado log/journal files
+*.jou
+*.log
+ip_upgrade.log
+
+# Vivado checkpoint/report/bitstream files
+*.dcp
+*.bit
+*.bin
+*.ltx
+*.rpt
+*.rpx
+*.pb
+*.vdi
+*.vds
+*.wdf
+*.wpc
+
+# Temporary/OS files
+.Xil/
+*.bak
+*~

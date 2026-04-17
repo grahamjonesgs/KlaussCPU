@@ -1,0 +1,1180 @@
+
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date: 09/24/2020 01:15:33 PM
+// Design Name:
+// Module Name: SPI_top
+// Project Name:
+// Target Devices:
+// Tool Versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+`timescale 1ns / 1ps
+module FPGA_CPU_32_bits_cache (
+    input             CPU_RESETN,        // CPU reset button
+    input             i_Clk,             // FPGA Clock
+    input             i_uart_rx,
+    input             i_load_H,          // Load button
+    output            o_uart_tx,
+    output reg [15:0] o_led,
+    output            o_SPI_LCD_Clk,
+    input             i_SPI_LCD_MISO,
+    output            o_SPI_LCD_MOSI,
+    output            o_SPI_LCD_CS_n,
+    output reg        o_LCD_DC,
+    output reg        o_LCD_reset_n,
+    output     [ 7:0] o_Anode_Activate,  // anode signals of the 7-segment LED display
+    output     [ 7:0] o_LED_cathode,     // cathode patterns of the 7-segment LED display
+    input      [15:0] i_switch,
+    output     [ 2:0] o_LED_RGB_1,
+    output     [ 2:0] o_LED_RGB_2,
+
+    // DDR2 Physical Interface Signals
+    //Inouts
+    inout [15:0] ddr2_dq,
+    inout [1:0] ddr2_dqs_n,
+    inout [1:0] ddr2_dqs_p,
+    // Outputs
+    output [12:0] ddr2_addr,
+    output [2:0] ddr2_ba,
+    output ddr2_ras_n,
+    output ddr2_cas_n,
+    output ddr2_we_n,
+    //output ddr2_reset_n,
+    output [0:0] ddr2_ck_p,
+    output [0:0] ddr2_ck_n,
+    output [0:0] ddr2_cke,
+    output [0:0] ddr2_cs_n,
+    output [1:0] ddr2_dm,
+    output [0:0] ddr2_odt
+);
+
+   localparam STACK_TOP = 32'h800_0000;  // one doubleword (8 bytes) above top of 128 MiB byte address space
+
+   // State Machine Code
+   localparam OPCODE_REQUEST = 32'h1, OPCODE_FETCH = 32'h2, OPCODE_FETCH2 = 32'h4;
+   localparam VAR1_FETCH = 32'h8, VAR1_FETCH2 = 32'h10, VAR1_FETCH3 = 32'h20;
+   localparam START_WAIT = 32'h40, UART_DELAY = 32'h80, OPCODE_EXECUTE = 32'h100;
+   localparam HCF_1 = 32'h200, HCF_2 = 32'h400, HCF_3 = 32'h800, HCF_4 = 32'h1_000;
+   localparam NO_PROGRAM = 32'h2_000, LOAD_START = 32'h4_000, LOADING_BYTE = 32'h8_000;
+   localparam LOAD_COMPLETE = 32'h10_000, LOAD_WAIT = 32'h20_000;
+   localparam DEBUG_DATA = 32'h40_000, DEBUG_DATA2 = 32'h80_000, DEBUG_DATA3 = 32'h100_000;
+   localparam DEBUG_WAIT = 32'h200_000;
+   localparam MULTIPLY_CALC      = 32'h0040_0000;  // DSP pipeline stage 1 (MREG)
+   localparam MULTIPLY_PIPE      = 32'h0100_0000;  // DSP pipeline stage 2 (PREG)
+   localparam MULTIPLY_WRITEBACK = 32'h0080_0000;  // Write result
+   localparam WRITEBACK          = 32'h0200_0000;  // Register file writeback stage
+   localparam HALTED             = 32'h0400_0000;  // CPU halted, waiting for reset
+   localparam DIVIDE_STEP        = 32'h0800_0000;  // Division iteration state
+   localparam HALTED_BREAK       = 32'h1000_0000;  // Sending UART break before halt
+
+   // Error Codes
+   localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
+   localparam ERR_DATA_LOAD = 8'h4, ERR_CHECKSUM_LOAD = 8'h5, ERR_OVERFLOW = 8'h6;
+   localparam ERR_SEG_WRITE_TO_CODE = 'h7, ERR_SEG_EXEC_DATA = 'h8;
+   localparam ERR_TRAP = 8'h9;        // Explicit software trap (TRAP opcode)
+
+   // UART receive control
+   wire [7:0] w_uart_rx_value;  // Received value
+   wire w_uart_rx_DV;  // receive flag
+   wire w_uart_break;  // Break condition detected
+   reg  r_break_received;  // Set after break, cleared after command byte
+
+   // UART RX FIFO — buffers bytes for the CPU to read via RXRB / RXRNB opcodes
+   wire       w_rx_fifo_empty;
+   wire       w_rx_fifo_full;
+   wire [7:0] w_rx_fifo_byte;   // combinatorial peek at FIFO head
+   reg        r_rx_fifo_read;   // 1-cycle strobe: pop one byte from FIFO
+
+   // LCD control
+   reg [3:0] o_TX_LCD_Count;  // # bytes per CS low
+   reg [7:0] o_TX_LCD_Byte;  // Byte to transmit on MOSI
+   reg o_TX_LCD_DV;  // Data Valid Pulse with i_TX_Byte
+   wire i_TX_LCD_Ready;  // Transmit Ready for next byte
+
+   // RX (MISO) Signals
+   wire [3:0] i_RX_LCD_Count;  // Index RX byte
+   wire i_RX_LCD_DV;  // Data Valid pulse (1 clock cycle)
+   wire [7:0] i_RX_LCD_Byte;  // Byte received on MISO
+
+   reg [44:0] r_timeout_counter;  // Room for 32 bits plus the 13 left shift in the timing task
+   reg [44:0] r_timeout_max;
+
+   // Machine control
+   reg [31:0] r_SM;
+   reg [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
+   reg [31:0] r_mem_read_addr;
+   wire [31:0] w_opcode;
+   wire [31:0] w_var1;
+   wire [31:0] w_var2;
+   wire [31:0] w_mem;
+   reg [3:0] r_reg_1;
+   reg [3:0] r_reg_2;
+   reg [3:0] r_reg_dst;
+   reg [1:0] r_extra_clock;
+   reg [31:0] r_idx_base_addr;  // Saved base address for indexed register ops (byte addr)
+   reg r_hcf_message_sent;
+   reg [31:0] r_start_wait_counter;
+
+   //load control
+   //reg          o_ram_write_DV;
+   reg [31:0] o_ram_write_value;
+   reg [31:0] o_ram_write_addr;
+   reg [31:0] r_ram_next_write_addr;
+   reg [7:0] rx_count;
+   reg [2:0] r_load_byte_counter;
+   reg [15:0] r_checksum;
+   reg [15:0] r_old_checksum;
+   reg [15:0] r_calc_checksum;
+   reg [15:0] r_rec_checksum;
+   reg [31:0] r_PC_requested;
+
+   // Register control
+   reg [63:0] r_register[15:0];
+   reg r_zero_flag;
+   reg r_equal_flag;
+   reg r_carry_flag;
+   reg r_overflow_flag;
+   reg [7:0] r_error_code;
+
+   // Display value
+   reg [31:0] r_seven_seg_value1;
+   reg [31:0] r_seven_seg_value2;
+   reg r_error_display_type;
+   reg [11:0] r_RGB_LED_1;
+   reg [11:0] r_RGB_LED_2;
+
+   // Stack control — stack now lives in DDR2 RAM, top of 128 MiB, growing down
+   // SP = 32'h800_0000 means empty; PUSH: SP-=8, mem[SP]=val; POP: val=mem[SP], SP+=8
+   // R15 is the frame pointer by convention (software convention only, no hardware enforcement)
+   reg [31:0] r_SP;           // byte address, always doubleword-aligned (bits [2:0] = 0)
+   reg        r_int_push_wait;  // set while waiting for DDR2 to complete interrupt PC-push
+
+   // UART send message
+   reg [255:0] r_msg;  // 32 bytes — longest message is 21 bytes (case 2 of t_tx_message)
+   reg [7:0] r_msg_length;
+   reg r_msg_send_DV;
+   reg r_mem_was_ready;
+   wire i_msg_sent_DV;
+   wire w_sending_msg;
+
+   // temp vars for timing
+   reg r_timing_start;
+
+   // Interrupt handler
+   reg [31:0] r_interrupt_table[3:0];
+   reg r_timer_interrupt;
+   reg [31:0] r_timer_interrupt_counter;
+   reg [63:0] r_timer_interrupt_counter_sec;
+
+   // Memory
+   reg r_mem_write_DV;
+   reg r_mem_read_DV;
+   reg [31:0] r_mem_addr;      // byte address
+   reg [63:0] r_mem_write_data;
+   reg [ 7:0] r_mem_byte_en;   // byte enables: 8'hFF=full doubleword, else partial op
+   wire [63:0] w_mem_read_data;
+   wire [63:0] w_mem_read_data_next; // next doubleword in same cache line
+   wire        w_mem_next_valid;     // 1 when w_mem_read_data_next is valid
+   wire w_mem_ready;
+   reg [31:0] r_opcode_mem;
+   reg [31:0] r_var1_mem;
+   reg [31:0] r_var2_mem;
+   reg r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
+
+   // Debug
+   reg r_debug_flag;
+   reg r_debug_step_flag;
+   reg r_debug_step_run;
+
+   wire w_reset_H;
+   reg r_boot_flash;
+   
+   //=========================================================================
+   // Additional flags for expanded comparisons
+   //=========================================================================
+   reg r_sign_flag;      // Sign of last result (bit 63)
+   reg r_less_flag;      // Result of signed less-than comparison
+   reg r_ult_flag;       // Result of unsigned less-than comparison
+
+   reg r_mul_is_immediate;  // If true, increment PC by 2 instead of 1
+   
+   //=============================================================================
+  // PIPELINED MULTIPLY REGISTERS
+  //=============================================================================
+
+  // Pipeline stage registers (active during s_multiply state)
+  reg [127:0] r_mul_pipe1;        // Stage 1: multiply result (maps to DSP48 MREG)
+  reg [127:0] r_mul_pipe2;        // Stage 2: registered output (maps to DSP48 PREG)
+  wire [63:0] r_mul_result_lo;
+  wire [63:0] r_mul_result_hi;
+  assign r_mul_result_lo = r_mul_pipe2[63:0];
+  assign r_mul_result_hi = r_mul_pipe2[127:64];
+
+  reg        r_mul_is_high;      // Are we capturing high word?
+  reg        r_mul_is_unsigned;  // Unsigned operation?
+  reg [3:0]  r_mul_dest_reg;     // Destination register
+  // Dedicated multiply operand capture (breaks path from register file)
+  reg [63:0] r_mul_operand_a;
+  reg [63:0] r_mul_operand_b;
+
+  // Free-running 2-stage multiply pipeline (lets Vivado use DSP48 MREG + PREG)
+  always @(posedge i_Clk) begin
+     // Stage 1: multiply
+     if (r_mul_is_unsigned)
+        r_mul_pipe1 <= r_mul_operand_a * r_mul_operand_b;
+     else
+        r_mul_pipe1 <= $signed(r_mul_operand_a) * $signed(r_mul_operand_b);
+     // Stage 2: register
+     r_mul_pipe2 <= r_mul_pipe1;
+  end
+
+
+   //=========================================================================
+   // Hardware divide using iterative but optimized state machine
+   // For true single-cycle, you'd need a pipelined divider IP
+   //=========================================================================
+   reg [63:0] r_div_dividend;
+   reg [63:0] r_div_divisor;
+   reg [63:0] r_div_quotient;
+   reg [63:0] r_div_remainder;
+   reg [6:0]  r_div_counter;
+   reg        r_div_busy;
+   reg        r_div_sign_q;      // Sign of quotient
+   reg        r_div_sign_r;      // Sign of remainder
+   reg        r_div_is_signed;
+   reg [1:0]  r_div_op;          // 0=none, 1=div, 2=mod
+   reg [3:0]  r_div_dest_reg;    // Destination register for division result
+   reg        r_div_pc_inc;      // 0=PC+1, 1=PC+2
+   
+   localparam DIV_OP_NONE = 2'd0;
+   localparam DIV_OP_DIV  = 2'd1;
+   localparam DIV_OP_MOD  = 2'd2;
+   
+   // Dedicated read ports - registered every cycle
+   reg [63:0] r_reg_port_a;
+   reg [63:0] r_reg_port_b;
+
+   // Writeback pipeline registers
+   reg [63:0] r_writeback_value;
+   reg [3:0]  r_writeback_reg;
+   reg        r_writeback_set_zero_flag;  // Set zero flag from writeback value in WRITEBACK stage
+
+    always @(posedge i_Clk) begin
+       r_reg_port_a <= r_register[r_reg_1];
+       r_reg_port_b <= r_register[r_reg_2];
+   end
+
+   // UART TX break generation — holds o_uart_tx low to signal program end
+   wire       w_uart_tx_serial;   // internal serial output from uart_send_msg
+   reg        r_break_active;     // when 1, overrides TX line to low (break)
+   reg [11:0] r_break_counter;    // countdown: 2500 clocks ≈ 2.5 frames
+
+   // Mux: break takes priority over normal TX; idle state is line-high
+   assign o_uart_tx  = r_break_active ? 1'b0 : w_uart_tx_serial;
+   assign w_reset_H  = !CPU_RESETN;
+
+   mem_read_write mem_read_write (
+       .i_Clk(i_Clk),
+       .ddr2_dq(ddr2_dq),
+       .ddr2_dqs_n(ddr2_dqs_n),
+       .ddr2_dqs_p(ddr2_dqs_p),
+       // Outputs
+       .ddr2_addr(ddr2_addr),
+       .ddr2_ba(ddr2_ba),
+       .ddr2_ras_n(ddr2_ras_n),
+       .ddr2_cas_n(ddr2_cas_n),
+       .ddr2_we_n(ddr2_we_n),
+       .ddr2_ck_p(ddr2_ck_p),
+       .ddr2_ck_n(ddr2_ck_n),
+       .ddr2_cke(ddr2_cke),
+       .ddr2_cs_n(ddr2_cs_n),
+       .ddr2_dm(ddr2_dm),
+       .ddr2_odt(ddr2_odt),
+
+       .i_mem_write_DV(r_mem_write_DV),
+       .i_mem_read_DV(r_mem_read_DV),
+       .i_mem_addr(r_mem_addr),
+       .i_mem_write_data(r_mem_write_data),
+       .i_mem_byte_en(r_mem_byte_en),
+       .o_mem_read_data(w_mem_read_data),
+       .o_mem_read_data_next(w_mem_read_data_next),
+       .o_mem_next_valid(w_mem_next_valid),
+       .o_mem_ready(w_mem_ready)
+   );
+
+
+   uart_send_msg uart_send_msg1 (
+       .i_Clk(i_Clk),
+       .i_msg_flat(r_msg),
+       .i_msg_length(r_msg_length),
+       .i_msg_send_DV(r_msg_send_DV),
+       .o_Tx_Serial(w_uart_tx_serial),
+       .o_msg_sent_DV(i_msg_sent_DV),
+       .o_sending_msg(w_sending_msg)
+   );
+
+
+   uart_rx uart_rx1 (
+       .i_Clock(i_Clk),
+       .i_Rx_Serial(i_uart_rx),
+       .o_Rx_DV(w_uart_rx_DV),
+       .o_Rx_Byte(w_uart_rx_value),
+       .o_Break(w_uart_break)
+   );
+
+   // Write to FIFO only when the byte is not consumed by the break/command
+   // handler (!r_break_received) or the program loader (r_SM != LOADING_BYTE).
+   uart_rx_fifo uart_rx_fifo1 (
+       .i_Clk        (i_Clk),
+       .i_Reset      (w_reset_H),
+       .i_Write_En   (w_uart_rx_DV & !r_break_received & (r_SM != LOADING_BYTE)),
+       .i_Write_Byte (w_uart_rx_value),
+       .i_Read_En    (r_rx_fifo_read),
+       .o_Peek_Byte  (w_rx_fifo_byte),
+       .o_Empty      (w_rx_fifo_empty),
+       .o_Full       (w_rx_fifo_full),
+       .o_Count      ()
+   );
+
+
+   Seven_seg_LED_Display_Controller Seven_seg_LED_Display_Controller1 (
+       .i_sysclk(i_Clk),
+       .i_reset(w_reset_H),
+       .i_displayed_number1(r_seven_seg_value1),  // Number to display
+       .i_displayed_number2(r_seven_seg_value2),  // Number to display
+       .o_Anode_Activate(o_Anode_Activate),
+       .o_LED_cathode(o_LED_cathode)
+   );
+
+   SPI_Master_With_Single_CS SPI_Master_With_Single_CS_inst (
+       .i_Rst_L   (~w_reset_H),
+       .i_Clk     (i_Clk),
+       // TX (MOSI) Signals
+       .i_TX_Count(o_TX_LCD_Count),  // # bytes per CS low
+       .i_TX_Byte (o_TX_LCD_Byte),   // Byte to transmit on MOSI
+       .i_TX_DV   (o_TX_LCD_DV),     // Data Valid Pulse with i_TX_Byte
+       .o_TX_Ready(i_TX_LCD_Ready),  // Transmit Ready for next byte
+       // RX (MISO) Signals
+       .o_RX_Count(i_RX_LCD_Count),  // Index RX byte
+       .o_RX_DV   (i_RX_LCD_DV),     // Data Valid pulse (1 clock cycle)
+       .o_RX_Byte (i_RX_LCD_Byte),   // Byte received on MISO
+       // SPI Interface
+       .o_SPI_Clk (o_SPI_LCD_Clk),
+       .i_SPI_MISO(i_SPI_LCD_MISO),
+       .o_SPI_MOSI(o_SPI_LCD_MOSI),
+       .o_SPI_CS_n(o_SPI_LCD_CS_n)
+   );
+   /*
+rams_sp_nc rams_sp_nc1 (
+               .i_clk(i_Clk),
+               .i_opcode_read_addr(r_PC),
+               .i_mem_read_addr(r_mem_read_addr),
+               .o_dout_opcode(w_opcode),
+               .o_dout_mem(w_mem),
+               .o_dout_var1(w_var1),
+               .o_dout_var2(w_var2),
+               .i_write_addr(o_ram_write_addr),
+               .i_write_value(o_ram_write_value),
+               .i_write_en(o_ram_write_DV)
+                );
+ */
+   integer i;
+   initial begin
+      r_sign_flag <= 0;
+      r_less_flag <= 0;
+      r_ult_flag <= 0;
+      r_div_busy <= 0;
+      r_div_op <= DIV_OP_NONE;
+      r_div_counter <= 0;
+       for (i = 0; i < 16; i = i + 1)
+       r_register[i] = 64'b0;
+      r_mul_is_immediate = 0;
+   end
+   
+   assign w_opcode = r_opcode_mem;
+   assign w_var1   = r_var1_mem;
+   assign w_var2   = r_var2_mem;
+   
+
+   // Stack module removed — stack now uses DDR2 RAM via r_SP register
+
+   RGB_LED RGB_LED (
+       .i_sysclk(i_Clk),
+       .LED1(r_RGB_LED_1),
+       .LED2(r_RGB_LED_2),
+       .o_LED_RGB_1(o_LED_RGB_1),
+       .o_LED_RGB_2(o_LED_RGB_2)
+   );
+
+
+   /*ila_0  myila(.clk(i_Clk),
+             .probe0(w_opcode),
+             .probe1(0),
+             .probe2(r_PC),
+             .probe3(r_SM),
+             .probe4(r_var1_mem),
+             .probe5(0),
+             .probe6(0),
+             .probe7(0),
+             .probe8(r_mem_read_DV),
+             .probe9(r_mem_addr),
+             .probe10(w_mem_ready),
+             .probe11(w_var1),
+             .probe12(w_mem_read_data),
+             .probe13(w_temp_cache_hit),
+             .probe14(w_temp_cache_value),
+             .probe15(0)
+
+            ); */
+
+   `include "timing_tasks.vh"
+   `include "LCD_tasks.vh"
+   `include "led_tasks.vh"
+   `include "register_tasks.vh"
+   `include "control_tasks.vh"
+   `include "stack_tasks.vh"
+   `include "functions.vh"
+   `include "seven_seg.vh"
+   `include "opcode_select.vh"
+   `include "uart_tasks.vh"
+   `include "memory_tasks.vh"
+   `include "alu_extended_tasks.vh"    
+
+   initial begin
+      o_TX_LCD_Count = 4'd1;
+      o_TX_LCD_Byte = 8'b0;
+      r_SM = NO_PROGRAM;
+      r_timeout_counter = 0;
+      o_LCD_reset_n = 1'b0;
+      r_PC = 32'h0;
+      r_zero_flag = 0;
+      r_equal_flag = 0;
+      r_carry_flag = 0;
+      r_overflow_flag = 0;
+      r_error_code = 8'h0;
+      r_timeout_counter = 32'b0;
+      r_seven_seg_value1 = 32'h20_10_00_07;
+      r_seven_seg_value2 = 32'h21_21_21_21;
+      o_led <= 16'h0;
+      rx_count = 8'b0;
+      o_ram_write_addr = 32'h0;
+      r_ram_next_write_addr = 32'h0;
+      r_SP = 32'h800_0000;          // empty-descending stack, top of 128 MiB byte space
+      r_int_push_wait = 1'b0;
+      r_msg_send_DV <= 1'b0;
+      r_hcf_message_sent <= 1'b0;
+      r_RGB_LED_1 = 12'h000;
+      r_RGB_LED_2 = 12'h000;
+      r_timing_start <= 0;
+      r_timer_interrupt_counter <= 0;
+      r_timer_interrupt_counter_sec <= 0;
+      r_mem_write_DV <= 0;
+      r_mem_read_DV <= 0;
+      r_mem_byte_en <= 8'hFF;
+      r_msg = 256'b0;
+      r_boot_flash = 0;
+      r_debug_flag = 0;
+      r_debug_step_flag = 0;
+      r_debug_step_run = 0;
+      r_break_received = 0;
+      r_writeback_set_zero_flag = 0;
+      r_rx_fifo_read  = 0;
+      r_break_active  = 0;
+      r_break_counter = 0;
+      r_var1_prefetched = 0;
+   end
+
+   always @(posedge i_Clk) begin
+      if (w_reset_H) begin
+
+         r_SM <= NO_PROGRAM;
+         r_SP <= 32'h800_0000;
+         r_int_push_wait <= 1'b0;
+         r_break_received <= 1'b0;
+         for (i = 0; i < 16; i = i + 1)
+            r_register[i] <= 64'b0;
+
+      end // if (w_reset_H)
+      // Break received: arm the flag so next byte is treated as a command
+      else if (w_uart_break) begin
+         r_break_received <= 1'b1;
+      end
+      // Command characters are only accepted after a break
+      else if (w_uart_rx_DV & r_break_received) begin
+         r_break_received <= 1'b0;  // consume the break — one command per break
+         case (w_uart_rx_value)
+            8'h53: begin // 'S' — load start
+               r_SM <= LOADING_BYTE;
+               r_load_byte_counter <= 0;
+               o_ram_write_addr <= 32'h0;
+               r_ram_next_write_addr <= 32'h0;
+               r_checksum <= 16'h0;
+               r_old_checksum <= 16'h0;
+               r_RGB_LED_1 <= 12'h0;
+               r_RGB_LED_2 <= 12'h0;
+               o_led <= 16'h0;
+               r_mem_write_DV <= 1'b0;
+               r_mem_read_DV <= 1'b0;
+            end
+            8'h47: r_debug_flag      <= 1;  // 'G' — debug on
+            8'h67: r_debug_flag      <= 0;  // 'g' — debug off
+            8'h57: r_debug_step_flag <= 1;  // 'W' — step on
+            8'h77: r_debug_step_flag <= 0;  // 'w' — step off
+            8'h6E: r_debug_step_run  <= 1;  // 'n' — next step
+            // Any other byte after break: silently ignored
+         endcase
+      end else begin
+         r_msg_send_DV  <= 1'b0;
+         r_rx_fifo_read <= 1'b0;
+
+         if (r_timer_interrupt_counter > 32'hFFFFF) begin
+            r_timer_interrupt_counter <= 0;
+            r_timer_interrupt <= 1;
+         end else begin
+            r_timer_interrupt_counter <= r_timer_interrupt_counter + 1;
+         end
+
+         if (r_timer_interrupt_counter_sec > 100_000_000) begin
+            r_timer_interrupt_counter_sec <= 0;
+         end else begin
+            r_timer_interrupt_counter_sec <= r_timer_interrupt_counter_sec + 1;
+         end
+
+
+         case (r_SM)
+            NO_PROGRAM: begin
+               r_seven_seg_value1 <= 32'h22222222;
+               r_seven_seg_value2 <= 32'h22222222;
+
+               if (r_timer_interrupt_counter_sec == 0) begin
+                  case (r_boot_flash)
+                     0: begin
+                        r_RGB_LED_1  <= 12'h010;
+                        r_RGB_LED_2  <= 12'h100;
+                        //o_led[0]<=1;
+                        r_boot_flash <= 1;
+                     end
+                     default: begin
+                        r_RGB_LED_1  <= 12'h100;
+                        r_RGB_LED_2  <= 12'h010;
+                        //o_led[0]<=0;
+                        r_boot_flash <= 0;
+                     end
+                  endcase
+               end
+            end
+
+            LOADING_BYTE: begin
+
+               if (w_mem_ready) begin
+                  r_mem_write_DV <= 1'b0;
+               end
+               r_SP <= 32'h800_0000;  // reset stack pointer during program load
+               r_int_push_wait <= 1'b0;
+
+               r_seven_seg_value1 <= {
+                  8'h24,
+                  8'h22,
+                  4'h0,
+                  r_ram_next_write_addr[23:20],
+                  4'h0,
+                  r_ram_next_write_addr[19:16]
+               };
+               r_seven_seg_value2 <= {
+                  4'h0,
+                  r_ram_next_write_addr[15:12],
+                  4'h0,
+                  r_ram_next_write_addr[11:8],
+                  4'h0,
+                  r_ram_next_write_addr[7:4],
+                  4'h0,
+                  r_ram_next_write_addr[3:0]
+               };
+
+               if (w_uart_rx_DV) begin
+
+
+                  case (w_uart_rx_value)
+                     8'h58: // End char X
+                        begin
+                        if (r_load_byte_counter == 0) begin
+                           r_SM <= LOAD_COMPLETE;
+                           r_calc_checksum<=r_old_checksum+o_ram_write_addr[17:2]*2+o_ram_write_value[31:16]; //adding number of words to checksum (addr>>2=word count)
+                           r_rec_checksum <= o_ram_write_value[15:0];
+                           o_ram_write_value <= 32'h0;
+
+                        end // (r_load_byte_counter==0)
+                            else
+                            begin
+                           r_SM <= HCF_1;  // Halt and catch fire error
+                           r_error_code <= ERR_DATA_LOAD;
+                        end  // else (r_load_byte_counter==3)
+                     end  // case 8'h58
+                     8'h5A: // Start data flag Z
+                        begin
+                        r_PC_requested <= o_ram_write_value[31:0];
+                     end
+                     8'h0a: ;  // ignore LF
+                     8'h0d: ;  // ignore CR
+                     default: begin
+                        case (r_load_byte_counter)
+                           0: o_ram_write_value[31:28] = return_hex_from_ascii(w_uart_rx_value);
+                           1: o_ram_write_value[27:24] = return_hex_from_ascii(w_uart_rx_value);
+                           2: o_ram_write_value[23:20] = return_hex_from_ascii(w_uart_rx_value);
+                           3: o_ram_write_value[19:16] = return_hex_from_ascii(w_uart_rx_value);
+                           4: o_ram_write_value[15:12] = return_hex_from_ascii(w_uart_rx_value);
+                           5: o_ram_write_value[11:8] = return_hex_from_ascii(w_uart_rx_value);
+                           6: o_ram_write_value[7:4] = return_hex_from_ascii(w_uart_rx_value);
+                           7: o_ram_write_value[3:0] = return_hex_from_ascii(w_uart_rx_value);
+                           default: ;
+                        endcase  //r_load_byte_counter
+                        if (r_load_byte_counter == 7) begin
+                           r_load_byte_counter <= 0;
+                           case (r_RGB_LED_1)
+                              12'h050: r_RGB_LED_1 <= 12'h005;
+                              default: r_RGB_LED_1 <= 12'h050;
+                           endcase
+                           o_ram_write_addr <= r_ram_next_write_addr;
+                           r_ram_next_write_addr <= r_ram_next_write_addr + 4;  // byte addr: 4 bytes per word
+                           if (r_ram_next_write_addr>32'h7FF_FFFC) // Nexys has 128 MiB DDR2, last valid word at byte addr 0x7FF_FFFC
+                                begin
+                              r_SM <= HCF_1;  // Halt and catch fire error
+                              r_error_code <= ERR_OVERFLOW;
+                           end
+                           r_mem_addr <= r_ram_next_write_addr;
+                           // Place 32-bit word in the correct half of the 64-bit doubleword.
+                           // Little-endian layout: addr[2]==0 → LOW half [31:0]; addr[2]==1 → HIGH half [63:32].
+                           if (r_ram_next_write_addr[2] == 1'b0) begin
+                              r_mem_write_data <= {32'b0, o_ram_write_value};
+                              r_mem_byte_en    <= 8'h0F;
+                           end else begin
+                              r_mem_write_data <= {o_ram_write_value, 32'b0};
+                              r_mem_byte_en    <= 8'hF0;
+                           end
+                           r_mem_write_DV <= 1'b1;
+
+                           r_old_checksum <= r_checksum;
+                           r_checksum <= r_checksum + o_ram_write_value[31:16] + o_ram_write_value[15:0];
+                        end // if (r_load_byte_counter==3)
+                            else
+                            begin
+                           r_load_byte_counter <= r_load_byte_counter + 1;
+                        end  // else if (r_load_byte_counter==3)
+                     end  // case default
+                  endcase  // w_uart_rx_value
+               end
+            end
+
+            LOAD_COMPLETE: begin
+               r_seven_seg_value1 <= 32'h22222222;  // Blank 7 seg
+               if (r_calc_checksum==r_rec_checksum) // Last value received should be checksum
+                begin  // Reset all flags and jump to first instruction
+                  o_LCD_reset_n <= 1'b0;
+                  o_led <= 16'h0;
+                  o_ram_write_addr <= 32'h0;
+                  o_TX_LCD_Byte <= 8'b0;
+                  o_TX_LCD_Count <= 4'd1;
+                  r_carry_flag <= 1'b0;
+                  r_debug_flag <= 1'b0;
+                  r_debug_step_flag <= 1'b0;
+                  r_debug_step_run <= 1'b0;
+                  r_equal_flag <= 1'b0;
+                  r_error_code <= 8'h0;
+                  r_hcf_message_sent <= 1'b0;
+                  r_interrupt_table[0] <= 0;  // blank timer interrupt
+                  r_msg_send_DV <= 1'b0;
+                  r_overflow_flag <= 1'b0;
+                  r_PC <= r_PC_requested;
+                  r_mem_byte_en <= 8'hFF;  // restore full-doubleword default after loader partial writes
+                  r_ram_next_write_addr <= 32'h0;
+                  r_RGB_LED_1 <= 12'h000;
+                  r_RGB_LED_2 <= 12'h000;
+                  r_seven_seg_value1 <= 32'h22_22_22_22;
+                  r_seven_seg_value2 <= 32'h22_22_22_22;
+                  r_SM <= START_WAIT;
+                  r_timeout_counter <= 0;
+                  r_timer_interrupt <= 0;
+                  r_timer_interrupt_counter <= 0;
+                  r_timing_start <= 0;
+                  r_zero_flag <= 0;
+                  t_tx_message(8'd1);  // Load OK message
+               end else begin
+                  r_SM <= HCF_1;  // Halt and catch fire error
+                  r_error_code <= ERR_CHECKSUM_LOAD;
+                  t_tx_message(8'd2);  // Load error message
+               end
+            end
+
+            // Delay to enable load message to be sent before starting
+            START_WAIT: begin
+               r_msg_send_DV <= 1'b0;
+               if (r_start_wait_counter == 0) begin
+                  r_SM <= OPCODE_REQUEST;
+                  r_seven_seg_value1 <= 32'h22_22_22_22;
+                  r_seven_seg_value2 <= 32'h22_22_22_22;
+               end else begin
+                  r_start_wait_counter <= r_start_wait_counter - 1;
+                  r_seven_seg_value1 <= 32'h21_21_21_21;
+                  r_seven_seg_value2 <= 32'h21_21_21_21;
+               end
+            end
+
+            // Delay to enable load message to be sent before starting
+            UART_DELAY: begin
+               r_msg_send_DV <= 1'b0;
+               if (!w_sending_msg) begin
+                  r_SM <= OPCODE_REQUEST;
+               end
+
+            end
+
+            OPCODE_REQUEST: begin
+               r_msg_send_DV <= 1'b0;
+               r_extra_clock <= 2'b0;  // always reset — all instructions rely on this
+               r_mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
+
+               if (r_int_push_wait) begin
+                  // Waiting for DDR2 to finish the timer-interrupt PC push
+                  if (w_mem_ready) begin
+                     r_mem_write_DV  <= 1'b0;
+                     r_int_push_wait <= 1'b0;
+                     r_mem_addr      <= r_PC;  // r_PC already set to interrupt target
+                     r_mem_read_DV   <= 1'b1;
+                     r_SM            <= OPCODE_FETCH;
+                  end
+               end else if (r_timer_interrupt && r_interrupt_table[0] != 32'h0) begin
+                  // Start pushing current PC onto DDR2 stack before jumping to handler
+                  r_SP             <= r_SP - 8;
+                  r_mem_addr       <= r_SP - 32'd8;
+                  // Pack flags into [38:32] so IRET can restore them.
+                  // Slot layout: [63:39]=0, [38]=zero, [37]=equal, [36]=carry,
+                  //              [35]=overflow, [34]=sign, [33]=less, [32]=ult, [31:0]=PC
+                  r_mem_write_data <= {25'b0,
+                                       r_zero_flag, r_equal_flag, r_carry_flag,
+                                       r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
+                                       r_PC};
+                  r_mem_byte_en    <= 8'hFF;
+                  r_mem_write_DV   <= 1'b1;
+                  r_timer_interrupt <= 1'b0;
+                  r_PC             <= r_interrupt_table[0];
+                  r_int_push_wait  <= 1'b1;
+                  // stay in OPCODE_REQUEST until push completes
+               end else begin
+                  r_mem_addr    <= r_PC;
+                  r_mem_read_DV <= 1'b1;
+                  r_SM          <= OPCODE_FETCH;
+               end
+            end
+
+            OPCODE_FETCH: begin
+               if (w_mem_ready) begin
+                  // PC[2] selects which 32-bit half of the 64-bit doubleword holds the opcode.
+                  // Little-endian layout:
+                  //   [31:0]  = bytes at the doubleword-aligned base address  (PC[2]==0)
+                  //   [63:32] = bytes at base+4                               (PC[2]==1)
+                  r_opcode_mem  <= r_PC[2] ? w_mem_read_data[63:32]
+                                           : w_mem_read_data[31:0];
+                  r_mem_read_DV <= 1'b0;
+                  if (r_PC[2] == 0) begin
+                     // var1 (at PC+4) is in the HIGH half of the same doubleword — always here.
+                     r_var1_mem        <= w_mem_read_data[63:32];
+                     r_var1_prefetched <= 1'b1;
+                  end else if (w_mem_next_valid) begin
+                     // var1 (at PC+4) is in the next doubleword's low half.
+                     r_var1_mem        <= w_mem_read_data_next[31:0];
+                     r_var1_prefetched <= 1'b1;
+                  end else begin
+                     r_var1_prefetched <= 1'b0;
+                  end
+                  r_SM <= OPCODE_FETCH2;
+               end  // if ready asserted, else will loop until ready
+            end
+
+            OPCODE_FETCH2: begin
+               r_reg_1   <= w_opcode[7:4];
+               r_reg_2   <= w_opcode[3:0];
+               r_reg_dst <= w_opcode[11:8];
+               if (r_var1_prefetched) begin
+                  // var1 already in r_var1_mem — skip memory fetch.
+                  // VAR1_FETCH2 is a 1-cycle bubble so r_reg_port_a/b
+                  // (registered reads) update before OPCODE_EXECUTE uses them.
+                  r_SM <= VAR1_FETCH2;
+               end else begin
+                  r_SM          <= VAR1_FETCH;
+                  r_mem_addr    <= (r_PC + 4);
+                  r_mem_read_DV <= 1'b1;
+               end
+            end
+
+            VAR1_FETCH2: begin
+               // Pipeline bubble only — r_reg_port_a/b now valid.
+               if (r_debug_flag && w_opcode[31:12] != 20'h0000F) begin
+                  r_SM <= DEBUG_DATA;
+               end else begin
+                  r_SM <= OPCODE_EXECUTE;
+               end
+            end
+
+
+            VAR1_FETCH: begin
+               if (w_mem_ready) begin
+                  r_var1_mem<=w_mem_read_data[31:0]; // lower 32 bits = instruction word at this address (little-endian, PC[2]==0)
+                  if (r_debug_flag&&w_opcode[31:12]!=20'h0000F) begin  // Ignore delay/NOP opcodes (0x0000_F???)
+                     r_SM <= DEBUG_DATA;
+                  end else begin
+                     r_SM <= OPCODE_EXECUTE;
+                  end
+                  r_mem_read_DV <= 1'b0;
+
+               end  // if ready asserted, else will loop until ready
+            end
+
+
+            DEBUG_DATA: begin
+               t_debug_message;
+               r_SM <= DEBUG_DATA2;
+            end
+
+            DEBUG_DATA2: begin
+               r_msg_send_DV <= 1'b0;
+               r_SM <= DEBUG_DATA3;
+            end
+
+            DEBUG_DATA3: begin
+               if (!w_sending_msg) begin
+                  r_SM <= OPCODE_EXECUTE;
+                  if (r_debug_step_flag == 1'b1) begin
+                     r_SM <= DEBUG_WAIT;
+                  end else begin
+                     r_SM <= OPCODE_EXECUTE;
+                  end
+               end
+            end
+
+            DEBUG_WAIT: begin
+               if (r_debug_step_run == 1'b1) begin
+                  r_debug_step_run <= 1'b0;
+                  r_SM <= OPCODE_EXECUTE;
+               end
+            end
+
+            OPCODE_EXECUTE: begin
+               t_opcode_select;
+            end  // case OPCODE_EXECUTE
+
+            HCF_1: begin
+               if (!r_hcf_message_sent) begin
+                  r_hcf_message_sent <= 1'b1;
+               end
+               r_timeout_counter <= 0;
+               r_SM <= HCF_2;
+            end
+
+            HCF_2: begin
+               r_seven_seg_value1[31:8] <= 24'h230C0F;
+               r_seven_seg_value1[7:0] <= r_error_code;
+               r_seven_seg_value2 <= 32'h22_22_22_22;
+               r_timeout_max <= 32'd100_000_000;
+               if (r_timeout_counter >= r_timeout_max) begin
+                  r_timeout_counter <= 0;
+                  r_SM <= HCF_3;
+               end  // if(r_timeout_counter>=DELAY_TIME)
+                else
+                begin
+                  r_timeout_counter <= r_timeout_counter + 1;
+               end  // else if(r_timeout_counter>=DELAY_TIME)
+            end
+            HCF_3: begin
+               r_timeout_counter <= 0;
+               r_SM <= HCF_4;
+               r_error_display_type <= ~r_error_display_type;
+            end
+            HCF_4: begin
+               if (r_error_display_type) begin
+                  // ERR_INV_OPCODE=8'h1, ERR_INV_FSM_STATE=8'h2, ERR_STACK=8'h3, ERR_DATA_LOAD=8'h4, ERR_CHECKSUM_LOAD=8'h5;
+
+                  case (r_error_code)
+                     ERR_CHECKSUM_LOAD:
+                     // incoming checksum
+                     r_seven_seg_value1 <= {
+                        4'h0,
+                        r_rec_checksum[15:12],
+                        4'h0,
+                        r_rec_checksum[11:8],
+                        4'h0,
+                        r_rec_checksum[7:4],
+                        4'h0,
+                        r_rec_checksum[3:0]
+                     };
+                     ERR_DATA_LOAD:  // Load counter
+              begin
+                        r_seven_seg_value1 <= {
+                           8'h24,
+                           8'h24,
+                           4'h0,
+                           r_ram_next_write_addr[23:20],
+                           4'h0,
+                           r_ram_next_write_addr[19:16]
+                        };
+                        r_seven_seg_value2 <= {
+                           4'h0,
+                           r_ram_next_write_addr[15:12],
+                           4'h0,
+                           r_ram_next_write_addr[11:8],
+                           4'h0,
+                           r_ram_next_write_addr[7:4],
+                           4'h0,
+                           r_ram_next_write_addr[3:0]
+                        };
+                     end
+                     default: // Also for opcode 1
+                            // Blank then Program counter
+                     begin
+                        r_seven_seg_value1 <= {8'h22, 8'h22, 4'h0, r_PC[23:20], 4'h0, r_PC[19:16]};
+                        r_seven_seg_value2 <= {
+                           4'h0, r_PC[15:12], 4'h0, r_PC[11:8], 4'h0, r_PC[7:4], 4'h0, r_PC[3:0]
+                        };
+                     end
+
+
+                  endcase
+               end   // if (r_error_display_type)
+                else
+                begin
+
+                  case (r_error_code)
+                     ERR_CHECKSUM_LOAD:
+                     // Calculated checksum
+                     r_seven_seg_value1 <= {
+                        4'h0,
+                        r_calc_checksum[15:12],
+                        4'h0,
+                        r_calc_checksum[11:8],
+                        4'h0,
+                        r_calc_checksum[7:4],
+                        4'h0,
+                        r_calc_checksum[3:0]
+                     };
+
+                     ERR_DATA_LOAD: begin
+                        // Three blanks then loading byte counter
+                        r_seven_seg_value1 <= 32'h22_22_22_22;
+                        r_seven_seg_value2 <= {8'h22, 8'h22, 8'h22, 6'h0, r_load_byte_counter[1:0]};
+                     end
+                     default // Also for opcode 1
+                        // Opcode selected print OP on 7seg1, and code on 7seg2
+                     begin
+                        r_seven_seg_value1 <= 32'h00_25_0C_0D;
+                        r_seven_seg_value2 <= {
+                           4'h0,
+                           w_opcode[31:28],
+                           4'h0,
+                           w_opcode[27:24],
+                           4'h0,
+                           w_opcode[23:20],
+                           4'h0,
+                           w_opcode[19:16]
+                        };
+                     end
+
+                  endcase
+
+               end  // else if (r_error_display_type)
+
+               r_timeout_max <= 32'd100_000_000;
+               if (r_timeout_counter >= r_timeout_max) begin
+                  r_timeout_counter <= 0;
+                  r_SM <= HCF_1;
+               end  // if(r_timeout_counter>=DELAY_TIME)
+                else
+                begin
+                  r_timeout_counter <= r_timeout_counter + 1;
+               end  // else if(r_timeout_counter>=DELAY_TIME)
+
+            end
+            
+             MULTIPLY_CALC: begin
+    // Wait for pipeline stage 1 (MREG) - multiply is computed
+    // by the free-running pipeline from r_mul_operand_a/b
+    r_SM <= MULTIPLY_PIPE;
+end
+
+MULTIPLY_PIPE: begin
+    // Wait for pipeline stage 2 (PREG) - result now in r_mul_result_hi/lo
+    r_SM <= MULTIPLY_WRITEBACK;
+end
+
+MULTIPLY_WRITEBACK: begin
+    // Stage result into writeback pipeline
+    if (r_mul_is_high)
+        r_writeback_value <= r_mul_result_hi;
+    else
+        r_writeback_value <= r_mul_result_lo;
+    r_writeback_reg <= r_mul_dest_reg;
+
+    // Flags from registered values
+    if (r_mul_is_high) begin
+        r_zero_flag     <= (r_mul_result_hi == 64'b0);
+        r_sign_flag     <= r_mul_result_hi[63];
+        r_overflow_flag <= 1'b0;
+    end else begin
+        r_zero_flag     <= (r_mul_result_lo == 64'b0);
+        r_sign_flag     <= r_mul_result_lo[63];
+        if (r_mul_is_unsigned)
+            r_overflow_flag <= (r_mul_result_hi != 64'b0);
+        else
+            r_overflow_flag <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
+    end
+
+    // PC increment depends on instruction type
+    if (r_mul_is_immediate)
+        r_PC <= r_PC + 8;
+    else
+        r_PC <= r_PC + 4;
+
+    r_SM <= WRITEBACK;
+end
+
+            HALTED_BREAK: begin
+               // Wait for any in-flight TX to finish, then hold line low for
+               // ~2.5 frames (2500 clocks at CLKS_PER_BIT=100) as a UART break,
+               // then transition to HALTED.
+               if (r_break_counter == 0) begin
+                  if (!w_sending_msg) begin
+                     r_break_active  <= 1'b1;
+                     r_break_counter <= 12'd2500;
+                  end
+               end else begin
+                  r_break_counter <= r_break_counter - 1;
+                  if (r_break_counter == 12'd1) begin
+                     r_break_active <= 1'b0;
+                     r_SM           <= HALTED;
+                  end
+               end
+            end
+
+            HALTED: begin
+               // CPU halted - do nothing until reset
+            end
+
+            DIVIDE_STEP: begin
+               // Shared division iteration - avoids re-evaluating opcode casez each cycle
+               if (r_div_counter < 7'd64) begin
+                  // Restoring division step
+                  if ({r_div_remainder[62:0], r_div_dividend[63]} >= r_div_divisor) begin
+                     r_div_remainder <= {r_div_remainder[62:0], r_div_dividend[63]} - r_div_divisor;
+                     r_div_quotient <= {r_div_quotient[62:0], 1'b1};
+                  end
+                  else begin
+                     r_div_remainder <= {r_div_remainder[62:0], r_div_dividend[63]};
+                     r_div_quotient <= {r_div_quotient[62:0], 1'b0};
+                  end
+                  r_div_dividend <= {r_div_dividend[62:0], 1'b0};
+                  r_div_counter <= r_div_counter + 1;
+               end
+               else begin
+                  // Division complete - write result based on op type
+                  if (r_div_op == DIV_OP_DIV) begin
+                     if (r_div_is_signed && r_div_sign_q)
+                        r_writeback_value <= ~r_div_quotient + 1;
+                     else
+                        r_writeback_value <= r_div_quotient;
+                     r_zero_flag <= (r_div_quotient == 0) ? 1'b1 : 1'b0;
+                  end
+                  else begin  // DIV_OP_MOD
+                     if (r_div_is_signed && r_div_sign_r)
+                        r_writeback_value <= ~r_div_remainder + 1;
+                     else
+                        r_writeback_value <= r_div_remainder;
+                     r_zero_flag <= (r_div_remainder == 0) ? 1'b1 : 1'b0;
+                  end
+                  r_writeback_reg <= r_div_dest_reg;
+                  r_overflow_flag <= 1'b0;
+                  r_div_op <= DIV_OP_NONE;
+                  r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
+                  r_SM <= WRITEBACK;
+               end
+            end
+
+            WRITEBACK: begin
+               r_register[r_writeback_reg] <= r_writeback_value;
+               if (r_writeback_set_zero_flag)
+                  r_zero_flag <= (r_writeback_value == 64'b0);
+               r_writeback_set_zero_flag <= 1'b0;
+               r_SM <= OPCODE_REQUEST;
+            end
+
+            default: r_SM <= HCF_1;  // loop in error
+         endcase  // case(r_SM)
+      end  // else if (w_reset_H)
+   end  // always @(posedge i_Clk)
+   
+   //=========================================================================
+   // Bit manipulation helper functions (active during single cycles)
+   //=========================================================================
+   // Population count - count number of 1 bits
+   function [6:0] popcount;
+      input [63:0] val;
+      integer i;
+      begin
+         popcount = 0;
+         for (i = 0; i < 64; i = i + 1) begin
+            popcount = popcount + val[i];
+         end
+      end
+   endfunction
+   
+   // Count leading zeros (64-bit)
+   function [6:0] count_leading_zeros;
+      input [63:0] val;
+      integer clz_i;
+      reg [6:0] clz_result;
+      begin
+         clz_result = 7'd64;
+         for (clz_i = 63; clz_i >= 0; clz_i = clz_i - 1) begin
+            if (val[clz_i])
+               clz_result = 7'd63 - clz_i[6:0];
+         end
+         count_leading_zeros = clz_result;
+      end
+   endfunction
+   
+   // Count trailing zeros (64-bit)
+   function [6:0] count_trailing_zeros;
+      input [63:0] val;
+      integer ctz_i;
+      reg [6:0] ctz_result;
+      begin
+         ctz_result = 7'd64;
+         for (ctz_i = 0; ctz_i < 64; ctz_i = ctz_i + 1) begin
+            if (val[ctz_i])
+               ctz_result = ctz_i[6:0];
+         end
+         count_trailing_zeros = ctz_result;
+      end
+   endfunction
+
+   // Bit reverse (64-bit)
+   function [63:0] bit_reverse;
+      input [63:0] val;
+      integer br_i;
+      begin
+         for (br_i = 0; br_i < 64; br_i = br_i + 1) begin
+            bit_reverse[63-br_i] = val[br_i];
+         end
+      end
+   endfunction
+
+endmodule
