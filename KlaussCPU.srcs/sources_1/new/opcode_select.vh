@@ -17,7 +17,8 @@
 // Immediate sign/zero extension:
 //   Sign-extended (imm32 → 64 bit) : SETR, CMPRV, ADDSP
 //   Zero-extended (imm32 → 64 bit) : ADDV, MINUSV, ANDV, ORV, XORV, PUSHV,
-//                                     LDIDX, STIDX, LDIDX64, STIDX64
+//                                     LDIDX, STIDX, LDIDX64, STIDX64,
+//                                     LDIDX64A, STIDX64A
 //   Full 64-bit, no extension       : SETR64, PUSHV64
 //
 // Two opcode encodings:
@@ -35,7 +36,10 @@
 //     [7:4]   = rs1  (source / first operand; destination for COPY)
 //     [3:0]   = rs2  (source / second operand; destination for single-R ops)
 //
-// Memory bus: big-endian 64-bit. Byte address 0 (lowest addr) = MSB of doubleword.
+// Memory bus: little-endian 64-bit. Byte at address A where A[2:0]=0 occupies
+// bits [7:0] of the doubleword; the 32-bit word at A[2]=0 is in [31:0] and the
+// word at A[2]=1 (i.e. base+4) is in [63:32]. See CPU_ARCHITECTURE.md §14 for
+// the big-endian → little-endian conversion history.
 // Stack: full-descending, 8-byte slots. SP points to last-pushed item. R15 = frame ptr.
 //   PUSH: SP -= 8; mem[SP] = value (64-bit)
 //   POP:  value = mem[SP]; SP += 8
@@ -201,6 +205,15 @@ task t_opcode_select;
          //=====================================================================
          // Indexed memory — sub-word load/store (RRV, 2-word)
          // LDIDX32/STIDX32: 4-byte aligned; LDIDX16: 2-byte aligned; LDIDX8: byte address.
+         //
+         // Half-select within the 64-bit cache doubleword (little-endian):
+         //   effective_addr[2]=0  → lower 32 bits [31:0]   (word at base+0)
+         //   effective_addr[2]=1  → upper 32 bits [63:32]  (word at base+4)
+         // LDIDX32 uses this to pick the read half; STIDX32 applies the same
+         // rule to the byte-enable mask (0→8'b0000_1111, 1→8'b1111_0000).
+         // NOTE: an earlier big-endian implementation had this select inverted;
+         // it was corrected during the little-endian conversion (see
+         // CPU_ARCHITECTURE.md §14). No software workaround is required.
          //=====================================================================
          32'h0000_C0??: t_load_indexed32(w_var1);              // LDIDX32 RRV rd=zero_ext(mem32[(rs2+zero_ext(imm32))&~3])
          32'h0000_C1??: t_store_indexed32(w_var1);             // STIDX32 RRV mem32[(rs2+zero_ext(imm32))&~3]=rs1[31:0]
@@ -224,6 +237,16 @@ task t_opcode_select;
          // Encoding: opcode word (rd in [3:0]) | lo32 word at PC+4 | hi32 word at PC+8
          // Result: rd = {hi32, lo32} — full 64 bits, no sign extension.
          // The three words are inline (consecutive); this is NOT a literal pool.
+         //
+         // hi32 fetch: the CPU issues a read at PC+8 and picks the correct half
+         // of the returned 64-bit cache doubleword using r_PC[2] (little-endian):
+         //   r_PC[2]=0  → hi32 is in bits [31:0]
+         //   r_PC[2]=1  → hi32 is in bits [63:32]
+         // (Adding 8 to PC doesn't change bit 2, so (PC+8)[2] == PC[2].)
+         // NOTE: an earlier big-endian implementation had this select inverted;
+         // it was corrected during the little-endian conversion (see
+         // CPU_ARCHITECTURE.md §14). SETR64 is safe to emit directly — no need
+         // for a SETR/SHLV/ORV workaround sequence.
          //=====================================================================
          32'h0000_0FE?: t_set_reg64(w_var1, 32'b0);            // SETR64 RV64 rd={hi32,lo32}; 3-word: opcode@PC rd=[3:0], lo32@PC+4, hi32@PC+8
 
@@ -358,27 +381,29 @@ task t_opcode_select;
          32'h0000_73??: t_store_indexed_reg(w_var1);           // STIDX64R RRV mem64[rs2+reg[imm[3:0]]]=rs1; imm[3:0]=offset reg number
 
          //=====================================================================
-         // Byte memory access (74xx–75xx) — big-endian byte addressing
+         // Byte memory access (74xx–75xx) — little-endian byte addressing
          // addr[2:0] selects the byte within the 64-bit doubleword.
-         // addr[2:0]=0 → MSB (bits[63:56]); addr[2:0]=7 → LSB (bits[7:0]).
+         // addr[2:0]=0 → LSByte (bits[7:0]); addr[2:0]=7 → MSByte (bits[63:56]).
          // No alignment requirement.
          //=====================================================================
-         32'h0000_74??: t_memset8;                             // MEMSET8 RR mem8[rs2]=rs1[7:0]; byte addr, big-endian
-         32'h0000_75??: t_memget8;                             // MEMGET8 RR rd=zero_ext(mem8[rs2]); byte addr, big-endian
+         32'h0000_74??: t_memset8;                             // MEMSET8 RR mem8[rs2]=rs1[7:0]; byte addr, little-endian
+         32'h0000_75??: t_memget8;                             // MEMGET8 RR rd=zero_ext(mem8[rs2]); byte addr, little-endian
 
          //=====================================================================
          // 16-bit halfword memory access (76xx–77xx)
-         // Hardware clears addr[0] (2-byte aligned). big-endian.
+         // Hardware clears addr[0] (2-byte aligned). little-endian:
+         // addr[2:1]=00 → bits[15:0] (lowest addr); addr[2:1]=11 → bits[63:48].
          //=====================================================================
-         32'h0000_76??: t_memset16;                            // MEMSET16 RR mem16[rs2&~1]=rs1[15:0]; 2-byte aligned, big-endian
-         32'h0000_77??: t_memget16;                            // MEMGET16 RR rd=zero_ext(mem16[rs2&~1]); 2-byte aligned, big-endian
+         32'h0000_76??: t_memset16;                            // MEMSET16 RR mem16[rs2&~1]=rs1[15:0]; 2-byte aligned, little-endian
+         32'h0000_77??: t_memget16;                            // MEMGET16 RR rd=zero_ext(mem16[rs2&~1]); 2-byte aligned, little-endian
 
          //=====================================================================
          // 32-bit word memory access (78xx–79xx)
-         // Hardware clears addr[1:0] (4-byte aligned). big-endian.
+         // Hardware clears addr[1:0] (4-byte aligned). little-endian:
+         // addr[2]=0 → bits[31:0] (low half); addr[2]=1 → bits[63:32] (high half).
          //=====================================================================
-         32'h0000_78??: t_memset32;                            // MEMSET32 RR mem32[rs2&~3]=rs1[31:0]; 4-byte aligned, big-endian
-         32'h0000_79??: t_memget32;                            // MEMGET32 RR rd=zero_ext(mem32[rs2&~3]); 4-byte aligned, big-endian
+         32'h0000_78??: t_memset32;                            // MEMSET32 RR mem32[rs2&~3]=rs1[31:0]; 4-byte aligned, little-endian
+         32'h0000_79??: t_memget32;                            // MEMGET32 RR rd=zero_ext(mem32[rs2&~3]); 4-byte aligned, little-endian
 
          //=====================================================================
          // 64-bit doubleword memory access (7Axx–7Bxx)
@@ -400,11 +425,13 @@ task t_opcode_select;
          32'h0000_F014: t_trap;                                // TRAP software abort; HCF with ERR_TRAP (0x9)
 
          //=====================================================================
-         // 64-bit indexed memory — 8-byte aligned (FCxx–FDxx, RRV, 2-word)
-         // Effective address = (rs2[31:0] + zero_ext(imm32)) & ~7 (8-byte aligned).
+         // 64-bit indexed memory — forced 8-byte aligned (FCxx–FDxx, RRV, 2-word)
+         // Effective address = (rs2[31:0] + zero_ext(imm32)) & ~7.
+         // Same behaviour as LDIDX64/STIDX64 except the low 3 bits of the
+         // effective address are cleared in hardware before the bus access.
          //=====================================================================
-         32'h0000_FC??: t_load_indexed64(w_var1);              // LDIDX64 RRV rd=mem64[(rs2+zero_ext(imm32))&~7]; 8-byte aligned
-         32'h0000_FD??: t_store_indexed64(w_var1);             // STIDX64 RRV mem64[(rs2+zero_ext(imm32))&~7]=rs1; 8-byte aligned
+         32'h0000_FC??: t_load_indexed64(w_var1);              // LDIDX64A RRV rd=mem64[(rs2+zero_ext(imm32))&~7]; forced 8-byte aligned
+         32'h0000_FD??: t_store_indexed64(w_var1);             // STIDX64A RRV mem64[(rs2+zero_ext(imm32))&~7]=rs1; forced 8-byte aligned
 
          default: begin
             r_SM <= HCF_1;  // Halt and catch fire error 1
