@@ -1141,10 +1141,10 @@ task t_load_indexed16;
             effective_addr = r_reg_port_b[31:0] + i_offset;
             r_mem_read_DV <= 1'b0;
             case (effective_addr[2:1])
-               2'b00: r_writeback_value <= {48'b0, w_mem_read_data[63:48]};
-               2'b01: r_writeback_value <= {48'b0, w_mem_read_data[47:32]};
-               2'b10: r_writeback_value <= {48'b0, w_mem_read_data[31:16]};
-               2'b11: r_writeback_value <= {48'b0, w_mem_read_data[15:0]};
+               2'b00: r_writeback_value <= {48'b0, w_mem_read_data[15:0]};
+               2'b01: r_writeback_value <= {48'b0, w_mem_read_data[31:16]};
+               2'b10: r_writeback_value <= {48'b0, w_mem_read_data[47:32]};
+               2'b11: r_writeback_value <= {48'b0, w_mem_read_data[63:48]};
             endcase
             r_writeback_reg <= r_reg_1;
             r_SM            <= WRITEBACK;
@@ -1165,7 +1165,7 @@ task t_store_indexed16;
          byte_lane        = {effective_addr[2:1], 1'b0};
          r_mem_addr       <= {effective_addr[31:1], 1'b0};
          r_mem_write_data <= {4{r_reg_port_a[15:0]}};
-         r_mem_byte_en    <= 8'b1100_0000 >> byte_lane;
+         r_mem_byte_en    <= 8'b0000_0011 << byte_lane;
          r_mem_write_DV   <= 1'b1;
          r_extra_clock    <= 1'b1;
       end else begin
@@ -1193,14 +1193,14 @@ task t_load_indexed8;
             effective_addr = r_reg_port_b[31:0] + i_offset;
             r_mem_read_DV <= 1'b0;
             case (effective_addr[2:0])
-               3'b000: r_writeback_value <= {56'b0, w_mem_read_data[63:56]};
-               3'b001: r_writeback_value <= {56'b0, w_mem_read_data[55:48]};
-               3'b010: r_writeback_value <= {56'b0, w_mem_read_data[47:40]};
-               3'b011: r_writeback_value <= {56'b0, w_mem_read_data[39:32]};
-               3'b100: r_writeback_value <= {56'b0, w_mem_read_data[31:24]};
-               3'b101: r_writeback_value <= {56'b0, w_mem_read_data[23:16]};
-               3'b110: r_writeback_value <= {56'b0, w_mem_read_data[15:8]};
-               3'b111: r_writeback_value <= {56'b0, w_mem_read_data[7:0]};
+               3'b000: r_writeback_value <= {56'b0, w_mem_read_data[7:0]};
+               3'b001: r_writeback_value <= {56'b0, w_mem_read_data[15:8]};
+               3'b010: r_writeback_value <= {56'b0, w_mem_read_data[23:16]};
+               3'b011: r_writeback_value <= {56'b0, w_mem_read_data[31:24]};
+               3'b100: r_writeback_value <= {56'b0, w_mem_read_data[39:32]};
+               3'b101: r_writeback_value <= {56'b0, w_mem_read_data[47:40]};
+               3'b110: r_writeback_value <= {56'b0, w_mem_read_data[55:48]};
+               3'b111: r_writeback_value <= {56'b0, w_mem_read_data[63:56]};
             endcase
             r_writeback_reg <= r_reg_1;
             r_SM            <= WRITEBACK;
@@ -1221,7 +1221,7 @@ task t_store_indexed8;
          byte_lane        = effective_addr[2:0];
          r_mem_addr       <= effective_addr;
          r_mem_write_data <= {8{r_reg_port_a[7:0]}};
-         r_mem_byte_en    <= 8'b1000_0000 >> byte_lane;
+         r_mem_byte_en    <= 8'b0000_0001 << byte_lane;
          r_mem_write_DV   <= 1'b1;
          r_extra_clock    <= 1'b1;
       end else begin
