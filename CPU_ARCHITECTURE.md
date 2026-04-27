@@ -363,6 +363,9 @@ The following bugs were present in the original big-endian implementation and we
 
 **STIDX32** (`alu_extended_tasks.vh` line 1116): the byte-enable mask had the same inversion. Fixed: `effective_addr[2]=0` now enables the lower four byte lanes (`8'b0000_1111`), `effective_addr[2]=1` enables the upper four (`8'b1111_0000`).
 
+**LDIDX16 / LDIDX8** (`alu_extended_tasks.vh` lines 1143, 1195): the byte-/halfword-lane case statements had the lane-to-bit mapping reversed (lane 0 → MSByte/MSHalfword), inconsistent with LDIDX32 and the MEMGET8/16 tasks. Fixed: lane `n` now reads bits `[8n+7:8n]` (LDIDX8) or bits `[16n+15:16n]` (LDIDX16), matching the documented little-endian convention.
+**STIDX16 / STIDX8** (`alu_extended_tasks.vh` lines 1168, 1224): the byte-enable masks had the same inversion (`8'b1100_0000 >> byte_lane`, `8'b1000_0000 >> byte_lane`). Fixed: now `8'b0000_0011 << byte_lane` and `8'b0000_0001 << byte_lane`, matching MEMSET16/MEMSET8.
+
 ---
 
 ## 15. Instruction Encoding Quick Reference
