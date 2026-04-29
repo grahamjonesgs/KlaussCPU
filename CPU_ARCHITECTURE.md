@@ -340,9 +340,13 @@ Pointers are 32-bit values (the address space is 32-bit). When loaded into a 64-
 ## 13. I/O Peripherals
 
 The CPU has hardware instructions (not memory-mapped) for on-board peripherals:
-- **UART** (opcodes 5xxx): `TXR`, `TXCHARMEMR`, `TXSTRMEMR`, `RXRB`/`RXRNB` for serial debug output/input.
+- **UART** (opcodes 5xxx): `TXR`, `TXCHARMEMR`, `TXSTRMEM`, `TXSTRMEMR`, `RXRB`/`RXRNB` for serial debug output/input.
   - `TXCHARMEMR rs` — transmit one byte from memory. The hardware reads the 64-bit doubleword at `rs & ~7`, then selects byte lane `rs[2:0]` (identical byte-lane semantics to `MEMGET8`): lane 0 = bits[7:0] (lowest address/LSByte), lane 7 = bits[63:56]. The selected byte is transmitted over UART.
-  - `TXSTRMEMR rs` — transmit 8 bytes from memory starting at `rs`, in little-endian order (byte at `rs` first, byte at `rs+7` last). Byte-lane selection within the doubleword follows the same scheme as `TXCHARMEMR`.
+  - `TXSTRMEM imm32` — transmit null-terminated string from memory starting at address `imm32` (little-endian byte order: byte at address, address+1, address+2, …). Reads consecutive 8-byte chunks from memory and scans each for a null terminator (`8'h00`). Transmission stops at the first null byte encountered (the null itself is not transmitted).
+  - `TXSTRMEMR rs` — transmit null-terminated string from memory starting at address `rs` (little-endian byte order). Same semantics as `TXSTRMEM`, but the starting address comes from register `rs[26:0]`.
+- **LCD** (opcodes 2xxx): SPI LCD command/data send.
+- **LEDs** (opcodes 3xxx): LED register, RGB LEDs, 7-segment displays, switches.
+- **Interrupts** (opcodes 6xxx): `INTSETRR` to set handler address; `IRET` for interrupt return.
 - **LCD** (opcodes 2xxx): SPI LCD command/data send.
 - **LEDs** (opcodes 3xxx): LED register, RGB LEDs, 7-segment displays, switches.
 - **Interrupts** (opcodes 6xxx): `INTSETRR` to set handler address; `IRET` for interrupt return.
@@ -365,6 +369,8 @@ The following bugs were present in the original big-endian implementation and we
 
 **LDIDX16 / LDIDX8** (`alu_extended_tasks.vh` lines 1143, 1195): the byte-/halfword-lane case statements had the lane-to-bit mapping reversed (lane 0 → MSByte/MSHalfword), inconsistent with LDIDX32 and the MEMGET8/16 tasks. Fixed: lane `n` now reads bits `[8n+7:8n]` (LDIDX8) or bits `[16n+15:16n]` (LDIDX16), matching the documented little-endian convention.
 **STIDX16 / STIDX8** (`alu_extended_tasks.vh` lines 1168, 1224): the byte-enable masks had the same inversion (`8'b1100_0000 >> byte_lane`, `8'b1000_0000 >> byte_lane`). Fixed: now `8'b0000_0011 << byte_lane` and `8'b0000_0001 << byte_lane`, matching MEMSET16/MEMSET8.
+
+**TXSTRMEM / TXSTRMEMR** (`uart_tasks.vh` lines 226–402): these instructions were implemented as single-shot 8-byte transmitters with no null-terminator scanning, truncating longer strings and transmitting beyond the null. Fixed: now properly implement null-terminated string transmission by iterating through consecutive 8-byte chunks, scanning each for a null byte, and stopping transmission at the first null found (null not transmitted). State machines (`r_tx_str_state_mem`/`r_tx_str_state_reg`) manage multi-cycle transmission across multiple doubleword reads.
 
 ---
 

@@ -220,84 +220,158 @@ task t_tx_value_of_mem;
     end
 endtask
 
-// Print to serial character from memory location
-// On completion
-// Increment PC 2
-// Increment r_SM_msg
+// Send null-terminated string from memory location (at imm32).
+// Mirror of t_tx_string_at_reg — see that task for the state-machine commentary.
+// On completion: r_PC += 8 (2-word instruction: opcode + imm32).
 task t_tx_string_at_mem;
     input [31:0] i_location;
+    reg [3:0] null_pos;
+    reg       has_null;
     begin
-        if (r_extra_clock == 0) begin
-            r_mem_addr <= i_location[26:0];
-            r_mem_read_DV <= 1'b1;
-            r_mem_was_ready <=1'b0;
-            r_extra_clock <= 1'b1;
-        end // if first loop
-        else
-        begin
+        if (r_tx_str_state_mem == 3'b000) begin
+            r_tx_str_addr_mem <= i_location[26:0];
+            r_mem_addr        <= i_location[26:0];
+            r_mem_read_DV     <= 1'b1;
+            r_tx_str_state_mem <= 3'b001;
+        end
+        else if (r_tx_str_state_mem == 3'b001) begin
             if (w_mem_ready) begin
-                r_mem_read_DV <= 1'b0;
-                r_mem_was_ready <= 1'b1;
-                
-            end       
-            if ((w_mem_ready||r_mem_was_ready) && !w_sending_msg) begin
-                // Little-endian: send 8 bytes in address order (lowest byte first).
-                // addr+0 → bits[7:0], addr+1 → bits[15:8], … addr+7 → bits[63:56].
-                r_msg[7:0]   <= w_mem_read_data[7:0];
-                r_msg[15:8]  <= w_mem_read_data[15:8];
-                r_msg[23:16] <= w_mem_read_data[23:16];
-                r_msg[31:24] <= w_mem_read_data[31:24];
-                r_msg[39:32] <= w_mem_read_data[39:32];
-                r_msg[47:40] <= w_mem_read_data[47:40];
-                r_msg[55:48] <= w_mem_read_data[55:48];
-                r_msg[63:56] <= w_mem_read_data[63:56];
-                r_msg_length <= 8'h8;
-                r_msg_send_DV <= 1'b1;
-                r_SM <= UART_DELAY;
-                r_mem_read_DV <= 1'b0;
-                r_PC <= r_PC + 8;
-            end  // if ready asserted, else will loop until ready
-        end  // if subsequent loop
+                r_mem_read_DV      <= 1'b0;
+                r_tx_str_state_mem <= 3'b010;
+            end
+        end
+        else if (r_tx_str_state_mem == 3'b010) begin
+            null_pos = 4'h8;
+            has_null = 1'b0;
+            if      (w_mem_read_data[7:0]   == 8'h00) begin null_pos = 4'h0; has_null = 1'b1; end
+            else if (w_mem_read_data[15:8]  == 8'h00) begin null_pos = 4'h1; has_null = 1'b1; end
+            else if (w_mem_read_data[23:16] == 8'h00) begin null_pos = 4'h2; has_null = 1'b1; end
+            else if (w_mem_read_data[31:24] == 8'h00) begin null_pos = 4'h3; has_null = 1'b1; end
+            else if (w_mem_read_data[39:32] == 8'h00) begin null_pos = 4'h4; has_null = 1'b1; end
+            else if (w_mem_read_data[47:40] == 8'h00) begin null_pos = 4'h5; has_null = 1'b1; end
+            else if (w_mem_read_data[55:48] == 8'h00) begin null_pos = 4'h6; has_null = 1'b1; end
+            else if (w_mem_read_data[63:56] == 8'h00) begin null_pos = 4'h7; has_null = 1'b1; end
+
+            r_tx_str_done_mem <= has_null;
+            r_msg[63:0]       <= w_mem_read_data[63:0];
+
+            if (has_null && null_pos == 4'h0) begin
+                r_SM               <= UART_DELAY;
+                r_PC               <= r_PC + 8;
+                r_tx_str_state_mem <= 3'b000;
+            end else begin
+                r_msg_length       <= has_null ? {4'b0, null_pos} : 8'h08;
+                r_msg_send_DV      <= 1'b1;
+                r_tx_str_state_mem <= 3'b011;
+            end
+        end
+        else if (r_tx_str_state_mem == 3'b011) begin
+            if (w_sending_msg) begin
+                r_msg_send_DV      <= 1'b0;
+                r_tx_str_state_mem <= 3'b100;
+            end
+        end
+        else if (r_tx_str_state_mem == 3'b100) begin
+            if (i_msg_sent_DV) begin
+                if (r_tx_str_done_mem) begin
+                    r_SM               <= UART_DELAY;
+                    r_PC               <= r_PC + 8;
+                    r_tx_str_state_mem <= 3'b000;
+                end else begin
+                    r_mem_addr         <= r_tx_str_addr_mem + 8;
+                    r_mem_read_DV      <= 1'b1;
+                    r_tx_str_addr_mem  <= r_tx_str_addr_mem + 8;
+                    r_tx_str_state_mem <= 3'b001;
+                end
+            end
+        end
     end
 endtask
 
-// Print to serial character from memory location given by register
-// On completion
-// Increment PC 1
-// Increment r_SM_msg
+// Send null-terminated string from memory location given by register.
+// Reads consecutive doublewords until a null byte is found, sending each chunk
+// over UART before advancing.
+//
+// State machine (3-bit r_tx_str_state_reg):
+//   000  init: latch base address, issue first read
+//   001  wait for memory read to complete
+//   010  scan doubleword for null; queue chunk to UART (r_msg, r_msg_length, DV pulse)
+//   011  wait for UART to acknowledge (w_sending_msg=1) — closes the race where
+//        the CPU would otherwise read !w_sending_msg as still-idle on the cycle
+//        immediately after setting DV. Once acknowledged, clear DV so the UART
+//        does not auto-re-trigger the same message on its next IDLE.
+//   100  wait for UART completion pulse (i_msg_sent_DV); then either advance
+//        the pointer by 8 and loop (no null in chunk) or finish the instruction
+//        (null in chunk — done flag latched in state 010).
+//
+// On completion: r_PC += 4 (1-word instruction).
 task t_tx_string_at_reg;
+    reg [3:0] null_pos;
+    reg       has_null;
     begin
-        if (r_extra_clock == 0) begin
-            r_mem_addr <= r_reg_port_b[26:0];
-            r_mem_read_DV <= 1'b1;
-            r_mem_was_ready <=1'b0;
-            r_extra_clock <= 1'b1;
-        end // if first loop
-        else
-        begin
+        if (r_tx_str_state_reg == 3'b000) begin
+            r_tx_str_addr_reg <= r_reg_port_b[26:0];
+            r_mem_addr        <= r_reg_port_b[26:0];
+            r_mem_read_DV     <= 1'b1;
+            r_tx_str_state_reg <= 3'b001;
+        end
+        else if (r_tx_str_state_reg == 3'b001) begin
             if (w_mem_ready) begin
-                r_mem_read_DV <= 1'b0;
-                r_mem_was_ready <= 1'b1;
-                
-            end       
-            if ((w_mem_ready||r_mem_was_ready) && !w_sending_msg) begin
-                // Little-endian: send 8 bytes in address order (lowest byte first).
-                // addr+0 → bits[7:0], addr+1 → bits[15:8], … addr+7 → bits[63:56].
-                r_msg[7:0]   <= w_mem_read_data[7:0];
-                r_msg[15:8]  <= w_mem_read_data[15:8];
-                r_msg[23:16] <= w_mem_read_data[23:16];
-                r_msg[31:24] <= w_mem_read_data[31:24];
-                r_msg[39:32] <= w_mem_read_data[39:32];
-                r_msg[47:40] <= w_mem_read_data[47:40];
-                r_msg[55:48] <= w_mem_read_data[55:48];
-                r_msg[63:56] <= w_mem_read_data[63:56];
-                r_msg_length <= 8'h8;
-                r_msg_send_DV <= 1'b1;
-                r_SM <= UART_DELAY;
-                r_mem_read_DV <= 1'b0;
-                r_PC <= r_PC + 4;
-            end  // if ready asserted, else will loop until ready
-        end  // if subsequent loop
+                r_mem_read_DV      <= 1'b0;
+                r_tx_str_state_reg <= 3'b010;
+            end
+        end
+        else if (r_tx_str_state_reg == 3'b010) begin
+            null_pos = 4'h8;
+            has_null = 1'b0;
+            if      (w_mem_read_data[7:0]   == 8'h00) begin null_pos = 4'h0; has_null = 1'b1; end
+            else if (w_mem_read_data[15:8]  == 8'h00) begin null_pos = 4'h1; has_null = 1'b1; end
+            else if (w_mem_read_data[23:16] == 8'h00) begin null_pos = 4'h2; has_null = 1'b1; end
+            else if (w_mem_read_data[31:24] == 8'h00) begin null_pos = 4'h3; has_null = 1'b1; end
+            else if (w_mem_read_data[39:32] == 8'h00) begin null_pos = 4'h4; has_null = 1'b1; end
+            else if (w_mem_read_data[47:40] == 8'h00) begin null_pos = 4'h5; has_null = 1'b1; end
+            else if (w_mem_read_data[55:48] == 8'h00) begin null_pos = 4'h6; has_null = 1'b1; end
+            else if (w_mem_read_data[63:56] == 8'h00) begin null_pos = 4'h7; has_null = 1'b1; end
+
+            r_tx_str_done_reg <= has_null;
+            r_msg[63:0]       <= w_mem_read_data[63:0];
+
+            if (has_null && null_pos == 4'h0) begin
+                // Empty string — nothing to send; skip UART entirely.
+                // (length=0 would otherwise underflow the UART byte counter and
+                //  dump 256 bytes of garbage.)
+                r_SM               <= UART_DELAY;
+                r_PC               <= r_PC + 4;
+                r_tx_str_state_reg <= 3'b000;
+            end else begin
+                r_msg_length       <= has_null ? {4'b0, null_pos} : 8'h08;
+                r_msg_send_DV      <= 1'b1;
+                r_tx_str_state_reg <= 3'b011;
+            end
+        end
+        else if (r_tx_str_state_reg == 3'b011) begin
+            // Wait for UART to acknowledge (start transmitting). Then clear DV
+            // so the UART does not latch the same r_msg again when it next idles.
+            if (w_sending_msg) begin
+                r_msg_send_DV      <= 1'b0;
+                r_tx_str_state_reg <= 3'b100;
+            end
+        end
+        else if (r_tx_str_state_reg == 3'b100) begin
+            // Wait for UART completion pulse (one cycle, fires on s_CLEANUP entry).
+            if (i_msg_sent_DV) begin
+                if (r_tx_str_done_reg) begin
+                    r_SM               <= UART_DELAY;
+                    r_PC               <= r_PC + 4;
+                    r_tx_str_state_reg <= 3'b000;
+                end else begin
+                    r_mem_addr         <= r_tx_str_addr_reg + 8;
+                    r_mem_read_DV      <= 1'b1;
+                    r_tx_str_addr_reg  <= r_tx_str_addr_reg + 8;
+                    r_tx_str_state_reg <= 3'b001;
+                end
+            end
+        end
     end
 endtask
 

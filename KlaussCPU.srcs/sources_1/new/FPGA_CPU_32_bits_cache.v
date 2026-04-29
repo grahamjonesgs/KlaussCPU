@@ -169,6 +169,14 @@ module FPGA_CPU_32_bits_cache (
    wire i_msg_sent_DV;
    wire w_sending_msg;
 
+   // String transmission state machines (for TXSTRMEM and TXSTRMEMR)
+   reg [2:0] r_tx_str_state_mem;   // State machine for TXSTRMEM (imm32 address)
+   reg [2:0] r_tx_str_state_reg;   // State machine for TXSTRMEMR (register address)
+   reg [26:0] r_tx_str_addr_mem;   // Current address for TXSTRMEM
+   reg [26:0] r_tx_str_addr_reg;   // Current address for TXSTRMEMR
+   reg        r_tx_str_done_mem;   // Persists has_null across UART handshake states (TXSTRMEM)
+   reg        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
+
    // temp vars for timing
    reg r_timing_start;
 
@@ -629,15 +637,19 @@ rams_sp_nc rams_sp_nc1 (
                      8'h0a: ;  // ignore LF
                      8'h0d: ;  // ignore CR
                      default: begin
+                        // Pack hex pairs into o_ram_write_value in little-endian byte order:
+                        // first hex pair (stream byte 0) → bits[7:0], last (byte 3) → bits[31:24].
+                        // This makes mem_byte[N] land at bits[8(N%4)+7:8(N%4)] of the 32-bit
+                        // word, matching the CPU's LE byte-lane mapping in MEMGET8 / STIDX8 etc.
                         case (r_load_byte_counter)
-                           0: o_ram_write_value[31:28] = return_hex_from_ascii(w_uart_rx_value);
-                           1: o_ram_write_value[27:24] = return_hex_from_ascii(w_uart_rx_value);
-                           2: o_ram_write_value[23:20] = return_hex_from_ascii(w_uart_rx_value);
-                           3: o_ram_write_value[19:16] = return_hex_from_ascii(w_uart_rx_value);
-                           4: o_ram_write_value[15:12] = return_hex_from_ascii(w_uart_rx_value);
-                           5: o_ram_write_value[11:8] = return_hex_from_ascii(w_uart_rx_value);
-                           6: o_ram_write_value[7:4] = return_hex_from_ascii(w_uart_rx_value);
-                           7: o_ram_write_value[3:0] = return_hex_from_ascii(w_uart_rx_value);
+                           0: o_ram_write_value[7:4]   = return_hex_from_ascii(w_uart_rx_value);
+                           1: o_ram_write_value[3:0]   = return_hex_from_ascii(w_uart_rx_value);
+                           2: o_ram_write_value[15:12] = return_hex_from_ascii(w_uart_rx_value);
+                           3: o_ram_write_value[11:8]  = return_hex_from_ascii(w_uart_rx_value);
+                           4: o_ram_write_value[23:20] = return_hex_from_ascii(w_uart_rx_value);
+                           5: o_ram_write_value[19:16] = return_hex_from_ascii(w_uart_rx_value);
+                           6: o_ram_write_value[31:28] = return_hex_from_ascii(w_uart_rx_value);
+                           7: o_ram_write_value[27:24] = return_hex_from_ascii(w_uart_rx_value);
                            default: ;
                         endcase  //r_load_byte_counter
                         if (r_load_byte_counter == 7) begin
@@ -743,6 +755,8 @@ rams_sp_nc rams_sp_nc1 (
             OPCODE_REQUEST: begin
                r_msg_send_DV <= 1'b0;
                r_extra_clock <= 2'b0;  // always reset — all instructions rely on this
+               r_tx_str_state_mem <= 3'b0;  // reset string transmission state machine (TXSTRMEM)
+               r_tx_str_state_reg <= 3'b0;  // reset string transmission state machine (TXSTRMEMR)
                r_mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
 
                if (r_int_push_wait) begin
@@ -974,10 +988,11 @@ rams_sp_nc rams_sp_nc1 (
                         r_seven_seg_value2 <= {8'h22, 8'h22, 8'h22, 6'h0, r_load_byte_counter[1:0]};
                      end
                      default // Also for opcode 1
-                        // Opcode selected print OP on 7seg1, and code on 7seg2
+                        // Show the full 32-bit opcode across both displays:
+                        //   7seg1 = w_opcode[31:16] (upper 4 hex digits)
+                        //   7seg2 = w_opcode[15:0]  (lower 4 hex digits)
                      begin
-                        r_seven_seg_value1 <= 32'h00_25_0C_0D;
-                        r_seven_seg_value2 <= {
+                        r_seven_seg_value1 <= {
                            4'h0,
                            w_opcode[31:28],
                            4'h0,
@@ -986,6 +1001,16 @@ rams_sp_nc rams_sp_nc1 (
                            w_opcode[23:20],
                            4'h0,
                            w_opcode[19:16]
+                        };
+                        r_seven_seg_value2 <= {
+                           4'h0,
+                           w_opcode[15:12],
+                           4'h0,
+                           w_opcode[11:8],
+                           4'h0,
+                           w_opcode[7:4],
+                           4'h0,
+                           w_opcode[3:0]
                         };
                      end
 
