@@ -164,6 +164,34 @@ task t_add_value;
    end
 endtask
 
+// ADDI — Add sign-extended immediate to register, write to a (potentially
+// different) destination register. RRV format, 2-word.
+//   Encoding: opcode bits [7:4] = rd, [3:0] = rs;  imm32 at PC+4.
+//   Operation:  rd = rs + sign_ext(imm32)
+//   Sets zero/sign/carry/overflow.
+//
+// Distinct from ADDV (0x0000_081?) which is RV (single register, in-place)
+// and zero-extends the immediate. ADDI exists primarily to materialise frame
+// addresses in a single instruction (e.g. `addi rd, R15, frame_offset`)
+// instead of the prior SETR + ADDR pair.
+task t_addi;
+   input [31:0] i_value;
+   reg [63:0] sign_ext_imm;
+   reg [63:0] hold;
+   begin
+      sign_ext_imm = {{32{i_value[31]}}, i_value};
+      {r_carry_flag, hold} = {1'b0, r_reg_port_b} + {1'b0, sign_ext_imm};
+      r_writeback_set_zero_flag <= 1'b1;
+      r_sign_flag <= hold[63];
+      r_overflow_flag <= (r_reg_port_b[63] == sign_ext_imm[63]) &&
+                         (hold[63] != r_reg_port_b[63]) ? 1'b1 : 1'b0;
+      r_writeback_value <= hold;
+      r_writeback_reg <= r_reg_1;   // rd = bits[7:4]
+      r_SM <= WRITEBACK;
+      r_PC <= r_PC + 8;
+   end
+endtask
+
 // Subtract value from reg
 task t_minus_value;
    input [31:0] i_value;

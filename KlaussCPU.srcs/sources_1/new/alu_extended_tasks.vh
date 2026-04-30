@@ -1154,6 +1154,39 @@ task t_load_indexed16;
    end
 endtask
 
+// LDIDX16_S RRV — rd = sign_ext(mem16[(rs2 + imm32) & ~1])
+// Mirror of LDIDX16 but sign-extends the loaded halfword to 64 bits.
+// Lets LLVM mark SEXTLOAD i16 as Legal and emit a single instruction
+// instead of LDIDX16 + SEXTH.
+task t_load_indexed16_s;
+   input [31:0] i_offset;
+   reg [31:0] effective_addr;
+   reg [15:0] half_val;
+   begin
+      if (r_extra_clock == 0) begin
+         effective_addr = r_reg_port_b[31:0] + i_offset;
+         r_mem_addr    <= {effective_addr[31:1], 1'b0};
+         r_mem_read_DV <= 1'b1;
+         r_extra_clock <= 1'b1;
+      end else begin
+         if (w_mem_ready) begin
+            effective_addr = r_reg_port_b[31:0] + i_offset;
+            r_mem_read_DV <= 1'b0;
+            case (effective_addr[2:1])
+               2'b00: half_val = w_mem_read_data[15:0];
+               2'b01: half_val = w_mem_read_data[31:16];
+               2'b10: half_val = w_mem_read_data[47:32];
+               2'b11: half_val = w_mem_read_data[63:48];
+            endcase
+            r_writeback_value <= {{48{half_val[15]}}, half_val};
+            r_writeback_reg   <= r_reg_1;
+            r_SM              <= WRITEBACK;
+            r_PC              <= r_PC + 8;
+         end
+      end
+   end
+endtask
+
 // STIDX16 RRV — mem16[(rs2 + imm32) & ~1] = rs1[15:0]
 task t_store_indexed16;
    input [31:0] i_offset;
@@ -1205,6 +1238,43 @@ task t_load_indexed8;
             r_writeback_reg <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 8;
+         end
+      end
+   end
+endtask
+
+// LDIDX8_S RRV — rd = sign_ext(mem8[rs2 + imm32])
+// Mirror of LDIDX8 but sign-extends the loaded byte to 64 bits.
+// Lets LLVM mark SEXTLOAD i8 as Legal and emit a single instruction
+// instead of LDIDX8 + SEXTB.
+task t_load_indexed8_s;
+   input [31:0] i_offset;
+   reg [31:0] effective_addr;
+   reg [7:0]  byte_val;
+   begin
+      if (r_extra_clock == 0) begin
+         effective_addr = r_reg_port_b[31:0] + i_offset;
+         r_mem_addr    <= effective_addr;
+         r_mem_read_DV <= 1'b1;
+         r_extra_clock <= 1'b1;
+      end else begin
+         if (w_mem_ready) begin
+            effective_addr = r_reg_port_b[31:0] + i_offset;
+            r_mem_read_DV <= 1'b0;
+            case (effective_addr[2:0])
+               3'b000: byte_val = w_mem_read_data[7:0];
+               3'b001: byte_val = w_mem_read_data[15:8];
+               3'b010: byte_val = w_mem_read_data[23:16];
+               3'b011: byte_val = w_mem_read_data[31:24];
+               3'b100: byte_val = w_mem_read_data[39:32];
+               3'b101: byte_val = w_mem_read_data[47:40];
+               3'b110: byte_val = w_mem_read_data[55:48];
+               3'b111: byte_val = w_mem_read_data[63:56];
+            endcase
+            r_writeback_value <= {{56{byte_val[7]}}, byte_val};
+            r_writeback_reg   <= r_reg_1;
+            r_SM              <= WRITEBACK;
+            r_PC              <= r_PC + 8;
          end
       end
    end

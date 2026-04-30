@@ -218,23 +218,97 @@ task t_memset32;
    end
 endtask
 
-// MEMGET32 - Read 32-bit word, zero-extended into dest register
-// Little-endian: addr[2]=0 → LOW_HALF bits[31:0], addr[2]=1 → HIGH_HALF bits[63:32]
+// MEMGET32 - Read 32-bit word at byte address in r_reg_port_b, zero-extended
+// into dest register. Supports any byte alignment of the source address.
+//
+// The cache returns 8-byte aligned doublewords plus a "next" doubleword for
+// reads at the lower half of a cache line. There are four cases depending on
+// the byte offset O = addr[2:0] and addr[3]:
+//
+//   offset 0..4               → all 4 bytes in the first returned doubleword.
+//   offset 5..7, addr[3]=0    → spans within same cache line; byte source for
+//                                the high bytes is o_mem_read_data_next (cache
+//                                lookahead), available in the same cycle.
+//   offset 5..7, addr[3]=1    → spans into the NEXT cache line; the cache does
+//                                not pre-fetch this. Issue a second read at
+//                                (addr & ~7) + 8 to get those bytes.
+//
+// State machine (r_extra_clock):
+//   0: issue first read at addr (cache aligns to 8-byte boundary internally).
+//   1: wait first ready. Extract bytes; either writeback (single-read case) or
+//      stash dw0 in r_writeback_value and re-assert DV for the second read.
+//   2: bubble — lets the cache's stale o_mem_ready (from the first read's
+//      READ_CACHE2 → PRE_WAIT path) clear before phase 3 starts polling. The
+//      cache's WAIT body in this cycle drives ready low and latches the new
+//      DV; without this bubble phase 3 would race-fire on the stale ready=1.
+//   3: wait second ready. Combine the saved high bytes of dw0 with the low
+//      bytes of dw1, then writeback.
+//
+// Stash mechanism: r_writeback_value is used as scratch storage for dw0 in
+// phases 1-3. Safe because WRITEBACK only fires once we set r_SM<=WRITEBACK
+// in the final cycle of phase 1 or phase 3. PC += 4 (1-word RR instruction).
 task t_memget32;
+   reg [2:0]  offset;
+   reg [31:0] result;
    begin
-      if (r_extra_clock == 0) begin
-         r_mem_addr    <= {r_reg_port_b[31:2], 2'b00};
+      offset = r_reg_port_b[2:0];
+
+      if (r_extra_clock == 2'd0) begin
+         r_mem_addr    <= r_reg_port_b[31:0];
          r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
-      end else begin
+         r_extra_clock <= 2'd1;
+      end else if (r_extra_clock == 2'd1) begin
          if (w_mem_ready) begin
             r_mem_read_DV <= 1'b0;
-            r_writeback_value <= r_reg_port_b[2] ?
-               {32'b0, w_mem_read_data[63:32]} :
-               {32'b0, w_mem_read_data[31:0]};
-            r_writeback_reg <= r_reg_1;
-            r_SM            <= WRITEBACK;
-            r_PC            <= r_PC + 4;
+            if (offset <= 3'd4) begin
+               case (offset)
+                  3'd0:    result = w_mem_read_data[31:0];
+                  3'd1:    result = w_mem_read_data[39:8];
+                  3'd2:    result = w_mem_read_data[47:16];
+                  3'd3:    result = w_mem_read_data[55:24];
+                  3'd4:    result = w_mem_read_data[63:32];
+                  default: result = 32'b0;
+               endcase
+               r_writeback_value <= {32'b0, result};
+               r_writeback_reg   <= r_reg_1;
+               r_SM              <= WRITEBACK;
+               r_PC              <= r_PC + 4;
+            end else if (w_mem_next_valid) begin
+               // Span within same cache line — use cache lookahead.
+               case (offset)
+                  3'd5:    result = {w_mem_read_data_next[7:0],  w_mem_read_data[63:40]};
+                  3'd6:    result = {w_mem_read_data_next[15:0], w_mem_read_data[63:48]};
+                  3'd7:    result = {w_mem_read_data_next[23:0], w_mem_read_data[63:56]};
+                  default: result = 32'b0;
+               endcase
+               r_writeback_value <= {32'b0, result};
+               r_writeback_reg   <= r_reg_1;
+               r_SM              <= WRITEBACK;
+               r_PC              <= r_PC + 4;
+            end else begin
+               // Cross-cache-line span: stash dw0, issue second read at next dw.
+               r_writeback_value <= w_mem_read_data;
+               r_mem_addr        <= {r_reg_port_b[31:3], 3'b000} + 32'd8;
+               r_mem_read_DV     <= 1'b1;
+               r_extra_clock     <= 2'd2;
+            end
+         end
+      end else if (r_extra_clock == 2'd2) begin
+         r_extra_clock <= 2'd3;
+      end else begin  // r_extra_clock == 2'd3
+         if (w_mem_ready) begin
+            r_mem_read_DV <= 1'b0;
+            // dw1 = w_mem_read_data; dw0 = r_writeback_value (stashed in phase 1).
+            case (offset)
+               3'd5:    result = {w_mem_read_data[7:0],  r_writeback_value[63:40]};
+               3'd6:    result = {w_mem_read_data[15:0], r_writeback_value[63:48]};
+               3'd7:    result = {w_mem_read_data[23:0], r_writeback_value[63:56]};
+               default: result = 32'b0;
+            endcase
+            r_writeback_value <= {32'b0, result};
+            r_writeback_reg   <= r_reg_1;
+            r_SM              <= WRITEBACK;
+            r_PC              <= r_PC + 4;
          end
       end
    end
