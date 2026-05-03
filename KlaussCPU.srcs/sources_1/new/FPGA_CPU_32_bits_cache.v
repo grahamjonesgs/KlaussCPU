@@ -71,13 +71,15 @@ module FPGA_CPU_32_bits_cache (
    localparam LOAD_COMPLETE = 32'h10_000, LOAD_WAIT = 32'h20_000;
    localparam DEBUG_DATA = 32'h40_000, DEBUG_DATA2 = 32'h80_000, DEBUG_DATA3 = 32'h100_000;
    localparam DEBUG_WAIT = 32'h200_000;
-   localparam MULTIPLY_CALC      = 32'h0040_0000;  // DSP pipeline stage 1 (MREG)
-   localparam MULTIPLY_PIPE      = 32'h0100_0000;  // DSP pipeline stage 2 (PREG)
+   localparam MULTIPLY_CALC      = 32'h0040_0000;  // DSP pipeline stage 2 (MREG)
+   localparam MULTIPLY_PIPE      = 32'h0100_0000;  // DSP pipeline stage 3 (PREG)
    localparam MULTIPLY_WRITEBACK = 32'h0080_0000;  // Write result
+   localparam MULTIPLY_SETUP     = 32'h4000_0000;  // Setup operands for multiply
    localparam WRITEBACK          = 32'h0200_0000;  // Register file writeback stage
    localparam HALTED             = 32'h0400_0000;  // CPU halted, waiting for reset
    localparam DIVIDE_STEP        = 32'h0800_0000;  // Division iteration state
    localparam HALTED_BREAK       = 32'h1000_0000;  // Sending UART break before halt
+   localparam MULTIPLY_BREG      = 32'h2000_0000;  // DSP pipeline stage 1 (AREG/BREG)
 
    // Error Codes
    localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
@@ -237,14 +239,24 @@ module FPGA_CPU_32_bits_cache (
   reg [63:0] r_mul_operand_a;
   reg [63:0] r_mul_operand_b;
 
-  // Free-running 2-stage multiply pipeline (lets Vivado use DSP48 MREG + PREG)
+  // Extra input-side latches so Vivado can pull these into the DSP48E1
+  // AREG/BREG, breaking the long FDRE -> LUT2 -> DSP-cascade path.
+  reg [63:0] r_mul_operand_a_q;
+  reg [63:0] r_mul_operand_b_q;
+  reg        r_mul_is_unsigned_q;
+
+  // Free-running 3-stage multiply pipeline (Vivado: DSP48 AREG/BREG + MREG + PREG)
   always @(posedge i_Clk) begin
-     // Stage 1: multiply
-     if (r_mul_is_unsigned)
-        r_mul_pipe1 <= r_mul_operand_a * r_mul_operand_b;
+     // Stage 1: latch operands (absorbed into DSP AREG/BREG)
+     r_mul_operand_a_q   <= r_mul_operand_a;
+     r_mul_operand_b_q   <= r_mul_operand_b;
+     r_mul_is_unsigned_q <= r_mul_is_unsigned;
+     // Stage 2: multiply (MREG)
+     if (r_mul_is_unsigned_q)
+        r_mul_pipe1 <= r_mul_operand_a_q * r_mul_operand_b_q;
      else
-        r_mul_pipe1 <= $signed(r_mul_operand_a) * $signed(r_mul_operand_b);
-     // Stage 2: register
+        r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
+     // Stage 3: register (PREG)
      r_mul_pipe2 <= r_mul_pipe1;
   end
 
@@ -1030,14 +1042,25 @@ rams_sp_nc rams_sp_nc1 (
 
             end
             
-             MULTIPLY_CALC: begin
-    // Wait for pipeline stage 1 (MREG) - multiply is computed
-    // by the free-running pipeline from r_mul_operand_a/b
+             MULTIPLY_SETUP: begin
+    // Operands now valid in r_mul_operand_a/b; this cycle they propagate
+    // into r_mul_operand_a_q/b_q (absorbed into DSP48E1 AREG/BREG).
+    r_SM <= MULTIPLY_BREG;
+end
+
+MULTIPLY_BREG: begin
+    // Wait for DSP input registers (AREG/BREG) - multiply now starting
+    r_SM <= MULTIPLY_CALC;
+end
+
+MULTIPLY_CALC: begin
+    // Wait for pipeline stage 2 (MREG) - multiply is computed
+    // by the free-running pipeline from r_mul_operand_a_q/b_q
     r_SM <= MULTIPLY_PIPE;
 end
 
 MULTIPLY_PIPE: begin
-    // Wait for pipeline stage 2 (PREG) - result now in r_mul_result_hi/lo
+    // Wait for pipeline stage 3 (PREG) - result now in r_mul_result_hi/lo
     r_SM <= MULTIPLY_WRITEBACK;
 end
 

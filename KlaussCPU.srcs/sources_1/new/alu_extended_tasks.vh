@@ -439,7 +439,7 @@ begin
     r_mul_is_high     <= 1'b0;
     r_mul_is_unsigned <= 1'b0;
     r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_CALC;
+    r_SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -452,7 +452,7 @@ begin
     r_mul_is_high     <= 1'b0;
     r_mul_is_unsigned <= 1'b1;
     r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_CALC;
+    r_SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -465,7 +465,7 @@ begin
     r_mul_is_high     <= 1'b1;
     r_mul_is_unsigned <= 1'b0;
     r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_CALC;
+    r_SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -478,7 +478,7 @@ begin
     r_mul_is_high     <= 1'b1;
     r_mul_is_unsigned <= 1'b1;
     r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_CALC;
+    r_SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -492,7 +492,7 @@ begin
     r_mul_is_high     <= 1'b0;
     r_mul_is_unsigned <= 1'b0;
     r_mul_is_immediate <= 1'b1;             // Flag for PC increment
-    r_SM              <= MULTIPLY_CALC;
+    r_SM              <= MULTIPLY_SETUP;
 end
 endtask
 
