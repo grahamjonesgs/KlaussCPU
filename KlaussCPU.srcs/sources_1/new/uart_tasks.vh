@@ -621,3 +621,316 @@ task t_tx_message;
         r_msg_send_DV <= 1'b1;
     end
 endtask
+
+
+// Build a single line of the HCF crash dump into r_msg / r_msg_length.
+// Phase index is r_hcf_dump_phase (see DUMP_* localparams in FPGA_CPU_32_bits_cache.v).
+// Caller (HCF_DUMP state, PREP sub-state) handles UART handshake and phase advance.
+//
+// All lines fit within the 32-byte r_msg buffer.  Lines end with "\r\n" so a
+// host terminal (minicom etc.) renders one dump field per line.
+//
+// Phases:
+//   0           "*** CRASH DUMP ***"        (banner)
+//   1           "ERR=xx PC=xxxxxxxx"
+//   2           "OPC=xxxxxxxx SP=xxxxxxxx"
+//   3           "V1=xxxxxxxx IDX=xxxxxxxx"
+//   4           "FLG Z=x E=x C=x V=x"
+//   5           "    S=x L=x U=x"
+//   6..21       "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF, hex index)
+//   22..25      "SX=NNNNNNNNNNNNNNNN"       4 top-of-stack doublewords (S0..S3)
+//   26..41      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
+//   42          "*** END ***"               (footer)
+task t_hcf_dump_build_line;
+    reg [5:0]  k_phase;     // phase relative to base for repeated phases
+    reg [3:0]  trace_pos;   // ring index for trace lookup
+    reg [63:0] reg_val;
+    reg [63:0] trace_val;
+    begin
+        case (r_hcf_dump_phase)
+            DUMP_HEADER: begin
+                // "\r\n*** CRASH DUMP ***\r\n"  (22 bytes)
+                r_msg[ 0*8 +: 8] <= 8'h0D;
+                r_msg[ 1*8 +: 8] <= 8'h0A;
+                r_msg[ 2*8 +: 8] <= "*";
+                r_msg[ 3*8 +: 8] <= "*";
+                r_msg[ 4*8 +: 8] <= "*";
+                r_msg[ 5*8 +: 8] <= " ";
+                r_msg[ 6*8 +: 8] <= "C";
+                r_msg[ 7*8 +: 8] <= "R";
+                r_msg[ 8*8 +: 8] <= "A";
+                r_msg[ 9*8 +: 8] <= "S";
+                r_msg[10*8 +: 8] <= "H";
+                r_msg[11*8 +: 8] <= " ";
+                r_msg[12*8 +: 8] <= "D";
+                r_msg[13*8 +: 8] <= "U";
+                r_msg[14*8 +: 8] <= "M";
+                r_msg[15*8 +: 8] <= "P";
+                r_msg[16*8 +: 8] <= " ";
+                r_msg[17*8 +: 8] <= "*";
+                r_msg[18*8 +: 8] <= "*";
+                r_msg[19*8 +: 8] <= "*";
+                r_msg[20*8 +: 8] <= 8'h0D;
+                r_msg[21*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd22;
+            end
+
+            DUMP_ERR_PC: begin
+                // "ERR=xx PC=xxxxxxxx\r\n"  (20 bytes)
+                r_msg[ 0*8 +: 8] <= "E";
+                r_msg[ 1*8 +: 8] <= "R";
+                r_msg[ 2*8 +: 8] <= "R";
+                r_msg[ 3*8 +: 8] <= "=";
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_error_code[7:4]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_error_code[3:0]);
+                r_msg[ 6*8 +: 8] <= " ";
+                r_msg[ 7*8 +: 8] <= "P";
+                r_msg[ 8*8 +: 8] <= "C";
+                r_msg[ 9*8 +: 8] <= "=";
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[31:28]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[27:24]);
+                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_PC[23:20]);
+                r_msg[13*8 +: 8] <= return_ascii_from_hex(r_PC[19:16]);
+                r_msg[14*8 +: 8] <= return_ascii_from_hex(r_PC[15:12]);
+                r_msg[15*8 +: 8] <= return_ascii_from_hex(r_PC[11: 8]);
+                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_PC[ 7: 4]);
+                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_PC[ 3: 0]);
+                r_msg[18*8 +: 8] <= 8'h0D;
+                r_msg[19*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd20;
+            end
+
+            DUMP_OPC_SP: begin
+                // "OPC=xxxxxxxx SP=xxxxxxxx\r\n"  (26 bytes)
+                r_msg[ 0*8 +: 8] <= "O";
+                r_msg[ 1*8 +: 8] <= "P";
+                r_msg[ 2*8 +: 8] <= "C";
+                r_msg[ 3*8 +: 8] <= "=";
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(w_opcode[31:28]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(w_opcode[27:24]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(w_opcode[23:20]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(w_opcode[19:16]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(w_opcode[15:12]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(w_opcode[11: 8]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(w_opcode[ 7: 4]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(w_opcode[ 3: 0]);
+                r_msg[12*8 +: 8] <= " ";
+                r_msg[13*8 +: 8] <= "S";
+                r_msg[14*8 +: 8] <= "P";
+                r_msg[15*8 +: 8] <= "=";
+                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_SP[31:28]);
+                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_SP[27:24]);
+                r_msg[18*8 +: 8] <= return_ascii_from_hex(r_SP[23:20]);
+                r_msg[19*8 +: 8] <= return_ascii_from_hex(r_SP[19:16]);
+                r_msg[20*8 +: 8] <= return_ascii_from_hex(r_SP[15:12]);
+                r_msg[21*8 +: 8] <= return_ascii_from_hex(r_SP[11: 8]);
+                r_msg[22*8 +: 8] <= return_ascii_from_hex(r_SP[ 7: 4]);
+                r_msg[23*8 +: 8] <= return_ascii_from_hex(r_SP[ 3: 0]);
+                r_msg[24*8 +: 8] <= 8'h0D;
+                r_msg[25*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd26;
+            end
+
+            DUMP_V1_V2: begin
+                // "V1=xxxxxxxx IDX=xxxxxxxx\r\n"  (26 bytes)
+                // V1  = w_var1, the 32-bit immediate at PC+4 (instruction operand
+                //       fetched in OPCODE_FETCH / VAR1_FETCH).
+                // IDX = r_idx_base_addr, the saved base address used by indexed
+                //       register ops (LDIDX/STIDX family).  Replaces the dead
+                //       w_var2 wire which has no driver in the current FSM.
+                r_msg[ 0*8 +: 8] <= "V";
+                r_msg[ 1*8 +: 8] <= "1";
+                r_msg[ 2*8 +: 8] <= "=";
+                r_msg[ 3*8 +: 8] <= return_ascii_from_hex(w_var1[31:28]);
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(w_var1[27:24]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(w_var1[23:20]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(w_var1[19:16]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(w_var1[15:12]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(w_var1[11: 8]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(w_var1[ 7: 4]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(w_var1[ 3: 0]);
+                r_msg[11*8 +: 8] <= " ";
+                r_msg[12*8 +: 8] <= "I";
+                r_msg[13*8 +: 8] <= "D";
+                r_msg[14*8 +: 8] <= "X";
+                r_msg[15*8 +: 8] <= "=";
+                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[31:28]);
+                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[27:24]);
+                r_msg[18*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[23:20]);
+                r_msg[19*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[19:16]);
+                r_msg[20*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[15:12]);
+                r_msg[21*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[11: 8]);
+                r_msg[22*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[ 7: 4]);
+                r_msg[23*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[ 3: 0]);
+                r_msg[24*8 +: 8] <= 8'h0D;
+                r_msg[25*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd26;
+            end
+
+            DUMP_FLAGS_A: begin
+                // "FLG Z=x E=x C=x V=x\r\n"  (21 bytes)
+                r_msg[ 0*8 +: 8] <= "F";
+                r_msg[ 1*8 +: 8] <= "L";
+                r_msg[ 2*8 +: 8] <= "G";
+                r_msg[ 3*8 +: 8] <= " ";
+                r_msg[ 4*8 +: 8] <= "Z";
+                r_msg[ 5*8 +: 8] <= "=";
+                r_msg[ 6*8 +: 8] <= r_zero_flag    ? "1" : "0";
+                r_msg[ 7*8 +: 8] <= " ";
+                r_msg[ 8*8 +: 8] <= "E";
+                r_msg[ 9*8 +: 8] <= "=";
+                r_msg[10*8 +: 8] <= r_equal_flag   ? "1" : "0";
+                r_msg[11*8 +: 8] <= " ";
+                r_msg[12*8 +: 8] <= "C";
+                r_msg[13*8 +: 8] <= "=";
+                r_msg[14*8 +: 8] <= r_carry_flag   ? "1" : "0";
+                r_msg[15*8 +: 8] <= " ";
+                r_msg[16*8 +: 8] <= "V";
+                r_msg[17*8 +: 8] <= "=";
+                r_msg[18*8 +: 8] <= r_overflow_flag ? "1" : "0";
+                r_msg[19*8 +: 8] <= 8'h0D;
+                r_msg[20*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd21;
+            end
+
+            DUMP_FLAGS_B: begin
+                // "    S=x L=x U=x\r\n"  (17 bytes)
+                r_msg[ 0*8 +: 8] <= " ";
+                r_msg[ 1*8 +: 8] <= " ";
+                r_msg[ 2*8 +: 8] <= " ";
+                r_msg[ 3*8 +: 8] <= " ";
+                r_msg[ 4*8 +: 8] <= "S";
+                r_msg[ 5*8 +: 8] <= "=";
+                r_msg[ 6*8 +: 8] <= r_sign_flag ? "1" : "0";
+                r_msg[ 7*8 +: 8] <= " ";
+                r_msg[ 8*8 +: 8] <= "L";
+                r_msg[ 9*8 +: 8] <= "=";
+                r_msg[10*8 +: 8] <= r_less_flag ? "1" : "0";
+                r_msg[11*8 +: 8] <= " ";
+                r_msg[12*8 +: 8] <= "U";
+                r_msg[13*8 +: 8] <= "=";
+                r_msg[14*8 +: 8] <= r_ult_flag  ? "1" : "0";
+                r_msg[15*8 +: 8] <= 8'h0D;
+                r_msg[16*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd17;
+            end
+
+            DUMP_FOOTER: begin
+                // "*** END ***\r\n"  (13 bytes)
+                r_msg[ 0*8 +: 8] <= "*";
+                r_msg[ 1*8 +: 8] <= "*";
+                r_msg[ 2*8 +: 8] <= "*";
+                r_msg[ 3*8 +: 8] <= " ";
+                r_msg[ 4*8 +: 8] <= "E";
+                r_msg[ 5*8 +: 8] <= "N";
+                r_msg[ 6*8 +: 8] <= "D";
+                r_msg[ 7*8 +: 8] <= " ";
+                r_msg[ 8*8 +: 8] <= "*";
+                r_msg[ 9*8 +: 8] <= "*";
+                r_msg[10*8 +: 8] <= "*";
+                r_msg[11*8 +: 8] <= 8'h0D;
+                r_msg[12*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd13;
+            end
+
+            default: begin
+                // Repeated-line phases — pick the right family from the phase
+                // index.  Note that DUMP_TRACE_BASE+15 = DUMP_FOOTER-1, so the
+                // "< DUMP_FOOTER" guard is enough to keep this branch safe.
+                if (r_hcf_dump_phase < DUMP_STACK_BASE) begin
+                    // ============== Register dump (R0..RF) ==============
+                    // "RX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
+                    k_phase = r_hcf_dump_phase - DUMP_REG_BASE;
+                    reg_val = r_register[k_phase[3:0]];
+                    r_msg[ 0*8 +: 8] <= "R";
+                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
+                    r_msg[ 2*8 +: 8] <= "=";
+                    r_msg[ 3*8 +: 8] <= return_ascii_from_hex(reg_val[63:60]);
+                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(reg_val[59:56]);
+                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(reg_val[55:52]);
+                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(reg_val[51:48]);
+                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(reg_val[47:44]);
+                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(reg_val[43:40]);
+                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(reg_val[39:36]);
+                    r_msg[10*8 +: 8] <= return_ascii_from_hex(reg_val[35:32]);
+                    r_msg[11*8 +: 8] <= return_ascii_from_hex(reg_val[31:28]);
+                    r_msg[12*8 +: 8] <= return_ascii_from_hex(reg_val[27:24]);
+                    r_msg[13*8 +: 8] <= return_ascii_from_hex(reg_val[23:20]);
+                    r_msg[14*8 +: 8] <= return_ascii_from_hex(reg_val[19:16]);
+                    r_msg[15*8 +: 8] <= return_ascii_from_hex(reg_val[15:12]);
+                    r_msg[16*8 +: 8] <= return_ascii_from_hex(reg_val[11: 8]);
+                    r_msg[17*8 +: 8] <= return_ascii_from_hex(reg_val[ 7: 4]);
+                    r_msg[18*8 +: 8] <= return_ascii_from_hex(reg_val[ 3: 0]);
+                    r_msg[19*8 +: 8] <= 8'h0D;
+                    r_msg[20*8 +: 8] <= 8'h0A;
+                    r_msg_length     <= 8'd21;
+                end else if (r_hcf_dump_phase < DUMP_TRACE_BASE) begin
+                    // ============== Stack dump (S0..S3) ==============
+                    // "SX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
+                    // Data was pre-fetched in HCF_DUMP STACK_FETCH sub-state
+                    // and is sitting in r_hcf_stack_data.
+                    k_phase = r_hcf_dump_phase - DUMP_STACK_BASE;
+                    r_msg[ 0*8 +: 8] <= "S";
+                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
+                    r_msg[ 2*8 +: 8] <= "=";
+                    r_msg[ 3*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[63:60]);
+                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[59:56]);
+                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[55:52]);
+                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[51:48]);
+                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[47:44]);
+                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[43:40]);
+                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[39:36]);
+                    r_msg[10*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[35:32]);
+                    r_msg[11*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[31:28]);
+                    r_msg[12*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[27:24]);
+                    r_msg[13*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[23:20]);
+                    r_msg[14*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[19:16]);
+                    r_msg[15*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[15:12]);
+                    r_msg[16*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[11: 8]);
+                    r_msg[17*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 7: 4]);
+                    r_msg[18*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 3: 0]);
+                    r_msg[19*8 +: 8] <= 8'h0D;
+                    r_msg[20*8 +: 8] <= 8'h0A;
+                    r_msg_length     <= 8'd21;
+                end else begin
+                    // ============== Trace dump (T0..TF, newest-first) ==============
+                    // "TX P=xxxxxxxx OP=xxxxxxxx\r\n"  (27 bytes)
+                    // T0 is the most-recent fetch; T15 is 16 fetches back.
+                    // Buffer layout: r_trace_idx points to the *next* write
+                    // slot, so the most recent entry is at r_trace_idx-1.
+                    k_phase   = r_hcf_dump_phase - DUMP_TRACE_BASE;
+                    trace_pos = r_trace_idx - 4'd1 - k_phase[3:0];
+                    trace_val = r_trace_buf[trace_pos];
+                    r_msg[ 0*8 +: 8] <= "T";
+                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
+                    r_msg[ 2*8 +: 8] <= " ";
+                    r_msg[ 3*8 +: 8] <= "P";
+                    r_msg[ 4*8 +: 8] <= "=";
+                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(trace_val[63:60]);
+                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(trace_val[59:56]);
+                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(trace_val[55:52]);
+                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(trace_val[51:48]);
+                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(trace_val[47:44]);
+                    r_msg[10*8 +: 8] <= return_ascii_from_hex(trace_val[43:40]);
+                    r_msg[11*8 +: 8] <= return_ascii_from_hex(trace_val[39:36]);
+                    r_msg[12*8 +: 8] <= return_ascii_from_hex(trace_val[35:32]);
+                    r_msg[13*8 +: 8] <= " ";
+                    r_msg[14*8 +: 8] <= "O";
+                    r_msg[15*8 +: 8] <= "P";
+                    r_msg[16*8 +: 8] <= "=";
+                    r_msg[17*8 +: 8] <= return_ascii_from_hex(trace_val[31:28]);
+                    r_msg[18*8 +: 8] <= return_ascii_from_hex(trace_val[27:24]);
+                    r_msg[19*8 +: 8] <= return_ascii_from_hex(trace_val[23:20]);
+                    r_msg[20*8 +: 8] <= return_ascii_from_hex(trace_val[19:16]);
+                    r_msg[21*8 +: 8] <= return_ascii_from_hex(trace_val[15:12]);
+                    r_msg[22*8 +: 8] <= return_ascii_from_hex(trace_val[11: 8]);
+                    r_msg[23*8 +: 8] <= return_ascii_from_hex(trace_val[ 7: 4]);
+                    r_msg[24*8 +: 8] <= return_ascii_from_hex(trace_val[ 3: 0]);
+                    r_msg[25*8 +: 8] <= 8'h0D;
+                    r_msg[26*8 +: 8] <= 8'h0A;
+                    r_msg_length     <= 8'd27;
+                end
+            end
+        endcase
+    end
+endtask

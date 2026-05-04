@@ -80,12 +80,25 @@ module FPGA_CPU_32_bits_cache (
    localparam DIVIDE_STEP        = 32'h0800_0000;  // Division iteration state
    localparam HALTED_BREAK       = 32'h1000_0000;  // Sending UART break before halt
    localparam MULTIPLY_BREG      = 32'h2000_0000;  // DSP pipeline stage 1 (AREG/BREG)
+   localparam HCF_DUMP           = 32'h8000_0000;  // Crash dump UART emission (sub-state inside r_hcf_dump_phase / r_hcf_dump_sub)
 
    // Error Codes
    localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
    localparam ERR_DATA_LOAD = 8'h4, ERR_CHECKSUM_LOAD = 8'h5, ERR_OVERFLOW = 8'h6;
    localparam ERR_SEG_WRITE_TO_CODE = 'h7, ERR_SEG_EXEC_DATA = 'h8;
    localparam ERR_TRAP = 8'h9;        // Explicit software trap (TRAP opcode)
+
+   // Crash dump phase boundaries (r_hcf_dump_phase). Each "phase" emits one UART line.
+   localparam DUMP_HEADER     = 6'd0;
+   localparam DUMP_ERR_PC     = 6'd1;
+   localparam DUMP_OPC_SP     = 6'd2;
+   localparam DUMP_V1_V2      = 6'd3;
+   localparam DUMP_FLAGS_A    = 6'd4;   // Z E C V
+   localparam DUMP_FLAGS_B    = 6'd5;   // S L U
+   localparam DUMP_REG_BASE   = 6'd6;   // R0..RF → phases  6..21
+   localparam DUMP_STACK_BASE = 6'd22;  // S0..S3 → phases 22..25 (each preceded by a DDR2 read)
+   localparam DUMP_TRACE_BASE = 6'd26;  // T0..TF → phases 26..41 (newest-first)
+   localparam DUMP_FOOTER     = 6'd42;  // last phase; on completion → HCF_2
 
    // UART receive control
    wire [7:0] w_uart_rx_value;  // Received value
@@ -128,6 +141,23 @@ module FPGA_CPU_32_bits_cache (
    reg [31:0] r_idx_base_addr;  // Saved base address for indexed register ops (byte addr)
    reg r_hcf_message_sent;
    reg [31:0] r_start_wait_counter;
+
+   // Crash-dump trace ring buffer — captures {PC, opcode} of every dispatched
+   // fetch in OPCODE_FETCH2.  On HCF entry the most recent 16 entries (newest at
+   // r_trace_idx-1) are flushed over UART so a crash log shows the branch-history
+   // leading up to the failing instruction, not just the failing instruction itself.
+   reg [63:0] r_trace_buf [0:15];
+   reg [3:0]  r_trace_idx;          // next-write index, wraps freely
+   reg        r_trace_full;         // 1 once the ring has wrapped at least once
+
+   // Crash dump UART state machine.  Lives entirely inside HCF_DUMP; the sub-state
+   // r_hcf_dump_sub walks each line through the canonical 4-step UART handshake
+   // (PREP → ACK → DONE_WAIT) used elsewhere in this codebase, with an extra
+   // STACK_FETCH branch for stack lines that need a DDR2 read first.
+   reg [5:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
+   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK
+   reg [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
+   reg        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
 
    //load control
    //reg          o_ram_write_DV;
@@ -239,23 +269,22 @@ module FPGA_CPU_32_bits_cache (
   reg [63:0] r_mul_operand_a;
   reg [63:0] r_mul_operand_b;
 
-  // Extra input-side latches so Vivado can pull these into the DSP48E1
-  // AREG/BREG, breaking the long FDRE -> LUT2 -> DSP-cascade path.
-  reg [63:0] r_mul_operand_a_q;
-  reg [63:0] r_mul_operand_b_q;
-  reg        r_mul_is_unsigned_q;
+  // Sign-extended (65-bit) operand latches. Doing the signed/unsigned mux
+  // *here* (before the DSP) keeps the LUT2 off the operand_q -> DSP-cascade
+  // path so Vivado can absorb operand_q into DSP48E1 AREG/BREG cleanly.
+  // For unsigned ops we zero-extend; for signed we sign-extend. A single
+  // 65x65 signed multiply then gives the correct lower-128-bit result for
+  // both cases.
+  reg [64:0] r_mul_operand_a_q;
+  reg [64:0] r_mul_operand_b_q;
 
   // Free-running 3-stage multiply pipeline (Vivado: DSP48 AREG/BREG + MREG + PREG)
   always @(posedge i_Clk) begin
-     // Stage 1: latch operands (absorbed into DSP AREG/BREG)
-     r_mul_operand_a_q   <= r_mul_operand_a;
-     r_mul_operand_b_q   <= r_mul_operand_b;
-     r_mul_is_unsigned_q <= r_mul_is_unsigned;
-     // Stage 2: multiply (MREG)
-     if (r_mul_is_unsigned_q)
-        r_mul_pipe1 <= r_mul_operand_a_q * r_mul_operand_b_q;
-     else
-        r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
+     // Stage 1: sign-extend & latch operands (absorbed into DSP AREG/BREG)
+     r_mul_operand_a_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_a[63]), r_mul_operand_a};
+     r_mul_operand_b_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_b[63]), r_mul_operand_b};
+     // Stage 2: multiply (MREG) - lower 128 bits of 130-bit signed product
+     r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
      // Stage 3: register (PREG)
      r_mul_pipe2 <= r_mul_pipe1;
   end
@@ -514,6 +543,14 @@ rams_sp_nc rams_sp_nc1 (
       r_break_active  = 0;
       r_break_counter = 0;
       r_var1_prefetched = 0;
+      r_trace_idx = 4'h0;
+      r_trace_full = 1'b0;
+      r_hcf_dump_phase = 6'd0;
+      r_hcf_dump_sub = 3'b000;
+      r_hcf_stack_loaded = 1'b0;
+      r_hcf_stack_data = 64'b0;
+      for (i = 0; i < 16; i = i + 1)
+         r_trace_buf[i] = 64'b0;
    end
 
    always @(posedge i_Clk) begin
@@ -525,6 +562,13 @@ rams_sp_nc rams_sp_nc1 (
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_register[i] <= 64'b0;
+         r_trace_idx <= 4'h0;
+         r_trace_full <= 1'b0;
+         r_hcf_dump_phase <= 6'd0;
+         r_hcf_dump_sub <= 3'b000;
+         r_hcf_stack_loaded <= 1'b0;
+         for (i = 0; i < 16; i = i + 1)
+            r_trace_buf[i] <= 64'b0;
 
       end // if (w_reset_H)
       // Break received: arm the flag so next byte is treated as a command
@@ -829,6 +873,15 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             OPCODE_FETCH2: begin
+               // Capture {PC, opcode} into the crash-dump trace ring exactly once
+               // per dispatched fetch.  OPCODE_FETCH2 is the unique "instruction
+               // committed for execution" gate (it precedes every path into
+               // OPCODE_EXECUTE, including the debug-step and interrupt-handler
+               // paths), so this gives one entry per executed instruction.
+               r_trace_buf[r_trace_idx] <= {r_PC, w_opcode};
+               r_trace_idx              <= r_trace_idx + 4'd1;
+               if (r_trace_idx == 4'd15)
+                  r_trace_full <= 1'b1;
                r_reg_1   <= w_opcode[7:4];
                r_reg_2   <= w_opcode[3:0];
                r_reg_dst <= w_opcode[11:8];
@@ -901,11 +954,131 @@ rams_sp_nc rams_sp_nc1 (
             end  // case OPCODE_EXECUTE
 
             HCF_1: begin
+               // First entry only: kick the crash-dump UART emitter.  HCF_4 loops
+               // back here periodically to drive the 7-seg, but we don't want to
+               // re-spam the dump each loop, so r_hcf_message_sent gates it.
                if (!r_hcf_message_sent) begin
                   r_hcf_message_sent <= 1'b1;
+                  r_hcf_dump_phase   <= 6'd0;
+                  r_hcf_dump_sub     <= 3'b000;
+                  r_hcf_stack_loaded <= 1'b0;
+                  r_break_counter    <= 12'd0;  // clean start for the post-dump UART break
+                  r_SM               <= HCF_DUMP;
+               end else begin
+                  r_timeout_counter <= 0;
+                  r_SM              <= HCF_2;
                end
-               r_timeout_counter <= 0;
-               r_SM <= HCF_2;
+            end
+
+            // Crash dump: walk r_hcf_dump_phase through the dump-line sequence,
+            // emitting each line over UART using the canonical 4-step handshake
+            // (PREP → ACK → DONE_WAIT).  Stack phases insert an extra
+            // STACK_FETCH state to read the doubleword from DDR2 first.
+            HCF_DUMP: begin
+               case (r_hcf_dump_sub)
+                  // PREP — fill r_msg for the current phase, pulse DV.
+                  // For stack phases, kick a DDR2 read first; the response
+                  // goes through STACK_FETCH and re-enters PREP with
+                  // r_hcf_stack_loaded=1 so the line emit can proceed.
+                  3'b000: begin
+                     if (!w_sending_msg) begin
+                        if ((r_hcf_dump_phase >= DUMP_STACK_BASE)
+                         && (r_hcf_dump_phase <  DUMP_STACK_BASE + 6'd4)
+                         && !r_hcf_stack_loaded) begin
+                           // Skip DDR2 reads past the top of the stack region
+                           // (r_SP+offset >= STACK_TOP).  Substitute an FFs
+                           // sentinel and mark loaded so the next PREP emits
+                           // the line directly.  Prevents OOB DDR2 access when
+                           // the stack is empty (r_SP at initial 0x0800_0000).
+                           if ((r_SP + ({26'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3))
+                                 >= STACK_TOP) begin
+                              r_hcf_stack_data   <= 64'hFFFF_FFFF_FFFF_FFFF;
+                              r_hcf_stack_loaded <= 1'b1;
+                           end else begin
+                              r_mem_addr     <= r_SP +
+                                 ({26'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3);
+                              r_mem_read_DV  <= 1'b1;
+                              r_hcf_dump_sub <= 3'b011;
+                           end
+                        end else begin
+                           t_hcf_dump_build_line;
+                           r_msg_send_DV  <= 1'b1;
+                           r_hcf_dump_sub <= 3'b001;
+                        end
+                     end
+                  end
+
+                  // ACK — wait for the UART to latch our DV / start sending.
+                  // Once w_sending_msg goes high we know the bytes have been
+                  // captured; the default top-of-case clears DV automatically.
+                  3'b001: begin
+                     if (w_sending_msg) begin
+                        r_hcf_dump_sub <= 3'b010;
+                     end
+                  end
+
+                  // DONE_WAIT — wait for the UART completion pulse, then
+                  // advance to the next phase, or fall through to HCF_2 once
+                  // the footer line has been sent.
+                  3'b010: begin
+                     if (i_msg_sent_DV) begin
+                        r_hcf_dump_sub <= 3'b000;
+                        // Leaving a stack phase invalidates the cached read so
+                        // the next stack phase fetches fresh data.
+                        if ((r_hcf_dump_phase >= DUMP_STACK_BASE)
+                         && (r_hcf_dump_phase <  DUMP_STACK_BASE + 6'd4)) begin
+                           r_hcf_stack_loaded <= 1'b0;
+                        end
+                        if (r_hcf_dump_phase == DUMP_FOOTER) begin
+                           // After the footer line drains, drop into the BREAK
+                           // sub-state to assert a UART break (line low for ~2.5
+                           // frames) so a host parser sees an unambiguous
+                           // end-of-dump marker — same pattern as HALTED_BREAK.
+                           r_hcf_dump_phase <= 6'd0;
+                           r_hcf_dump_sub   <= 3'b100;  // override default 000
+                        end else begin
+                           r_hcf_dump_phase <= r_hcf_dump_phase + 6'd1;
+                        end
+                     end
+                  end
+
+                  // STACK_FETCH — wait for DDR2 read to complete, latch the
+                  // doubleword, then return to PREP which now sees
+                  // r_hcf_stack_loaded=1 and emits the line.
+                  3'b011: begin
+                     if (w_mem_ready) begin
+                        r_hcf_stack_data   <= w_mem_read_data;
+                        r_hcf_stack_loaded <= 1'b1;
+                        r_mem_read_DV      <= 1'b0;
+                        r_hcf_dump_sub     <= 3'b000;
+                     end
+                  end
+
+                  // BREAK — wait for the footer's UART transmission to fully
+                  // drain, then hold the TX line low for 2500 clocks (~2.5 frame
+                  // times at CLKS_PER_BIT=100) as a UART break.  This mirrors
+                  // HALTED_BREAK so a host parser can treat the break as the
+                  // unambiguous end-of-dump marker, the same way it does for
+                  // a clean HALT.  Once the break completes we fall through to
+                  // HCF_2 for the existing 7-seg error display loop.
+                  3'b100: begin
+                     if (r_break_counter == 0) begin
+                        if (!w_sending_msg) begin
+                           r_break_active  <= 1'b1;
+                           r_break_counter <= 12'd2500;
+                        end
+                     end else begin
+                        r_break_counter <= r_break_counter - 1;
+                        if (r_break_counter == 12'd1) begin
+                           r_break_active    <= 1'b0;
+                           r_timeout_counter <= 0;
+                           r_SM              <= HCF_2;
+                        end
+                     end
+                  end
+
+                  default: r_hcf_dump_sub <= 3'b000;
+               endcase
             end
 
             HCF_2: begin
