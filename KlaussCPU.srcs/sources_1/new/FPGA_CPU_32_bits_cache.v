@@ -1358,28 +1358,30 @@ end
    endfunction
    
    // Count leading zeros (64-bit)
+   // Iterate low->high so the last overwrite is the highest set bit.
    function [6:0] count_leading_zeros;
       input [63:0] val;
       integer clz_i;
       reg [6:0] clz_result;
       begin
          clz_result = 7'd64;
-         for (clz_i = 63; clz_i >= 0; clz_i = clz_i - 1) begin
+         for (clz_i = 0; clz_i < 64; clz_i = clz_i + 1) begin
             if (val[clz_i])
                clz_result = 7'd63 - clz_i[6:0];
          end
          count_leading_zeros = clz_result;
       end
    endfunction
-   
+
    // Count trailing zeros (64-bit)
+   // Iterate high->low so the last overwrite is the lowest set bit.
    function [6:0] count_trailing_zeros;
       input [63:0] val;
       integer ctz_i;
       reg [6:0] ctz_result;
       begin
          ctz_result = 7'd64;
-         for (ctz_i = 0; ctz_i < 64; ctz_i = ctz_i + 1) begin
+         for (ctz_i = 63; ctz_i >= 0; ctz_i = ctz_i - 1) begin
             if (val[ctz_i])
                ctz_result = ctz_i[6:0];
          end
