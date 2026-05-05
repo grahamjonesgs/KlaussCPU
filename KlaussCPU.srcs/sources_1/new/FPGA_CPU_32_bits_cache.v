@@ -40,6 +40,16 @@ module FPGA_CPU_32_bits_cache (
     output     [ 2:0] o_LED_RGB_1,
     output     [ 2:0] o_LED_RGB_2,
 
+    // microSD slot (Nexys A7, SPI mode)
+    output            o_SD_RESET,    // active-low slot power gate
+    input             i_SD_CD,       // card detect
+    output            o_SD_SCK,
+    output            o_SD_MOSI,
+    input             i_SD_MISO,
+    output            o_SD_CS_n,     // SD_DAT[3] used as CS in SPI mode
+    output            o_SD_DAT1,     // unused in SPI mode — driven high
+    output            o_SD_DAT2,     // unused in SPI mode — driven high
+
     // DDR2 Physical Interface Signals
     //Inouts
     inout [15:0] ddr2_dq,
@@ -81,6 +91,13 @@ module FPGA_CPU_32_bits_cache (
    localparam HALTED_BREAK       = 32'h1000_0000;  // Sending UART break before halt
    localparam MULTIPLY_BREG      = 32'h2000_0000;  // DSP pipeline stage 1 (AREG/BREG)
    localparam HCF_DUMP           = 32'h8000_0000;  // Crash dump UART emission (sub-state inside r_hcf_dump_phase / r_hcf_dump_sub)
+   // Pipeline register for the 64-bit ALU compute path. Arithmetic / compare
+   // tasks register their result + flags into r_alu_pipe_* (one cycle), then
+   // ALU_FINISH copies the intermediates out to the architectural flag regs
+   // and r_writeback_value (next cycle). Splits the long
+   //   r_reg_port_b → 16 CARRY4 → 7 LUT6 → r_carry_flag
+   // path into two shorter stages for timing closure.
+   localparam ALU_FINISH         = 33'h1_0000_0000;
 
    // Error Codes
    localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
@@ -127,7 +144,7 @@ module FPGA_CPU_32_bits_cache (
    reg [44:0] r_timeout_max;
 
    // Machine control
-   reg [31:0] r_SM;
+   reg [32:0] r_SM;   // 33 bits: bit 32 is ALU_FINISH (added for 64-bit ALU pipeline)
    reg [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
    reg [31:0] r_mem_read_addr;
    wire [31:0] w_opcode;
@@ -180,6 +197,21 @@ module FPGA_CPU_32_bits_cache (
    reg r_overflow_flag;
    reg [7:0] r_error_code;
 
+   // -----------------------------------------------------------------------
+   // ALU pipeline registers — written by arithmetic / compare tasks during
+   // OPCODE_EXECUTE; consumed in ALU_FINISH (next cycle) to drive the
+   // architectural flags + r_writeback_value. Adds +1 cycle to ADD/SUB/CMP
+   // ops in exchange for breaking the 64-bit subtractor → carry-flag path.
+   // r_alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
+   // -----------------------------------------------------------------------
+   reg [63:0] r_alu_pipe_value;     // ARITH+CMP: subtract/add result
+   reg        r_alu_pipe_carry;     // ARITH only
+   reg        r_alu_pipe_overflow;  // ARITH only
+   reg        r_alu_pipe_equal;     // CMP only
+   reg        r_alu_pipe_less;      // CMP only (signed less-than)
+   reg        r_alu_pipe_ult;       // CMP only (unsigned less-than)
+   reg        r_alu_pipe_mode;      // 0 = ARITH (carry/overflow/sign/value), 1 = CMP (equal/less/ult/sign)
+
    // Display value
    reg [31:0] r_seven_seg_value1;
    reg [31:0] r_seven_seg_value2;
@@ -217,6 +249,22 @@ module FPGA_CPU_32_bits_cache (
    reg r_timer_interrupt;
    reg [31:0] r_timer_interrupt_counter;
    reg [63:0] r_timer_interrupt_counter_sec;
+   // Per-source interrupt enable. Bit N = source N enabled (1) / masked (0).
+   // Software-controlled via INTMASKR/INTMASKV. Hardware auto-clears the
+   // dispatched source's bit on entry; IRET restores the 4-bit mask from the
+   // stack slot (bits [42:39] of the saved context word).
+   reg [ 3:0] r_int_mask;
+   // Timer-interrupt period in raw clock cycles. Software-controlled via
+   // TIMERSETR/TIMERSETV. Counter rolls over (and asserts r_timer_interrupt)
+   // when r_timer_interrupt_counter > r_timer_period.
+   reg [31:0] r_timer_period;
+
+   // Free-running millisecond counter (since LOAD_COMPLETE). 64-bit so it
+   // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
+   // r_clock_ms_div counts 0..99_999 (one ms at 100 MHz) before incrementing
+   // r_clock_ms — 17 bits hold up to 131071 so 99_999 fits comfortably.
+   reg [63:0] r_clock_ms;
+   reg [16:0] r_clock_ms_div;
 
    // Memory
    reg r_mem_write_DV;
@@ -227,6 +275,30 @@ module FPGA_CPU_32_bits_cache (
    wire [63:0] w_mem_read_data;
    wire [63:0] w_mem_read_data_next; // next doubleword in same cache line
    wire        w_mem_next_valid;     // 1 when w_mem_read_data_next is valid
+
+   // -------------------------------------------------------------------------
+   // Bus splitter outputs — DRAM side (to mem_read_write) and MMIO side
+   // (to peripheral logic below). Splitter routes on i_mem_addr[31:28]:
+   //   4'hF → MMIO, else DRAM. CPU FSM sees only the original r_mem_*/w_mem_*
+   //   signals; routing is invisible above this line.
+   // -------------------------------------------------------------------------
+   wire        w_dram_write_DV;
+   wire        w_dram_read_DV;
+   wire [31:0] w_dram_addr;
+   wire [63:0] w_dram_write_data;
+   wire [ 7:0] w_dram_byte_en;
+   wire [63:0] w_dram_read_data;
+   wire [63:0] w_dram_read_data_next;
+   wire        w_dram_next_valid;
+   wire        w_dram_ready;
+
+   wire        w_mmio_write_DV;
+   wire        w_mmio_read_DV;
+   wire [31:0] w_mmio_addr;
+   wire [63:0] w_mmio_write_data;
+   wire [ 7:0] w_mmio_byte_en;
+   reg  [63:0] r_mmio_read_data;
+   wire        w_mmio_ready = 1'b1;   // simple regs ready instantly
    wire w_mem_ready;
    reg [31:0] r_opcode_mem;
    reg [31:0] r_var1_mem;
@@ -334,6 +406,123 @@ module FPGA_CPU_32_bits_cache (
    assign o_uart_tx  = r_break_active ? 1'b0 : w_uart_tx_serial;
    assign w_reset_H  = !CPU_RESETN;
 
+   // KEEP_HIERARCHY prevents Vivado from flattening these modules' logic into
+   // surrounding CPU slices. Without it the placer can scatter sd_spi/splitter
+   // cells across the CPU's 64-bit ALU carry chain, lengthening route delay on
+   // an already-tight critical path (r_reg_port_b → r_carry_flag, ~25 levels).
+   (* KEEP_HIERARCHY = "yes" *)
+   bus_splitter bus_splitter_i (
+       // CPU side — same names the FSM has always driven/observed
+       .i_mem_write_DV(r_mem_write_DV),
+       .i_mem_read_DV(r_mem_read_DV),
+       .i_mem_addr(r_mem_addr),
+       .i_mem_write_data(r_mem_write_data),
+       .i_mem_byte_en(r_mem_byte_en),
+       .o_mem_read_data(w_mem_read_data),
+       .o_mem_read_data_next(w_mem_read_data_next),
+       .o_mem_next_valid(w_mem_next_valid),
+       .o_mem_ready(w_mem_ready),
+       // DRAM side
+       .o_dram_write_DV(w_dram_write_DV),
+       .o_dram_read_DV(w_dram_read_DV),
+       .o_dram_addr(w_dram_addr),
+       .o_dram_write_data(w_dram_write_data),
+       .o_dram_byte_en(w_dram_byte_en),
+       .i_dram_read_data(w_dram_read_data),
+       .i_dram_read_data_next(w_dram_read_data_next),
+       .i_dram_next_valid(w_dram_next_valid),
+       .i_dram_ready(w_dram_ready),
+       // MMIO side
+       .o_mmio_write_DV(w_mmio_write_DV),
+       .o_mmio_read_DV(w_mmio_read_DV),
+       .o_mmio_addr(w_mmio_addr),
+       .o_mmio_write_data(w_mmio_write_data),
+       .o_mmio_byte_en(w_mmio_byte_en),
+       .i_mmio_read_data(r_mmio_read_data),
+       .i_mmio_ready(w_mmio_ready)
+   );
+
+   // -------------------------------------------------------------------------
+   // Per-device chip-selects for MMIO. addr[27:16] picks the device; we gate
+   // the write/read strobes so that each peripheral module only sees strobes
+   // intended for it. addr[15:0] is the offset within the device's window.
+   // -------------------------------------------------------------------------
+   wire        w_sd_sel       = (w_mmio_addr[27:16] == 12'h000);
+   wire        w_sd_write_DV  = w_mmio_write_DV & w_sd_sel;
+   wire        w_sd_read_DV   = w_mmio_read_DV  & w_sd_sel;
+   wire [63:0] w_sd_read_data;
+   wire        w_sd_ready;
+
+   (* KEEP_HIERARCHY = "yes" *)
+   sd_spi sd_spi_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .i_mmio_write_DV(w_sd_write_DV),
+       .i_mmio_read_DV(w_sd_read_DV),
+       .i_mmio_addr(w_mmio_addr[15:0]),
+       .i_mmio_write_data(w_mmio_write_data),
+       .i_mmio_byte_en(w_mmio_byte_en),
+       .o_mmio_read_data(w_sd_read_data),
+       .o_mmio_ready(w_sd_ready),
+       .i_sd_cd(i_SD_CD),
+       .o_sd_reset_n(o_SD_RESET),
+       .o_sd_sck(o_SD_SCK),
+       .o_sd_mosi(o_SD_MOSI),
+       .i_sd_miso(i_SD_MISO),
+       .o_sd_cs_n(o_SD_CS_n),
+       .o_sd_dat1(o_SD_DAT1),
+       .o_sd_dat2(o_SD_DAT2)
+   );
+
+   // -------------------------------------------------------------------------
+   // MMIO read mux — combinational; reads return current peripheral state.
+   // Returns zero for undefined offsets (treat as scratch / write-only).
+   // See MMIO_MAP.md for the full memory map.
+   // -------------------------------------------------------------------------
+   always @* begin
+      r_mmio_read_data = 64'h0;
+      case (w_mmio_addr[27:16])
+         12'h000: r_mmio_read_data = w_sd_read_data;  // SD card
+         12'h002: begin  // RGB LEDs
+            case (w_mmio_addr[15:0])
+               16'h0000: r_mmio_read_data = {52'b0, r_RGB_LED_1};
+               16'h0008: r_mmio_read_data = {52'b0, r_RGB_LED_2};
+               default:  r_mmio_read_data = 64'h0;
+            endcase
+         end
+         12'h003: begin  // 7-segment display (raw padded values)
+            case (w_mmio_addr[15:0])
+               16'h0000: r_mmio_read_data = {32'b0, r_seven_seg_value2};
+               16'h0008: r_mmio_read_data = {32'b0, r_seven_seg_value1};
+               16'h0010: r_mmio_read_data = {r_seven_seg_value1, r_seven_seg_value2};
+               default:  r_mmio_read_data = 64'h0;
+            endcase
+         end
+         12'h004: begin  // LEDs (RW) and switches (RO)
+            case (w_mmio_addr[15:0])
+               16'h0000: r_mmio_read_data = {48'b0, o_led};
+               16'h0008: r_mmio_read_data = {48'b0, i_switch};
+               default:  r_mmio_read_data = 64'h0;
+            endcase
+         end
+         12'h00F: begin  // Interrupt controller / timer
+            case (w_mmio_addr[15:0])
+               16'h0000: r_mmio_read_data = {60'b0, r_int_mask};
+               16'h0008: r_mmio_read_data = {63'b0, r_timer_interrupt};
+               16'h0010: r_mmio_read_data = {32'b0, r_interrupt_table[0]};
+               16'h0018: r_mmio_read_data = {32'b0, r_interrupt_table[1]};
+               16'h0020: r_mmio_read_data = {32'b0, r_interrupt_table[2]};
+               16'h0028: r_mmio_read_data = {32'b0, r_interrupt_table[3]};
+               16'h0030: r_mmio_read_data = {32'b0, r_timer_period};
+               16'h0038: r_mmio_read_data = {32'b0, r_timer_interrupt_counter};
+               16'h0040: r_mmio_read_data = r_clock_ms;
+               default:  r_mmio_read_data = 64'h0;
+            endcase
+         end
+         default: r_mmio_read_data = 64'h0;
+      endcase
+   end
+
    mem_read_write mem_read_write (
        .i_Clk(i_Clk),
        .ddr2_dq(ddr2_dq),
@@ -352,15 +541,15 @@ module FPGA_CPU_32_bits_cache (
        .ddr2_dm(ddr2_dm),
        .ddr2_odt(ddr2_odt),
 
-       .i_mem_write_DV(r_mem_write_DV),
-       .i_mem_read_DV(r_mem_read_DV),
-       .i_mem_addr(r_mem_addr),
-       .i_mem_write_data(r_mem_write_data),
-       .i_mem_byte_en(r_mem_byte_en),
-       .o_mem_read_data(w_mem_read_data),
-       .o_mem_read_data_next(w_mem_read_data_next),
-       .o_mem_next_valid(w_mem_next_valid),
-       .o_mem_ready(w_mem_ready)
+       .i_mem_write_DV(w_dram_write_DV),
+       .i_mem_read_DV(w_dram_read_DV),
+       .i_mem_addr(w_dram_addr),
+       .i_mem_write_data(w_dram_write_data),
+       .i_mem_byte_en(w_dram_byte_en),
+       .o_mem_read_data(w_dram_read_data),
+       .o_mem_read_data_next(w_dram_read_data_next),
+       .o_mem_next_valid(w_dram_next_valid),
+       .o_mem_ready(w_dram_ready)
    );
 
 
@@ -529,6 +718,10 @@ rams_sp_nc rams_sp_nc1 (
       r_timing_start <= 0;
       r_timer_interrupt_counter <= 0;
       r_timer_interrupt_counter_sec <= 0;
+      r_int_mask <= 4'h0;            // all sources masked at power-up
+      r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
+      r_clock_ms <= 64'h0;
+      r_clock_ms_div <= 17'h0;
       r_mem_write_DV <= 0;
       r_mem_read_DV <= 0;
       r_mem_byte_en <= 8'hFF;
@@ -539,6 +732,13 @@ rams_sp_nc rams_sp_nc1 (
       r_debug_step_run = 0;
       r_break_received = 0;
       r_writeback_set_zero_flag = 0;
+      r_alu_pipe_value    = 64'b0;
+      r_alu_pipe_carry    = 1'b0;
+      r_alu_pipe_overflow = 1'b0;
+      r_alu_pipe_equal    = 1'b0;
+      r_alu_pipe_less     = 1'b0;
+      r_alu_pipe_ult      = 1'b0;
+      r_alu_pipe_mode     = 1'b0;
       r_rx_fifo_read  = 0;
       r_break_active  = 0;
       r_break_counter = 0;
@@ -603,7 +803,7 @@ rams_sp_nc rams_sp_nc1 (
          r_msg_send_DV  <= 1'b0;
          r_rx_fifo_read <= 1'b0;
 
-         if (r_timer_interrupt_counter > 32'hFFFFF) begin
+         if (r_timer_interrupt_counter > r_timer_period) begin
             r_timer_interrupt_counter <= 0;
             r_timer_interrupt <= 1;
          end else begin
@@ -616,6 +816,104 @@ rams_sp_nc rams_sp_nc1 (
             r_timer_interrupt_counter_sec <= r_timer_interrupt_counter_sec + 1;
          end
 
+         // Free-running millisecond clock — increments every 100_000 cycles
+         // (1 ms at 100 MHz). Exposed read-only at MMIO 0xF00F_0040.
+         if (r_clock_ms_div >= 17'd99_999) begin
+            r_clock_ms_div <= 17'd0;
+            r_clock_ms     <= r_clock_ms + 64'd1;
+         end else begin
+            r_clock_ms_div <= r_clock_ms_div + 17'd1;
+         end
+
+         //=====================================================================
+         // MMIO write handler — fires when bus_splitter routes a CPU store
+         // (LD/ST opcode → r_mem_write_DV) to an MMIO address (top nibble 'F).
+         // Peripheral state regs are touched here AND by the legacy opcode
+         // tasks (e.g. t_led_rgb1_value, t_7_seg1_reg). Both paths converge
+         // on the same registers — no double-driver conflict because they
+         // never fire on the same cycle (legacy opcodes run during
+         // OPCODE_EXECUTE; MMIO writes complete during memory-task states
+         // that do not otherwise touch these regs).
+         //
+         // Write handler runs BEFORE the FSM case statement, so any state
+         // that assigns these regs explicitly (NO_PROGRAM boot animation,
+         // LOADING_BYTE display, HCF blanking) overrides the MMIO write.
+         // Address decode: addr[27:16]=device, addr[15:0]=register offset.
+         // See doc/MMIO_MAP.md for the full memory map.
+         //=====================================================================
+         if (w_mmio_write_DV) begin
+            case (w_mmio_addr[27:16])
+               12'h002: begin  // RGB LEDs
+                  case (w_mmio_addr[15:0])
+                     16'h0000: r_RGB_LED_1 <= w_mmio_write_data[11:0];
+                     16'h0008: r_RGB_LED_2 <= w_mmio_write_data[11:0];
+                     default: ;
+                  endcase
+               end
+               12'h003: begin  // 7-segment display
+                  case (w_mmio_addr[15:0])
+                     // SEG_LOW: 4 hex digits → lower display (value2)
+                     16'h0000: r_seven_seg_value2 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_HIGH: 4 hex digits → upper display (value1)
+                     16'h0008: r_seven_seg_value1 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_ALL: 8 hex digits across both displays
+                     16'h0010: begin
+                        r_seven_seg_value1 <= {
+                           4'h0, w_mmio_write_data[31:28],
+                           4'h0, w_mmio_write_data[27:24],
+                           4'h0, w_mmio_write_data[23:20],
+                           4'h0, w_mmio_write_data[19:16]
+                        };
+                        r_seven_seg_value2 <= {
+                           4'h0, w_mmio_write_data[15:12],
+                           4'h0, w_mmio_write_data[11:8],
+                           4'h0, w_mmio_write_data[7:4],
+                           4'h0, w_mmio_write_data[3:0]
+                        };
+                     end
+                     // SEG_BLANK: any write blanks both displays
+                     16'h0018: begin
+                        r_seven_seg_value1 <= 32'h22222222;
+                        r_seven_seg_value2 <= 32'h22222222;
+                     end
+                     default: ;
+                  endcase
+               end
+               12'h004: begin  // 16-bit LED bar
+                  case (w_mmio_addr[15:0])
+                     16'h0000: o_led <= w_mmio_write_data[15:0];
+                     default: ;
+                  endcase
+               end
+               12'h00F: begin  // Interrupt controller / timer
+                  case (w_mmio_addr[15:0])
+                     16'h0000: r_int_mask           <= w_mmio_write_data[3:0];
+                     // 16'h0008 (INT_PENDING) is read-only; writes ignored
+                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
+                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
+                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
+                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
+                     16'h0030: begin
+                        r_timer_period            <= w_mmio_write_data[31:0];
+                        r_timer_interrupt_counter <= 32'h0;  // restart with new period
+                     end
+                     // 16'h0038 (TIMER_COUNT) is read-only; writes ignored
+                     default: ;
+                  endcase
+               end
+               default: ;
+            endcase
+         end
 
          case (r_SM)
             NO_PROGRAM: begin
@@ -761,7 +1059,10 @@ rams_sp_nc rams_sp_nc1 (
                   r_equal_flag <= 1'b0;
                   r_error_code <= 8'h0;
                   r_hcf_message_sent <= 1'b0;
-                  r_interrupt_table[0] <= 0;  // blank timer interrupt
+                  r_interrupt_table[0] <= 32'h0;  // clear all 4 handler vectors;
+                  r_interrupt_table[1] <= 32'h0;  // a 0 vector disables that source
+                  r_interrupt_table[2] <= 32'h0;
+                  r_interrupt_table[3] <= 32'h0;
                   r_msg_send_DV <= 1'b0;
                   r_overflow_flag <= 1'b0;
                   r_PC <= r_PC_requested;
@@ -775,6 +1076,10 @@ rams_sp_nc rams_sp_nc1 (
                   r_timeout_counter <= 0;
                   r_timer_interrupt <= 0;
                   r_timer_interrupt_counter <= 0;
+                  r_int_mask <= 4'h0;            // all sources masked until program enables
+                  r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
+                  r_clock_ms <= 64'h0;            // millisecond clock starts at 0 per program run
+                  r_clock_ms_div <= 17'h0;
                   r_timing_start <= 0;
                   r_zero_flag <= 0;
                   t_tx_message(8'd1);  // Load OK message
@@ -824,20 +1129,24 @@ rams_sp_nc rams_sp_nc1 (
                      r_mem_read_DV   <= 1'b1;
                      r_SM            <= OPCODE_FETCH;
                   end
-               end else if (r_timer_interrupt && r_interrupt_table[0] != 32'h0) begin
-                  // Start pushing current PC onto DDR2 stack before jumping to handler
+               end else if (r_timer_interrupt && r_interrupt_table[0] != 32'h0 && r_int_mask[0]) begin
+                  // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
+                  // Slot layout (64-bit doubleword):
+                  //   [63:43] = 0
+                  //   [42:39] = r_int_mask (per-source enables, restored by IRET)
+                  //   [38]    = zero,    [37] = equal,  [36] = carry,
+                  //   [35]    = overflow,[34] = sign,   [33] = less, [32] = ult
+                  //   [31:0]  = PC (resume address)
                   r_SP             <= r_SP - 8;
                   r_mem_addr       <= r_SP - 32'd8;
-                  // Pack flags into [38:32] so IRET can restore them.
-                  // Slot layout: [63:39]=0, [38]=zero, [37]=equal, [36]=carry,
-                  //              [35]=overflow, [34]=sign, [33]=less, [32]=ult, [31:0]=PC
-                  r_mem_write_data <= {25'b0,
+                  r_mem_write_data <= {21'b0, r_int_mask,
                                        r_zero_flag, r_equal_flag, r_carry_flag,
                                        r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
                                        r_PC};
                   r_mem_byte_en    <= 8'hFF;
                   r_mem_write_DV   <= 1'b1;
                   r_timer_interrupt <= 1'b0;
+                  r_int_mask[0]    <= 1'b0;       // mask source 0 while handler runs; IRET restores
                   r_PC             <= r_interrupt_table[0];
                   r_int_push_wait  <= 1'b1;
                   // stay in OPCODE_REQUEST until push completes
@@ -1335,6 +1644,30 @@ end
                   r_zero_flag <= (r_writeback_value == 64'b0);
                r_writeback_set_zero_flag <= 1'b0;
                r_SM <= OPCODE_REQUEST;
+            end
+
+            //==================================================================
+            // ALU_FINISH — second pipeline stage for arithmetic / compare ops.
+            // Cycle 1 (the task in OPCODE_EXECUTE) registered the 64-bit
+            // subtract / compare result + flags into r_alu_pipe_*. This stage
+            // copies the intermediates to architectural state, then either
+            // proceeds to WRITEBACK (ARITH ops, write rd) or directly back to
+            // OPCODE_REQUEST (CMP ops, no rd). Mode bit selects.
+            //==================================================================
+            ALU_FINISH: begin
+               if (r_alu_pipe_mode == 1'b0) begin       // ARITH
+                  r_writeback_value <= r_alu_pipe_value;
+                  r_carry_flag      <= r_alu_pipe_carry;
+                  r_overflow_flag   <= r_alu_pipe_overflow;
+                  r_sign_flag       <= r_alu_pipe_value[63];
+                  r_SM              <= WRITEBACK;
+               end else begin                           // CMP
+                  r_equal_flag <= r_alu_pipe_equal;
+                  r_less_flag  <= r_alu_pipe_less;
+                  r_ult_flag   <= r_alu_pipe_ult;
+                  r_sign_flag  <= r_alu_pipe_value[63];
+                  r_SM         <= OPCODE_REQUEST;
+               end
             end
 
             default: r_SM <= HCF_1;  // loop in error

@@ -172,16 +172,18 @@ set_property -dict {PACKAGE_PIN J4 IOSTANDARD LVCMOS33} [get_ports o_LCD_reset_n
 #set_property -dict { PACKAGE_PIN B12   IOSTANDARD LVCMOS33 } [get_ports { VGA_VS }]; #IO_L3N_T0_DQS_AD1N_15 Sch=vga_vs
 
 
-##Micro SD Connector
-
-#set_property -dict { PACKAGE_PIN E2    IOSTANDARD LVCMOS33 } [get_ports { SD_RESET }]; #IO_L14P_T2_SRCC_35 Sch=sd_reset
-#set_property -dict { PACKAGE_PIN A1    IOSTANDARD LVCMOS33 } [get_ports { SD_CD }]; #IO_L9N_T1_DQS_AD7N_35 Sch=sd_cd
-#set_property -dict { PACKAGE_PIN B1    IOSTANDARD LVCMOS33 } [get_ports { SD_SCK }]; #IO_L9P_T1_DQS_AD7P_35 Sch=sd_sck
-#set_property -dict { PACKAGE_PIN C1    IOSTANDARD LVCMOS33 } [get_ports { SD_CMD }]; #IO_L16N_T2_35 Sch=sd_cmd
-#set_property -dict { PACKAGE_PIN C2    IOSTANDARD LVCMOS33 } [get_ports { SD_DAT[0] }]; #IO_L16P_T2_35 Sch=sd_dat[0]
-#set_property -dict { PACKAGE_PIN E1    IOSTANDARD LVCMOS33 } [get_ports { SD_DAT[1] }]; #IO_L18N_T2_35 Sch=sd_dat[1]
-#set_property -dict { PACKAGE_PIN F1    IOSTANDARD LVCMOS33 } [get_ports { SD_DAT[2] }]; #IO_L18P_T2_35 Sch=sd_dat[2]
-#set_property -dict { PACKAGE_PIN D2    IOSTANDARD LVCMOS33 } [get_ports { SD_DAT[3] }]; #IO_L14N_T2_SRCC_35 Sch=sd_dat[3]
+##Micro SD Connector — used in SPI mode by sd_spi.v
+##  SD_CMD    → MOSI       SD_DAT[0] → MISO       SD_DAT[3] → CS_n
+##  SD_DAT[1] / SD_DAT[2]  → unused, driven high
+##  SD_RESET  → active-low slot power gate (drive 0 to power the slot)
+set_property -dict { PACKAGE_PIN E2    IOSTANDARD LVCMOS33 } [get_ports { o_SD_RESET }]; #IO_L14P_T2_SRCC_35 Sch=sd_reset
+set_property -dict { PACKAGE_PIN A1    IOSTANDARD LVCMOS33 } [get_ports { i_SD_CD }];    #IO_L9N_T1_DQS_AD7N_35 Sch=sd_cd
+set_property -dict { PACKAGE_PIN B1    IOSTANDARD LVCMOS33 } [get_ports { o_SD_SCK }];   #IO_L9P_T1_DQS_AD7P_35 Sch=sd_sck
+set_property -dict { PACKAGE_PIN C1    IOSTANDARD LVCMOS33 } [get_ports { o_SD_MOSI }];  #IO_L16N_T2_35 Sch=sd_cmd
+set_property -dict { PACKAGE_PIN C2    IOSTANDARD LVCMOS33 } [get_ports { i_SD_MISO }];  #IO_L16P_T2_35 Sch=sd_dat[0]
+set_property -dict { PACKAGE_PIN E1    IOSTANDARD LVCMOS33 } [get_ports { o_SD_DAT1 }];  #IO_L18N_T2_35 Sch=sd_dat[1]
+set_property -dict { PACKAGE_PIN F1    IOSTANDARD LVCMOS33 } [get_ports { o_SD_DAT2 }];  #IO_L18P_T2_35 Sch=sd_dat[2]
+set_property -dict { PACKAGE_PIN D2    IOSTANDARD LVCMOS33 } [get_ports { o_SD_CS_n }];  #IO_L14N_T2_SRCC_35 Sch=sd_dat[3]
 
 
 ##Accelerometer

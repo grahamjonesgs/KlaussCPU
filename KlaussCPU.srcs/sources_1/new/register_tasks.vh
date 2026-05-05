@@ -152,14 +152,16 @@ endtask
 task t_add_value;
    input [31:0] i_value;
    reg [63:0] hold;
+   reg        carry;
    begin
-      {r_carry_flag, hold} = {1'b0, r_reg_port_b} + {1'b0, i_value};
+      {carry, hold} = {1'b0, r_reg_port_b} + {1'b0, i_value};
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (r_reg_port_b[63]&&i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&!i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;     // ARITH
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_b[63]&&i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&!i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_2;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -178,16 +180,18 @@ task t_addi;
    input [31:0] i_value;
    reg [63:0] sign_ext_imm;
    reg [63:0] hold;
+   reg        carry;
    begin
       sign_ext_imm = {{32{i_value[31]}}, i_value};
-      {r_carry_flag, hold} = {1'b0, r_reg_port_b} + {1'b0, sign_ext_imm};
+      {carry, hold} = {1'b0, r_reg_port_b} + {1'b0, sign_ext_imm};
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (r_reg_port_b[63] == sign_ext_imm[63]) &&
+                             (hold[63] != r_reg_port_b[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_b[63] == sign_ext_imm[63]) &&
-                         (hold[63] != r_reg_port_b[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_1;   // rd = bits[7:4]
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -196,14 +200,16 @@ endtask
 task t_minus_value;
    input [31:0] i_value;
    reg [63:0] hold;
+   reg        carry;
    begin
-      {r_carry_flag, hold} = {1'b0, r_reg_port_b} - {1'b0, i_value};
+      {carry, hold} = {1'b0, r_reg_port_b} - {1'b0, i_value};
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (r_reg_port_b[63]&&!i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_b[63]&&!i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_2;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -211,14 +217,16 @@ endtask
 // Decrement reg
 task t_dec_reg;
    reg [63:0] hold;
+   reg        carry;
    begin
-      {r_carry_flag, hold} = {1'b0, r_reg_port_b} - {65'b1};
+      {carry, hold} = {1'b0, r_reg_port_b} - {65'b1};
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (r_reg_port_b[63] && !hold[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_b[63] && !hold[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_2;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -226,14 +234,16 @@ endtask
 // Increment reg
 task t_inc_reg;
    reg [63:0] hold;
+   reg        carry;
    begin
-      {r_carry_flag, hold} = {1'b0, r_reg_port_b} + 65'b1;
+      {carry, hold} = {1'b0, r_reg_port_b} + 65'b1;
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (!r_reg_port_b[63] && hold[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (!r_reg_port_b[63] && hold[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_2;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -243,14 +253,17 @@ task t_compare_reg_value;
    input [31:0] i_value;
    reg signed [63:0] s_reg;
    reg signed [63:0] s_val;
+   reg [63:0] diff;
    begin
       s_reg = r_reg_port_b;
       s_val = {{32{i_value[31]}}, i_value};  // sign-extend 32-bit value to 64-bit
-      r_equal_flag <= (r_reg_port_b == s_val) ? 1'b1 : 1'b0;
-      r_less_flag <= (s_reg < s_val) ? 1'b1 : 1'b0;
-      r_ult_flag <= (r_reg_port_b < i_value) ? 1'b1 : 1'b0;
-      r_sign_flag <= (s_reg - s_val) < 0 ? 1'b1 : 1'b0;
-      r_SM <= OPCODE_REQUEST;
+      diff  = r_reg_port_b - s_val;
+      r_alu_pipe_value <= diff;       // sign flag = diff[63] in ALU_FINISH
+      r_alu_pipe_equal <= (r_reg_port_b == s_val) ? 1'b1 : 1'b0;
+      r_alu_pipe_less  <= (s_reg < s_val) ? 1'b1 : 1'b0;
+      r_alu_pipe_ult   <= (r_reg_port_b < {{32{1'b0}}, i_value}) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode  <= 1'b1;        // CMP
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -258,14 +271,16 @@ endtask
 // SUBR - rd = rs1 - rs2
 task t_subr3;
    reg [63:0] hold;
+   reg        carry;
    begin
-      {r_carry_flag, hold} = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b};
+      {carry, hold} = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b};
+      r_alu_pipe_value    <= hold;
+      r_alu_pipe_carry    <= carry;
+      r_alu_pipe_overflow <= (r_reg_port_a[63]&&!r_reg_port_b[63]&&!hold[63])||(!r_reg_port_a[63]&&r_reg_port_b[63]&&hold[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_a[63]&&!r_reg_port_b[63]&&!hold[63])||(!r_reg_port_a[63]&&r_reg_port_b[63]&&hold[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold;
       r_writeback_reg <= r_reg_dst;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -338,14 +353,17 @@ endtask
 task t_cmprr3;
    reg signed [63:0] s_a;
    reg signed [63:0] s_b;
+   reg [63:0] diff;
    begin
-      s_a = r_reg_port_a;
-      s_b = r_reg_port_b;
-      r_equal_flag <= (r_reg_port_a == r_reg_port_b) ? 1'b1 : 1'b0;
-      r_less_flag <= (s_a < s_b) ? 1'b1 : 1'b0;
-      r_ult_flag <= (r_reg_port_a < r_reg_port_b) ? 1'b1 : 1'b0;
-      r_sign_flag <= (s_a - s_b) < 0 ? 1'b1 : 1'b0;
-      r_SM <= OPCODE_REQUEST;
+      s_a  = r_reg_port_a;
+      s_b  = r_reg_port_b;
+      diff = r_reg_port_a - r_reg_port_b;
+      r_alu_pipe_value <= diff;       // sign flag = diff[63] in ALU_FINISH
+      r_alu_pipe_equal <= (r_reg_port_a == r_reg_port_b) ? 1'b1 : 1'b0;
+      r_alu_pipe_less  <= (s_a < s_b) ? 1'b1 : 1'b0;
+      r_alu_pipe_ult   <= (r_reg_port_a < r_reg_port_b) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode  <= 1'b1;        // CMP
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -357,14 +375,14 @@ task t_addr3;
    reg [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b};
-      r_carry_flag <= hold[64];
+      r_alu_pipe_value    <= hold[63:0];
+      r_alu_pipe_carry    <= hold[64];
+      r_alu_pipe_overflow <= (r_reg_port_a[63] == r_reg_port_b[63]) &&
+                             (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_a[63] == r_reg_port_b[63]) &&
-                         (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold[63:0];
       r_writeback_reg <= r_reg_dst;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -375,14 +393,14 @@ task t_addc3;
    reg [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b} + {65'b0, r_carry_flag};
-      r_carry_flag <= hold[64];
+      r_alu_pipe_value    <= hold[63:0];
+      r_alu_pipe_carry    <= hold[64];
+      r_alu_pipe_overflow <= (r_reg_port_a[63] == r_reg_port_b[63]) &&
+                             (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_a[63] == r_reg_port_b[63]) &&
-                         (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold[63:0];
       r_writeback_reg <= r_reg_dst;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -394,14 +412,14 @@ task t_subc3;
    reg [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b} - {65'b0, r_carry_flag};
-      r_carry_flag <= hold[64];
+      r_alu_pipe_value    <= hold[63:0];
+      r_alu_pipe_carry    <= hold[64];
+      r_alu_pipe_overflow <= (r_reg_port_a[63] != r_reg_port_b[63]) &&
+                             (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
+      r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= hold[63];
-      r_overflow_flag <= (r_reg_port_a[63] != r_reg_port_b[63]) &&
-                         (hold[63] != r_reg_port_a[63]) ? 1'b1 : 1'b0;
-      r_writeback_value <= hold[63:0];
       r_writeback_reg <= r_reg_dst;
-      r_SM <= WRITEBACK;
+      r_SM <= ALU_FINISH;
       r_PC <= r_PC + 4;
    end
 endtask

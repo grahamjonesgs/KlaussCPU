@@ -364,11 +364,15 @@ task t_opcode_select;
 
          //=====================================================================
          // Interrupt control (6xxx)
-         // INTSETRR: rs1[1:0] = interrupt number (0–3); rs2[31:0] = handler byte address.
-         // IRET:     pop 64-bit interrupt context; restore PC[31:0] and flags[38:32]; SP+=8.
+         // IRET is the only interrupt-control opcode; everything else (handler
+         // table, per-source mask, timer period) is configured via MMIO at
+         // base 0xF00F_0000. See MMIO_MAP.md "Timers / interrupts" and
+         // CPU_ARCHITECTURE.md §13.1.
+         //
+         // IRET: pop 64-bit interrupt context; restore PC[31:0], flags[38:32],
+         //       and r_int_mask[42:39]; SP+=8.
          //=====================================================================
-         32'h0000_60??: t_set_interrupt_regs;                  // INTSETRR RR set interrupt[rs1[1:0]] handler = rs2[31:0]
-         32'h0000_6011: t_iret;                                // IRET restore PC and flags from stack; SP+=8
+         32'h0000_6011: t_iret;                                // IRET restore PC, flags, mask from stack; SP+=8
 
          //=====================================================================
          // Memory — 64-bit doubleword load/store (7xxx)

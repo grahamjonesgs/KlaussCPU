@@ -7,7 +7,7 @@ a hardware change (IRET); the rest are LLVM TableGen/C++ configuration.
 
 | # | Item | Scope | Priority |
 |---|------|-------|----------|
-| 1 | IRET — interrupt return | Hardware (RTL + opcode) | **Critical** |
+| 1 | IRET — interrupt return (+ MMIO interrupt controller) | Hardware (RTL + opcode + MMIO) — **shipped** | **Critical** |
 | 2 | TRAP opcode | Hardware (RTL + opcode) | Recommended |
 | 3 | Sign-extending loads | LLVM backend only | Required |
 | 4 | Conditional move (SELECT) | LLVM backend only | Required |
@@ -16,25 +16,33 @@ a hardware change (IRET); the rest are LLVM TableGen/C++ configuration.
 
 ---
 
-## Item 1 — IRET (hardware change, critical)
+## Item 1 — IRET (hardware change, critical) — **DONE**
 
-### Problem
+> **Status:** Implemented. The dispatch path saves flags and the per-source
+> interrupt mask alongside PC, and `IRET` restores all three. All other
+> interrupt control (handler table, mask, timer period) is exposed via MMIO
+> at base `0xF00F_0000` rather than dedicated opcodes — `IRET` is the only
+> interrupt-related opcode. See `CPU_ARCHITECTURE.md` §13.1 and
+> `MMIO_MAP.md` "Timers / interrupts" for the runtime model. The summary
+> below reflects the shipped layout.
 
-The interrupt dispatch hardware (FPGA_CPU_32_bits_cache.v:763–773) pushes only
-`{32'b0, r_PC}` onto the stack, then jumps to the handler.  There is no IRET opcode
-to pop and restore that context.  An interrupt handler cannot return.
+### Original problem
 
-Additionally, flags are **not** saved, so any handler that touches arithmetic will
-corrupt the interrupted program's flags.
+The interrupt dispatch hardware originally pushed only `{32'b0, r_PC}` onto the
+stack and provided no IRET opcode, so handlers could not return. Flags were
+also not saved, so any handler touching arithmetic corrupted the interrupted
+program's flags.
 
-### Fix — pack flags + PC into one 64-bit slot
+### Fix — pack mask + flags + PC into one 64-bit slot
 
-The existing push word is 64 bits wide and the lower 32 carry PC.  The upper 32 are
-currently zero.  Seven flags fit in 7 bits; pack them into `[38:32]`.
+The push word is 64 bits wide; the lower 32 carry PC, the next 7 bits hold the
+flags, and the next 4 bits hold the per-source interrupt mask. The remaining
+21 high bits are reserved (zero).
 
 ```
 Saved slot layout (64-bit):
-  [63:39]  = 25'b0 (reserved / zero)
+  [63:43]  = 21'b0 (reserved / zero)
+  [42:39]  = r_int_mask  (per-source enable; restored by IRET)
   [38]     = r_zero_flag
   [37]     = r_equal_flag
   [36]     = r_carry_flag
@@ -47,31 +55,48 @@ Saved slot layout (64-bit):
 
 #### 1a. FPGA_CPU_32_bits_cache.v — interrupt dispatch
 
-File: `FPGA_CPU_32_DDR_cache.srcs/sources_1/new/FPGA_CPU_32_bits_cache.v`
+File: `KlaussCPU.srcs/sources_1/new/FPGA_CPU_32_bits_cache.v`
 
-Change line ~767:
+The dispatch block now (a) gates on `r_int_mask[N]`, (b) packs mask + flags + PC,
+and (c) auto-clears the dispatched source's mask bit so the handler cannot
+re-enter on the same source:
+
 ```verilog
-// Old
-r_mem_write_data <= {32'b0, r_PC};
-
-// New — pack 7 flags into [38:32], PC into [31:0]
-r_mem_write_data <= {25'b0,
-                     r_zero_flag, r_equal_flag, r_carry_flag,
-                     r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
-                     r_PC};
+end else if (r_timer_interrupt && r_interrupt_table[0] != 32'h0 && r_int_mask[0]) begin
+   r_SP             <= r_SP - 8;
+   r_mem_addr       <= r_SP - 32'd8;
+   r_mem_write_data <= {21'b0, r_int_mask,
+                        r_zero_flag, r_equal_flag, r_carry_flag,
+                        r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
+                        r_PC};
+   r_mem_byte_en     <= 8'hFF;
+   r_mem_write_DV    <= 1'b1;
+   r_timer_interrupt <= 1'b0;
+   r_int_mask[0]     <= 1'b0;        // mask source 0 while handler runs
+   r_PC              <= r_interrupt_table[0];
+   r_int_push_wait   <= 1'b1;
+end
 ```
 
-#### 1b. control_tasks.vh — add t_iret task
+The free-running counter compares against `r_timer_period` (32-bit register)
+instead of the previous hardcoded `0xFFFFF`. Reset value of `r_timer_period`
+is `0x000F_FFFF` (≈10.5 ms @ 100 MHz); reset value of `r_int_mask` is `4'h0`
+(all sources masked).
 
-File: `FPGA_CPU_32_DDR_cache.srcs/sources_1/new/control_tasks.vh`
+#### 1b. control_tasks.vh — t_iret only
 
-Add after `t_ret` (line ~67):
+File: `KlaussCPU.srcs/sources_1/new/control_tasks.vh`
+
+`t_iret` is the only interrupt-related task; mask/period/handler writes
+are handled by the MMIO write block in `FPGA_CPU_32_bits_cache.v` (see
+1d).
 
 ```verilog
 // IRET — return from interrupt handler.
 // Pops the 64-bit context slot saved by interrupt dispatch:
-//   [31:0]  → PC (resume address)
-//   [38:32] → flags (zero, equal, carry, overflow, sign, less, ult)
+//   [31:0]   → PC          (resume address)
+//   [38:32]  → flags       (zero, equal, carry, overflow, sign, less, ult)
+//   [42:39]  → r_int_mask  (per-source enables, restored)
 // Uses the same multi-cycle DDR2 read pattern as t_ret.
 task t_iret;
    begin
@@ -81,49 +106,72 @@ task t_iret;
          r_extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
-            r_PC           <= w_mem_read_data[31:0];
-            r_zero_flag    <= w_mem_read_data[38];
-            r_equal_flag   <= w_mem_read_data[37];
-            r_carry_flag   <= w_mem_read_data[36];
+            r_PC            <= w_mem_read_data[31:0];
+            r_zero_flag     <= w_mem_read_data[38];
+            r_equal_flag    <= w_mem_read_data[37];
+            r_carry_flag    <= w_mem_read_data[36];
             r_overflow_flag <= w_mem_read_data[35];
-            r_sign_flag    <= w_mem_read_data[34];
-            r_less_flag    <= w_mem_read_data[33];
-            r_ult_flag     <= w_mem_read_data[32];
-            r_SP           <= r_SP + 8;
-            r_mem_read_DV  <= 1'b0;
-            r_SM           <= OPCODE_REQUEST;
+            r_sign_flag     <= w_mem_read_data[34];
+            r_less_flag     <= w_mem_read_data[33];
+            r_ult_flag      <= w_mem_read_data[32];
+            r_int_mask      <= w_mem_read_data[42:39];
+            r_SP            <= r_SP + 8;
+            r_mem_read_DV   <= 1'b0;
+            r_SM            <= OPCODE_REQUEST;
          end
       end
    end
 endtask
 ```
 
-#### 1c. opcode_select.vh — assign opcode
+#### 1c. opcode_select.vh — IRET only
 
-File: `FPGA_CPU_32_DDR_cache.srcs/sources_1/new/opcode_select.vh`
+File: `KlaussCPU.srcs/sources_1/new/opcode_select.vh`
 
-In the interrupt control (6xxx) section, add after `INTSETRR`:
-
-```verilog
-32'h0000_6011: t_iret;   // IRET pop {flags,PC} from stack; resume interrupted context
-```
-
-Updated comment block:
+The 6xxx block now has a single dispatch entry; everything else is MMIO.
 
 ```verilog
 //=====================================================================
 // Interrupt control (6xxx)
-// INTSETRR: rs1[1:0] = interrupt number (0–3); rs2[31:0] = handler byte address.
-// IRET:     pop 64-bit interrupt context; restore PC[31:0] and flags[38:32].
+// IRET is the only interrupt-control opcode; everything else (handler
+// table, per-source mask, timer period) is configured via MMIO at base
+// 0xF00F_0000. See MMIO_MAP.md.
 //=====================================================================
-32'h0000_60??: t_set_interrupt_regs;   // INTSETRR RR set interrupt[rs1[1:0]] handler = rs2[31:0]
-32'h0000_6011: t_iret;                 // IRET restore PC and flags from stack; SP+=8
+32'h0000_6011: t_iret;                                // IRET restore PC, flags, mask from stack
+```
+
+#### 1d. FPGA_CPU_32_bits_cache.v — MMIO interrupt controller
+
+The MMIO write block handles all configuration; the read mux exposes the
+same registers plus a live pending bit and a free-running counter. See
+`MMIO_MAP.md` "Timers / interrupts" for the offsets.
+
+```verilog
+12'h00F: begin  // Interrupt controller / timer
+   case (w_mmio_addr[15:0])
+      16'h0000: r_int_mask           <= w_mmio_write_data[3:0];
+      16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
+      16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
+      16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
+      16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
+      16'h0030: begin
+         r_timer_period            <= w_mmio_write_data[31:0];
+         r_timer_interrupt_counter <= 32'h0;
+      end
+      default: ;
+   endcase
+end
 ```
 
 ### Assembler support
 
-Add `IRET` as a zero-operand mnemonic (format: no operand word, PC += 4) to the
-assembler.  The opcode word is `0x0000_6011`.
+The assembler needs only one new zero-operand mnemonic; mask/period/vector
+configuration is plain `MEMSET32` to the MMIO addresses listed in
+`MMIO_MAP.md`.
+
+| Mnemonic   | Format | Encoding         | Operand semantics |
+|------------|--------|------------------|-------------------|
+| `IRET`     | none   | `0x0000_6011`    | (no operands; PC += 4) |
 
 ---
 
@@ -329,11 +377,15 @@ matched against a compare-with-zero pattern that does not involve CMPRR.
 
 ## Implementation order
 
-1. **IRET** — hardware change, enables interrupt-driven programs to be compiled at all.
-   - Edit `FPGA_CPU_32_bits_cache.v` (interrupt dispatch, flags save)
-   - Add `t_iret` to `control_tasks.vh`
-   - Add opcode to `opcode_select.vh`
-   - Add `IRET` mnemonic to assembler
+1. **IRET + MMIO interrupt controller** — **DONE** (hardware shipped;
+   assembler/LLVM mnemonic for `IRET` still pending). Mask, timer period,
+   and handler vectors are MMIO at `0xF00F_0000`, configured via plain
+   `MEMSET32` — no dedicated opcodes.
+   - ✅ `FPGA_CPU_32_bits_cache.v` dispatch saves flags + mask, gates on mask
+   - ✅ MMIO read mux + write handler at offset `0x00F` in `FPGA_CPU_32_bits_cache.v`
+   - ✅ `t_iret` in `control_tasks.vh`
+   - ✅ Single dispatch entry in `opcode_select.vh` (`0x0000_6011`)
+   - ⬜ Assembler mnemonic: `IRET`
 
 2. **TRAP** — one-line hardware change, avoids debug confusion.
    - Add `ERR_TRAP` constant, `t_trap` task, opcode entry
@@ -349,7 +401,10 @@ matched against a compare-with-zero pattern that does not involve CMPRR.
 
 ## Opcode table additions summary
 
-| Mnemonic | Encoding      | Format | Action |
-|----------|---------------|--------|--------|
-| `IRET`   | `0x0000_6011` | (none) | Pop {flags[38:32],PC[31:0]} from stack; SP+=8 |
-| `TRAP`   | `0x0000_F014` | (none) | HCF with ERR_TRAP (0x9) — software abort |
+| Mnemonic    | Encoding              | Format | Action |
+|-------------|-----------------------|--------|--------|
+| `IRET`      | `0x0000_6011`         | (none) | Pop {mask[42:39],flags[38:32],PC[31:0]} from stack; SP+=8 |
+| `TRAP`      | `0x0000_F014`         | (none) | HCF with ERR_TRAP (0x9) — software abort |
+
+Mask, timer period, and handler vectors are reachable as plain MMIO stores
+at `0xF00F_0000`+. See `MMIO_MAP.md` for the register layout.

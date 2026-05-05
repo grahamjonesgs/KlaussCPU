@@ -99,8 +99,10 @@ endtask
 
 // IRET — return from interrupt handler.
 // Pops the 64-bit context slot saved by interrupt dispatch:
-//   [31:0]  → PC  (resume address of interrupted instruction)
-//   [38:32] → flags (zero, equal, carry, overflow, sign, less, ult)
+//   [31:0]  → PC        (resume address of interrupted instruction)
+//   [38:32] → flags     (zero, equal, carry, overflow, sign, less, ult)
+//   [42:39] → r_int_mask (per-source enables; restored so masked-on-entry
+//                         source becomes active again outside the handler)
 // Uses the same multi-cycle DDR2 read pattern as t_ret.
 task t_iret;
    begin
@@ -118,6 +120,7 @@ task t_iret;
             r_sign_flag     <= w_mem_read_data[34];
             r_less_flag     <= w_mem_read_data[33];
             r_ult_flag      <= w_mem_read_data[32];
+            r_int_mask      <= w_mem_read_data[42:39];
             r_SP            <= r_SP + 8;
             r_mem_read_DV   <= 1'b0;
             r_SM            <= OPCODE_REQUEST;
@@ -135,19 +138,8 @@ task t_trap;
    end
 endtask
 
-// Set interrupt from regs first is interrupt in lowest byte, then address of handlers
-// On completion
-// Increment PC
-// Increment r_SM
-task t_set_interrupt_regs;
-   reg [1:0] r_interrupt_number;
-   begin
-      r_interrupt_number = r_reg_port_a[1:0];
-      r_interrupt_table[r_interrupt_number] <= r_reg_port_b[31:0];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
-   end
-endtask
+// Interrupt control state (handler vector table, per-source mask, timer period)
+// is configured via MMIO at base 0xF00F_0000. See MMIO_MAP.md.
 
 
 
