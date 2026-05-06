@@ -34,7 +34,7 @@ Reserved ranges read as 0 and ignore writes (no bus error).
 - MMIO writes complete in a single cycle (no read-data path involved).
 - MMIO reads take two cycles: the read strobe is captured in cycle 1, the
   registered data and `ready` arrive in cycle 2. The pipeline FF on the
-  read return path (`r_mmio_read_data` in `FPGA_CPU_32_bits_cache.v`) is
+  read return path (`r_mmio_read_data` in `KlaussCPU.v`) is
   what enables timing closure — without it the combinational path from
   peripheral RAMs through `bus_splitter` and into the UART helpers blows
   through the 100 MHz budget.

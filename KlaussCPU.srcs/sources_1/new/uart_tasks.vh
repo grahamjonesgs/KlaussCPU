@@ -624,7 +624,7 @@ endtask
 
 
 // Build a single line of the HCF crash dump into r_msg / r_msg_length.
-// Phase index is r_hcf_dump_phase (see DUMP_* localparams in FPGA_CPU_32_bits_cache.v).
+// Phase index is r_hcf_dump_phase (see DUMP_* localparams in KlaussCPU.v).
 // Caller (HCF_DUMP state, PREP sub-state) handles UART handshake and phase advance.
 //
 // All lines fit within the 32-byte r_msg buffer.  Lines end with "\r\n" so a

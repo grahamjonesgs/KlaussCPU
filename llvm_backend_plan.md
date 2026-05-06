@@ -53,9 +53,9 @@ Saved slot layout (64-bit):
   [31:0]   = r_PC (byte address of interrupted instruction)
 ```
 
-#### 1a. FPGA_CPU_32_bits_cache.v — interrupt dispatch
+#### 1a. KlaussCPU.v — interrupt dispatch
 
-File: `KlaussCPU.srcs/sources_1/new/FPGA_CPU_32_bits_cache.v`
+File: `KlaussCPU.srcs/sources_1/new/KlaussCPU.v`
 
 The dispatch block now (a) gates on `r_int_mask[N]`, (b) packs mask + flags + PC,
 and (c) auto-clears the dispatched source's mask bit so the handler cannot
@@ -88,7 +88,7 @@ is `0x000F_FFFF` (≈10.5 ms @ 100 MHz); reset value of `r_int_mask` is `4'h0`
 File: `KlaussCPU.srcs/sources_1/new/control_tasks.vh`
 
 `t_iret` is the only interrupt-related task; mask/period/handler writes
-are handled by the MMIO write block in `FPGA_CPU_32_bits_cache.v` (see
+are handled by the MMIO write block in `KlaussCPU.v` (see
 1d).
 
 ```verilog
@@ -140,7 +140,7 @@ The 6xxx block now has a single dispatch entry; everything else is MMIO.
 32'h0000_6011: t_iret;                                // IRET restore PC, flags, mask from stack
 ```
 
-#### 1d. FPGA_CPU_32_bits_cache.v — MMIO interrupt controller
+#### 1d. KlaussCPU.v — MMIO interrupt controller
 
 The MMIO write block handles all configuration; the read mux exposes the
 same registers plus a live pending bit and a free-running counter. See
@@ -184,9 +184,9 @@ is lowered to `HALT`, a crash and a normal halt are indistinguishable at the boa
 
 ### Fix — dedicated TRAP opcode with distinct error code
 
-#### 2a. FPGA_CPU_32_bits_cache.v — add ERR_TRAP error code
+#### 2a. KlaussCPU.v — add ERR_TRAP error code
 
-File: `FPGA_CPU_32_DDR_cache.srcs/sources_1/new/FPGA_CPU_32_bits_cache.v`
+File: `KlaussCPU.srcs/sources_1/new/KlaussCPU.v`
 
 ```verilog
 // Old error codes end at ERR_SEG_EXEC_DATA = 8'h8
@@ -381,8 +381,8 @@ matched against a compare-with-zero pattern that does not involve CMPRR.
    assembler/LLVM mnemonic for `IRET` still pending). Mask, timer period,
    and handler vectors are MMIO at `0xF00F_0000`, configured via plain
    `MEMSET32` — no dedicated opcodes.
-   - ✅ `FPGA_CPU_32_bits_cache.v` dispatch saves flags + mask, gates on mask
-   - ✅ MMIO read mux + write handler at offset `0x00F` in `FPGA_CPU_32_bits_cache.v`
+   - ✅ `KlaussCPU.v` dispatch saves flags + mask, gates on mask
+   - ✅ MMIO read mux + write handler at offset `0x00F` in `KlaussCPU.v`
    - ✅ `t_iret` in `control_tasks.vh`
    - ✅ Single dispatch entry in `opcode_select.vh` (`0x0000_6011`)
    - ⬜ Assembler mnemonic: `IRET`

@@ -21,7 +21,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 `timescale 1ns / 1ps
-module FPGA_CPU_32_bits_cache (
+module KlaussCPU (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk,             // FPGA Clock
     input             i_uart_rx,
