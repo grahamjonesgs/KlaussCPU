@@ -815,6 +815,28 @@ task t_hcf_dump_build_line;
                 r_msg_length     <= 8'd17;
             end
 
+            DUMP_INSTR: begin
+                // "INSTR=NNNNNNNN\r\n"  (16 bytes) — committed instruction
+                // count since program load (LOAD_COMPLETE).
+                r_msg[ 0*8 +: 8] <= "I";
+                r_msg[ 1*8 +: 8] <= "N";
+                r_msg[ 2*8 +: 8] <= "S";
+                r_msg[ 3*8 +: 8] <= "T";
+                r_msg[ 4*8 +: 8] <= "R";
+                r_msg[ 5*8 +: 8] <= "=";
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_instr_count[31:28]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_instr_count[27:24]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_instr_count[23:20]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_instr_count[19:16]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_instr_count[15:12]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_instr_count[11:8]);
+                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_instr_count[7:4]);
+                r_msg[13*8 +: 8] <= return_ascii_from_hex(r_instr_count[3:0]);
+                r_msg[14*8 +: 8] <= 8'h0D;
+                r_msg[15*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd16;
+            end
+
             DUMP_FOOTER: begin
                 // "*** END ***\r\n"  (13 bytes)
                 r_msg[ 0*8 +: 8] <= "*";
@@ -835,8 +857,7 @@ task t_hcf_dump_build_line;
 
             default: begin
                 // Repeated-line phases — pick the right family from the phase
-                // index.  Note that DUMP_TRACE_BASE+15 = DUMP_FOOTER-1, so the
-                // "< DUMP_FOOTER" guard is enough to keep this branch safe.
+                // index.  Order: regs → stack → trace → memory dump (M00..M1F).
                 if (r_hcf_dump_phase < DUMP_STACK_BASE) begin
                     // ============== Register dump (R0..RF) ==============
                     // "RX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
@@ -892,7 +913,7 @@ task t_hcf_dump_build_line;
                     r_msg[19*8 +: 8] <= 8'h0D;
                     r_msg[20*8 +: 8] <= 8'h0A;
                     r_msg_length     <= 8'd21;
-                end else begin
+                end else if (r_hcf_dump_phase < DUMP_MEM_BASE) begin
                     // ============== Trace dump (T0..TF, newest-first) ==============
                     // "TX P=xxxxxxxx OP=xxxxxxxx\r\n"  (27 bytes)
                     // T0 is the most-recent fetch; T15 is 16 fetches back.
@@ -929,6 +950,38 @@ task t_hcf_dump_build_line;
                     r_msg[25*8 +: 8] <= 8'h0D;
                     r_msg[26*8 +: 8] <= 8'h0A;
                     r_msg_length     <= 8'd27;
+                end else begin
+                    // ============== Memory dump (M00..M1F) ==============
+                    // Diagnostic dump of the first 32 doublewords of DRAM
+                    // (byte addresses 0x00..0xF8).  Useful for verifying
+                    // loader integrity for programs > 64 KB.
+                    // "MNN=NNNNNNNNNNNNNNNN\r\n"  (22 bytes)
+                    // Data was pre-fetched in HCF_DUMP STACK_FETCH sub-state
+                    // and is sitting in r_hcf_stack_data.
+                    k_phase = r_hcf_dump_phase - DUMP_MEM_BASE;
+                    r_msg[ 0*8 +: 8] <= "M";
+                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex({2'b00, k_phase[5:4]});
+                    r_msg[ 2*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
+                    r_msg[ 3*8 +: 8] <= "=";
+                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[63:60]);
+                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[59:56]);
+                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[55:52]);
+                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[51:48]);
+                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[47:44]);
+                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[43:40]);
+                    r_msg[10*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[39:36]);
+                    r_msg[11*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[35:32]);
+                    r_msg[12*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[31:28]);
+                    r_msg[13*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[27:24]);
+                    r_msg[14*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[23:20]);
+                    r_msg[15*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[19:16]);
+                    r_msg[16*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[15:12]);
+                    r_msg[17*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[11: 8]);
+                    r_msg[18*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 7: 4]);
+                    r_msg[19*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 3: 0]);
+                    r_msg[20*8 +: 8] <= 8'h0D;
+                    r_msg[21*8 +: 8] <= 8'h0A;
+                    r_msg_length     <= 8'd22;
                 end
             end
         endcase

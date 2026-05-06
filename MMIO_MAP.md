@@ -18,7 +18,8 @@ cache controller.
 0xF002_xxxx                 RGB LED │   addr[15:0]          → register offset
 0xF003_xxxx                 7-segment
 0xF004_xxxx                 LEDs / switches
-0xF005_xxxx – 0xF00E_xxxx   reserved
+0xF005_xxxx                 cache controller (counters + control)
+0xF006_xxxx – 0xF00E_xxxx   reserved
 0xF00F_xxxx                 timers / IRQ controller
 ```
 
@@ -143,6 +144,62 @@ Writes to `SWITCHES` are dropped. Reading `LEDS` returns the last value written.
 Legacy opcodes: `LEDR/LEDV` (set), `SWITCHR` (read switches) — see
 `opcode_select.vh` `0x3xxx` block.
 
+### Cache controller — base `0xF005_0000`
+
+Performance counters and control for the L1 cache (2-way set-associative
+write-back, 64 KB total, 16-byte lines — see
+[mem_read_write.v](KlaussCPU.srcs/sources_1/new/mem_read_write.v)). The events
+mirror the cache-related set of RISC-V Zihpm performance counters
+(`mhpmcounter` / `mhpmevent`); RISC-V leaves the actual counter exposure
+implementation-defined, so they live in MMIO here rather than as CSRs.
+
+| Offset  | Reg                  | RW | Width | Description |
+|---------|----------------------|----|-------|-------------|
+| 0x0000  | `CACHE_CTRL`         | RW | 1     | `[0]` write-1-clear-counters (self-clearing). Bit 0 reads as 0. Other bits reserved (read 0). |
+| 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_1008_0002` (2 ways, 2048 sets, 16 B/line, 64 KB total). |
+| 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
+| 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
+| 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line. |
+| 0x0058  | `CNT_WRITE_MISSES`   | R  | 64    | Write accesses that missed and triggered a fetch-then-merge refill. |
+| 0x0060  | `CNT_WRITEBACKS`     | R  | 64    | Dirty-line evictions (the cache wrote a dirty line back to DDR before refilling its slot). Counts both write-miss and read-miss eviction paths. |
+| 0x0068  | `CNT_STALL_CYCLES`   | R  | 64    | `i_Clk` cycles the cache spent in the miss/refill chain (writeback, CDC gap, DDR fetch, install). Counts only beyond the single-cycle hit case, so this is the cycle cost of cache misses, not total memory-access latency. |
+
+**Counters are 64-bit and free-running.** At `i_Clk = 100 MHz` even an event
+that fires every cycle takes ~5.8 × 10⁹ years to wrap, so software never has
+to manage rollover. Reset values: all zero. Counters are not affected by
+`CPU_RESETN` or program load — only by writing `CACHE_CTRL` bit 0.
+
+**Why not flush?** A cache flush + invalidate (writeback all dirty + drop all
+tags) requires walking every set, which is a multi-thousand-cycle FSM
+extension to `mem_read_write.v`. The cache is currently never observed
+externally (no DMA, MMIO already bypasses the cache), so flush is not
+required for correctness. It is reserved for future use under a separate
+`CACHE_CTRL` bit.
+
+**How to use:**
+
+1. Clear counters at the start of the region of interest.
+2. Run the workload.
+3. Read all the counters and compute hit rate / miss rate / writeback rate /
+   average miss penalty offline. The total access count is
+   `READ_HITS + READ_MISSES + WRITE_HITS + WRITE_MISSES`. Average miss
+   penalty in cycles is `STALL_CYCLES / (READ_MISSES + WRITE_MISSES)`.
+
+```c
+#include "mmio.h"
+
+void cache_profile(void (*workload)(void)) {
+    REG_CACHE_CTRL = 1;                 /* clear */
+    workload();
+    uint64_t rh = REG_CACHE_RD_HITS,    wh = REG_CACHE_WR_HITS;
+    uint64_t rm = REG_CACHE_RD_MISSES,  wm = REG_CACHE_WR_MISSES;
+    uint64_t wb = REG_CACHE_WRITEBACKS, st = REG_CACHE_STALL_CYC;
+    uint64_t total   = rh + rm + wh + wm;
+    uint64_t misses  = rm + wm;
+    /* hit_rate_per_million = total ? (rh + wh) * 1000000ull / total : 0; */
+}
+```
+
 ### Timers / interrupts — base `0xF00F_0000`
 
 Per-source interrupt controller and the source-0 timer. The CPU supports up
@@ -250,6 +307,19 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define IO_BASE         (MMIO_BASE + 0x00040000u)
 #define REG_LEDS        (*(volatile uint32_t *)(IO_BASE + 0x0000))
 #define REG_SWITCHES    (*(volatile uint32_t *)(IO_BASE + 0x0008))
+
+/* Cache controller (0xF005_0xxx) — counters + control */
+#define CACHE_BASE        (MMIO_BASE + 0x00050000u)
+#define REG_CACHE_CTRL    (*(volatile uint32_t *)(CACHE_BASE + 0x0000))
+#define REG_CACHE_INFO    (*(volatile uint64_t *)(CACHE_BASE + 0x0008))
+#define REG_CACHE_RD_HITS    (*(volatile uint64_t *)(CACHE_BASE + 0x0040))
+#define REG_CACHE_RD_MISSES  (*(volatile uint64_t *)(CACHE_BASE + 0x0048))
+#define REG_CACHE_WR_HITS    (*(volatile uint64_t *)(CACHE_BASE + 0x0050))
+#define REG_CACHE_WR_MISSES  (*(volatile uint64_t *)(CACHE_BASE + 0x0058))
+#define REG_CACHE_WRITEBACKS (*(volatile uint64_t *)(CACHE_BASE + 0x0060))
+#define REG_CACHE_STALL_CYC  (*(volatile uint64_t *)(CACHE_BASE + 0x0068))
+
+#define CACHE_CTRL_CLEAR  (1u << 0)        /* W1AC: zero all counters */
 
 /* Interrupt controller / timer (0xF00F_0xxx) */
 #define INTC_BASE       (MMIO_BASE + 0x000F0000u)

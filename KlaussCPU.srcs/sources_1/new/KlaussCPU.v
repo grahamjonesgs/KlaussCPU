@@ -106,16 +106,18 @@ module KlaussCPU (
    localparam ERR_TRAP = 8'h9;        // Explicit software trap (TRAP opcode)
 
    // Crash dump phase boundaries (r_hcf_dump_phase). Each "phase" emits one UART line.
-   localparam DUMP_HEADER     = 6'd0;
-   localparam DUMP_ERR_PC     = 6'd1;
-   localparam DUMP_OPC_SP     = 6'd2;
-   localparam DUMP_V1_V2      = 6'd3;
-   localparam DUMP_FLAGS_A    = 6'd4;   // Z E C V
-   localparam DUMP_FLAGS_B    = 6'd5;   // S L U
-   localparam DUMP_REG_BASE   = 6'd6;   // R0..RF → phases  6..21
-   localparam DUMP_STACK_BASE = 6'd22;  // S0..S3 → phases 22..25 (each preceded by a DDR2 read)
-   localparam DUMP_TRACE_BASE = 6'd26;  // T0..TF → phases 26..41 (newest-first)
-   localparam DUMP_FOOTER     = 6'd42;  // last phase; on completion → HCF_2
+   localparam DUMP_HEADER     = 7'd0;
+   localparam DUMP_ERR_PC     = 7'd1;
+   localparam DUMP_OPC_SP     = 7'd2;
+   localparam DUMP_V1_V2      = 7'd3;
+   localparam DUMP_FLAGS_A    = 7'd4;   // Z E C V
+   localparam DUMP_FLAGS_B    = 7'd5;   // S L U
+   localparam DUMP_INSTR      = 7'd6;   // INSTR=NNNNNNNN — instructions committed since program load
+   localparam DUMP_REG_BASE   = 7'd7;   // R0..RF → phases  7..22
+   localparam DUMP_STACK_BASE = 7'd23;  // S0..S3 → phases 23..26 (each preceded by a DDR2 read)
+   localparam DUMP_TRACE_BASE = 7'd27;  // T0..TF → phases 27..42 (newest-first)
+   localparam DUMP_MEM_BASE   = 7'd43;  // M00..M1F → phases 43..74 — first 32 doublewords of DRAM (each preceded by a DDR2 read)
+   localparam DUMP_FOOTER     = 7'd75;  // last phase; on completion → HCF_2
 
    // UART receive control
    wire [7:0] w_uart_rx_value;  // Received value
@@ -165,13 +167,17 @@ module KlaussCPU (
    // leading up to the failing instruction, not just the failing instruction itself.
    reg [63:0] r_trace_buf [0:15];
    reg [3:0]  r_trace_idx;          // next-write index, wraps freely
+   // Free-running count of instructions committed since program load. 32-bit
+   // wraps at ~4.3e9 — plenty for crash diagnostics. Reset on initial,
+   // CPU_RESETN, and successful program load (LOAD_COMPLETE).
+   reg [31:0] r_instr_count;
    reg        r_trace_full;         // 1 once the ring has wrapped at least once
 
    // Crash dump UART state machine.  Lives entirely inside HCF_DUMP; the sub-state
    // r_hcf_dump_sub walks each line through the canonical 4-step UART handshake
    // (PREP → ACK → DONE_WAIT) used elsewhere in this codebase, with an extra
    // STACK_FETCH branch for stack lines that need a DDR2 read first.
-   reg [5:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
+   reg [6:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
    reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK
    reg [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
    reg        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
@@ -297,6 +303,23 @@ module KlaussCPU (
    wire [31:0] w_mmio_addr;
    wire [63:0] w_mmio_write_data;
    wire [ 7:0] w_mmio_byte_en;
+
+   // Cache performance counters / control (driven by mem_read_write below;
+   // exposed via MMIO 0xF005_xxxx — see MMIO_MAP.md "Cache controller").
+   wire [63:0] w_cache_info;
+   wire [63:0] w_cnt_read_hits;
+   wire [63:0] w_cnt_read_misses;
+   wire [63:0] w_cnt_write_hits;
+   wire [63:0] w_cnt_write_misses;
+   wire [63:0] w_cnt_writebacks;
+   wire [63:0] w_cnt_stall_cycles;
+   // CACHE_CTRL bit 0 self-clearing: a 1-cycle pulse on the cycle the CPU
+   // writes 0xF005_0000 with bit 0 set, fed straight into mem_read_write's
+   // i_stat_clear (which zeros all counters on the next edge).
+   wire        w_cache_stat_clear = w_mmio_write_DV
+                                  && (w_mmio_addr[27:16] == 12'h005)
+                                  && (w_mmio_addr[15:0]  == 16'h0000)
+                                  && w_mmio_write_data[0];
    reg  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always @*)
    reg  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
    reg         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
@@ -530,6 +553,20 @@ module KlaussCPU (
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
+         12'h005: begin  // Cache controller — counters and config (RO)
+            case (w_mmio_addr[15:0])
+               // 0x0000 CACHE_CTRL is self-clearing — reads as 0
+               16'h0000: r_mmio_read_data_comb = 64'h0;
+               16'h0008: r_mmio_read_data_comb = w_cache_info;
+               16'h0040: r_mmio_read_data_comb = w_cnt_read_hits;
+               16'h0048: r_mmio_read_data_comb = w_cnt_read_misses;
+               16'h0050: r_mmio_read_data_comb = w_cnt_write_hits;
+               16'h0058: r_mmio_read_data_comb = w_cnt_write_misses;
+               16'h0060: r_mmio_read_data_comb = w_cnt_writebacks;
+               16'h0068: r_mmio_read_data_comb = w_cnt_stall_cycles;
+               default:  r_mmio_read_data_comb = 64'h0;
+            endcase
+         end
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, r_int_mask};
@@ -585,7 +622,17 @@ module KlaussCPU (
        .o_mem_read_data(w_dram_read_data),
        .o_mem_read_data_next(w_dram_read_data_next),
        .o_mem_next_valid(w_dram_next_valid),
-       .o_mem_ready(w_dram_ready)
+       .o_mem_ready(w_dram_ready),
+
+       // Cache performance counters and clear pulse.
+       .i_stat_clear(w_cache_stat_clear),
+       .o_cache_info(w_cache_info),
+       .o_cnt_read_hits(w_cnt_read_hits),
+       .o_cnt_read_misses(w_cnt_read_misses),
+       .o_cnt_write_hits(w_cnt_write_hits),
+       .o_cnt_write_misses(w_cnt_write_misses),
+       .o_cnt_writebacks(w_cnt_writebacks),
+       .o_cnt_stall_cycles(w_cnt_stall_cycles)
    );
 
 
@@ -781,7 +828,8 @@ rams_sp_nc rams_sp_nc1 (
       r_var1_prefetched = 0;
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
-      r_hcf_dump_phase = 6'd0;
+      r_instr_count = 32'h0;
+      r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
       r_hcf_stack_loaded = 1'b0;
       r_hcf_stack_data = 64'b0;
@@ -800,7 +848,8 @@ rams_sp_nc rams_sp_nc1 (
             r_register[i] <= 64'b0;
          r_trace_idx <= 4'h0;
          r_trace_full <= 1'b0;
-         r_hcf_dump_phase <= 6'd0;
+         r_instr_count <= 32'h0;
+         r_hcf_dump_phase <= 7'd0;
          r_hcf_dump_sub <= 3'b000;
          r_hcf_stack_loaded <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
@@ -1105,6 +1154,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_timer_interrupt_counter <= 0;
                   r_int_mask <= 4'h0;            // all sources masked until program enables
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
+                  r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
                   r_timing_start <= 0;
                   r_zero_flag <= 0;
                   t_tx_message(8'd1);  // Load OK message
@@ -1216,6 +1266,10 @@ rams_sp_nc rams_sp_nc1 (
                r_trace_idx              <= r_trace_idx + 4'd1;
                if (r_trace_idx == 4'd15)
                   r_trace_full <= 1'b1;
+               // Bump the committed-instruction counter once per fetch (this is
+               // the unique commit gate). 32-bit wrap is ~4.3e9 — irrelevant
+               // for crash diagnostics.
+               r_instr_count <= r_instr_count + 32'd1;
                r_reg_1   <= w_opcode[7:4];
                r_reg_2   <= w_opcode[3:0];
                r_reg_dst <= w_opcode[11:8];
@@ -1293,7 +1347,7 @@ rams_sp_nc rams_sp_nc1 (
                // re-spam the dump each loop, so r_hcf_message_sent gates it.
                if (!r_hcf_message_sent) begin
                   r_hcf_message_sent <= 1'b1;
-                  r_hcf_dump_phase   <= 6'd0;
+                  r_hcf_dump_phase   <= 7'd0;
                   r_hcf_dump_sub     <= 3'b000;
                   r_hcf_stack_loaded <= 1'b0;
                   r_break_counter    <= 12'd0;  // clean start for the post-dump UART break
@@ -1317,23 +1371,34 @@ rams_sp_nc rams_sp_nc1 (
                   3'b000: begin
                      if (!w_sending_msg) begin
                         if ((r_hcf_dump_phase >= DUMP_STACK_BASE)
-                         && (r_hcf_dump_phase <  DUMP_STACK_BASE + 6'd4)
+                         && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4)
                          && !r_hcf_stack_loaded) begin
                            // Skip DDR2 reads past the top of the stack region
                            // (r_SP+offset >= STACK_TOP).  Substitute an FFs
                            // sentinel and mark loaded so the next PREP emits
                            // the line directly.  Prevents OOB DDR2 access when
                            // the stack is empty (r_SP at initial 0x0800_0000).
-                           if ((r_SP + ({26'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3))
+                           if ((r_SP + ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3))
                                  >= STACK_TOP) begin
                               r_hcf_stack_data   <= 64'hFFFF_FFFF_FFFF_FFFF;
                               r_hcf_stack_loaded <= 1'b1;
                            end else begin
                               r_mem_addr     <= r_SP +
-                                 ({26'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3);
+                                 ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3);
                               r_mem_read_DV  <= 1'b1;
                               r_hcf_dump_sub <= 3'b011;
                            end
+                        end else if ((r_hcf_dump_phase >= DUMP_MEM_BASE)
+                                  && (r_hcf_dump_phase <  DUMP_MEM_BASE + 7'd32)
+                                  && !r_hcf_stack_loaded) begin
+                           // Diagnostic dump of the first 32 doublewords of DRAM
+                           // (M00..M1F).  Reuses r_hcf_stack_data / _loaded
+                           // since both are DDR2-read-then-emit phases.
+                           // Address = (phase - DUMP_MEM_BASE) << 3, in the
+                           // 0x00..0xF8 byte range.
+                           r_mem_addr     <= ({25'b0, r_hcf_dump_phase - DUMP_MEM_BASE} << 3);
+                           r_mem_read_DV  <= 1'b1;
+                           r_hcf_dump_sub <= 3'b011;
                         end else begin
                            t_hcf_dump_build_line;
                            r_msg_send_DV  <= 1'b1;
@@ -1357,10 +1422,12 @@ rams_sp_nc rams_sp_nc1 (
                   3'b010: begin
                      if (i_msg_sent_DV) begin
                         r_hcf_dump_sub <= 3'b000;
-                        // Leaving a stack phase invalidates the cached read so
-                        // the next stack phase fetches fresh data.
-                        if ((r_hcf_dump_phase >= DUMP_STACK_BASE)
-                         && (r_hcf_dump_phase <  DUMP_STACK_BASE + 6'd4)) begin
+                        // Leaving a stack or memory-dump phase invalidates the
+                        // cached read so the next phase fetches fresh data.
+                        if (((r_hcf_dump_phase >= DUMP_STACK_BASE)
+                          && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
+                         || ((r_hcf_dump_phase >= DUMP_MEM_BASE)
+                          && (r_hcf_dump_phase <  DUMP_MEM_BASE   + 7'd32))) begin
                            r_hcf_stack_loaded <= 1'b0;
                         end
                         if (r_hcf_dump_phase == DUMP_FOOTER) begin
@@ -1368,10 +1435,10 @@ rams_sp_nc rams_sp_nc1 (
                            // sub-state to assert a UART break (line low for ~2.5
                            // frames) so a host parser sees an unambiguous
                            // end-of-dump marker — same pattern as HALTED_BREAK.
-                           r_hcf_dump_phase <= 6'd0;
+                           r_hcf_dump_phase <= 7'd0;
                            r_hcf_dump_sub   <= 3'b100;  // override default 000
                         end else begin
-                           r_hcf_dump_phase <= r_hcf_dump_phase + 6'd1;
+                           r_hcf_dump_phase <= r_hcf_dump_phase + 7'd1;
                         end
                      end
                   end

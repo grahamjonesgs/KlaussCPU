@@ -42,7 +42,19 @@ module mem_read_write (
     output reg [63:0] o_mem_read_data,
     output reg [63:0] o_mem_read_data_next, // next consecutive doubleword in same cache line
     output reg        o_mem_next_valid,      // 1 when o_mem_read_data_next is valid (offset == 0)
-    output reg        o_mem_ready
+    output reg        o_mem_ready,
+
+    // Performance counters (RISC-V Zihpm-style cache events) and control.
+    // i_stat_clear: 1-cycle pulse — zeros all counters on the next edge.
+    // o_cache_info: read-only geometry register, see MMIO_MAP.md.
+    input             i_stat_clear,
+    output     [63:0] o_cache_info,
+    output reg [63:0] o_cnt_read_hits,
+    output reg [63:0] o_cnt_read_misses,
+    output reg [63:0] o_cnt_write_hits,
+    output reg [63:0] o_cnt_write_misses,
+    output reg [63:0] o_cnt_writebacks,
+    output reg [63:0] o_cnt_stall_cycles
 );
 
     parameter  CACHE_SIZE = 2_048;              // number of sets — 2 ways × 2048 sets = 4096 total lines = 64 KB
@@ -68,6 +80,24 @@ module mem_read_write (
     reg  [ 15:0] r_app_wdf_mask;
 
     assign w_app_wdf_mask = r_app_wdf_mask;
+
+    // -------------------------------------------------------------------------
+    // 2-FF synchroniser for i_ddr_mem_ready — ddr2_control drives o_mem_ready
+    // from ui_clk (50 MHz), and the FSM here samples it from i_Clk (100 MHz).
+    // Without this sync the FSM can pick up a metastable value on the
+    // transition edge, and (worse) act on a partially-propagated assertion
+    // before ddr2_control's internal write/read accept handshake is complete.
+    // ASYNC_REG keeps the pair in one slice and excludes the path from STA.
+    // -------------------------------------------------------------------------
+    (* ASYNC_REG = "true" *) reg sync_ddr_ready_0 = 1'b0;
+    (* ASYNC_REG = "true" *) reg sync_ddr_ready_1 = 1'b0;
+
+    always @(posedge i_Clk) begin
+        sync_ddr_ready_0 <= i_ddr_mem_ready;
+        sync_ddr_ready_1 <= sync_ddr_ready_0;
+    end
+
+    wire w_ddr_ready_synced = sync_ddr_ready_1;
 
     // -------------------------------------------------------------------------
     // Address decode — combinational from i_mem_addr (32-bit byte address).
@@ -167,6 +197,8 @@ module mem_read_write (
     reg [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
     reg         r_hit_way;            // which way matched (write-hit path)
     reg         r_evict_way;          // which way to replace (miss paths)
+    reg [3:0]   r_gap_count;          // CDC gap countdown between writeback and refill
+                                       // (see WRITE_EVICT_GAP / READ_EVICT_GAP)
 
     // -------------------------------------------------------------------------
     // State machine — one-hot 16-bit
@@ -219,19 +251,19 @@ module mem_read_write (
     //
     // dirty_din = 1 on write-hit or write-fetch (line becomes dirty), 0 on read refill (line clean).
     // -------------------------------------------------------------------------
-    wire dirty0_wen = (state == WRITE_HIT   &&                        r_hit_way == 1'b0) ||
-                      (state == WRITE_FETCH  && i_ddr_mem_ready && r_evict_way == 1'b0) ||
-                      (state == READ_WAIT    && i_ddr_mem_ready && r_evict_way == 1'b0);
+    wire dirty0_wen = (state == WRITE_HIT   &&                              r_hit_way == 1'b0) ||
+                      (state == WRITE_FETCH  && w_ddr_ready_synced && r_evict_way == 1'b0) ||
+                      (state == READ_WAIT    && w_ddr_ready_synced && r_evict_way == 1'b0);
     // WRITE_FETCH installs as DIRTY (write-back on miss): avoids DDR write-through
     // after a miss, which would race against MIG's internal write pipeline and
     // could clobber bytes committed by a prior buffered write to the same line.
     // The dirty line will be written back to DDR by the normal WRITE_MISS_EVICT path.
-    wire dirty0_din = (state == WRITE_HIT) || (state == WRITE_FETCH && i_ddr_mem_ready);
+    wire dirty0_din = (state == WRITE_HIT) || (state == WRITE_FETCH && w_ddr_ready_synced);
 
-    wire dirty1_wen = (state == WRITE_HIT   &&                        r_hit_way == 1'b1) ||
-                      (state == WRITE_FETCH  && i_ddr_mem_ready && r_evict_way == 1'b1) ||
-                      (state == READ_WAIT    && i_ddr_mem_ready && r_evict_way == 1'b1);
-    wire dirty1_din = (state == WRITE_HIT) || (state == WRITE_FETCH && i_ddr_mem_ready);
+    wire dirty1_wen = (state == WRITE_HIT   &&                              r_hit_way == 1'b1) ||
+                      (state == WRITE_FETCH  && w_ddr_ready_synced && r_evict_way == 1'b1) ||
+                      (state == READ_WAIT    && w_ddr_ready_synced && r_evict_way == 1'b1);
+    wire dirty1_din = (state == WRITE_HIT) || (state == WRITE_FETCH && w_ddr_ready_synced);
 
     always @(posedge i_Clk) begin
         if (dirty0_wen) cache_dirty_way0[r_cache_index] <= dirty0_din;
@@ -390,22 +422,41 @@ module mem_read_write (
             end
 
             WRITE_EVICT_DONE: begin
-                if (i_ddr_mem_ready) begin
+                if (w_ddr_ready_synced) begin
                     o_ddr_mem_write_DV <= 0;
-                    o_ddr_mem_addr     <= r_fetch_ddr_addr;
+                    // CRITICAL: do NOT change o_ddr_mem_addr here. ddr2_control
+                    // synchronises i_mem_write_DV via a 2-FF sync at ui_clk, so
+                    // the deassertion takes ~2 ui_clk (~4 i_Clk cycles) to be
+                    // visible inside ddr2_control. During that window its FSM
+                    // can return WRITE_DONE→IDLE→WAIT and resample
+                    // synced_write_dv as still=1, re-entering WRITE and latching
+                    // app_addr from the live i_mem_addr. If we have already
+                    // changed addr to the refill target, that spurious write
+                    // commits the eviction line's data to the refill address —
+                    // corrupting DRAM.  Hold the eviction address through the
+                    // gap below so any spurious write is idempotent.
+                    r_gap_count        <= 4'd7;
                     state              <= WRITE_EVICT_GAP;
                 end
             end
 
             WRITE_EVICT_GAP: begin
-                // One-cycle gap: ddr2_control must see write DV deasserted
-                // before read DV rises (CDC safety across ui_clk boundary).
-                o_ddr_mem_read_DV <= 1;
-                state             <= WRITE_FETCH;
+                // CDC gap: hold the eviction address (and keep both DVs low)
+                // long enough for ddr2_control's 2-FF synchroniser of
+                // i_mem_write_DV to catch up.  Only after that is it safe to
+                // change addr to the refill target and raise read DV.  8 i_Clk
+                // cycles ≥ 4 ui_clk — well clear of the 2-ui_clk sync depth.
+                if (r_gap_count == 4'd0) begin
+                    o_ddr_mem_addr    <= r_fetch_ddr_addr;
+                    o_ddr_mem_read_DV <= 1;
+                    state             <= WRITE_FETCH;
+                end else begin
+                    r_gap_count <= r_gap_count - 4'd1;
+                end
             end
 
             WRITE_FETCH: begin
-                if (i_ddr_mem_ready) begin
+                if (w_ddr_ready_synced) begin
                     o_ddr_mem_read_DV <= 0;
 
                     begin : write_fetch_merge
@@ -479,23 +530,30 @@ module mem_read_write (
             end
 
             READ_EVICT_DONE: begin
-                if (i_ddr_mem_ready) begin
+                if (w_ddr_ready_synced) begin
                     o_ddr_mem_write_DV <= 0;
-                    o_ddr_mem_addr     <= r_fetch_ddr_addr;
+                    // Hold eviction address through the CDC gap — see the long
+                    // comment in WRITE_EVICT_DONE for the race this prevents.
+                    r_gap_count        <= 4'd7;
                     state              <= READ_EVICT_GAP;
                 end
             end
 
             READ_EVICT_GAP: begin
-                o_ddr_mem_read_DV <= 1;
-                state             <= READ_WAIT;
+                if (r_gap_count == 4'd0) begin
+                    o_ddr_mem_addr    <= r_fetch_ddr_addr;
+                    o_ddr_mem_read_DV <= 1;
+                    state             <= READ_WAIT;
+                end else begin
+                    r_gap_count <= r_gap_count - 4'd1;
+                end
             end
 
             // ------------------------------------------------------------------
             // READ WAIT: DDR fetch complete — install line, return word
             // ------------------------------------------------------------------
             READ_WAIT: begin
-                if (i_ddr_mem_ready) begin
+                if (w_ddr_ready_synced) begin
                     o_ddr_mem_read_DV <= 0;
 
                     // Dirty bit cleared via dirty0/1_wen combinatorial wires above.
@@ -529,6 +587,74 @@ module mem_read_write (
 
         endcase
     end // fsm
+
+    // -------------------------------------------------------------------------
+    // Performance counters — RISC-V Zihpm-style cache events.
+    //
+    // CHECK is the unique decision cycle: r_cache_hit, r_is_write, r_evict_dirty
+    // are all valid here, the state runs for exactly one i_Clk cycle per access,
+    // and exactly one transition out of CHECK fires per request, so each event
+    // counter increments at most once per memory access.
+    //
+    // The "miss path" stall counter ticks every cycle the FSM is anywhere in
+    // the writeback / DDR-fetch / CDC-gap chain — i.e., whenever the CPU is
+    // waiting on us beyond a single-cycle hit.
+    //
+    // i_stat_clear pulses for one cycle and zeros every counter; CACHE_INFO is
+    // a static geometry descriptor decoded by the MMIO read mux.
+    // -------------------------------------------------------------------------
+    // Sized intermediates so each field of the concat has the correct width.
+    // CACHE_SIZE is an unsized integer parameter, so naked use inside {} would
+    // pad/widen unpredictably — bind to explicit-width localparams first.
+    localparam [31:0] LP_CACHE_TOTAL_BYTES = CACHE_SIZE * 2 * 16;  // ways × sets × line_bytes
+    localparam [15:0] LP_CACHE_NUM_SETS    = CACHE_SIZE;
+    localparam [ 7:0] LP_CACHE_LINE_BYTES  = 8'd16;
+    localparam [ 7:0] LP_CACHE_NUM_WAYS    = 8'd2;
+    localparam [63:0] LP_CACHE_INFO = {
+        LP_CACHE_TOTAL_BYTES,   // [63:32]
+        LP_CACHE_LINE_BYTES,    // [31:24]
+        LP_CACHE_NUM_SETS,      // [23: 8]
+        LP_CACHE_NUM_WAYS       // [ 7: 0]
+    };
+    assign o_cache_info = LP_CACHE_INFO;
+
+    wire is_miss_path = (state == WRITE_MISS_EVICT) ||
+                        (state == WRITE_EVICT_DONE) ||
+                        (state == WRITE_EVICT_GAP)  ||
+                        (state == WRITE_FETCH)      ||
+                        (state == READ_EVICT)       ||
+                        (state == READ_EVICT_DONE)  ||
+                        (state == READ_EVICT_GAP)   ||
+                        (state == READ_WAIT);
+
+    initial begin
+        o_cnt_read_hits    = 64'd0;
+        o_cnt_read_misses  = 64'd0;
+        o_cnt_write_hits   = 64'd0;
+        o_cnt_write_misses = 64'd0;
+        o_cnt_writebacks   = 64'd0;
+        o_cnt_stall_cycles = 64'd0;
+    end
+
+    always @(posedge i_Clk) begin
+        if (i_stat_clear) begin
+            o_cnt_read_hits    <= 64'd0;
+            o_cnt_read_misses  <= 64'd0;
+            o_cnt_write_hits   <= 64'd0;
+            o_cnt_write_misses <= 64'd0;
+            o_cnt_writebacks   <= 64'd0;
+            o_cnt_stall_cycles <= 64'd0;
+        end else begin
+            if (state == CHECK) begin
+                if (!r_is_write &&  r_cache_hit)              o_cnt_read_hits    <= o_cnt_read_hits    + 64'd1;
+                if (!r_is_write && !r_cache_hit)              o_cnt_read_misses  <= o_cnt_read_misses  + 64'd1;
+                if ( r_is_write &&  r_cache_hit)              o_cnt_write_hits   <= o_cnt_write_hits   + 64'd1;
+                if ( r_is_write && !r_cache_hit)              o_cnt_write_misses <= o_cnt_write_misses + 64'd1;
+                if (!r_cache_hit && r_evict_dirty)            o_cnt_writebacks   <= o_cnt_writebacks   + 64'd1;
+            end
+            if (is_miss_path)                                 o_cnt_stall_cycles <= o_cnt_stall_cycles + 64'd1;
+        end
+    end
 
     // -------------------------------------------------------------------------
     // Clock wizard and DDR2 controller
