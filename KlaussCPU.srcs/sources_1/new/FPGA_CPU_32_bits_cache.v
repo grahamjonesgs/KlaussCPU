@@ -297,8 +297,13 @@ module FPGA_CPU_32_bits_cache (
    wire [31:0] w_mmio_addr;
    wire [63:0] w_mmio_write_data;
    wire [ 7:0] w_mmio_byte_en;
-   reg  [63:0] r_mmio_read_data;
-   wire        w_mmio_ready = 1'b1;   // simple regs ready instantly
+   reg  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always @*)
+   reg  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
+   reg         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
+   // MMIO writes complete in 1 cycle (write-side has no read-data path).
+   // MMIO reads now take 2 cycles: cycle 1 captures decode into the FF,
+   // cycle 2 asserts ready so the CPU FSM samples r_mmio_read_data.
+   wire        w_mmio_ready = w_mmio_write_DV | r_mmio_read_dv_d;
    wire w_mem_ready;
    reg [31:0] r_opcode_mem;
    reg [31:0] r_var1_mem;
@@ -359,6 +364,20 @@ module FPGA_CPU_32_bits_cache (
      r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
      // Stage 3: register (PREG)
      r_mul_pipe2 <= r_mul_pipe1;
+  end
+
+  // Free-running millisecond clock since FPGA boot. Lives in its own always
+  // block so it ticks every cycle, independent of the main FSM, UART
+  // break/command handling, and reset logic. Initial values come from the
+  // top-level initial block (r_clock_ms = 0, r_clock_ms_div = 0). 64-bit
+  // counter wraps in ~5.8e8 years at 100 MHz; the divider wraps every 1 ms.
+  always @(posedge i_Clk) begin
+     if (r_clock_ms_div >= 17'd99_999) begin
+        r_clock_ms_div <= 17'd0;
+        r_clock_ms     <= r_clock_ms + 64'd1;
+     end else begin
+        r_clock_ms_div <= r_clock_ms_div + 17'd1;
+     end
   end
 
 
@@ -475,52 +494,69 @@ module FPGA_CPU_32_bits_cache (
    );
 
    // -------------------------------------------------------------------------
-   // MMIO read mux — combinational; reads return current peripheral state.
+   // MMIO read mux — combinational decode into r_mmio_read_data_comb.
+   // The result is registered into r_mmio_read_data (FF) below to break the
+   // long combinational path from peripheral state regs through bus_splitter
+   // and into the UART helpers' FSMs (which gate the main CPU r_SM/r_PC CE).
+   // Reads therefore take 2 cycles: address valid in cycle N → comb decode in
+   // cycle N → registered into r_mmio_read_data at edge N+1 → ready pulses in
+   // cycle N+1 so the CPU FSM samples it.
    // Returns zero for undefined offsets (treat as scratch / write-only).
    // See MMIO_MAP.md for the full memory map.
    // -------------------------------------------------------------------------
    always @* begin
-      r_mmio_read_data = 64'h0;
+      r_mmio_read_data_comb = 64'h0;
       case (w_mmio_addr[27:16])
-         12'h000: r_mmio_read_data = w_sd_read_data;  // SD card
+         12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
          12'h002: begin  // RGB LEDs
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data = {52'b0, r_RGB_LED_1};
-               16'h0008: r_mmio_read_data = {52'b0, r_RGB_LED_2};
-               default:  r_mmio_read_data = 64'h0;
+               16'h0000: r_mmio_read_data_comb = {52'b0, r_RGB_LED_1};
+               16'h0008: r_mmio_read_data_comb = {52'b0, r_RGB_LED_2};
+               default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h003: begin  // 7-segment display (raw padded values)
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data = {32'b0, r_seven_seg_value2};
-               16'h0008: r_mmio_read_data = {32'b0, r_seven_seg_value1};
-               16'h0010: r_mmio_read_data = {r_seven_seg_value1, r_seven_seg_value2};
-               default:  r_mmio_read_data = 64'h0;
+               16'h0000: r_mmio_read_data_comb = {32'b0, r_seven_seg_value2};
+               16'h0008: r_mmio_read_data_comb = {32'b0, r_seven_seg_value1};
+               16'h0010: r_mmio_read_data_comb = {r_seven_seg_value1, r_seven_seg_value2};
+               default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h004: begin  // LEDs (RW) and switches (RO)
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data = {48'b0, o_led};
-               16'h0008: r_mmio_read_data = {48'b0, i_switch};
-               default:  r_mmio_read_data = 64'h0;
+               16'h0000: r_mmio_read_data_comb = {48'b0, o_led};
+               16'h0008: r_mmio_read_data_comb = {48'b0, i_switch};
+               default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data = {60'b0, r_int_mask};
-               16'h0008: r_mmio_read_data = {63'b0, r_timer_interrupt};
-               16'h0010: r_mmio_read_data = {32'b0, r_interrupt_table[0]};
-               16'h0018: r_mmio_read_data = {32'b0, r_interrupt_table[1]};
-               16'h0020: r_mmio_read_data = {32'b0, r_interrupt_table[2]};
-               16'h0028: r_mmio_read_data = {32'b0, r_interrupt_table[3]};
-               16'h0030: r_mmio_read_data = {32'b0, r_timer_period};
-               16'h0038: r_mmio_read_data = {32'b0, r_timer_interrupt_counter};
-               16'h0040: r_mmio_read_data = r_clock_ms;
-               default:  r_mmio_read_data = 64'h0;
+               16'h0000: r_mmio_read_data_comb = {60'b0, r_int_mask};
+               16'h0008: r_mmio_read_data_comb = {63'b0, r_timer_interrupt};
+               16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
+               16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
+               16'h0020: r_mmio_read_data_comb = {32'b0, r_interrupt_table[2]};
+               16'h0028: r_mmio_read_data_comb = {32'b0, r_interrupt_table[3]};
+               16'h0030: r_mmio_read_data_comb = {32'b0, r_timer_period};
+               16'h0038: r_mmio_read_data_comb = {32'b0, r_timer_interrupt_counter};
+               16'h0040: r_mmio_read_data_comb = r_clock_ms;
+               default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
-         default: r_mmio_read_data = 64'h0;
+         default: r_mmio_read_data_comb = 64'h0;
       endcase
+   end
+
+   // Pipeline FF on the MMIO read return path. The FF on r_mmio_read_data
+   // breaks the path from peripheral RAMs/regs (notably the SD sector buffer)
+   // through bus_splitter and into uart_send_msg/uart_rx, which gate the
+   // main CPU r_SM/r_PC clock enables. r_mmio_read_dv_d generates the
+   // 1-cycle-delayed ready pulse so the CPU samples r_mmio_read_data on the
+   // cycle after the read strobe.
+   always @(posedge i_Clk) begin
+      r_mmio_read_data <= r_mmio_read_data_comb;
+      r_mmio_read_dv_d <= w_mmio_read_DV;
    end
 
    mem_read_write mem_read_write (
@@ -816,15 +852,6 @@ rams_sp_nc rams_sp_nc1 (
             r_timer_interrupt_counter_sec <= r_timer_interrupt_counter_sec + 1;
          end
 
-         // Free-running millisecond clock — increments every 100_000 cycles
-         // (1 ms at 100 MHz). Exposed read-only at MMIO 0xF00F_0040.
-         if (r_clock_ms_div >= 17'd99_999) begin
-            r_clock_ms_div <= 17'd0;
-            r_clock_ms     <= r_clock_ms + 64'd1;
-         end else begin
-            r_clock_ms_div <= r_clock_ms_div + 17'd1;
-         end
-
          //=====================================================================
          // MMIO write handler — fires when bus_splitter routes a CPU store
          // (LD/ST opcode → r_mem_write_DV) to an MMIO address (top nibble 'F).
@@ -1078,8 +1105,6 @@ rams_sp_nc rams_sp_nc1 (
                   r_timer_interrupt_counter <= 0;
                   r_int_mask <= 4'h0;            // all sources masked until program enables
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
-                  r_clock_ms <= 64'h0;            // millisecond clock starts at 0 per program run
-                  r_clock_ms_div <= 17'h0;
                   r_timing_start <= 0;
                   r_zero_flag <= 0;
                   t_tx_message(8'd1);  // Load OK message

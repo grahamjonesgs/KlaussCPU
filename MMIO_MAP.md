@@ -31,8 +31,13 @@ Reserved ranges read as 0 and ignore writes (no bus error).
   read/written; bits outside the register-defined width read as 0.
 - **MMIO is never cached.** The splitter sits in front of the cache, so reads
   always reflect current device state and writes take effect immediately.
-- MMIO ready is single-cycle for all current devices. A store opcode therefore
-  completes one cycle after the strobe, identical to a cache-hit DRAM store.
+- MMIO writes complete in a single cycle (no read-data path involved).
+- MMIO reads take two cycles: the read strobe is captured in cycle 1, the
+  registered data and `ready` arrive in cycle 2. The pipeline FF on the
+  read return path (`r_mmio_read_data` in `FPGA_CPU_32_bits_cache.v`) is
+  what enables timing closure — without it the combinational path from
+  peripheral RAMs through `bus_splitter` and into the UART helpers blows
+  through the 100 MHz budget.
 - Writes to undefined offsets within a mapped device are silently dropped.
 - Reads from undefined offsets return 0.
 
@@ -155,12 +160,14 @@ opcode is `IRET` (return from handler) — everything else is configured here.
 | 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (reserved). |
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
 | 0x0038  | `TIMER_COUNT`  | R  | 32    | Live cycle counter — useful for profiling. |
-| 0x0040  | `CLOCK_MS`     | R  | 64    | Free-running millisecond counter since program load. Increments every 100 000 cycles at the assumed 100 MHz `i_Clk`. 64-bit so it takes ~5.8 × 10⁸ years to wrap. |
+| 0x0040  | `CLOCK_MS`     | R  | 64    | Free-running millisecond counter since FPGA power-on. Increments every 100 000 cycles at the 100 MHz `i_Clk` (constrained in `nexys_ddr.xdc`). 64-bit so it takes ~5.8 × 10⁸ years to wrap. Not reset by `CPU_RESETN` or by program load — programs that need a "time since started" value should snapshot it on entry. |
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
-0x000F_FFFF` (≈ 10.5 ms at 100 MHz), `CLOCK_MS = 0`. Interrupts are therefore
-disabled at boot until software writes a vector and unmasks the source; the
-millisecond clock starts from zero on every program load.
+0x000F_FFFF` (≈ 10.5 ms at 100 MHz), `CLOCK_MS = 0` (at FPGA power-on only).
+Interrupts are disabled at boot until software writes a vector and unmasks
+the source. `CLOCK_MS` keeps ticking across `CPU_RESETN` and program loads —
+it represents real time since the FPGA was configured, not since the
+program started.
 
 **Atomicity of `CLOCK_MS`:** read it as a single 64-bit `MEMGET64` to avoid
 tearing — the upper half can change between two 32-bit reads. There is no
