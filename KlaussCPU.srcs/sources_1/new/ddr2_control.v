@@ -181,9 +181,21 @@ module ddr2_control (
          app_wdf_wren <= 0;
       end else begin
          case (state)
+            // IDLE: stay here until BOTH synced DVs are deasserted before
+            // returning to WAIT. This is critical for CDC correctness:
+            // synced_*_dv come from a 2-FF synchroniser, so they lag the CPU's
+            // actual deassertion by ~2 ui_clk. Without this gate, after a
+            // WRITE_DONE→IDLE→WAIT transition we would re-sample synced_write_dv
+            // as still high (because the CPU has lowered i_mem_write_DV but the
+            // 0 hasn't propagated yet) and immediately re-fire WRITE → another
+            // o_mem_ready pulse. The cache's WRITE_FETCH/READ_WAIT then sees
+            // that spurious ready as the read completion, latching stale
+            // o_mem_read_data into the cache line and corrupting DRAM on
+            // subsequent evictions. Holding IDLE until DV=0 forces the cache to
+            // produce a real rising edge for the next transaction.
             IDLE: begin
                o_mem_ready <= 1'b0;
-               if (calib_done) begin
+               if (calib_done & ~synced_write_dv & ~synced_read_dv) begin
                   state <= WAIT;
                end
             end
