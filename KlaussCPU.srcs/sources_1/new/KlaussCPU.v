@@ -110,14 +110,17 @@ module KlaussCPU (
    localparam DUMP_ERR_PC     = 7'd1;
    localparam DUMP_OPC_SP     = 7'd2;
    localparam DUMP_V1_V2      = 7'd3;
-   localparam DUMP_FLAGS_A    = 7'd4;   // Z E C V
-   localparam DUMP_FLAGS_B    = 7'd5;   // S L U
-   localparam DUMP_INSTR      = 7'd6;   // INSTR=NNNNNNNN — instructions committed since program load
-   localparam DUMP_REG_BASE   = 7'd7;   // R0..RF → phases  7..22
-   localparam DUMP_STACK_BASE = 7'd23;  // S0..S3 → phases 23..26 (each preceded by a DDR2 read)
-   localparam DUMP_TRACE_BASE = 7'd27;  // T0..TF → phases 27..42 (newest-first)
-   localparam DUMP_MEM_BASE   = 7'd43;  // M00..M1F → phases 43..74 — first 32 doublewords of DRAM (each preceded by a DDR2 read)
-   localparam DUMP_FOOTER     = 7'd75;  // last phase; on completion → HCF_2
+   localparam DUMP_V1H        = 7'd4;   // V1H=xxxxxxxx — hi32 of 64-bit immediate (DRAM read at PC+8)
+   localparam DUMP_OPCM       = 7'd5;   // OPCM=xxxxxxxx — DRAM-side re-read at PC; differ from OPC ⇒ cache mismatch
+   localparam DUMP_SM         = 7'd6;   // SM=xxxxxxxxx — FSM state (33-bit one-hot, 9 hex digits)
+   localparam DUMP_IV0        = 7'd7;   // IV0=xxxxxxxx — timer ISR vector (r_interrupt_table[0])
+   localparam DUMP_FLAGS_A    = 7'd8;   // Z E C V
+   localparam DUMP_FLAGS_B    = 7'd9;   // S L U
+   localparam DUMP_INSTR      = 7'd10;  // INSTR=NNNNNNNN — instructions committed since program load
+   localparam DUMP_REG_BASE   = 7'd11;  // R0..RF → phases 11..26
+   localparam DUMP_STACK_BASE = 7'd27;  // S0..S3 → phases 27..30 (each preceded by a DDR2 read)
+   localparam DUMP_TRACE_BASE = 7'd31;  // T0..TF → phases 31..46 (newest-first)
+   localparam DUMP_FOOTER     = 7'd47;  // last phase; on completion → HCF_2
 
    // UART receive control
    wire [7:0] w_uart_rx_value;  // Received value
@@ -147,6 +150,13 @@ module KlaussCPU (
 
    // Machine control
    reg [32:0] r_SM;   // 33 bits: bit 32 is ALU_FINISH (added for 64-bit ALU pipeline)
+   // Snapshot of r_SM at fault time.  r_SM gets overwritten by the HCF chain
+   // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping r_SM directly
+   // is useless.  We continuously copy r_SM into r_fault_sm while the FSM is
+   // in any *non-HCF* state; the moment the trap fires, r_fault_sm freezes
+   // at the state that was running immediately before the transition into
+   // HCF_1, which is what we actually want in the crash dump.
+   reg [32:0] r_fault_sm = 33'b0;
    reg [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
    reg [31:0] r_mem_read_addr;
    wire [31:0] w_opcode;
@@ -437,6 +447,17 @@ module KlaussCPU (
     always @(posedge i_Clk) begin
        r_reg_port_a <= r_register[r_reg_1];
        r_reg_port_b <= r_register[r_reg_2];
+   end
+
+   // Track the last non-HCF FSM state so the crash dump can show what was
+   // executing at the moment of the trap.  All five HCF states are excluded
+   // — HCF_1 fires first, then the chain walks through HCF_DUMP / HCF_2..4
+   // and would otherwise overwrite the snapshot before the dump emits.
+   always @(posedge i_Clk) begin
+      if ((r_SM != HCF_1) && (r_SM != HCF_DUMP) &&
+          (r_SM != HCF_2) && (r_SM != HCF_3) && (r_SM != HCF_4)) begin
+         r_fault_sm <= r_SM;
+      end
    end
 
    // UART TX break generation — holds o_uart_tx low to signal program end
@@ -1388,15 +1409,16 @@ rams_sp_nc rams_sp_nc1 (
                               r_mem_read_DV  <= 1'b1;
                               r_hcf_dump_sub <= 3'b011;
                            end
-                        end else if ((r_hcf_dump_phase >= DUMP_MEM_BASE)
-                                  && (r_hcf_dump_phase <  DUMP_MEM_BASE + 7'd32)
-                                  && !r_hcf_stack_loaded) begin
-                           // Diagnostic dump of the first 32 doublewords of DRAM
-                           // (M00..M1F).  Reuses r_hcf_stack_data / _loaded
-                           // since both are DDR2-read-then-emit phases.
-                           // Address = (phase - DUMP_MEM_BASE) << 3, in the
-                           // 0x00..0xF8 byte range.
-                           r_mem_addr     <= ({25'b0, r_hcf_dump_phase - DUMP_MEM_BASE} << 3);
+                        end else if (r_hcf_dump_phase == DUMP_V1H && !r_hcf_stack_loaded) begin
+                           // Read DRAM at PC+8 to recover the hi32 of a 64-bit
+                           // immediate (V64 encoding: lo32 at PC+4, hi32 at PC+8).
+                           r_mem_addr     <= r_PC + 32'd8;
+                           r_mem_read_DV  <= 1'b1;
+                           r_hcf_dump_sub <= 3'b011;
+                        end else if (r_hcf_dump_phase == DUMP_OPCM && !r_hcf_stack_loaded) begin
+                           // Re-read DRAM at PC.  If this disagrees with OPC,
+                           // the opcode cache is incoherent with DRAM.
+                           r_mem_addr     <= r_PC;
                            r_mem_read_DV  <= 1'b1;
                            r_hcf_dump_sub <= 3'b011;
                         end else begin
@@ -1422,12 +1444,12 @@ rams_sp_nc rams_sp_nc1 (
                   3'b010: begin
                      if (i_msg_sent_DV) begin
                         r_hcf_dump_sub <= 3'b000;
-                        // Leaving a stack or memory-dump phase invalidates the
-                        // cached read so the next phase fetches fresh data.
+                        // Leaving a DDR2-fetch phase invalidates the cached
+                        // read so the next phase fetches fresh data.
                         if (((r_hcf_dump_phase >= DUMP_STACK_BASE)
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
-                         || ((r_hcf_dump_phase >= DUMP_MEM_BASE)
-                          && (r_hcf_dump_phase <  DUMP_MEM_BASE   + 7'd32))) begin
+                         || (r_hcf_dump_phase == DUMP_V1H)
+                         || (r_hcf_dump_phase == DUMP_OPCM)) begin
                            r_hcf_stack_loaded <= 1'b0;
                         end
                         if (r_hcf_dump_phase == DUMP_FOOTER) begin

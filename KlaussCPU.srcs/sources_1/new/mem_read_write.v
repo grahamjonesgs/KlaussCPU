@@ -283,8 +283,19 @@ module mem_read_write (
         case (state)
 
             // ------------------------------------------------------------------
+            // PRE_WAIT runs the cycle after a transaction completes (each
+            // completion path sets o_mem_ready=1 and state<=PRE_WAIT).  The
+            // ready pulse must be visible to the CPU for exactly one cycle:
+            // longer than that and a CPU FSM that issues a back-to-back
+            // request (e.g. OPCODE_REQUEST → OPCODE_FETCH on the timer-
+            // interrupt push→fetch path) will see the *previous* transaction's
+            // stale ready in its new state and latch garbage from
+            // o_mem_read_data.  Clearing ready here — not in WAIT — gives a
+            // clean low edge before the next request can be picked up.
             PRE_WAIT: begin
-                state <= WAIT;
+                o_mem_ready      <= 0;
+                o_mem_next_valid <= 0;
+                state            <= WAIT;
             end
 
             // ------------------------------------------------------------------

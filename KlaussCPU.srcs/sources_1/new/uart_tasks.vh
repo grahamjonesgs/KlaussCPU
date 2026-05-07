@@ -635,12 +635,17 @@ endtask
 //   1           "ERR=xx PC=xxxxxxxx"
 //   2           "OPC=xxxxxxxx SP=xxxxxxxx"
 //   3           "V1=xxxxxxxx IDX=xxxxxxxx"
-//   4           "FLG Z=x E=x C=x V=x"
-//   5           "    S=x L=x U=x"
-//   6..21       "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF, hex index)
-//   22..25      "SX=NNNNNNNNNNNNNNNN"       4 top-of-stack doublewords (S0..S3)
-//   26..41      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
-//   42          "*** END ***"               (footer)
+//   4           "V1H=xxxxxxxx"              (hi32 of V64 immediate; DRAM read at PC+8)
+//   5           "OPCM=xxxxxxxx"             (DRAM-side re-read at PC; differ from OPC ⇒ cache mismatch)
+//   6           "SM=xxxxxxxxx"              (FSM state, 33-bit one-hot)
+//   7           "IV0=xxxxxxxx"              (timer ISR vector, r_interrupt_table[0])
+//   8           "FLG Z=x E=x C=x V=x"
+//   9           "    S=x L=x U=x"
+//   10          "INSTR=NNNNNNNN"            (committed instruction count)
+//   11..26      "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF, hex index)
+//   27..30      "SX=NNNNNNNNNNNNNNNN"       4 top-of-stack doublewords (S0..S3)
+//   31..46      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
+//   47          "*** END ***"               (footer)
 task t_hcf_dump_build_line;
     reg [5:0]  k_phase;     // phase relative to base for repeated phases
     reg [3:0]  trace_pos;   // ring index for trace lookup
@@ -767,6 +772,96 @@ task t_hcf_dump_build_line;
                 r_msg_length     <= 8'd26;
             end
 
+            DUMP_V1H: begin
+                // "V1H=xxxxxxxx\r\n"  (14 bytes)
+                // hi32 of a 64-bit immediate (V64 ops: SETR64, PUSHV64).
+                // DDR2 read at PC+8 was issued in PREP; r_hcf_stack_data
+                // holds the full doubleword.  PC+8 has the same bit-2 parity
+                // as PC, so the same r_PC[2] selects the right 32-bit half.
+                r_msg[ 0*8 +: 8] <= "V";
+                r_msg[ 1*8 +: 8] <= "1";
+                r_msg[ 2*8 +: 8] <= "H";
+                r_msg[ 3*8 +: 8] <= "=";
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[63:60] : r_hcf_stack_data[31:28]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[59:56] : r_hcf_stack_data[27:24]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[55:52] : r_hcf_stack_data[23:20]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[51:48] : r_hcf_stack_data[19:16]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[47:44] : r_hcf_stack_data[15:12]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[43:40] : r_hcf_stack_data[11: 8]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[39:36] : r_hcf_stack_data[ 7: 4]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[35:32] : r_hcf_stack_data[ 3: 0]);
+                r_msg[12*8 +: 8] <= 8'h0D;
+                r_msg[13*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd14;
+            end
+
+            DUMP_OPCM: begin
+                // "OPCM=xxxxxxxx\r\n"  (15 bytes)
+                // Re-read DRAM at PC and pick the same 32-bit half OPC came
+                // from.  Mismatch with OPC means the opcode cache is stale.
+                r_msg[ 0*8 +: 8] <= "O";
+                r_msg[ 1*8 +: 8] <= "P";
+                r_msg[ 2*8 +: 8] <= "C";
+                r_msg[ 3*8 +: 8] <= "M";
+                r_msg[ 4*8 +: 8] <= "=";
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[63:60] : r_hcf_stack_data[31:28]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[59:56] : r_hcf_stack_data[27:24]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[55:52] : r_hcf_stack_data[23:20]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[51:48] : r_hcf_stack_data[19:16]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[47:44] : r_hcf_stack_data[15:12]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[43:40] : r_hcf_stack_data[11: 8]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[39:36] : r_hcf_stack_data[ 7: 4]);
+                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[35:32] : r_hcf_stack_data[ 3: 0]);
+                r_msg[13*8 +: 8] <= 8'h0D;
+                r_msg[14*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd15;
+            end
+
+            DUMP_SM: begin
+                // "SM=xxxxxxxxx\r\n"  (14 bytes)
+                // FSM state at fault time, snapshotted before the HCF chain
+                // overwrites r_SM (see r_fault_sm tracker in KlaussCPU.v).
+                // 33 bits one-hot; top nibble carries only bit 32 (ALU_FINISH).
+                r_msg[ 0*8 +: 8] <= "S";
+                r_msg[ 1*8 +: 8] <= "M";
+                r_msg[ 2*8 +: 8] <= "=";
+                r_msg[ 3*8 +: 8] <= return_ascii_from_hex({3'b0, r_fault_sm[32]});
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_fault_sm[31:28]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_fault_sm[27:24]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_fault_sm[23:20]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_fault_sm[19:16]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_fault_sm[15:12]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_fault_sm[11: 8]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_fault_sm[ 7: 4]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_fault_sm[ 3: 0]);
+                r_msg[12*8 +: 8] <= 8'h0D;
+                r_msg[13*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd14;
+            end
+
+            DUMP_IV0: begin
+                // "IV0=xxxxxxxx\r\n"  (14 bytes)
+                // Timer ISR entry vector — value of r_interrupt_table[0] at
+                // crash time.  Compare against PC: if PC matches, the timer
+                // interrupt dispatched correctly and any subsequent fault is
+                // in the ISR body; if PC differs, the dispatch went wrong.
+                r_msg[ 0*8 +: 8] <= "I";
+                r_msg[ 1*8 +: 8] <= "V";
+                r_msg[ 2*8 +: 8] <= "0";
+                r_msg[ 3*8 +: 8] <= "=";
+                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][31:28]);
+                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][27:24]);
+                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][23:20]);
+                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][19:16]);
+                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][15:12]);
+                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][11: 8]);
+                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][ 7: 4]);
+                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][ 3: 0]);
+                r_msg[12*8 +: 8] <= 8'h0D;
+                r_msg[13*8 +: 8] <= 8'h0A;
+                r_msg_length     <= 8'd14;
+            end
+
             DUMP_FLAGS_A: begin
                 // "FLG Z=x E=x C=x V=x\r\n"  (21 bytes)
                 r_msg[ 0*8 +: 8] <= "F";
@@ -857,7 +952,7 @@ task t_hcf_dump_build_line;
 
             default: begin
                 // Repeated-line phases — pick the right family from the phase
-                // index.  Order: regs → stack → trace → memory dump (M00..M1F).
+                // index.  Order: regs → stack → trace.
                 if (r_hcf_dump_phase < DUMP_STACK_BASE) begin
                     // ============== Register dump (R0..RF) ==============
                     // "RX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
@@ -913,7 +1008,7 @@ task t_hcf_dump_build_line;
                     r_msg[19*8 +: 8] <= 8'h0D;
                     r_msg[20*8 +: 8] <= 8'h0A;
                     r_msg_length     <= 8'd21;
-                end else if (r_hcf_dump_phase < DUMP_MEM_BASE) begin
+                end else begin
                     // ============== Trace dump (T0..TF, newest-first) ==============
                     // "TX P=xxxxxxxx OP=xxxxxxxx\r\n"  (27 bytes)
                     // T0 is the most-recent fetch; T15 is 16 fetches back.
@@ -950,38 +1045,6 @@ task t_hcf_dump_build_line;
                     r_msg[25*8 +: 8] <= 8'h0D;
                     r_msg[26*8 +: 8] <= 8'h0A;
                     r_msg_length     <= 8'd27;
-                end else begin
-                    // ============== Memory dump (M00..M1F) ==============
-                    // Diagnostic dump of the first 32 doublewords of DRAM
-                    // (byte addresses 0x00..0xF8).  Useful for verifying
-                    // loader integrity for programs > 64 KB.
-                    // "MNN=NNNNNNNNNNNNNNNN\r\n"  (22 bytes)
-                    // Data was pre-fetched in HCF_DUMP STACK_FETCH sub-state
-                    // and is sitting in r_hcf_stack_data.
-                    k_phase = r_hcf_dump_phase - DUMP_MEM_BASE;
-                    r_msg[ 0*8 +: 8] <= "M";
-                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex({2'b00, k_phase[5:4]});
-                    r_msg[ 2*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
-                    r_msg[ 3*8 +: 8] <= "=";
-                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[63:60]);
-                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[59:56]);
-                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[55:52]);
-                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[51:48]);
-                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[47:44]);
-                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[43:40]);
-                    r_msg[10*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[39:36]);
-                    r_msg[11*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[35:32]);
-                    r_msg[12*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[31:28]);
-                    r_msg[13*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[27:24]);
-                    r_msg[14*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[23:20]);
-                    r_msg[15*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[19:16]);
-                    r_msg[16*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[15:12]);
-                    r_msg[17*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[11: 8]);
-                    r_msg[18*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 7: 4]);
-                    r_msg[19*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 3: 0]);
-                    r_msg[20*8 +: 8] <= 8'h0D;
-                    r_msg[21*8 +: 8] <= 8'h0A;
-                    r_msg_length     <= 8'd22;
                 end
             end
         endcase
