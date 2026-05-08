@@ -19,7 +19,10 @@ cache controller.
 0xF003_xxxx                 7-segment
 0xF004_xxxx                 LEDs / switches
 0xF005_xxxx                 cache controller (counters + control)
-0xF006_xxxx – 0xF00E_xxxx   reserved
+0xF006_xxxx                 Ethernet — LiteEth CSRs (control + MDIO + MAC)
+0xF007_xxxx                 reserved (gap inside LiteEth WB space, returns 0)
+0xF008_xxxx                 Ethernet — RX/TX slot SRAM buffers (8 KiB)
+0xF009_xxxx – 0xF00E_xxxx   reserved
 0xF00F_xxxx                 timers / IRQ controller
 ```
 
@@ -200,6 +203,251 @@ void cache_profile(void (*workload)(void)) {
 }
 ```
 
+### Ethernet (LiteEth) — bases `0xF006_0000` (CSR), `0xF008_0000` (SRAM)
+
+10/100 Ethernet via the **LiteEth** open-source MAC ([liteeth_core.v](KlaussCPU.srcs/sources_1/new/liteeth_core.v))
+on the Nexys A7's SMSC LAN8720A RMII PHY. The CPU reaches LiteEth through the
+[eth_mmio_bridge.v](KlaussCPU.srcs/sources_1/new/eth_mmio_bridge.v) which
+translates the 64-bit MMIO bus into LiteEth's 32-bit classic Wishbone slave
+(byte-for-byte, `cpu_byte_addr − 0xF006_0000` → LiteEth WB byte addr).
+
+The MAC handles framing, preamble/SFD, padding, and CRC32. It does **not**
+implement IP, ARP, UDP, or TCP — those live in software (lwIP recommended).
+The hardware exposes a slot-based interface: TX = "stage a frame in slot
+SRAM, write the length, kick the start bit"; RX = "wait for an event, read
+the slot index and length, drain the bytes."
+
+Three address slots are consumed (LiteEth's WB space is wider than one MMIO
+device-id slot):
+
+```
+0xF006_0000 – 0xF006_FFFF   CSR window (control + MDIO + MAC descriptors)
+0xF007_0000 – 0xF007_FFFF   gap (LiteEth WB 0x10000–0x1FFFF; reads 0, writes drop)
+0xF008_0000 – 0xF008_1FFF   slot SRAM (RX0, RX1, TX0, TX1 — 2 KiB each)
+```
+
+#### CSR registers
+
+All registers are 32-bit, byte-addressable. Spacing is 4 bytes (NOT 8 like
+other peripherals — software accesses each as a 32-bit `volatile uint32_t`).
+
+**SoCController (LiteX boilerplate):**
+
+| Offset       | Reg                  | RW | Width | Description |
+|--------------|----------------------|----|-------|-------------|
+| 0x0000       | `CTRL_RESET`         | RW | 2     | `[0]` soc_rst (pulse-reset whole LiteEth core), `[1]` cpu_rst (no-op here, no internal CPU) |
+| 0x0004       | `CTRL_SCRATCH`       | RW | 32    | Software scratchpad (default `0x12345678`) — useful as a connectivity self-test |
+| 0x0008       | `CTRL_BUS_ERRORS`    | RO | 32    | Counter of Wishbone bus errors observed by the SoC controller |
+
+**PHY management (`ethphy`):**
+
+| Offset       | Reg                  | RW | Width | Description |
+|--------------|----------------------|----|-------|-------------|
+| 0x0800       | `PHY_RESET`          | RW | 1     | `[0]` = PHY reset assert (drives the MDIO PLL reset; software sets and clears) |
+| 0x0804       | `MDIO_W`             | RW | 3     | MDIO write port. `[0]` MDC clock bit, `[1]` MDIO output enable, `[2]` MDIO data out (software bit-bangs MDIO using these three bits) |
+| 0x0808       | `MDIO_R`             | RO | 1     | `[0]` live MDIO line value (software samples while bit-banging) |
+
+MDIO is **bit-banged** in software via these three bits — there's no
+hardware MDIO controller. The `liteeth_mdio` C library from LiteX/LiteEth
+or any MDIO-over-GPIO driver works directly; one MDIO transaction takes
+~32–64 software-driven MDC cycles.
+
+**MAC RX (sram_writer = HW writes RX frames into slot SRAM):**
+
+| Offset       | Reg                       | RW | Width | Description |
+|--------------|---------------------------|----|-------|-------------|
+| 0x1000       | `RX_SLOT`                 | RO | 1     | Slot number (0 or 1) of the most recently completed RX frame |
+| 0x1004       | `RX_LENGTH`               | RO | 32    | Byte length of the frame in `RX_SLOT` (header through end of payload, no CRC) |
+| 0x1008       | `RX_ERRORS`               | RO | 32    | Free-running count of frames dropped due to FIFO overflow / preamble error |
+| 0x100C       | `RX_EV_STATUS`            | RO | 1     | `[0]` raw RX-done event source (live state) |
+| 0x1010       | `RX_EV_PENDING`           | RW | 1     | `[0]` latched RX-done event. **Write 1 to clear** (W1C). Read 1 means "a frame is ready in `RX_SLOT`." |
+| 0x1014       | `RX_EV_ENABLE`            | RW | 1     | `[0]` enable RX-done IRQ propagation to the `interrupt` line |
+
+**MAC TX (sram_reader = HW reads slot SRAM and transmits):**
+
+| Offset       | Reg                       | RW | Width | Description |
+|--------------|---------------------------|----|-------|-------------|
+| 0x1018       | `TX_START`                | RW | 1     | Write 1 to start transmitting the frame in `TX_SLOT`. Auto-clears. |
+| 0x101C       | `TX_READY`                | RO | 1     | `[0]` 1 = MAC ready to accept a new TX kick (no frame in flight) |
+| 0x1020       | `TX_LEVEL`                | RO | 1     | `[0]` reserved/depth indicator (LiteEth internal — usually unused) |
+| 0x1024       | `TX_SLOT`                 | RW | 1     | `[0]` slot number (0 or 1) the next `TX_START` will read from |
+| 0x1028       | `TX_LENGTH`               | RW | 32    | Byte length of the frame staged in `TX_SLOT` (header through end of payload; CRC added by MAC) |
+| 0x102C       | `TX_EV_STATUS`            | RO | 1     | `[0]` raw TX-done event source |
+| 0x1030       | `TX_EV_PENDING`           | RW | 1     | `[0]` latched TX-done event. W1C. |
+| 0x1034       | `TX_EV_ENABLE`            | RW | 1     | `[0]` enable TX-done IRQ |
+
+**MAC stats (read-only counters — not reset by anything except FPGA config):**
+
+| Offset       | Reg                                | RW | Width | Description |
+|--------------|------------------------------------|----|-------|-------------|
+| 0x1038       | `MAC_PREAMBLE_CRC`                 | RO | 32    | Combined preamble + CRC error counter (or sticky bits, depending on LiteEth build) |
+| 0x103C       | `MAC_RX_PREAMBLE_ERRORS`           | RO | 32    | RX frames discarded for bad preamble/SFD |
+| 0x1040       | `MAC_RX_CRC_ERRORS`                | RO | 32    | RX frames discarded for failed CRC32 |
+
+#### Slot SRAM
+
+Plain memory — accessed with byte / halfword / word loads and stores.
+Software stages outgoing frames here before kicking `TX_START`, and reads
+incoming frames here after seeing `RX_EV_PENDING` set.
+
+```
+0xF008_0000 – 0xF008_07FF   ETH_RX0   2 KiB RX slot 0
+0xF008_0800 – 0xF008_0FFF   ETH_RX1   2 KiB RX slot 1
+0xF008_1000 – 0xF008_17FF   ETH_TX0   2 KiB TX slot 0
+0xF008_1800 – 0xF008_1FFF   ETH_TX1   2 KiB TX slot 1
+```
+
+Frame layout in a slot (TX or RX) — standard Ethernet II at offset 0:
+
+```
+offset    bytes  field
+------    -----  ----------------------
+0x000     6      destination MAC
+0x006     6      source MAC
+0x00C     2      ethertype (big-endian on the wire — 0x0800 IPv4, 0x0806 ARP, 0x86DD IPv6)
+0x00E     N      payload (IP packet, ARP, etc.)
+```
+
+The MAC handles preamble/SFD on TX (don't include them) and strips them
+on RX. CRC32 is appended on TX and verified-then-discarded on RX. The
+length you write to `TX_LENGTH` and the value you read from `RX_LENGTH`
+both refer to bytes from offset 0 (destination MAC) through the last
+payload byte — i.e. the frame as it appears in the slot, no preamble, no
+CRC.
+
+#### TX path — software flow
+
+```c
+/* Wait until MAC is ready to accept a new frame */
+while (!REG_ETH_TX_READY) { }
+
+/* Stage frame into the slot you'll use (1500 byte MTU + 14-byte header) */
+volatile uint8_t *tx = ETH_TX_SLOT(0);
+tx[0] = dst_mac[0]; ...                /* 14-byte Ethernet header */
+memcpy((void *)&tx[14], payload, len); /* payload */
+
+/* Tell MAC which slot, how big, then kick it */
+REG_ETH_TX_SLOT   = 0;
+REG_ETH_TX_LENGTH = 14 + len;
+REG_ETH_TX_START  = 1;
+
+/* Optional: wait for completion, or rely on TX_EV_PENDING / IRQ */
+while (!(REG_ETH_TX_EV_PENDING & 1)) { }
+REG_ETH_TX_EV_PENDING = 1;             /* W1C the latched event */
+```
+
+The MAC alternates between TX0 and TX1 internally, so software can write
+the next frame into the inactive slot while the current one is in flight
+(double-buffered TX). If single-frame-at-a-time is enough, just always
+use slot 0.
+
+#### RX path — software flow
+
+```c
+/* Poll (or wait on the IRQ) */
+while (!(REG_ETH_RX_EV_PENDING & 1)) { }
+
+uint32_t slot = REG_ETH_RX_SLOT;     /* 0 or 1 */
+uint32_t len  = REG_ETH_RX_LENGTH;   /* including 14-byte header, no CRC */
+volatile uint8_t *rx = ETH_RX_SLOT(slot);
+
+/* Process the frame in place, or copy out: */
+memcpy(my_pbuf, (const void *)rx, len);
+
+/* W1C the event so the MAC can fill the next slot */
+REG_ETH_RX_EV_PENDING = 1;
+```
+
+The MAC will not overwrite a slot whose RX event is still pending — read
+the data first, then clear `RX_EV_PENDING`. With both slots and W1C
+discipline you have a 2-deep ring; if software falls behind by more than
+one frame, subsequent frames increment `RX_ERRORS` and are dropped.
+
+#### Interrupts
+
+LiteEth aggregates RX-done and TX-done into one combined `interrupt`
+output (wired to `w_eth_irq` in [KlaussCPU.v](KlaussCPU.srcs/sources_1/new/KlaussCPU.v)).
+Wiring to a CPU interrupt vector is **Phase 6 of [ETHERNET_PLAN.md](ETHERNET_PLAN.md)**
+— currently the IRQ line is unconnected and software polls the
+`*_EV_PENDING` registers.
+
+Once wired, the ISR distinguishes RX vs TX by reading both `EV_PENDING`
+registers and W1C-clearing whichever fired:
+
+```c
+void eth_isr(void) {
+    if (REG_ETH_RX_EV_PENDING & 1) { handle_rx(); REG_ETH_RX_EV_PENDING = 1; }
+    if (REG_ETH_TX_EV_PENDING & 1) { handle_tx(); REG_ETH_TX_EV_PENDING = 1; }
+}
+```
+
+#### MAC address
+
+LiteEth itself does **not** filter incoming frames by destination MAC —
+all received frames (unicast, multicast, broadcast) land in RX. Software
+filters in the IP stack. This means the "MAC address" is just a value
+software puts into the source-MAC field of outgoing frames; there is no
+hardware register for it.
+
+Recommended: use a locally-administered address (`02:xx:xx:xx:xx:xx`).
+Default for KlaussCPU: `02:00:00:00:00:01`. Override per-board if you
+need uniqueness on the same network.
+
+#### PHY initialization
+
+The LAN8720A needs `ETH_RSTN` low for ≥25 ms at power-up before MDIO
+becomes responsive. The HDL holds reset until `ETH_PHY_RESET` is cleared
+by software; then auto-negotiation runs in the PHY (typically 100 ms).
+Recommended startup sequence:
+
+```c
+/* 1. Hold PHY in reset for ≥ 25 ms (software-controlled), then release */
+REG_ETH_PHY_RESET = 1;
+sleep_ms(30);
+REG_ETH_PHY_RESET = 0;
+sleep_ms(120);                       /* allow auto-negotiation */
+
+/* 2. Sanity check: read PHY ID1 register (PHY internal reg 0x02) via MDIO.
+       Expected for LAN8720A: 0x0007 in low 16 bits.
+       Use a bit-bang MDIO library (or LiteX's mdio.c) operating on
+       REG_ETH_MDIO_W / REG_ETH_MDIO_R per the C22 protocol. */
+
+/* 3. Optional: read PHY register 0x01 (BMSR) for link status, 0x05 (ANLPAR)
+       for negotiated speed. The LAN8720A indicates 100Mbps full-duplex via
+       its native LED behavior — software doesn't strictly need to read it. */
+```
+
+#### Things to be aware of
+
+1. **Endianness on the wire.** Ethernet/IP/TCP all use **big-endian**
+   (network byte order). The CPU is little-endian. Use `htons`/`htonl`
+   when writing multi-byte fields into TX slots, and `ntohs`/`ntohl`
+   when reading from RX slots. lwIP does this for you; raw packet code
+   must do it explicitly.
+
+2. **Slot SRAM is true-dual-port BRAM** — software shouldn't read a TX
+   slot while the MAC is transmitting from it (read result undefined),
+   nor write an RX slot while the MAC is filling it. The
+   `TX_READY`/`RX_EV_PENDING` handshake prevents the bad cases when used
+   correctly. Synthesis prints a warning ([Synth 8-6430]) about this —
+   safe to ignore as long as software respects the protocol.
+
+3. **No MAC-address filtering.** All traffic on the network segment
+   reaches RX, including frames not addressed to us. The IP stack drops
+   irrelevant frames. Don't be surprised by high `RX_*` event rates on a
+   busy network.
+
+4. **`RX_ERRORS` distinguishes drops** — the count increments when an RX
+   frame arrives but both slots are still pending. Use it to detect
+   whether the polling/IRQ loop is keeping up.
+
+5. **Sub-1500 byte slot.** Slot size is **2048 bytes** so up-to-MTU
+   frames fit with headroom. Anything larger (jumbo frames) is
+   **silently truncated**.
+
+6. **No CSR for the MAC address** — confusing if you're used to other
+   MACs. Software's job to put the source-MAC bytes into the TX frame.
+
 ### Timers / interrupts — base `0xF00F_0000`
 
 Per-source interrupt controller and the source-0 timer. The CPU supports up
@@ -331,6 +579,72 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define REG_CLOCK_MS    (*(volatile uint64_t *)(INTC_BASE + 0x0040))   /* atomic 64-bit read */
 
 #define INT_SRC_TIMER   0u
+#define INT_SRC_ETH     1u   /* reserved — wired in Phase 6 of ETHERNET_PLAN.md */
+
+/* Ethernet (LiteEth) — CSRs at 0xF006_xxxx, slot SRAM at 0xF008_xxxx */
+#define ETH_BASE                  (MMIO_BASE + 0x00060000u)
+
+/* SoCController */
+#define REG_ETH_CTRL_RESET        (*(volatile uint32_t *)(ETH_BASE + 0x0000))
+#define REG_ETH_CTRL_SCRATCH      (*(volatile uint32_t *)(ETH_BASE + 0x0004))
+#define REG_ETH_CTRL_BUS_ERRORS   (*(volatile uint32_t *)(ETH_BASE + 0x0008))
+
+/* PHY: reset + bit-banged MDIO */
+#define REG_ETH_PHY_RESET         (*(volatile uint32_t *)(ETH_BASE + 0x0800))
+#define REG_ETH_MDIO_W            (*(volatile uint32_t *)(ETH_BASE + 0x0804))
+#define REG_ETH_MDIO_R            (*(volatile uint32_t *)(ETH_BASE + 0x0808))
+
+#define ETH_MDIO_W_MDC            (1u << 0)   /* MDC clock bit  */
+#define ETH_MDIO_W_OE             (1u << 1)   /* drive MDIO out */
+#define ETH_MDIO_W_MDIO_OUT       (1u << 2)   /* MDIO data out  */
+
+/* MAC RX side (sram_writer = HW writes RX into slot SRAM) */
+#define REG_ETH_RX_SLOT           (*(volatile uint32_t *)(ETH_BASE + 0x1000))
+#define REG_ETH_RX_LENGTH         (*(volatile uint32_t *)(ETH_BASE + 0x1004))
+#define REG_ETH_RX_ERRORS         (*(volatile uint32_t *)(ETH_BASE + 0x1008))
+#define REG_ETH_RX_EV_STATUS      (*(volatile uint32_t *)(ETH_BASE + 0x100C))
+#define REG_ETH_RX_EV_PENDING     (*(volatile uint32_t *)(ETH_BASE + 0x1010))
+#define REG_ETH_RX_EV_ENABLE      (*(volatile uint32_t *)(ETH_BASE + 0x1014))
+
+/* MAC TX side (sram_reader = HW reads slot SRAM, transmits) */
+#define REG_ETH_TX_START          (*(volatile uint32_t *)(ETH_BASE + 0x1018))
+#define REG_ETH_TX_READY          (*(volatile uint32_t *)(ETH_BASE + 0x101C))
+#define REG_ETH_TX_LEVEL          (*(volatile uint32_t *)(ETH_BASE + 0x1020))
+#define REG_ETH_TX_SLOT           (*(volatile uint32_t *)(ETH_BASE + 0x1024))
+#define REG_ETH_TX_LENGTH         (*(volatile uint32_t *)(ETH_BASE + 0x1028))
+#define REG_ETH_TX_EV_STATUS      (*(volatile uint32_t *)(ETH_BASE + 0x102C))
+#define REG_ETH_TX_EV_PENDING     (*(volatile uint32_t *)(ETH_BASE + 0x1030))
+#define REG_ETH_TX_EV_ENABLE      (*(volatile uint32_t *)(ETH_BASE + 0x1034))
+
+/* MAC stats */
+#define REG_ETH_PREAMBLE_CRC      (*(volatile uint32_t *)(ETH_BASE + 0x1038))
+#define REG_ETH_RX_PREAMBLE_ERR   (*(volatile uint32_t *)(ETH_BASE + 0x103C))
+#define REG_ETH_RX_CRC_ERR        (*(volatile uint32_t *)(ETH_BASE + 0x1040))
+
+/* Slot SRAMs (2 KiB each — plain memory, byte-addressable) */
+#define ETH_SRAM_BASE             (MMIO_BASE + 0x00080000u)
+#define ETH_SLOT_SIZE             2048
+#define ETH_RX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x0000 + (n) * ETH_SLOT_SIZE))
+#define ETH_TX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x1000 + (n) * ETH_SLOT_SIZE))
+
+/* Default MAC for KlaussCPU (locally-administered range) */
+#define ETH_DEFAULT_MAC_0   0x02
+#define ETH_DEFAULT_MAC_1   0x00
+#define ETH_DEFAULT_MAC_2   0x00
+#define ETH_DEFAULT_MAC_3   0x00
+#define ETH_DEFAULT_MAC_4   0x00
+#define ETH_DEFAULT_MAC_5   0x01
+
+/* Endianness helpers — wire is big-endian; CPU is little-endian. */
+static inline uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+static inline uint32_t htonl(uint32_t v) {
+    return ((v & 0x000000FFu) << 24)
+         | ((v & 0x0000FF00u) <<  8)
+         | ((v & 0x00FF0000u) >>  8)
+         | ((v & 0xFF000000u) >> 24);
+}
+#define ntohs(v) htons(v)
+#define ntohl(v) htonl(v)
 
 /* Pack a 24-bit RGB triple (R,G,B each 0..15) into a 12-bit register value. */
 static inline uint32_t rgb12(uint8_t r, uint8_t g, uint8_t b) {
@@ -509,6 +823,146 @@ void show_sector_zero(void) {
     REG_SEG_ALL = sig;                  /* lower 4 digits show "55AA" */
 }
 ```
+
+### Ethernet driver (sketch)
+
+Minimal raw-frame driver — the layer that sits underneath an IP/UDP/TCP
+stack (lwIP's `ethernetif.c` would call into something like this).
+Polled here for clarity; switch to ISR-driven when Phase 6 of
+[ETHERNET_PLAN.md](ETHERNET_PLAN.md) wires `w_eth_irq`.
+
+```c
+/* eth.c — KlaussCPU LiteEth driver, raw L2 frames only.
+   Higher layers (ARP/IP/UDP/TCP) live in lwIP or equivalent. */
+#include "mmio.h"
+#include <stdint.h>
+#include <string.h>
+
+/* Per-direction next-slot index — alternate between TX0/TX1 (and RX0/RX1)
+   so the next frame can be staged while the previous one is in flight. */
+static uint8_t tx_next_slot = 0;
+
+void eth_init(void) {
+    /* 1. Hold PHY in reset, then release. ≥25 ms required by LAN8720A. */
+    REG_ETH_PHY_RESET = 1;
+    delay_ms(30);
+    REG_ETH_PHY_RESET = 0;
+    delay_ms(120);                       /* auto-negotiation window */
+
+    /* 2. Enable RX/TX events (still polled until IRQ wiring is done). */
+    REG_ETH_RX_EV_ENABLE = 1;
+    REG_ETH_TX_EV_ENABLE = 1;
+
+    /* 3. Drain any stale event bits left over from POR. */
+    REG_ETH_RX_EV_PENDING = 1;
+    REG_ETH_TX_EV_PENDING = 1;
+}
+
+/* Send `len` bytes from `frame` (must already include the 14-byte Ethernet
+   header — destination MAC, source MAC, ethertype). Returns 0 on success.
+   Blocks until the MAC is ready to take a new frame. */
+int eth_tx(const void *frame, uint32_t len) {
+    if (len < 14 || len > ETH_SLOT_SIZE) return -1;
+
+    /* Wait for the MAC to be free (typically already 1 by the time we get here). */
+    while (!REG_ETH_TX_READY) { }
+
+    uint8_t slot = tx_next_slot;
+    volatile uint8_t *dst = ETH_TX_SLOT(slot);
+    /* memcpy works at any width; the bridge handles 8/16/32-bit accesses
+       via byte enables. Word-at-a-time is fastest. */
+    memcpy((void *)dst, frame, len);
+
+    REG_ETH_TX_SLOT   = slot;
+    REG_ETH_TX_LENGTH = len;
+    REG_ETH_TX_START  = 1;               /* HW kicks transmission */
+
+    tx_next_slot ^= 1;                   /* alternate slot for next call */
+    return 0;
+}
+
+/* Non-blocking receive. If a frame is ready, copy up to `max` bytes into
+   `buf`, return its length; otherwise return 0. Frame includes the 14-byte
+   Ethernet header. CRC is stripped by the MAC. */
+uint32_t eth_rx_poll(void *buf, uint32_t max) {
+    if (!(REG_ETH_RX_EV_PENDING & 1)) return 0;
+
+    uint32_t slot = REG_ETH_RX_SLOT;
+    uint32_t len  = REG_ETH_RX_LENGTH;
+    if (len > max) len = max;
+
+    memcpy(buf, (const void *)ETH_RX_SLOT(slot), len);
+
+    REG_ETH_RX_EV_PENDING = 1;           /* W1C — releases the slot to HW */
+    return len;
+}
+
+/* Build and send an ARP request: who-has `target_ip`, tell `our_ip` / `our_mac`.
+   `our_ip` and `target_ip` in network byte order (big-endian), `our_mac` as
+   six raw bytes. Useful as the first thing to test once frames go on the wire. */
+int eth_send_arp_request(const uint8_t our_mac[6],
+                         uint32_t our_ip_be, uint32_t target_ip_be) {
+    uint8_t f[42];                       /* 14 (ETH) + 28 (ARP) */
+    /* Ethernet header */
+    memset(&f[0], 0xFF, 6);              /* dst = broadcast */
+    memcpy(&f[6], our_mac, 6);           /* src */
+    f[12] = 0x08; f[13] = 0x06;          /* ethertype = ARP (0x0806) */
+    /* ARP payload */
+    f[14] = 0x00; f[15] = 0x01;          /* HTYPE = Ethernet */
+    f[16] = 0x08; f[17] = 0x00;          /* PTYPE = IPv4 */
+    f[18] = 6;    f[19] = 4;             /* HLEN, PLEN */
+    f[20] = 0x00; f[21] = 0x01;          /* OPER = request */
+    memcpy(&f[22], our_mac, 6);          /* sender MAC */
+    f[28] = (our_ip_be >> 24) & 0xFF;
+    f[29] = (our_ip_be >> 16) & 0xFF;
+    f[30] = (our_ip_be >>  8) & 0xFF;
+    f[31] = (our_ip_be      ) & 0xFF;
+    memset(&f[32], 0, 6);                /* target MAC = unknown */
+    f[38] = (target_ip_be >> 24) & 0xFF;
+    f[39] = (target_ip_be >> 16) & 0xFF;
+    f[40] = (target_ip_be >>  8) & 0xFF;
+    f[41] = (target_ip_be      ) & 0xFF;
+    return eth_tx(f, 42);                /* MAC pads to 64 bytes automatically */
+}
+```
+
+### Ethernet bring-up self-test
+
+```c
+#include "mmio.h"
+extern void eth_init(void);
+extern int  eth_tx(const void *frame, uint32_t len);
+extern uint32_t eth_rx_poll(void *buf, uint32_t max);
+
+void eth_selftest(void) {
+    /* 1. Sanity check: scratch register round-trips. */
+    REG_ETH_CTRL_SCRATCH = 0xCAFEBABEu;
+    if (REG_ETH_CTRL_SCRATCH != 0xCAFEBABEu) { REG_SEG_ALL = 0xE0000001; return; }
+
+    /* 2. Bring up PHY. */
+    eth_init();
+
+    /* 3. Send a gratuitous ARP. Watch on a host with `tcpdump -i ethX -e arp`. */
+    static const uint8_t mac[6] = {
+        ETH_DEFAULT_MAC_0, ETH_DEFAULT_MAC_1, ETH_DEFAULT_MAC_2,
+        ETH_DEFAULT_MAC_3, ETH_DEFAULT_MAC_4, ETH_DEFAULT_MAC_5
+    };
+    /* 192.168.1.50 in network byte order */
+    eth_send_arp_request(mac, 0xC0A80132u, 0xC0A80101u);
+
+    /* 4. Receive loop — show length of any incoming frame on the 7-seg. */
+    uint8_t rxbuf[1600];
+    while (1) {
+        uint32_t len = eth_rx_poll(rxbuf, sizeof(rxbuf));
+        if (len) REG_SEG_ALL = len;
+    }
+}
+```
+
+The MDIO bit-bang library and IP/UDP/TCP layers are intentionally
+**not** in the HDL repo — those belong with the firmware, alongside
+lwIP. See [ETHERNET_PLAN.md](ETHERNET_PLAN.md) for the lwIP integration
+plan (`NO_SYS=0` with the existing RTOS).
 
 ## Compiler / linker notes
 

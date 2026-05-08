@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/gjonesblackcyton/Documents/src/llvm-project/llvm/lib/Target/KlaussCPU/**)",
+      "Bash(find /home/graham -path \"*KlaussCPU/runtime*\" -maxdepth 8 2>/dev/null | head *)",
+      "Read(//home/graham/**)"
+    ]
+  }
+}

@@ -54,7 +54,13 @@ module mem_read_write (
     output reg [63:0] o_cnt_write_hits,
     output reg [63:0] o_cnt_write_misses,
     output reg [63:0] o_cnt_writebacks,
-    output reg [63:0] o_cnt_stall_cycles
+    output reg [63:0] o_cnt_stall_cycles,
+
+    // 50 MHz clock for Ethernet RMII REF_CLK — produced by clk_wiz_0
+    // alongside the existing 200 MHz DDR reference clock.  Plumbed up to
+    // the top level so KlaussCPU.v can drive both LiteEth's sys-clock
+    // input and the PHY's ETH_REFCLK pin (via ODDR).
+    output            clk_50
 );
 
     parameter  CACHE_SIZE = 2_048;              // number of sets — 2 ways × 2048 sets = 4096 total lines = 64 KB
@@ -216,6 +222,17 @@ module mem_read_write (
     localparam READ_EVICT_DONE       = 16'd1024;  // wait for writeback, then fetch
     localparam READ_EVICT_GAP        = 16'd2048;  // CDC gap before read DV
     localparam READ_WAIT             = 16'd4096;  // wait for DDR fetch
+    localparam COOL_DOWN             = 16'd8192;  // dead cycle after PRE_WAIT — covers the
+                                                  // 1-cycle return delay added by bus_splitter's
+                                                  // registered output stage. Without it, WAIT
+                                                  // would re-enter while CPU's DV is still high
+                                                  // (CPU sees splitter.ready 1 cycle after cache
+                                                  // asserts it, and only drops DV at the next edge),
+                                                  // causing a spurious re-latch of the same request.
+                                                  // The phantom ready pulses produced by those
+                                                  // re-latches were observed to drive opcode
+                                                  // fetches off stale o_mem_read_data — see
+                                                  // CRASH_DUMP.md ERR=01 trace at PC=0x78.
 
     reg [15:0] state = WAIT;
 
@@ -292,10 +309,28 @@ module mem_read_write (
             // stale ready in its new state and latch garbage from
             // o_mem_read_data.  Clearing ready here — not in WAIT — gives a
             // clean low edge before the next request can be picked up.
+            //
+            // COOL_DOWN is inserted after PRE_WAIT so that WAIT re-entry is
+            // delayed one extra cycle.  Required because bus_splitter now
+            // registers o_mem_ready: the CPU sees ready one cycle after this
+            // module asserts it, and so it drops r_mem_*_DV one cycle later
+            // than the legacy combinational-splitter path expected.  Without
+            // the dead cycle, WAIT runs while the CPU's DV is still high and
+            // re-latches the same request — see CRASH_DUMP.md notes.
             PRE_WAIT: begin
                 o_mem_ready      <= 0;
                 o_mem_next_valid <= 0;
-                state            <= WAIT;
+                state            <= COOL_DOWN;
+            end
+
+            // ------------------------------------------------------------------
+            // COOL_DOWN: one-cycle dead state.  Does NOT inspect i_mem_*_DV, so
+            // any lingering CPU DV (still high while the CPU finishes observing
+            // the registered ready pulse from the splitter) is harmlessly
+            // ignored.  Always advances to WAIT.
+            // ------------------------------------------------------------------
+            COOL_DOWN: begin
+                state <= WAIT;
             end
 
             // ------------------------------------------------------------------
@@ -673,6 +708,8 @@ module mem_read_write (
     clk_wiz_0 clk_wiz_0 (
         .i_Clk  (i_Clk),
         .clk_200(sys_clk_i),
+        .clk_50 (clk_50),
+        .locked (),                // intentionally unused
         .resetn (resetn)
     );
 

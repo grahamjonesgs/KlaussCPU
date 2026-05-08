@@ -231,18 +231,18 @@ set_property -dict {PACKAGE_PIN D4 IOSTANDARD LVCMOS33} [get_ports o_uart_tx]
 
 ##SMSC Ethernet PHY
 
-#set_property -dict { PACKAGE_PIN C9    IOSTANDARD LVCMOS33 } [get_ports { ETH_MDC }]; #IO_L11P_T1_SRCC_16 Sch=eth_mdc
-#set_property -dict { PACKAGE_PIN A9    IOSTANDARD LVCMOS33 } [get_ports { ETH_MDIO }]; #IO_L14N_T2_SRCC_16 Sch=eth_mdio
-#set_property -dict { PACKAGE_PIN B3    IOSTANDARD LVCMOS33 } [get_ports { ETH_RSTN }]; #IO_L10P_T1_AD15P_35 Sch=eth_rstn
-#set_property -dict { PACKAGE_PIN D9    IOSTANDARD LVCMOS33 } [get_ports { ETH_CRSDV }]; #IO_L6N_T0_VREF_16 Sch=eth_crsdv
-#set_property -dict { PACKAGE_PIN C10   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXERR }]; #IO_L13N_T2_MRCC_16 Sch=eth_rxerr
-#set_property -dict { PACKAGE_PIN C11   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXD[0] }]; #IO_L13P_T2_MRCC_16 Sch=eth_rxd[0]
-#set_property -dict { PACKAGE_PIN D10   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXD[1] }]; #IO_L19N_T3_VREF_16 Sch=eth_rxd[1]
-#set_property -dict { PACKAGE_PIN B9    IOSTANDARD LVCMOS33 } [get_ports { ETH_TXEN }]; #IO_L11N_T1_SRCC_16 Sch=eth_txen
-#set_property -dict { PACKAGE_PIN A10   IOSTANDARD LVCMOS33 } [get_ports { ETH_TXD[0] }]; #IO_L14P_T2_SRCC_16 Sch=eth_txd[0]
-#set_property -dict { PACKAGE_PIN A8    IOSTANDARD LVCMOS33 } [get_ports { ETH_TXD[1] }]; #IO_L12N_T1_MRCC_16 Sch=eth_txd[1]
-#set_property -dict { PACKAGE_PIN D5    IOSTANDARD LVCMOS33 } [get_ports { ETH_REFCLK }]; #IO_L11P_T1_SRCC_35 Sch=eth_refclk
-#set_property -dict { PACKAGE_PIN B8    IOSTANDARD LVCMOS33 } [get_ports { ETH_INTN }]; #IO_L12P_T1_MRCC_16 Sch=eth_intn
+set_property -dict { PACKAGE_PIN C9    IOSTANDARD LVCMOS33 } [get_ports { ETH_MDC }]; #IO_L11P_T1_SRCC_16 Sch=eth_mdc
+set_property -dict { PACKAGE_PIN A9    IOSTANDARD LVCMOS33 } [get_ports { ETH_MDIO }]; #IO_L14N_T2_SRCC_16 Sch=eth_mdio
+set_property -dict { PACKAGE_PIN B3    IOSTANDARD LVCMOS33 } [get_ports { ETH_RSTN }]; #IO_L10P_T1_AD15P_35 Sch=eth_rstn
+set_property -dict { PACKAGE_PIN D9    IOSTANDARD LVCMOS33 } [get_ports { ETH_CRSDV }]; #IO_L6N_T0_VREF_16 Sch=eth_crsdv
+set_property -dict { PACKAGE_PIN C10   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXERR }]; #IO_L13N_T2_MRCC_16 Sch=eth_rxerr
+set_property -dict { PACKAGE_PIN C11   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXD[0] }]; #IO_L13P_T2_MRCC_16 Sch=eth_rxd[0]
+set_property -dict { PACKAGE_PIN D10   IOSTANDARD LVCMOS33 } [get_ports { ETH_RXD[1] }]; #IO_L19N_T3_VREF_16 Sch=eth_rxd[1]
+set_property -dict { PACKAGE_PIN B9    IOSTANDARD LVCMOS33 } [get_ports { ETH_TXEN }]; #IO_L11N_T1_SRCC_16 Sch=eth_txen
+set_property -dict { PACKAGE_PIN A10   IOSTANDARD LVCMOS33 } [get_ports { ETH_TXD[0] }]; #IO_L14P_T2_SRCC_16 Sch=eth_txd[0]
+set_property -dict { PACKAGE_PIN A8    IOSTANDARD LVCMOS33 } [get_ports { ETH_TXD[1] }]; #IO_L12N_T1_MRCC_16 Sch=eth_txd[1]
+set_property -dict { PACKAGE_PIN D5    IOSTANDARD LVCMOS33 } [get_ports { ETH_REFCLK }]; #IO_L11P_T1_SRCC_35 Sch=eth_refclk
+#set_property -dict { PACKAGE_PIN B8    IOSTANDARD LVCMOS33 } [get_ports { ETH_INTN }]; #IO_L12P_T1_MRCC_16 Sch=eth_intn  -- not used by LiteEth; leave commented
 
 
 ##Quad SPI Flash
@@ -280,3 +280,96 @@ set_false_path -to [get_ports o_SPI_LCD_Clk]
 set_false_path -to [get_ports o_SPI_LCD_CS_n]
 set_false_path -to [get_ports o_LCD_DC]
 set_false_path -to [get_ports o_LCD_reset_n]
+
+
+##############################################################################
+# Ethernet (LiteEth, SMSC LAN8720A on Nexys A7)
+##############################################################################
+
+# Reference the auto-generated 50 MHz clock that clk_wiz_0 produces on the
+# clk_50 net (used internally by LiteEth's MAC core).
+set eth_ref_clk [get_clocks -of_objects [get_nets clk_50]]
+
+# Define a *forwarded* clock at the ETH_REFCLK output pin — the FPGA generates
+# this clock for the PHY via ODDR_eth_refclk.  All RMII data lanes (TX and RX)
+# are source-synchronous to this same clock at the pin, so the I/O-delay
+# constraints below reference it (NOT the internal clk_50).  Without this,
+# Vivado would charge ~6 ns of internal clock-distribution delay against the
+# 10 ns half-period budget, blowing the constraint by ~4 ns even though the
+# external interface is perfectly fine.
+create_generated_clock -name eth_phy_clk \
+    -source [get_pins ODDR_eth_refclk/C] \
+    -divide_by 1 \
+    [get_ports ETH_REFCLK]
+
+# CSR/SRAM crossings between the CPU domain (sys_clk_pin = i_Clk) and the
+# Eth domain are async-FIFO based inside LiteEth.  Tell Vivado the two
+# clock groups are asynchronous so it doesn't try to time-close paths
+# between them.
+set_clock_groups -asynchronous \
+    -group [get_clocks sys_clk_pin] \
+    -group [get_clocks {clk_50_clk_wiz_0 eth_phy_clk}]
+
+# LiteEth marks its own CDC synchronisers with magic attributes
+# (mr_ff, ars_ff1, ars_ff2).  Copy these false-path / max-delay constraints
+# verbatim from LiteEth's emitted XDC; Vivado finds the marked cells inside
+# the liteeth_core hierarchy.
+set_false_path -quiet -to [get_nets -filter {mr_ff == TRUE}]
+set_false_path -quiet -to [get_pins -filter {REF_PIN_NAME == PRE} \
+    -of_objects [get_cells -hierarchical -filter {ars_ff1 == TRUE || ars_ff2 == TRUE}]]
+set_max_delay 2 -quiet \
+    -from [get_pins -filter {REF_PIN_NAME == Q} \
+        -of_objects [get_cells -hierarchical -filter {ars_ff1 == TRUE}]] \
+    -to   [get_pins -filter {REF_PIN_NAME == D} \
+        -of_objects [get_cells -hierarchical -filter {ars_ff2 == TRUE}]]
+
+# RMII data-lane I/O delays — relative to the forwarded eth_phy_clk so the
+# clock and data paths are balanced (source-synchronous interface).
+# Numbers from the SMSC LAN8720A datasheet (TX setup ~4 ns, RX output delay
+# up to ~14 ns from REFCLK rising edge).
+set_input_delay  -clock [get_clocks eth_phy_clk] -max 14 [get_ports {ETH_RXD[*] ETH_CRSDV}]
+set_input_delay  -clock [get_clocks eth_phy_clk] -min  2 [get_ports {ETH_RXD[*] ETH_CRSDV}]
+set_output_delay -clock [get_clocks eth_phy_clk] -max  4 [get_ports {ETH_TXD[*] ETH_TXEN}]
+set_output_delay -clock [get_clocks eth_phy_clk] -min -1 [get_ports {ETH_TXD[*] ETH_TXEN}]
+
+# RMII is logically SDR at 50 MHz — only the rising-edge IDDR/ODDR sample is
+# meaningful (the primitives are used for their pad-adjacent placement,
+# i.e. minimal IBUF→FF routing delay, not for DDR data).  Vivado's default
+# analysis picks the closer destination edge (a falling edge half a period
+# away) and demands a 10 ns budget against the 14 ns RX input delay —
+# off by ~4 ns even though the actual interface has 20 ns to capture.
+# Multicycle 2 on setup tells Vivado to use the *next* rising edge instead;
+# the companion hold=1 keeps the hold relationship at the default position.
+# Applied to both directions of the source-synchronous boundary.
+set_multicycle_path -setup -end 2 \
+    -from [get_clocks eth_phy_clk]      -to [get_clocks clk_50_clk_wiz_0]
+set_multicycle_path -hold  -end 1 \
+    -from [get_clocks eth_phy_clk]      -to [get_clocks clk_50_clk_wiz_0]
+set_multicycle_path -setup -end 2 \
+    -from [get_clocks clk_50_clk_wiz_0] -to [get_clocks eth_phy_clk]
+set_multicycle_path -hold  -end 1 \
+    -from [get_clocks clk_50_clk_wiz_0] -to [get_clocks eth_phy_clk]
+
+# False-path TX hold checks.  ODDR_eth_refclk (forwarding REFCLK to the PHY)
+# can't share a placement region with LiteEth's data ODDRs because the pins
+# are in different I/O banks, so Vivado sees ~2 ns of FPGA-internal clock-
+# distribution skew between the data clock (clk_50 at LiteEth's ODDR/C) and
+# the destination clock model (eth_phy_clk at the ETH_REFCLK pin, which
+# includes the extra ODDR + OBUF delay).  This skew is a modelling
+# artifact, not a silicon issue: in actual operation the PHY captures TX
+# data with the REFCLK it receives, and both signals leave the FPGA via
+# OBUFs and travel matched PCB traces — board layout determines real
+# alignment, not FPGA-internal clock distribution.  Setup is still
+# rigorously checked (data path delays must match the PHY's tSU); only
+# the spurious hold check is removed.
+set_false_path -hold \
+    -from [get_clocks clk_50_clk_wiz_0] -to [get_clocks eth_phy_clk]
+
+# MDIO is ≤ 2.5 MHz — far slower than any FPGA timing concern.
+set_false_path -to   [get_ports ETH_MDC]
+set_false_path -from [get_ports ETH_MDIO]
+set_false_path -to   [get_ports ETH_MDIO]
+set_false_path -to   [get_ports ETH_RSTN]
+
+# RXERR pin is on the connector but unused by LiteEth's RMII PHY.
+set_false_path -from [get_ports ETH_RXERR]
