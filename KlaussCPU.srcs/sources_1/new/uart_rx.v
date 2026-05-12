@@ -12,8 +12,8 @@
 // (10000000)/(115200) = 87
 `timescale 1ns / 1ps
 module uart_rx #(
-    parameter CLKS_PER_BIT = 100
-)  // was 868
+    parameter CLKS_PER_BIT = 33
+)  // was 868, 100 = 1 Mbaud, 33 = ~3 Mbaud
 (
     input        i_Clock,
     input        i_Rx_Serial,

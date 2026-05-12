@@ -4,8 +4,8 @@
 module uart_tx
 //#(parameter CLKS_PER_BIT=10416) // 9600 baud
 #(
-    parameter CLKS_PER_BIT = 100
-)  // 115200 baud is 868
+    parameter CLKS_PER_BIT = 33
+)  // 115200 baud is 868, 100 = 1 Mbaud, 33 = ~3 Mbaud
 (
     input            i_Clk,
     input            i_Tx_DV,

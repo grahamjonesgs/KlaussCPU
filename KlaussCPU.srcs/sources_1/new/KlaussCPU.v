@@ -500,7 +500,7 @@ module KlaussCPU (
    // UART TX break generation — holds o_uart_tx low to signal program end
    wire       w_uart_tx_serial;   // internal serial output from uart_send_msg
    reg        r_break_active;     // when 1, overrides TX line to low (break)
-   reg [11:0] r_break_counter;    // countdown: 2500 clocks ≈ 2.5 frames
+   reg [11:0] r_break_counter;    // countdown: 2500 clocks ≈ 7.5 frames at CLKS_PER_BIT=33
 
    // Mux: break takes priority over normal TX; idle state is line-high
    assign o_uart_tx  = r_break_active ? 1'b0 : w_uart_tx_serial;
@@ -1628,8 +1628,8 @@ rams_sp_nc rams_sp_nc1 (
                   end
 
                   // BREAK — wait for the footer's UART transmission to fully
-                  // drain, then hold the TX line low for 2500 clocks (~2.5 frame
-                  // times at CLKS_PER_BIT=100) as a UART break.  This mirrors
+                  // drain, then hold the TX line low for 2500 clocks (~7.5 frame
+                  // times at CLKS_PER_BIT=33) as a UART break.  This mirrors
                   // HALTED_BREAK so a host parser can treat the break as the
                   // unambiguous end-of-dump marker, the same way it does for
                   // a clean HALT.  Once the break completes we fall through to
@@ -1843,7 +1843,7 @@ end
 
             HALTED_BREAK: begin
                // Wait for any in-flight TX to finish, then hold line low for
-               // ~2.5 frames (2500 clocks at CLKS_PER_BIT=100) as a UART break,
+               // ~7.5 frames (2500 clocks at CLKS_PER_BIT=33) as a UART break,
                // then transition to HALTED.
                if (r_break_counter == 0) begin
                   if (!w_sending_msg) begin
