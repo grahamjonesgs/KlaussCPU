@@ -223,7 +223,7 @@ device-id slot):
 ```
 0xF006_0000 – 0xF006_FFFF   CSR window (control + MDIO + MAC descriptors)
 0xF007_0000 – 0xF007_FFFF   gap (LiteEth WB 0x10000–0x1FFFF; reads 0, writes drop)
-0xF008_0000 – 0xF008_1FFF   slot SRAM (RX0, RX1, TX0, TX1 — 2 KiB each)
+0xF008_0000 – 0xF008_1FFF   slot SRAM (RX0, RX1 — 2 KiB each; TX0 — 2 KiB; TX1 unused)
 ```
 
 #### CSR registers
@@ -293,9 +293,18 @@ incoming frames here after seeing `RX_EV_PENDING` set.
 ```
 0xF008_0000 – 0xF008_07FF   ETH_RX0   2 KiB RX slot 0
 0xF008_0800 – 0xF008_0FFF   ETH_RX1   2 KiB RX slot 1
-0xF008_1000 – 0xF008_17FF   ETH_TX0   2 KiB TX slot 0
-0xF008_1800 – 0xF008_1FFF   ETH_TX1   2 KiB TX slot 1
+0xF008_1000 – 0xF008_17FF   ETH_TX0   2 KiB TX slot (only one — see below)
+0xF008_1800 – 0xF008_1FFF   unused    (TX1 was here; LiteEth built with ntxslots=1)
 ```
+
+**Only one TX slot.** The LiteEth core is generated with `ntxslots: 1`
+(see [tools/liteeth/liteeth_nexys_a7.yml](tools/liteeth/liteeth_nexys_a7.yml)).
+With the default `ntxslots=2`, `TX_READY` stays high immediately after a
+`TX_START` kick because the FIFO still has room — software that loops
+"wait for ready, kick TX" naturally double-pushes every frame. With a
+single slot, `TX_READY` drops as soon as we kick TX and only returns
+high after `TERMINATE` fires (frame fully on the wire), which is what
+the handshake assumes.
 
 Frame layout in a slot (TX or RX) — standard Ethernet II at offset 0:
 
@@ -336,10 +345,10 @@ while (!(REG_ETH_TX_EV_PENDING & 1)) { }
 REG_ETH_TX_EV_PENDING = 1;             /* W1C the latched event */
 ```
 
-The MAC alternates between TX0 and TX1 internally, so software can write
-the next frame into the inactive slot while the current one is in flight
-(double-buffered TX). If single-frame-at-a-time is enough, just always
-use slot 0.
+Only TX slot 0 is valid (`ntxslots: 1`). Always write `REG_ETH_TX_SLOT = 0`
+and stage into `ETH_TX_SLOT(0)`. Don't double-buffer — kick a TX, wait for
+`TX_READY` to come back high (or watch `TX_EV_PENDING`), then stage the
+next frame.
 
 #### RX path — software flow
 
@@ -621,11 +630,16 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define REG_ETH_RX_PREAMBLE_ERR   (*(volatile uint32_t *)(ETH_BASE + 0x103C))
 #define REG_ETH_RX_CRC_ERR        (*(volatile uint32_t *)(ETH_BASE + 0x1040))
 
-/* Slot SRAMs (2 KiB each — plain memory, byte-addressable) */
+/* Slot SRAMs (2 KiB each — plain memory, byte-addressable).
+ *
+ * Note: LiteEth is built with ntxslots=1, so only ETH_TX_SLOT(0) is valid;
+ * ETH_TX_SLOT(1)'s address window has no backing SRAM.  Two RX slots
+ * (ETH_RX_SLOT(0) and ETH_RX_SLOT(1)) — MAC alternates between them.   */
 #define ETH_SRAM_BASE             (MMIO_BASE + 0x00080000u)
 #define ETH_SLOT_SIZE             2048
 #define ETH_RX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x0000 + (n) * ETH_SLOT_SIZE))
 #define ETH_TX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x1000 + (n) * ETH_SLOT_SIZE))
+#define ETH_TX_SLOT0              ETH_TX_SLOT(0)   /* the only valid TX slot */
 
 /* Default MAC for KlaussCPU (locally-administered range) */
 #define ETH_DEFAULT_MAC_0   0x02
@@ -838,9 +852,9 @@ Polled here for clarity; switch to ISR-driven when Phase 6 of
 #include <stdint.h>
 #include <string.h>
 
-/* Per-direction next-slot index — alternate between TX0/TX1 (and RX0/RX1)
-   so the next frame can be staged while the previous one is in flight. */
-static uint8_t tx_next_slot = 0;
+/* No TX double-buffering: LiteEth is built with ntxslots=1 so we always
+   stage into TX slot 0.  RX has two slots and the MAC alternates; software
+   just reads whichever RX_SLOT the MAC reports. */
 
 void eth_init(void) {
     /* 1. Hold PHY in reset, then release. ≥25 ms required by LAN8720A. */
@@ -864,20 +878,19 @@ void eth_init(void) {
 int eth_tx(const void *frame, uint32_t len) {
     if (len < 14 || len > ETH_SLOT_SIZE) return -1;
 
-    /* Wait for the MAC to be free (typically already 1 by the time we get here). */
+    /* Wait for the MAC's single TX slot to be free.  TX_READY drops as soon
+       as we kick TX_START and only returns high after the frame is fully on
+       the wire — exactly the handshake we want. */
     while (!REG_ETH_TX_READY) { }
 
-    uint8_t slot = tx_next_slot;
-    volatile uint8_t *dst = ETH_TX_SLOT(slot);
+    volatile uint8_t *dst = ETH_TX_SLOT(0);
     /* memcpy works at any width; the bridge handles 8/16/32-bit accesses
        via byte enables. Word-at-a-time is fastest. */
     memcpy((void *)dst, frame, len);
 
-    REG_ETH_TX_SLOT   = slot;
+    REG_ETH_TX_SLOT   = 0;
     REG_ETH_TX_LENGTH = len;
     REG_ETH_TX_START  = 1;               /* HW kicks transmission */
-
-    tx_next_slot ^= 1;                   /* alternate slot for next call */
     return 0;
 }
 

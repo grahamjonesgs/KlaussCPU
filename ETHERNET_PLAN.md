@@ -4,7 +4,11 @@ Tracker for adding 10/100 Ethernet to KlaussCPU using the **LiteEth** open-sourc
 MAC, exposed to the CPU as MMIO. Goal: get to "broadcast frame received in
 software" so we can layer lwIP on top.
 
-**Status:** Phases 1–4 complete (2026-05-08). Bitstream builds with timing met across all clock domains. Phase 5 (bring-up tests) ready to start.
+**Status:** Phases 1–5 complete (2026-05-09). Bidirectional traffic verified
+end-to-end — FPGA's ARP broadcasts are received cleanly by a host running
+tcpdump, FPGA RX correctly parses IPv4 / IPv6 / ARP / multicast frames with
+correct ethertypes and headers. Ready for software-side lwIP integration.
+Phase 6 (interrupt wiring) deferred — polling works.
 
 ---
 
@@ -107,8 +111,17 @@ rather diverge.
 | 4 × 2 KB each direction | More buffering, more BRAM (~16 KB extra). Useful if RX bursts overrun a 2-deep ring. |
 | 2 × 1.5 KB each direction | Tight fit for MTU. Saves ~2 KB BRAM. Not recommended. |
 
-**Decision:** **2 × 2 KB each direction** — _date:_ 2026-05-07. Assumed from
-the recommendation; flag if you'd rather diverge.
+**Decision (2026-05-07):** 2 × 2 KB each direction — LiteEth defaults.
+
+**Revised (2026-05-12):** RX kept at 2 slots; **TX dropped to 1 slot
+(`ntxslots: 1`)** in the generator YAML. Reason discovered during
+bring-up: with two TX slots, `TX_READY` stays high immediately after a
+`TX_START` kick (the FIFO still has room), and software code that loops
+"wait for TX_READY, write next frame, kick" double-pushes every frame.
+With a single TX slot, `TX_READY` drops on kick and only comes back high
+after `TERMINATE` (frame fully on the wire) — which is what the obvious
+handshake expects.  See
+[tools/liteeth/liteeth_nexys_a7.yml](tools/liteeth/liteeth_nexys_a7.yml).
 
 ---
 
@@ -395,6 +408,54 @@ Estimated software-side effort: **another ~1 week** to TCP-listen.
   clk_50]] so it's hierarchy-independent).
 - 2026-05-08 — Phase 4 (MMIO_MAP.md) updated with full Eth section, CSR
   list, slot SRAM layout, software flow notes, and driver sketches.
+- 2026-05-08 — Phase 5 complete. Bring-up worked through several real bugs:
+   1. Bridge address-translation bug for unaligned 32-bit MMIO accesses
+      (high_active path added +1 to a word index that was already at the
+      correct half).  Fixed by aligning the input addr to 8 bytes first
+      and deriving the WB word index purely from byte_en.
+   2. MDIO read off-by-one bit.  The LAN8720A drives D15 already during
+      what spec calls "TA bit 2", so my 2-TA implementation was sampling
+      D14..D0,idle instead of D15..D0.  Fixed by using 1 TA cycle.
+   3. PHY internal loopback (T3) is flaky on this LAN8720A — generates
+      spurious phantom frames in loopback mode even with no link.
+      Documented as a known issue; non-blocking since T4/T5 cover the
+      same datapath with real frames.
+   4. LiteEth regenerated with `endianness: little` (corrected my earlier
+      mistaken setting of `big`).  This is bus byte order, not network
+      byte order — software still handles network byte order via
+      htons/htonl as documented in MMIO_MAP.md.  After regen, byte-level
+      frame parsing works correctly.
+   5. Independent issue surfaced: picolibc printf has a vararg corruption
+      bug at the 4th vararg position on this LLVM target.  Cosmetic
+      (doesn't affect frames), being fixed separately in the toolchain.
+   Real network traffic confirmed: IPv4 unicast, IPv4 multicast (SSDP,
+   mDNS), IPv6 multicast (NDP), ARP, MVRP/STP all parse with correct
+   ethertypes and headers.
+- 2026-05-09 — TX bring-up worked through a deeper timing issue.  The
+  forwarded REFCLK at the PHY pin was arriving 0.64 ns after the data
+  changed (vs LAN8720A's 4 ns tSU), so the PHY missed every frame
+  silently — link stayed up via idle signals, but no data frames hit
+  the wire.  Fix:
+    1. Invert ODDR_eth_refclk (swap D1/D2) so the forwarded REFCLK is
+       180° shifted, centring the PHY's sample point in the middle
+       of the data-valid window.
+    2. Update the SDC generated-clock to `-edges {2 3 4}` so Vivado's
+       STA tracks the inverted phase.
+    3. False-path the spurious falling-edge launch from clk_50 to
+       eth_phy_clk — LiteEth's OPPOSITE_EDGE ODDRs re-emit on both
+       edges, but for RMII SDR D1==D2 so the falling launch is not a
+       real transition.
+    4. Operate at 100M FD with AN enabled (not forced 10M without AN
+       as a debug attempt).  LiteEth's internal RMII speed_detect
+       only tracks correctly when the PHY runs at AN-negotiated speed.
+  FPGA's ARP broadcasts confirmed visible on a host running tcpdump.
+- 2026-05-12 — `ntxslots` reduced from 2 (LiteEth default) to 1 in the
+  generator YAML.  With 2 TX slots, `TX_READY` stays high immediately
+  after `TX_START` because the second slot is still free → the natural
+  software pattern of "while !TX_READY; stage; kick" double-pushes every
+  frame.  With 1 slot, `TX_READY` drops on kick and only returns after
+  `TERMINATE` fires.  MMIO_MAP.md, the C header, and the driver sketch
+  updated to reflect single-slot TX (still 2-slot RX).
 - 2026-05-08 — Timing closed.  Iterations:
    1. First impl: WNS −0.5 ns on a CPU-internal path through bus_splitter's
       combinational mux into r_SM CE — 3-way mux added enough depth to

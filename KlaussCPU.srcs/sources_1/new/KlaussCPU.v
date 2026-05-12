@@ -27,7 +27,7 @@ module KlaussCPU (
     input             i_uart_rx,
     input             i_load_H,          // Load button
     output            o_uart_tx,
-    output reg [15:0] o_led,
+    output     [15:0] o_led,
     output            o_SPI_LCD_Clk,
     input             i_SPI_LCD_MISO,
     output            o_SPI_LCD_MOSI,
@@ -615,7 +615,7 @@ module KlaussCPU (
          end
          12'h004: begin  // LEDs (RW) and switches (RO)
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {48'b0, o_led};
+               16'h0000: r_mmio_read_data_comb = {48'b0, r_led};
                16'h0008: r_mmio_read_data_comb = {48'b0, i_switch};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
@@ -651,6 +651,16 @@ module KlaussCPU (
          default: r_mmio_read_data_comb = 64'h0;
       endcase
    end
+
+   /* Internal LED register.  The top-level `o_led` port was converted from
+      `output reg` to `output wire` so we could once tap an ETH_TXEN
+      diagnostic into bit 0.  The diagnostic was removed (an ODDR driving
+      a pin can't have its Q net read by fabric — REQP-1884), but the
+      wire-port + internal reg + continuous assign pattern remains as a
+      neutral pass-through.  Same behaviour as the original output reg. */
+   reg [15:0] r_led;
+   assign o_led = r_led;
+
 
    // Pipeline FF on the MMIO read return path. The FF on r_mmio_read_data
    // breaks the path from peripheral RAMs/regs (notably the SD sector buffer)
@@ -769,6 +779,15 @@ module KlaussCPU (
    // ETH_REFCLK (output to PHY) — clock-mode output via ODDR is the proper
    // way to forward an internal clock to a pin on 7-series.  Driving it from
    // a logic register would not meet the PHY's clock-input spec.
+   //
+   // D1/D2 are swapped (D1=0, D2=1) to invert the output relative to clk_50.
+   // At 50 MHz this is equivalent to a 10 ns / 180° phase shift, which
+   // centres the PHY's REFCLK rising edge in the middle of the data-valid
+   // window at the PHY pin (data is launched from clk_50's rising edge and
+   // propagates through ODDR+OBUF to the pin; without this shift the PHY's
+   // sample point lands ~0.6 ns into the new data — below LAN8720A's 4 ns
+   // tSU and causing transmitted frames to be rejected silently, with the
+   // Pi seeing zero RX bytes despite our MAC reporting TX complete).
    ODDR #(
        .DDR_CLK_EDGE("OPPOSITE_EDGE"),
        .INIT(1'b0),
@@ -777,8 +796,8 @@ module KlaussCPU (
        .Q (ETH_REFCLK),
        .C (clk_50),
        .CE(1'b1),
-       .D1(1'b1),
-       .D2(1'b0),
+       .D1(1'b0),
+       .D2(1'b1),
        .R (1'b0),
        .S (1'b0)
    );
@@ -940,7 +959,7 @@ rams_sp_nc rams_sp_nc1 (
       r_timeout_counter = 32'b0;
       r_seven_seg_value1 = 32'h20_10_00_07;
       r_seven_seg_value2 = 32'h21_21_21_21;
-      o_led <= 16'h0;
+      r_led <= 16'h0;
       rx_count = 8'b0;
       o_ram_write_addr = 32'h0;
       r_ram_next_write_addr = 32'h0;
@@ -1025,7 +1044,7 @@ rams_sp_nc rams_sp_nc1 (
                r_old_checksum <= 16'h0;
                r_RGB_LED_1 <= 12'h0;
                r_RGB_LED_2 <= 12'h0;
-               o_led <= 16'h0;
+               r_led <= 16'h0;
                r_mem_write_DV <= 1'b0;
                r_mem_read_DV <= 1'b0;
             end
@@ -1119,7 +1138,7 @@ rams_sp_nc rams_sp_nc1 (
                end
                12'h004: begin  // 16-bit LED bar
                   case (w_mmio_addr[15:0])
-                     16'h0000: o_led <= w_mmio_write_data[15:0];
+                     16'h0000: r_led <= w_mmio_write_data[15:0];
                      default: ;
                   endcase
                end
@@ -1276,7 +1295,7 @@ rams_sp_nc rams_sp_nc1 (
                if (r_calc_checksum==r_rec_checksum) // Last value received should be checksum
                 begin  // Reset all flags and jump to first instruction
                   o_LCD_reset_n <= 1'b0;
-                  o_led <= 16'h0;
+                  r_led <= 16'h0;
                   o_ram_write_addr <= 32'h0;
                   o_TX_LCD_Byte <= 8'b0;
                   o_TX_LCD_Count <= 4'd1;

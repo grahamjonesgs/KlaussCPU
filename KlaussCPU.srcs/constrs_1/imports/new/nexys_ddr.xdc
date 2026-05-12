@@ -299,7 +299,7 @@ set eth_ref_clk [get_clocks -of_objects [get_nets clk_50]]
 # external interface is perfectly fine.
 create_generated_clock -name eth_phy_clk \
     -source [get_pins ODDR_eth_refclk/C] \
-    -divide_by 1 \
+    -edges {2 3 4} \
     [get_ports ETH_REFCLK]
 
 # CSR/SRAM crossings between the CPU domain (sys_clk_pin = i_Clk) and the
@@ -350,20 +350,19 @@ set_multicycle_path -setup -end 2 \
 set_multicycle_path -hold  -end 1 \
     -from [get_clocks clk_50_clk_wiz_0] -to [get_clocks eth_phy_clk]
 
-# False-path TX hold checks.  ODDR_eth_refclk (forwarding REFCLK to the PHY)
-# can't share a placement region with LiteEth's data ODDRs because the pins
-# are in different I/O banks, so Vivado sees ~2 ns of FPGA-internal clock-
-# distribution skew between the data clock (clk_50 at LiteEth's ODDR/C) and
-# the destination clock model (eth_phy_clk at the ETH_REFCLK pin, which
-# includes the extra ODDR + OBUF delay).  This skew is a modelling
-# artifact, not a silicon issue: in actual operation the PHY captures TX
-# data with the REFCLK it receives, and both signals leave the FPGA via
-# OBUFs and travel matched PCB traces — board layout determines real
-# alignment, not FPGA-internal clock distribution.  Setup is still
-# rigorously checked (data path delays must match the PHY's tSU); only
-# the spurious hold check is removed.
-set_false_path -hold \
-    -from [get_clocks clk_50_clk_wiz_0] -to [get_clocks eth_phy_clk]
+# False-path the falling-edge launch from clk_50 to eth_phy_clk.  LiteEth's
+# TX ODDRs run in OPPOSITE_EDGE mode but RMII is SDR — for each data bit
+# D1 == D2, so the falling-edge "launch" is just the ODDR re-emitting the
+# same value it already emitted on the rising edge.  Vivado doesn't know
+# this and analyses each edge as a distinct launch; combined with the
+# inverted eth_phy_clk (which now rises at +10 ns to centre the PHY's
+# sample point in the data-valid window), the falling-edge launch lands
+# right on top of the capture edge and reports a phantom hold violation.
+# Only the falling-edge launch is false-pathed; the rising-edge launch
+# (the real data) is still rigorously checked for setup AND hold.
+set_false_path \
+    -fall_from [get_clocks clk_50_clk_wiz_0] \
+    -to        [get_clocks eth_phy_clk]
 
 # MDIO is ≤ 2.5 MHz — far slower than any FPGA timing concern.
 set_false_path -to   [get_ports ETH_MDC]

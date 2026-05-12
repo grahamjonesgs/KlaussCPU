@@ -6,7 +6,7 @@
 task t_led_value;
    input [31:0] i_state;
    begin
-      o_led <= i_state[15:0];
+      r_led <= i_state[15:0];
       r_SM  <= OPCODE_REQUEST;
       r_PC  <= r_PC + 8;
    end
@@ -18,7 +18,7 @@ endtask
 // Increment r_SM_msg
 task t_led_reg;
    begin
-      o_led <= r_reg_port_b[15:0];
+      r_led <= r_reg_port_b[15:0];
       r_SM  <= OPCODE_REQUEST;
       r_PC  <= r_PC + 4;
    end

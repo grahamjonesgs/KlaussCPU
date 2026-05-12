@@ -3,7 +3,9 @@
     "allow": [
       "Read(//Users/gjonesblackcyton/Documents/src/llvm-project/llvm/lib/Target/KlaussCPU/**)",
       "Bash(find /home/graham -path \"*KlaussCPU/runtime*\" -maxdepth 8 2>/dev/null | head *)",
-      "Read(//home/graham/**)"
+      "Read(//home/graham/**)",
+      "Bash(sed -n '155,160p' /home/graham/Documents/src/fpga/KlaussCPU/KlaussCPU.runs/impl_1/KlaussCPU_timing_summary_postroute_physopted.rpt)",
+      "Bash(awk '/VIOLATED/{found=NR} found && NR<=found+30{print}' /home/graham/Documents/src/fpga/KlaussCPU/KlaussCPU.runs/impl_1/KlaussCPU_timing_summary_postroute_physopted.rpt)"
     ]
   }
 }

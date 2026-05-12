@@ -11,7 +11,7 @@
 // Device     : xc7a100t
 // Hierarchy  : disabled
 // LiteX sha1 : --------
-// Date       : 2026-05-07 15:39:43
+// Date       : 2026-05-12 10:36:31
 //------------------------------------------------------------------------------
 
 `timescale 1ns / 1ps
@@ -152,14 +152,15 @@ MACCore
 │    │    │    │    ├── ev (EventManager)
 │    │    │    │    │    └── eventsourcepulse_0 (EventSourcePulse) [Gen]
 │    │    │    │    ├── syncfifo_0 (SyncFIFO) [Gen]
-│    │    │    │    │    └── fifo (SyncFIFO)
+│    │    │    │    │    └── buffer_0 (Buffer) [Gen]
+│    │    │    │    │         ├── pipe_valid (PipeValid)
+│    │    │    │    │         └── pipeline (Pipeline)
 │    │    │    │    └── fsm (FSM)
 │    │    │    └── ev (SharedIRQ)
 │    │    ├── sram_0 (SRAM) [Gen]
 │    │    ├── sram_1 (SRAM) [Gen]
 │    │    ├── decoder_0 (Decoder) [Gen]
 │    │    ├── sram_2 (SRAM) [Gen]
-│    │    ├── sram_3 (SRAM) [Gen]
 │    │    └── decoder_1 (Decoder) [Gen]
 │    └── ev (SharedIRQ)
 ├── csr_bridge (Wishbone2CSR)
@@ -191,16 +192,16 @@ MACCore
 │         ├── csrstorage_1 (CSRStorage) [Gen]
 │         └── csrstatus_0 (CSRStatus) [Gen]
 ├── csr_interconnect (InterconnectShared)
+├── [BB:ODDR]
+├── [BB:ODDR]
+├── [BB:FDPE]
+├── [BB:FDPE]
+├── [BB:FDPE]
+├── [BB:FDPE]
 ├── [BB:IOBUF]
-├── [BB:FDPE]
-├── [BB:FDPE]
-├── [BB:ODDR]
-├── [BB:FDPE]
-├── [BB:FDPE]
 ├── [BB:ODDR]
 ├── [BB:IDDR]
 ├── [BB:IDDR]
-├── [BB:ODDR]
 └── [BB:IDDR]
 Legend:
   [Gen]: Auto-generated instance name.
@@ -772,9 +773,9 @@ wire   [10:0] csrbank1_sram_reader_length0_r;
 reg           csrbank1_sram_reader_length0_re = 1'd0;
 wire   [10:0] csrbank1_sram_reader_length0_w;
 reg           csrbank1_sram_reader_length0_we = 1'd0;
-wire    [1:0] csrbank1_sram_reader_level_r;
+wire          csrbank1_sram_reader_level_r;
 reg           csrbank1_sram_reader_level_re = 1'd0;
-wire    [1:0] csrbank1_sram_reader_level_w;
+wire          csrbank1_sram_reader_level_w;
 reg           csrbank1_sram_reader_level_we = 1'd0;
 wire          csrbank1_sram_reader_ready_r;
 reg           csrbank1_sram_reader_ready_re = 1'd0;
@@ -1132,8 +1133,8 @@ wire          wishbone_interface_bus_tx_stb;
 wire          wishbone_interface_bus_tx_we;
 reg     [1:0] wishbone_interface_decoder0_slave_sel = 2'd0;
 reg     [1:0] wishbone_interface_decoder0_slave_sel_r = 2'd0;
-reg     [1:0] wishbone_interface_decoder1_slave_sel = 2'd0;
-reg     [1:0] wishbone_interface_decoder1_slave_sel_r = 2'd0;
+wire          wishbone_interface_decoder1_slave_sel;
+reg           wishbone_interface_decoder1_slave_sel_r = 1'd0;
 wire          wishbone_interface_ev_irq;
 reg           wishbone_interface_interface0_ack = 1'd0;
 wire   [29:0] wishbone_interface_interface0_adr;
@@ -1168,53 +1169,6 @@ reg           wishbone_interface_interface2_err = 1'd0;
 wire    [3:0] wishbone_interface_interface2_sel;
 wire          wishbone_interface_interface2_stb;
 wire          wishbone_interface_interface2_we;
-reg           wishbone_interface_interface3_ack = 1'd0;
-wire   [29:0] wishbone_interface_interface3_adr;
-wire    [1:0] wishbone_interface_interface3_bte;
-wire    [2:0] wishbone_interface_interface3_cti;
-wire          wishbone_interface_interface3_cyc;
-wire   [31:0] wishbone_interface_interface3_dat_r;
-wire   [31:0] wishbone_interface_interface3_dat_w;
-reg           wishbone_interface_interface3_err = 1'd0;
-wire    [3:0] wishbone_interface_interface3_sel;
-wire          wishbone_interface_interface3_stb;
-wire          wishbone_interface_interface3_we;
-reg           wishbone_interface_reader_cmd_fifo_consume = 1'd0;
-wire          wishbone_interface_reader_cmd_fifo_do_read;
-wire          wishbone_interface_reader_cmd_fifo_fifo_in_first;
-wire          wishbone_interface_reader_cmd_fifo_fifo_in_last;
-wire   [10:0] wishbone_interface_reader_cmd_fifo_fifo_in_payload_length;
-wire          wishbone_interface_reader_cmd_fifo_fifo_in_payload_slot;
-wire          wishbone_interface_reader_cmd_fifo_fifo_out_first;
-wire          wishbone_interface_reader_cmd_fifo_fifo_out_last;
-wire   [10:0] wishbone_interface_reader_cmd_fifo_fifo_out_payload_length;
-wire          wishbone_interface_reader_cmd_fifo_fifo_out_payload_slot;
-reg     [1:0] wishbone_interface_reader_cmd_fifo_level = 2'd0;
-reg           wishbone_interface_reader_cmd_fifo_produce = 1'd0;
-wire          wishbone_interface_reader_cmd_fifo_rdport_adr;
-wire   [13:0] wishbone_interface_reader_cmd_fifo_rdport_dat_r;
-reg           wishbone_interface_reader_cmd_fifo_replace = 1'd0;
-reg           wishbone_interface_reader_cmd_fifo_sink_first = 1'd0;
-reg           wishbone_interface_reader_cmd_fifo_sink_last = 1'd0;
-wire   [10:0] wishbone_interface_reader_cmd_fifo_sink_payload_length;
-wire          wishbone_interface_reader_cmd_fifo_sink_payload_slot;
-wire          wishbone_interface_reader_cmd_fifo_sink_ready;
-wire          wishbone_interface_reader_cmd_fifo_sink_valid;
-wire          wishbone_interface_reader_cmd_fifo_source_first;
-wire          wishbone_interface_reader_cmd_fifo_source_last;
-wire   [10:0] wishbone_interface_reader_cmd_fifo_source_payload_length;
-wire          wishbone_interface_reader_cmd_fifo_source_payload_slot;
-reg           wishbone_interface_reader_cmd_fifo_source_ready = 1'd0;
-wire          wishbone_interface_reader_cmd_fifo_source_valid;
-wire   [13:0] wishbone_interface_reader_cmd_fifo_syncfifo_din;
-wire   [13:0] wishbone_interface_reader_cmd_fifo_syncfifo_dout;
-wire          wishbone_interface_reader_cmd_fifo_syncfifo_re;
-wire          wishbone_interface_reader_cmd_fifo_syncfifo_readable;
-wire          wishbone_interface_reader_cmd_fifo_syncfifo_we;
-wire          wishbone_interface_reader_cmd_fifo_syncfifo_writable;
-reg           wishbone_interface_reader_cmd_fifo_wrport_adr = 1'd0;
-wire   [13:0] wishbone_interface_reader_cmd_fifo_wrport_dat_w;
-wire          wishbone_interface_reader_cmd_fifo_wrport_we;
 reg           wishbone_interface_reader_enable_re = 1'd0;
 reg           wishbone_interface_reader_enable_storage = 1'd0;
 wire          wishbone_interface_reader_event00;
@@ -1230,33 +1184,55 @@ reg    [10:0] wishbone_interface_reader_length_liteethmac_liteethmacsramreader_n
 reg           wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce = 1'd0;
 reg           wishbone_interface_reader_length_re = 1'd0;
 reg    [10:0] wishbone_interface_reader_length_storage = 11'd0;
+wire          wishbone_interface_reader_level;
 reg           wishbone_interface_reader_level_re = 1'd0;
-wire    [1:0] wishbone_interface_reader_level_status;
+wire          wishbone_interface_reader_level_status;
 wire          wishbone_interface_reader_level_we;
-wire    [8:0] wishbone_interface_reader_memory0_adr;
-wire   [31:0] wishbone_interface_reader_memory0_dat_r;
-wire          wishbone_interface_reader_memory0_re;
-wire    [8:0] wishbone_interface_reader_memory1_adr;
-wire   [31:0] wishbone_interface_reader_memory1_dat_r;
-wire          wishbone_interface_reader_memory1_re;
+wire    [8:0] wishbone_interface_reader_memory_adr;
+wire   [31:0] wishbone_interface_reader_memory_dat_r;
+wire          wishbone_interface_reader_memory_re;
 reg           wishbone_interface_reader_pending_r = 1'd0;
 reg           wishbone_interface_reader_pending_re = 1'd0;
 wire          wishbone_interface_reader_pending_status;
 wire          wishbone_interface_reader_pending_we;
+wire          wishbone_interface_reader_pipe_valid_sink_first;
+wire          wishbone_interface_reader_pipe_valid_sink_last;
+wire   [10:0] wishbone_interface_reader_pipe_valid_sink_payload_length;
+wire          wishbone_interface_reader_pipe_valid_sink_payload_slot;
+wire          wishbone_interface_reader_pipe_valid_sink_ready;
+wire          wishbone_interface_reader_pipe_valid_sink_valid;
+reg           wishbone_interface_reader_pipe_valid_source_first = 1'd0;
+reg           wishbone_interface_reader_pipe_valid_source_last = 1'd0;
+reg    [10:0] wishbone_interface_reader_pipe_valid_source_payload_length = 11'd0;
+reg           wishbone_interface_reader_pipe_valid_source_payload_slot = 1'd0;
+wire          wishbone_interface_reader_pipe_valid_source_ready;
+reg           wishbone_interface_reader_pipe_valid_source_valid = 1'd0;
 reg    [31:0] wishbone_interface_reader_rd_data = 32'd0;
 reg           wishbone_interface_reader_read = 1'd0;
 reg           wishbone_interface_reader_ready_re = 1'd0;
 wire          wishbone_interface_reader_ready_status;
 wire          wishbone_interface_reader_ready_we;
+reg           wishbone_interface_reader_sink_sink_first = 1'd0;
+reg           wishbone_interface_reader_sink_sink_last = 1'd0;
+wire   [10:0] wishbone_interface_reader_sink_sink_payload_length;
+wire          wishbone_interface_reader_sink_sink_payload_slot;
+wire          wishbone_interface_reader_sink_sink_ready;
+wire          wishbone_interface_reader_sink_sink_valid;
 reg           wishbone_interface_reader_slot_re = 1'd0;
 reg           wishbone_interface_reader_slot_storage = 1'd0;
-reg           wishbone_interface_reader_source_source_first = 1'd0;
-reg           wishbone_interface_reader_source_source_last = 1'd0;
-wire   [31:0] wishbone_interface_reader_source_source_payload_data;
-reg     [3:0] wishbone_interface_reader_source_source_payload_error = 4'd0;
-reg     [3:0] wishbone_interface_reader_source_source_payload_last_be = 4'd0;
-wire          wishbone_interface_reader_source_source_ready;
-reg           wishbone_interface_reader_source_source_valid = 1'd0;
+reg           wishbone_interface_reader_source_first = 1'd0;
+reg           wishbone_interface_reader_source_last = 1'd0;
+wire   [31:0] wishbone_interface_reader_source_payload_data;
+reg     [3:0] wishbone_interface_reader_source_payload_error = 4'd0;
+reg     [3:0] wishbone_interface_reader_source_payload_last_be = 4'd0;
+wire          wishbone_interface_reader_source_ready;
+wire          wishbone_interface_reader_source_source_first;
+wire          wishbone_interface_reader_source_source_last;
+wire   [10:0] wishbone_interface_reader_source_source_payload_length;
+wire          wishbone_interface_reader_source_source_payload_slot;
+reg           wishbone_interface_reader_source_source_ready = 1'd0;
+wire          wishbone_interface_reader_source_source_valid;
+reg           wishbone_interface_reader_source_valid = 1'd0;
 wire          wishbone_interface_reader_start_r;
 reg           wishbone_interface_reader_start_re = 1'd0;
 reg           wishbone_interface_reader_start_w = 1'd0;
@@ -1289,11 +1265,6 @@ reg           wishbone_interface_sram2_adr_burst = 1'd0;
 wire   [31:0] wishbone_interface_sram2_dat_r;
 wire   [31:0] wishbone_interface_sram2_dat_w;
 reg     [3:0] wishbone_interface_sram2_we = 4'd0;
-wire    [8:0] wishbone_interface_sram3_adr;
-reg           wishbone_interface_sram3_adr_burst = 1'd0;
-wire   [31:0] wishbone_interface_sram3_dat_r;
-wire   [31:0] wishbone_interface_sram3_dat_w;
-reg     [3:0] wishbone_interface_sram3_we = 4'd0;
 wire          wishbone_interface_writer_available0;
 wire          wishbone_interface_writer_available1;
 wire          wishbone_interface_writer_available2;
@@ -1416,7 +1387,7 @@ assign grant = 1'd0;
 always @(*) begin
     slave_sel <= 3'd0;
     slave_sel[0] <= (shared_adr[29:10] == 6'd32);
-    slave_sel[1] <= (shared_adr[29:10] == 6'd33);
+    slave_sel[1] <= (shared_adr[29:9] == 7'd66);
     slave_sel[2] <= (shared_adr[29:14] == 1'd0);
 end
 assign wishbone_interface_bus_rx_adr = shared_adr;
@@ -2611,13 +2582,13 @@ assign wishbone_interface_writer_sink_sink_last = wishbone_interface_sink_last;
 assign wishbone_interface_writer_sink_sink_payload_data = wishbone_interface_sink_payload_data;
 assign wishbone_interface_writer_sink_sink_payload_last_be = wishbone_interface_sink_payload_last_be;
 assign wishbone_interface_writer_sink_sink_payload_error = wishbone_interface_sink_payload_error;
-assign wishbone_interface_source_valid = wishbone_interface_reader_source_source_valid;
-assign wishbone_interface_reader_source_source_ready = wishbone_interface_source_ready;
-assign wishbone_interface_source_first = wishbone_interface_reader_source_source_first;
-assign wishbone_interface_source_last = wishbone_interface_reader_source_source_last;
-assign wishbone_interface_source_payload_data = wishbone_interface_reader_source_source_payload_data;
-assign wishbone_interface_source_payload_last_be = wishbone_interface_reader_source_source_payload_last_be;
-assign wishbone_interface_source_payload_error = wishbone_interface_reader_source_source_payload_error;
+assign wishbone_interface_source_valid = wishbone_interface_reader_source_valid;
+assign wishbone_interface_reader_source_ready = wishbone_interface_source_ready;
+assign wishbone_interface_source_first = wishbone_interface_reader_source_first;
+assign wishbone_interface_source_last = wishbone_interface_reader_source_last;
+assign wishbone_interface_source_payload_data = wishbone_interface_reader_source_payload_data;
+assign wishbone_interface_source_payload_last_be = wishbone_interface_reader_source_payload_last_be;
+assign wishbone_interface_source_payload_error = wishbone_interface_reader_source_payload_error;
 always @(*) begin
     wishbone_interface_writer_length_inc <= 4'd0;
     case (wishbone_interface_writer_sink_sink_payload_last_be)
@@ -2651,7 +2622,7 @@ assign wishbone_interface_writer_stat_fifo_source_ready = wishbone_interface_wri
 assign wishbone_interface_writer_available_trigger = wishbone_interface_writer_stat_fifo_source_valid;
 assign wishbone_interface_writer_slot_status = wishbone_interface_writer_stat_fifo_source_payload_slot;
 assign wishbone_interface_writer_length_status = wishbone_interface_writer_stat_fifo_source_payload_length;
-assign wishbone_interface_writer_wr_data = {wishbone_interface_writer_sink_sink_payload_data[7:0], wishbone_interface_writer_sink_sink_payload_data[15:8], wishbone_interface_writer_sink_sink_payload_data[23:16], wishbone_interface_writer_sink_sink_payload_data[31:24]};
+assign wishbone_interface_writer_wr_data = wishbone_interface_writer_sink_sink_payload_data;
 assign wishbone_interface_writer_memory0_adr = wishbone_interface_writer_length[10:2];
 assign wishbone_interface_writer_memory0_dat_w = wishbone_interface_writer_wr_data;
 assign wishbone_interface_writer_memory1_adr = wishbone_interface_writer_length[10:2];
@@ -2784,58 +2755,53 @@ always @(*) begin
         end
     endcase
 end
-assign wishbone_interface_reader_cmd_fifo_sink_valid = wishbone_interface_reader_start_re;
-assign wishbone_interface_reader_cmd_fifo_sink_payload_slot = wishbone_interface_reader_slot_storage;
-assign wishbone_interface_reader_cmd_fifo_sink_payload_length = wishbone_interface_reader_length_storage;
-assign wishbone_interface_reader_ready_status = wishbone_interface_reader_cmd_fifo_sink_ready;
-assign wishbone_interface_reader_level_status = wishbone_interface_reader_cmd_fifo_level;
+assign wishbone_interface_reader_sink_sink_valid = wishbone_interface_reader_start_re;
+assign wishbone_interface_reader_sink_sink_payload_slot = wishbone_interface_reader_slot_storage;
+assign wishbone_interface_reader_sink_sink_payload_length = wishbone_interface_reader_length_storage;
+assign wishbone_interface_reader_ready_status = wishbone_interface_reader_sink_sink_ready;
+assign wishbone_interface_reader_level_status = wishbone_interface_reader_level;
 always @(*) begin
-    wishbone_interface_reader_source_source_payload_last_be <= 4'd0;
-    if (wishbone_interface_reader_source_source_last) begin
-        case (wishbone_interface_reader_cmd_fifo_source_payload_length[1:0])
+    wishbone_interface_reader_source_payload_last_be <= 4'd0;
+    if (wishbone_interface_reader_source_last) begin
+        case (wishbone_interface_reader_source_source_payload_length[1:0])
             1'd1: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 1'd1;
+                wishbone_interface_reader_source_payload_last_be <= 1'd1;
             end
             2'd2: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 2'd2;
+                wishbone_interface_reader_source_payload_last_be <= 2'd2;
             end
             2'd3: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 3'd4;
+                wishbone_interface_reader_source_payload_last_be <= 3'd4;
             end
             3'd4: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 4'd8;
+                wishbone_interface_reader_source_payload_last_be <= 4'd8;
             end
             3'd5: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 5'd16;
+                wishbone_interface_reader_source_payload_last_be <= 5'd16;
             end
             3'd6: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 6'd32;
+                wishbone_interface_reader_source_payload_last_be <= 6'd32;
             end
             3'd7: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 7'd64;
+                wishbone_interface_reader_source_payload_last_be <= 7'd64;
             end
             default: begin
-                wishbone_interface_reader_source_source_payload_last_be <= 4'd8;
+                wishbone_interface_reader_source_payload_last_be <= 4'd8;
             end
         endcase
     end
 end
-assign wishbone_interface_reader_memory0_re = wishbone_interface_reader_read;
-assign wishbone_interface_reader_memory0_adr = wishbone_interface_reader_length[10:2];
-assign wishbone_interface_reader_memory1_re = wishbone_interface_reader_read;
-assign wishbone_interface_reader_memory1_adr = wishbone_interface_reader_length[10:2];
+assign wishbone_interface_reader_memory_re = wishbone_interface_reader_read;
+assign wishbone_interface_reader_memory_adr = wishbone_interface_reader_length[10:2];
 always @(*) begin
     wishbone_interface_reader_rd_data <= 32'd0;
-    case (wishbone_interface_reader_cmd_fifo_source_payload_slot)
+    case (wishbone_interface_reader_source_source_payload_slot)
         1'd0: begin
-            wishbone_interface_reader_rd_data <= wishbone_interface_reader_memory0_dat_r;
-        end
-        1'd1: begin
-            wishbone_interface_reader_rd_data <= wishbone_interface_reader_memory1_dat_r;
+            wishbone_interface_reader_rd_data <= wishbone_interface_reader_memory_dat_r;
         end
     endcase
 end
-assign wishbone_interface_reader_source_source_payload_data = {wishbone_interface_reader_rd_data[7:0], wishbone_interface_reader_rd_data[15:8], wishbone_interface_reader_rd_data[23:16], wishbone_interface_reader_rd_data[31:24]};
+assign wishbone_interface_reader_source_payload_data = wishbone_interface_reader_rd_data;
 assign wishbone_interface_reader_event00 = wishbone_interface_reader_eventsourcepulse_status;
 assign wishbone_interface_reader_event01 = wishbone_interface_reader_eventsourcepulse_pending;
 always @(*) begin
@@ -2846,54 +2812,39 @@ always @(*) begin
 end
 assign wishbone_interface_reader_irq = (wishbone_interface_reader_pending_status & wishbone_interface_reader_enable_storage);
 assign wishbone_interface_reader_eventsourcepulse_status = 1'd0;
-assign wishbone_interface_reader_cmd_fifo_syncfifo_din = {wishbone_interface_reader_cmd_fifo_fifo_in_last, wishbone_interface_reader_cmd_fifo_fifo_in_first, wishbone_interface_reader_cmd_fifo_fifo_in_payload_length, wishbone_interface_reader_cmd_fifo_fifo_in_payload_slot};
-assign {wishbone_interface_reader_cmd_fifo_fifo_out_last, wishbone_interface_reader_cmd_fifo_fifo_out_first, wishbone_interface_reader_cmd_fifo_fifo_out_payload_length, wishbone_interface_reader_cmd_fifo_fifo_out_payload_slot} = wishbone_interface_reader_cmd_fifo_syncfifo_dout;
-assign wishbone_interface_reader_cmd_fifo_sink_ready = wishbone_interface_reader_cmd_fifo_syncfifo_writable;
-assign wishbone_interface_reader_cmd_fifo_syncfifo_we = wishbone_interface_reader_cmd_fifo_sink_valid;
-assign wishbone_interface_reader_cmd_fifo_fifo_in_first = wishbone_interface_reader_cmd_fifo_sink_first;
-assign wishbone_interface_reader_cmd_fifo_fifo_in_last = wishbone_interface_reader_cmd_fifo_sink_last;
-assign wishbone_interface_reader_cmd_fifo_fifo_in_payload_slot = wishbone_interface_reader_cmd_fifo_sink_payload_slot;
-assign wishbone_interface_reader_cmd_fifo_fifo_in_payload_length = wishbone_interface_reader_cmd_fifo_sink_payload_length;
-assign wishbone_interface_reader_cmd_fifo_source_valid = wishbone_interface_reader_cmd_fifo_syncfifo_readable;
-assign wishbone_interface_reader_cmd_fifo_source_first = wishbone_interface_reader_cmd_fifo_fifo_out_first;
-assign wishbone_interface_reader_cmd_fifo_source_last = wishbone_interface_reader_cmd_fifo_fifo_out_last;
-assign wishbone_interface_reader_cmd_fifo_source_payload_slot = wishbone_interface_reader_cmd_fifo_fifo_out_payload_slot;
-assign wishbone_interface_reader_cmd_fifo_source_payload_length = wishbone_interface_reader_cmd_fifo_fifo_out_payload_length;
-assign wishbone_interface_reader_cmd_fifo_syncfifo_re = wishbone_interface_reader_cmd_fifo_source_ready;
-always @(*) begin
-    wishbone_interface_reader_cmd_fifo_wrport_adr <= 1'd0;
-    if (wishbone_interface_reader_cmd_fifo_replace) begin
-        wishbone_interface_reader_cmd_fifo_wrport_adr <= (wishbone_interface_reader_cmd_fifo_produce - 1'd1);
-    end else begin
-        wishbone_interface_reader_cmd_fifo_wrport_adr <= wishbone_interface_reader_cmd_fifo_produce;
-    end
-end
-assign wishbone_interface_reader_cmd_fifo_wrport_dat_w = wishbone_interface_reader_cmd_fifo_syncfifo_din;
-assign wishbone_interface_reader_cmd_fifo_wrport_we = (wishbone_interface_reader_cmd_fifo_syncfifo_we & (wishbone_interface_reader_cmd_fifo_syncfifo_writable | wishbone_interface_reader_cmd_fifo_replace));
-assign wishbone_interface_reader_cmd_fifo_do_read = (wishbone_interface_reader_cmd_fifo_syncfifo_readable & wishbone_interface_reader_cmd_fifo_syncfifo_re);
-assign wishbone_interface_reader_cmd_fifo_rdport_adr = wishbone_interface_reader_cmd_fifo_consume;
-assign wishbone_interface_reader_cmd_fifo_syncfifo_dout = wishbone_interface_reader_cmd_fifo_rdport_dat_r;
-assign wishbone_interface_reader_cmd_fifo_syncfifo_writable = (wishbone_interface_reader_cmd_fifo_level != 2'd2);
-assign wishbone_interface_reader_cmd_fifo_syncfifo_readable = (wishbone_interface_reader_cmd_fifo_level != 1'd0);
+assign wishbone_interface_reader_level = wishbone_interface_reader_source_source_valid;
+assign wishbone_interface_reader_pipe_valid_sink_ready = ((~wishbone_interface_reader_pipe_valid_source_valid) | wishbone_interface_reader_pipe_valid_source_ready);
+assign wishbone_interface_reader_pipe_valid_sink_valid = wishbone_interface_reader_sink_sink_valid;
+assign wishbone_interface_reader_sink_sink_ready = wishbone_interface_reader_pipe_valid_sink_ready;
+assign wishbone_interface_reader_pipe_valid_sink_first = wishbone_interface_reader_sink_sink_first;
+assign wishbone_interface_reader_pipe_valid_sink_last = wishbone_interface_reader_sink_sink_last;
+assign wishbone_interface_reader_pipe_valid_sink_payload_slot = wishbone_interface_reader_sink_sink_payload_slot;
+assign wishbone_interface_reader_pipe_valid_sink_payload_length = wishbone_interface_reader_sink_sink_payload_length;
+assign wishbone_interface_reader_source_source_valid = wishbone_interface_reader_pipe_valid_source_valid;
+assign wishbone_interface_reader_pipe_valid_source_ready = wishbone_interface_reader_source_source_ready;
+assign wishbone_interface_reader_source_source_first = wishbone_interface_reader_pipe_valid_source_first;
+assign wishbone_interface_reader_source_source_last = wishbone_interface_reader_pipe_valid_source_last;
+assign wishbone_interface_reader_source_source_payload_slot = wishbone_interface_reader_pipe_valid_source_payload_slot;
+assign wishbone_interface_reader_source_source_payload_length = wishbone_interface_reader_pipe_valid_source_payload_length;
 always @(*) begin
     liteethmacsramreader_next_state <= 2'd0;
-    wishbone_interface_reader_cmd_fifo_source_ready <= 1'd0;
     wishbone_interface_reader_eventsourcepulse_trigger <= 1'd0;
     wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value <= 11'd0;
     wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce <= 1'd0;
     wishbone_interface_reader_read <= 1'd0;
-    wishbone_interface_reader_source_source_last <= 1'd0;
-    wishbone_interface_reader_source_source_valid <= 1'd0;
+    wishbone_interface_reader_source_last <= 1'd0;
+    wishbone_interface_reader_source_source_ready <= 1'd0;
+    wishbone_interface_reader_source_valid <= 1'd0;
     liteethmacsramreader_next_state <= liteethmacsramreader_state;
     case (liteethmacsramreader_state)
         1'd1: begin
-            wishbone_interface_reader_source_source_valid <= 1'd1;
-            wishbone_interface_reader_source_source_last <= (wishbone_interface_reader_length >= wishbone_interface_reader_cmd_fifo_source_payload_length);
-            if (wishbone_interface_reader_source_source_ready) begin
+            wishbone_interface_reader_source_valid <= 1'd1;
+            wishbone_interface_reader_source_last <= (wishbone_interface_reader_length >= wishbone_interface_reader_source_source_payload_length);
+            if (wishbone_interface_reader_source_ready) begin
                 wishbone_interface_reader_read <= 1'd1;
                 wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value <= (wishbone_interface_reader_length + 3'd4);
                 wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce <= 1'd1;
-                if (wishbone_interface_reader_source_source_last) begin
+                if (wishbone_interface_reader_source_last) begin
                     liteethmacsramreader_next_state <= 2'd2;
                 end
             end
@@ -2902,11 +2853,11 @@ always @(*) begin
             wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value <= 1'd0;
             wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce <= 1'd1;
             wishbone_interface_reader_eventsourcepulse_trigger <= 1'd1;
-            wishbone_interface_reader_cmd_fifo_source_ready <= 1'd1;
+            wishbone_interface_reader_source_source_ready <= 1'd1;
             liteethmacsramreader_next_state <= 1'd0;
         end
         default: begin
-            if (wishbone_interface_reader_cmd_fifo_source_valid) begin
+            if (wishbone_interface_reader_source_source_valid) begin
                 wishbone_interface_reader_read <= 1'd1;
                 wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value <= 3'd4;
                 wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce <= 1'd1;
@@ -2954,21 +2905,7 @@ end
 assign wishbone_interface_sram2_adr = wishbone_interface_interface2_adr[8:0];
 assign wishbone_interface_interface2_dat_r = wishbone_interface_sram2_dat_r;
 assign wishbone_interface_sram2_dat_w = wishbone_interface_interface2_dat_w;
-always @(*) begin
-    wishbone_interface_sram3_we <= 4'd0;
-    wishbone_interface_sram3_we[0] <= (((wishbone_interface_interface3_cyc & wishbone_interface_interface3_stb) & wishbone_interface_interface3_we) & wishbone_interface_interface3_sel[0]);
-    wishbone_interface_sram3_we[1] <= (((wishbone_interface_interface3_cyc & wishbone_interface_interface3_stb) & wishbone_interface_interface3_we) & wishbone_interface_interface3_sel[1]);
-    wishbone_interface_sram3_we[2] <= (((wishbone_interface_interface3_cyc & wishbone_interface_interface3_stb) & wishbone_interface_interface3_we) & wishbone_interface_interface3_sel[2]);
-    wishbone_interface_sram3_we[3] <= (((wishbone_interface_interface3_cyc & wishbone_interface_interface3_stb) & wishbone_interface_interface3_we) & wishbone_interface_interface3_sel[3]);
-end
-assign wishbone_interface_sram3_adr = wishbone_interface_interface3_adr[8:0];
-assign wishbone_interface_interface3_dat_r = wishbone_interface_sram3_dat_r;
-assign wishbone_interface_sram3_dat_w = wishbone_interface_interface3_dat_w;
-always @(*) begin
-    wishbone_interface_decoder1_slave_sel <= 2'd0;
-    wishbone_interface_decoder1_slave_sel[0] <= (wishbone_interface_bus_tx_adr[9] == 1'd0);
-    wishbone_interface_decoder1_slave_sel[1] <= (wishbone_interface_bus_tx_adr[9] == 1'd1);
-end
+assign wishbone_interface_decoder1_slave_sel = (wishbone_interface_bus_tx_adr[9] == 1'd0);
 assign wishbone_interface_interface2_adr = wishbone_interface_bus_tx_adr;
 assign wishbone_interface_interface2_dat_w = wishbone_interface_bus_tx_dat_w;
 assign wishbone_interface_interface2_sel = wishbone_interface_bus_tx_sel;
@@ -2976,18 +2913,10 @@ assign wishbone_interface_interface2_stb = wishbone_interface_bus_tx_stb;
 assign wishbone_interface_interface2_we = wishbone_interface_bus_tx_we;
 assign wishbone_interface_interface2_cti = wishbone_interface_bus_tx_cti;
 assign wishbone_interface_interface2_bte = wishbone_interface_bus_tx_bte;
-assign wishbone_interface_interface3_adr = wishbone_interface_bus_tx_adr;
-assign wishbone_interface_interface3_dat_w = wishbone_interface_bus_tx_dat_w;
-assign wishbone_interface_interface3_sel = wishbone_interface_bus_tx_sel;
-assign wishbone_interface_interface3_stb = wishbone_interface_bus_tx_stb;
-assign wishbone_interface_interface3_we = wishbone_interface_bus_tx_we;
-assign wishbone_interface_interface3_cti = wishbone_interface_bus_tx_cti;
-assign wishbone_interface_interface3_bte = wishbone_interface_bus_tx_bte;
-assign wishbone_interface_interface2_cyc = (wishbone_interface_bus_tx_cyc & wishbone_interface_decoder1_slave_sel[0]);
-assign wishbone_interface_interface3_cyc = (wishbone_interface_bus_tx_cyc & wishbone_interface_decoder1_slave_sel[1]);
-assign wishbone_interface_bus_tx_ack = (wishbone_interface_interface2_ack | wishbone_interface_interface3_ack);
-assign wishbone_interface_bus_tx_err = (wishbone_interface_interface2_err | wishbone_interface_interface3_err);
-assign wishbone_interface_bus_tx_dat_r = (({32{wishbone_interface_decoder1_slave_sel_r[0]}} & wishbone_interface_interface2_dat_r) | ({32{wishbone_interface_decoder1_slave_sel_r[1]}} & wishbone_interface_interface3_dat_r));
+assign wishbone_interface_interface2_cyc = (wishbone_interface_bus_tx_cyc & wishbone_interface_decoder1_slave_sel);
+assign wishbone_interface_bus_tx_ack = wishbone_interface_interface2_ack;
+assign wishbone_interface_bus_tx_err = wishbone_interface_interface2_err;
+assign wishbone_interface_bus_tx_dat_r = ({32{wishbone_interface_decoder1_slave_sel_r}} & wishbone_interface_interface2_dat_r);
 always @(*) begin
     interface0_ack <= 1'd0;
     interface0_dat_r <= 32'd0;
@@ -3126,7 +3055,7 @@ always @(*) begin
         csrbank1_sram_reader_ready_we <= interface1_bank_bus_re;
     end
 end
-assign csrbank1_sram_reader_level_r = interface1_bank_bus_dat_w[1:0];
+assign csrbank1_sram_reader_level_r = interface1_bank_bus_dat_w[0];
 always @(*) begin
     csrbank1_sram_reader_level_re <= 1'd0;
     csrbank1_sram_reader_level_we <= 1'd0;
@@ -3771,20 +3700,12 @@ always @(posedge sys_clk) begin
     if (wishbone_interface_reader_eventsourcepulse_trigger) begin
         wishbone_interface_reader_eventsourcepulse_pending <= 1'd1;
     end
-    if (((wishbone_interface_reader_cmd_fifo_syncfifo_we & wishbone_interface_reader_cmd_fifo_syncfifo_writable) & (~wishbone_interface_reader_cmd_fifo_replace))) begin
-        wishbone_interface_reader_cmd_fifo_produce <= (wishbone_interface_reader_cmd_fifo_produce + 1'd1);
-    end
-    if (wishbone_interface_reader_cmd_fifo_do_read) begin
-        wishbone_interface_reader_cmd_fifo_consume <= (wishbone_interface_reader_cmd_fifo_consume + 1'd1);
-    end
-    if (((wishbone_interface_reader_cmd_fifo_syncfifo_we & wishbone_interface_reader_cmd_fifo_syncfifo_writable) & (~wishbone_interface_reader_cmd_fifo_replace))) begin
-        if ((~wishbone_interface_reader_cmd_fifo_do_read)) begin
-            wishbone_interface_reader_cmd_fifo_level <= (wishbone_interface_reader_cmd_fifo_level + 1'd1);
-        end
-    end else begin
-        if (wishbone_interface_reader_cmd_fifo_do_read) begin
-            wishbone_interface_reader_cmd_fifo_level <= (wishbone_interface_reader_cmd_fifo_level - 1'd1);
-        end
+    if (((~wishbone_interface_reader_pipe_valid_source_valid) | wishbone_interface_reader_pipe_valid_source_ready)) begin
+        wishbone_interface_reader_pipe_valid_source_valid <= wishbone_interface_reader_pipe_valid_sink_valid;
+        wishbone_interface_reader_pipe_valid_source_first <= wishbone_interface_reader_pipe_valid_sink_first;
+        wishbone_interface_reader_pipe_valid_source_last <= wishbone_interface_reader_pipe_valid_sink_last;
+        wishbone_interface_reader_pipe_valid_source_payload_slot <= wishbone_interface_reader_pipe_valid_sink_payload_slot;
+        wishbone_interface_reader_pipe_valid_source_payload_length <= wishbone_interface_reader_pipe_valid_sink_payload_length;
     end
     liteethmacsramreader_state <= liteethmacsramreader_next_state;
     if (wishbone_interface_reader_length_liteethmac_liteethmacsramreader_next_value_ce) begin
@@ -3802,10 +3723,6 @@ always @(posedge sys_clk) begin
     wishbone_interface_interface2_ack <= 1'd0;
     if (((wishbone_interface_interface2_cyc & wishbone_interface_interface2_stb) & ((~wishbone_interface_interface2_ack) | wishbone_interface_sram2_adr_burst))) begin
         wishbone_interface_interface2_ack <= 1'd1;
-    end
-    wishbone_interface_interface3_ack <= 1'd0;
-    if (((wishbone_interface_interface3_cyc & wishbone_interface_interface3_stb) & ((~wishbone_interface_interface3_ack) | wishbone_interface_sram3_adr_burst))) begin
-        wishbone_interface_interface3_ack <= 1'd1;
     end
     wishbone_interface_decoder1_slave_sel_r <= wishbone_interface_decoder1_slave_sel;
     wishbone2csr_state <= wishbone2csr_next_state;
@@ -3992,15 +3909,14 @@ always @(posedge sys_clk) begin
         wishbone_interface_reader_enable_storage <= 1'd0;
         wishbone_interface_reader_enable_re <= 1'd0;
         wishbone_interface_reader_length <= 11'd0;
-        wishbone_interface_reader_cmd_fifo_level <= 2'd0;
-        wishbone_interface_reader_cmd_fifo_produce <= 1'd0;
-        wishbone_interface_reader_cmd_fifo_consume <= 1'd0;
+        wishbone_interface_reader_pipe_valid_source_valid <= 1'd0;
+        wishbone_interface_reader_pipe_valid_source_payload_slot <= 1'd0;
+        wishbone_interface_reader_pipe_valid_source_payload_length <= 11'd0;
         wishbone_interface_interface0_ack <= 1'd0;
         wishbone_interface_interface1_ack <= 1'd0;
         wishbone_interface_decoder0_slave_sel_r <= 2'd0;
         wishbone_interface_interface2_ack <= 1'd0;
-        wishbone_interface_interface3_ack <= 1'd0;
-        wishbone_interface_decoder1_slave_sel_r <= 2'd0;
+        wishbone_interface_decoder1_slave_sel_r <= 1'd0;
         slave_sel_r <= 3'd0;
         count <= 20'd1000000;
         liteethmacsramwriter_state <= 3'd0;
@@ -4129,21 +4045,6 @@ assign wishbone_interface_sram1_dat_r = mac_sram_writer_slot1_dat1;
 
 
 //------------------------------------------------------------------------------
-// Memory storage_4: 2-words x 14-bit
-//------------------------------------------------------------------------------
-// Port 0 | Read: ----  | Write: Sync | Mode: Read-First 
-// Port 1 | Read: Async | Write: ---- | 
-reg [13:0] storage_4[0:1];
-always @(posedge sys_clk) begin
-	if (wishbone_interface_reader_cmd_fifo_wrport_we)
-		storage_4[wishbone_interface_reader_cmd_fifo_wrport_adr] <= wishbone_interface_reader_cmd_fifo_wrport_dat_w;
-end
-always @(posedge sys_clk) begin
-end
-assign wishbone_interface_reader_cmd_fifo_rdport_dat_r = storage_4[wishbone_interface_reader_cmd_fifo_rdport_adr];
-
-
-//------------------------------------------------------------------------------
 // Memory mac_sram_reader_slot0: 383-words x 32-bit
 //------------------------------------------------------------------------------
 // Port 0 | Read: Sync  | Write: ---- | 
@@ -4152,8 +4053,8 @@ reg [31:0] mac_sram_reader_slot0[0:382];
 reg [31:0] mac_sram_reader_slot0_dat0;
 reg [8:0] mac_sram_reader_slot0_adr1;
 always @(posedge sys_clk) begin
-	if (wishbone_interface_reader_memory0_re)
-		mac_sram_reader_slot0_dat0 <= mac_sram_reader_slot0[wishbone_interface_reader_memory0_adr];
+	if (wishbone_interface_reader_memory_re)
+		mac_sram_reader_slot0_dat0 <= mac_sram_reader_slot0[wishbone_interface_reader_memory_adr];
 end
 always @(posedge sys_clk) begin : mem_write_block
 	integer we_index;
@@ -4162,31 +4063,8 @@ always @(posedge sys_clk) begin : mem_write_block
 			mac_sram_reader_slot0[wishbone_interface_sram2_adr][we_index*8 +: 8] <= wishbone_interface_sram2_dat_w[we_index*8 +: 8];
 	mac_sram_reader_slot0_adr1 <= wishbone_interface_sram2_adr;
 end
-assign wishbone_interface_reader_memory0_dat_r = mac_sram_reader_slot0_dat0;
+assign wishbone_interface_reader_memory_dat_r = mac_sram_reader_slot0_dat0;
 assign wishbone_interface_sram2_dat_r = mac_sram_reader_slot0[mac_sram_reader_slot0_adr1];
-
-
-//------------------------------------------------------------------------------
-// Memory mac_sram_reader_slot1: 383-words x 32-bit
-//------------------------------------------------------------------------------
-// Port 0 | Read: Sync  | Write: ---- | 
-// Port 1 | Read: Sync  | Write: Sync | Mode: Write-First | Write-Granularity: 8
-reg [31:0] mac_sram_reader_slot1[0:382];
-reg [31:0] mac_sram_reader_slot1_dat0;
-reg [8:0] mac_sram_reader_slot1_adr1;
-always @(posedge sys_clk) begin
-	if (wishbone_interface_reader_memory1_re)
-		mac_sram_reader_slot1_dat0 <= mac_sram_reader_slot1[wishbone_interface_reader_memory1_adr];
-end
-always @(posedge sys_clk) begin : mem_write_block_1
-	integer we_index_1;
-	for(we_index_1 = 0; we_index_1 < 4; we_index_1=we_index_1+1)
-		if (wishbone_interface_sram3_we[we_index_1])
-			mac_sram_reader_slot1[wishbone_interface_sram3_adr][we_index_1*8 +: 8] <= wishbone_interface_sram3_dat_w[we_index_1*8 +: 8];
-	mac_sram_reader_slot1_adr1 <= wishbone_interface_sram3_adr;
-end
-assign wishbone_interface_reader_memory1_dat_r = mac_sram_reader_slot1_dat0;
-assign wishbone_interface_sram3_dat_r = mac_sram_reader_slot1[mac_sram_reader_slot1_adr1];
 
 
 (* ars_ff1 = "true", async_reg = "true" *)
@@ -4393,5 +4271,5 @@ IOBUF IOBUF(
 endmodule
 
 // -----------------------------------------------------------------------------
-//  Auto-Generated by LiteX on 2026-05-07 15:39:43.
+//  Auto-Generated by LiteX on 2026-05-12 10:36:31.
 //------------------------------------------------------------------------------

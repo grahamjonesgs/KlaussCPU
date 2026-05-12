@@ -1,0 +1,33 @@
+# LiteEth standalone core for KlaussCPU on Nexys A7 100T
+# Generated 2026-05-07
+
+# Target FPGA (Nexys A7 100T = xc7a100t-1csg324)
+vendor:        xilinx
+toolchain:     vivado
+device:        xc7a100t
+package:       csg324
+speedgrade:    -1
+
+# PHY (D2: RMII; D3: FPGA drives REF_CLK)
+phy:           LiteEthPHYRMII
+
+# Bus interface to CPU (D4: Wishbone)
+core:             wishbone
+csr_data_width:   32
+endianness:       little
+
+# Clocks
+clk_freq:         100000000
+phy_clk_freq:      50000000
+
+# TX SRAM slots: 1 makes TX_READY go low immediately on TX_START and only
+# return high once TERMINATE fires (frame fully on the wire).  With the
+# default ntxslots=2, TX_READY stays high after the first push (FIFO still
+# has room), allowing a second accidental push → every frame sent twice.
+ntxslots:         1
+
+# Default MAC (D6: software can override via CSR write)
+mac_address:      0x020000000001
+
+# Single IRQ line for RX/TX events (wired in Phase 6)
+interrupt:        true
