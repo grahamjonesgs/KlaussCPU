@@ -22,7 +22,11 @@ cache controller.
 0xF006_xxxx                 Ethernet — LiteEth CSRs (control + MDIO + MAC)
 0xF007_xxxx                 reserved (gap inside LiteEth WB space, returns 0)
 0xF008_xxxx                 Ethernet — RX/TX slot SRAM buffers (8 KiB)
-0xF009_xxxx – 0xF00E_xxxx   reserved
+0xF009_xxxx                 reserved
+0xF00A_xxxx                 Crypto — AES-128 (+ AES-GCM, planned)
+0xF00B_xxxx                 Crypto — SHA-256 (+ HMAC wrapper, planned)
+0xF00C_xxxx                 Crypto — TRNG (planned)
+0xF00D_xxxx – 0xF00E_xxxx   reserved
 0xF00F_xxxx                 timers / IRQ controller
 ```
 
@@ -508,6 +512,229 @@ should clear `INT_MASK[0]` first, then later re-enable.
 re-zeroes `INT_MASK` and all four vectors, so a freshly-loaded program
 always starts with interrupts off.
 
+### Crypto: AES-128 — base `0xF00A_0000`
+
+Hardware AES-128 encrypt/decrypt block. See
+[CRYPTO_PLAN.md §4](CRYPTO_PLAN.md) for the architecture and the rationale
+for putting bulk crypto in fabric. Implemented in
+[crypto_aes.v](KlaussCPU.srcs/sources_1/new/crypto_aes.v) and
+[aes_core.v](KlaussCPU.srcs/sources_1/new/aes_core.v).
+
+| Offset | Reg          | RW | Width | Description |
+|--------|--------------|----|-------|-------------|
+| 0x000  | `AES_CTRL`   | W  | 8     | `[0]` GO (encrypt/decrypt one block; self-clearing). `[1]` ENC (1 = encrypt, 0 = decrypt; sampled with GO). `[2]` KEY_LOAD (expand key schedule; self-clearing). `[3]` KEY_ZERO (wipe key registers; self-clearing). |
+| 0x008  | `AES_STATUS` | R  | 8     | `[0]` BUSY (operation in progress). `[1]` DONE (last operation completed; sticky until next GO/KEY_LOAD). |
+| 0x010  | `AES_KEY0`   | RW | 64    | Key bits [63:0]. |
+| 0x018  | `AES_KEY1`   | RW | 64    | Key bits [127:64]. |
+| 0x040  | `AES_IN0`    | RW | 64    | Input block bits [63:0] (plaintext for encrypt, ciphertext for decrypt). |
+| 0x048  | `AES_IN1`    | RW | 64    | Input block bits [127:64]. |
+| 0x050  | `AES_OUT0`   | R  | 64    | Output block bits [63:0]. |
+| 0x058  | `AES_OUT1`   | R  | 64    | Output block bits [127:64]. |
+
+**Timing.** Key schedule expansion takes ~11 cycles after `KEY_LOAD`.
+Encrypt and decrypt each take 10 cycles after `GO`. `BUSY` is high for the
+entire operation; `DONE` latches at completion and stays set until the
+next `GO` / `KEY_LOAD`.
+
+**Usage.** Always load the key (one MMIO write + KEY_LOAD pulse) before
+the first block; reload only if the session key changes. Higher-level
+modes (CTR for SSH stream cipher, ECB-DECRYPT for KAT validation, GCM
+once item 2 lands) are all built on top of the per-block primitive in
+software. See `aes_ctr()` in `CRYPTO_PLAN.md` §4 for a CTR example.
+
+**Side-channel note.** Hardware AES has data-independent timing — unlike
+the C reference implementation, this MMIO path is not vulnerable to
+cache-timing key recovery. Wipe the key with `KEY_ZERO` (or by writing 0
+to `AES_KEY0/1` followed by KEY_LOAD) at the end of each session to
+avoid leaving residue in fabric.
+
+### AES-GCM / GHASH — base `0xF00A_0080`
+
+Shares the AES-128 device window (offsets `0x080..0x0BC`).  Implements
+the GHASH multiplier (GF(2^128)) plus a tag-accumulating wrapper, so the
+on-bus operation is "tag ← (tag XOR X) • H".  Software sequences AES-CTR
+encryption (using the AES-128 core at offsets `0x000..0x058`) with these
+GHASH steps to build a full AES-GCM AEAD.  See
+[CRYPTO_PLAN.md §5](CRYPTO_PLAN.md) and
+[ghash.v](KlaussCPU.srcs/sources_1/new/ghash.v).
+
+| Offset | Reg          | RW | Width | Description |
+|--------|--------------|----|-------|-------------|
+| 0x080  | `GCM_CTRL`   | W  | 8     | `[0]` GO (kick `tag ← (tag XOR X) • H`; ignored if BUSY).  `[1]` RESET (`tag ← 0`).  Both self-clearing. |
+| 0x088  | `GCM_STATUS` | R  | 8     | `[0]` BUSY (GHASH multiply in progress).  `[1]` DONE (sticky; cleared by next GO). |
+| 0x090  | `GCM_H0`     | RW | 64    | Hash subkey H bytes 0..7 (little-endian uint64 view; software writes the raw `AES_K(0^128)` output here). |
+| 0x098  | `GCM_H1`     | RW | 64    | H bytes 8..15. |
+| 0x0A0  | `GCM_X0`     | RW | 64    | Next-block X bytes 0..7 (ciphertext, AAD, or length encoding). |
+| 0x0A8  | `GCM_X1`     | RW | 64    | X bytes 8..15. |
+| 0x0B0  | `GCM_TAG0`   | R  | 64    | Current tag bytes 0..7. |
+| 0x0B8  | `GCM_TAG1`   | R  | 64    | Tag bytes 8..15. |
+
+**Byte order.** All GCM registers use software's natural little-endian
+`uint64_t` view — byte 0 at bits `[7:0]`, byte 7 at `[63:56]`, etc.
+Hardware internally byteswaps to the network-bit-order convention GHASH
+operates on, so software passes ciphertext / AAD bytes in their natural
+memory layout via `((uint64_t *)dst)[0] = X0; ((uint64_t *)dst)[1] = X1;`.
+
+**Timing.** One multiply takes 128 cycles (bit-serial) + 1 cycle FSM
+overhead.  Together with the AES counter encryption (10 cycles) and ~6
+MMIO writes / 2 reads per block, the per-block GCM cost is ~150 cycles
+= ~9.4 cycles/byte ≈ 11 MB/s at 100 MHz.  Adequate for 100 Mbps SSH;
+a future 4-bit or 8-bit-per-cycle Karatsuba GHASH would push it to
+~25 MB/s if profiling justifies the area.
+
+**Per-frame software flow (AES-GCM encryption of N blocks of plaintext,
+M blocks of AAD, 96-bit IV):**
+
+```c
+/* Once per session: load AES key, compute H. */
+aes_set_key(K);                              /* writes AES_KEY0/1 + KEY_LOAD   */
+REG_AES_IN0 = 0; REG_AES_IN1 = 0;
+REG_AES_CTRL = AES_CTRL_GO | AES_CTRL_ENC;
+aes_wait_done();
+REG_GCM_H0 = REG_AES_OUT0;
+REG_GCM_H1 = REG_AES_OUT1;
+
+/* Per frame: */
+uint64_t j0_lo = iv_low64, j0_hi = iv_hi32 | (1ULL << 32);  /* J0 = IV || 0x...01 */
+aes_encrypt_block(j0_lo, j0_hi, &j0ks_lo, &j0ks_hi);          /* save AES_K(J0) for tag mask */
+REG_GCM_CTRL = GCM_CTRL_RESET;                                /* tag = 0 */
+
+for (each AAD block):    gcm_ghash_block(aad);                /* write GCM_X*, GO */
+for (each PT block) {
+    inc_ctr(&ctr);
+    aes_encrypt_block(ctr_lo, ctr_hi, &ks_lo, &ks_hi);
+    ct_lo = pt_lo ^ ks_lo;
+    ct_hi = pt_hi ^ ks_hi;
+    emit_ct(ct_lo, ct_hi);
+    gcm_ghash_block_64(ct_lo, ct_hi);
+}
+/* Length block: (lenA_bits || lenC_bits), each 64-bit big-endian on the wire,
+   so on a little-endian CPU we bswap each half: */
+gcm_ghash_block_64(bswap64(lenC_bits), bswap64(lenA_bits));
+
+uint64_t tag0 = REG_GCM_TAG0 ^ j0ks_lo;
+uint64_t tag1 = REG_GCM_TAG1 ^ j0ks_hi;
+emit_tag(tag0, tag1);
+```
+
+### Crypto: SHA-256 — base `0xF00B_0000`
+
+Bare SHA-256 compression engine (FIPS 180-4).  Padding and length
+encoding are software's job; hardware compresses one 512-bit block per
+`START`.  See [CRYPTO_PLAN.md §6](CRYPTO_PLAN.md).  Implemented in
+[crypto_sha.v](KlaussCPU.srcs/sources_1/new/crypto_sha.v) and
+[sha256_core.v](KlaussCPU.srcs/sources_1/new/sha256_core.v).
+
+| Offset       | Reg              | RW | Width | Description |
+|--------------|------------------|----|-------|-------------|
+| 0x000        | `SHA_CTRL`       | W  | 8     | `[0]` INIT (reset H to FIPS-180-4 IV; self-clearing). `[1]` START (compress block currently in BLOCK regs; self-clearing). |
+| 0x008        | `SHA_STATUS`     | R  | 8     | `[0]` BUSY (compression in progress). `[1]` DONE (sticky; cleared by next INIT/START). |
+| 0x010..0x048 | `SHA_BLOCK0..7`  | RW | 64×8  | 512-bit message block.  Low 32 of slot `i` = M[2i]; high 32 = M[2i+1].  Hardware byteswaps each 32-bit half, so software just does `((uint64_t*)BLOCK)[i] = ((uint64_t*)msg)[i]`. |
+| 0x050..0x068 | `SHA_DIGEST0..3` | R  | 64×4  | 256-bit current digest, packed and byteswapped identically.  `((uint64_t*)out)[i] = REG_SHA_DIGEST_i` yields the standard SHA-256 byte order. |
+
+**Timing.** 64 cycles per block + ~3 cycles FSM overhead.  Reads of
+`SHA_DIGEST0..3` reflect the live `H[0..7]` — valid after each block
+completes (i.e., after `BUSY` clears).
+
+**Padding.** SHA-256 padding is byte-stream-defined (FIPS 180-4 §5.1):
+append `0x80`, zero-pad until length ≡ 56 (mod 64), then append the
+64-bit big-endian total message length in bits.  All of this is
+software's job — call sequence is:
+
+```c
+sha256_init();                                       /* SHA_CTRL = INIT */
+while (have full 64-byte block) sha256_block(blk);   /* SHA_CTRL = START */
+sha256_block(final_padded_block);                    /* may be two blocks if needed */
+sha256_read_digest(out);
+```
+
+See `sha256()` in `CRYPTO_PLAN.md` §6 for the canonical software loop.
+
+### HMAC-SHA-256 wrapper — base `0xF00B_0080`
+
+Shares the SHA-256 device window (offsets `0x080..0x0AC`).  Caches the
+inner/outer hash midstates derived from a 256-bit key so per-MAC overhead
+collapses to a single H reload at the start and end of each authentication.
+Per CRYPTO_PLAN.md §8.
+
+| Offset | Reg            | RW | Width | Description |
+|--------|----------------|----|-------|-------------|
+| 0x080  | `HMAC_CTRL`    | W  | 8     | `[0]` KEY_LOAD  (recompute inner/outer midstates from `HMAC_KEY0..3`; ignored if already busy).  `[1]` START (single-cycle: H ← inner_state).  `[2]` FINAL (single-cycle: H ← outer_state).  `[3]` KEY_ZERO (wipe key + midstates).  All bits self-clearing. |
+| 0x088  | `HMAC_STATUS`  | R  | 8     | `[0]` BUSY (HMAC FSM running a midstate-computation pass).  `[1]` KEY_VALID (midstates have been computed and not been wiped). |
+| 0x090  | `HMAC_KEY0`    | RW | 64    | Key bits [63:0]. |
+| 0x098  | `HMAC_KEY1`    | RW | 64    | Key bits [127:64]. |
+| 0x0A0  | `HMAC_KEY2`    | RW | 64    | Key bits [191:128]. |
+| 0x0A8  | `HMAC_KEY3`    | RW | 64    | Key bits [255:192]. |
+
+**Timing.**  `KEY_LOAD` runs two SHA compressions back-to-back — ~135 cycles
+total.  `START` and `FINAL` are single-cycle H-load pulses; they never
+block.
+
+**Per-MAC software flow:**
+
+```c
+/* Once per SSH session — only if the key changes */
+hmac_set_key(session_mac_key, 32);   /* writes HMAC_KEY0..3 + KEY_LOAD */
+while (REG_HMAC_STATUS & HMAC_STATUS_BUSY) { }
+
+/* Per packet */
+REG_HMAC_CTRL = HMAC_CTRL_START;     /* H ← inner_state */
+hmac_stream(msg, len);               /* normal SHA blocks; pad as if 64 ipad bytes
+                                        were prepended → bit-length += 64*8 */
+hmac_read_inner_digest(inner);
+REG_HMAC_CTRL = HMAC_CTRL_FINAL;     /* H ← outer_state */
+hmac_final_block(inner, 32);         /* 1 SHA block: inner || 0x80 || pad || bitlen=96*8 */
+hmac_read_tag(tag);                  /* read SHA_DIGEST */
+```
+
+**Long keys.**  This wrapper supports keys up to 256 bits.  Per RFC 2104,
+longer keys must be SHA-256-hashed by software first; software then passes
+the 32-byte digest as the key here.  Keys shorter than 32 bytes should be
+zero-padded by software before writing `HMAC_KEY0..3`.
+
+**Side-channel note.**  Same data-independent timing as the bare SHA
+engine.  Wipe the key with `KEY_ZERO` at the end of each session so
+fabric state doesn't outlive the session.
+
+### Crypto: TRNG — base `0xF00C_0000`
+
+Ring-oscillator-based true random number generator with Von Neumann
+debiasing and a NIST SP 800-90B repetition-count health monitor.  See
+[CRYPTO_PLAN.md §7](CRYPTO_PLAN.md).  Implemented in
+[trng.v](KlaussCPU.srcs/sources_1/new/trng.v) and
+[ring_osc.v](KlaussCPU.srcs/sources_1/new/ring_osc.v).
+
+| Offset | Reg            | RW | Width | Description |
+|--------|----------------|----|-------|-------------|
+| 0x000  | `TRNG_CTRL`    | RW | 8     | `[0]` ENABLE (1 = sample ROs and produce output). `[1]` RESEED (self-clearing — drains FIFO, resets accumulator, restarts the RCT). |
+| 0x008  | `TRNG_STATUS`  | R  | 8     | `[0]` READY (≥1 conditioned 64-bit word in FIFO). `[1]` HEALTH_OK (Repetition-Count Test has not tripped). |
+| 0x010  | `TRNG_DATA`    | R  | 64    | 64-bit conditioned word.  **Reading this register consumes one FIFO entry** — side-effecting MMIO read.  Reads when READY = 0 return the last popped value (no new entropy). |
+
+**Pipeline.**  16 ring oscillators → metastability double-FF → XOR-fold to
+1 raw bit/cycle → Von Neumann debias (drops same-pair bits, emits the
+first of any 01/10 pair) → 64-bit shift accumulator → 2-deep FIFO.  At
+~25 % Von Neumann yield on a balanced source, fresh 64-bit words arrive
+every ~256 cycles (~2.6 µs at 100 MHz).
+
+**Boot-time use.**  At power-on, ROs are disabled (`r_enable = 0`).
+Software must set `TRNG_CTRL.ENABLE = 1`, then wait at least a few
+microseconds before reading `TRNG_DATA` — the FIFO fills as soon as the
+ROs settle (typically <1 µs).
+
+**Health monitor.**  `HEALTH_OK` drops to 0 if the raw-bit Repetition-Count
+Test trips (32 consecutive identical bits, false-positive ≈ 2⁻³¹ on a
+balanced source).  Once tripped, the fault is latched until `RESEED`;
+software MUST treat `!HEALTH_OK` as fatal for key material and refuse
+further use until a reseed succeeds.
+
+**Conditioning policy.**  Output is XOR-distilled (16 independent ROs)
+and Von-Neumann debiased — minimum-entropy per output bit is conservatively
+close to 1.  For cryptographic key material, software wraps the TRNG in a
+NIST-compliant CSPRNG (HMAC-DRBG over SHA-256) — see
+[CRYPTO_PLAN.md §9.4](CRYPTO_PLAN.md).  The TRNG provides entropy; the
+software CSPRNG provides the FIPS-conformant conditioning + reseed
+discipline.
+
 ## Reserved (planned)
 
 ### UART — base `0xF001_0000`
@@ -589,6 +816,131 @@ Width of access maps directly to the load/store opcode the compiler emits.
 
 #define INT_SRC_TIMER   0u
 #define INT_SRC_ETH     1u   /* reserved — wired in Phase 6 of ETHERNET_PLAN.md */
+
+/* Crypto: AES-128 (0xF00A_xxxx) — see CRYPTO_PLAN.md §4 */
+#define AES_BASE          (MMIO_BASE + 0x000A0000u)
+#define REG_AES_CTRL      (*(volatile uint32_t *)(AES_BASE + 0x0000))
+#define REG_AES_STATUS    (*(volatile uint32_t *)(AES_BASE + 0x0008))
+#define REG_AES_KEY0      (*(volatile uint64_t *)(AES_BASE + 0x0010))
+#define REG_AES_KEY1      (*(volatile uint64_t *)(AES_BASE + 0x0018))
+#define REG_AES_IN0       (*(volatile uint64_t *)(AES_BASE + 0x0040))
+#define REG_AES_IN1       (*(volatile uint64_t *)(AES_BASE + 0x0048))
+#define REG_AES_OUT0      (*(volatile uint64_t *)(AES_BASE + 0x0050))
+#define REG_AES_OUT1      (*(volatile uint64_t *)(AES_BASE + 0x0058))
+
+/* AES_CTRL bits (all self-clearing) */
+#define AES_CTRL_GO         (1u << 0)   /* kick one encrypt/decrypt operation */
+#define AES_CTRL_ENC        (1u << 1)   /* 1 = encrypt, 0 = decrypt; sampled with GO */
+#define AES_CTRL_KEY_LOAD   (1u << 2)   /* expand key schedule */
+#define AES_CTRL_KEY_ZERO   (1u << 3)   /* wipe key registers */
+
+/* AES_STATUS bits */
+#define AES_STATUS_BUSY     (1u << 0)
+#define AES_STATUS_DONE     (1u << 1)   /* sticky; cleared by next GO/KEY_LOAD */
+
+/* Block one AES operation to completion.  Inline so the hot CTR loop in
+   aes_ctr() / aes_gcm() doesn't pay a call. */
+static inline void aes_wait_done(void) {
+    while (REG_AES_STATUS & AES_STATUS_BUSY) { }
+}
+
+/* AES-GCM / GHASH (0xF00A_0080..00BC) — see CRYPTO_PLAN.md §5 */
+#define REG_GCM_CTRL    (*(volatile uint32_t *)(AES_BASE + 0x0080))
+#define REG_GCM_STATUS  (*(volatile uint32_t *)(AES_BASE + 0x0088))
+#define REG_GCM_H0      (*(volatile uint64_t *)(AES_BASE + 0x0090))
+#define REG_GCM_H1      (*(volatile uint64_t *)(AES_BASE + 0x0098))
+#define REG_GCM_X0      (*(volatile uint64_t *)(AES_BASE + 0x00A0))
+#define REG_GCM_X1      (*(volatile uint64_t *)(AES_BASE + 0x00A8))
+#define REG_GCM_TAG0    (*(volatile uint64_t *)(AES_BASE + 0x00B0))
+#define REG_GCM_TAG1    (*(volatile uint64_t *)(AES_BASE + 0x00B8))
+
+/* GCM_CTRL bits (self-clearing) */
+#define GCM_CTRL_GO     (1u << 0)   /* tag = (tag XOR X) • H */
+#define GCM_CTRL_RESET  (1u << 1)   /* tag = 0 */
+
+/* GCM_STATUS bits */
+#define GCM_STATUS_BUSY (1u << 0)
+#define GCM_STATUS_DONE (1u << 1)
+
+static inline void gcm_wait_done(void) {
+    while (REG_GCM_STATUS & GCM_STATUS_BUSY) { }
+}
+
+/* Accumulate one 128-bit block into the GHASH tag.
+   Caller has already loaded GCM_H0/H1.  Block bytes 0..7 in lo, 8..15 in hi. */
+static inline void gcm_ghash_block(uint64_t lo, uint64_t hi) {
+    REG_GCM_X0 = lo;
+    REG_GCM_X1 = hi;
+    REG_GCM_CTRL = GCM_CTRL_GO;
+    gcm_wait_done();
+}
+
+/* Crypto: SHA-256 (0xF00B_xxxx) — see CRYPTO_PLAN.md §6 */
+#define SHA_BASE          (MMIO_BASE + 0x000B0000u)
+#define REG_SHA_CTRL      (*(volatile uint32_t *)(SHA_BASE + 0x0000))
+#define REG_SHA_STATUS    (*(volatile uint32_t *)(SHA_BASE + 0x0008))
+#define SHA_BLOCK_PTR     ((volatile uint64_t *)(SHA_BASE + 0x0010))   /* 8 × 64-bit */
+#define SHA_DIGEST_PTR    ((volatile uint64_t *)(SHA_BASE + 0x0050))   /* 4 × 64-bit */
+
+/* SHA_CTRL bits (self-clearing) */
+#define SHA_CTRL_INIT     (1u << 0)   /* reset H to FIPS-180-4 IV */
+#define SHA_CTRL_START    (1u << 1)   /* compress current block */
+
+/* SHA_STATUS bits */
+#define SHA_STATUS_BUSY   (1u << 0)
+#define SHA_STATUS_DONE   (1u << 1)
+
+static inline void sha_wait_done(void) {
+    while (REG_SHA_STATUS & SHA_STATUS_BUSY) { }
+}
+
+/* HMAC-SHA-256 wrapper (0xF00B_0080..00AC) — see CRYPTO_PLAN.md §8 */
+#define REG_HMAC_CTRL    (*(volatile uint32_t *)(SHA_BASE + 0x0080))
+#define REG_HMAC_STATUS  (*(volatile uint32_t *)(SHA_BASE + 0x0088))
+#define REG_HMAC_KEY0    (*(volatile uint64_t *)(SHA_BASE + 0x0090))
+#define REG_HMAC_KEY1    (*(volatile uint64_t *)(SHA_BASE + 0x0098))
+#define REG_HMAC_KEY2    (*(volatile uint64_t *)(SHA_BASE + 0x00A0))
+#define REG_HMAC_KEY3    (*(volatile uint64_t *)(SHA_BASE + 0x00A8))
+
+/* HMAC_CTRL bits (all self-clearing) */
+#define HMAC_CTRL_KEY_LOAD  (1u << 0)
+#define HMAC_CTRL_START     (1u << 1)   /* H ← inner_state */
+#define HMAC_CTRL_FINAL     (1u << 2)   /* H ← outer_state */
+#define HMAC_CTRL_KEY_ZERO  (1u << 3)
+
+/* HMAC_STATUS bits */
+#define HMAC_STATUS_BUSY      (1u << 0)
+#define HMAC_STATUS_KEY_VALID (1u << 1)
+
+static inline void hmac_wait_keyload(void) {
+    while (REG_HMAC_STATUS & HMAC_STATUS_BUSY) { }
+}
+
+/* Crypto: TRNG (0xF00C_xxxx) — see CRYPTO_PLAN.md §7 */
+#define TRNG_BASE         (MMIO_BASE + 0x000C0000u)
+#define REG_TRNG_CTRL     (*(volatile uint32_t *)(TRNG_BASE + 0x0000))
+#define REG_TRNG_STATUS   (*(volatile uint32_t *)(TRNG_BASE + 0x0008))
+#define REG_TRNG_DATA     (*(volatile uint64_t *)(TRNG_BASE + 0x0010))
+
+/* TRNG_CTRL bits */
+#define TRNG_CTRL_ENABLE  (1u << 0)
+#define TRNG_CTRL_RESEED  (1u << 1)   /* self-clearing */
+
+/* TRNG_STATUS bits */
+#define TRNG_STATUS_READY      (1u << 0)
+#define TRNG_STATUS_HEALTH_OK  (1u << 1)
+
+/* Block until at least one 64-bit word is available, then consume it.
+   Returns 0 and writes nothing on a health-monitor fault — callers MUST
+   check the return value for crypto-key use. */
+static inline int trng_read64(uint64_t *out) {
+    while (!(REG_TRNG_STATUS & TRNG_STATUS_READY)) {
+        if (!(REG_TRNG_STATUS & TRNG_STATUS_HEALTH_OK)) return 0;
+    }
+    if (!(REG_TRNG_STATUS & TRNG_STATUS_HEALTH_OK)) return 0;
+    *out = REG_TRNG_DATA;   /* side-effecting read: pops the FIFO */
+    return 1;
+}
 
 /* Ethernet (LiteEth) — CSRs at 0xF006_xxxx, slot SRAM at 0xF008_xxxx */
 #define ETH_BASE                  (MMIO_BASE + 0x00060000u)

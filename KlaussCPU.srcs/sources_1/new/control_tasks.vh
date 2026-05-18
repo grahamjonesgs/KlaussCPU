@@ -66,6 +66,53 @@ task t_ret;
    end
 endtask
 
+// PC-relative conditional jump.  Target = PC_of_this_instruction + sign_ext(imm32).
+// r_PC at task-execution time is the opcode address (RISC-V convention),
+// so no pre-adjustment is needed.  imm32 is treated as signed 32-bit;
+// 32-bit add wraps mod 2^32 (the high bits of r_PC are always 0 in physical memory).
+task t_cond_jump_rel;
+   input [31:0] i_value;
+   input i_condition;
+   begin
+      if (i_condition) begin
+         r_SM <= OPCODE_REQUEST;
+         r_PC <= r_PC + i_value;
+      end else begin
+         r_SM <= OPCODE_REQUEST;
+         r_PC <= r_PC + 8;
+      end
+   end
+endtask
+
+// PC-relative conditional call.  Push return PC (PC+8) onto the DDR2 stack,
+// then jump to PC_of_this_instruction + sign_ext(imm32).  Same multi-cycle
+// DDR2 write pattern as t_cond_call.
+task t_cond_call_rel;
+   input [31:0] i_value;
+   input i_condition;
+   begin
+      if (i_condition) begin
+         if (r_extra_clock == 0) begin
+            r_SP             <= r_SP - 8;
+            r_mem_addr       <= r_SP - 32'd8;
+            r_mem_write_data <= {32'b0, r_PC + 32'd8};  // return after 2-word instruction
+            r_mem_byte_en    <= 8'hFF;
+            r_mem_write_DV   <= 1'b1;
+            r_extra_clock    <= 1'b1;
+         end else begin
+            if (w_mem_ready) begin
+               r_mem_write_DV <= 1'b0;
+               r_SM           <= OPCODE_REQUEST;
+               r_PC           <= r_PC + i_value;
+            end
+         end
+      end else begin
+         r_SM <= OPCODE_REQUEST;
+         r_PC <= r_PC + 8;
+      end
+   end
+endtask
+
 // Do nothing
 // On completion
 // Increment PC

@@ -71,6 +71,22 @@ task t_set_reg;
    end
 endtask
 
+// LEAPC — rd = PC_of_this_instruction + sign_ext(imm32), zero-extended to 64 bits.
+// r_PC is the opcode address at task time (RISC-V convention).  The 32-bit
+// add wraps mod 2^32; result is zero-extended to 64 bits to match the
+// CPU's address-in-register convention (e.g. CALL pushes {32'b0, ret_addr}).
+// Used by the compiler for position-independent global / function pointer
+// materialisation, replacing SETR for any non-MMIO address.
+task t_lea_pc;
+   input [31:0] i_value;
+   begin
+      r_writeback_value <= {32'b0, r_PC + i_value};
+      r_writeback_reg   <= r_reg_2;
+      r_SM              <= WRITEBACK;
+      r_PC              <= r_PC + 8;
+   end
+endtask
+
 // Set reg with flags
 task t_set_reg_flags;
    begin

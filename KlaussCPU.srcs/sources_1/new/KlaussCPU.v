@@ -584,6 +584,72 @@ module KlaussCPU (
    );
 
    // -------------------------------------------------------------------------
+   // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
+   // -------------------------------------------------------------------------
+   wire        w_aes_sel      = (w_mmio_addr[27:16] == 12'h00A);
+   wire        w_aes_write_DV = w_mmio_write_DV & w_aes_sel;
+   wire        w_aes_read_DV  = w_mmio_read_DV  & w_aes_sel;
+   wire [63:0] w_aes_read_data;
+   wire        w_aes_ready;
+
+   (* KEEP_HIERARCHY = "yes" *)
+   crypto_aes crypto_aes_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .i_mmio_write_DV(w_aes_write_DV),
+       .i_mmio_read_DV(w_aes_read_DV),
+       .i_mmio_addr(w_mmio_addr[15:0]),
+       .i_mmio_write_data(w_mmio_write_data),
+       .i_mmio_byte_en(w_mmio_byte_en),
+       .o_mmio_read_data(w_aes_read_data),
+       .o_mmio_ready(w_aes_ready)
+   );
+
+   // -------------------------------------------------------------------------
+   // Crypto SHA-256 — device id 0x00B. See CRYPTO_PLAN.md §6 and MMIO_MAP.md.
+   // -------------------------------------------------------------------------
+   wire        w_sha_sel      = (w_mmio_addr[27:16] == 12'h00B);
+   wire        w_sha_write_DV = w_mmio_write_DV & w_sha_sel;
+   wire        w_sha_read_DV  = w_mmio_read_DV  & w_sha_sel;
+   wire [63:0] w_sha_read_data;
+   wire        w_sha_ready;
+
+   (* KEEP_HIERARCHY = "yes" *)
+   crypto_sha crypto_sha_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .i_mmio_write_DV(w_sha_write_DV),
+       .i_mmio_read_DV(w_sha_read_DV),
+       .i_mmio_addr(w_mmio_addr[15:0]),
+       .i_mmio_write_data(w_mmio_write_data),
+       .i_mmio_byte_en(w_mmio_byte_en),
+       .o_mmio_read_data(w_sha_read_data),
+       .o_mmio_ready(w_sha_ready)
+   );
+
+   // -------------------------------------------------------------------------
+   // Crypto TRNG — device id 0x00C. See CRYPTO_PLAN.md §7 and MMIO_MAP.md.
+   // -------------------------------------------------------------------------
+   wire        w_trng_sel      = (w_mmio_addr[27:16] == 12'h00C);
+   wire        w_trng_write_DV = w_mmio_write_DV & w_trng_sel;
+   wire        w_trng_read_DV  = w_mmio_read_DV  & w_trng_sel;
+   wire [63:0] w_trng_read_data;
+   wire        w_trng_ready;
+
+   (* KEEP_HIERARCHY = "yes" *)
+   trng trng_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .i_mmio_write_DV(w_trng_write_DV),
+       .i_mmio_read_DV(w_trng_read_DV),
+       .i_mmio_addr(w_mmio_addr[15:0]),
+       .i_mmio_write_data(w_mmio_write_data),
+       .i_mmio_byte_en(w_mmio_byte_en),
+       .o_mmio_read_data(w_trng_read_data),
+       .o_mmio_ready(w_trng_ready)
+   );
+
+   // -------------------------------------------------------------------------
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
    // The result is registered into r_mmio_read_data (FF) below to break the
    // long combinational path from peripheral state regs through bus_splitter
@@ -634,6 +700,9 @@ module KlaussCPU (
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
+         12'h00A: r_mmio_read_data_comb = w_aes_read_data;  // Crypto: AES
+         12'h00B: r_mmio_read_data_comb = w_sha_read_data;  // Crypto: SHA-256
+         12'h00C: r_mmio_read_data_comb = w_trng_read_data; // Crypto: TRNG
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, r_int_mask};

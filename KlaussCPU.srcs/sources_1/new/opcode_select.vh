@@ -170,6 +170,7 @@ task t_opcode_select;
          32'h0000_096?: t_zero_extend_half;                    // ZEXTH R rd=zero_ext(rs[15:0]) to 64 bits; sets zero
          32'h0000_097?: t_byte_swap;                           // BSWAP R rd=byte_reverse(rs) all 8 bytes (64-bit endian swap)
          32'h0000_098?: t_not_reg;                             // NOTR R rd=~rs bitwise NOT; sets zero
+         32'h0000_099?: t_lea_pc(w_var1);                      // LEAPC RV rd=PC_of_this_insn+sign_ext(imm32), zero-ext to 64 bits (PC-relative addr-of)
 
          //=====================================================================
          // Bit manipulation by immediate (RV, 2-word). Bit position in imm[5:0] (0–63).
@@ -274,6 +275,11 @@ task t_opcode_select;
          // JMPZ tests the arithmetic zero_flag; JMPE tests the compare equal_flag.
          // JMPLT/JMPLE/JMPGT/JMPGE use less_flag (from CMPRR/CMPRV, signed).
          // JMPULT/JMPULE/JMPUGT/JMPUGE use ult_flag (from CMPRR/CMPRV, unsigned).
+         //
+         // PC-relative counterparts live at 1030–1041 (see "PC-relative flow
+         // control" block below).  Use those for intra-module branches/calls;
+         // keep the absolute forms here for MMIO targets and inter-module
+         // dispatch where the destination is a true absolute address.
          //=====================================================================
          32'h0000_1000: t_cond_jump(w_var1, 1'b1);             // JMP V jump to absolute byte addr imm32 (unconditional)
          32'h0000_1001: t_cond_jump(w_var1, r_zero_flag);      // JMPZ V jump if zero_flag (arithmetic result was zero)
@@ -305,6 +311,32 @@ task t_opcode_select;
          32'h0000_101B: t_cond_jump(w_var1, !r_ult_flag & !r_equal_flag);        // JMPUGT V jump if !ult_flag&!equal_flag (unsigned >)
          32'h0000_101C: t_cond_jump(w_var1, !r_ult_flag);                        // JMPUGE V jump if !ult_flag (unsigned >=)
          32'h0000_102?: t_jump_reg;                             // JMPR R jump to absolute byte addr in rs2
+
+         //=====================================================================
+         // PC-relative flow control (V/Vcall = signed 32-bit byte offset at PC+4)
+         // Target = PC_of_this_instruction + sign_ext(imm32) (RISC-V convention).
+         // Same flag sources as the absolute JMP/CALL family above; one-for-one
+         // replacement for intra-module branches and direct calls.  The assembler/
+         // linker emits simm32 = target_addr - addr_of_this_opcode.
+         //=====================================================================
+         32'h0000_1030: t_cond_jump_rel(w_var1, 1'b1);                            // JMPREL V PC+=sign_ext(imm32) (unconditional)
+         32'h0000_1031: t_cond_jump_rel(w_var1, r_zero_flag);                     // JMPZREL V rel jump if zero_flag
+         32'h0000_1032: t_cond_jump_rel(w_var1, !r_zero_flag);                    // JMPNZREL V rel jump if not zero_flag
+         32'h0000_1033: t_cond_jump_rel(w_var1, r_equal_flag);                    // JMPEREL V rel jump if equal_flag
+         32'h0000_1034: t_cond_jump_rel(w_var1, !r_equal_flag);                   // JMPNEREL V rel jump if not equal_flag
+         32'h0000_1035: t_cond_jump_rel(w_var1, r_carry_flag);                    // JMPCREL V rel jump if carry_flag
+         32'h0000_1036: t_cond_jump_rel(w_var1, !r_carry_flag);                   // JMPNCREL V rel jump if not carry_flag
+         32'h0000_1037: t_cond_jump_rel(w_var1, r_sign_flag);                     // JMPSREL V rel jump if sign_flag
+         32'h0000_1038: t_cond_jump_rel(w_var1, !r_sign_flag);                    // JMPNSREL V rel jump if not sign_flag
+         32'h0000_1039: t_cond_jump_rel(w_var1, r_less_flag);                     // JMPLTREL V rel jump if less_flag (signed <)
+         32'h0000_103A: t_cond_jump_rel(w_var1, r_less_flag | r_equal_flag);      // JMPLEREL V rel jump if less|equal (signed <=)
+         32'h0000_103B: t_cond_jump_rel(w_var1, !r_less_flag & !r_equal_flag);    // JMPGTREL V rel jump if !less&!equal (signed >)
+         32'h0000_103C: t_cond_jump_rel(w_var1, !r_less_flag);                    // JMPGEREL V rel jump if !less_flag (signed >=)
+         32'h0000_103D: t_cond_jump_rel(w_var1, r_ult_flag);                      // JMPULTREL V rel jump if ult_flag (unsigned <)
+         32'h0000_103E: t_cond_jump_rel(w_var1, r_ult_flag | r_equal_flag);       // JMPULEREL V rel jump if ult|equal (unsigned <=)
+         32'h0000_103F: t_cond_jump_rel(w_var1, !r_ult_flag & !r_equal_flag);     // JMPUGTREL V rel jump if !ult&!equal (unsigned >)
+         32'h0000_1040: t_cond_jump_rel(w_var1, !r_ult_flag);                     // JMPUGEREL V rel jump if !ult_flag (unsigned >=)
+         32'h0000_1041: t_cond_call_rel(w_var1, 1'b1);                            // CALLREL V push PC+8 (ret addr), PC+=sign_ext(imm32); SP-=8
 
          //=====================================================================
          // SPI LCD Control (2xxx)
