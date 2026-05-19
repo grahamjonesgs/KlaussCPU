@@ -623,430 +623,465 @@ task t_tx_message;
 endtask
 
 
-// Build a single line of the HCF crash dump into r_msg / r_msg_length.
-// Phase index is r_hcf_dump_phase (see DUMP_* localparams in KlaussCPU.v).
-// Caller (HCF_DUMP state, PREP sub-state) handles UART handshake and phase advance.
+// HCF crash-dump byte/length functions.
 //
-// All lines fit within the 32-byte r_msg buffer.  Lines end with "\r\n" so a
-// host terminal (minicom etc.) renders one dump field per line.
+// Replaces the legacy single-cycle t_hcf_dump_build_line task that assigned
+// all 32 bytes of r_msg in one branch of a wide case statement.  That case
+// collapsed in synthesis to a 207-input × 256-bit multiplexer — the largest
+// routing-congestion driver in the design (post-place congestion 8x8 E/W,
+// route_design wallclock ~35 min).
 //
-// Phases:
+// The byte/length functions compile to 8-bit-wide lookups instead.  The HCF
+// FSM (sub-state BYTE_BUILD in KlaussCPU.v) walks pos = 0..length-1 and writes
+// one byte of r_msg per cycle, so the per-byte write-data is an 8-bit mux,
+// not a 256-bit one (~32x smaller).
+//
+// Cost: adds N cycles of latency per dump line (13..27 cycles depending on
+// phase), trivially hidden under the UART transmission time (~100 µs/line at
+// 1 Mbaud).
+//
+// Phases (same as before):
 //   0           "*** CRASH DUMP ***"        (banner)
 //   1           "ERR=xx PC=xxxxxxxx"
 //   2           "OPC=xxxxxxxx SP=xxxxxxxx"
 //   3           "V1=xxxxxxxx IDX=xxxxxxxx"
 //   4           "V1H=xxxxxxxx"              (hi32 of V64 immediate; DRAM read at PC+8)
-//   5           "OPCM=xxxxxxxx"             (DRAM-side re-read at PC; differ from OPC ⇒ cache mismatch)
+//   5           "OPCM=xxxxxxxx"             (DRAM-side re-read at PC)
 //   6           "SM=xxxxxxxxx"              (FSM state, 33-bit one-hot)
 //   7           "IV0=xxxxxxxx"              (timer ISR vector, r_interrupt_table[0])
 //   8           "FLG Z=x E=x C=x V=x"
 //   9           "    S=x L=x U=x"
-//   10          "INSTR=NNNNNNNN"            (committed instruction count)
-//   11..26      "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF, hex index)
+//   10          "INSTR=NNNNNNNN"
+//   11..26      "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF)
 //   27..30      "SX=NNNNNNNNNNNNNNNN"       4 top-of-stack doublewords (S0..S3)
 //   31..46      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
-//   47          "*** END ***"               (footer)
-task t_hcf_dump_build_line;
-    reg [5:0]  k_phase;     // phase relative to base for repeated phases
-    reg [3:0]  trace_pos;   // ring index for trace lookup
-    reg [63:0] reg_val;
-    reg [63:0] trace_val;
+//   47          "*** END ***"
+
+// Byte length of the dump line for the given phase.
+function [7:0] f_dump_length;
+    input [6:0] phase;
     begin
-        case (r_hcf_dump_phase)
+        case (phase)
+            DUMP_HEADER:  f_dump_length = 8'd22;
+            DUMP_ERR_PC:  f_dump_length = 8'd20;
+            DUMP_OPC_SP:  f_dump_length = 8'd26;
+            DUMP_V1_V2:   f_dump_length = 8'd26;
+            DUMP_V1H:     f_dump_length = 8'd14;
+            DUMP_OPCM:    f_dump_length = 8'd15;
+            DUMP_SM:      f_dump_length = 8'd14;
+            DUMP_IV0:     f_dump_length = 8'd14;
+            DUMP_FLAGS_A: f_dump_length = 8'd21;
+            DUMP_FLAGS_B: f_dump_length = 8'd17;
+            DUMP_INSTR:   f_dump_length = 8'd16;
+            DUMP_FOOTER:  f_dump_length = 8'd13;
+            default: begin
+                // Family phases: regs (R/S) = 21B, trace (T) = 27B
+                if (phase < DUMP_TRACE_BASE) f_dump_length = 8'd21;
+                else                         f_dump_length = 8'd27;
+            end
+        endcase
+    end
+endfunction
+
+
+// Returns the byte at position `pos` for the given dump phase.
+// The HCF FSM only walks pos = 0..f_dump_length(phase)-1; out-of-range
+// positions return 0x00 and are never sent.
+function [7:0] f_dump_byte;
+    input [6:0] phase;
+    input [4:0] pos;
+    reg   [3:0]  k;          // family index (which reg / stack / trace entry)
+    reg   [63:0] data;       // 64-bit data word for family lines
+    reg   [31:0] half;       // 32-bit V1H/OPCM half-word
+    begin
+        f_dump_byte = 8'h00;
+        case (phase)
             DUMP_HEADER: begin
-                // "\r\n*** CRASH DUMP ***\r\n"  (22 bytes)
-                r_msg[ 0*8 +: 8] <= 8'h0D;
-                r_msg[ 1*8 +: 8] <= 8'h0A;
-                r_msg[ 2*8 +: 8] <= "*";
-                r_msg[ 3*8 +: 8] <= "*";
-                r_msg[ 4*8 +: 8] <= "*";
-                r_msg[ 5*8 +: 8] <= " ";
-                r_msg[ 6*8 +: 8] <= "C";
-                r_msg[ 7*8 +: 8] <= "R";
-                r_msg[ 8*8 +: 8] <= "A";
-                r_msg[ 9*8 +: 8] <= "S";
-                r_msg[10*8 +: 8] <= "H";
-                r_msg[11*8 +: 8] <= " ";
-                r_msg[12*8 +: 8] <= "D";
-                r_msg[13*8 +: 8] <= "U";
-                r_msg[14*8 +: 8] <= "M";
-                r_msg[15*8 +: 8] <= "P";
-                r_msg[16*8 +: 8] <= " ";
-                r_msg[17*8 +: 8] <= "*";
-                r_msg[18*8 +: 8] <= "*";
-                r_msg[19*8 +: 8] <= "*";
-                r_msg[20*8 +: 8] <= 8'h0D;
-                r_msg[21*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd22;
+                // "\r\n*** CRASH DUMP ***\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = 8'h0D;
+                    5'd1:  f_dump_byte = 8'h0A;
+                    5'd2:  f_dump_byte = "*";
+                    5'd3:  f_dump_byte = "*";
+                    5'd4:  f_dump_byte = "*";
+                    5'd5:  f_dump_byte = " ";
+                    5'd6:  f_dump_byte = "C";
+                    5'd7:  f_dump_byte = "R";
+                    5'd8:  f_dump_byte = "A";
+                    5'd9:  f_dump_byte = "S";
+                    5'd10: f_dump_byte = "H";
+                    5'd11: f_dump_byte = " ";
+                    5'd12: f_dump_byte = "D";
+                    5'd13: f_dump_byte = "U";
+                    5'd14: f_dump_byte = "M";
+                    5'd15: f_dump_byte = "P";
+                    5'd16: f_dump_byte = " ";
+                    5'd17: f_dump_byte = "*";
+                    5'd18: f_dump_byte = "*";
+                    5'd19: f_dump_byte = "*";
+                    5'd20: f_dump_byte = 8'h0D;
+                    5'd21: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_ERR_PC: begin
-                // "ERR=xx PC=xxxxxxxx\r\n"  (20 bytes)
-                r_msg[ 0*8 +: 8] <= "E";
-                r_msg[ 1*8 +: 8] <= "R";
-                r_msg[ 2*8 +: 8] <= "R";
-                r_msg[ 3*8 +: 8] <= "=";
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_error_code[7:4]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_error_code[3:0]);
-                r_msg[ 6*8 +: 8] <= " ";
-                r_msg[ 7*8 +: 8] <= "P";
-                r_msg[ 8*8 +: 8] <= "C";
-                r_msg[ 9*8 +: 8] <= "=";
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[31:28]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[27:24]);
-                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_PC[23:20]);
-                r_msg[13*8 +: 8] <= return_ascii_from_hex(r_PC[19:16]);
-                r_msg[14*8 +: 8] <= return_ascii_from_hex(r_PC[15:12]);
-                r_msg[15*8 +: 8] <= return_ascii_from_hex(r_PC[11: 8]);
-                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_PC[ 7: 4]);
-                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_PC[ 3: 0]);
-                r_msg[18*8 +: 8] <= 8'h0D;
-                r_msg[19*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd20;
+                // "ERR=xx PC=xxxxxxxx\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "E";
+                    5'd1:  f_dump_byte = "R";
+                    5'd2:  f_dump_byte = "R";
+                    5'd3:  f_dump_byte = "=";
+                    5'd4:  f_dump_byte = return_ascii_from_hex(r_error_code[7:4]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(r_error_code[3:0]);
+                    5'd6:  f_dump_byte = " ";
+                    5'd7:  f_dump_byte = "P";
+                    5'd8:  f_dump_byte = "C";
+                    5'd9:  f_dump_byte = "=";
+                    5'd10: f_dump_byte = return_ascii_from_hex(r_PC[31:28]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(r_PC[27:24]);
+                    5'd12: f_dump_byte = return_ascii_from_hex(r_PC[23:20]);
+                    5'd13: f_dump_byte = return_ascii_from_hex(r_PC[19:16]);
+                    5'd14: f_dump_byte = return_ascii_from_hex(r_PC[15:12]);
+                    5'd15: f_dump_byte = return_ascii_from_hex(r_PC[11: 8]);
+                    5'd16: f_dump_byte = return_ascii_from_hex(r_PC[ 7: 4]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(r_PC[ 3: 0]);
+                    5'd18: f_dump_byte = 8'h0D;
+                    5'd19: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_OPC_SP: begin
-                // "OPC=xxxxxxxx SP=xxxxxxxx\r\n"  (26 bytes)
-                r_msg[ 0*8 +: 8] <= "O";
-                r_msg[ 1*8 +: 8] <= "P";
-                r_msg[ 2*8 +: 8] <= "C";
-                r_msg[ 3*8 +: 8] <= "=";
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(w_opcode[31:28]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(w_opcode[27:24]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(w_opcode[23:20]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(w_opcode[19:16]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(w_opcode[15:12]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(w_opcode[11: 8]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(w_opcode[ 7: 4]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(w_opcode[ 3: 0]);
-                r_msg[12*8 +: 8] <= " ";
-                r_msg[13*8 +: 8] <= "S";
-                r_msg[14*8 +: 8] <= "P";
-                r_msg[15*8 +: 8] <= "=";
-                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_SP[31:28]);
-                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_SP[27:24]);
-                r_msg[18*8 +: 8] <= return_ascii_from_hex(r_SP[23:20]);
-                r_msg[19*8 +: 8] <= return_ascii_from_hex(r_SP[19:16]);
-                r_msg[20*8 +: 8] <= return_ascii_from_hex(r_SP[15:12]);
-                r_msg[21*8 +: 8] <= return_ascii_from_hex(r_SP[11: 8]);
-                r_msg[22*8 +: 8] <= return_ascii_from_hex(r_SP[ 7: 4]);
-                r_msg[23*8 +: 8] <= return_ascii_from_hex(r_SP[ 3: 0]);
-                r_msg[24*8 +: 8] <= 8'h0D;
-                r_msg[25*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd26;
+                // "OPC=xxxxxxxx SP=xxxxxxxx\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "O";
+                    5'd1:  f_dump_byte = "P";
+                    5'd2:  f_dump_byte = "C";
+                    5'd3:  f_dump_byte = "=";
+                    5'd4:  f_dump_byte = return_ascii_from_hex(w_opcode[31:28]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(w_opcode[27:24]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(w_opcode[23:20]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(w_opcode[19:16]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(w_opcode[15:12]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(w_opcode[11: 8]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(w_opcode[ 7: 4]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(w_opcode[ 3: 0]);
+                    5'd12: f_dump_byte = " ";
+                    5'd13: f_dump_byte = "S";
+                    5'd14: f_dump_byte = "P";
+                    5'd15: f_dump_byte = "=";
+                    5'd16: f_dump_byte = return_ascii_from_hex(r_SP[31:28]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(r_SP[27:24]);
+                    5'd18: f_dump_byte = return_ascii_from_hex(r_SP[23:20]);
+                    5'd19: f_dump_byte = return_ascii_from_hex(r_SP[19:16]);
+                    5'd20: f_dump_byte = return_ascii_from_hex(r_SP[15:12]);
+                    5'd21: f_dump_byte = return_ascii_from_hex(r_SP[11: 8]);
+                    5'd22: f_dump_byte = return_ascii_from_hex(r_SP[ 7: 4]);
+                    5'd23: f_dump_byte = return_ascii_from_hex(r_SP[ 3: 0]);
+                    5'd24: f_dump_byte = 8'h0D;
+                    5'd25: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_V1_V2: begin
-                // "V1=xxxxxxxx IDX=xxxxxxxx\r\n"  (26 bytes)
-                // V1  = w_var1, the 32-bit immediate at PC+4 (instruction operand
-                //       fetched in OPCODE_FETCH / VAR1_FETCH).
-                // IDX = r_idx_base_addr, the saved base address used by indexed
-                //       register ops (LDIDX/STIDX family).  Replaces the dead
-                //       w_var2 wire which has no driver in the current FSM.
-                r_msg[ 0*8 +: 8] <= "V";
-                r_msg[ 1*8 +: 8] <= "1";
-                r_msg[ 2*8 +: 8] <= "=";
-                r_msg[ 3*8 +: 8] <= return_ascii_from_hex(w_var1[31:28]);
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(w_var1[27:24]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(w_var1[23:20]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(w_var1[19:16]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(w_var1[15:12]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(w_var1[11: 8]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(w_var1[ 7: 4]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(w_var1[ 3: 0]);
-                r_msg[11*8 +: 8] <= " ";
-                r_msg[12*8 +: 8] <= "I";
-                r_msg[13*8 +: 8] <= "D";
-                r_msg[14*8 +: 8] <= "X";
-                r_msg[15*8 +: 8] <= "=";
-                r_msg[16*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[31:28]);
-                r_msg[17*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[27:24]);
-                r_msg[18*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[23:20]);
-                r_msg[19*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[19:16]);
-                r_msg[20*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[15:12]);
-                r_msg[21*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[11: 8]);
-                r_msg[22*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[ 7: 4]);
-                r_msg[23*8 +: 8] <= return_ascii_from_hex(r_idx_base_addr[ 3: 0]);
-                r_msg[24*8 +: 8] <= 8'h0D;
-                r_msg[25*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd26;
+                // "V1=xxxxxxxx IDX=xxxxxxxx\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "V";
+                    5'd1:  f_dump_byte = "1";
+                    5'd2:  f_dump_byte = "=";
+                    5'd3:  f_dump_byte = return_ascii_from_hex(w_var1[31:28]);
+                    5'd4:  f_dump_byte = return_ascii_from_hex(w_var1[27:24]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(w_var1[23:20]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(w_var1[19:16]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(w_var1[15:12]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(w_var1[11: 8]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(w_var1[ 7: 4]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(w_var1[ 3: 0]);
+                    5'd11: f_dump_byte = " ";
+                    5'd12: f_dump_byte = "I";
+                    5'd13: f_dump_byte = "D";
+                    5'd14: f_dump_byte = "X";
+                    5'd15: f_dump_byte = "=";
+                    5'd16: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[31:28]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[27:24]);
+                    5'd18: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[23:20]);
+                    5'd19: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[19:16]);
+                    5'd20: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[15:12]);
+                    5'd21: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[11: 8]);
+                    5'd22: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[ 7: 4]);
+                    5'd23: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[ 3: 0]);
+                    5'd24: f_dump_byte = 8'h0D;
+                    5'd25: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_V1H: begin
-                // "V1H=xxxxxxxx\r\n"  (14 bytes)
-                // hi32 of a 64-bit immediate (V64 ops: SETR64, PUSHV64).
-                // DDR2 read at PC+8 was issued in PREP; r_hcf_stack_data
-                // holds the full doubleword.  PC+8 has the same bit-2 parity
-                // as PC, so the same r_PC[2] selects the right 32-bit half.
-                r_msg[ 0*8 +: 8] <= "V";
-                r_msg[ 1*8 +: 8] <= "1";
-                r_msg[ 2*8 +: 8] <= "H";
-                r_msg[ 3*8 +: 8] <= "=";
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[63:60] : r_hcf_stack_data[31:28]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[59:56] : r_hcf_stack_data[27:24]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[55:52] : r_hcf_stack_data[23:20]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[51:48] : r_hcf_stack_data[19:16]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[47:44] : r_hcf_stack_data[15:12]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[43:40] : r_hcf_stack_data[11: 8]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[39:36] : r_hcf_stack_data[ 7: 4]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[35:32] : r_hcf_stack_data[ 3: 0]);
-                r_msg[12*8 +: 8] <= 8'h0D;
-                r_msg[13*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd14;
+                // "V1H=xxxxxxxx\r\n"  (hi32 picked by r_PC[2])
+                half = r_PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
+                case (pos)
+                    5'd0:  f_dump_byte = "V";
+                    5'd1:  f_dump_byte = "1";
+                    5'd2:  f_dump_byte = "H";
+                    5'd3:  f_dump_byte = "=";
+                    5'd4:  f_dump_byte = return_ascii_from_hex(half[31:28]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(half[27:24]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(half[23:20]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(half[19:16]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(half[15:12]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(half[11: 8]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(half[ 7: 4]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(half[ 3: 0]);
+                    5'd12: f_dump_byte = 8'h0D;
+                    5'd13: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_OPCM: begin
-                // "OPCM=xxxxxxxx\r\n"  (15 bytes)
-                // Re-read DRAM at PC and pick the same 32-bit half OPC came
-                // from.  Mismatch with OPC means the opcode cache is stale.
-                r_msg[ 0*8 +: 8] <= "O";
-                r_msg[ 1*8 +: 8] <= "P";
-                r_msg[ 2*8 +: 8] <= "C";
-                r_msg[ 3*8 +: 8] <= "M";
-                r_msg[ 4*8 +: 8] <= "=";
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[63:60] : r_hcf_stack_data[31:28]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[59:56] : r_hcf_stack_data[27:24]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[55:52] : r_hcf_stack_data[23:20]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[51:48] : r_hcf_stack_data[19:16]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[47:44] : r_hcf_stack_data[15:12]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[43:40] : r_hcf_stack_data[11: 8]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[39:36] : r_hcf_stack_data[ 7: 4]);
-                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_PC[2] ? r_hcf_stack_data[35:32] : r_hcf_stack_data[ 3: 0]);
-                r_msg[13*8 +: 8] <= 8'h0D;
-                r_msg[14*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd15;
+                // "OPCM=xxxxxxxx\r\n"
+                half = r_PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
+                case (pos)
+                    5'd0:  f_dump_byte = "O";
+                    5'd1:  f_dump_byte = "P";
+                    5'd2:  f_dump_byte = "C";
+                    5'd3:  f_dump_byte = "M";
+                    5'd4:  f_dump_byte = "=";
+                    5'd5:  f_dump_byte = return_ascii_from_hex(half[31:28]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(half[27:24]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(half[23:20]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(half[19:16]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(half[15:12]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(half[11: 8]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(half[ 7: 4]);
+                    5'd12: f_dump_byte = return_ascii_from_hex(half[ 3: 0]);
+                    5'd13: f_dump_byte = 8'h0D;
+                    5'd14: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_SM: begin
-                // "SM=xxxxxxxxx\r\n"  (14 bytes)
-                // FSM state at fault time, snapshotted before the HCF chain
-                // overwrites r_SM (see r_fault_sm tracker in KlaussCPU.v).
-                // 33 bits one-hot; top nibble carries only bit 32 (ALU_FINISH).
-                r_msg[ 0*8 +: 8] <= "S";
-                r_msg[ 1*8 +: 8] <= "M";
-                r_msg[ 2*8 +: 8] <= "=";
-                r_msg[ 3*8 +: 8] <= return_ascii_from_hex({3'b0, r_fault_sm[32]});
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_fault_sm[31:28]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_fault_sm[27:24]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_fault_sm[23:20]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_fault_sm[19:16]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_fault_sm[15:12]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_fault_sm[11: 8]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_fault_sm[ 7: 4]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_fault_sm[ 3: 0]);
-                r_msg[12*8 +: 8] <= 8'h0D;
-                r_msg[13*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd14;
+                // "SM=xxxxxxxxx\r\n"  (33-bit one-hot FSM)
+                case (pos)
+                    5'd0:  f_dump_byte = "S";
+                    5'd1:  f_dump_byte = "M";
+                    5'd2:  f_dump_byte = "=";
+                    5'd3:  f_dump_byte = return_ascii_from_hex({3'b0, r_fault_sm[32]});
+                    5'd4:  f_dump_byte = return_ascii_from_hex(r_fault_sm[31:28]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(r_fault_sm[27:24]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(r_fault_sm[23:20]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(r_fault_sm[19:16]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(r_fault_sm[15:12]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(r_fault_sm[11: 8]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(r_fault_sm[ 7: 4]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(r_fault_sm[ 3: 0]);
+                    5'd12: f_dump_byte = 8'h0D;
+                    5'd13: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_IV0: begin
-                // "IV0=xxxxxxxx\r\n"  (14 bytes)
-                // Timer ISR entry vector — value of r_interrupt_table[0] at
-                // crash time.  Compare against PC: if PC matches, the timer
-                // interrupt dispatched correctly and any subsequent fault is
-                // in the ISR body; if PC differs, the dispatch went wrong.
-                r_msg[ 0*8 +: 8] <= "I";
-                r_msg[ 1*8 +: 8] <= "V";
-                r_msg[ 2*8 +: 8] <= "0";
-                r_msg[ 3*8 +: 8] <= "=";
-                r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][31:28]);
-                r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][27:24]);
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][23:20]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][19:16]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][15:12]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][11: 8]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][ 7: 4]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_interrupt_table[0][ 3: 0]);
-                r_msg[12*8 +: 8] <= 8'h0D;
-                r_msg[13*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd14;
+                // "IV0=xxxxxxxx\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "I";
+                    5'd1:  f_dump_byte = "V";
+                    5'd2:  f_dump_byte = "0";
+                    5'd3:  f_dump_byte = "=";
+                    5'd4:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][31:28]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][27:24]);
+                    5'd6:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][23:20]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][19:16]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][15:12]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][11: 8]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][ 7: 4]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(r_interrupt_table[0][ 3: 0]);
+                    5'd12: f_dump_byte = 8'h0D;
+                    5'd13: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_FLAGS_A: begin
-                // "FLG Z=x E=x C=x V=x\r\n"  (21 bytes)
-                r_msg[ 0*8 +: 8] <= "F";
-                r_msg[ 1*8 +: 8] <= "L";
-                r_msg[ 2*8 +: 8] <= "G";
-                r_msg[ 3*8 +: 8] <= " ";
-                r_msg[ 4*8 +: 8] <= "Z";
-                r_msg[ 5*8 +: 8] <= "=";
-                r_msg[ 6*8 +: 8] <= r_zero_flag    ? "1" : "0";
-                r_msg[ 7*8 +: 8] <= " ";
-                r_msg[ 8*8 +: 8] <= "E";
-                r_msg[ 9*8 +: 8] <= "=";
-                r_msg[10*8 +: 8] <= r_equal_flag   ? "1" : "0";
-                r_msg[11*8 +: 8] <= " ";
-                r_msg[12*8 +: 8] <= "C";
-                r_msg[13*8 +: 8] <= "=";
-                r_msg[14*8 +: 8] <= r_carry_flag   ? "1" : "0";
-                r_msg[15*8 +: 8] <= " ";
-                r_msg[16*8 +: 8] <= "V";
-                r_msg[17*8 +: 8] <= "=";
-                r_msg[18*8 +: 8] <= r_overflow_flag ? "1" : "0";
-                r_msg[19*8 +: 8] <= 8'h0D;
-                r_msg[20*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd21;
+                // "FLG Z=x E=x C=x V=x\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "F";
+                    5'd1:  f_dump_byte = "L";
+                    5'd2:  f_dump_byte = "G";
+                    5'd3:  f_dump_byte = " ";
+                    5'd4:  f_dump_byte = "Z";
+                    5'd5:  f_dump_byte = "=";
+                    5'd6:  f_dump_byte = r_zero_flag     ? "1" : "0";
+                    5'd7:  f_dump_byte = " ";
+                    5'd8:  f_dump_byte = "E";
+                    5'd9:  f_dump_byte = "=";
+                    5'd10: f_dump_byte = r_equal_flag    ? "1" : "0";
+                    5'd11: f_dump_byte = " ";
+                    5'd12: f_dump_byte = "C";
+                    5'd13: f_dump_byte = "=";
+                    5'd14: f_dump_byte = r_carry_flag    ? "1" : "0";
+                    5'd15: f_dump_byte = " ";
+                    5'd16: f_dump_byte = "V";
+                    5'd17: f_dump_byte = "=";
+                    5'd18: f_dump_byte = r_overflow_flag ? "1" : "0";
+                    5'd19: f_dump_byte = 8'h0D;
+                    5'd20: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_FLAGS_B: begin
-                // "    S=x L=x U=x\r\n"  (17 bytes)
-                r_msg[ 0*8 +: 8] <= " ";
-                r_msg[ 1*8 +: 8] <= " ";
-                r_msg[ 2*8 +: 8] <= " ";
-                r_msg[ 3*8 +: 8] <= " ";
-                r_msg[ 4*8 +: 8] <= "S";
-                r_msg[ 5*8 +: 8] <= "=";
-                r_msg[ 6*8 +: 8] <= r_sign_flag ? "1" : "0";
-                r_msg[ 7*8 +: 8] <= " ";
-                r_msg[ 8*8 +: 8] <= "L";
-                r_msg[ 9*8 +: 8] <= "=";
-                r_msg[10*8 +: 8] <= r_less_flag ? "1" : "0";
-                r_msg[11*8 +: 8] <= " ";
-                r_msg[12*8 +: 8] <= "U";
-                r_msg[13*8 +: 8] <= "=";
-                r_msg[14*8 +: 8] <= r_ult_flag  ? "1" : "0";
-                r_msg[15*8 +: 8] <= 8'h0D;
-                r_msg[16*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd17;
+                // "    S=x L=x U=x\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = " ";
+                    5'd1:  f_dump_byte = " ";
+                    5'd2:  f_dump_byte = " ";
+                    5'd3:  f_dump_byte = " ";
+                    5'd4:  f_dump_byte = "S";
+                    5'd5:  f_dump_byte = "=";
+                    5'd6:  f_dump_byte = r_sign_flag ? "1" : "0";
+                    5'd7:  f_dump_byte = " ";
+                    5'd8:  f_dump_byte = "L";
+                    5'd9:  f_dump_byte = "=";
+                    5'd10: f_dump_byte = r_less_flag ? "1" : "0";
+                    5'd11: f_dump_byte = " ";
+                    5'd12: f_dump_byte = "U";
+                    5'd13: f_dump_byte = "=";
+                    5'd14: f_dump_byte = r_ult_flag  ? "1" : "0";
+                    5'd15: f_dump_byte = 8'h0D;
+                    5'd16: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_INSTR: begin
-                // "INSTR=NNNNNNNN\r\n"  (16 bytes) — committed instruction
-                // count since program load (LOAD_COMPLETE).
-                r_msg[ 0*8 +: 8] <= "I";
-                r_msg[ 1*8 +: 8] <= "N";
-                r_msg[ 2*8 +: 8] <= "S";
-                r_msg[ 3*8 +: 8] <= "T";
-                r_msg[ 4*8 +: 8] <= "R";
-                r_msg[ 5*8 +: 8] <= "=";
-                r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_instr_count[31:28]);
-                r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_instr_count[27:24]);
-                r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_instr_count[23:20]);
-                r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_instr_count[19:16]);
-                r_msg[10*8 +: 8] <= return_ascii_from_hex(r_instr_count[15:12]);
-                r_msg[11*8 +: 8] <= return_ascii_from_hex(r_instr_count[11:8]);
-                r_msg[12*8 +: 8] <= return_ascii_from_hex(r_instr_count[7:4]);
-                r_msg[13*8 +: 8] <= return_ascii_from_hex(r_instr_count[3:0]);
-                r_msg[14*8 +: 8] <= 8'h0D;
-                r_msg[15*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd16;
+                // "INSTR=NNNNNNNN\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "I";
+                    5'd1:  f_dump_byte = "N";
+                    5'd2:  f_dump_byte = "S";
+                    5'd3:  f_dump_byte = "T";
+                    5'd4:  f_dump_byte = "R";
+                    5'd5:  f_dump_byte = "=";
+                    5'd6:  f_dump_byte = return_ascii_from_hex(r_instr_count[31:28]);
+                    5'd7:  f_dump_byte = return_ascii_from_hex(r_instr_count[27:24]);
+                    5'd8:  f_dump_byte = return_ascii_from_hex(r_instr_count[23:20]);
+                    5'd9:  f_dump_byte = return_ascii_from_hex(r_instr_count[19:16]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(r_instr_count[15:12]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(r_instr_count[11: 8]);
+                    5'd12: f_dump_byte = return_ascii_from_hex(r_instr_count[ 7: 4]);
+                    5'd13: f_dump_byte = return_ascii_from_hex(r_instr_count[ 3: 0]);
+                    5'd14: f_dump_byte = 8'h0D;
+                    5'd15: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             DUMP_FOOTER: begin
-                // "*** END ***\r\n"  (13 bytes)
-                r_msg[ 0*8 +: 8] <= "*";
-                r_msg[ 1*8 +: 8] <= "*";
-                r_msg[ 2*8 +: 8] <= "*";
-                r_msg[ 3*8 +: 8] <= " ";
-                r_msg[ 4*8 +: 8] <= "E";
-                r_msg[ 5*8 +: 8] <= "N";
-                r_msg[ 6*8 +: 8] <= "D";
-                r_msg[ 7*8 +: 8] <= " ";
-                r_msg[ 8*8 +: 8] <= "*";
-                r_msg[ 9*8 +: 8] <= "*";
-                r_msg[10*8 +: 8] <= "*";
-                r_msg[11*8 +: 8] <= 8'h0D;
-                r_msg[12*8 +: 8] <= 8'h0A;
-                r_msg_length     <= 8'd13;
+                // "*** END ***\r\n"
+                case (pos)
+                    5'd0:  f_dump_byte = "*";
+                    5'd1:  f_dump_byte = "*";
+                    5'd2:  f_dump_byte = "*";
+                    5'd3:  f_dump_byte = " ";
+                    5'd4:  f_dump_byte = "E";
+                    5'd5:  f_dump_byte = "N";
+                    5'd6:  f_dump_byte = "D";
+                    5'd7:  f_dump_byte = " ";
+                    5'd8:  f_dump_byte = "*";
+                    5'd9:  f_dump_byte = "*";
+                    5'd10: f_dump_byte = "*";
+                    5'd11: f_dump_byte = 8'h0D;
+                    5'd12: f_dump_byte = 8'h0A;
+                    default: f_dump_byte = 8'h00;
+                endcase
             end
 
             default: begin
-                // Repeated-line phases — pick the right family from the phase
-                // index.  Order: regs → stack → trace.
-                if (r_hcf_dump_phase < DUMP_STACK_BASE) begin
-                    // ============== Register dump (R0..RF) ==============
-                    // "RX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
-                    k_phase = r_hcf_dump_phase - DUMP_REG_BASE;
-                    reg_val = r_register[k_phase[3:0]];
-                    r_msg[ 0*8 +: 8] <= "R";
-                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
-                    r_msg[ 2*8 +: 8] <= "=";
-                    r_msg[ 3*8 +: 8] <= return_ascii_from_hex(reg_val[63:60]);
-                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(reg_val[59:56]);
-                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(reg_val[55:52]);
-                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(reg_val[51:48]);
-                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(reg_val[47:44]);
-                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(reg_val[43:40]);
-                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(reg_val[39:36]);
-                    r_msg[10*8 +: 8] <= return_ascii_from_hex(reg_val[35:32]);
-                    r_msg[11*8 +: 8] <= return_ascii_from_hex(reg_val[31:28]);
-                    r_msg[12*8 +: 8] <= return_ascii_from_hex(reg_val[27:24]);
-                    r_msg[13*8 +: 8] <= return_ascii_from_hex(reg_val[23:20]);
-                    r_msg[14*8 +: 8] <= return_ascii_from_hex(reg_val[19:16]);
-                    r_msg[15*8 +: 8] <= return_ascii_from_hex(reg_val[15:12]);
-                    r_msg[16*8 +: 8] <= return_ascii_from_hex(reg_val[11: 8]);
-                    r_msg[17*8 +: 8] <= return_ascii_from_hex(reg_val[ 7: 4]);
-                    r_msg[18*8 +: 8] <= return_ascii_from_hex(reg_val[ 3: 0]);
-                    r_msg[19*8 +: 8] <= 8'h0D;
-                    r_msg[20*8 +: 8] <= 8'h0A;
-                    r_msg_length     <= 8'd21;
-                end else if (r_hcf_dump_phase < DUMP_TRACE_BASE) begin
-                    // ============== Stack dump (S0..S3) ==============
-                    // "SX=NNNNNNNNNNNNNNNN\r\n"  (21 bytes)
-                    // Data was pre-fetched in HCF_DUMP STACK_FETCH sub-state
-                    // and is sitting in r_hcf_stack_data.
-                    k_phase = r_hcf_dump_phase - DUMP_STACK_BASE;
-                    r_msg[ 0*8 +: 8] <= "S";
-                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
-                    r_msg[ 2*8 +: 8] <= "=";
-                    r_msg[ 3*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[63:60]);
-                    r_msg[ 4*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[59:56]);
-                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[55:52]);
-                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[51:48]);
-                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[47:44]);
-                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[43:40]);
-                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[39:36]);
-                    r_msg[10*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[35:32]);
-                    r_msg[11*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[31:28]);
-                    r_msg[12*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[27:24]);
-                    r_msg[13*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[23:20]);
-                    r_msg[14*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[19:16]);
-                    r_msg[15*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[15:12]);
-                    r_msg[16*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[11: 8]);
-                    r_msg[17*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 7: 4]);
-                    r_msg[18*8 +: 8] <= return_ascii_from_hex(r_hcf_stack_data[ 3: 0]);
-                    r_msg[19*8 +: 8] <= 8'h0D;
-                    r_msg[20*8 +: 8] <= 8'h0A;
-                    r_msg_length     <= 8'd21;
+                // Family phases (regs / stack / trace).  Resolve k and data
+                // first so the per-position case below stays simple.
+                if (phase < DUMP_STACK_BASE) begin
+                    // Register dump R0..RF
+                    k    = phase[3:0] - DUMP_REG_BASE[3:0];
+                    data = r_register[k];
+                end else if (phase < DUMP_TRACE_BASE) begin
+                    // Stack dump S0..S3 (data pre-fetched into r_hcf_stack_data)
+                    k    = phase[3:0] - DUMP_STACK_BASE[3:0];
+                    data = r_hcf_stack_data;
                 end else begin
-                    // ============== Trace dump (T0..TF, newest-first) ==============
-                    // "TX P=xxxxxxxx OP=xxxxxxxx\r\n"  (27 bytes)
-                    // T0 is the most-recent fetch; T15 is 16 fetches back.
-                    // Buffer layout: r_trace_idx points to the *next* write
-                    // slot, so the most recent entry is at r_trace_idx-1.
-                    k_phase   = r_hcf_dump_phase - DUMP_TRACE_BASE;
-                    trace_pos = r_trace_idx - 4'd1 - k_phase[3:0];
-                    trace_val = r_trace_buf[trace_pos];
-                    r_msg[ 0*8 +: 8] <= "T";
-                    r_msg[ 1*8 +: 8] <= return_ascii_from_hex(k_phase[3:0]);
-                    r_msg[ 2*8 +: 8] <= " ";
-                    r_msg[ 3*8 +: 8] <= "P";
-                    r_msg[ 4*8 +: 8] <= "=";
-                    r_msg[ 5*8 +: 8] <= return_ascii_from_hex(trace_val[63:60]);
-                    r_msg[ 6*8 +: 8] <= return_ascii_from_hex(trace_val[59:56]);
-                    r_msg[ 7*8 +: 8] <= return_ascii_from_hex(trace_val[55:52]);
-                    r_msg[ 8*8 +: 8] <= return_ascii_from_hex(trace_val[51:48]);
-                    r_msg[ 9*8 +: 8] <= return_ascii_from_hex(trace_val[47:44]);
-                    r_msg[10*8 +: 8] <= return_ascii_from_hex(trace_val[43:40]);
-                    r_msg[11*8 +: 8] <= return_ascii_from_hex(trace_val[39:36]);
-                    r_msg[12*8 +: 8] <= return_ascii_from_hex(trace_val[35:32]);
-                    r_msg[13*8 +: 8] <= " ";
-                    r_msg[14*8 +: 8] <= "O";
-                    r_msg[15*8 +: 8] <= "P";
-                    r_msg[16*8 +: 8] <= "=";
-                    r_msg[17*8 +: 8] <= return_ascii_from_hex(trace_val[31:28]);
-                    r_msg[18*8 +: 8] <= return_ascii_from_hex(trace_val[27:24]);
-                    r_msg[19*8 +: 8] <= return_ascii_from_hex(trace_val[23:20]);
-                    r_msg[20*8 +: 8] <= return_ascii_from_hex(trace_val[19:16]);
-                    r_msg[21*8 +: 8] <= return_ascii_from_hex(trace_val[15:12]);
-                    r_msg[22*8 +: 8] <= return_ascii_from_hex(trace_val[11: 8]);
-                    r_msg[23*8 +: 8] <= return_ascii_from_hex(trace_val[ 7: 4]);
-                    r_msg[24*8 +: 8] <= return_ascii_from_hex(trace_val[ 3: 0]);
-                    r_msg[25*8 +: 8] <= 8'h0D;
-                    r_msg[26*8 +: 8] <= 8'h0A;
-                    r_msg_length     <= 8'd27;
+                    // Trace dump T0..TF.  The r_trace_buf BRAM read is lifted
+                    // into a PREP-time pre-fetch (KlaussCPU.v) — the latched
+                    // entry lives in r_hcf_stack_data by the time BYTE_BUILD
+                    // runs.  This keeps the BRAM read off f_dump_byte's
+                    // combinational path so the trace byte mux closes timing.
+                    k    = phase[3:0] - DUMP_TRACE_BASE[3:0];
+                    data = r_hcf_stack_data;
+                end
+
+                if (phase < DUMP_TRACE_BASE) begin
+                    // Reg/stack: "?X=NNNNNNNNNNNNNNNN\r\n"   (21 bytes)
+                    case (pos)
+                        5'd0:  f_dump_byte = (phase < DUMP_STACK_BASE) ? "R" : "S";
+                        5'd1:  f_dump_byte = return_ascii_from_hex(k);
+                        5'd2:  f_dump_byte = "=";
+                        5'd3:  f_dump_byte = return_ascii_from_hex(data[63:60]);
+                        5'd4:  f_dump_byte = return_ascii_from_hex(data[59:56]);
+                        5'd5:  f_dump_byte = return_ascii_from_hex(data[55:52]);
+                        5'd6:  f_dump_byte = return_ascii_from_hex(data[51:48]);
+                        5'd7:  f_dump_byte = return_ascii_from_hex(data[47:44]);
+                        5'd8:  f_dump_byte = return_ascii_from_hex(data[43:40]);
+                        5'd9:  f_dump_byte = return_ascii_from_hex(data[39:36]);
+                        5'd10: f_dump_byte = return_ascii_from_hex(data[35:32]);
+                        5'd11: f_dump_byte = return_ascii_from_hex(data[31:28]);
+                        5'd12: f_dump_byte = return_ascii_from_hex(data[27:24]);
+                        5'd13: f_dump_byte = return_ascii_from_hex(data[23:20]);
+                        5'd14: f_dump_byte = return_ascii_from_hex(data[19:16]);
+                        5'd15: f_dump_byte = return_ascii_from_hex(data[15:12]);
+                        5'd16: f_dump_byte = return_ascii_from_hex(data[11: 8]);
+                        5'd17: f_dump_byte = return_ascii_from_hex(data[ 7: 4]);
+                        5'd18: f_dump_byte = return_ascii_from_hex(data[ 3: 0]);
+                        5'd19: f_dump_byte = 8'h0D;
+                        5'd20: f_dump_byte = 8'h0A;
+                        default: f_dump_byte = 8'h00;
+                    endcase
+                end else begin
+                    // Trace: "TX P=xxxxxxxx OP=xxxxxxxx\r\n"  (27 bytes)
+                    case (pos)
+                        5'd0:  f_dump_byte = "T";
+                        5'd1:  f_dump_byte = return_ascii_from_hex(k);
+                        5'd2:  f_dump_byte = " ";
+                        5'd3:  f_dump_byte = "P";
+                        5'd4:  f_dump_byte = "=";
+                        5'd5:  f_dump_byte = return_ascii_from_hex(data[63:60]);
+                        5'd6:  f_dump_byte = return_ascii_from_hex(data[59:56]);
+                        5'd7:  f_dump_byte = return_ascii_from_hex(data[55:52]);
+                        5'd8:  f_dump_byte = return_ascii_from_hex(data[51:48]);
+                        5'd9:  f_dump_byte = return_ascii_from_hex(data[47:44]);
+                        5'd10: f_dump_byte = return_ascii_from_hex(data[43:40]);
+                        5'd11: f_dump_byte = return_ascii_from_hex(data[39:36]);
+                        5'd12: f_dump_byte = return_ascii_from_hex(data[35:32]);
+                        5'd13: f_dump_byte = " ";
+                        5'd14: f_dump_byte = "O";
+                        5'd15: f_dump_byte = "P";
+                        5'd16: f_dump_byte = "=";
+                        5'd17: f_dump_byte = return_ascii_from_hex(data[31:28]);
+                        5'd18: f_dump_byte = return_ascii_from_hex(data[27:24]);
+                        5'd19: f_dump_byte = return_ascii_from_hex(data[23:20]);
+                        5'd20: f_dump_byte = return_ascii_from_hex(data[19:16]);
+                        5'd21: f_dump_byte = return_ascii_from_hex(data[15:12]);
+                        5'd22: f_dump_byte = return_ascii_from_hex(data[11: 8]);
+                        5'd23: f_dump_byte = return_ascii_from_hex(data[ 7: 4]);
+                        5'd24: f_dump_byte = return_ascii_from_hex(data[ 3: 0]);
+                        5'd25: f_dump_byte = 8'h0D;
+                        5'd26: f_dump_byte = 8'h0A;
+                        default: f_dump_byte = 8'h00;
+                    endcase
                 end
             end
         endcase
     end
-endtask
+endfunction
+

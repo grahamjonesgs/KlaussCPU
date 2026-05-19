@@ -223,20 +223,7 @@ void main(void) {
         sha256_one_block(msg, 3, buf);
         if (bcmp32(buf, expected) == 0) {
             show(0x00020000u);
-        } else {
-            show(0x0002EEEEu);
-            any_fail = 1;
-        }
-    }
-    delay_ms(1500);
-
-    /* ===== Stage 3: HMAC-SHA-256 RFC 4231 TC1 ===== */
-    show(0x00030000u);
-    delay_ms(500);
-    {
-        uint8_t key[20];
-        for (int i = 0; i < 20; i++) key[i] = 0x0b;
-        static const uint8_t data[8] = { 'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e' };
+        } else 
         static const uint8_t expected[32] = {
             0xb0,0x34,0x4c,0x61, 0xd8,0xdb,0x38,0x53,
             0x5c,0xa8,0xaf,0xce, 0xaf,0x0b,0xf1,0x2b,

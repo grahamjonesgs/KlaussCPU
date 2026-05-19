@@ -195,11 +195,16 @@ module KlaussCPU (
    reg        r_trace_full;         // 1 once the ring has wrapped at least once
 
    // Crash dump UART state machine.  Lives entirely inside HCF_DUMP; the sub-state
-   // r_hcf_dump_sub walks each line through the canonical 4-step UART handshake
-   // (PREP → ACK → DONE_WAIT) used elsewhere in this codebase, with an extra
-   // STACK_FETCH branch for stack lines that need a DDR2 read first.
+   // r_hcf_dump_sub walks each line through the UART handshake used elsewhere
+   // (PREP → BYTE_BUILD → ACK → DONE_WAIT), with an extra STACK_FETCH branch
+   // for lines that need a DDR2 read first.
+   //
+   // BYTE_BUILD streams r_msg one byte per cycle from f_dump_byte (see
+   // uart_tasks.vh).  The legacy single-cycle build collapsed to a 207-input
+   // 256-bit mux in synth; the byte-streamed form is an 8-bit mux instead.
    reg [6:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
-   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK
+   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK, 101=BYTE_BUILD
+   reg [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
    reg [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
    reg        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
 
@@ -660,6 +665,16 @@ module KlaussCPU (
    // Returns zero for undefined offsets (treat as scratch / write-only).
    // See MMIO_MAP.md for the full memory map.
    // -------------------------------------------------------------------------
+
+   /* Internal LED register.  The top-level `o_led` port was converted from
+      `output reg` to `output wire` so we could once tap an ETH_TXEN
+      diagnostic into bit 0.  The diagnostic was removed (an ODDR driving
+      a pin can't have its Q net read by fabric — REQP-1884), but the
+      wire-port + internal reg + continuous assign pattern remains as a
+      neutral pass-through.  Same behaviour as the original output reg. */
+   reg [15:0] r_led;
+   assign o_led = r_led;
+
    always @* begin
       r_mmio_read_data_comb = 64'h0;
       case (w_mmio_addr[27:16])
@@ -720,16 +735,6 @@ module KlaussCPU (
          default: r_mmio_read_data_comb = 64'h0;
       endcase
    end
-
-   /* Internal LED register.  The top-level `o_led` port was converted from
-      `output reg` to `output wire` so we could once tap an ETH_TXEN
-      diagnostic into bit 0.  The diagnostic was removed (an ODDR driving
-      a pin can't have its Q net read by fabric — REQP-1884), but the
-      wire-port + internal reg + continuous assign pattern remains as a
-      neutral pass-through.  Same behaviour as the original output reg. */
-   reg [15:0] r_led;
-   assign o_led = r_led;
-
 
    // Pipeline FF on the MMIO read return path. The FF on r_mmio_read_data
    // breaks the path from peripheral RAMs/regs (notably the SD sector buffer)
@@ -1071,6 +1076,7 @@ rams_sp_nc rams_sp_nc1 (
       r_instr_count = 32'h0;
       r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
+      r_hcf_dump_byte_pos = 5'd0;
       r_hcf_stack_loaded = 1'b0;
       r_hcf_stack_data = 64'b0;
       for (i = 0; i < 16; i = i + 1)
@@ -1091,6 +1097,7 @@ rams_sp_nc rams_sp_nc1 (
          r_instr_count <= 32'h0;
          r_hcf_dump_phase <= 7'd0;
          r_hcf_dump_sub <= 3'b000;
+         r_hcf_dump_byte_pos <= 5'd0;
          r_hcf_stack_loaded <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_trace_buf[i] <= 64'b0;
@@ -1640,10 +1647,27 @@ rams_sp_nc rams_sp_nc1 (
                            r_mem_addr     <= r_PC;
                            r_mem_read_DV  <= 1'b1;
                            r_hcf_dump_sub <= 3'b011;
+                        end else if (r_hcf_dump_phase >= DUMP_TRACE_BASE && !r_hcf_stack_loaded) begin
+                           // Trace phase pre-fetch.  Lift the r_trace_buf read out
+                           // of f_dump_byte's combinational path: without this,
+                           // the path r_trace_idx → trace_pos → r_trace_buf[pos]
+                           // → return_ascii_from_hex → r_msg byte write was the
+                           // failing endpoint at WNS −0.020 ns post-route.
+                           // Latching the trace entry one cycle before BYTE_BUILD
+                           // removes the BRAM read from the byte-mux and lets
+                           // f_dump_byte's trace branch read from a flat register.
+                           r_hcf_stack_data   <= r_trace_buf[r_trace_idx - 4'd1
+                                                 - (r_hcf_dump_phase[3:0] - DUMP_TRACE_BASE[3:0])];
+                           r_hcf_stack_loaded <= 1'b1;
+                           // Stay in PREP — next cycle the final else branch
+                           // launches the byte build with the latched data.
                         end else begin
-                           t_hcf_dump_build_line;
-                           r_msg_send_DV  <= 1'b1;
-                           r_hcf_dump_sub <= 3'b001;
+                           // Snapshot the line length and start the byte-by-byte
+                           // build.  BYTE_BUILD writes r_msg one byte per cycle
+                           // and pulses send_DV on the last byte.
+                           r_msg_length        <= f_dump_length(r_hcf_dump_phase);
+                           r_hcf_dump_byte_pos <= 5'd0;
+                           r_hcf_dump_sub      <= 3'b101;
                         end
                      end
                   end
@@ -1663,12 +1687,15 @@ rams_sp_nc rams_sp_nc1 (
                   3'b010: begin
                      if (i_msg_sent_DV) begin
                         r_hcf_dump_sub <= 3'b000;
-                        // Leaving a DDR2-fetch phase invalidates the cached
-                        // read so the next phase fetches fresh data.
+                        // Leaving a pre-fetched phase invalidates the cached
+                        // value so the next phase loads fresh data.  Stack/V1H/
+                        // OPCM are DDR2-fetched; trace phases are pre-fetched
+                        // from r_trace_buf (BRAM) for timing reasons (see PREP).
                         if (((r_hcf_dump_phase >= DUMP_STACK_BASE)
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
                          || (r_hcf_dump_phase == DUMP_V1H)
-                         || (r_hcf_dump_phase == DUMP_OPCM)) begin
+                         || (r_hcf_dump_phase == DUMP_OPCM)
+                         || (r_hcf_dump_phase >= DUMP_TRACE_BASE)) begin
                            r_hcf_stack_loaded <= 1'b0;
                         end
                         if (r_hcf_dump_phase == DUMP_FOOTER) begin
@@ -1693,6 +1720,22 @@ rams_sp_nc rams_sp_nc1 (
                         r_hcf_stack_loaded <= 1'b1;
                         r_mem_read_DV      <= 1'b0;
                         r_hcf_dump_sub     <= 3'b000;
+                     end
+                  end
+
+                  // BYTE_BUILD — write one byte of r_msg per cycle from
+                  // f_dump_byte(phase, pos).  On the last byte we pulse
+                  // r_msg_send_DV so uart_send_msg snapshots r_msg the next
+                  // cycle (NBAs schedule the final byte and DV for the same
+                  // edge).  Replaces the legacy 256-bit-wide single-cycle
+                  // assignment that became a 207-input mux in synth.
+                  3'b101: begin
+                     r_msg[r_hcf_dump_byte_pos*8 +: 8] <= f_dump_byte(r_hcf_dump_phase, r_hcf_dump_byte_pos);
+                     if (r_hcf_dump_byte_pos == r_msg_length[4:0] - 5'd1) begin
+                        r_msg_send_DV  <= 1'b1;
+                        r_hcf_dump_sub <= 3'b001;  // ACK
+                     end else begin
+                        r_hcf_dump_byte_pos <= r_hcf_dump_byte_pos + 5'd1;
                      end
                   end
 

@@ -22,7 +22,11 @@
 
 module liteeth_core (
     output wire          interrupt,
-    (* dont_touch = "true" *)
+    // dont_touch removed from rmii_clocks_ref_clk: the attribute on a clock
+    // input port causes Synth 8-5396 (extra LUT logic on the WCLK net of the
+    // distributed-RAM CRC/stat FIFOs).  The actual CDC sync FFs in this
+    // module already carry their own async_reg + dont_touch attributes, so
+    // there is nothing protected at port level that would be lost.
     input  wire          rmii_clocks_ref_clk,
     input  wire          rmii_crs_dv,
     output wire          rmii_mdc,
