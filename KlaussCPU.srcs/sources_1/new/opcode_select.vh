@@ -405,6 +405,7 @@ task t_opcode_select;
          //       and r_int_mask[42:39]; SP+=8.
          //=====================================================================
          32'h0000_6011: t_iret;                                // IRET restore PC, flags, mask from stack; SP+=8
+         32'h0000_6012: t_wait;                                // WAIT suspend core until an unmasked interrupt is pending; PC+=4 (resume after WAIT)
 
          //=====================================================================
          // Memory — 64-bit doubleword load/store (7xxx)

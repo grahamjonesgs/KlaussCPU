@@ -332,6 +332,7 @@ Pointers are 32-bit values (the address space is 32-bit). When loaded into a 64-
 | BSWAP R | byte-reverse all 8 bytes (useful for explicit big-endian I/O) |
 | NOP | no operation; PC+=4 |
 | HALT | freeze execution until hard reset. **Note:** the pipeline fetches the word immediately after HALT before freezing — place a NOP or a second HALT after every HALT to prevent the following data from being interpreted as an instruction. |
+| WAIT | opcode `0x0000_6012`. Interruptible core-suspend: stop fetching/executing and resume when an unmasked, vectored interrupt becomes pending (timer tick, or a future wired source). No register/flag side effects, no UART break. On wake the interrupt is taken through the normal dispatch path and `IRET` resumes at the instruction **after** `WAIT` (PC+4). Never sleeps if an interrupt is already pending; wake is level-sensitive so `enable-interrupts; WAIT` has no lost-wakeup race. Use for the idle thread (`arch_cpu_idle`) or any interrupt-driven wait instead of busy-polling. Distinct from `HALT` (which stops permanently). |
 | RESET | restart: PC = 0x0020 (first instruction). **Note:** the current hardware reset vector may target 0x0004; if so, place a `JMP 0x0020` at that address to redirect into code. |
 | DELAYR R | spin-wait rs2 clock cycles |
 | DELAYV V | spin-wait imm32 clock cycles |

@@ -141,6 +141,20 @@ task t_halt;
    end
 endtask
 
+// WAIT — interruptible core-suspend. Advance PC past the WAIT (so the resume
+// point is the next instruction), then park in WAITING until an unmasked,
+// vectored interrupt becomes pending (w_irq_ready). The WAITING state wakes
+// via the normal OPCODE_REQUEST dispatch, which saves this PC and jumps to the
+// handler; IRET resumes after the WAIT. No register/flag side effects; no UART
+// break (unlike HALT). If an interrupt is already pending, WAITING exits next
+// cycle — it never sleeps with work pending.
+task t_wait;
+   begin
+      r_PC <= r_PC + 4;
+      r_SM <= WAITING;
+   end
+endtask
+
 // Reset PC
 // On completion
 // Do not change PC

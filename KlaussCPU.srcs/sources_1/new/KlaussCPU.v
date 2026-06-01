@@ -85,7 +85,7 @@ module KlaussCPU (
 
    // State Machine Code
    localparam OPCODE_REQUEST = 32'h1, OPCODE_FETCH = 32'h2, OPCODE_FETCH2 = 32'h4;
-   localparam VAR1_FETCH = 32'h8, VAR1_FETCH2 = 32'h10, VAR1_FETCH3 = 32'h20;
+   localparam VAR1_FETCH = 32'h8, VAR1_FETCH2 = 32'h10, WAITING = 32'h20;  // WAITING: interruptible core-suspend (WAIT opcode); reuses the unused VAR1_FETCH3 bit
    localparam START_WAIT = 32'h40, UART_DELAY = 32'h80, OPCODE_EXECUTE = 32'h100;
    localparam HCF_1 = 32'h200, HCF_2 = 32'h400, HCF_3 = 32'h800, HCF_4 = 32'h1_000;
    localparam NO_PROGRAM = 32'h2_000, LOAD_START = 32'h4_000, LOADING_BYTE = 32'h8_000;
@@ -290,6 +290,13 @@ module KlaussCPU (
    // TIMERSETR/TIMERSETV. Counter rolls over (and asserts r_timer_interrupt)
    // when r_timer_interrupt_counter > r_timer_period.
    reg [31:0] r_timer_period;
+
+   // Interrupt-wake condition — an unmasked, vectored source is pending. This is
+   // the SAME expression OPCODE_REQUEST uses to dispatch, factored out so the
+   // WAITING (WAIT opcode) suspend exits on exactly the dispatch condition (no
+   // separate edge logic → no lost wakeups). Only source 0 (timer) is wired
+   // today; OR in sources 1..3 here when their pending signals are connected.
+   wire w_irq_ready = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && r_int_mask[0];
 
    // Free-running millisecond counter (since LOAD_COMPLETE). 64-bit so it
    // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
@@ -1588,7 +1595,7 @@ rams_sp_nc rams_sp_nc1 (
                      r_mem_read_DV   <= 1'b1;
                      r_SM            <= OPCODE_FETCH;
                   end
-               end else if (r_timer_interrupt && r_interrupt_table[0] != 32'h0 && r_int_mask[0]) begin
+               end else if (w_irq_ready) begin
                   // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
                   // Slot layout (64-bit doubleword):
                   //   [63:43] = 0
@@ -2164,6 +2171,24 @@ end
                // CPU halted - do nothing until reset
             end
 
+            // Interruptible core-suspend (WAIT opcode). The core parks here
+            // issuing no instruction fetches and no bus/MMIO activity (only the
+            // free-running timer / clock_ms / perf counters keep ticking), until
+            // an unmasked, vectored interrupt becomes pending. The wake is
+            // LEVEL-sensitive on w_irq_ready and re-evaluated every cycle, so an
+            // interrupt arriving on or after the WAIT cycle is never lost (this
+            // is what makes the software idiom "enable-interrupts; WAIT" safe).
+            // t_wait already advanced r_PC to the instruction after WAIT, so the
+            // normal dispatch in OPCODE_REQUEST saves that PC and IRET resumes
+            // past the WAIT. If an interrupt is already pending when WAIT runs,
+            // this exits next cycle — it never sleeps with work pending.
+            // CPU_RESETN (handled above) and UART load/command paths force-exit
+            // like any other state.
+            WAITING: begin
+               if (w_irq_ready)
+                  r_SM <= OPCODE_REQUEST;
+            end
+
             DIVIDE_STEP: begin
                // Shared division iteration - avoids re-evaluating opcode casez each cycle
                if (r_div_counter < 7'd64) begin
@@ -2367,7 +2392,7 @@ end
             r_perf_mul_cycles <= r_perf_mul_cycles + 64'd1;
          else if (r_SM == DIVIDE_STEP)
             r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
-         else if (r_SM == HALTED || r_SM == HALTED_BREAK)
+         else if (r_SM == HALTED || r_SM == HALTED_BREAK || r_SM == WAITING)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
 
          // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
