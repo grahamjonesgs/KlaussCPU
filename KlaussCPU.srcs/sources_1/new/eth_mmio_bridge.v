@@ -82,7 +82,8 @@ module eth_mmio_bridge (
     localparam S_LO     = 3'd1;          // driving low-half WB cycle
     localparam S_LO_GAP = 3'd2;          // STB low between LO and HI (only if both halves)
     localparam S_HI     = 3'd3;          // driving high-half WB cycle
-    localparam S_DONE   = 3'd4;          // pulse o_mmio_ready, return to IDLE
+    localparam S_DONE   = 3'd4;          // pulse o_mmio_ready, then cool down
+    localparam S_COOL   = 3'd5;          // hold (not accepting) until strobe drops
 
     reg [2:0] state;
 
@@ -174,7 +175,25 @@ module eth_mmio_bridge (
                 S_DONE: begin
                     // One-cycle ack to the CPU side; rdata is already valid.
                     o_mmio_ready <= 1'b1;
-                    state        <= S_IDLE;
+                    state        <= S_COOL;
+                end
+
+                // ----------------------------------------------------------------
+                // S_COOL: hold WITHOUT accepting a new request until the CPU has
+                // dropped its strobe.  bus_splitter registers o_mmio_ready, so the
+                // CPU sees the S_DONE ack one cycle late and keeps i_mmio_*_DV
+                // asserted for an extra cycle.  Returning straight to S_IDLE would
+                // re-fire the entire Wishbone transaction again off that lingering
+                // strobe (the same re-latch hazard mem_read_write.v guards with its
+                // COOL_DOWN state).  That phantom duplicate eth access, left in
+                // flight after the store "completed", raced the faster post-"fetch
+                // improvements" opcode fetch and latched 0 into r_opcode_mem — see
+                // fetch_repro T4 / ssh_shell MDIO bring-up crash (ERR=01, OPC=0).
+                S_COOL: begin
+                    o_wb_cyc <= 1'b0;
+                    o_wb_stb <= 1'b0;
+                    if (!is_write && !is_read)
+                        state <= S_IDLE;
                 end
 
                 default: state <= S_IDLE;
