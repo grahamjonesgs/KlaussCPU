@@ -203,7 +203,7 @@ module KlaussCPU (
    // uart_tasks.vh).  The legacy single-cycle build collapsed to a 207-input
    // 256-bit mux in synth; the byte-streamed form is an 8-bit mux instead.
    reg [6:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
-   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK, 101=BYTE_BUILD
+   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK, 101=BYTE_BUILD, 110=PRE_DISPLAY
    reg [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
    reg [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
    reg        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
@@ -372,6 +372,51 @@ module KlaussCPU (
                                   && (w_mmio_addr[27:16] == 12'h005)
                                   && (w_mmio_addr[15:0]  == 16'h0000)
                                   && w_mmio_write_data[0];
+
+   // -------------------------------------------------------------------------
+   // Performance counters (Tier 0/1/2) — exposed via MMIO 0xF00D_xxxx (see
+   // MMIO_MAP.md "Performance counters"). Free-running; cleared by writing
+   // PERF_CTRL (0xF00D_0000) bit 0. A dedicated always block (search
+   // "Performance-counter block") drives these off existing FSM state and the
+   // decoded opcode, so the main CPU datapath / critical path is untouched.
+   // -------------------------------------------------------------------------
+   // Tier 0 — denominators
+   reg [47:0] r_perf_cycles;        // every i_Clk cycle
+   reg [47:0] r_perf_instr;         // retired (committed) instructions
+   // Tier 1 — cycle accounting (buckets are disjoint; sum ≈ cycles in steady run)
+   reg [47:0] r_perf_fetch_cycles;  // instruction fetch / decode states
+   reg [47:0] r_perf_exec_cycles;   // execute / ALU-finish / writeback (incl. mem stalls)
+   reg [47:0] r_perf_mul_cycles;    // multiply pipeline states
+   reg [47:0] r_perf_div_cycles;    // iterative divide state
+   reg [47:0] r_perf_int_cycles;    // interrupt context-push wait
+   reg [47:0] r_perf_idle_cycles;   // HALTED / HALTED_BREAK
+   reg [47:0] r_perf_mul_ops;       // multiply instructions
+   reg [47:0] r_perf_div_ops;       // divide / mod instructions
+   reg [47:0] r_perf_int_ops;       // interrupt dispatches
+   // Tier 2 — instruction mix + branch behaviour
+   reg [47:0] r_perf_cnt_alu;
+   reg [47:0] r_perf_cnt_load;
+   reg [47:0] r_perf_cnt_store;
+   reg [47:0] r_perf_cnt_branch;        // conditional branches (cond jumps)
+   reg [47:0] r_perf_cnt_branch_taken;  // of those, the taken subset
+   reg [47:0] r_perf_cnt_jump;          // unconditional direct jumps (JMP/JMPREL)
+   reg [47:0] r_perf_cnt_call;          // direct + conditional calls
+   reg [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
+   reg [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
+   reg        r_int_push_wait_d;        // edge-detect for interrupt dispatch
+   // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
+   // (conditional encodings only), consumed by the perf block below.
+   reg        r_perf_br_valid;
+   reg        r_perf_br_taken;
+   // Instruction-class codes (return value of f_perf_class)
+   localparam PC_OTHER=3'd0, PC_ALU=3'd1, PC_LOAD=3'd2, PC_STORE=3'd3,
+              PC_BRANCH=3'd4, PC_JUMP=3'd5, PC_CALL=3'd6, PC_INDIRECT=3'd7;
+   // PERF_CTRL bit 0 self-clearing — same pattern as w_cache_stat_clear.
+   wire        w_perf_stat_clear = w_mmio_write_DV
+                                 && (w_mmio_addr[27:16] == 12'h00D)
+                                 && (w_mmio_addr[15:0]  == 16'h0000)
+                                 && w_mmio_write_data[0];
+
    reg  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always @*)
    reg  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
    reg         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
@@ -384,6 +429,42 @@ module KlaussCPU (
    reg [31:0] r_var1_mem;
    reg [31:0] r_var2_mem;
    reg r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
+
+   // -------------------------------------------------------------------------
+   // Instruction fetch buffer (IFB) — a one-line (two-doubleword) capture of
+   // the last cache line read for opcodes. Sequential fetches that land in the
+   // buffered line skip OPCODE_FETCH's ~5-cycle cache round-trip (a cache *hit*
+   // still costs ~5 cycles through the cache pipeline + bus_splitter register).
+   // Per-doubleword granularity so serving reuses the exact r_PC[2] half-select
+   // the cache path uses — no 128-bit repacking. Filled in OPCODE_FETCH on a
+   // miss; checked in OPCODE_REQUEST; invalidated when a store writes a buffered
+   // line (keeps self-modifying code / the Zephyr LLEXT loader coherent — the
+   // unified cache is coherent today and the IFB must not reintroduce a stale
+   // copy). Branch redirects need no flush: a changed PC simply misses the tag.
+   //
+   // NB: held at one line (S=2) deliberately. An S=4 (two-line) variant was
+   // measured and captured *zero* additional hits — every hot loop in the
+   // workload exceeds two lines, and a round-robin line buffer gets no
+   // cross-line reuse below whole-loop size (a cliff, not a gradient). The
+   // loops already sit in L1 at ~0% miss; the IFB's only job is intra-line
+   // sequential reuse, which one line fully delivers. Hiding the remaining
+   // per-line cache-access latency needs overlap (prefetch / pipeline), not
+   // more buffer capacity.
+   // -------------------------------------------------------------------------
+   reg [63:0] r_ifb_dw     [0:1];   // the two doublewords of one 16-byte line
+   reg [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
+   reg [ 1:0] r_ifb_dwval;          // per-slot valid
+
+   wire [28:0] w_ifb_pc_dw  = r_PC[31:3];         // dw holding the opcode at PC
+   wire [28:0] w_ifb_pc1_dw = r_PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
+   wire w_ifb_op_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc_dw);
+   wire w_ifb_op_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc_dw);
+   wire w_ifb_op_hit  = w_ifb_op_hit0 | w_ifb_op_hit1;
+   wire [63:0] w_ifb_op_dw = w_ifb_op_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   wire w_ifb_v1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc1_dw);
+   wire w_ifb_v1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc1_dw);
+   wire w_ifb_v1_hit  = w_ifb_v1_hit0 | w_ifb_v1_hit1;
+   wire [63:0] w_ifb_v1_dw = w_ifb_v1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
 
    // Debug
    reg r_debug_flag;
@@ -732,6 +813,32 @@ module KlaussCPU (
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
+         12'h00D: begin  // Performance counters (RO; PERF_CTRL self-clearing reads 0)
+            case (w_mmio_addr[15:0])
+               16'h0000: r_mmio_read_data_comb = 64'h0;            // PERF_CTRL
+               16'h0008: r_mmio_read_data_comb = r_perf_cycles;
+               16'h0010: r_mmio_read_data_comb = r_perf_instr;
+               16'h0018: r_mmio_read_data_comb = r_perf_fetch_cycles;
+               16'h0020: r_mmio_read_data_comb = r_perf_exec_cycles;
+               16'h0028: r_mmio_read_data_comb = r_perf_mul_cycles;
+               16'h0030: r_mmio_read_data_comb = r_perf_div_cycles;
+               16'h0038: r_mmio_read_data_comb = r_perf_int_cycles;
+               16'h0040: r_mmio_read_data_comb = r_perf_idle_cycles;
+               16'h0048: r_mmio_read_data_comb = r_perf_mul_ops;
+               16'h0050: r_mmio_read_data_comb = r_perf_div_ops;
+               16'h0058: r_mmio_read_data_comb = r_perf_int_ops;
+               16'h0060: r_mmio_read_data_comb = r_perf_cnt_alu;
+               16'h0068: r_mmio_read_data_comb = r_perf_cnt_load;
+               16'h0070: r_mmio_read_data_comb = r_perf_cnt_store;
+               16'h0078: r_mmio_read_data_comb = r_perf_cnt_branch;
+               16'h0080: r_mmio_read_data_comb = r_perf_cnt_branch_taken;
+               16'h0088: r_mmio_read_data_comb = r_perf_cnt_jump;
+               16'h0090: r_mmio_read_data_comb = r_perf_cnt_call;
+               16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
+               16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
+               default:  r_mmio_read_data_comb = 64'h0;
+            endcase
+         end
          default: r_mmio_read_data_comb = 64'h0;
       endcase
    end
@@ -1074,6 +1181,21 @@ rams_sp_nc rams_sp_nc1 (
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
       r_instr_count = 32'h0;
+      r_ifb_dwval = 2'b0;
+      r_perf_br_valid = 1'b0;
+      r_perf_br_taken = 1'b0;
+      r_int_push_wait_d = 1'b0;
+      r_perf_cycles = 64'd0;       r_perf_instr = 64'd0;
+      r_perf_fetch_cycles = 64'd0; r_perf_exec_cycles = 64'd0;
+      r_perf_mul_cycles = 64'd0;   r_perf_div_cycles = 64'd0;
+      r_perf_int_cycles = 64'd0;   r_perf_idle_cycles = 64'd0;
+      r_perf_mul_ops = 64'd0;      r_perf_div_ops = 64'd0;
+      r_perf_int_ops = 64'd0;
+      r_perf_cnt_alu = 64'd0;      r_perf_cnt_load = 64'd0;
+      r_perf_cnt_store = 64'd0;    r_perf_cnt_branch = 64'd0;
+      r_perf_cnt_branch_taken = 64'd0; r_perf_cnt_jump = 64'd0;
+      r_perf_cnt_call = 64'd0;     r_perf_cnt_indirect = 64'd0;
+      r_perf_cnt_other = 64'd0;
       r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
       r_hcf_dump_byte_pos = 5'd0;
@@ -1095,6 +1217,7 @@ rams_sp_nc rams_sp_nc1 (
          r_trace_idx <= 4'h0;
          r_trace_full <= 1'b0;
          r_instr_count <= 32'h0;
+         r_ifb_dwval <= 2'b0;
          r_hcf_dump_phase <= 7'd0;
          r_hcf_dump_sub <= 3'b000;
          r_hcf_dump_byte_pos <= 5'd0;
@@ -1134,6 +1257,18 @@ rams_sp_nc rams_sp_nc1 (
       end else begin
          r_msg_send_DV  <= 1'b0;
          r_rx_fifo_read <= 1'b0;
+         r_perf_br_valid <= 1'b0;  // 1-cycle strobe; jump tasks re-assert it
+
+         // Instruction-buffer coherence: a DRAM store into a buffered line
+         // drops it so the next fetch re-reads the modified bytes (self-
+         // modifying code / Zephyr LLEXT loader). MMIO stores (top nibble F)
+         // can't alias code, so they're excluded.
+         if (r_mem_write_DV && (r_mem_addr[31:28] != 4'hF)) begin
+            if (r_ifb_dwval[0] && (r_ifb_dwaddr[0] == r_mem_addr[31:3]))
+               r_ifb_dwval[0] <= 1'b0;
+            if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == r_mem_addr[31:3]))
+               r_ifb_dwval[1] <= 1'b0;
+         end
 
          if (r_timer_interrupt_counter > r_timer_period) begin
             r_timer_interrupt_counter <= 0;
@@ -1271,7 +1406,8 @@ rams_sp_nc rams_sp_nc1 (
 
                r_seven_seg_value1 <= {
                   8'h24,
-                  8'h22,
+                  4'h0,
+                  r_ram_next_write_addr[27:24],
                   4'h0,
                   r_ram_next_write_addr[23:20],
                   4'h0,
@@ -1402,6 +1538,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_int_mask <= 4'h0;            // all sources masked until program enables
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
+                  r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
                   r_timing_start <= 0;
                   r_zero_flag <= 0;
                   t_tx_message(8'd1);  // Load OK message
@@ -1472,6 +1609,29 @@ rams_sp_nc rams_sp_nc1 (
                   r_PC             <= r_interrupt_table[0];
                   r_int_push_wait  <= 1'b1;
                   // stay in OPCODE_REQUEST until push completes
+               end else if (w_ifb_op_hit) begin
+                  // Instruction-buffer hit: serve the opcode now and skip the
+                  // OPCODE_FETCH cache round-trip. var1 (PC+4) is prefetched
+                  // from the buffer when available; otherwise OPCODE_FETCH2
+                  // falls through to VAR1_FETCH exactly as on a non-prefetch.
+                  r_opcode_mem <= r_PC[2] ? w_ifb_op_dw[63:32] : w_ifb_op_dw[31:0];
+                  // Latch register fields a cycle early — the opcode is available
+                  // combinationally on an IFB hit, so the registered reg-file
+                  // reads settle during OPCODE_FETCH2 and the VAR1_FETCH2 bubble
+                  // is no longer needed (fetch sequencing 3 cycles -> 2).
+                  r_reg_1   <= r_PC[2] ? w_ifb_op_dw[39:36] : w_ifb_op_dw[7:4];
+                  r_reg_2   <= r_PC[2] ? w_ifb_op_dw[35:32] : w_ifb_op_dw[3:0];
+                  r_reg_dst <= r_PC[2] ? w_ifb_op_dw[43:40] : w_ifb_op_dw[11:8];
+                  if (r_PC[2] == 1'b0) begin
+                     r_var1_mem        <= w_ifb_op_dw[63:32];  // var1 shares this dw
+                     r_var1_prefetched <= 1'b1;
+                  end else if (w_ifb_v1_hit) begin
+                     r_var1_mem        <= w_ifb_v1_dw[31:0];   // var1 in the next buffered dw
+                     r_var1_prefetched <= 1'b1;
+                  end else begin
+                     r_var1_prefetched <= 1'b0;
+                  end
+                  r_SM <= OPCODE_FETCH2;
                end else begin
                   r_mem_addr    <= r_PC;
                   r_mem_read_DV <= 1'b1;
@@ -1487,6 +1647,12 @@ rams_sp_nc rams_sp_nc1 (
                   //   [63:32] = bytes at base+4                               (PC[2]==1)
                   r_opcode_mem  <= r_PC[2] ? w_mem_read_data[63:32]
                                            : w_mem_read_data[31:0];
+                  // Latch register fields here (a cycle earlier than the old
+                  // OPCODE_FETCH2) so the registered reg reads settle by the time
+                  // OPCODE_FETCH2 hands off to OPCODE_EXECUTE — no VAR1_FETCH2.
+                  r_reg_1   <= r_PC[2] ? w_mem_read_data[39:36] : w_mem_read_data[7:4];
+                  r_reg_2   <= r_PC[2] ? w_mem_read_data[35:32] : w_mem_read_data[3:0];
+                  r_reg_dst <= r_PC[2] ? w_mem_read_data[43:40] : w_mem_read_data[11:8];
                   r_mem_read_DV <= 1'b0;
                   if (r_PC[2] == 0) begin
                      // var1 (at PC+4) is in the HIGH half of the same doubleword — always here.
@@ -1498,6 +1664,20 @@ rams_sp_nc rams_sp_nc1 (
                      r_var1_prefetched <= 1'b1;
                   end else begin
                      r_var1_prefetched <= 1'b0;
+                  end
+                  // Refill the instruction buffer from the returned line so the
+                  // following sequential fetches hit it. The cache exposes the
+                  // requested doubleword (w_mem_read_data) and, when valid, the
+                  // line companion (w_mem_read_data_next, addr bit 3 toggled).
+                  r_ifb_dw[0]     <= w_mem_read_data;
+                  r_ifb_dwaddr[0] <= r_mem_addr[31:3];
+                  r_ifb_dwval[0]  <= 1'b1;
+                  if (w_mem_next_valid) begin
+                     r_ifb_dw[1]     <= w_mem_read_data_next;
+                     r_ifb_dwaddr[1] <= {r_mem_addr[31:4], ~r_mem_addr[3]};
+                     r_ifb_dwval[1]  <= 1'b1;
+                  end else begin
+                     r_ifb_dwval[1]  <= 1'b0;
                   end
                   r_SM <= OPCODE_FETCH2;
                end  // if ready asserted, else will loop until ready
@@ -1517,14 +1697,16 @@ rams_sp_nc rams_sp_nc1 (
                // the unique commit gate). 32-bit wrap is ~4.3e9 — irrelevant
                // for crash diagnostics.
                r_instr_count <= r_instr_count + 32'd1;
-               r_reg_1   <= w_opcode[7:4];
-               r_reg_2   <= w_opcode[3:0];
-               r_reg_dst <= w_opcode[11:8];
+               // Register fields (r_reg_1/2/dst) were latched a cycle earlier in
+               // OPCODE_REQUEST (IFB hit) or OPCODE_FETCH (miss), so r_reg_port_a/b
+               // are already settling — the old VAR1_FETCH2 bubble is gone.
                if (r_var1_prefetched) begin
-                  // var1 already in r_var1_mem — skip memory fetch.
-                  // VAR1_FETCH2 is a 1-cycle bubble so r_reg_port_a/b
-                  // (registered reads) update before OPCODE_EXECUTE uses them.
-                  r_SM <= VAR1_FETCH2;
+                  // var1 already in r_var1_mem — go straight to execute.
+                  if (r_debug_flag && w_opcode[31:12] != 20'h0000F) begin
+                     r_SM <= DEBUG_DATA;
+                  end else begin
+                     r_SM <= OPCODE_EXECUTE;
+                  end
                end else begin
                   r_SM          <= VAR1_FETCH;
                   r_mem_addr    <= (r_PC + 4);
@@ -1532,15 +1714,9 @@ rams_sp_nc rams_sp_nc1 (
                end
             end
 
-            VAR1_FETCH2: begin
-               // Pipeline bubble only — r_reg_port_a/b now valid.
-               if (r_debug_flag && w_opcode[31:12] != 20'h0000F) begin
-                  r_SM <= DEBUG_DATA;
-               end else begin
-                  r_SM <= OPCODE_EXECUTE;
-               end
-            end
-
+            // VAR1_FETCH2 removed: register fields are now latched a cycle
+            // earlier (OPCODE_REQUEST / OPCODE_FETCH), so the registered reg
+            // reads no longer need a dedicated settle bubble before EXECUTE.
 
             VAR1_FETCH: begin
                if (w_mem_ready) begin
@@ -1744,8 +1920,8 @@ rams_sp_nc rams_sp_nc1 (
                   // times at CLKS_PER_BIT=33) as a UART break.  This mirrors
                   // HALTED_BREAK so a host parser can treat the break as the
                   // unambiguous end-of-dump marker, the same way it does for
-                  // a clean HALT.  Once the break completes we fall through to
-                  // HCF_2 for the existing 7-seg error display loop.
+                  // a clean HALT.  Once the break completes we move to the
+                  // PRE_DISPLAY hold (3'b110) before HCF_2 takes over the 7-seg.
                   3'b100: begin
                      if (r_break_counter == 0) begin
                         if (!w_sending_msg) begin
@@ -1757,8 +1933,21 @@ rams_sp_nc rams_sp_nc1 (
                         if (r_break_counter == 12'd1) begin
                            r_break_active    <= 1'b0;
                            r_timeout_counter <= 0;
-                           r_SM              <= HCF_2;
+                           r_hcf_dump_sub    <= 3'b110;
                         end
+                     end
+                  end
+
+                  // PRE_DISPLAY — hold for 3 seconds (300M cycles @ 100 MHz)
+                  // after the UART crash dump completes so the operator can
+                  // read whatever was on the 7-seg at the moment of the fault
+                  // before HCF_2 overwrites it with the error display.
+                  3'b110: begin
+                     if (r_timeout_counter >= 45'd300_000_000) begin
+                        r_timeout_counter <= 0;
+                        r_SM              <= HCF_2;
+                     end else begin
+                        r_timeout_counter <= r_timeout_counter + 1;
                      end
                   end
 
@@ -2050,7 +2239,168 @@ end
          endcase  // case(r_SM)
       end  // else if (w_reset_H)
    end  // always @(posedge i_Clk)
-   
+
+   //=========================================================================
+   // Instruction classifier for the performance counters. Returns one
+   // mutually-exclusive class per opcode, so the Tier-2 mix counters sum to
+   // the retired-instruction count. mul/div/system/io/nop fall into PC_OTHER
+   // (mul/div are broken out separately by the Tier-1 *_OPS counters). The
+   // casez patterns mirror t_opcode_select (opcode_select.vh) exactly.
+   //=========================================================================
+   function [2:0] f_perf_class;
+      input [31:0] op;
+      begin
+         casez (op)
+            // Conditional branches (conditional jumps, absolute + PC-relative)
+            32'h0000_1001, 32'h0000_1002, 32'h0000_1003, 32'h0000_1004,
+            32'h0000_1005, 32'h0000_1006, 32'h0000_1007, 32'h0000_1008,
+            32'h0000_1013, 32'h0000_1014, 32'h0000_1015, 32'h0000_1016,
+            32'h0000_1017, 32'h0000_1018, 32'h0000_1019, 32'h0000_101A,
+            32'h0000_101B, 32'h0000_101C,
+            32'h0000_1031, 32'h0000_1032, 32'h0000_1033, 32'h0000_1034,
+            32'h0000_1035, 32'h0000_1036, 32'h0000_1037, 32'h0000_1038,
+            32'h0000_1039, 32'h0000_103A, 32'h0000_103B, 32'h0000_103C,
+            32'h0000_103D, 32'h0000_103E, 32'h0000_103F, 32'h0000_1040:
+               f_perf_class = PC_BRANCH;
+            // Unconditional direct jumps
+            32'h0000_1000, 32'h0000_1030:
+               f_perf_class = PC_JUMP;
+            // Direct + conditional calls
+            32'h0000_1009, 32'h0000_100A, 32'h0000_100B, 32'h0000_100C,
+            32'h0000_100D, 32'h0000_100E, 32'h0000_100F, 32'h0000_1010,
+            32'h0000_1011, 32'h0000_1041:
+               f_perf_class = PC_CALL;
+            // Indirect / stack-target control transfers
+            32'h0000_1012,                                   // RET
+            32'h0000_102?,                                   // JMPR
+            32'h0000_6011,                                   // IRET
+            32'h0000_407?:                                   // CALLR
+               f_perf_class = PC_INDIRECT;
+            // Loads (incl. POP)
+            32'h0000_0C??, 32'h0000_0E??,                    // LDIDX64 / LDIDX64R
+            32'h0000_C0??, 32'h0000_C2??, 32'h0000_C4??,
+            32'h0000_C6??, 32'h0000_C7??,                    // LDIDX32/16/8/8s/16s
+            32'h0000_71??, 32'h0000_721?,                    // MEMREADRR / MEMREADR
+            32'h0000_75??, 32'h0000_77??, 32'h0000_79??,
+            32'h0000_7B??,                                   // MEMGET8/16/32/64
+            32'h0000_FC??,                                   // LDIDX64A
+            32'h0000_401?:                                   // POP
+               f_perf_class = PC_LOAD;
+            // Stores (incl. PUSH / PUSHV / PUSHV64)
+            32'h0000_0D??,                                   // STIDX64
+            32'h0000_C1??, 32'h0000_C3??, 32'h0000_C5??,     // STIDX32/16/8
+            32'h0000_70??, 32'h0000_720?, 32'h0000_73??,     // MEMSET64RR / MEMSETR / STIDX64R
+            32'h0000_74??, 32'h0000_76??, 32'h0000_78??,
+            32'h0000_7A??,                                   // MEMSET8/16/32/64
+            32'h0000_FD??,                                   // STIDX64A
+            32'h0000_400?, 32'h0000_4020, 32'h0000_4060:     // PUSH / PUSHV / PUSHV64
+               f_perf_class = PC_STORE;
+            // ALU: arithmetic / logic / shift / rotate / compare / bit / moves
+            32'h0001_0???, 32'h0002_0???, 32'h0003_0???, 32'h0004_0???,
+            32'h0005_0???, 32'h0006_0???, 32'h0007_0???,     // basic arith (NOT 0010-0017 mul/div)
+            32'h0020_0???, 32'h0021_0???, 32'h0022_0???,
+            32'h0023_0???, 32'h0024_0???,                    // shift / rotate
+            32'h0030_0???, 32'h0031_0???, 32'h0032_0???, 32'h0033_0???,
+            32'h0034_0???, 32'h0035_0???, 32'h0036_0???, 32'h0037_0???,
+            32'h0038_0???, 32'h0039_0???,                    // boolean compare
+            32'h0040_0???, 32'h0041_0???, 32'h0042_0???, 32'h0043_0???, // min / max
+            32'h0050_0???, 32'h0051_0???, 32'h0052_0???, 32'h0053_0???, // bit
+            32'h0000_01??, 32'h0000_02??, 32'h0000_05??,     // COPY / ADDI / CMPRR
+            32'h0000_08??,                                   // SETR..SHRAR block
+            32'h0000_090?, 32'h0000_091?, 32'h0000_092?, 32'h0000_093?,
+            32'h0000_094?, 32'h0000_095?, 32'h0000_096?, 32'h0000_097?,
+            32'h0000_098?, 32'h0000_099?,                    // shifts / ext / bswap / not / leapc
+            32'h0000_0A??,                                   // bit ops / popcnt / clz / ctz / bextr / bdep
+            32'h0000_0F0?, 32'h0000_0F1?,                    // SEXTW / ZEXTW
+            32'h0000_0F8?, 32'h0000_0F9?, 32'h0000_0FA?,
+            32'h0000_0FB?, 32'h0000_0FC?, 32'h0000_0FD?,     // rotates
+            32'h0000_0FE?:                                   // SETR64
+               f_perf_class = PC_ALU;
+            default:
+               f_perf_class = PC_OTHER;
+         endcase
+      end
+   endfunction
+
+   //=========================================================================
+   // Performance-counter block (Tier 0/1/2). Its own always block: reads
+   // existing FSM state (r_SM, r_div_counter, r_int_push_wait), the decoded
+   // opcode (w_opcode) and the branch-outcome strobe set by the jump tasks.
+   // Writes only the r_perf_* counters, so it adds no logic to the main CPU
+   // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
+   //=========================================================================
+   always @(posedge i_Clk) begin
+      r_int_push_wait_d <= r_int_push_wait;
+      if (w_reset_H || w_perf_stat_clear) begin
+         r_perf_cycles           <= 64'd0;  r_perf_instr            <= 64'd0;
+         r_perf_fetch_cycles     <= 64'd0;  r_perf_exec_cycles      <= 64'd0;
+         r_perf_mul_cycles       <= 64'd0;  r_perf_div_cycles       <= 64'd0;
+         r_perf_int_cycles       <= 64'd0;  r_perf_idle_cycles      <= 64'd0;
+         r_perf_mul_ops          <= 64'd0;  r_perf_div_ops          <= 64'd0;
+         r_perf_int_ops          <= 64'd0;
+         r_perf_cnt_alu          <= 64'd0;  r_perf_cnt_load         <= 64'd0;
+         r_perf_cnt_store        <= 64'd0;  r_perf_cnt_branch       <= 64'd0;
+         r_perf_cnt_branch_taken <= 64'd0;  r_perf_cnt_jump         <= 64'd0;
+         r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
+         r_perf_cnt_other        <= 64'd0;
+      end else begin
+         // Tier 0 — total cycles and retired instructions.
+         // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
+         r_perf_cycles <= r_perf_cycles + 64'd1;
+         if (r_SM == OPCODE_FETCH2) r_perf_instr <= r_perf_instr + 64'd1;
+
+         // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
+         // inside OPCODE_REQUEST (r_int_push_wait==1), so it is split out first
+         // to keep the fetch bucket clean.
+         if (r_int_push_wait)
+            r_perf_int_cycles <= r_perf_int_cycles + 64'd1;
+         else if (r_SM == OPCODE_REQUEST || r_SM == OPCODE_FETCH  ||
+                  r_SM == OPCODE_FETCH2  || r_SM == VAR1_FETCH    ||
+                  r_SM == VAR1_FETCH2)
+            r_perf_fetch_cycles <= r_perf_fetch_cycles + 64'd1;
+         else if (r_SM == OPCODE_EXECUTE || r_SM == ALU_FINISH ||
+                  r_SM == WRITEBACK)
+            r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
+         else if (r_SM == MULTIPLY_SETUP || r_SM == MULTIPLY_BREG ||
+                  r_SM == MULTIPLY_CALC  || r_SM == MULTIPLY_PIPE ||
+                  r_SM == MULTIPLY_WRITEBACK)
+            r_perf_mul_cycles <= r_perf_mul_cycles + 64'd1;
+         else if (r_SM == DIVIDE_STEP)
+            r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
+         else if (r_SM == HALTED || r_SM == HALTED_BREAK)
+            r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
+
+         // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
+         // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
+         if (r_SM == MULTIPLY_SETUP)
+            r_perf_mul_ops <= r_perf_mul_ops + 64'd1;
+         if (r_SM == DIVIDE_STEP && r_div_counter == 7'd0)
+            r_perf_div_ops <= r_perf_div_ops + 64'd1;
+         if (r_int_push_wait && !r_int_push_wait_d)
+            r_perf_int_ops <= r_perf_int_ops + 64'd1;
+
+         // Tier 2 — conditional-branch taken outcome (strobe from jump tasks).
+         // The matching BRANCH total is incremented from the classifier below,
+         // so taken ≤ branch always holds.
+         if (r_perf_br_valid && r_perf_br_taken)
+            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
+
+         // Tier 2 — instruction mix: one class per committed instruction.
+         if (r_SM == OPCODE_FETCH2) begin
+            case (f_perf_class(w_opcode))
+               PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
+               PC_LOAD:     r_perf_cnt_load     <= r_perf_cnt_load     + 64'd1;
+               PC_STORE:    r_perf_cnt_store    <= r_perf_cnt_store    + 64'd1;
+               PC_BRANCH:   r_perf_cnt_branch   <= r_perf_cnt_branch   + 64'd1;
+               PC_JUMP:     r_perf_cnt_jump     <= r_perf_cnt_jump     + 64'd1;
+               PC_CALL:     r_perf_cnt_call     <= r_perf_cnt_call     + 64'd1;
+               PC_INDIRECT: r_perf_cnt_indirect <= r_perf_cnt_indirect + 64'd1;
+               default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
+            endcase
+         end
+      end
+   end
+
    //=========================================================================
    // Bit manipulation helper functions (active during single cycles)
    //=========================================================================

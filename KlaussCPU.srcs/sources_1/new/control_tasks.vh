@@ -6,6 +6,11 @@ task t_cond_jump;
    input [31:0] i_value;
    input i_condition;
    begin
+      // Perf: record taken/not-taken for conditional jumps only. JMP (0x1000)
+      // also routes here with i_condition=1; exclude it so the perf BRANCH_TAKEN
+      // denominator matches the classifier's PC_BRANCH (conditional jumps only).
+      r_perf_br_valid <= (w_opcode != 32'h0000_1000);
+      r_perf_br_taken <= i_condition;
       if (i_condition) begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= i_value[31:0];  // jump (byte address)
@@ -74,6 +79,9 @@ task t_cond_jump_rel;
    input [31:0] i_value;
    input i_condition;
    begin
+      // Perf: as t_cond_jump, but JMPREL (0x1030) is the unconditional form here.
+      r_perf_br_valid <= (w_opcode != 32'h0000_1030);
+      r_perf_br_taken <= i_condition;
       if (i_condition) begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + i_value;

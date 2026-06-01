@@ -26,7 +26,8 @@ cache controller.
 0xF00A_xxxx                 Crypto — AES-128 (+ AES-GCM, planned)
 0xF00B_xxxx                 Crypto — SHA-256 (+ HMAC wrapper, planned)
 0xF00C_xxxx                 Crypto — TRNG (planned)
-0xF00D_xxxx – 0xF00E_xxxx   reserved
+0xF00D_xxxx                 Performance counters (CPU pipeline / mix events)
+0xF00E_xxxx                 reserved
 0xF00F_xxxx                 timers / IRQ controller
 ```
 
@@ -204,6 +205,84 @@ void cache_profile(void (*workload)(void)) {
     uint64_t total   = rh + rm + wh + wm;
     uint64_t misses  = rm + wm;
     /* hit_rate_per_million = total ? (rh + wh) * 1000000ull / total : 0; */
+}
+```
+
+### Performance counters — base `0xF00D_0000`
+
+CPU-side performance counters for microarchitecture profiling, complementing
+the cache counters at `0xF005_xxxx`. The intent is to characterise where cycles
+go on the current multicycle FSM **before** committing to a pipeline — measure
+CPI, the fetch/execute/stall split, and the branch/instruction mix, then use
+those numbers to decide what pipelining actually buys. Driven by a dedicated
+always block in [KlaussCPU.v](KlaussCPU.srcs/sources_1/new/KlaussCPU.v) (search
+"Performance-counter block") that observes existing FSM state and the decoded
+opcode, so it adds no logic to the CPU's critical path.
+
+All counters are **read as 64-bit, free-running** and **read-only**. Internally
+they are 48-bit (the upper 16 bits read as 0) to save fabric and ease timing
+closure in the CPU core — at 100 MHz a counter that ticks every cycle still
+takes ~32 days to wrap, far longer than any profiling window (clear before each
+run). Writing `PERF_CTRL` bit 0 clears every counter on the next
+cycle (self-clearing, W1AC — same semantics as `CACHE_CTRL`). Counters are not
+affected by `CPU_RESETN` or program load — only by `PERF_CTRL` bit 0 (and FPGA
+reconfiguration). Profile a region the same way as the cache counters: clear,
+run, read.
+
+| Offset | Reg                     | RW | Width | Description |
+|--------|-------------------------|----|-------|-------------|
+| 0x0000 | `PERF_CTRL`             | RW | 1     | `[0]` write-1-clear-all (self-clearing; reads 0). |
+| **Tier 0 — denominators** | | | | |
+| 0x0008 | `PERF_CYCLES`           | R  | 64    | Every `i_Clk` cycle. The CPI denominator. |
+| 0x0010 | `PERF_INSTR`            | R  | 64    | Retired (committed) instructions. Counts one per pass through the `OPCODE_FETCH2` commit gate. **CPI = CYCLES / INSTR.** |
+| **Tier 1 — cycle accounting** | | | | |
+| 0x0018 | `PERF_FETCH_CYCLES`     | R  | 64    | Cycles in instruction fetch/decode states (`OPCODE_REQUEST` (non-interrupt), `OPCODE_FETCH`, `OPCODE_FETCH2`, `VAR1_FETCH`, `VAR1_FETCH2`). The cycles a fetch/decode pipeline stage would overlap away. |
+| 0x0020 | `PERF_EXEC_CYCLES`      | R  | 64    | Cycles in `OPCODE_EXECUTE` / `ALU_FINISH` / `WRITEBACK`. Includes memory-access stalls for loads/stores (they spin in `OPCODE_EXECUTE` waiting on the bus); see the cache `CNT_STALL_CYCLES` for the DDR portion. |
+| 0x0028 | `PERF_MUL_CYCLES`       | R  | 64    | Cycles in the multiply pipeline states. |
+| 0x0030 | `PERF_DIV_CYCLES`       | R  | 64    | Cycles in `DIVIDE_STEP` (iterative divide; ~65 cycles/op). |
+| 0x0038 | `PERF_INT_CYCLES`       | R  | 64    | Cycles spent pushing interrupt context (`r_int_push_wait`). Context-entry tax. |
+| 0x0040 | `PERF_IDLE_CYCLES`      | R  | 64    | Cycles in `HALTED` / `HALTED_BREAK`. |
+| 0x0048 | `PERF_MUL_OPS`          | R  | 64    | Multiply instructions executed. Avg multiply latency = `MUL_CYCLES / MUL_OPS`. |
+| 0x0050 | `PERF_DIV_OPS`          | R  | 64    | Divide/mod instructions executed. Avg divide latency = `DIV_CYCLES / DIV_OPS`. |
+| 0x0058 | `PERF_INT_OPS`          | R  | 64    | Interrupt dispatches (rising edge of context-push). |
+| **Tier 2 — instruction mix + branch behaviour** | | | | |
+| 0x0060 | `PERF_CNT_ALU`          | R  | 64    | Arithmetic / logic / shift / rotate / compare / bit / move ops. |
+| 0x0068 | `PERF_CNT_LOAD`         | R  | 64    | Loads (all `MEMGET*`/`LDIDX*`/`MEMREAD*` + `POP`). |
+| 0x0070 | `PERF_CNT_STORE`        | R  | 64    | Stores (all `MEMSET*`/`STIDX*` + `PUSH`/`PUSHV`/`PUSHV64`). |
+| 0x0078 | `PERF_CNT_BRANCH`       | R  | 64    | Conditional branches (conditional jumps, absolute + PC-relative). |
+| 0x0080 | `PERF_CNT_BRANCH_TAKEN` | R  | 64    | Of `PERF_CNT_BRANCH`, the taken subset. **Taken rate = TAKEN / BRANCH.** |
+| 0x0088 | `PERF_CNT_JUMP`         | R  | 64    | Unconditional direct jumps (`JMP`, `JMPREL`). |
+| 0x0090 | `PERF_CNT_CALL`         | R  | 64    | Direct + conditional calls (`CALL`/`CALLREL`/`CALLcc`). |
+| 0x0098 | `PERF_CNT_INDIRECT`     | R  | 64    | Register/stack-target transfers (`JMPR`, `RET`, `IRET`, `CALLR`). Future BTB / target-prediction budget. |
+| 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div (also in `*_OPS`), system, I/O, `NOP`, etc. |
+
+**Mix invariant.** Each retired instruction is classified into exactly one of
+the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or
+OTHER, so:
+
+```
+ALU + LOAD + STORE + BRANCH + JUMP + CALL + INDIRECT + OTHER == INSTR
+```
+
+Multiply/divide instructions land in OTHER; their counts come from the Tier-1
+`PERF_MUL_OPS` / `PERF_DIV_OPS`.
+
+**Cycle-bucket coverage.** The Tier-1 cycle buckets are mutually exclusive. In
+a steady run (no program-load, debug-step, or crash-dump activity) they sum to
+very close to `PERF_CYCLES`; the small remainder is program-load / debug /
+HCF / boot-animation states, which are deliberately not bucketed.
+
+```c
+#include "mmio.h"
+
+void perf_profile(void (*workload)(void)) {
+    REG_PERF_CTRL = 1;                  /* clear all */
+    workload();
+    uint64_t cyc = REG_PERF_CYCLES, ins = REG_PERF_INSTR;
+    /* cpi_milli       = ins ? cyc * 1000ull / ins : 0;                  */
+    /* fetch_frac_ppm  = cyc ? REG_PERF_FETCH_CYCLES * 1000000ull / cyc; */
+    /* taken_rate_ppm  = REG_PERF_CNT_BRANCH ?                           */
+    /*     REG_PERF_CNT_BRANCH_TAKEN * 1000000ull / REG_PERF_CNT_BRANCH; */
 }
 ```
 
@@ -804,6 +883,35 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define REG_CACHE_STALL_CYC  (*(volatile uint64_t *)(CACHE_BASE + 0x0068))
 
 #define CACHE_CTRL_CLEAR  (1u << 0)        /* W1AC: zero all counters */
+
+/* Performance counters (0xF00D_0xxx) — CPU pipeline / mix events */
+#define PERF_BASE              (MMIO_BASE + 0x000D0000u)
+#define REG_PERF_CTRL          (*(volatile uint32_t *)(PERF_BASE + 0x0000))
+/* Tier 0 — denominators */
+#define REG_PERF_CYCLES        (*(volatile uint64_t *)(PERF_BASE + 0x0008))
+#define REG_PERF_INSTR         (*(volatile uint64_t *)(PERF_BASE + 0x0010))
+/* Tier 1 — cycle accounting */
+#define REG_PERF_FETCH_CYCLES  (*(volatile uint64_t *)(PERF_BASE + 0x0018))
+#define REG_PERF_EXEC_CYCLES   (*(volatile uint64_t *)(PERF_BASE + 0x0020))
+#define REG_PERF_MUL_CYCLES    (*(volatile uint64_t *)(PERF_BASE + 0x0028))
+#define REG_PERF_DIV_CYCLES    (*(volatile uint64_t *)(PERF_BASE + 0x0030))
+#define REG_PERF_INT_CYCLES    (*(volatile uint64_t *)(PERF_BASE + 0x0038))
+#define REG_PERF_IDLE_CYCLES   (*(volatile uint64_t *)(PERF_BASE + 0x0040))
+#define REG_PERF_MUL_OPS       (*(volatile uint64_t *)(PERF_BASE + 0x0048))
+#define REG_PERF_DIV_OPS       (*(volatile uint64_t *)(PERF_BASE + 0x0050))
+#define REG_PERF_INT_OPS       (*(volatile uint64_t *)(PERF_BASE + 0x0058))
+/* Tier 2 — instruction mix + branch behaviour */
+#define REG_PERF_CNT_ALU          (*(volatile uint64_t *)(PERF_BASE + 0x0060))
+#define REG_PERF_CNT_LOAD         (*(volatile uint64_t *)(PERF_BASE + 0x0068))
+#define REG_PERF_CNT_STORE        (*(volatile uint64_t *)(PERF_BASE + 0x0070))
+#define REG_PERF_CNT_BRANCH       (*(volatile uint64_t *)(PERF_BASE + 0x0078))
+#define REG_PERF_CNT_BRANCH_TAKEN (*(volatile uint64_t *)(PERF_BASE + 0x0080))
+#define REG_PERF_CNT_JUMP         (*(volatile uint64_t *)(PERF_BASE + 0x0088))
+#define REG_PERF_CNT_CALL         (*(volatile uint64_t *)(PERF_BASE + 0x0090))
+#define REG_PERF_CNT_INDIRECT     (*(volatile uint64_t *)(PERF_BASE + 0x0098))
+#define REG_PERF_CNT_OTHER        (*(volatile uint64_t *)(PERF_BASE + 0x00A0))
+
+#define PERF_CTRL_CLEAR   (1u << 0)        /* W1AC: zero all perf counters */
 
 /* Interrupt controller / timer (0xF00F_0xxx) */
 #define INTC_BASE       (MMIO_BASE + 0x000F0000u)

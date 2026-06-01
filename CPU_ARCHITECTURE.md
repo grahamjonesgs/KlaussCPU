@@ -30,6 +30,7 @@ Custom 64-bit RISC-style CPU implemented on a Xilinx 7-series FPGA, targeting 12
 - **Code and data share the same flat address space.** The assembler places the first instruction at `0x0020` (`HEAP_HEADER_WORDS * 8 = 4 * 8 = 32`). Addresses `0x0000–0x001F` (four 64-bit doublewords) are the heap header used by the runtime; the compiler/assembler must not emit code into this region.
 - **Stack** lives at the top of DDR2 and grows downward.
 - All memory accesses go through the cache. The DDR2 bus is 64-bit wide; the cache line is 128-bit (two 64-bit doublewords).
+- **Instruction fetch buffer (IFB).** The fetch FSM keeps a one-line (two-doubleword) buffer of the last cache line read for opcodes. A fetch whose PC falls in the buffered line is served directly — skipping the ~5-cycle cache round-trip a hit otherwise costs — so straight-line/tight-loop fetch is much cheaper. It is filled on the OPCODE_FETCH miss path and checked in OPCODE_REQUEST. To preserve coherence (the unified cache is coherent today), a DRAM **store into a buffered line invalidates it**, so self-modifying code and the Zephyr LLEXT loader still observe freshly-written instructions. Branch redirects need no flush — a changed PC simply misses the buffer tag. The IFB is transparent to software; its effect shows up as a drop in `PERF_FETCH_CYCLES` and cache `CNT_READ_HITS` (see MMIO_MAP.md).
 
 ---
 

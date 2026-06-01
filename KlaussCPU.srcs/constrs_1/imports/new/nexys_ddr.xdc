@@ -359,6 +359,28 @@ set_multicycle_path -quiet -setup -end 2 \
 set_multicycle_path -quiet -hold  -end 1 \
     -from [get_clocks -quiet clk_50_clk_wiz_0]  -to [get_clocks eth_phy_clk]
 
+# ---------------------------------------------------------------------------
+# Crash-dump message builder — multicycle.
+#
+# The HCF crash dump emits one diagnostic line at a time over UART. The line
+# selector r_hcf_dump_phase advances only once per fully-transmitted line
+# (gated by i_msg_sent_DV — hundreds of i_Clk cycles at the UART rate), and the
+# byte-build mux (f_dump_byte) that formats r_msg from it doesn't run until at
+# least two cycles after the phase changes (HCF_DUMP: DONE_WAIT -> PREP ->
+# BYTE_BUILD). The phase-select cone is deep (~12 logic levels), but it has the
+# whole line-transmit time to settle, so single-cycle closure on it is
+# meaningless. Relax only the r_hcf_dump_phase -> r_msg paths: the per-byte
+# position mux (r_hcf_dump_byte_pos -> r_msg) and every other phase fanout stay
+# single-cycle. Broad NAME match so register-replicated phase bits
+# (r_hcf_dump_phase_reg[*]_rep created during place/phys_opt) are covered too.
+# ---------------------------------------------------------------------------
+set_multicycle_path -setup -end 2 \
+    -from [get_cells -hierarchical -filter {NAME =~ *r_hcf_dump_phase_reg*}] \
+    -to   [get_cells -hierarchical -filter {NAME =~ *r_msg_reg*}]
+set_multicycle_path -hold  -end 1 \
+    -from [get_cells -hierarchical -filter {NAME =~ *r_hcf_dump_phase_reg*}] \
+    -to   [get_cells -hierarchical -filter {NAME =~ *r_msg_reg*}]
+
 # False-path the falling-edge launch from clk_50 to eth_phy_clk.  LiteEth's
 # TX ODDRs run in OPPOSITE_EDGE mode but RMII is SDR — for each data bit
 # D1 == D2, so the falling-edge "launch" is just the ODDR re-emitting the
