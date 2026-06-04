@@ -35,13 +35,12 @@
  * Build: drop this in runtime/programs/ alongside lwip_demo.c — it reuses the
  * same includes (mmio.h, src/eth.h, lwip_port/ethernetif.h) and lwIP config.
  *
- * 7-seg:
- *   "INIT____"  startup
- *   "dHCP____"  DHCP running
- *   <raw IP>    IP assigned (e.g. C0A8443B = 192.168.68.59)
- *   "Ld <off>"  receiving — low half = bytes received so far (KiB)
- *   <checksum>  transfer complete
- * LEDs: 0=lwip init  1=link up  2=ip assigned  3=connection active  4=image complete
+ * 7-seg status (no LEDs):
+ *   1E110000    startup marker ("INIT"), shown before eth/lwIP bring-up
+ *   D8C90000    DHCP in progress ("dHCP")
+ *   <IP>        IP assigned, host byte order (C0A8443B = 192.168.68.59)
+ *   <bytes>     receiving — image bytes received so far (matches the UART loader)
+ *   <checksum>  transfer complete (32-bit additive checksum of the image)
  */
 
 #include <stdio.h>
@@ -179,12 +178,12 @@ static void launch_image(uint32_t entry_pc, uint32_t img_len) {
 
 static void netif_status_cb(struct netif *nif) {
     if (nif->ip_addr.addr != 0) {
-        REG_SEG_ALL = nif->ip_addr.addr;    // raw IP on 7-seg
-        REG_LEDS   |= 0x0004;
+        // ip_addr.addr is network byte order; ntohl gives host order so the
+        // 7-seg reads as the dotted quad (e.g. C0A8443B = 192.168.68.59).
+        REG_SEG_ALL = ntohl(nif->ip_addr.addr);
         g_ip_assigned = 1;
     } else {
         g_ip_assigned = 0;
-        REG_LEDS &= ~0x0004u;
     }
 }
 
@@ -236,11 +235,10 @@ static void consume(struct tcp_pcb *pcb, const uint8_t *src, uint32_t n) {
             g_offset += take;
             src += take;
             n   -= take;
-            REG_SEG_ALL = 0x1D000000u | (g_offset >> 10);   // "Ld" + KiB received
+            REG_SEG_ALL = g_offset;            // bytes received (matches UART loader)
             if (g_offset == g_img_len) {
                 uint32_t cks = image_checksum(g_img_len);
                 REG_SEG_ALL = cks;
-                REG_LEDS   |= 0x0010;          // image complete
                 send_ack(pcb, 0u, cks);
                 uint64_t elapsed_ms = REG_CLOCK_MS - g_start_ms;
                 if (elapsed_ms == 0) elapsed_ms = 1;   // avoid /0 on tiny images
@@ -267,7 +265,6 @@ static err_t netboot_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t 
     if (err != ERR_OK || p == NULL) {          // peer closed / error
         if (p) pbuf_free(p);
         tcp_close(pcb);
-        REG_LEDS &= ~0x0008u;
         return ERR_OK;
     }
     for (struct pbuf *q = p; q != NULL; q = q->next) {
@@ -288,7 +285,6 @@ static err_t netboot_accept(void *arg, struct tcp_pcb *new_pcb, err_t err) {
     if (err != ERR_OK || new_pcb == NULL) return ERR_VAL;
     // Reset receive state for each new connection.
     g_phase = RX_HEADER; g_hdr_have = 0; g_offset = 0; g_img_len = 0;
-    REG_LEDS |= 0x0008;
     tcp_recv(new_pcb, netboot_recv);
     printf("netboot: connection accepted\n");
     return ERR_OK;
@@ -309,13 +305,11 @@ static void start_netboot_server(void) {
 // ── main ──────────────────────────────────────────────────────────────────
 
 int main(void) {
-    printf("=== KlaussCPU netboot (Phase 0: receive+verify) ===\n");
-    REG_SEG_ALL = 0x1E110000u;   // "INIT"
-    REG_LEDS    = 0x0000;
+    printf("=== KlaussCPU netboot ===\n");
+    REG_SEG_ALL = 0x1E110000u;   // startup marker ("INIT")
 
     eth_init();                  // PHY reset + MDIO verify + enable events
     lwip_init();
-    REG_LEDS |= 0x0001;
 
     ip4_addr_t ipaddr, netmask, gw;
     IP4_ADDR(&ipaddr,  0, 0, 0, 0);
@@ -327,10 +321,9 @@ int main(void) {
     netif_set_default(&g_netif);
     netif_set_status_callback(&g_netif, netif_status_cb);
     netif_set_up(&g_netif);
-    REG_LEDS |= 0x0002;
 
     printf("Starting DHCP...\n");
-    REG_SEG_ALL = 0xD8C90000u;   // "dHCP"
+    REG_SEG_ALL = 0xD8C90000u;   // "dHCP" — DHCP in progress
     dhcp_start(&g_netif);
 
     uint64_t dhcp_deadline = REG_CLOCK_MS + DHCP_TIMEOUT_MS;
