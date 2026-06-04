@@ -47,12 +47,14 @@ module ddr2_control (
     input [127:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
     output reg [127:0] o_mem_read_data,
-    output reg o_mem_ready
+    output reg o_mem_ready,
+    output o_calib_done           // MIG init_calib_complete (DDR2 ready)
 
 );
 
 
    wire calib_done;
+   assign o_calib_done = calib_done;
 
    reg [26:0] app_addr = 0;
    reg [2:0] app_cmd = 0;

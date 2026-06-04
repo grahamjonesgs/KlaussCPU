@@ -900,7 +900,35 @@ module KlaussCPU (
        .o_cnt_stall_cycles(w_cnt_stall_cycles),
 
        // 50 MHz output for Ethernet PHY REF_CLK (drives liteeth_core and ODDR).
-       .clk_50(clk_50)
+       .clk_50(clk_50),
+
+       // DDR2 ready — gates the resident boot-ROM copy below.
+       .o_calib_done(w_calib_done)
+   );
+
+   // ==========================================================================
+   // Resident boot ROM (Phase 2 of NETBOOT_PLAN.md).  Holds the netboot image
+   // ($readmemh "netboot.mem", built as today and converted with
+   // `klausscc --mem-out`).  At reset the NO_PROGRAM boot sub-FSM reads word 0
+   // (heap_start = image byte length), copies the image into DDR from byte 0,
+   // and hands off to LOAD_COMPLETE — so netboot runs exactly as a UART load,
+   // with no UART bootstrap.  A UART break+'S' still preempts to reflash.
+   // ==========================================================================
+   wire        w_calib_done;
+   wire [63:0] w_boot_dword;        // boot_rom read data (1-cycle latency)
+   reg  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
+   reg  [15:0] r_boot_len_dw;       // image length in doublewords (from word 0)
+   reg  [ 2:0] r_boot_phase;        // sub-state within NO_PROGRAM
+   reg         r_boot_active;       // 1 = boot copy pending/in-progress
+
+   boot_rom #(
+       .DEPTH_DW (32768),           // 256 KiB capacity — sized for netboot
+       .ADDR_W   (15),
+       .INIT_FILE("netboot.mem")
+   ) boot_rom_i (
+       .i_clk    (i_Clk),
+       .i_dw_addr(r_boot_dw_addr),
+       .o_dword  (w_boot_dword)
    );
 
 
@@ -1136,6 +1164,9 @@ rams_sp_nc rams_sp_nc1 (
       o_TX_LCD_Count = 4'd1;
       o_TX_LCD_Byte = 8'b0;
       r_SM = NO_PROGRAM;
+      r_boot_active = 1'b1;
+      r_boot_phase = 3'd0;
+      r_boot_dw_addr = 15'd0;
       r_timeout_counter = 0;
       o_LCD_reset_n = 1'b0;
       r_PC = 32'h0;
@@ -1217,6 +1248,9 @@ rams_sp_nc rams_sp_nc1 (
 
          r_SM <= NO_PROGRAM;
          r_SP <= 32'h800_0000;
+         r_boot_active   <= 1'b1;   // arm the resident boot-ROM copy
+         r_boot_phase    <= 3'd0;
+         r_boot_dw_addr  <= 15'd0;
          r_int_push_wait <= 1'b0;
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
@@ -1385,7 +1419,63 @@ rams_sp_nc rams_sp_nc1 (
                r_seven_seg_value1 <= 32'h22222222;
                r_seven_seg_value2 <= 32'h22222222;
 
-               if (r_timer_interrupt_counter_sec == 0) begin
+               if (r_boot_active) begin
+                  // ---- Resident boot-ROM → DDR copy (sub-FSM in r_boot_phase) ----
+                  // Marker on the upper display so a stuck copy is distinguishable
+                  // from a blank idle board ("b00t").
+                  r_seven_seg_value1 <= 32'h0B000704;
+                  case (r_boot_phase)
+                     3'd0: begin
+                        // Wait for DDR calibration, then present word 0.
+                        if (w_calib_done) begin
+                           r_boot_dw_addr <= 15'd0;
+                           r_boot_phase   <= 3'd1;
+                        end
+                     end
+                     3'd1: begin
+                        // word 0 valid: heap_start (lo32) = image byte length.
+                        // >>3 → doubleword count.  Zero ⇒ no valid image: idle.
+                        if (w_boot_dword[18:3] == 16'd0) begin
+                           r_boot_active <= 1'b0;   // unprogrammed ROM → normal idle
+                        end else begin
+                           r_boot_len_dw  <= w_boot_dword[18:3];
+                           r_boot_dw_addr <= 15'd0; // restart at dword 0 to copy it
+                           r_boot_phase   <= 3'd2;
+                        end
+                     end
+                     3'd2: begin
+                        // ROM read latency: o_dword settles for r_boot_dw_addr.
+                        r_boot_phase <= 3'd3;
+                     end
+                     3'd3: begin
+                        // Issue the full 64-bit DDR write of this doubleword.
+                        r_mem_addr       <= {14'd0, r_boot_dw_addr, 3'b0};
+                        r_mem_write_data <= w_boot_dword;
+                        r_mem_byte_en    <= 8'hFF;
+                        r_mem_write_DV   <= 1'b1;
+                        r_boot_phase     <= 3'd4;
+                     end
+                     3'd4: begin
+                        if (w_mem_ready) begin
+                           r_mem_write_DV <= 1'b0;
+                           if (r_boot_dw_addr == r_boot_len_dw - 1'b1) begin
+                              // Hand off to the normal run path.  Equal checksums
+                              // bypass LOAD_COMPLETE's verify; entry = 0x20.
+                              r_boot_active   <= 1'b0;
+                              r_PC_requested  <= 32'h0000_0020;
+                              r_calc_checksum <= 16'h0;
+                              r_rec_checksum  <= 16'h0;
+                              r_SP            <= 32'h800_0000;
+                              r_SM            <= LOAD_COMPLETE;
+                           end else begin
+                              r_boot_dw_addr <= r_boot_dw_addr + 1'b1;
+                              r_boot_phase   <= 3'd2;  // ROM latency before next
+                           end
+                        end
+                     end
+                     default: r_boot_phase <= 3'd0;
+                  endcase
+               end else if (r_timer_interrupt_counter_sec == 0) begin
                   case (r_boot_flash)
                      0: begin
                         r_RGB_LED_1  <= 12'h010;

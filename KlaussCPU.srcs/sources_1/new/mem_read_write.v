@@ -60,7 +60,11 @@ module mem_read_write (
     // alongside the existing 200 MHz DDR reference clock.  Plumbed up to
     // the top level so KlaussCPU.v can drive both LiteEth's sys-clock
     // input and the PHY's ETH_REFCLK pin (via ODDR).
-    output            clk_50
+    output            clk_50,
+
+    // DDR2 calibration complete — passed up so the boot-ROM copy (KlaussCPU.v)
+    // waits for DDR before writing the resident netboot image into it.
+    output            o_calib_done
 );
 
     parameter  CACHE_SIZE = 2_048;              // number of sets — 2 ways × 2048 sets = 4096 total lines = 64 KB
@@ -736,7 +740,8 @@ module mem_read_write (
         .i_mem_write_data (o_ddr_mem_write_data),
         .i_app_wdf_mask   (w_app_wdf_mask),
         .o_mem_read_data  (i_ddr_mem_read_data),
-        .o_mem_ready      (i_ddr_mem_ready)
+        .o_mem_ready      (i_ddr_mem_ready),
+        .o_calib_done     (o_calib_done)
     );
 
 endmodule

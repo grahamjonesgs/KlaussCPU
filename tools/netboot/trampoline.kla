@@ -1,0 +1,30 @@
+// netboot relocation trampoline — reference source.
+//
+// Assembled ONLY to extract its machine-code words (it is not loaded the normal
+// way).  netboot.c embeds these words, relocates the two absolute jump targets
+// to the high run address, patches the len/entry immediates, copies the staged
+// image down to 0x0, and jumps to the program entry.
+//
+// Registers: A=src  B=dst  C=len(bytes)  D=entry  E=tmp  F=stack-top
+//
+// SETSP F restores SP=0x0800_0000 before the jump — exactly what the hardware
+// loader's LOAD_COMPLETE does, so the program sees the same initial SP.
+// See netboot.c TRAMP_* constants for the word indices that get patched.
+_start
+SETR A 0x4000000
+SETR B 0x0
+SETR C 0x0
+SETR D 0x0
+SETR F 0x8000000
+LOOP:
+CMPRV C 0
+JMPE DONE:
+MEMGET64 E A
+MEMSET64 E B
+ADDV A 8
+ADDV B 8
+MINUSV C 8
+JMP LOOP:
+DONE:
+SETSP F
+JMPR D
