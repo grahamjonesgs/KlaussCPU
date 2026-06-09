@@ -1004,9 +1004,14 @@ function [7:0] f_dump_byte;
                 // Family phases (regs / stack / trace).  Resolve k and data
                 // first so the per-position case below stays simple.
                 if (phase < DUMP_STACK_BASE) begin
-                    // Register dump R0..RF
+                    // Register dump R0..RF.  data is the register value
+                    // pre-fetched into r_hcf_stack_data during PREP
+                    // (KlaussCPU.v) — keeping the live register file off
+                    // f_dump_byte's combinational cone removes the 16:1 64-bit
+                    // mux that was the crash-dump routing-congestion source.
+                    // k is still derived from phase only, for the "RX=" label.
                     k    = phase[3:0] - DUMP_REG_BASE[3:0];
-                    data = r_register[k];
+                    data = r_hcf_stack_data;
                 end else if (phase < DUMP_TRACE_BASE) begin
                     // Stack dump S0..S3 (data pre-fetched into r_hcf_stack_data)
                     k    = phase[3:0] - DUMP_STACK_BASE[3:0];

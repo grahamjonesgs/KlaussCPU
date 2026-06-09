@@ -564,6 +564,17 @@ module KlaussCPU (
    localparam DIV_OP_NONE = 2'd0;
    localparam DIV_OP_DIV  = 2'd1;
    localparam DIV_OP_MOD  = 2'd2;
+
+   // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
+   // instead of a separate 64-bit comparator + 64-bit subtractor in series.
+   // In restoring division the ">=" test and the subtract are the same
+   // operation: the borrow-out of {rem,bit} - divisor IS the comparison
+   // result (no borrow => result >= 0 => quotient bit 1, take the difference;
+   // borrow => quotient bit 0, keep the shifted remainder).  Driving the
+   // quotient-bit mux from w_div_borrow halves the logic on this path.
+   wire [63:0] w_div_shifted = {r_div_remainder[62:0], r_div_dividend[63]};
+   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, r_div_divisor};
+   wire        w_div_borrow  = w_div_trial[64];
    
    // Dedicated read ports - registered every cycle
    reg [63:0] r_reg_port_a;
@@ -1920,6 +1931,22 @@ rams_sp_nc rams_sp_nc1 (
                            r_mem_addr     <= r_PC;
                            r_mem_read_DV  <= 1'b1;
                            r_hcf_dump_sub <= 3'b011;
+                        end else if (r_hcf_dump_phase >= DUMP_REG_BASE
+                                  && r_hcf_dump_phase <  DUMP_STACK_BASE
+                                  && !r_hcf_stack_loaded) begin
+                           // Register phase pre-fetch (R0..RF).  Same trick as
+                           // the trace branch below: f_dump_byte's register
+                           // branch used to read r_register[k] with a runtime
+                           // index, inferring a 16:1 64-bit mux hung off the
+                           // live register file and dragging all 16 regs into
+                           // the dump corner — the routing-congestion source
+                           // behind the crash-dump rip-up/reroute.  Latch the
+                           // selected register here one cycle before BYTE_BUILD
+                           // so f_dump_byte reads the flat r_hcf_stack_data
+                           // latch instead (see uart_tasks.vh).
+                           r_hcf_stack_data   <= r_register[r_hcf_dump_phase[3:0]
+                                                 - DUMP_REG_BASE[3:0]];
+                           r_hcf_stack_loaded <= 1'b1;
                         end else if (r_hcf_dump_phase >= DUMP_TRACE_BASE && !r_hcf_stack_loaded) begin
                            // Trace phase pre-fetch.  Lift the r_trace_buf read out
                            // of f_dump_byte's combinational path: without this,
@@ -1964,7 +1991,9 @@ rams_sp_nc rams_sp_nc1 (
                         // value so the next phase loads fresh data.  Stack/V1H/
                         // OPCM are DDR2-fetched; trace phases are pre-fetched
                         // from r_trace_buf (BRAM) for timing reasons (see PREP).
-                        if (((r_hcf_dump_phase >= DUMP_STACK_BASE)
+                        if (((r_hcf_dump_phase >= DUMP_REG_BASE)
+                          && (r_hcf_dump_phase <  DUMP_STACK_BASE))
+                         || ((r_hcf_dump_phase >= DUMP_STACK_BASE)
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
                          || (r_hcf_dump_phase == DUMP_V1H)
                          || (r_hcf_dump_phase == DUMP_OPCM)
@@ -2282,14 +2311,15 @@ end
             DIVIDE_STEP: begin
                // Shared division iteration - avoids re-evaluating opcode casez each cycle
                if (r_div_counter < 7'd64) begin
-                  // Restoring division step
-                  if ({r_div_remainder[62:0], r_div_dividend[63]} >= r_div_divisor) begin
-                     r_div_remainder <= {r_div_remainder[62:0], r_div_dividend[63]} - r_div_divisor;
-                     r_div_quotient <= {r_div_quotient[62:0], 1'b1};
+                  // Restoring division step — single subtract (w_div_trial),
+                  // borrow-out (w_div_borrow) selects quotient bit and remainder.
+                  if (!w_div_borrow) begin
+                     r_div_remainder <= w_div_trial[63:0];
+                     r_div_quotient  <= {r_div_quotient[62:0], 1'b1};
                   end
                   else begin
-                     r_div_remainder <= {r_div_remainder[62:0], r_div_dividend[63]};
-                     r_div_quotient <= {r_div_quotient[62:0], 1'b0};
+                     r_div_remainder <= w_div_shifted;
+                     r_div_quotient  <= {r_div_quotient[62:0], 1'b0};
                   end
                   r_div_dividend <= {r_div_dividend[62:0], 1'b0};
                   r_div_counter <= r_div_counter + 1;

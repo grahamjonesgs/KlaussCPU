@@ -21,10 +21,14 @@
 // Each vector is encrypted, then decrypted, and both directions checked.
 // Result: $display PASS / FAIL lines per test; final summary line at end.
 //
-// Byte ordering: the testbench passes 128-bit values to aes_core such that
-// PT bytes 0..15 are at bits [127:120] down to [7:0] — i.e. byte 0 is the
-// MSB of the 128-bit reg.  This matches the AES specification.  The MMIO
-// wrapper handles the conversion from the CPU's little-endian uint64 layout.
+// Byte ordering: aes_core uses a little-endian state layout — AES byte 0 is
+// at bits [7:0] of the 128-bit word (see aes_core.v header).  The FIPS-197
+// vectors above are written big-endian (byte 0 in the MSB) for readability,
+// so run_vector byte-reverses (brev) every value when driving the core and
+// byte-reverses the core's output before comparing.  In the real system the
+// MMIO/software layer performs this same marshalling — which is why SSH works
+// with the identical core.  (Earlier this tb drove the core big-endian with
+// no reversal, producing a spurious mismatch that looked like a core bug.)
 //
 // Run from Vivado simulator (xsim) — no waveforms required; everything is
 // printed.
@@ -63,15 +67,17 @@ module tb_aes_core;
     initial clk = 0;
     always #5 clk = ~clk;
 
-    // Wait until the core de-asserts busy after a one-cycle pulse.
-    task wait_done;
+    // aes_core uses a little-endian byte layout (AES byte 0 at bits [7:0]).
+    // The FIPS vectors are written big-endian for readability, so reverse the
+    // 16 bytes of a 128-bit word when crossing the core boundary.
+    function [127:0] brev;
+        input [127:0] v;
+        integer b;
         begin
-            @(posedge clk);
-            while (busy) @(posedge clk);
-            // One extra cycle so data_out latches.
-            @(posedge clk);
+            for (b = 0; b < 16; b = b + 1)
+                brev[8*b +: 8] = v[8*(15 - b) +: 8];
         end
-    endtask
+    endfunction
 
     // Encrypt-and-check, then decrypt-and-check.
     task run_vector;
@@ -82,19 +88,20 @@ module tb_aes_core;
         reg   [127:0] enc_out;
         reg   [127:0] dec_out;
         begin
-            key      = k_in;
+            // Load key (byte-reversed into the core's little-endian layout).
+            key      = brev(k_in);
             key_load = 1'b1;
             @(posedge clk);
             key_load = 1'b0;
-            wait_done();
+            @(posedge clk); while (busy) @(posedge clk); @(posedge clk);
 
             // Encrypt
-            data_in = pt_in;
+            data_in = brev(pt_in);
             go_enc  = 1'b1;
             @(posedge clk);
             go_enc  = 1'b0;
-            wait_done();
-            enc_out = data_out;
+            @(posedge clk); while (busy) @(posedge clk); @(posedge clk);
+            enc_out = brev(data_out);
 
             if (enc_out === ct_expected) begin
                 $display("[PASS] AES vector %0d ENCRYPT: ct = %032h", vec_num, enc_out);
@@ -105,13 +112,13 @@ module tb_aes_core;
                 fails = fails + 1;
             end
 
-            // Decrypt the result, should round-trip back to plaintext.
-            data_in = ct_expected;
+            // Decrypt the ciphertext, should round-trip back to plaintext.
+            data_in = brev(ct_expected);
             go_dec  = 1'b1;
             @(posedge clk);
             go_dec  = 1'b0;
-            wait_done();
-            dec_out = data_out;
+            @(posedge clk); while (busy) @(posedge clk); @(posedge clk);
+            dec_out = brev(data_out);
 
             if (dec_out === pt_in) begin
                 $display("[PASS] AES vector %0d DECRYPT: pt = %032h", vec_num, dec_out);

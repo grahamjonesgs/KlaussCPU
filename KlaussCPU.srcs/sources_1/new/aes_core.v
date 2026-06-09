@@ -19,8 +19,18 @@
 // Latency
 // -------
 //   - KEY_LOAD : ~11 cycles (one expansion step per cycle).
-//   - encrypt  : 10 cycles after GO.
-//   - decrypt  : 10 cycles after GO.
+//   - encrypt  : 20 cycles after GO (2 clocks/round — see pipeline note).
+//   - decrypt  : 20 cycles after GO (2 clocks/round).
+//
+// Round pipeline
+// --------------
+//   Each round is split across two clocks to break the long combinational
+//   chain SubBytes -> ShiftRows -> MixColumns -> AddRoundKey -> (next-round
+//   SubBytes address), which was the design's worst timing path (route-bound,
+//   inside this core).  Stage PH_SUB registers the S-box output into r_sub;
+//   stage PH_MIX does ShiftRows/MixColumns/AddRoundKey from r_sub.  This is a
+//   latency change only — the o_busy/o_done handshake is unchanged, so callers
+//   need no modification.
 //
 // External handshake
 // ------------------
@@ -64,6 +74,13 @@ module aes_core (
     reg [2:0] r_state;
     reg [3:0] r_round;        // 0..10 (encrypt counts up, decrypt counts down)
     reg [127:0] r_state_data; // current 128-bit state
+
+    // Round pipeline (see header).  r_sub holds the registered SubBytes /
+    // InvSubBytes result; r_phase selects the round sub-cycle.
+    reg [127:0] r_sub;
+    reg         r_phase;
+    localparam PH_SUB = 1'b0;  // cycle 1: latch S-box output into r_sub
+    localparam PH_MIX = 1'b1;  // cycle 2: ShiftRows / MixColumns / AddRoundKey
 
     // -------------------------------------------------------------------------
     // Round-constants for key schedule (Rcon[i] for i = 1..10).  Each entry
@@ -259,10 +276,13 @@ module aes_core (
     // -------------------------------------------------------------------------
     // Round-data computation.
     // -------------------------------------------------------------------------
-    wire [127:0] w_enc_full   = mix_columns(shift_rows(w_after_sub)) ^ r_round_key[r_round + 1];
-    wire [127:0] w_enc_final  = shift_rows(w_after_sub) ^ r_round_key[10];
-    wire [127:0] w_dec_full   = inv_mix_columns(inv_shift_rows(w_after_isub) ^ r_round_key[r_round - 1]);
-    wire [127:0] w_dec_final  = inv_shift_rows(w_after_isub) ^ r_round_key[0];
+    // Stage-2 (PH_MIX) round data is computed from the registered S-box output
+    // r_sub, not the combinational w_after_sub/w_after_isub — that register is
+    // the pipeline cut that shortens the round's critical path.
+    wire [127:0] w_enc_full   = mix_columns(shift_rows(r_sub)) ^ r_round_key[r_round + 1];
+    wire [127:0] w_enc_final  = shift_rows(r_sub) ^ r_round_key[10];
+    wire [127:0] w_dec_full   = inv_mix_columns(inv_shift_rows(r_sub) ^ r_round_key[r_round - 1]);
+    wire [127:0] w_dec_final  = inv_shift_rows(r_sub) ^ r_round_key[0];
 
     // -------------------------------------------------------------------------
     // Main state machine
@@ -278,6 +298,8 @@ module aes_core (
             o_done     <= 1'b0;
             o_data_out <= 128'h0;
             r_state_data <= 128'h0;
+            r_sub        <= 128'h0;
+            r_phase      <= PH_SUB;
             for (i = 0; i < 11; i = i + 1)
                 r_round_key[i] <= 128'h0;
         end else begin
@@ -295,12 +317,14 @@ module aes_core (
                     end else if (i_go_enc) begin
                         r_state_data <= i_data_in ^ r_round_key[0];   // initial AddRoundKey
                         r_round      <= 4'd0;
+                        r_phase      <= PH_SUB;
                         r_state      <= ST_ENC;
                         o_busy       <= 1'b1;
                         o_done       <= 1'b0;
                     end else if (i_go_dec) begin
                         r_state_data <= i_data_in ^ r_round_key[10];  // initial AddRoundKey (final round key)
                         r_round      <= 4'd10;
+                        r_phase      <= PH_SUB;
                         r_state      <= ST_DEC;
                         o_busy       <= 1'b1;
                         o_done       <= 1'b0;
@@ -318,24 +342,40 @@ module aes_core (
                 end
 
                 ST_ENC: begin
-                    if (r_round == 4'd9) begin
-                        // Final round: no MixColumns.
-                        r_state_data <= w_enc_final;
-                        r_state      <= ST_DONE;
+                    if (r_phase == PH_SUB) begin
+                        // Stage 1: register SubBytes of the current state.
+                        r_sub   <= w_after_sub;
+                        r_phase <= PH_MIX;
                     end else begin
-                        r_state_data <= w_enc_full;
-                        r_round      <= r_round + 4'd1;
+                        // Stage 2: ShiftRows / MixColumns / AddRoundKey.
+                        r_phase <= PH_SUB;
+                        if (r_round == 4'd9) begin
+                            // Final round: no MixColumns.
+                            r_state_data <= w_enc_final;
+                            r_state      <= ST_DONE;
+                        end else begin
+                            r_state_data <= w_enc_full;
+                            r_round      <= r_round + 4'd1;
+                        end
                     end
                 end
 
                 ST_DEC: begin
-                    if (r_round == 4'd1) begin
-                        // Final round: no inv MixColumns.
-                        r_state_data <= w_dec_final;
-                        r_state      <= ST_DONE;
+                    if (r_phase == PH_SUB) begin
+                        // Stage 1: register InvSubBytes of the current state.
+                        r_sub   <= w_after_isub;
+                        r_phase <= PH_MIX;
                     end else begin
-                        r_state_data <= w_dec_full;
-                        r_round      <= r_round - 4'd1;
+                        // Stage 2: InvShiftRows / AddRoundKey / InvMixColumns.
+                        r_phase <= PH_SUB;
+                        if (r_round == 4'd1) begin
+                            // Final round: no inv MixColumns.
+                            r_state_data <= w_dec_final;
+                            r_state      <= ST_DONE;
+                        end else begin
+                            r_state_data <= w_dec_full;
+                            r_round      <= r_round - 4'd1;
+                        end
                     end
                 end
 
