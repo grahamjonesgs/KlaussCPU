@@ -184,8 +184,10 @@ task t_opcode_select;
          32'h0000_0A9?: t_clz;                                 // CLZ R rd=count of leading zeros (0–64)
          32'h0000_0AA?: t_ctz;                                 // CTZ R rd=count of trailing zeros (0–64)
          32'h0000_0AB?: t_bit_reverse;                         // BITREV R rd=bit_reverse(rs) (bit 63↔0, etc.)
-         32'h0000_0AC?: t_extract_bits(w_var1);                // BEXTR RV rd=extract bit field from rs using imm descriptor
-         32'h0000_0AD?: t_deposit_bits(w_var1);                // BDEP RV rd=deposit bit field into rs using imm descriptor
+         // BEXTR/BDEP descriptor: imm[4:0]=start (0–31), imm[12:8]=length (0–31).
+         // Operates on the low 32 bits of rs only; result zero-extended to 64.
+         32'h0000_0AC?: t_extract_bits(w_var1);                // BEXTR RV rd=zero_ext((rs>>start)&((1<<len)-1)); start=imm[4:0], len=imm[12:8]; low 32 bits only
+         32'h0000_0AD?: t_deposit_bits(w_var1);                // BDEP RV rd=rs2 with len bits of rs1 deposited at start; start=imm[4:0], len=imm[12:8]; low 32 bits only
 
          //=====================================================================
          // Hardware multiply/divide by immediate (RV, 2-word).  Signed only.

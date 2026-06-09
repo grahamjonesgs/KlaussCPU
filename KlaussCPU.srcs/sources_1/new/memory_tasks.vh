@@ -88,9 +88,7 @@ task t_set_reg_from_mem_reg;
             r_writeback_reg <= r_reg_1;
             r_SM <= WRITEBACK;
             r_mem_read_DV <= 1'b0;
-            if (r_mem_read_DV) begin
-               r_PC <= r_PC + 4;
-            end
+            r_PC <= r_PC + 4;
          end  // if ready asserted, else will loop until ready
       end  // if subsequent loop
    end

@@ -261,7 +261,8 @@ task t_bit_reverse;
 endtask
 
 // BEXTR - Extract bit field
-// Value format: bits [7:0] = start position, bits [15:8] = length
+// Descriptor: imm[4:0] = start position (0-31), imm[12:8] = length (0-31).
+// Operates on the low 32 bits of rs only; result zero-extended to 64 bits.
 task t_extract_bits;
    input [31:0] i_params;
    reg [4:0] start_pos;
@@ -283,7 +284,9 @@ endtask
 
 // BDEP - Deposit bit field (insert bits at position)
 // Uses r_reg_1 as source, r_reg_2 as destination
-// Value format: bits [7:0] = start position, bits [15:8] = length
+// Descriptor: imm[4:0] = start position (0-31), imm[12:8] = length (0-31).
+// Operates on the low 32 bits only; high bits of rd come from rs2 unchanged
+// for [31:0], and are zero above bit 31 (32-bit result zero-extended).
 task t_deposit_bits;
    input [31:0] i_params;
    reg [4:0] start_pos;
@@ -487,7 +490,7 @@ task t_mul_value_hw;
    input [31:0] i_value;
 begin
     r_mul_operand_a   <= r_reg_port_b;      // Register value
-    r_mul_operand_b   <= i_value;           // Immediate value
+    r_mul_operand_b   <= {{32{i_value[31]}}, i_value};  // sign-extend imm32 (signed MULV; mul pipe sign-extends from bit 63)
     r_mul_dest_reg    <= r_reg_2;           // Result goes back to same register
     r_mul_is_high     <= 1'b0;
     r_mul_is_unsigned <= 1'b0;
@@ -688,6 +691,7 @@ task t_abs_reg;
          r_overflow_flag <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
       end else begin
          r_writeback_value <= r_reg_port_b;
+         r_overflow_flag <= 1'b0;  // non-negative input never overflows
       end
       r_writeback_reg <= r_reg_2;
       r_writeback_set_zero_flag <= 1'b1;

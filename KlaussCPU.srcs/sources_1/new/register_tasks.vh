@@ -173,7 +173,9 @@ task t_add_value;
       {carry, hold} = {1'b0, r_reg_port_b} + {1'b0, i_value};
       r_alu_pipe_value    <= hold;
       r_alu_pipe_carry    <= carry;
-      r_alu_pipe_overflow <= (r_reg_port_b[63]&&i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&!i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
+      // ADDV zero-extends imm32, so the addend's 64-bit sign is always 0:
+      // signed overflow only when a non-negative reg + non-negative addend goes negative.
+      r_alu_pipe_overflow <= (!r_reg_port_b[63] && hold[63]) ? 1'b1 : 1'b0;
       r_alu_pipe_mode     <= 1'b0;     // ARITH
       r_writeback_set_zero_flag <= 1'b1;
       r_writeback_reg <= r_reg_2;
@@ -221,7 +223,9 @@ task t_minus_value;
       {carry, hold} = {1'b0, r_reg_port_b} - {1'b0, i_value};
       r_alu_pipe_value    <= hold;
       r_alu_pipe_carry    <= carry;
-      r_alu_pipe_overflow <= (r_reg_port_b[63]&&!i_value[31]&&!hold[63])||(!r_reg_port_b[63]&&i_value[31]&&hold[63]) ? 1'b1 : 1'b0;
+      // MINUSV zero-extends imm32, so the subtrahend's 64-bit sign is always 0:
+      // signed overflow only when a negative reg - non-negative subtrahend goes positive.
+      r_alu_pipe_overflow <= (r_reg_port_b[63] && !hold[63]) ? 1'b1 : 1'b0;
       r_alu_pipe_mode     <= 1'b0;
       r_writeback_set_zero_flag <= 1'b1;
       r_writeback_reg <= r_reg_2;
