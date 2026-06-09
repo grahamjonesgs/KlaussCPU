@@ -269,15 +269,17 @@ task t_compare_reg_value;
    input [31:0] i_value;
    reg signed [63:0] s_reg;
    reg signed [63:0] s_val;
+   reg [63:0] u_val;
    reg [63:0] diff;
    begin
       s_reg = r_reg_port_b;
       s_val = {{32{i_value[31]}}, i_value};  // sign-extend 32-bit value to 64-bit
+      u_val = {{32{i_value[31]}}, i_value};  // same sign-extended bits, unsigned-typed for ult
       diff  = r_reg_port_b - s_val;
       r_alu_pipe_value <= diff;       // sign flag = diff[63] in ALU_FINISH
       r_alu_pipe_equal <= (r_reg_port_b == s_val) ? 1'b1 : 1'b0;
       r_alu_pipe_less  <= (s_reg < s_val) ? 1'b1 : 1'b0;
-      r_alu_pipe_ult   <= (r_reg_port_b < {{32{1'b0}}, i_value}) ? 1'b1 : 1'b0;
+      r_alu_pipe_ult   <= (r_reg_port_b < u_val) ? 1'b1 : 1'b0;  // sign-extend then unsigned-compare (matches CMPRR)
       r_alu_pipe_mode  <= 1'b1;        // CMP
       r_SM <= ALU_FINISH;
       r_PC <= r_PC + 8;

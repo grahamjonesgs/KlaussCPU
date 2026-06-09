@@ -258,6 +258,15 @@ set_property CFGBVS VCCO [current_design]
 
 set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
 
+## QSPI flash boot configuration (must match `write_cfgmem -interface SPIx1`).
+## x1 is used (not x4) because x4 master-SPI boot needs the S25FL128S Quad-Enable
+## bit set, which the flash programming flow does not guarantee — x4 read returns
+## garbled data, the bitstream CRC fails and DONE never asserts. x1 avoids the QE
+## dependency entirely; the compressed bitstream still boots in ~1 s.
+set_property CONFIG_MODE SPIx1 [current_design]
+set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 1 [current_design]
+set_property BITSTREAM.CONFIG.CONFIGRATE 33 [current_design]
+
 ## I/O Timing Constraints
 ## These slow interfaces (LEDs, switches, UART, LCD, 7-seg) have no real
 ## timing requirement, so use set_false_path to exclude them from timing analysis.
