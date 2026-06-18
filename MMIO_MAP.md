@@ -27,7 +27,7 @@ cache controller.
 0xF00B_xxxx                 Crypto — SHA-256 (+ HMAC wrapper, planned)
 0xF00C_xxxx                 Crypto — TRNG (planned)
 0xF00D_xxxx                 Performance counters (CPU pipeline / mix events)
-0xF00E_xxxx                 reserved
+0xF00E_xxxx                 2D DMA blitter (RGB565 framebuffer accelerator)
 0xF00F_xxxx                 timers / IRQ controller
 ```
 
@@ -163,8 +163,9 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 
 | Offset  | Reg                  | RW | Width | Description |
 |---------|----------------------|----|-------|-------------|
-| 0x0000  | `CACHE_CTRL`         | RW | 1     | `[0]` write-1-clear-counters (self-clearing). Bit 0 reads as 0. Other bits reserved (read 0). |
+| 0x0000  | `CACHE_CTRL`         | W  | 3     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). Reads as 0. |
 | 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_1008_0002` (2 ways, 2048 sets, 16 B/line, 64 KB total). |
+| 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line. |
@@ -177,12 +178,34 @@ that fires every cycle takes ~5.8 × 10⁹ years to wrap, so software never has
 to manage rollover. Reset values: all zero. Counters are not affected by
 `CPU_RESETN` or program load — only by writing `CACHE_CTRL` bit 0.
 
-**Why not flush?** A cache flush + invalidate (writeback all dirty + drop all
-tags) requires walking every set, which is a multi-thousand-cycle FSM
-extension to `mem_read_write.v`. The cache is currently never observed
-externally (no DMA, MMIO already bypasses the cache), so flush is not
-required for correctness. It is reserved for future use under a separate
-`CACHE_CTRL` bit.
+**Flush / invalidate (full-cache).** `CACHE_CTRL[1]` (FLUSH) and `[2]`
+(INVALIDATE) trigger an FSM in `mem_read_write.v` that walks every set/way
+(2048 × 2). FLUSH writes back each dirty line to DDR and marks it clean,
+keeping it valid; INVALIDATE flushes dirty lines and then clears valid on
+every line. The walk takes on the order of a few thousand `i_Clk` cycles (more
+when many lines are dirty). It runs only when the cache is idle and has
+priority over CPU requests, so the CPU's next cached access transparently
+stalls until the walk completes — **a flush/invalidate behaves synchronously**
+from software's view (the store returns, and the following instruction fetch
+blocks until done). `CACHE_STATUS[0]` (MNT_BUSY) can also be polled.
+
+These exist for **DMA / blitter coherency**: the CPU accesses memory through
+this write-back cache, while the [2D DMA blitter](#2d-dma-blitter--base-0xf00e_0000)
+hits DDR directly. The required sequence is:
+
+1. **FLUSH** before a blit, so DDR holds the CPU's latest writes for any source
+   and destination region the blitter reads.
+2. Program and start the blit; wait for `BLIT_STATUS.DONE`.
+3. **INVALIDATE** after the blit, so the CPU re-reads the blitter's output from
+   DDR instead of stale cached copies of the destination.
+
+```c
+#include "mmio.h"
+/* DMA-coherent blit: flush, blit, invalidate. */
+REG_CACHE_CTRL = 0x2;                       /* FLUSH (blocks until complete) */
+blit_copy(dst, dst_stride, src, src_stride, w, h);
+REG_CACHE_CTRL = 0x4;                       /* INVALIDATE */
+```
 
 **How to use:**
 
@@ -543,16 +566,17 @@ sleep_ms(120);                       /* allow auto-negotiation */
 ### Timers / interrupts — base `0xF00F_0000`
 
 Per-source interrupt controller and the source-0 timer. The CPU supports up
-to 4 interrupt sources; source 0 is wired to the periodic timer below, and
-sources 1–3 are reserved for future peripherals. The only interrupt-related
-opcode is `IRET` (return from handler) — everything else is configured here.
+to 4 interrupt sources; source 0 is wired to the periodic timer below,
+**source 1 is the 2D DMA blitter's DONE interrupt**, and sources 2–3 are
+reserved for future peripherals. The only interrupt-related opcode is `IRET`
+(return from handler) — everything else is configured here.
 
 | Offset  | Reg            | RW | Width | Description |
 |---------|----------------|----|-------|-------------|
 | 0x0000  | `INT_MASK`     | RW | 4     | Per-source enable; bit N = source N. Only bits [3:0] are used; upper bits ignored on write, read as 0. |
-| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = `r_timer_interrupt` (source 0); bits 1–3 reserved (read 0). |
+| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bits 2–3 reserved (read 0). |
 | 0x0010  | `INT_VEC0`     | RW | 32    | Handler byte address for source 0 (timer). A vector of 0 disables the source even when its mask bit is set. |
-| 0x0018  | `INT_VEC1`     | RW | 32    | Handler for source 1 (reserved). |
+| 0x0018  | `INT_VEC1`     | RW | 32    | Handler for source 1 (2D DMA blitter DONE). A vector of 0 disables the source. |
 | 0x0020  | `INT_VEC2`     | RW | 32    | Handler for source 2 (reserved). |
 | 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (reserved). |
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
@@ -581,15 +605,146 @@ or do the read-twice-and-retry-if-high-changed dance.
   source, and jumps to `INT_VECn`.
 - `IRET` (opcode `0x0000_6011`) pops the slot and restores all three.
 
-**Pending-bit semantics:** `INT_PENDING[0]` follows the timer counter
+**Pending-bit semantics:** `INT_PENDING[0]` (timer) follows the timer counter
 edge — it asserts when the counter rolls over, and is auto-cleared by
 hardware when the interrupt is dispatched. There is no W1C path; software
 that wants to "swallow" a pending timer event without running a handler
 should clear `INT_MASK[0]` first, then later re-enable.
 
+`INT_PENDING[1]` (blitter) is a **level** signal — it stays asserted until the
+ISR acknowledges the blitter by writing `BLIT_STATUS.DONE` (W1C) at
+`0xF00E_0008`. Hardware does **not** auto-clear it on dispatch (unlike the
+timer), because that same DONE bit is also the poll-mode completion flag.
+**A blitter ISR MUST write `BLIT_STATUS = 0x2` (W1C DONE) before `IRET`.** If it
+does not, `IRET` re-enables `INT_MASK[1]`, the still-asserted level immediately
+re-dispatches the handler, and the ISR re-enters in a loop (eventual stack
+overflow). This is the standard level-triggered device-IRQ contract; see the
+blitter section's ISR example.
+
 **Coexistence with the LOAD_COMPLETE reset:** pressing the load button
 re-zeroes `INT_MASK` and all four vectors, so a freshly-loaded program
 always starts with interrupts off.
+
+### 2D DMA blitter — base `0xF00E_0000`
+
+Bus-master 2D DMA engine for RGB565 (16 bpp, little-endian) framebuffer
+fill / copy / alpha-blend, implemented in
+[blitter_dma.v](KlaussCPU.srcs/sources_1/new/blitter_dma.v). The CPU writes the
+operand registers and a START bit, then continues; the engine reads/writes main
+DDR autonomously (as a second master arbitrated inside
+[mem_read_write.v](KlaussCPU.srcs/sources_1/new/mem_read_write.v)) and signals
+completion by `STATUS.DONE` (poll) or interrupt source 1. Rectangles are
+row-major; independent src/dst (and mask) strides let a rect be a sub-region of
+a larger buffer. There is **no clipping in hardware** — pass an exact, pre-clipped
+rect. The blitter shares the CPU's 100 MHz clock, so there is no clock-domain
+crossing on its register or interrupt interface.
+
+| Offset | Reg           | RW | Width | Description |
+|--------|---------------|----|-------|-------------|
+| 0x0000 | `BLIT_CTRL`   | W  | 5     | `[0]` START (self-clearing); `[3:1]` OP; `[4]` IRQ_EN. OP and IRQ_EN are sampled on START. START is ignored while BUSY. |
+| 0x0008 | `BLIT_STATUS` | RW | 2     | `[0]` BUSY (read-only); `[1]` DONE (write-1-to-clear). DONE is sticky from completion until cleared, and is the interrupt-ack for source 1. |
+| 0x0010 | `BLIT_DST_ADDR`   | RW | 32 | Destination top-left byte address. |
+| 0x0018 | `BLIT_DST_STRIDE` | RW | 32 | Destination row stride in bytes. |
+| 0x0020 | `BLIT_SRC_ADDR`   | RW | 32 | Source top-left byte address (COPY / COPY_BLEND). |
+| 0x0028 | `BLIT_SRC_STRIDE` | RW | 32 | Source row stride in bytes. |
+| 0x0030 | `BLIT_WIDTH`      | RW | 16 | Width in pixels (1..65535; 0 = no-op). |
+| 0x0038 | `BLIT_HEIGHT`     | RW | 16 | Height in rows (1..65535; 0 = no-op). |
+| 0x0040 | `BLIT_COLOR`      | RW | 16 | RGB565 fill/foreground colour (FILL, FILL_BLEND, MASK_BLEND). |
+| 0x0048 | `BLIT_ALPHA`      | RW | 8  | Global alpha 0..255 (FILL_BLEND, COPY_BLEND). |
+| 0x0050 | `BLIT_MASK_ADDR`  | RW | 32 | A8 (8 bpp) per-pixel alpha mask top-left address (MASK_BLEND). |
+| 0x0058 | `BLIT_MASK_STRIDE`| RW | 32 | Mask row stride in bytes. |
+| 0x0060 | `BLIT_CYCLES`     | R  | 32 | `i_Clk` cycle count of the last completed blit (profiling). |
+
+All registers are 64-bit and software uses 64-bit accesses (the fields above
+occupy the low bits). `*_ADDR` are byte addresses into the ≤128 MB DDR space.
+
+**Operations** (`BLIT_CTRL[3:1]`):
+
+| OP | Name         | Semantics |
+|----|--------------|-----------|
+| 0  | `FILL`       | `dst = COLOR` |
+| 1  | `COPY`       | `dst = src` |
+| 2  | `FILL_BLEND` | `dst = blend(COLOR, dst, ALPHA)` (global alpha) |
+| 3  | `COPY_BLEND` | `dst = blend(src,   dst, ALPHA)` (global alpha) |
+| 4  | `MASK_BLEND` | `dst = blend(COLOR, dst, mask[x,y])`, mask = A8 per-pixel alpha (anti-aliased text/edges) |
+
+Note: `MASK_BLEND` uses `BLIT_COLOR` as the foreground (the glyph/AA-text case),
+with per-pixel coverage from the A8 mask.
+
+**Blend math** (per RGB565 channel, matching LVGL's `>>8` form):
+
+```
+out = (fg*a + bg*(255-a) + 128) >> 8        // computed per R5 / G6 / B5 channel
+```
+
+Opaque ops (FILL, COPY) write only the in-rect bytes of each 128-bit DDR word
+(byte-masked), so unaligned rect edges do not disturb neighbouring pixels.
+Blend ops read-modify-write the destination word (the destination is the blend
+background).
+
+**Programming sequence:**
+
+1. Write the operand registers for the op (addresses, strides, width, height,
+   colour/alpha/mask as needed).
+2. Write `BLIT_CTRL` = `START | (OP<<1) | (IRQ_EN<<4)`.
+3. Wait for completion: poll `BLIT_STATUS.BUSY == 0` (or `.DONE == 1`), or take
+   interrupt source 1 if `IRQ_EN` and `INT_MASK[1]` are set.
+4. Clear completion: write `BLIT_STATUS = 0x2` (W1C DONE). Optionally read
+   `BLIT_CYCLES`.
+
+**⚠ Cache coherency.** The CPU accesses memory through its write-back cache; the
+blitter hits DDR directly. Software MUST bracket a blit with cache maintenance
+(see [Cache controller](#cache-controller--base-0xf005_0000)): **FLUSH** the
+source and destination regions before the blit, and **INVALIDATE** the
+destination after, so the CPU does not read stale cached copies.
+
+```c
+#include "mmio.h"
+
+/* DMA-coherent rectangular copy (different src/dst strides allowed). */
+void blit_copy(uint32_t dst, uint32_t dstride,
+               uint32_t src, uint32_t sstride, uint16_t w, uint16_t h) {
+    REG_CACHE_CTRL = 0x2;            /* FLUSH dirty lines to DDR (blocks) */
+    REG_BLIT_DST_ADDR   = dst;  REG_BLIT_DST_STRIDE = dstride;
+    REG_BLIT_SRC_ADDR   = src;  REG_BLIT_SRC_STRIDE = sstride;
+    REG_BLIT_WIDTH      = w;    REG_BLIT_HEIGHT     = h;
+    REG_BLIT_CTRL       = 0x1 | (1u << 1);          /* START | OP=COPY */
+    while (REG_BLIT_STATUS & 0x1) { }               /* wait BUSY -> 0 */
+    REG_BLIT_STATUS     = 0x2;                       /* W1C DONE */
+    REG_CACHE_CTRL      = 0x4;                       /* INVALIDATE dst copies */
+}
+
+/* Solid rectangle fill. */
+void blit_fill(uint32_t dst, uint32_t dstride, uint16_t w, uint16_t h,
+               uint16_t rgb565) {
+    REG_CACHE_CTRL    = 0x2;                         /* FLUSH */
+    REG_BLIT_DST_ADDR = dst; REG_BLIT_DST_STRIDE = dstride;
+    REG_BLIT_WIDTH    = w;   REG_BLIT_HEIGHT     = h;
+    REG_BLIT_COLOR    = rgb565;
+    REG_BLIT_CTRL     = 0x1 | (0u << 1);            /* START | OP=FILL */
+    while (REG_BLIT_STATUS & 0x1) { }
+    REG_BLIT_STATUS   = 0x2;
+    REG_CACHE_CTRL    = 0x4;                         /* INVALIDATE */
+}
+```
+
+**Interrupt-driven completion (source 1).** Set `IRQ_EN` in `BLIT_CTRL`, install
+a handler in `INT_VEC1`, and unmask `INT_MASK[1]`. The blitter DONE interrupt is
+**level-sensitive** — the ISR MUST acknowledge it by clearing DONE before `IRET`,
+or it will re-enter immediately (see Timers/interrupts → pending-bit semantics):
+
+```c
+/* INT_VEC1 handler — ACK FIRST, then IRET. */
+void blit_isr(void) {
+    REG_BLIT_STATUS = 0x2;        /* W1C DONE — REQUIRED before IRET */
+    /* ... post-blit work (e.g. INVALIDATE dst, kick next blit) ... */
+}                                 /* IRET restores INT_MASK[1] */
+```
+
+**Performance.** With burst DDR access the blitter moves bytes far faster than
+the CPU's ~1.6 MB/s software `memcpy`, and runs concurrently with the CPU, so
+frame time becomes `max(render, copy)` rather than `render + copy`. Read
+`BLIT_CYCLES` (or the `0xF00D` cycle counter) around a blit to measure.
 
 ### Crypto: AES-128 — base `0xF00A_0000`
 

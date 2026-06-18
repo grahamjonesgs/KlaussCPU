@@ -109,6 +109,14 @@ module KlaussCPU (
    //   r_reg_port_b → 16 CARRY4 → 7 LUT6 → r_carry_flag
    // path into two shorter stages for timing closure.
    localparam ALU_FINISH         = 33'h1_0000_0000;
+   // Divide normalization: one cycle between the div task and DIVIDE_STEP that
+   // pre-shifts the dividend by its leading-zero count, so the iteration loop
+   // runs (64 - clz) steps instead of a fixed 64. Bit-identical result — the
+   // skipped iterations shift zeros into the remainder and emit 0 quotient
+   // bits. Its own state keeps the CLZ + 64-bit shifter off both the
+   // OPCODE_EXECUTE decode region and DIVIDE_STEP's trial-subtract carry chain
+   // (the documented critical paths).
+   localparam DIVIDE_PREP        = 34'h2_0000_0000;
 
    // Error Codes
    localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
@@ -123,7 +131,7 @@ module KlaussCPU (
    localparam DUMP_V1_V2      = 7'd3;
    localparam DUMP_V1H        = 7'd4;   // V1H=xxxxxxxx — hi32 of 64-bit immediate (DRAM read at PC+8)
    localparam DUMP_OPCM       = 7'd5;   // OPCM=xxxxxxxx — DRAM-side re-read at PC; differ from OPC ⇒ cache mismatch
-   localparam DUMP_SM         = 7'd6;   // SM=xxxxxxxxx — FSM state (33-bit one-hot, 9 hex digits)
+   localparam DUMP_SM         = 7'd6;   // SM=xxxxxxxxx — FSM state (34-bit one-hot, 9 hex digits)
    localparam DUMP_IV0        = 7'd7;   // IV0=xxxxxxxx — timer ISR vector (r_interrupt_table[0])
    localparam DUMP_FLAGS_A    = 7'd8;   // Z E C V
    localparam DUMP_FLAGS_B    = 7'd9;   // S L U
@@ -160,14 +168,14 @@ module KlaussCPU (
    reg [44:0] r_timeout_max;
 
    // Machine control
-   reg [32:0] r_SM;   // 33 bits: bit 32 is ALU_FINISH (added for 64-bit ALU pipeline)
+   reg [33:0] r_SM;   // 34 bits: bit 32 is ALU_FINISH, bit 33 is DIVIDE_PREP
    // Snapshot of r_SM at fault time.  r_SM gets overwritten by the HCF chain
    // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping r_SM directly
    // is useless.  We continuously copy r_SM into r_fault_sm while the FSM is
    // in any *non-HCF* state; the moment the trap fires, r_fault_sm freezes
    // at the state that was running immediately before the transition into
    // HCF_1, which is what we actually want in the crash dump.
-   reg [32:0] r_fault_sm = 33'b0;
+   reg [33:0] r_fault_sm = 34'b0;
    reg [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
    reg [31:0] r_mem_read_addr;
    wire [31:0] w_opcode;
@@ -294,9 +302,17 @@ module KlaussCPU (
    // Interrupt-wake condition — an unmasked, vectored source is pending. This is
    // the SAME expression OPCODE_REQUEST uses to dispatch, factored out so the
    // WAITING (WAIT opcode) suspend exits on exactly the dispatch condition (no
-   // separate edge logic → no lost wakeups). Only source 0 (timer) is wired
-   // today; OR in sources 1..3 here when their pending signals are connected.
-   wire w_irq_ready = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && r_int_mask[0];
+   // separate edge logic → no lost wakeups).
+   //   source 0 = timer (r_timer_interrupt, hardware-cleared on dispatch)
+   //   source 1 = blitter DONE (w_blit_irq = blitter r_done & IRQ_EN; level —
+   //              the ISR must ack by writing STATUS.DONE (W1C) before IRET)
+   // A source fires only when it has a non-zero vector AND its mask bit is set.
+   // w_irq_sel picks the source to dispatch; timer (0) has priority over blitter
+   // (1). Sources 2..3 remain free for future devices — OR them in here.
+   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && r_int_mask[0];
+   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && r_int_mask[1];
+   wire w_irq_ready = w_irq_src0 || w_irq_src1;
+   wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : 2'd1;
 
    // Free-running millisecond counter (since LOAD_COMPLETE). 64-bit so it
    // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
@@ -379,6 +395,19 @@ module KlaussCPU (
                                   && (w_mmio_addr[27:16] == 12'h005)
                                   && (w_mmio_addr[15:0]  == 16'h0000)
                                   && w_mmio_write_data[0];
+
+   // CACHE_CTRL (0xF005_0000) bit1 = FLUSH, bit2 = INVALIDATE — self-clearing
+   // 1-cycle pulses into mem_read_write's maintenance FSM (full-cache walk).
+   // o_mnt_busy (CACHE_STATUS 0xF005_0010 bit0) reads high during the walk.
+   wire        w_cache_flush_go = w_mmio_write_DV
+                                && (w_mmio_addr[27:16] == 12'h005)
+                                && (w_mmio_addr[15:0]  == 16'h0000)
+                                && w_mmio_write_data[1];
+   wire        w_cache_inval_go = w_mmio_write_DV
+                                && (w_mmio_addr[27:16] == 12'h005)
+                                && (w_mmio_addr[15:0]  == 16'h0000)
+                                && w_mmio_write_data[2];
+   wire        w_cache_mnt_busy;
 
    // -------------------------------------------------------------------------
    // Performance counters (Tier 0/1/2) — exposed via MMIO 0xF00D_xxxx (see
@@ -754,6 +783,54 @@ module KlaussCPU (
    );
 
    // -------------------------------------------------------------------------
+   // 2D DMA blitter — device id 0x00E. MMIO slave for operands + START/STATUS;
+   // a second DDR master (master B) on mem_read_write's arbiter. See
+   // BLITTER_IMPLEMENTATION_PLAN.md and blitter-fpga-handoff.md.
+   // -------------------------------------------------------------------------
+   wire        w_blit_sel      = (w_mmio_addr[27:16] == 12'h00E);
+   wire        w_blit_write_DV = w_mmio_write_DV & w_blit_sel;
+   wire        w_blit_read_DV  = w_mmio_read_DV  & w_blit_sel;
+   wire [63:0] w_blit_read_data;
+   wire        w_blit_ready;
+
+   // DMA master wires to mem_read_write (instantiated above).
+   wire         w_blit_dma_req;
+   wire         w_blit_dma_done;
+   wire         w_blit_dma_write_DV;
+   wire         w_blit_dma_read_DV;
+   wire [31:0]  w_blit_dma_addr;
+   wire [127:0] w_blit_dma_write_data;
+   wire [15:0]  w_blit_dma_wdf_mask;
+   wire [127:0] w_blit_dma_read_data;
+   wire         w_blit_dma_ready;
+   wire         w_blit_dma_grant;
+   wire         w_blit_irq;          // DONE interrupt — wired to the CPU in Phase 5
+
+   (* KEEP_HIERARCHY = "yes" *)
+   blitter_dma blitter_dma_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .i_mmio_write_DV(w_blit_write_DV),
+       .i_mmio_read_DV(w_blit_read_DV),
+       .i_mmio_addr(w_mmio_addr[15:0]),
+       .i_mmio_write_data(w_mmio_write_data),
+       .i_mmio_byte_en(w_mmio_byte_en),
+       .o_mmio_read_data(w_blit_read_data),
+       .o_mmio_ready(w_blit_ready),
+       .o_dma_req(w_blit_dma_req),
+       .o_dma_done(w_blit_dma_done),
+       .o_dma_write_DV(w_blit_dma_write_DV),
+       .o_dma_read_DV(w_blit_dma_read_DV),
+       .o_dma_addr(w_blit_dma_addr),
+       .o_dma_write_data(w_blit_dma_write_data),
+       .o_dma_wdf_mask(w_blit_dma_wdf_mask),
+       .i_dma_read_data(w_blit_dma_read_data),
+       .i_dma_ready(w_blit_dma_ready),
+       .i_dma_grant(w_blit_dma_grant),
+       .o_irq(w_blit_irq)
+   );
+
+   // -------------------------------------------------------------------------
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
    // The result is registered into r_mmio_read_data (FF) below to break the
    // long combinational path from peripheral state regs through bus_splitter
@@ -805,6 +882,7 @@ module KlaussCPU (
                // 0x0000 CACHE_CTRL is self-clearing — reads as 0
                16'h0000: r_mmio_read_data_comb = 64'h0;
                16'h0008: r_mmio_read_data_comb = w_cache_info;
+               16'h0010: r_mmio_read_data_comb = {63'b0, w_cache_mnt_busy}; // CACHE_STATUS
                16'h0040: r_mmio_read_data_comb = w_cnt_read_hits;
                16'h0048: r_mmio_read_data_comb = w_cnt_read_misses;
                16'h0050: r_mmio_read_data_comb = w_cnt_write_hits;
@@ -817,10 +895,11 @@ module KlaussCPU (
          12'h00A: r_mmio_read_data_comb = w_aes_read_data;  // Crypto: AES
          12'h00B: r_mmio_read_data_comb = w_sha_read_data;  // Crypto: SHA-256
          12'h00C: r_mmio_read_data_comb = w_trng_read_data; // Crypto: TRNG
+         12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, r_int_mask};
-               16'h0008: r_mmio_read_data_comb = {63'b0, r_timer_interrupt};
+               16'h0008: r_mmio_read_data_comb = {62'b0, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
                16'h0020: r_mmio_read_data_comb = {32'b0, r_interrupt_table[2]};
@@ -914,7 +993,24 @@ module KlaussCPU (
        .clk_50(clk_50),
 
        // DDR2 ready — gates the resident boot-ROM copy below.
-       .o_calib_done(w_calib_done)
+       .o_calib_done(w_calib_done),
+
+       // DMA master port — driven by the 2D blitter (device 0x00E).
+       .i_dma_req(w_blit_dma_req),
+       .i_dma_done(w_blit_dma_done),
+       .i_dma_write_DV(w_blit_dma_write_DV),
+       .i_dma_read_DV(w_blit_dma_read_DV),
+       .i_dma_addr(w_blit_dma_addr),
+       .i_dma_write_data(w_blit_dma_write_data),
+       .i_dma_wdf_mask(w_blit_dma_wdf_mask),
+       .o_dma_read_data(w_blit_dma_read_data),
+       .o_dma_ready(w_blit_dma_ready),
+       .o_dma_grant(w_blit_dma_grant),
+
+       // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
+       .i_flush_go(w_cache_flush_go),
+       .i_inval_go(w_cache_inval_go),
+       .o_mnt_busy(w_cache_mnt_busy)
    );
 
    // ==========================================================================
@@ -1712,9 +1808,14 @@ rams_sp_nc rams_sp_nc1 (
                                        r_PC};
                   r_mem_byte_en    <= 8'hFF;
                   r_mem_write_DV   <= 1'b1;
-                  r_timer_interrupt <= 1'b0;
-                  r_int_mask[0]    <= 1'b0;       // mask source 0 while handler runs; IRET restores
-                  r_PC             <= r_interrupt_table[0];
+                  // Source-selected dispatch (timer=0 priority, blitter=1). The
+                  // pushed mask above is the pre-dispatch r_int_mask, so IRET
+                  // re-enables this source. Timer pending is hardware-cleared
+                  // here; the blitter is level/sticky and acked by the ISR
+                  // (write STATUS.DONE W1C) before IRET.
+                  if (w_irq_sel == 2'd0) r_timer_interrupt <= 1'b0;
+                  r_int_mask[w_irq_sel] <= 1'b0;  // mask this source while handler runs; IRET restores
+                  r_PC             <= r_interrupt_table[w_irq_sel];
                   r_int_push_wait  <= 1'b1;
                   // stay in OPCODE_REQUEST until push completes
                end else if (w_ifb_op_hit) begin
@@ -1829,6 +1930,26 @@ rams_sp_nc rams_sp_nc1 (
             VAR1_FETCH: begin
                if (w_mem_ready) begin
                   r_var1_mem<=w_mem_read_data[31:0]; // lower 32 bits = instruction word at this address (little-endian, PC[2]==0)
+                  // Refill the instruction buffer from this returned line, same
+                  // as OPCODE_FETCH does.  VAR1_FETCH only runs when the
+                  // immediate at PC+4 fell outside the buffered/prefetched
+                  // doubleword (PC at the last word of a line), so the line
+                  // returned here is the NEXT code line — exactly what the
+                  // following fetch at PC+8 needs.  Without this refill that
+                  // fetch pays a second full cache round-trip for data the CPU
+                  // just had in its hands.  r_mem_addr still holds PC+4 (set in
+                  // OPCODE_FETCH2), so the tagging matches OPCODE_FETCH's
+                  // refill verbatim.
+                  r_ifb_dw[0]     <= w_mem_read_data;
+                  r_ifb_dwaddr[0] <= r_mem_addr[31:3];
+                  r_ifb_dwval[0]  <= 1'b1;
+                  if (w_mem_next_valid) begin
+                     r_ifb_dw[1]     <= w_mem_read_data_next;
+                     r_ifb_dwaddr[1] <= {r_mem_addr[31:4], ~r_mem_addr[3]};
+                     r_ifb_dwval[1]  <= 1'b1;
+                  end else begin
+                     r_ifb_dwval[1]  <= 1'b0;
+                  end
                   if (r_debug_flag&&w_opcode[31:12]!=20'h0000F) begin  // Ignore delay/NOP opcodes (0x0000_F???)
                      r_SM <= DEBUG_DATA;
                   end else begin
@@ -2308,6 +2429,31 @@ end
                   r_SM <= OPCODE_REQUEST;
             end
 
+            // DIVIDE_PREP — skip the leading-zero iterations of restoring
+            // division.  The div tasks land here (dividend already abs'd,
+            // divisor checked non-zero); pre-shifting the dividend by clz and
+            // starting the counter there is bit-identical to running those
+            // iterations: each would shift a 0 into the remainder, fail the
+            // trial subtract, and emit a 0 quotient bit.  Typical 32-bit
+            // operands now iterate ~32 times instead of a fixed 64; small loop
+            // counters take a handful.  DIVIDE_STEP's iteration datapath is
+            // untouched (its trial-subtract carry chain is a known critical
+            // path), and the CLZ + shifter here run register-to-register in
+            // their own cycle.
+            DIVIDE_PREP: begin : divide_prep
+               reg [6:0] prep_clz;
+               prep_clz = count_leading_zeros(r_div_dividend);
+               if (prep_clz[6]) begin
+                  // dividend == 0 (clz = 64): quotient 0, remainder 0 —
+                  // go straight to DIVIDE_STEP's finish branch.
+                  r_div_counter <= 7'd64;
+               end else begin
+                  r_div_dividend <= r_div_dividend << prep_clz[5:0];
+                  r_div_counter  <= {1'b0, prep_clz[5:0]};
+               end
+               r_SM <= DIVIDE_STEP;
+            end
+
             DIVIDE_STEP: begin
                // Shared division iteration - avoids re-evaluating opcode casez each cycle
                if (r_div_counter < 7'd64) begin
@@ -2510,7 +2656,7 @@ end
                   r_SM == MULTIPLY_CALC  || r_SM == MULTIPLY_PIPE ||
                   r_SM == MULTIPLY_WRITEBACK)
             r_perf_mul_cycles <= r_perf_mul_cycles + 64'd1;
-         else if (r_SM == DIVIDE_STEP)
+         else if (r_SM == DIVIDE_STEP || r_SM == DIVIDE_PREP)
             r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
          else if (r_SM == HALTED || r_SM == HALTED_BREAK || r_SM == WAITING)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
@@ -2519,7 +2665,10 @@ end
          // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
          if (r_SM == MULTIPLY_SETUP)
             r_perf_mul_ops <= r_perf_mul_ops + 64'd1;
-         if (r_SM == DIVIDE_STEP && r_div_counter == 7'd0)
+         // DIVIDE_PREP is the unique 1-cycle entry state per divide (the old
+         // counter==0 test no longer fires once per op — prep starts the
+         // counter at clz, and a zero dividend skips the iterations entirely).
+         if (r_SM == DIVIDE_PREP)
             r_perf_div_ops <= r_perf_div_ops + 64'd1;
          if (r_int_push_wait && !r_int_push_wait_d)
             r_perf_int_ops <= r_perf_int_ops + 64'd1;

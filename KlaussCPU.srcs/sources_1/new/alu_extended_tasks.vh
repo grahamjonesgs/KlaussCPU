@@ -531,7 +531,7 @@ task t_div_regs_hw;
          r_div_op <= DIV_OP_DIV;
          r_div_dest_reg <= r_reg_dst;
          r_div_pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -556,7 +556,7 @@ task t_divu_regs_hw;
          r_div_op <= DIV_OP_DIV;
          r_div_dest_reg <= r_reg_dst;
          r_div_pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -586,7 +586,7 @@ task t_mod_regs_hw;
          r_div_op <= DIV_OP_MOD;
          r_div_dest_reg <= r_reg_dst;
          r_div_pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -611,7 +611,7 @@ task t_modu_regs_hw;
          r_div_op <= DIV_OP_MOD;
          r_div_dest_reg <= r_reg_dst;
          r_div_pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -642,7 +642,7 @@ task t_div_value_hw;
          r_div_op <= DIV_OP_DIV;
          r_div_dest_reg <= r_reg_2;
          r_div_pc_inc <= 1'b1;  // PC += 2
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -672,7 +672,7 @@ task t_mod_value_hw;
          r_div_op <= DIV_OP_MOD;
          r_div_dest_reg <= r_reg_2;
          r_div_pc_inc <= 1'b1;  // PC += 2
-         r_SM <= DIVIDE_STEP;
+         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask

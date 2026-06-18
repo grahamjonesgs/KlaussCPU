@@ -13,7 +13,18 @@
       "Bash(cargo build *)",
       "Bash(cargo clippy *)",
       "Bash(cargo run *)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(iverilog -g2012 -o /tmp/tb_cache.vvp tb_cache.v ../../sources_1/new/mem_read_write.v)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(vvp /tmp/tb_cache.vvp)",
+      "Bash(iverilog -g2012 -o /tmp/tb_blitter.vvp tb_blitter.v ../../sources_1/new/mem_read_write.v ../../sources_1/new/blitter_dma.v)",
+      "Bash(vvp /tmp/tb_blitter.vvp)",
+      "Bash(iverilog -g2012 -t null -I . KlaussCPU.v blitter_dma.v)",
+      "Bash(iverilog *)",
+      "Bash(python3)",
+      "Bash(awk *)",
+      "Bash(cat)",
+      "Read(//tmp/**)"
     ],
     "additionalDirectories": [
       "/home/graham/Documents/src/klausscc/src"

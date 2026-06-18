@@ -864,12 +864,12 @@ function [7:0] f_dump_byte;
             end
 
             DUMP_SM: begin
-                // "SM=xxxxxxxxx\r\n"  (33-bit one-hot FSM)
+                // "SM=xxxxxxxxx\r\n"  (34-bit one-hot FSM)
                 case (pos)
                     5'd0:  f_dump_byte = "S";
                     5'd1:  f_dump_byte = "M";
                     5'd2:  f_dump_byte = "=";
-                    5'd3:  f_dump_byte = return_ascii_from_hex({3'b0, r_fault_sm[32]});
+                    5'd3:  f_dump_byte = return_ascii_from_hex({2'b0, r_fault_sm[33:32]});
                     5'd4:  f_dump_byte = return_ascii_from_hex(r_fault_sm[31:28]);
                     5'd5:  f_dump_byte = return_ascii_from_hex(r_fault_sm[27:24]);
                     5'd6:  f_dump_byte = return_ascii_from_hex(r_fault_sm[23:20]);
