@@ -82,7 +82,7 @@ task t_get_switch_reg;
    begin
       r_writeback_value <= {r_reg_port_b[31:16], i_switch};
       r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_SM <= WRITEBACK;
       r_PC <= r_PC + 4;
    end
 endtask
