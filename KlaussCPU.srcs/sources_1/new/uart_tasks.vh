@@ -15,7 +15,7 @@ task t_rx_blocking;
             r_writeback_value         <= {24'b0, w_rx_fifo_byte};
             r_writeback_reg           <= r_reg_2;
             r_zero_flag               <= 1'b0;
-            r_SM <= WRITEBACK;
+            r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC <= r_PC + 4;
         end
     end
@@ -37,7 +37,7 @@ task t_rx_nonblocking;
             r_writeback_value <= {24'b0, w_rx_fifo_byte};
             r_writeback_reg   <= r_reg_2;
             r_zero_flag       <= 1'b0;
-            r_SM <= WRITEBACK;
+            r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC <= r_PC + 4;
         end
     end

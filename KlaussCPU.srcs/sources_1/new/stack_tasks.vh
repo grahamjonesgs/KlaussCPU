@@ -62,7 +62,7 @@ task t_stack_pop_reg;
             r_writeback_reg   <= r_reg_2;
             r_SP              <= r_SP + 8;
             r_mem_read_DV     <= 1'b0;
-            r_SM              <= WRITEBACK;
+            r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC              <= r_PC + 4;
          end
       end
@@ -75,7 +75,7 @@ task t_get_sp;
    begin
       r_writeback_value <= {32'b0, r_SP};
       r_writeback_reg   <= r_reg_2;
-      r_SM              <= WRITEBACK;
+      r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC              <= r_PC + 4;
    end
 endtask

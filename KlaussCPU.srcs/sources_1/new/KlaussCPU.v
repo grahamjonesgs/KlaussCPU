@@ -613,6 +613,7 @@ module KlaussCPU (
    reg [63:0] r_writeback_value;
    reg [3:0]  r_writeback_reg;
    reg        r_writeback_set_zero_flag;  // Set zero flag from writeback value in WRITEBACK stage
+   reg        r_wb_pending;               // Phase 2: writeback deferred into OPCODE_REQUEST dispatch (eliminates the WRITEBACK cycle)
 
     always @(posedge i_Clk) begin
        r_reg_port_a <= r_register[r_reg_1];
@@ -1312,6 +1313,7 @@ rams_sp_nc rams_sp_nc1 (
       r_debug_step_run = 0;
       r_break_received = 0;
       r_writeback_set_zero_flag = 0;
+      r_wb_pending        = 0;
       r_alu_pipe_value    = 64'b0;
       r_alu_pipe_carry    = 1'b0;
       r_alu_pipe_overflow = 1'b0;
@@ -1359,6 +1361,7 @@ rams_sp_nc rams_sp_nc1 (
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
          r_int_push_wait <= 1'b0;
+         r_wb_pending    <= 1'b0;
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_register[i] <= 64'b0;
@@ -1783,6 +1786,22 @@ rams_sp_nc rams_sp_nc1 (
                r_tx_str_state_reg <= 3'b0;  // reset string transmission state machine (TXSTRMEMR)
                r_mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
 
+               // Phase 2 (execute-occupancy fusion): commit the previous
+               // instruction's register writeback here, in parallel with the
+               // fetch dispatch below. r_register and the dispatch's
+               // r_mem_addr/r_PC are disjoint resources, and the register read
+               // ports are sampled at OPCODE_FETCH2 (after this write), so the
+               // next instruction observes the result with no RAW hazard. This
+               // removes the dedicated WRITEBACK cycle (~ -1 cyc/instr on the
+               // writeback-producing op classes).
+               if (r_wb_pending) begin
+                  r_register[r_writeback_reg] <= r_writeback_value;
+                  if (r_writeback_set_zero_flag)
+                     r_zero_flag <= (r_writeback_value == 64'b0);
+                  r_writeback_set_zero_flag <= 1'b0;
+                  r_wb_pending <= 1'b0;
+               end
+
                if (r_int_push_wait) begin
                   // Waiting for DDR2 to finish the timer-interrupt PC push
                   if (w_mem_ready) begin
@@ -1802,8 +1821,12 @@ rams_sp_nc rams_sp_nc1 (
                   //   [31:0]  = PC (resume address)
                   r_SP             <= r_SP - 8;
                   r_mem_addr       <= r_SP - 32'd8;
+                  // Zero flag pushed as it will be AFTER any deferred writeback
+                  // committing this same cycle (r_wb_pending block above), so the
+                  // saved interrupt context stays precise.
                   r_mem_write_data <= {21'b0, r_int_mask,
-                                       r_zero_flag, r_equal_flag, r_carry_flag,
+                                       ((r_wb_pending && r_writeback_set_zero_flag) ? (r_writeback_value == 64'b0) : r_zero_flag),
+                                       r_equal_flag, r_carry_flag,
                                        r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
                                        r_PC};
                   r_mem_byte_en    <= 8'hFF;
@@ -2386,7 +2409,7 @@ MULTIPLY_WRITEBACK: begin
     else
         r_PC <= r_PC + 4;
 
-    r_SM <= WRITEBACK;
+    r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
 end
 
             HALTED_BREAK: begin
@@ -2490,7 +2513,7 @@ end
                   r_overflow_flag <= 1'b0;
                   r_div_op <= DIV_OP_NONE;
                   r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
-                  r_SM <= WRITEBACK;
+                  r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                end
             end
 
@@ -2516,7 +2539,7 @@ end
                   r_carry_flag      <= r_alu_pipe_carry;
                   r_overflow_flag   <= r_alu_pipe_overflow;
                   r_sign_flag       <= r_alu_pipe_value[63];
-                  r_SM              <= WRITEBACK;
+                  r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                end else begin                           // CMP
                   r_equal_flag <= r_alu_pipe_equal;
                   r_less_flag  <= r_alu_pipe_less;

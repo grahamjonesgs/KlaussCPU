@@ -62,7 +62,7 @@ task t_set_reg_from_mem_value;
          if (w_mem_ready) begin
             r_writeback_value <= w_mem_read_data;
             r_writeback_reg <= r_reg_2;
-            r_SM <= WRITEBACK;
+            r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 8;
          end  // if ready asserted, else will loop until ready
@@ -86,7 +86,7 @@ task t_set_reg_from_mem_reg;
          if (w_mem_ready) begin
             r_writeback_value <= w_mem_read_data;
             r_writeback_reg <= r_reg_1;
-            r_SM <= WRITEBACK;
+            r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 4;
          end  // if ready asserted, else will loop until ready
@@ -141,7 +141,7 @@ task t_memget8;
                3'b111: r_writeback_value <= {56'b0, w_mem_read_data[63:56]};
             endcase
             r_writeback_reg <= r_reg_1;
-            r_SM            <= WRITEBACK;
+            r_SM            <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC            <= r_PC + 4;
          end
       end
@@ -189,7 +189,7 @@ task t_memget16;
                2'b11: r_writeback_value <= {48'b0, w_mem_read_data[63:48]};
             endcase
             r_writeback_reg <= r_reg_1;
-            r_SM            <= WRITEBACK;
+            r_SM            <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC            <= r_PC + 4;
          end
       end
@@ -269,7 +269,7 @@ task t_memget32;
                endcase
                r_writeback_value <= {32'b0, result};
                r_writeback_reg   <= r_reg_1;
-               r_SM              <= WRITEBACK;
+               r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                r_PC              <= r_PC + 4;
             end else if (w_mem_next_valid) begin
                // Span within same cache line — use cache lookahead.
@@ -281,7 +281,7 @@ task t_memget32;
                endcase
                r_writeback_value <= {32'b0, result};
                r_writeback_reg   <= r_reg_1;
-               r_SM              <= WRITEBACK;
+               r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                r_PC              <= r_PC + 4;
             end else begin
                // Cross-cache-line span: stash dw0, issue second read at next dw.
@@ -305,7 +305,7 @@ task t_memget32;
             endcase
             r_writeback_value <= {32'b0, result};
             r_writeback_reg   <= r_reg_1;
-            r_SM              <= WRITEBACK;
+            r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC              <= r_PC + 4;
          end
       end
@@ -343,7 +343,7 @@ task t_memget64;
             r_mem_read_DV     <= 1'b0;
             r_writeback_value <= w_mem_read_data;
             r_writeback_reg   <= r_reg_1;
-            r_SM              <= WRITEBACK;
+            r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
             r_PC              <= r_PC + 4;
          end
       end
