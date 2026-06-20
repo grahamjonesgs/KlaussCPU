@@ -390,6 +390,19 @@ set_multicycle_path -hold  -end 1 \
     -from [get_cells -hierarchical -filter {NAME =~ *r_hcf_dump_phase_reg*}] \
     -to   [get_cells -hierarchical -filter {NAME =~ *r_msg_reg*}]
 
+# ---------------------------------------------------------------------------
+# r_msg is the UART message register: loaded once per message, then shifted out
+# over the slow UART (~33 cyc/bit), so EVERY path into it is multicycle, not just
+# r_hcf_dump_phase.  After the Phase-2 writeback fusion the critical path became
+# r_opcode_mem -> r_msg (the crash-dump opcode->ASCII formatter).  Relax all
+# paths into r_msg; none is ever single-cycle-critical (the consumer is always
+# the UART shifter, never the next clock edge).
+# ---------------------------------------------------------------------------
+set_multicycle_path -setup -end 2 \
+    -to [get_cells -hierarchical -filter {NAME =~ *r_msg_reg*}]
+set_multicycle_path -hold  -end 1 \
+    -to [get_cells -hierarchical -filter {NAME =~ *r_msg_reg*}]
+
 # False-path the falling-edge launch from clk_50 to eth_phy_clk.  LiteEth's
 # TX ODDRs run in OPPOSITE_EDGE mode but RMII is SDR — for each data bit
 # D1 == D2, so the falling-edge "launch" is just the ODDR re-emitting the
