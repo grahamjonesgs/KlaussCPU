@@ -376,9 +376,13 @@ module mem_read_write (
                                                         : w_cache_index;
 
     // -------------------------------------------------------------------------
-    // Power-on reset counter
+    // Power-on reset counter — MUST run on the always-on board oscillator, NOT
+    // i_Clk (= ui_clk). resetn (= por_counter==0) resets clk_wiz AND the MIG,
+    // which PRODUCE ui_clk; clocking this on ui_clk deadlocks at power-on
+    // (ui_clk can't start until resetn releases, resetn can't release without
+    // ui_clk). The board clock is free-running, so it breaks the loop.
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always @(posedge i_Clk_board) begin
         if (por_counter > 0)
             por_counter <= por_counter - 1;
     end
