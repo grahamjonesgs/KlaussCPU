@@ -237,6 +237,7 @@ module blitter_dma (
     localparam S_END      = 5'd10;  // final flush dispatch
     localparam S_FINISH   = 5'd11;  // mark done
     localparam S_BLEND    = 5'd12;  // blend pipeline stage 1: latch operands (blend ops only)
+    localparam S_BLEND2   = 5'd13;  // blend pipeline stage 2: register the 6 products (multiplies)
 
     // Read targets for the generic read sub-FSM.
     localparam RDT_SRC  = 2'd0;
@@ -249,6 +250,12 @@ module blitter_dma (
     reg [15:0] r_fg_q;          // foreground pixel (src or COLOR)
     reg [15:0] r_bg_q;          // background pixel (current dst)
     reg [ 7:0] r_alpha_q;       // alpha (mask A8 or global)
+    // Stage-2 blend products (fg_ch*a, bg_ch*ia per channel) registered in
+    // S_BLEND2 so S_PLACE only does add+pack — splits the blend565 chain so it
+    // closes on the default impl strategy (was a 13-level path at the 10ns edge).
+    reg [15:0] r_mul_fg_r, r_mul_bg_r;   // R5 products
+    reg [15:0] r_mul_fg_g, r_mul_bg_g;   // G6 products
+    reg [15:0] r_mul_fg_b, r_mul_bg_b;   // B5 products
     reg [15:0] r_x;             // current pixel column
     reg [15:0] r_row;           // current row
     reg [31:0] r_dst_row_base;  // byte address of current dst row start
@@ -409,18 +416,42 @@ module blitter_dma (
                     r_fg_q    <= w_fg;
                     r_bg_q    <= w_bg;
                     r_alpha_q <= w_alpha;
-                    state     <= S_PLACE;
+                    state     <= S_BLEND2;
+                end
+
+                // ----------------------------------------------------------
+                // Blend pipeline stage 2 — register the 6 products (the heavy
+                // multiplies). S_PLACE then does the add+128+pack. This splits
+                // the old 13-level blend565 chain (~10ns at the edge) so it
+                // closes comfortably on the DEFAULT impl strategy. Result is
+                // bit-identical to blend565(); blended pixels just cost +1 cycle
+                // (negligible — the blitter is DDR-bound). Cursor is stable.
+                S_BLEND2: begin : blend_mul
+                    reg [7:0] ia;
+                    ia = 8'd255 - r_alpha_q;
+                    r_mul_fg_r <= r_fg_q[15:11] * r_alpha_q;
+                    r_mul_bg_r <= r_bg_q[15:11] * ia;
+                    r_mul_fg_g <= r_fg_q[10:5]  * r_alpha_q;
+                    r_mul_bg_g <= r_bg_q[10:5]  * ia;
+                    r_mul_fg_b <= r_fg_q[4:0]   * r_alpha_q;
+                    r_mul_bg_b <= r_bg_q[4:0]   * ia;
+                    state      <= S_PLACE;
                 end
 
                 // ----------------------------------------------------------
                 S_PLACE: begin
-                    // Opaque: write w_fg directly (short path). Blend: blend the
-                    // registered operands (the heavy multiply/add half).
-                    r_wbuf[w_dst_off*16 +: 16] <= w_is_blend
-                        ? blend565(r_fg_q, r_bg_q, r_alpha_q)
-                        : w_fg;
-                    if (!w_is_blend)
+                    // Opaque: write w_fg directly (short path). Blend: add the
+                    // registered products + 128 and pack (the light second half).
+                    if (w_is_blend) begin : blend_add
+                        reg [15:0] tr, tg, tb;
+                        tr = r_mul_fg_r + r_mul_bg_r + 16'd128;  // R5
+                        tg = r_mul_fg_g + r_mul_bg_g + 16'd128;  // G6
+                        tb = r_mul_fg_b + r_mul_bg_b + 16'd128;  // B5
+                        r_wbuf[w_dst_off*16 +: 16] <= {tr[12:8], tg[13:8], tb[12:8]};
+                    end else begin
+                        r_wbuf[w_dst_off*16 +: 16] <= w_fg;
                         r_wbuf_mask[w_dst_off*2 +: 2] <= 2'b00;  // mark 2 bytes valid
+                    end
                     r_wbuf_dirty <= 1'b1;
                     // Advance cursor.
                     if (w_last_pixel) begin

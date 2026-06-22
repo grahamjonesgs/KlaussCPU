@@ -27,9 +27,11 @@ module ddr2_control (
     input [31:0] i_mem_addr, input [127:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
     output reg [127:0] o_mem_read_data, output reg o_mem_ready,
-    output o_calib_done
+    output o_calib_done,
+    output o_ui_clk
 );
    assign o_calib_done = 1'b1;
+   assign o_ui_clk = sys_clk_i;   // P3: cache FSM runs on ui_clk; tb drives it from sys_clk_i
    reg [127:0] mem [0:65535];      // addr[19:4] indexes the line
    integer i;
    initial begin
@@ -95,7 +97,8 @@ module tb_blitter;
    wire blit_irq;
 
    mem_read_write dut_mem (
-      .i_Clk(clk),
+      .i_Clk_board(clk),
+      .o_ui_clk(),
       .ddr2_dq(), .ddr2_dqs_n(), .ddr2_dqs_p(),
       .ddr2_addr(), .ddr2_ba(), .ddr2_ras_n(), .ddr2_cas_n(), .ddr2_we_n(),
       .ddr2_ck_p(), .ddr2_ck_n(), .ddr2_cke(), .ddr2_cs_n(), .ddr2_dm(), .ddr2_odt(),
