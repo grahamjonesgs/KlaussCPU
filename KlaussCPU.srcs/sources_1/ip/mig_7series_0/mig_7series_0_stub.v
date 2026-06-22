@@ -2,7 +2,7 @@
 // Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
 // --------------------------------------------------------------------------------
 // Tool Version: Vivado v.2025.2 (lin64) Build 6299465 Fri Nov 14 12:34:56 MST 2025
-// Date        : Fri Apr 17 09:51:01 2026
+// Date        : Mon Jun 22 12:10:11 2026
 // Host        : Ubunutu running 64-bit Ubuntu 24.04.4 LTS
 // Command     : write_verilog -force -mode synth_stub
 //               /home/graham/Documents/src/fpga/KlaussCPU/KlaussCPU.srcs/sources_1/ip/mig_7series_0/mig_7series_0_stub.v
@@ -20,7 +20,7 @@ module mig_7series_0(ddr2_dq, ddr2_dqs_n, ddr2_dqs_p, ddr2_addr,
   app_wdf_wren, app_rd_data, app_rd_data_end, app_rd_data_valid, app_rdy, app_wdf_rdy, 
   app_sr_req, app_ref_req, app_zq_req, app_sr_active, app_ref_ack, app_zq_ack, ui_clk, 
   ui_clk_sync_rst, init_calib_complete, sys_rst)
-/* synthesis syn_black_box black_box_pad_pin="ddr2_dq[15:0],ddr2_dqs_n[1:0],ddr2_dqs_p[1:0],ddr2_addr[12:0],ddr2_ba[2:0],ddr2_ras_n,ddr2_cas_n,ddr2_we_n,ddr2_ck_p[0:0],ddr2_ck_n[0:0],ddr2_cke[0:0],ddr2_cs_n[0:0],ddr2_dm[1:0],ddr2_odt[0:0],app_addr[26:0],app_cmd[2:0],app_en,app_wdf_data[127:0],app_wdf_end,app_wdf_mask[15:0],app_wdf_wren,app_rd_data[127:0],app_rd_data_end,app_rd_data_valid,app_rdy,app_wdf_rdy,app_sr_req,app_ref_req,app_zq_req,app_sr_active,app_ref_ack,app_zq_ack,ui_clk_sync_rst,init_calib_complete,sys_rst" */
+/* synthesis syn_black_box black_box_pad_pin="ddr2_dq[15:0],ddr2_dqs_n[1:0],ddr2_dqs_p[1:0],ddr2_addr[12:0],ddr2_ba[2:0],ddr2_ras_n,ddr2_cas_n,ddr2_we_n,ddr2_ck_p[0:0],ddr2_ck_n[0:0],ddr2_cke[0:0],ddr2_cs_n[0:0],ddr2_dm[1:0],ddr2_odt[0:0],app_addr[26:0],app_cmd[2:0],app_en,app_wdf_data[63:0],app_wdf_end,app_wdf_mask[7:0],app_wdf_wren,app_rd_data[63:0],app_rd_data_end,app_rd_data_valid,app_rdy,app_wdf_rdy,app_sr_req,app_ref_req,app_zq_req,app_sr_active,app_ref_ack,app_zq_ack,ui_clk_sync_rst,init_calib_complete,sys_rst" */
 /* synthesis syn_force_seq_prim="sys_clk_i" */
 /* synthesis syn_force_seq_prim="ui_clk" */;
   inout [15:0]ddr2_dq;
@@ -41,11 +41,11 @@ module mig_7series_0(ddr2_dq, ddr2_dqs_n, ddr2_dqs_p, ddr2_addr,
   input [26:0]app_addr;
   input [2:0]app_cmd;
   input app_en;
-  input [127:0]app_wdf_data;
+  input [63:0]app_wdf_data;
   input app_wdf_end;
-  input [15:0]app_wdf_mask;
+  input [7:0]app_wdf_mask;
   input app_wdf_wren;
-  output [127:0]app_rd_data;
+  output [63:0]app_rd_data;
   output app_rd_data_end;
   output app_rd_data_valid;
   output app_rdy;

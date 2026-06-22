@@ -91,7 +91,7 @@ module mig_7series_0_mig #
                                      // # of unique CS outputs per rank for phy
    parameter CKE_WIDTH             = 1,
                                      // # of CKE outputs to memory.
-   parameter DATA_BUF_ADDR_WIDTH   = 5,
+   parameter DATA_BUF_ADDR_WIDTH   = 4,
    parameter DQ_CNT_WIDTH          = 4,
                                      // = ceil(log2(DQ_WIDTH))
    parameter DQ_PER_DM             = 8,
@@ -219,11 +219,11 @@ module mig_7series_0_mig #
                                      // VCO output divisor for PLL output clock (CLKOUT1)
    parameter CLKOUT2_DIVIDE        = 64,
                                      // VCO output divisor for PLL output clock (CLKOUT2)
-   parameter CLKOUT3_DIVIDE        = 16,
+   parameter CLKOUT3_DIVIDE        = 8,
                                      // VCO output divisor for PLL output clock (CLKOUT3)
    parameter MMCM_VCO              = 1200,
                                      // Max Freq (MHz) of MMCM VCO
-   parameter MMCM_MULT_F           = 24,
+   parameter MMCM_MULT_F           = 12,
                                      // write MMCM VCO multiplier
    parameter MMCM_DIVCLK_DIVIDE    = 1,
                                      // write MMCM VCO divisor
@@ -424,7 +424,7 @@ module mig_7series_0_mig #
    parameter tCK                   = 5000,
                                      // memory tCK paramter.
                                      // # = Clock Period in pS.
-   parameter nCK_PER_CLK           = 4,
+   parameter nCK_PER_CLK           = 2,
                                      // # of memory CKs per fabric CLK
    parameter DIFF_TERM_SYSCLK      = "TRUE",
                                      // Differential Termination for System

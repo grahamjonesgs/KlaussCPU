@@ -161,7 +161,7 @@ module example_top #
    //***************************************************************************
    // System clock frequency parameters
    //***************************************************************************
-   parameter nCK_PER_CLK           = 4,
+   parameter nCK_PER_CLK           = 2,
                                      // # of memory CKs per fabric CLK
 
    
