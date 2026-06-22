@@ -96,23 +96,11 @@ module ddr2_control (
    // Data/address buses (i_mem_addr, i_mem_write_data) need no synchroniser
    // because the CPU holds them stable from the DV assertion until o_mem_ready.
    // -------------------------------------------------------------------------
-   (* ASYNC_REG = "true" *) reg sync_wr_dv_0 = 1'b0, sync_wr_dv_1 = 1'b0;
-   (* ASYNC_REG = "true" *) reg sync_rd_dv_0 = 1'b0, sync_rd_dv_1 = 1'b0;
-
-   always @(posedge ui_clk or posedge ui_clk_sync_rst) begin
-      if (ui_clk_sync_rst) begin
-         sync_wr_dv_0 <= 1'b0;  sync_wr_dv_1 <= 1'b0;
-         sync_rd_dv_0 <= 1'b0;  sync_rd_dv_1 <= 1'b0;
-      end else begin
-         sync_wr_dv_0 <= i_mem_write_DV;
-         sync_wr_dv_1 <= sync_wr_dv_0;
-         sync_rd_dv_0 <= i_mem_read_DV;
-         sync_rd_dv_1 <= sync_rd_dv_0;
-      end
-   end
-
-   wire synced_write_dv = sync_wr_dv_1;
-   wire synced_read_dv  = sync_rd_dv_1;
+   // P4: cache and ddr2_control are the SAME ui_clk domain now (P3 made the CPU
+   // synchronous with the MIG ui_clk), so the async 2-FF DV synchronisers are
+   // removed — DV is sampled directly, cutting ~2 ui_clk of latency per access.
+   wire synced_write_dv = i_mem_write_DV;
+   wire synced_read_dv  = i_mem_read_DV;
 
 
 

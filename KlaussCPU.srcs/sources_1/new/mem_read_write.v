@@ -199,19 +199,15 @@ module mem_read_write (
     // before ddr2_control's internal write/read accept handshake is complete.
     // ASYNC_REG keeps the pair in one slice and excludes the path from STA.
     // -------------------------------------------------------------------------
-    (* ASYNC_REG = "true" *) reg sync_ddr_ready_0 = 1'b0;
-    (* ASYNC_REG = "true" *) reg sync_ddr_ready_1 = 1'b0;
-
-    always @(posedge i_Clk) begin
-        sync_ddr_ready_0 <= i_ddr_mem_ready;
-        sync_ddr_ready_1 <= sync_ddr_ready_0;
-    end
-
+    // P4: ddr2_control's ready (i_ddr_mem_ready) is now in the SAME ui_clk domain
+    // as the cache FSM (P3 made the CPU synchronous), so the async 2-FF ready
+    // synchroniser is removed — ready is sampled directly, cutting ~2 cycles of
+    // latency on every DDR completion.
     // ddr2_control's ready belongs to whichever master is currently granted.
     // Gate it so the cache only acts on its own DDR completions and the blitter
     // only on its own — neither can mistake the other's ready for its own.
-    wire w_cache_ddr_ready = sync_ddr_ready_1 & ~r_grant_blit;
-    wire w_blit_ddr_ready  = sync_ddr_ready_1 &  r_grant_blit;
+    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit;
+    wire w_blit_ddr_ready  = i_ddr_mem_ready &  r_grant_blit;
 
     assign o_dma_ready = w_blit_ddr_ready;
 
