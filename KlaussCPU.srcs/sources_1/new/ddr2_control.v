@@ -61,15 +61,18 @@ module ddr2_control (
    reg app_en;
    wire app_rdy;
 
-   reg [127:0] app_wdf_data;
-   wire app_wdf_end = 1;
-   reg app_wdf_wren;
-   wire app_wdf_rdy;
+   // 2:1 PHY ratio: the MIG user interface is 64-bit (APP_DATA_WIDTH =
+   // 2*nCK_PER_CLK*16 = 2*2*16). A 128-bit cache line is therefore TWO 64-bit
+   // UI beats. beat0 = line[63:0] (pushed/returned first), beat1 = line[127:64].
+   reg  [63:0] app_wdf_data;
+   reg         app_wdf_end;        // 0 on beat0, 1 on beat1 (last beat of the burst)
+   reg         app_wdf_wren;
+   wire        app_wdf_rdy;
 
-   wire [127:0] app_rd_data;
-   reg [15:0] app_wdf_mask;  // Only first quarter
-   wire app_rd_data_end;
-   wire app_rd_data_valid;
+   wire [63:0] app_rd_data;
+   reg  [ 7:0] app_wdf_mask;       // 8 byte-mask bits per 64-bit beat
+   wire        app_rd_data_end;
+   wire        app_rd_data_valid;
 
    wire app_sr_req = 0;
    wire app_ref_req = 0;
@@ -117,7 +120,10 @@ module ddr2_control (
    localparam WRITE_DONE = 4'd3;
    localparam READ = 4'd4;
    localparam READ_DONE = 4'd5;
+   localparam WRITE_B1 = 4'd6;   // push the second 64-bit write beat (2:1 UI)
    reg [3:0] state = IDLE;
+
+   reg rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
 
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
@@ -181,6 +187,8 @@ module ddr2_control (
          state <= IDLE;
          app_en <= 0;
          app_wdf_wren <= 0;
+         app_wdf_end <= 0;
+         rd_beat <= 1'b0;
       end else begin
          case (state)
             // IDLE: stay here until BOTH synced DVs are deasserted before
@@ -210,25 +218,41 @@ module ddr2_control (
                end
             end
 
-            WRITE: begin
+            // 2:1 write: issue the command once + push TWO 64-bit wdf beats.
+            WRITE: begin                          // command + beat0 (line[63:0])
                if (app_rdy & app_wdf_rdy) begin
-                  state <= WRITE_DONE;
-                  app_en <= 1;
+                  app_en       <= 1;
+                  app_cmd      <= CMD_WRITE;
+                  app_addr     <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
+                  app_wdf_data <= i_mem_write_data[63:0];
+                  app_wdf_mask <= i_app_wdf_mask[7:0];
                   app_wdf_wren <= 1;
-                  app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
-                  app_cmd <= CMD_WRITE;
-                  app_wdf_data <= i_mem_write_data;
-                  app_wdf_mask <= i_app_wdf_mask;
+                  app_wdf_end  <= 1'b0;              // beat0 is not the last beat
+                  state        <= WRITE_B1;
                end
             end
 
-            WRITE_DONE: begin
+            WRITE_B1: begin                       // clear cmd; push beat1 (line[127:64])
+               if (app_rdy & app_en) begin
+                  app_en <= 0;
+               end
+               if (app_wdf_rdy & app_wdf_wren) begin   // beat0 accepted → present beat1
+                  app_wdf_data <= i_mem_write_data[127:64];
+                  app_wdf_mask <= i_app_wdf_mask[15:8];
+                  app_wdf_end  <= 1'b1;                 // beat1 is the last beat
+                  // app_wdf_wren stays high for beat1
+                  state        <= WRITE_DONE;
+               end
+            end
+
+            WRITE_DONE: begin                     // drain command + beat1
                if (app_rdy & app_en) begin
                   app_en <= 0;
                end
 
-               if (app_wdf_rdy & app_wdf_wren) begin
+               if (app_wdf_rdy & app_wdf_wren) begin   // beat1 accepted
                   app_wdf_wren <= 0;
+                  app_wdf_end  <= 1'b0;
                end
 
                if (~app_en & ~app_wdf_wren) begin
@@ -243,20 +267,28 @@ module ddr2_control (
                   app_en <= 1;
                   app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
                   app_cmd <= CMD_READ;
+                  rd_beat <= 1'b0;
                   state <= READ_DONE;
                end
             end
 
+            // 2:1 read: the BL8 burst returns as TWO 64-bit app_rd_data beats.
+            // First valid = line[63:0], second = line[127:64] — reassembled so
+            // o_mem_read_data is byte-identical to the old single-128-bit-beat path.
             READ_DONE: begin
                if (app_rdy & app_en) begin
                   app_en <= 0;
                end
 
                if (app_rd_data_valid) begin
-                  o_mem_read_data <= app_rd_data;
-                  o_mem_ready <= 1'b1;
-                  state <= IDLE;
-
+                  if (rd_beat == 1'b0) begin
+                     o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]
+                     rd_beat <= 1'b1;
+                  end else begin
+                     o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
+                     o_mem_ready <= 1'b1;
+                     state <= IDLE;
+                  end
                end
             end
 
