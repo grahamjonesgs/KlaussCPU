@@ -317,6 +317,18 @@ OP: 0 FILL, 1 COPY, 2 FILL_BLEND, 3 COPY_BLEND, 4 MASK_BLEND.
 
 *(Resolved: `0xF00B` is live SHA-256; blitter uses free block `0xF00E`.)*
 
+## Deferred (measured, decided not worth it now)
+- **Burst / pipelined DDR throughput.** On-board the blitter is latency-bound:
+  ~51 cyc per 16-byte access (one outstanding MIG transaction at a time),
+  ~15 MB/s (~39 ms for a 640×480 copy) — already ~10× the CPU memcpy. We already
+  do BL8 DRAM bursts (128-bit app word = one burst); the only further win is
+  *pipelining multiple outstanding MIG commands* (rework `ddr2_control` from its
+  one-at-a-time FSM into a streaming/FIFO controller + a blitter prefetch
+  pipeline). Potential ~6× on FILL/COPY (less on blend, due to the RMW dst
+  dependency), but it modifies the **shared** DDR controller the CPU depends on →
+  Large effort + full-CPU-regression risk. **Deferred** — small practical win
+  relative to cost given the blitter already runs concurrently with the CPU.
+
 ## Out of scope (handoff-noted, deferred)
 - Range flush/invalidate (`FLUSH_ADDR/LEN`) — phase-6+ optimization over full flush.
 - Optional `BLEND565` scalar opcode — separate, complementary, lower priority.
