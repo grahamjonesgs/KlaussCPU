@@ -307,8 +307,12 @@ module mem_read_write (
     reg [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
     reg [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
     reg         r_evict_way;          // which way to replace (miss paths)
-    reg [3:0]   r_gap_count;          // CDC gap countdown between writeback and refill
-                                       // (see WRITE_EVICT_GAP / READ_EVICT_GAP)
+    reg [3:0]   r_gap_count;          // gap between writeback and refill. P4: cut
+                                       // 8->3 cycles — it was sized for the async
+                                       // write-DV 2-FF settle (>=4 ui_clk); now
+                                       // single-domain (P3) it only needs to let
+                                       // ddr2_control go IDLE->WAIT (both DVs low)
+                                       // before the refill DV. (WRITE/READ_EVICT_GAP)
 
     // -------------------------------------------------------------------------
     // State machine — one-hot 16-bit
@@ -652,7 +656,7 @@ module mem_read_write (
                     // commits the eviction line's data to the refill address —
                     // corrupting DRAM.  Hold the eviction address through the
                     // gap below so any spurious write is idempotent.
-                    r_gap_count        <= 4'd7;
+                    r_gap_count        <= 4'd2;
                     state              <= WRITE_EVICT_GAP;
                 end
             end
@@ -734,7 +738,7 @@ module mem_read_write (
                     o_ddr_mem_write_DV <= 0;
                     // Hold eviction address through the CDC gap — see the long
                     // comment in WRITE_EVICT_DONE for the race this prevents.
-                    r_gap_count        <= 4'd7;
+                    r_gap_count        <= 4'd2;
                     state              <= READ_EVICT_GAP;
                 end
             end
@@ -821,7 +825,7 @@ module mem_read_write (
                     MS_W0_WAIT: begin
                         if (w_cache_ddr_ready) begin
                             o_ddr_mem_write_DV <= 1'b0;
-                            r_gap_count        <= 4'd7;   // CDC settle, hold addr
+                            r_gap_count        <= 4'd2;   // CDC settle, hold addr
                             r_mnt_sub          <= MS_W0_GAP;
                         end
                     end
@@ -846,7 +850,7 @@ module mem_read_write (
                     MS_W1_WAIT: begin
                         if (w_cache_ddr_ready) begin
                             o_ddr_mem_write_DV <= 1'b0;
-                            r_gap_count        <= 4'd7;
+                            r_gap_count        <= 4'd2;
                             r_mnt_sub          <= MS_W1_GAP;
                         end
                     end
