@@ -20,7 +20,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 module mem_read_write (
-    input         i_Clk,
+    input         i_Clk_board,   // 100 MHz board oscillator — feeds clk_wiz (MIG 200MHz ref)
     inout  [15:0] ddr2_dq,
     inout  [ 1:0] ddr2_dqs_n,
     inout  [ 1:0] ddr2_dqs_p,
@@ -63,6 +63,10 @@ module mem_read_write (
     // the top level so KlaussCPU.v can drive both LiteEth's sys-clock
     // input and the PHY's ETH_REFCLK pin (via ODDR).
     output            clk_50,
+
+    // MIG ui_clk (100 MHz at 2:1) exposed to the top so the WHOLE CPU runs on it,
+    // synchronous with the cache↔MIG interface (P3: kills the async CDC).
+    output            o_ui_clk,
 
     // DDR2 calibration complete — passed up so the boot-ROM copy (KlaussCPU.v)
     // waits for DDR before writing the resident netboot image into it.
@@ -121,6 +125,14 @@ module mem_read_write (
     // DDR2 interface
     // -------------------------------------------------------------------------
     wire        sys_clk_i;
+    // P3: the cache FSM (and the whole CPU above) runs on the MIG ui_clk so it is
+    // SYNCHRONOUS with the cache↔MIG interface. `i_Clk` is kept as the name every
+    // `always @(posedge i_Clk)` already uses — it's now an internal net driven by
+    // the MIG ui_clk (w_ui_clk), not the board oscillator (i_Clk_board feeds the
+    // MIG's 200 MHz reference via clk_wiz_0).
+    wire        w_ui_clk;
+    wire        i_Clk = w_ui_clk;
+    assign      o_ui_clk = w_ui_clk;
     reg  [ 9:0] por_counter = 32;
     wire        resetn = (por_counter == 0);
 
@@ -970,7 +982,7 @@ module mem_read_write (
     // Clock wizard and DDR2 controller
     // -------------------------------------------------------------------------
     clk_wiz_0 clk_wiz_0 (
-        .i_Clk  (i_Clk),
+        .i_Clk  (i_Clk_board),     // board oscillator (NOT i_Clk=ui_clk — that would be circular)
         .clk_200(sys_clk_i),
         .clk_50 (clk_50),
         .locked (),                // intentionally unused
@@ -1001,7 +1013,8 @@ module mem_read_write (
         .i_app_wdf_mask   (mig_wdf_mask),
         .o_mem_read_data  (i_ddr_mem_read_data),
         .o_mem_ready      (i_ddr_mem_ready),
-        .o_calib_done     (o_calib_done)
+        .o_calib_done     (o_calib_done),
+        .o_ui_clk         (w_ui_clk)
     );
 
 endmodule

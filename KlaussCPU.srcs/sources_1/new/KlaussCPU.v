@@ -23,7 +23,7 @@
 `timescale 1ns / 1ps
 module KlaussCPU (
     input             CPU_RESETN,        // CPU reset button
-    input             i_Clk,             // FPGA Clock
+    input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
     input             i_uart_rx,
     input             i_load_H,          // Load button
     output            o_uart_tx,
@@ -80,6 +80,15 @@ module KlaussCPU (
     output [1:0] ddr2_dm,
     output [0:0] ddr2_odt
 );
+
+   // P3 — synchronous clocking: the WHOLE CPU runs on the MIG ui_clk (100 MHz at
+   // 2:1), exposed by mem_read_write below as o_ui_clk. `i_Clk` is kept as the
+   // name every `always @(posedge i_Clk)` and `.i_Clk(i_Clk)` already uses — it is
+   // now an internal net driven by ui_clk, not the board oscillator. The board
+   // oscillator (i_Clk_board) feeds only the MIG's 200 MHz reference (via clk_wiz
+   // inside mem_read_write). This makes the cache↔MIG crossing a single domain.
+   wire i_Clk = w_ui_clk;
+   wire w_ui_clk;
 
    localparam STACK_TOP = 32'h800_0000;  // one doubleword (8 bytes) above top of 128 MiB byte address space
 
@@ -953,7 +962,8 @@ module KlaussCPU (
    end
 
    mem_read_write mem_read_write (
-       .i_Clk(i_Clk),
+       .i_Clk_board(i_Clk_board),   // board oscillator -> clk_wiz -> MIG 200MHz ref
+       .o_ui_clk(w_ui_clk),         // MIG ui_clk (100MHz) -> drives i_Clk for the whole CPU
        .ddr2_dq(ddr2_dq),
        .ddr2_dqs_n(ddr2_dqs_n),
        .ddr2_dqs_p(ddr2_dqs_p),

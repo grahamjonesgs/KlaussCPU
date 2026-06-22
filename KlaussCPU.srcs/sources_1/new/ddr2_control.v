@@ -48,13 +48,15 @@ module ddr2_control (
     inout [15:0] i_app_wdf_mask,
     output reg [127:0] o_mem_read_data,
     output reg o_mem_ready,
-    output o_calib_done           // MIG init_calib_complete (DDR2 ready)
+    output o_calib_done,          // MIG init_calib_complete (DDR2 ready)
+    output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (P3 synchronous)
 
 );
 
 
    wire calib_done;
    assign o_calib_done = calib_done;
+   assign o_ui_clk = ui_clk;      // expose the MIG UI clock to clock the whole CPU synchronously
 
    reg [26:0] app_addr = 0;
    reg [2:0] app_cmd = 0;
