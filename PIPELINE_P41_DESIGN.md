@@ -66,6 +66,46 @@ decision, the per-instruction xsim trace is over-engineering — the emulator-vs
 output check + the mismatch counter suffice.) Add the two NEW overlap-only corners in
 P4.4: SMC-store-into-in-flight-IR, and IRQ-during-overlapped-fetch.
 
+## Implementation blueprint (derived from the FSM re-read)
+
+**Key structural finding:** the IR-latch decoupling is NOT cycle-identical in serial
+mode — separating "fill" from "consume" adds cycles unless the fill happens under the
+execute tail. So there is no behaviorally-identical pure-serial refactor; the testable
+unit is the overlap itself. Implement P4.1a (latch + X_DISPATCH consume path, dormant)
+and P4.1b (prefetch under execute) together.
+
+**IR latch + fetch pointer (new regs):** `r_FPC[31:0]` (next-sequential prefetch PC),
+`r_ir_valid`, `r_ir_pc[31:0]`, `r_ir_opcode[31:0]`, `r_ir_reg_1/2/dst[3:0]`,
+`r_ir_var1[31:0]`, `r_ir_var1_prefetched`. Reset/boot/redirect: `r_FPC <= r_PC`,
+`r_ir_valid <= 0`.
+
+**X_DISPATCH (rewrite of OPCODE_REQUEST body):** keep the int_push_wait / w_irq_ready /
+deferred-WB-commit blocks VERBATIM (this preserves the precise-interrupt + WB ordering
+bit-identically — the audit's load-bearing property). Then the dispatch tail becomes:
+- if `r_ir_valid && r_ir_pc == r_PC`: **consume** — load `r_opcode_mem/r_reg_1/2/dst/
+  r_var1_mem/r_var1_prefetched` from the IR fields, `r_ir_valid <= 0`, → OPCODE_FETCH2
+  (the existing settle: reg ports sample r_register AFTER the WB committed this cycle —
+  ordering unchanged). The fast path that skips the opcode fetch.
+- else: the existing IFB-hit-serve / cache-miss-issue behavior VERBATIM (the slow path,
+  taken on boot, after a redirect, or whenever the prefetch didn't land).
+
+**Prefetch under execute (the overlap):** during OPCODE_EXECUTE's wait/tail and the
+multicycle tail states (ALU_FINISH, the `r_extra_clock` load spin, MULTIPLY_*/DIVIDE_*),
+when `!r_ir_valid` and the IFB hits `r_FPC` (bus-free), fill the IR latch from the IFB
+(opcode + reg fields + var1, mirroring the OPCODE_REQUEST IFB-hit serve), set
+`r_ir_pc <= r_FPC`, `r_ir_valid <= 1`, `r_FPC <= r_FPC + f_predecode_len(opcode)`. One
+entry only. IFB miss under execute → no prefetch (P4.1c adds the arbiter later).
+
+**Redirect squash:** any execute task that writes a non-sequential `r_PC` (taken
+branch/JMP/CALL/RET/IRET, the interrupt dispatch, WAIT) must `r_ir_valid <= 0` and
+`r_FPC <= <new PC>` so the prefetched fall-through is discarded — the consume guard
+`r_ir_pc == r_PC` is the independent safety net if a site is missed (degrades to a
+re-fetch, never a wrong instruction). The SMC guard (:1427) also clears `r_ir_valid`.
+
+**Verification:** regression bit-identical (test_64bit 36, test_asm 7, expr 35, bst 11,
+queens 11) AND `PREDECODE_MISMATCH` still 0 AND CPI drops on tail-heavy kernels
+(mem_stream/ptr_chase/muldiv) vs the captured baseline.
+
 ## Roadmap
 - **P4.1** (this): structure + serial execute + IFB-hit overlap. Win on hot loops.
 - **P4.2** forwarding: the GREEN mux at the EXECUTE operand point (`w_oper_a/b =
