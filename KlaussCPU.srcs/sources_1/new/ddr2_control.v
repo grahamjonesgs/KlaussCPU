@@ -115,6 +115,24 @@ module ddr2_control (
 
    reg rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
 
+   // Partial-mask writes (mask != 0) come ONLY from the blitter — the cache always
+   // writes full lines (mask = 0). The MIG's partial-mask 2-beat write path corrupts
+   // on hardware (board-confirmed: aligned/full-mask blits are perfect, unaligned
+   // partial-mask ones smear), while the full-mask write + read paths are proven (the
+   // cache uses them constantly). So convert a partial write into a read-modify-write
+   // FULL-line write: read the line, keep the masked bytes, overlay the written ones,
+   // and write the whole line with mask = 0. The mask==0 path below is unchanged.
+   reg r_rmw = 1'b0;
+   reg [127:0] r_merged;
+   integer mb;
+   always @* begin
+      for (mb = 0; mb < 16; mb = mb + 1)
+         r_merged[mb*8 +: 8] = i_app_wdf_mask[mb] ? o_mem_read_data[mb*8 +: 8]
+                                                  : i_mem_write_data[mb*8 +: 8];
+   end
+   wire [127:0] w_wdata = r_rmw ? r_merged : i_mem_write_data;
+   wire [15:0]  w_wmask = r_rmw ? 16'h0    : i_app_wdf_mask;
+
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
 
@@ -179,6 +197,7 @@ module ddr2_control (
          app_wdf_wren <= 0;
          app_wdf_end <= 0;
          rd_beat <= 1'b0;
+         r_rmw <= 1'b0;
       end else begin
          case (state)
             // IDLE: stay here until BOTH synced DVs are deasserted before
@@ -202,8 +221,15 @@ module ddr2_control (
 
             WAIT: begin
                if (synced_write_dv) begin
-                  state <= WRITE;
+                  if (i_app_wdf_mask == 16'h0000) begin
+                     r_rmw <= 1'b0;          // full-line write — direct (cache + interior)
+                     state <= WRITE;
+                  end else begin
+                     r_rmw <= 1'b1;          // partial mask — read the line first (RMW)
+                     state <= READ;
+                  end
                end else if (synced_read_dv) begin
+                  r_rmw <= 1'b0;
                   state <= READ;
                end
             end
@@ -214,8 +240,8 @@ module ddr2_control (
                   app_en       <= 1;
                   app_cmd      <= CMD_WRITE;
                   app_addr     <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
-                  app_wdf_data <= i_mem_write_data[63:0];
-                  app_wdf_mask <= i_app_wdf_mask[7:0];
+                  app_wdf_data <= w_wdata[63:0];
+                  app_wdf_mask <= w_wmask[7:0];
                   app_wdf_wren <= 1;
                   app_wdf_end  <= 1'b0;              // beat0 is not the last beat
                   state        <= WRITE_B1;
@@ -227,8 +253,8 @@ module ddr2_control (
                   app_en <= 0;
                end
                if (app_wdf_rdy & app_wdf_wren) begin   // beat0 accepted → present beat1
-                  app_wdf_data <= i_mem_write_data[127:64];
-                  app_wdf_mask <= i_app_wdf_mask[15:8];
+                  app_wdf_data <= w_wdata[127:64];
+                  app_wdf_mask <= w_wmask[15:8];
                   app_wdf_end  <= 1'b1;                 // beat1 is the last beat
                   // app_wdf_wren stays high for beat1
                   state        <= WRITE_DONE;
@@ -247,6 +273,7 @@ module ddr2_control (
 
                if (~app_en & ~app_wdf_wren) begin
                   o_mem_ready <= 1'b1;
+                  r_rmw <= 1'b0;
                   state <= IDLE;
                end
             end
@@ -276,8 +303,12 @@ module ddr2_control (
                      rd_beat <= 1'b1;
                   end else begin
                      o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
-                     o_mem_ready <= 1'b1;
-                     state <= IDLE;
+                     if (r_rmw) begin
+                        state <= WRITE;       // RMW: line is read; now write the merged full line
+                     end else begin
+                        o_mem_ready <= 1'b1;
+                        state <= IDLE;
+                     end
                   end
                end
             end
