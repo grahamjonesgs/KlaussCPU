@@ -448,6 +448,14 @@ module KlaussCPU (
    reg [47:0] r_perf_cnt_call;          // direct + conditional calls
    reg [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
    reg [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
+   // P4.1a predecode validation — counts opcodes whose actual sequential PC
+   // advance disagreed with f_predecode_len (control-flow + interrupt redirects
+   // excluded). Reads ~0 across the regression => the predecode is exact.
+   reg [47:0] r_perf_predecode_mismatch;
+   reg [31:0] r_pdc_prev_pc;            // PC of the previously-committed instr
+   reg [31:0] r_pdc_prev_op;            // its opcode (for f_predecode_len)
+   reg        r_pdc_armed;              // prev instr was non-control-flow
+   reg        r_pdc_int_seen;           // an interrupt dispatched since prev commit
    reg        r_int_push_wait_d;        // edge-detect for interrupt dispatch
    // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
    // (conditional encodings only), consumed by the perf block below.
@@ -943,6 +951,7 @@ module KlaussCPU (
                16'h0090: r_mmio_read_data_comb = r_perf_cnt_call;
                16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
                16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
+               16'h00A8: r_mmio_read_data_comb = r_perf_predecode_mismatch;
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -1353,6 +1362,9 @@ rams_sp_nc rams_sp_nc1 (
       r_perf_cnt_branch_taken = 64'd0; r_perf_cnt_jump = 64'd0;
       r_perf_cnt_call = 64'd0;     r_perf_cnt_indirect = 64'd0;
       r_perf_cnt_other = 64'd0;
+      r_perf_predecode_mismatch = 64'd0;
+      r_pdc_armed = 1'b0;
+      r_pdc_int_seen = 1'b0;
       r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
       r_hcf_dump_byte_pos = 5'd0;
@@ -2646,6 +2658,15 @@ end
       end
    endfunction
 
+   // Control-flow predicate (P4.1a predecode validator): true for ops that may
+   // write a non-sequential PC, so they are excluded from the sequential-advance
+   // check. w_opcode is the decoded opcode committed at OPCODE_FETCH2.
+   wire [2:0] w_opcode_class   = f_perf_class(w_opcode);
+   wire       w_opcode_is_ctrl = (w_opcode_class == PC_BRANCH) ||
+                                 (w_opcode_class == PC_JUMP)   ||
+                                 (w_opcode_class == PC_CALL)   ||
+                                 (w_opcode_class == PC_INDIRECT);
+
    //=========================================================================
    // Performance-counter block (Tier 0/1/2). Its own always block: reads
    // existing FSM state (r_SM, r_div_counter, r_int_push_wait), the decoded
@@ -2667,6 +2688,9 @@ end
          r_perf_cnt_branch_taken <= 64'd0;  r_perf_cnt_jump         <= 64'd0;
          r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
          r_perf_cnt_other        <= 64'd0;
+         r_perf_predecode_mismatch <= 64'd0;
+         r_pdc_armed             <= 1'b0;
+         r_pdc_int_seen          <= 1'b0;
       end else begin
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
@@ -2724,6 +2748,23 @@ end
                PC_INDIRECT: r_perf_cnt_indirect <= r_perf_cnt_indirect + 64'd1;
                default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
             endcase
+         end
+
+         // P4.1a predecode validation (passive; drives no FSM state). For a
+         // non-control-flow instruction with no interrupt dispatched before the
+         // next commit, the next committed PC must equal PC + predecode length.
+         // Control-flow ops (may redirect) and interrupt redirects are skipped.
+         // r_perf_predecode_mismatch reads ~0 across the regression => exact.
+         if (r_int_push_wait)
+            r_pdc_int_seen <= 1'b1;
+         if (r_SM == OPCODE_FETCH2) begin
+            if (r_pdc_armed && !r_pdc_int_seen &&
+                (r_PC != (r_pdc_prev_pc + f_predecode_len(r_pdc_prev_op))))
+               r_perf_predecode_mismatch <= r_perf_predecode_mismatch + 64'd1;
+            r_pdc_prev_pc  <= r_PC;
+            r_pdc_prev_op  <= w_opcode;
+            r_pdc_armed    <= !w_opcode_is_ctrl;
+            r_pdc_int_seen <= 1'b0;
          end
       end
    end
