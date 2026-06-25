@@ -313,6 +313,17 @@ module blitter_dma (
     wire w_need_maskfill= w_use_mask && (!r_mbuf_valid || (w_mask_word != r_mbuf_addr));
     wire w_last_pixel   = (r_x == r_width - 16'd1);
 
+    // BYTE-ORDER FIX: the cache (mem_read_write) maps CPU doubleword addr[3]=0 to
+    // the UPPER 64 bits [127:64] of a 128-bit line, the opposite of the raw-line /
+    // ddr2_control convention ([63:0]=beat0=bytes 0-7) that this blitter's DMA uses.
+    // CPU-written src is therefore stored with its two 64-bit halves swapped vs our
+    // view (invisible to memcpy + blitter-only sim; only the cross-path CPU-writes /
+    // blitter-reads case exposes it -> the dst+8 beat-slip). Swap the two halves on
+    // every DMA read so r_rbuf/r_mbuf/r_wbuf are in our logical order, and swap back
+    // on write (data + byte-mask). FILL/aligned copies are unaffected (the swap
+    // cancels for verbatim data); unaligned re-packing is fixed.
+    wire [127:0] w_dma_rd_swap = {i_dma_read_data[63:0], i_dma_read_data[127:64]};
+
     always @(posedge i_Clk) begin
         if (!i_Rst_L) begin
             state          <= S_IDLE;
@@ -473,8 +484,8 @@ module blitter_dma (
                     o_dma_req <= 1'b1;
                     if (i_dma_grant) begin
                         o_dma_addr       <= r_wbuf_addr;
-                        o_dma_write_data <= r_wbuf;
-                        o_dma_wdf_mask   <= r_wbuf_mask;
+                        o_dma_write_data <= {r_wbuf[63:0], r_wbuf[127:64]};        // swap back (see w_dma_rd_swap)
+                        o_dma_wdf_mask   <= {r_wbuf_mask[7:0], r_wbuf_mask[15:8]};  // mask follows the data halves
                         o_dma_write_DV   <= 1'b1;
                         state            <= S_WF_DRIVE;
                     end
@@ -521,17 +532,17 @@ module blitter_dma (
                     if (i_dma_ready) begin
                         case (r_rd_target)
                             RDT_SRC: begin
-                                r_rbuf       <= i_dma_read_data;
+                                r_rbuf       <= w_dma_rd_swap;
                                 r_rbuf_addr  <= o_dma_addr;
                                 r_rbuf_valid <= 1'b1;
                             end
                             RDT_MASK: begin
-                                r_mbuf       <= i_dma_read_data;
+                                r_mbuf       <= w_dma_rd_swap;
                                 r_mbuf_addr  <= o_dma_addr;
                                 r_mbuf_valid <= 1'b1;
                             end
                             default: begin // RDT_DST — open the accumulator
-                                r_wbuf       <= i_dma_read_data;
+                                r_wbuf       <= w_dma_rd_swap;
                                 r_wbuf_addr  <= o_dma_addr;
                                 r_wbuf_mask  <= 16'h0000;  // write whole word back
                                 r_wbuf_open  <= 1'b1;
