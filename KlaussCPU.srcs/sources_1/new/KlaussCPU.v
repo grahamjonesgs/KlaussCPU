@@ -448,14 +448,13 @@ module KlaussCPU (
    reg [47:0] r_perf_cnt_call;          // direct + conditional calls
    reg [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
    reg [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
-   // P4.1a predecode validation — counts opcodes whose actual sequential PC
-   // advance disagreed with f_predecode_len (control-flow + interrupt redirects
-   // excluded). Reads ~0 across the regression => the predecode is exact.
-   reg [47:0] r_perf_predecode_mismatch;
-   reg [31:0] r_pdc_prev_pc;            // PC of the previously-committed instr
-   reg [31:0] r_pdc_prev_op;            // its opcode (for f_predecode_len)
-   reg        r_pdc_armed;              // prev instr was non-control-flow
-   reg        r_pdc_int_seen;           // an interrupt dispatched since prev commit
+   // P4.1 perf: X_DISPATCH fast-path fire count (MMIO 0xA8). A healthy 15-53%
+   // rate is itself live proof f_predecode_len is exact — a wrong length fails
+   // the r_ir_pc==r_PC consume guard and collapses the rate. Retires the old
+   // passive predecode-mismatch validator (superseded by the consume guard +
+   // the functional regression).
+   reg [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
+   reg        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
    reg        r_int_push_wait_d;        // edge-detect for interrupt dispatch
    // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
    // (conditional encodings only), consumed by the perf block below.
@@ -482,6 +481,30 @@ module KlaussCPU (
    reg [31:0] r_var1_mem;
    reg [31:0] r_var2_mem;
    reg r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
+
+   // -------------------------------------------------------------------------
+   // P4.1 — 2-stage fetch|execute pipeline (structural). r_FPC is the prefetch
+   // pointer running ahead of r_PC; a single-entry IR latch holds one decoded
+   // instruction, FILLED under the execute tail (P4.1b prefetch) and CONSUMED by
+   // the X_DISPATCH fast-path in OPCODE_REQUEST. The consume guard r_ir_pc==r_PC
+   // is the independent safety net; a miss degrades to a re-fetch, never a wrong
+   // instruction. Length comes from f_predecode_len (board-proven exact: a wrong
+   // length fails the consume guard and collapses the fast-path rate). Execute is
+   // serial; the fetch front-end (prefetch + presettle) overlaps its tail.
+   // -------------------------------------------------------------------------
+   reg [31:0] r_FPC;              // next-sequential prefetch PC (advanced by f_predecode_len)
+   reg        r_ir_valid;         // IR latch holds a valid prefetched instruction
+   reg [31:0] r_ir_pc;            // PC of the latched instruction (must == r_PC to consume)
+   reg [31:0] r_ir_opcode;        // its 32-bit opcode
+   reg [3:0]  r_ir_reg_1;
+   reg [3:0]  r_ir_reg_2;
+   reg [3:0]  r_ir_reg_dst;
+   reg [31:0] r_ir_var1;          // prefetched var1 (PC+4) when available in the IFB
+   reg        r_ir_var1_prefetched;
+   reg        r_ir_presettled;    // P4.1 aggressive: the execute tail already loaded
+                                  // r_reg_1/2 from this latch, so the reg-file read
+                                  // ports settle DURING the tail and X_DISPATCH can
+                                  // skip the OPCODE_FETCH2 settle bubble (1 cyc/instr).
 
    // -------------------------------------------------------------------------
    // Instruction fetch buffer (IFB) — a one-line (two-doubleword) capture of
@@ -518,6 +541,25 @@ module KlaussCPU (
    wire w_ifb_v1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc1_dw);
    wire w_ifb_v1_hit  = w_ifb_v1_hit0 | w_ifb_v1_hit1;
    wire [63:0] w_ifb_v1_dw = w_ifb_v1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+
+   // P4.1 — IFB lookup mirrored on the prefetch pointer r_FPC (the prefetch reads
+   // the buffered line at r_FPC; no cache request, so it never touches the bus).
+   wire [28:0] w_ifb_fpc_dw   = r_FPC[31:3];
+   wire [28:0] w_ifb_fpc1_dw  = r_FPC[31:3] + 1'b1;
+   wire w_ifb_fpc_hit0  = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc_dw);
+   wire w_ifb_fpc_hit1  = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc_dw);
+   wire w_ifb_fpc_hit   = w_ifb_fpc_hit0 | w_ifb_fpc_hit1;
+   wire [63:0] w_ifb_fpc_data = w_ifb_fpc_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   wire w_ifb_fpcv1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc1_dw);
+   wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
+   wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
+   wire [63:0] w_ifb_fpcv1_data = w_ifb_fpcv1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   // Execute-tail states where the memory bus is idle and a one-entry IFB-hit
+   // prefetch may fill the IR latch without contending for the cache port.
+   wire w_exec_tail = (r_SM == OPCODE_EXECUTE) || (r_SM == ALU_FINISH)    ||
+                      (r_SM == MULTIPLY_SETUP) || (r_SM == MULTIPLY_BREG) ||
+                      (r_SM == MULTIPLY_CALC)  || (r_SM == MULTIPLY_PIPE) ||
+                      (r_SM == DIVIDE_PREP)    || (r_SM == DIVIDE_STEP);
 
    // Debug
    reg r_debug_flag;
@@ -633,8 +675,14 @@ module KlaussCPU (
    reg        r_wb_pending;               // Phase 2: writeback deferred into OPCODE_REQUEST dispatch (eliminates the WRITEBACK cycle)
 
     always @(posedge i_Clk) begin
-       r_reg_port_a <= r_register[r_reg_1];
-       r_reg_port_b <= r_register[r_reg_2];
+       // P4.1 RAW forward: the execute-tail presettle moves the port read into the
+       // deferred-WB commit cycle, so forward a still-pending writeback whose dest
+       // matches the operand (the value r_register WILL hold next cycle). This mux
+       // is on the port INPUT (reg-file read), not the r_reg_port_b->carry-flag
+       // OUTPUT path, so the tight carry chain is untouched. On the slow (FETCH2)
+       // path r_wb_pending is already 0 when the port reads, so it is a no-op there.
+       r_reg_port_a <= (r_wb_pending && (r_writeback_reg == r_reg_1)) ? r_writeback_value : r_register[r_reg_1];
+       r_reg_port_b <= (r_wb_pending && (r_writeback_reg == r_reg_2)) ? r_writeback_value : r_register[r_reg_2];
    end
 
    // Track the last non-HCF FSM state so the crash dump can show what was
@@ -951,7 +999,7 @@ module KlaussCPU (
                16'h0090: r_mmio_read_data_comb = r_perf_cnt_call;
                16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
                16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
-               16'h00A8: r_mmio_read_data_comb = r_perf_predecode_mismatch;
+               16'h00A8: r_mmio_read_data_comb = r_perf_fastpath;  // P4.1 X_DISPATCH fast-path fire count (slot was predecode_mismatch)
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -1344,6 +1392,9 @@ rams_sp_nc rams_sp_nc1 (
       r_break_active  = 0;
       r_break_counter = 0;
       r_var1_prefetched = 0;
+      r_ir_valid = 1'b0;
+      r_ir_presettled = 1'b0;
+      r_FPC = 32'h0;
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
       r_instr_count = 32'h0;
@@ -1362,9 +1413,8 @@ rams_sp_nc rams_sp_nc1 (
       r_perf_cnt_branch_taken = 64'd0; r_perf_cnt_jump = 64'd0;
       r_perf_cnt_call = 64'd0;     r_perf_cnt_indirect = 64'd0;
       r_perf_cnt_other = 64'd0;
-      r_perf_predecode_mismatch = 64'd0;
-      r_pdc_armed = 1'b0;
-      r_pdc_int_seen = 1'b0;
+      r_perf_fastpath = 64'd0;
+      r_fastpath_fired = 1'b0;
       r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
       r_hcf_dump_byte_pos = 5'd0;
@@ -1391,6 +1441,9 @@ rams_sp_nc rams_sp_nc1 (
          r_trace_full <= 1'b0;
          r_instr_count <= 32'h0;
          r_ifb_dwval <= 2'b0;
+         r_ir_valid <= 1'b0;
+         r_ir_presettled <= 1'b0;
+         r_FPC <= 32'h0;
          r_hcf_dump_phase <= 7'd0;
          r_hcf_dump_sub <= 3'b000;
          r_hcf_dump_byte_pos <= 5'd0;
@@ -1431,6 +1484,32 @@ rams_sp_nc rams_sp_nc1 (
          r_msg_send_DV  <= 1'b0;
          r_rx_fifo_read <= 1'b0;
          r_perf_br_valid <= 1'b0;  // 1-cycle strobe; jump tasks re-assert it
+         r_fastpath_fired <= 1'b0; // default; the X_DISPATCH fast-path below asserts it
+
+         // P4.1b prefetch-under-execute: during a bus-idle execute tail, fill the
+         // one-entry IR latch from the IFB at r_FPC (this instruction's sequential
+         // successor, set at the dispatch below / OPCODE_FETCH2). IFB-hit-only — no
+         // cache request — so it never contends for the memory port; !r_mem_*_DV
+         // excludes load/store and SMC-store cycles. The execute-tail handoff then
+         // pre-loads r_reg_1/2 from this latch so X_DISPATCH can skip FETCH2.
+         if (w_exec_tail && !r_ir_valid && !r_mem_read_DV && !r_mem_write_DV
+             && w_ifb_fpc_hit) begin
+            r_ir_pc      <= r_FPC;
+            r_ir_opcode  <= r_FPC[2] ? w_ifb_fpc_data[63:32] : w_ifb_fpc_data[31:0];
+            r_ir_reg_1   <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+            r_ir_reg_2   <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+            r_ir_reg_dst <= r_FPC[2] ? w_ifb_fpc_data[43:40] : w_ifb_fpc_data[11:8];
+            if (r_FPC[2] == 1'b0) begin
+               r_ir_var1            <= w_ifb_fpc_data[63:32];  // var1 shares this dw
+               r_ir_var1_prefetched <= 1'b1;
+            end else if (w_ifb_fpcv1_hit) begin
+               r_ir_var1            <= w_ifb_fpcv1_data[31:0]; // var1 in the next dw
+               r_ir_var1_prefetched <= 1'b1;
+            end else begin
+               r_ir_var1_prefetched <= 1'b0;
+            end
+            r_ir_valid   <= 1'b1;
+         end
 
          // Instruction-buffer coherence: a DRAM store into a buffered line
          // drops it so the next fetch re-reads the modified bytes (self-
@@ -1441,6 +1520,14 @@ rams_sp_nc rams_sp_nc1 (
                r_ifb_dwval[0] <= 1'b0;
             if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == r_mem_addr[31:3]))
                r_ifb_dwval[1] <= 1'b0;
+            // P4.1 SMC poison: a store into the latched instruction's dword (or the
+            // next dw, where a spilled var1 lives) invalidates the prefetched IR so
+            // stale code is never consumed (same discipline as the IFB above).
+            if (r_ir_valid && ((r_ir_pc[31:3] == r_mem_addr[31:3]) ||
+                               (r_ir_pc[31:3] + 1'b1 == r_mem_addr[31:3]))) begin
+               r_ir_valid      <= 1'b0;
+               r_ir_presettled <= 1'b0;
+            end
          end
 
          if (r_timer_interrupt_counter > r_timer_period) begin
@@ -1768,6 +1855,9 @@ rams_sp_nc rams_sp_nc1 (
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
                   r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
+                  r_FPC <= r_PC_requested;       // P4.1: prefetch pointer starts at the entry point
+                  r_ir_valid <= 1'b0;            // no prefetched instruction yet
+                  r_ir_presettled <= 1'b0;
                   r_timing_start <= 0;
                   r_zero_flag <= 0;
                   t_tx_message(8'd1);  // Load OK message
@@ -1862,7 +1952,39 @@ rams_sp_nc rams_sp_nc1 (
                   r_int_mask[w_irq_sel] <= 1'b0;  // mask this source while handler runs; IRET restores
                   r_PC             <= r_interrupt_table[w_irq_sel];
                   r_int_push_wait  <= 1'b1;
+                  r_ir_valid       <= 1'b0;   // P4.1: discard the speculative fall-through
+                  r_ir_presettled  <= 1'b0;   // (IRQ redirect; precise interrupts preserved)
                   // stay in OPCODE_REQUEST until push completes
+               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == r_PC) begin
+                  // P4.1 X_DISPATCH fast path: the prefetched IR was pre-settled into
+                  // r_reg_1/2 during the previous instruction's execute tail, so the
+                  // reg-file read ports are already valid — skip the OPCODE_FETCH2
+                  // settle bubble and go straight to EXECUTE (the 1-cyc/instr win).
+                  // Ordered AFTER w_irq_ready so a pending interrupt always wins.
+                  r_opcode_mem      <= r_ir_opcode;
+                  r_reg_dst         <= r_ir_reg_dst;
+                  r_var1_mem        <= r_ir_var1;
+                  r_var1_prefetched <= r_ir_var1_prefetched;
+                  // Crash trace + retire counter: FETCH2 (their usual home) is skipped
+                  // on this path, so the unique commit gate moves here.
+                  r_trace_buf[r_trace_idx] <= {r_PC, r_ir_opcode};
+                  r_trace_idx              <= r_trace_idx + 4'd1;
+                  if (r_trace_idx == 4'd15) r_trace_full <= 1'b1;
+                  r_instr_count <= r_instr_count + 32'd1;
+                  r_FPC <= r_PC + f_predecode_len(r_ir_opcode);  // next sequential prefetch
+                  r_fastpath_fired <= 1'b1;  // a retired instruction that skips FETCH2 (counts in r_perf_instr + r_perf_fastpath)
+                  r_ir_valid      <= 1'b0;
+                  r_ir_presettled <= 1'b0;
+                  if (r_ir_var1_prefetched) begin
+                     if (r_debug_flag && r_ir_opcode[31:12] != 20'h0000F)
+                        r_SM <= DEBUG_DATA;
+                     else
+                        r_SM <= OPCODE_EXECUTE;
+                  end else begin
+                     r_SM          <= VAR1_FETCH;   // var1 not buffered — fetch it (also settles)
+                     r_mem_addr    <= (r_PC + 4);
+                     r_mem_read_DV <= 1'b1;
+                  end
                end else if (w_ifb_op_hit) begin
                   // Instruction-buffer hit: serve the opcode now and skip the
                   // OPCODE_FETCH cache round-trip. var1 (PC+4) is prefetched
@@ -1885,8 +2007,12 @@ rams_sp_nc rams_sp_nc1 (
                   end else begin
                      r_var1_prefetched <= 1'b0;
                   end
+                  r_ir_valid      <= 1'b0;   // P4.1: drop the prefetch (served from IFB, not pre-settled)
+                  r_ir_presettled <= 1'b0;
                   r_SM <= OPCODE_FETCH2;
                end else begin
+                  r_ir_valid      <= 1'b0;   // P4.1: drop any stale prefetch on a cache-miss fetch
+                  r_ir_presettled <= 1'b0;
                   r_mem_addr    <= r_PC;
                   r_mem_read_DV <= 1'b1;
                   r_SM          <= OPCODE_FETCH;
@@ -1951,6 +2077,11 @@ rams_sp_nc rams_sp_nc1 (
                // the unique commit gate). 32-bit wrap is ~4.3e9 — irrelevant
                // for crash diagnostics.
                r_instr_count <= r_instr_count + 32'd1;
+               // P4.1: advance the prefetch pointer to this instruction's sequential
+               // successor (the fast path does this in OPCODE_REQUEST instead). The
+               // predecode is board-proven exact, so r_FPC tracks the fall-through; a
+               // control-flow redirect just makes the next dispatch recompute it.
+               r_FPC <= r_PC + f_predecode_len(w_opcode);
                // Register fields (r_reg_1/2/dst) were latched a cycle earlier in
                // OPCODE_REQUEST (IFB hit) or OPCODE_FETCH (miss), so r_reg_port_a/b
                // are already settling — the old VAR1_FETCH2 bubble is gone.
@@ -2431,6 +2562,15 @@ MULTIPLY_WRITEBACK: begin
     else
         r_PC <= r_PC + 4;
 
+    // P4.1 execute-tail handoff: pre-load r_reg_1/2 from the prefetched latch (the
+    // multiply used r_mul_operand_*_q, not r_reg_1/2) so the next dispatch skips
+    // FETCH2. r_PC becomes the successor this cycle; OPCODE_REQUEST's r_ir_pc==r_PC
+    // guard confirms the match next cycle.
+    if (r_ir_valid) begin
+        r_reg_1         <= r_ir_reg_1;
+        r_reg_2         <= r_ir_reg_2;
+        r_ir_presettled <= 1'b1;
+    end
     r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
 end
 
@@ -2535,6 +2675,14 @@ end
                   r_overflow_flag <= 1'b0;
                   r_div_op <= DIV_OP_NONE;
                   r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
+                  // P4.1 execute-tail handoff: pre-load r_reg_1/2 from the prefetched
+                  // latch (the divide used r_div_* regs, not r_reg_1/2) so the next
+                  // dispatch skips FETCH2.
+                  if (r_ir_valid) begin
+                     r_reg_1         <= r_ir_reg_1;
+                     r_reg_2         <= r_ir_reg_2;
+                     r_ir_presettled <= 1'b1;
+                  end
                   r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                end
             end
@@ -2568,6 +2716,14 @@ end
                   r_ult_flag   <= r_alu_pipe_ult;
                   r_sign_flag  <= r_alu_pipe_value[63];
                   r_SM         <= OPCODE_REQUEST;
+               end
+               // P4.1 execute-tail handoff: the ALU already consumed its operands and
+               // r_PC is the successor, so pre-load r_reg_1/2 from the prefetched
+               // latch — the read ports settle now and X_DISPATCH skips FETCH2.
+               if (r_ir_valid) begin
+                  r_reg_1         <= r_ir_reg_1;
+                  r_reg_2         <= r_ir_reg_2;
+                  r_ir_presettled <= 1'b1;
                end
             end
 
@@ -2658,14 +2814,6 @@ end
       end
    endfunction
 
-   // Control-flow predicate (P4.1a predecode validator): true for ops that may
-   // write a non-sequential PC, so they are excluded from the sequential-advance
-   // check. w_opcode is the decoded opcode committed at OPCODE_FETCH2.
-   wire [2:0] w_opcode_class   = f_perf_class(w_opcode);
-   wire       w_opcode_is_ctrl = (w_opcode_class == PC_BRANCH) ||
-                                 (w_opcode_class == PC_JUMP)   ||
-                                 (w_opcode_class == PC_CALL)   ||
-                                 (w_opcode_class == PC_INDIRECT);
 
    //=========================================================================
    // Performance-counter block (Tier 0/1/2). Its own always block: reads
@@ -2688,14 +2836,13 @@ end
          r_perf_cnt_branch_taken <= 64'd0;  r_perf_cnt_jump         <= 64'd0;
          r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
          r_perf_cnt_other        <= 64'd0;
-         r_perf_predecode_mismatch <= 64'd0;
-         r_pdc_armed             <= 1'b0;
-         r_pdc_int_seen          <= 1'b0;
+         r_perf_fastpath           <= 64'd0;
       end else begin
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;
-         if (r_SM == OPCODE_FETCH2) r_perf_instr <= r_perf_instr + 64'd1;
+         if (r_SM == OPCODE_FETCH2 || r_fastpath_fired) r_perf_instr <= r_perf_instr + 64'd1;
+         if (r_fastpath_fired) r_perf_fastpath <= r_perf_fastpath + 64'd1;  // P4.1 fast-path fire count (MMIO 0xA8)
 
          // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
          // inside OPCODE_REQUEST (r_int_push_wait==1), so it is split out first
@@ -2750,22 +2897,9 @@ end
             endcase
          end
 
-         // P4.1a predecode validation (passive; drives no FSM state). For a
-         // non-control-flow instruction with no interrupt dispatched before the
-         // next commit, the next committed PC must equal PC + predecode length.
-         // Control-flow ops (may redirect) and interrupt redirects are skipped.
-         // r_perf_predecode_mismatch reads ~0 across the regression => exact.
-         if (r_int_push_wait)
-            r_pdc_int_seen <= 1'b1;
-         if (r_SM == OPCODE_FETCH2) begin
-            if (r_pdc_armed && !r_pdc_int_seen &&
-                (r_PC != (r_pdc_prev_pc + f_predecode_len(r_pdc_prev_op))))
-               r_perf_predecode_mismatch <= r_perf_predecode_mismatch + 64'd1;
-            r_pdc_prev_pc  <= r_PC;
-            r_pdc_prev_op  <= w_opcode;
-            r_pdc_armed    <= !w_opcode_is_ctrl;
-            r_pdc_int_seen <= 1'b0;
-         end
+         // (P4.1a predecode-mismatch validator retired — superseded by the
+         // r_ir_pc==r_PC consume guard, the functional regression, and the
+         // fast-path fire-rate counter which collapses on any predecode error.)
       end
    end
 
