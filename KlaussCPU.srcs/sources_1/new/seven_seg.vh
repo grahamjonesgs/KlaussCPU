@@ -1,3 +1,9 @@
+// 7-segment display format (all t_7_seg* tasks below):
+//   Each display digit is an 8-bit slot {dp/ctrl = 4'h0, value_nibble[3:0]}.
+//   Input nibbles are expanded into the low 4 bits of each digit slot; the
+//   high 4 bits (decimal-point / segment-control field) are written 0.
+//   Glyph code 0x2 is the blank glyph (see t_7_seg_blank).
+
 // Set 7 Seg 1 LED value
 // On completion
 // Increment PC 2
@@ -104,6 +110,8 @@ task t_7_seg_reg;
 endtask
 
 // Blank 7 Seg LED value
+// Writes 0x2 (the blank glyph) into every digit slot of both displays
+// (0x22222222 = 8 blank digits).
 // On completion
 // Increment PC
 // Increment r_SM_msg

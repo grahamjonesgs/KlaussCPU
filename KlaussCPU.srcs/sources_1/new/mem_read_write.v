@@ -65,7 +65,7 @@ module mem_read_write (
     output            clk_50,
 
     // MIG ui_clk (100 MHz at 2:1) exposed to the top so the WHOLE CPU runs on it,
-    // synchronous with the cache↔MIG interface (P3: kills the async CDC).
+    // synchronous with the cache↔MIG interface (no async CDC needed).
     output            o_ui_clk,
 
     // DDR2 calibration complete — passed up so the boot-ROM copy (KlaussCPU.v)
@@ -125,7 +125,7 @@ module mem_read_write (
     // DDR2 interface
     // -------------------------------------------------------------------------
     wire        sys_clk_i;
-    // P3: the cache FSM (and the whole CPU above) runs on the MIG ui_clk so it is
+    // The cache FSM (and the whole CPU above) runs on the MIG ui_clk so it is
     // SYNCHRONOUS with the cache↔MIG interface. `i_Clk` is kept as the name every
     // `always @(posedge i_Clk)` already uses — it's now an internal net driven by
     // the MIG ui_clk (w_ui_clk), not the board oscillator (i_Clk_board feeds the
@@ -192,17 +192,11 @@ module mem_read_write (
     end
 
     // -------------------------------------------------------------------------
-    // 2-FF synchroniser for i_ddr_mem_ready — ddr2_control drives o_mem_ready
-    // from ui_clk (50 MHz), and the FSM here samples it from i_Clk (100 MHz).
-    // Without this sync the FSM can pick up a metastable value on the
-    // transition edge, and (worse) act on a partially-propagated assertion
-    // before ddr2_control's internal write/read accept handshake is complete.
-    // ASYNC_REG keeps the pair in one slice and excludes the path from STA.
+    // ddr2_control's ready (i_ddr_mem_ready) is in the SAME ui_clk domain as the
+    // cache FSM (the whole CPU runs synchronous to the 100 MHz MIG ui_clk), so
+    // there is no clock crossing here and no 2-FF ready synchroniser — ready is
+    // sampled directly.
     // -------------------------------------------------------------------------
-    // P4: ddr2_control's ready (i_ddr_mem_ready) is now in the SAME ui_clk domain
-    // as the cache FSM (P3 made the CPU synchronous), so the async 2-FF ready
-    // synchroniser is removed — ready is sampled directly, cutting ~2 cycles of
-    // latency on every DDR completion.
     // ddr2_control's ready belongs to whichever master is currently granted.
     // Gate it so the cache only acts on its own DDR completions and the blitter
     // only on its own — neither can mistake the other's ready for its own.
@@ -307,10 +301,8 @@ module mem_read_write (
     reg [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
     reg [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
     reg         r_evict_way;          // which way to replace (miss paths)
-    reg [3:0]   r_gap_count;          // gap between writeback and refill. P4: cut
-                                       // 8->3 cycles — it was sized for the async
-                                       // write-DV 2-FF settle (>=4 ui_clk); now
-                                       // single-domain (P3) it only needs to let
+    reg [3:0]   r_gap_count;          // gap between writeback and refill. Single
+                                       // domain, so it only needs to let
                                        // ddr2_control go IDLE->WAIT (both DVs low)
                                        // before the refill DV. (WRITE/READ_EVICT_GAP)
 
@@ -646,12 +638,12 @@ module mem_read_write (
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_write_DV <= 0;
                     // CRITICAL: do NOT change o_ddr_mem_addr here. ddr2_control
-                    // synchronises i_mem_write_DV via a 2-FF sync at ui_clk, so
-                    // the deassertion takes ~2 ui_clk (~4 i_Clk cycles) to be
-                    // visible inside ddr2_control. During that window its FSM
-                    // can return WRITE_DONE→IDLE→WAIT and resample
-                    // synced_write_dv as still=1, re-entering WRITE and latching
-                    // app_addr from the live i_mem_addr. If we have already
+                    // samples i_mem_write_DV directly (same ui_clk domain), but
+                    // its FSM only returns WRITE_DONE->IDLE->WAIT once BOTH DVs
+                    // read low (the IDLE gate there). For a cycle or two after we
+                    // drop write_DV it can still be draining its write, and if it
+                    // re-enters WAIT->WRITE while write_DV still reads high it
+                    // latches app_addr from the live i_mem_addr. If we have already
                     // changed addr to the refill target, that spurious write
                     // commits the eviction line's data to the refill address —
                     // corrupting DRAM.  Hold the eviction address through the
@@ -662,11 +654,11 @@ module mem_read_write (
             end
 
             WRITE_EVICT_GAP: begin
-                // CDC gap: hold the eviction address (and keep both DVs low)
-                // long enough for ddr2_control's 2-FF synchroniser of
-                // i_mem_write_DV to catch up.  Only after that is it safe to
-                // change addr to the refill target and raise read DV.  8 i_Clk
-                // cycles ≥ 4 ui_clk — well clear of the 2-ui_clk sync depth.
+                // Settle gap: hold the eviction address (and keep both DVs low)
+                // long enough for ddr2_control to drain its write and return to
+                // its DV=0-gated IDLE/WAIT.  Only after that is it safe to change
+                // addr to the refill target and raise read DV.  r_gap_count=2 (a
+                // few i_Clk cycles) covers it in the single ui_clk domain.
                 if (r_gap_count == 4'd0) begin
                     o_ddr_mem_addr    <= r_fetch_ddr_addr;
                     o_ddr_mem_read_DV <= 1;
@@ -736,7 +728,7 @@ module mem_read_write (
             READ_EVICT_DONE: begin
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_write_DV <= 0;
-                    // Hold eviction address through the CDC gap — see the long
+                    // Hold eviction address through the settle gap — see the long
                     // comment in WRITE_EVICT_DONE for the race this prevents.
                     r_gap_count        <= 4'd2;
                     state              <= READ_EVICT_GAP;

@@ -5,7 +5,7 @@
 // Device base 0xF00E_0000 (MMIO device id 0x00E). See BLITTER_IMPLEMENTATION_PLAN.md
 // and blitter-fpga-handoff.md. This module is BOTH:
 //   * an MMIO slave (operand registers + START/STATUS), and
-//   * a DDR bus master (master B on mem_read_write's arbiter — Phase 1).
+//   * a DDR bus master (master B on mem_read_write's arbiter).
 //
 // Pixels are RGB565, 16 bpp, little-endian. A 128-bit DDR word = 8 pixels.
 // Rects may start at any pixel (any even byte) and src/dst strides may differ,
@@ -75,7 +75,7 @@ module blitter_dma (
     input             i_dma_ready,
     input             i_dma_grant,
 
-    // -------- DONE interrupt (Phase 5 wires this into the CPU) --------
+    // -------- DONE interrupt (o_irq, wired into the CPU) --------
     output            o_irq
 );
 
@@ -494,7 +494,7 @@ module blitter_dma (
                 S_WF_DRIVE: begin
                     if (i_dma_ready) begin
                         o_dma_write_DV <= 1'b0;
-                        r_gap          <= 4'd7;     // CDC settle (Phase 1 contract)
+                        r_gap          <= 4'd7;     // CDC settle
                         state          <= S_WF_GAP;
                     end
                 end

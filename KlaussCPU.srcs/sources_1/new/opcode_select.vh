@@ -156,7 +156,7 @@ task t_opcode_select;
          32'h0000_088?: t_xor_reg_value(w_var1);               // XORV RV rd=rs^zero_ext(imm32); sets zero
          32'h0000_089?: t_set_reg_flags;                       // SETFR R rd={zero,equal,carry,overflow,60'b0}
          32'h0000_08A?: t_negate_reg;                          // NEGR R rd=-(rs) two's complement; sets zero
-         32'h0000_08B?: t_abs_reg;                             // ABSR R rd=|rs| signed; sets zero
+         32'h0000_08B?: t_abs_reg;                             // ABSR R rd=|rs| signed; sets zero; sets overflow on |INT64_MIN| (0x8000...0)
          32'h0000_08C?: t_sign_extend_byte;                    // SEXTB R rd=sign_ext(rs[7:0]) to 64 bits; sets zero/sign
          32'h0000_08D?: t_left_shift_reg;                      // SHLR1 R rd=rs<<1 logical
          32'h0000_08E?: t_right_shift_reg;                     // SHRR1 R rd=rs>>1 logical
@@ -440,9 +440,11 @@ task t_opcode_select;
          32'h0000_77??: t_memget16;                            // MEMGET16 RR rd=zero_ext(mem16[rs2&~1]); 2-byte aligned, little-endian
 
          //=====================================================================
-         // 32-bit word memory access (78xx–79xx)
-         // Hardware clears addr[1:0] (4-byte aligned). little-endian:
+         // 32-bit word memory access (78xx–79xx). little-endian:
          // addr[2]=0 → bits[31:0] (low half); addr[2]=1 → bits[63:32] (high half).
+         // MEMSET32: hardware clears addr[1:0] (4-byte aligned) before the write.
+         // MEMGET32: accepts ANY byte alignment (offset addr[2:0]=0..7); reads that
+         //   cross a cache-line boundary issue a second read. (See t_memget32.)
          //=====================================================================
          32'h0000_78??: t_memset32;                            // MEMSET32 RR mem32[rs2&~3]=rs1[31:0]; 4-byte aligned, little-endian
          32'h0000_79??: t_memget32;                            // MEMGET32 RR rd=zero_ext(mem32[rs2]); any byte alignment, little-endian (cross-line spans take a 2nd read)

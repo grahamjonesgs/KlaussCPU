@@ -1,3 +1,4 @@
+// ASCII hex digit ('0'-'9','A'-'F') -> 4-bit nibble; any non-hex input -> 0x0
 function [3:0] return_hex_from_ascii;
    input [7:0] ascii;
    begin
@@ -23,6 +24,7 @@ function [3:0] return_hex_from_ascii;
    end
 endfunction
 
+// 4-bit nibble -> uppercase ASCII hex digit ('0'-'9','A'-'F'); out-of-range -> '?' (0x3F)
 function [7:0] return_ascii_from_hex;
    input [3:0] hex;
    begin
@@ -49,7 +51,7 @@ function [7:0] return_ascii_from_hex;
 endfunction
 
 // f_predecode_len — encoded instruction length in BYTES (4/8/12) from the 32-bit
-// opcode alone, for the fetch pipeline (P4.1). Mirrors the casez in
+// opcode alone, for the fetch pipeline. Mirrors the casez in
 // opcode_select.vh and the r_PC += {4,8,12} advance in each execute task:
 //   4  = 1-word ops (incl. jumps/halts; redirect handled separately)
 //   8  = ops that consume a PC+4 immediate (RV / RRV / V forms)

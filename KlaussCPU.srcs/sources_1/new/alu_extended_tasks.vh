@@ -485,7 +485,7 @@ begin
 end
 endtask
 
-// MULV - Multiply register by immediate value (signed) - NOW PIPELINED
+// MULV - Multiply register by immediate value (signed); routed through the 2-cycle multiply pipeline
 task t_mul_value_hw;
    input [31:0] i_value;
 begin
@@ -654,7 +654,9 @@ task t_mod_value_hw;
    reg [63:0] abs_divisor;
    begin
       if (i_value == 32'b0) begin
-         // Return dividend on mod by zero
+         // MODV by zero: sets overflow_flag only; rd is left UNCHANGED (no
+         // writeback). NOTE: differs from sibling t_mod_regs_hw, which writes
+         // the dividend back to rd on divide-by-zero. See FOR HUMAN REVIEW.
          r_overflow_flag <= 1'b1;
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + 8;

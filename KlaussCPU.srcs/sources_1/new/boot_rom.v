@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// boot_rom — resident bootloader image (Phase 2 of NETBOOT_PLAN.md).
+// boot_rom — resident bootloader image (see NETBOOT_PLAN.md).
 //
 // An initialized block RAM holding the `netboot` program's DDR image, built
 // exactly as the working UART/kbt version (linked at 0x20) — NOT relinked.  At

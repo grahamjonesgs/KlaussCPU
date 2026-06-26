@@ -9,7 +9,7 @@
 // Project Name:
 // Target Devices:
 // Tool Versions:
-// Description:
+// Description: MIG 2:1 UI wrapper — 128-bit cache line <-> two 64-bit UI beats.
 //
 // Dependencies:
 //
@@ -49,7 +49,7 @@ module ddr2_control (
     output reg [127:0] o_mem_read_data,
     output reg o_mem_ready,
     output o_calib_done,          // MIG init_calib_complete (DDR2 ready)
-    output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (P3 synchronous)
+    output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (CPU runs synchronous to it)
 
 );
 
@@ -87,18 +87,12 @@ module ddr2_control (
    wire ui_clk_sync_rst;
 
    // -------------------------------------------------------------------------
-   // 2-FF synchronisers for control signals crossing from i_Clk (100 MHz CPU
-   // clock) into ui_clk (50 MHz MIG UI clock).
-   // (* ASYNC_REG = "true" *) tells Vivado to:
-   //   • place both FFs in the same slice (tight hold margin)
-   //   • exclude the path from setup/hold STA (CDC false-path)
-   //   • suppress the TIMING-10 "missing ASYNC_REG" warning
-   // Data/address buses (i_mem_addr, i_mem_write_data) need no synchroniser
-   // because the CPU holds them stable from the DV assertion until o_mem_ready.
+   // The cache and ddr2_control are in the SAME ui_clk domain (the whole CPU
+   // runs synchronous to the 100 MHz MIG ui_clk), so the DV control signals do
+   // not cross clocks — there are no 2-FF synchronisers and DV is sampled
+   // directly. The `synced_*` names are retained from the old async path; they
+   // are now plain wire aliases of the inputs.
    // -------------------------------------------------------------------------
-   // P4: cache and ddr2_control are the SAME ui_clk domain now (P3 made the CPU
-   // synchronous with the MIG ui_clk), so the async 2-FF DV synchronisers are
-   // removed — DV is sampled directly, cutting ~2 ui_clk of latency per access.
    wire synced_write_dv = i_mem_write_DV;
    wire synced_read_dv  = i_mem_read_DV;
 
@@ -181,18 +175,17 @@ module ddr2_control (
          rd_beat <= 1'b0;
       end else begin
          case (state)
-            // IDLE: stay here until BOTH synced DVs are deasserted before
-            // returning to WAIT. This is critical for CDC correctness:
-            // synced_*_dv come from a 2-FF synchroniser, so they lag the CPU's
-            // actual deassertion by ~2 ui_clk. Without this gate, after a
-            // WRITE_DONE→IDLE→WAIT transition we would re-sample synced_write_dv
-            // as still high (because the CPU has lowered i_mem_write_DV but the
-            // 0 hasn't propagated yet) and immediately re-fire WRITE → another
-            // o_mem_ready pulse. The cache's WRITE_FETCH/READ_WAIT then sees
-            // that spurious ready as the read completion, latching stale
-            // o_mem_read_data into the cache line and corrupting DRAM on
-            // subsequent evictions. Holding IDLE until DV=0 forces the cache to
-            // produce a real rising edge for the next transaction.
+            // IDLE: stay here until BOTH DVs are deasserted before returning to
+            // WAIT. This is critical for transaction framing: the cache holds its
+            // DV high for several cycles per access (it spans multiple FSM
+            // states), so without this gate, after a WRITE_DONE→IDLE→WAIT
+            // transition we would re-sample write_dv as still high and immediately
+            // re-fire WRITE → another o_mem_ready pulse. The cache's
+            // WRITE_FETCH/READ_WAIT then sees that spurious ready as the read
+            // completion, latching stale o_mem_read_data into the cache line and
+            // corrupting DRAM on subsequent evictions. Holding IDLE until DV=0
+            // forces the cache to produce a real rising edge for the next
+            // transaction.
             IDLE: begin
                o_mem_ready <= 1'b0;
                if (calib_done & ~synced_write_dv & ~synced_read_dv) begin

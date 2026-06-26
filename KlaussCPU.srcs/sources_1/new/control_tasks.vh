@@ -19,6 +19,16 @@ task t_cond_jump;
         begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + 8;
+         // Not-taken fall-through == r_FPC. The prefetch (above the FSM case)
+         // latches it this cycle; pre-settle r_reg_1/2 from the same buffer data
+         // so the successor takes the fast-path dispatch. A single-cycle branch
+         // can't use the latch's own reg fields (not registered until next cycle),
+         // so read the instruction buffer directly. r_ir_pc==r_PC is the safety net.
+         if (!r_ir_valid && w_ifb_fpc_hit) begin
+            r_reg_1         <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+            r_reg_2         <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+            r_ir_presettled <= 1'b1;
+         end
       end  // else if(i_condition)
    end
 endtask
@@ -48,6 +58,11 @@ task t_cond_call;
       end else begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + 8;
+         if (!r_ir_valid && w_ifb_fpc_hit) begin   // not-taken fall-through pre-settle (see t_cond_jump)
+            r_reg_1         <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+            r_reg_2         <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+            r_ir_presettled <= 1'b1;
+         end
       end
    end
 endtask
@@ -88,6 +103,11 @@ task t_cond_jump_rel;
       end else begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + 8;
+         if (!r_ir_valid && w_ifb_fpc_hit) begin   // not-taken fall-through pre-settle (see t_cond_jump)
+            r_reg_1         <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+            r_reg_2         <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+            r_ir_presettled <= 1'b1;
+         end
       end
    end
 endtask
@@ -117,6 +137,11 @@ task t_cond_call_rel;
       end else begin
          r_SM <= OPCODE_REQUEST;
          r_PC <= r_PC + 8;
+         if (!r_ir_valid && w_ifb_fpc_hit) begin   // not-taken fall-through pre-settle (see t_cond_jump)
+            r_reg_1         <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+            r_reg_2         <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+            r_ir_presettled <= 1'b1;
+         end
       end
    end
 endtask
@@ -200,6 +225,8 @@ endtask
 
 // TRAP — software trap.  Halts with ERR_TRAP, distinct from HALT (normal stop)
 // and ERR_INV_OPCODE (illegal instruction).  Maps to ISD::TRAP in the LLVM backend.
+// Routes via HCF_1, so it runs the full HCF crash-dump path (f_dump_* in
+// uart_tasks.vh) — unlike HALT, which simply parks in HALTED_BREAK with no dump.
 task t_trap;
    begin
       r_error_code <= ERR_TRAP;

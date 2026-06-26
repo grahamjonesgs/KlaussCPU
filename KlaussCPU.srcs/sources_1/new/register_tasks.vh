@@ -51,6 +51,9 @@ endtask
 */
 
 // COPY - Copy second register into first (2-register format)
+// rd = reg[7:4] (=r_reg_1), rs = reg[3:0] (=r_reg_2): rd <- rs.
+// Operand order is REVERSED vs the 3-register ALU encoding (there rd is [11:8]).
+// 1-word, PC += 4.
 task t_copy_regs;
    begin
       r_writeback_value <= r_reg_port_b;
@@ -87,7 +90,10 @@ task t_lea_pc;
    end
 endtask
 
-// Set reg with flags
+// SETFR - Set reg from condition flags.
+// rd = {zero_flag, equal_flag, carry_flag, overflow_flag, 60'b0}
+//   (flags occupy the top 4 bits, MSB = zero_flag; low 60 bits = 0).
+// 1-word, PC += 4.
 task t_set_reg_flags;
    begin
       r_writeback_value <= {r_zero_flag, r_equal_flag, r_carry_flag, r_overflow_flag, 60'b0};

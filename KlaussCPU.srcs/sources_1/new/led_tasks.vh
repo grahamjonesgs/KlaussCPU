@@ -74,10 +74,11 @@ task t_led_rgb2_reg;
    end
 endtask
 
-// Put switch status into register
-// On completion
-// Increment PC 1
-// Increment r_SM_msg
+// SWR - Read switch inputs into register.
+// rd[15:0] = switch inputs (i_switch); rd[31:16] preserved from rs2[31:16];
+// rd[63:32] = 0.  NOTE: not a clean zero-extension — the source register's
+// upper-half bits [31:16] are carried through.
+// 1-word, PC += 4.
 task t_get_switch_reg;
    begin
       r_writeback_value <= {r_reg_port_b[31:16], i_switch};

@@ -43,6 +43,9 @@ task t_rx_nonblocking;
     end
 endtask
 
+// t_debug_message — build "PC is <hex>\r" into r_msg and pulse r_msg_send_DV.
+// Helper only: does NOT set r_SM or advance r_PC (caller drives those).
+// Prints PC[26:0] as 7 hex chars (PC[26:24] shown as a single nibble).
 task t_debug_message;
     begin
         if (!w_sending_msg) begin
@@ -526,6 +529,13 @@ task t_tx_reg;
 endtask
 
 
+// t_tx_message — load one of the canned UART strings into r_msg/r_msg_length
+// and pulse r_msg_send_DV, selected by i_message_number:
+//   1 = "Load Complete OK"   2 = "Load Error, bad CRC"
+//   3 = "Test message"       4 = "Test message" (label says "Segmentation
+//       error..." but currently emits the same bytes as 3 — see FOR HUMAN REVIEW)
+//   default = empty message (length 0)
+// Helper only: does NOT set r_SM or advance r_PC (caller drives those).
 task t_tx_message;
     input [7:0] i_message_number;
     begin
@@ -647,7 +657,7 @@ endtask
 //   3           "V1=xxxxxxxx IDX=xxxxxxxx"
 //   4           "V1H=xxxxxxxx"              (hi32 of V64 immediate; DRAM read at PC+8)
 //   5           "OPCM=xxxxxxxx"             (DRAM-side re-read at PC)
-//   6           "SM=xxxxxxxxx"              (FSM state, 33-bit one-hot)
+//   6           "SM=xxxxxxxxx"              (FSM state, 34-bit one-hot)
 //   7           "IV0=xxxxxxxx"              (timer ISR vector, r_interrupt_table[0])
 //   8           "FLG Z=x E=x C=x V=x"
 //   9           "    S=x L=x U=x"
