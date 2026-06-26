@@ -26,20 +26,20 @@ module ddr2_control (
     input i_mem_write_DV, input i_mem_read_DV,
     input [31:0] i_mem_addr, input [127:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
-    output reg [127:0] o_mem_read_data, output reg o_mem_ready,
+    output logic [127:0] o_mem_read_data, output logic o_mem_ready,
     output o_calib_done,
     output o_ui_clk
 );
    assign o_calib_done = 1'b1;
    assign o_ui_clk = sys_clk_i;   // P3: cache FSM runs on ui_clk; tb drives it from sys_clk_i
-   reg [127:0] mem [0:65535];      // addr[19:4] indexes the line
+   logic [127:0] mem [0:65535];      // addr[19:4] indexes the line
    integer i;
    initial begin
       o_mem_ready = 0; o_mem_read_data = 0;
       for (i = 0; i < 65536; i = i + 1) mem[i] = 128'h0;
    end
    localparam LAT = 6;
-   reg [3:0] cnt = 0;
+   logic [3:0] cnt = 0;
    wire [15:0] idx = i_mem_addr[19:4];
    integer b;
    always @(posedge sys_clk_i) begin
@@ -63,7 +63,7 @@ endmodule
 
 // ---------------------------------------------------------------------------
 module tb_blitter;
-   reg clk = 0;
+   logic clk = 0;
    always #5 clk = ~clk;   // 100 MHz
 
    // --- DMA wires between blitter (master) and mem_read_write (arbiter) ---
@@ -73,13 +73,13 @@ module tb_blitter;
    wire [15:0] dma_mask;
 
    // --- MMIO slave wires to the blitter ---
-   reg         mmio_w = 0, mmio_r = 0;
-   reg  [15:0] mmio_addr = 0;
-   reg  [63:0] mmio_wdata = 0;
+   logic         mmio_w = 0, mmio_r = 0;
+   logic  [15:0] mmio_addr = 0;
+   logic  [63:0] mmio_wdata = 0;
    wire [63:0] mmio_rdata;
    wire        mmio_ready;
 
-   reg rst_l = 1'b0;   // active-low reset for the blitter
+   logic rst_l = 1'b0;   // active-low reset for the blitter
 
    blitter_dma dut_blit (
       .i_Clk(clk), .i_Rst_L(rst_l),
@@ -154,7 +154,7 @@ module tb_blitter;
 
    // --- run a blit and wait for completion ---
    task run_blit(input [2:0] op);
-      reg [63:0] st;
+      logic [63:0] st;
       integer guard;
       begin
          mmio_write(16'h0000, {59'b0, 1'b0, op, 1'b1});   // CTRL: START | OP<<1
@@ -174,7 +174,7 @@ module tb_blitter;
 
    // ===================== reference model + checks =====================
    // Shadow byte memory mirrors DUT memory; we compare a window after each op.
-   reg [7:0] shadow [0:1048575];   // 1 MiB
+   logic [7:0] shadow [0:1048575];   // 1 MiB
    integer si;
 
    task snapshot_window(input [31:0] base, input integer len);
@@ -227,7 +227,7 @@ module tb_blitter;
 
    // RGB565 blend reference — must match blitter_dma.blend565 bit-for-bit.
    function [15:0] tb_blend565(input [15:0] fg, input [15:0] bg, input [7:0] a);
-      reg [7:0] ia; reg [15:0] tr, tg, tbl;
+      logic [7:0] ia; reg [15:0] tr, tg, tbl;
       begin
          ia = 8'd255 - a;
          tr  = fg[15:11]*a + bg[15:11]*ia + 16'd128;
@@ -282,7 +282,7 @@ module tb_blitter;
    endtask
 
    integer x, y;
-   reg [63:0] cyc;
+   logic [63:0] cyc;
 
    initial begin
       // clear shadow
@@ -447,7 +447,7 @@ module tb_blitter;
       // CTRL: START(bit0) | OP=FILL(bits3:1=0) | IRQ_EN(bit4) = 0x11
       mmio_write(16'h0000, 64'h0000_0011);
       begin : irq_wait
-         reg [63:0] st; integer g;
+         logic [63:0] st; integer g;
          g = 0; mmio_read(16'h0008, st);
          while (!st[1]) begin @(negedge clk); mmio_read(16'h0008, st);
             g = g + 1; if (g > 100000) begin errors=errors+1; disable irq_wait; end
@@ -464,7 +464,7 @@ module tb_blitter;
       // IRQ_EN=0 → o_irq must stay low even when DONE sets.
       mmio_write(16'h0000, 64'h0000_0001);   // START only, IRQ_EN=0
       begin : irq_wait2
-         reg [63:0] st; integer g;
+         logic [63:0] st; integer g;
          g = 0; mmio_read(16'h0008, st);
          while (!st[1]) begin @(negedge clk); mmio_read(16'h0008, st);
             g = g + 1; if (g > 100000) begin errors=errors+1; disable irq_wait2; end

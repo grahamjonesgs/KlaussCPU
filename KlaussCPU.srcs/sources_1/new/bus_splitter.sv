@@ -28,10 +28,10 @@ module bus_splitter (
     input      [31:0] i_mem_addr,
     input      [63:0] i_mem_write_data,
     input      [ 7:0] i_mem_byte_en,
-    output reg [63:0] o_mem_read_data,
-    output reg [63:0] o_mem_read_data_next,
-    output reg        o_mem_next_valid,
-    output reg        o_mem_ready,
+    output logic [63:0] o_mem_read_data,
+    output logic [63:0] o_mem_read_data_next,
+    output logic        o_mem_next_valid,
+    output logic        o_mem_ready,
 
     // ----- DRAM side (to mem_read_write) -----
     output            o_dram_write_DV,
@@ -112,7 +112,7 @@ module bus_splitter (
         o_mem_ready          = 1'b0;
     end
 
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         o_mem_read_data      <= mem_read_data_comb;
         o_mem_read_data_next <= mem_read_data_next_comb;
         o_mem_next_valid     <= mem_next_valid_comb;

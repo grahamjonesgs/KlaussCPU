@@ -33,16 +33,16 @@ module eth_mmio_bridge (
     input      [31:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,
-    output reg [63:0] o_mmio_read_data,
-    output reg        o_mmio_ready,
+    output logic [63:0] o_mmio_read_data,
+    output logic        o_mmio_ready,
 
     // -------- LiteEth Wishbone classic master --------
-    output reg [29:0] o_wb_adr,
-    output reg [31:0] o_wb_dat_w,
-    output reg [ 3:0] o_wb_sel,
-    output reg        o_wb_we,
-    output reg        o_wb_cyc,
-    output reg        o_wb_stb,
+    output logic [29:0] o_wb_adr,
+    output logic [31:0] o_wb_dat_w,
+    output logic [ 3:0] o_wb_sel,
+    output logic        o_wb_we,
+    output logic        o_wb_cyc,
+    output logic        o_wb_stb,
     output     [ 1:0] o_wb_bte,
     output     [ 2:0] o_wb_cti,
     input      [31:0] i_wb_dat_r,
@@ -85,9 +85,9 @@ module eth_mmio_bridge (
     localparam S_DONE   = 3'd4;          // pulse o_mmio_ready, then cool down
     localparam S_COOL   = 3'd5;          // hold (not accepting) until strobe drops
 
-    reg [2:0] state;
+    logic [2:0] state;
 
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         if (i_rst) begin
             state            <= S_IDLE;
             o_wb_adr         <= 30'b0;

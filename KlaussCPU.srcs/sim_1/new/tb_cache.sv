@@ -46,14 +46,14 @@ module ddr2_control (
     input [31:0] i_mem_addr,
     input [127:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
-    output reg [127:0] o_mem_read_data,
-    output reg o_mem_ready,
+    output logic [127:0] o_mem_read_data,
+    output logic o_mem_ready,
     output o_calib_done
 );
    assign o_calib_done = 1'b1;
 
    // 64K lines = 1 MiB modeled; addr[19:4] indexes the line.
-   reg [127:0] mem [0:65535];
+   logic [127:0] mem [0:65535];
 
    // init function shared with the TB scoreboard: dword at byte addr a
    // (a[3]=0 -> upper half of line, a[3]=1 -> lower half)
@@ -73,7 +73,7 @@ module ddr2_control (
    end
 
    localparam LAT = 6;
-   reg [3:0] cnt = 0;
+   logic [3:0] cnt = 0;
    wire [15:0] idx = i_mem_addr[19:4];
 
    always @(posedge sys_clk_i) begin
@@ -100,13 +100,13 @@ endmodule
 // ---------------------------------------------------------------------------
 module tb_cache;
 
-   reg clk = 0;
+   logic clk = 0;
    always #5 clk = ~clk;   // 100 MHz
 
-   reg         dv_w = 0, dv_r = 0;
-   reg  [31:0] addr;
-   reg  [63:0] wdata;
-   reg  [7:0]  be = 8'hFF;
+   logic         dv_w = 0, dv_r = 0;
+   logic  [31:0] addr;
+   logic  [63:0] wdata;
+   logic  [7:0]  be = 8'hFF;
    wire [63:0] rdata, rdata_next;
    wire        next_valid, ready;
 
@@ -139,18 +139,18 @@ module tb_cache;
       .i_flush_go(flush_go), .i_inval_go(inval_go), .o_mnt_busy(mnt_busy)
    );
 
-   reg          dma_req = 0, dma_done = 0, dma_w = 0, dma_r = 0;
-   reg  [31:0]  dma_addr = 0;
-   reg  [127:0] dma_wdata = 0;
+   logic          dma_req = 0, dma_done = 0, dma_w = 0, dma_r = 0;
+   logic  [31:0]  dma_addr = 0;
+   logic  [127:0] dma_wdata = 0;
    wire [127:0] dma_rdata;
    wire         dma_ready, dma_grant;
-   reg          flush_go = 0, inval_go = 0;
+   logic          flush_go = 0, inval_go = 0;
    wire         mnt_busy;
 
    // splitter model: 1-cycle registered return path
-   reg        ready_d = 0;
-   reg [63:0] rdata_d, rdata_next_d;
-   reg        next_valid_d;
+   logic        ready_d = 0;
+   logic [63:0] rdata_d, rdata_next_d;
+   logic        next_valid_d;
    always @(posedge clk) begin
       ready_d       <= ready;
       rdata_d       <= rdata;
@@ -159,7 +159,7 @@ module tb_cache;
    end
 
    // scoreboard: 64-bit dwords, addr[19:3] indexes
-   reg [63:0] sb [0:131071];
+   logic [63:0] sb [0:131071];
    function [63:0] init_dw;
       input [31:0] a;
       begin
@@ -196,8 +196,8 @@ module tb_cache;
    // CPU read; returns latency in cycles from DV-high to cache ready.
    // Polls at negedge so registered outputs are settled; captures data and
    // the 1-cycle next-dw pulse atomically with ready.
-   reg        cap_nv;
-   reg [63:0] cap_next;
+   logic        cap_nv;
+   logic [63:0] cap_next;
    task cpu_read;
       input [31:0] a;
       output [63:0] d;
@@ -216,7 +216,7 @@ module tb_cache;
 
    task check_read;
       input [31:0] a;
-      reg [63:0] d;
+      logic [63:0] d;
       integer l;
       begin
          cpu_read(a, d, l);
@@ -284,7 +284,7 @@ module tb_cache;
    endtask
    // Read/write the behavioral DDR directly (models DMA touching main memory).
    function [63:0] ddr_dword(input [31:0] a);
-      reg [127:0] line;
+      logic [127:0] line;
       begin
          line = dut.ddr2_control.mem[a[19:4]];
          ddr_dword = a[3] ? line[63:0] : line[127:64];
@@ -297,9 +297,9 @@ module tb_cache;
       end
    endtask
 
-   reg [63:0] d;
-   reg [31:0] a, ra;
-   reg [127:0] dline;
+   logic [63:0] d;
+   logic [31:0] a, ra;
+   logic [127:0] dline;
    integer l, n, sel;
 
    initial begin

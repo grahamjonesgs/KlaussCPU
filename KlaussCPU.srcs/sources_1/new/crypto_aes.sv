@@ -39,7 +39,7 @@ module crypto_aes (
     input      [15:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,   // unused — software always uses 64-bit accesses
-    output reg [63:0] o_mmio_read_data,
+    output logic [63:0] o_mmio_read_data,
     output            o_mmio_ready
 );
 
@@ -88,14 +88,14 @@ module crypto_aes (
     // -------------------------------------------------------------------------
     // Data registers
     // -------------------------------------------------------------------------
-    reg [127:0] r_key;
-    reg [127:0] r_data_in;
+    logic [127:0] r_key;
+    logic [127:0] r_data_in;
     wire [127:0] w_data_out;
 
     // Pulses to aes_core — 1-cycle wide.
-    reg r_key_load_pulse;
-    reg r_go_enc_pulse;
-    reg r_go_dec_pulse;
+    logic r_key_load_pulse;
+    logic r_go_enc_pulse;
+    logic r_go_dec_pulse;
 
     wire w_core_busy;
     wire w_core_done;
@@ -115,7 +115,7 @@ module crypto_aes (
     );
 
     // DONE flag — sticky, cleared on next GO.
-    reg r_done_latch;
+    logic r_done_latch;
 
     // -------------------------------------------------------------------------
     // GCM/GHASH state and instance
@@ -126,14 +126,14 @@ module crypto_aes (
     // - r_gcm_go_pulse / r_gcm_reset_pulse: 1-cycle handoff from MMIO block
     //   to FSM block (same pattern as the HMAC keyzero pulse in crypto_sha.v).
     // -------------------------------------------------------------------------
-    reg [127:0] r_gcm_H;          // MMIO-owned
-    reg [127:0] r_gcm_X;          // MMIO-owned
-    reg [127:0] r_gcm_tag;        // FSM-owned
-    reg         r_gcm_done_latch; // FSM-owned
-    reg         r_gcm_go_pulse;       // MMIO → FSM
-    reg         r_gcm_reset_pulse;    // MMIO → FSM
-    reg         r_gcm_start_pulse;    // FSM → ghash
-    reg [1:0]   r_gcm_fsm;
+    logic [127:0] r_gcm_H;          // MMIO-owned
+    logic [127:0] r_gcm_X;          // MMIO-owned
+    logic [127:0] r_gcm_tag;        // FSM-owned
+    logic         r_gcm_done_latch; // FSM-owned
+    logic         r_gcm_go_pulse;       // MMIO → FSM
+    logic         r_gcm_reset_pulse;    // MMIO → FSM
+    logic         r_gcm_start_pulse;    // FSM → ghash
+    logic [1:0]   r_gcm_fsm;
 
     // 3 states (still fits in 2 bits).
     //   GCM_IDLE     — no operation in flight.
@@ -158,7 +158,7 @@ module crypto_aes (
     function [127:0] bswap128;
         input [127:0] v;
         integer k;
-        reg [127:0] o;
+        logic [127:0] o;
         begin
             for (k = 0; k < 16; k = k + 1)
                 o[8*k +: 8] = v[8*(15-k) +: 8];
@@ -183,9 +183,9 @@ module crypto_aes (
     // needed.
     wire [127:0] w_ghash_X_in_pre = bswap128(r_gcm_tag ^ r_gcm_X);
     wire [127:0] w_ghash_H_in_pre = bswap128(r_gcm_H);
-    reg  [127:0] r_ghash_X_pipe;
-    reg  [127:0] r_ghash_H_pipe;
-    always @(posedge i_Clk) begin
+    logic  [127:0] r_ghash_X_pipe;
+    logic  [127:0] r_ghash_H_pipe;
+    always_ff @(posedge i_Clk) begin
         r_ghash_X_pipe <= w_ghash_X_in_pre;
         r_ghash_H_pipe <= w_ghash_H_in_pre;
     end
@@ -209,7 +209,7 @@ module crypto_aes (
     // -------------------------------------------------------------------------
     // Write path — software MMIO interface
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_key             <= 128'h0;
             r_data_in         <= 128'h0;
@@ -282,7 +282,7 @@ module crypto_aes (
     // Watches the 1-cycle pulses from the MMIO block above; never assigns the
     // same regs (single-driver rule).
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_gcm_fsm         <= GCM_IDLE;
             r_gcm_tag         <= 128'h0;
@@ -330,7 +330,7 @@ module crypto_aes (
     // not registered here; the bus_splitter pipelines the return path so the
     // CPU samples the value one cycle after the read strobe.
     // -------------------------------------------------------------------------
-    always @* begin
+    always_comb begin
         o_mmio_read_data = 64'h0;
         case (i_mmio_addr)
             OFF_STATUS: o_mmio_read_data = {62'h0, r_done_latch, w_core_busy};

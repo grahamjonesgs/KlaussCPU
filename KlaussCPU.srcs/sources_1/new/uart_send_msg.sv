@@ -5,22 +5,22 @@ module uart_send_msg (
     input      [   7:0] i_msg_length,
     input               i_msg_send_DV,
     output              o_Tx_Serial,
-    output reg          o_msg_sent_DV,
-    output reg          o_sending_msg
+    output logic          o_msg_sent_DV,
+    output logic          o_sending_msg
 );
 
     localparam s_IDLE = 3'b000;
     localparam s_TX_MSG = 3'b001;
     localparam s_CLEANUP = 3'b100;
 
-    reg     [7:0] i_msg_count;
-    reg     [2:0] r_SM_Main;
-    reg     [7:0] r_msg          [31:0];
-    reg     [7:0] r_msg_length;            // Latched copy of i_msg_length
+    logic     [7:0] i_msg_count;
+    logic     [2:0] r_SM_Main;
+    logic     [7:0] r_msg          [31:0];
+    logic     [7:0] r_msg_length;            // Latched copy of i_msg_length
 
     // for lower module
-    reg           r_UART_Tx_DV;
-    reg     [7:0] r_UART_Tx_Byte;
+    logic           r_UART_Tx_DV;
+    logic     [7:0] r_UART_Tx_Byte;
     wire          w_Tx_Active;
     wire          w_Tx_Done;
 
@@ -41,7 +41,7 @@ module uart_send_msg (
     end
 
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
 
         case (r_SM_Main)
             s_IDLE: begin

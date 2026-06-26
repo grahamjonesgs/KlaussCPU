@@ -4,21 +4,21 @@ module Seven_seg_LED_Display_Controller (
     input i_reset,
     input [31:0] i_displayed_number1,  // Number to display
     input [31:0] i_displayed_number2,  // Number to display
-    output reg [7:0] o_Anode_Activate,
-    output reg [7:0] o_LED_cathode
+    output logic [7:0] o_Anode_Activate,
+    output logic [7:0] o_LED_cathode
 );
 
-   reg  [ 7:0] r_LED_Bytes;
-   reg  [19:0] r_refresh_counter;
+   logic  [ 7:0] r_LED_Bytes;
+   logic  [19:0] r_refresh_counter;
    wire [ 2:0] r_LED_activating_counter;  // Which LED block to use
 
-   always @(posedge i_sysclk) begin
+   always_ff @(posedge i_sysclk) begin
       if (i_reset == 1) r_refresh_counter <= 0;
       else r_refresh_counter <= r_refresh_counter + 1;
    end
    assign r_LED_activating_counter = r_refresh_counter[17:15];
 
-   always @(posedge i_sysclk) begin
+   always_ff @(posedge i_sysclk) begin
       case (r_LED_activating_counter)
          3'b000: begin
             o_Anode_Activate = 8'b11110111;
@@ -59,7 +59,7 @@ module Seven_seg_LED_Display_Controller (
          end
       endcase
    end
-   always @(posedge i_sysclk) begin  // Segments as per manual dot then ABCDEFG . High is off.
+   always_ff @(posedge i_sysclk) begin  // Segments as per manual dot then ABCDEFG . High is off.
       case (r_LED_Bytes)
          8'h00:   o_LED_cathode = 8'b10000001;  // "0"
          8'h01:   o_LED_cathode = 8'b11001111;  // "1"

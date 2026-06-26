@@ -36,13 +36,13 @@
 
 module tb_aes_core;
 
-    reg          clk;
-    reg          rst;
-    reg          key_load;
-    reg          go_enc;
-    reg          go_dec;
-    reg  [127:0] key;
-    reg  [127:0] data_in;
+    logic          clk;
+    logic          rst;
+    logic          key_load;
+    logic          go_enc;
+    logic          go_dec;
+    logic  [127:0] key;
+    logic  [127:0] data_in;
     wire         busy;
     wire         done;
     wire [127:0] data_out;
@@ -85,8 +85,8 @@ module tb_aes_core;
         input [127:0] pt_in;
         input [127:0] ct_expected;
         input integer vec_num;
-        reg   [127:0] enc_out;
-        reg   [127:0] dec_out;
+        logic   [127:0] enc_out;
+        logic   [127:0] dec_out;
         begin
             // Load key (byte-reversed into the core's little-endian layout).
             key      = brev(k_in);

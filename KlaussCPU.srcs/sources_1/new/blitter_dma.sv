@@ -60,17 +60,17 @@ module blitter_dma (
     input      [15:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,    // unused — software uses 64-bit accesses
-    output reg [63:0] o_mmio_read_data,
+    output logic [63:0] o_mmio_read_data,
     output            o_mmio_ready,
 
     // -------- DDR master (master B on mem_read_write's arbiter) --------
-    output reg        o_dma_req,
-    output reg        o_dma_done,
-    output reg        o_dma_write_DV,
-    output reg        o_dma_read_DV,
-    output reg [31:0] o_dma_addr,
-    output reg [127:0] o_dma_write_data,
-    output reg [15:0] o_dma_wdf_mask,
+    output logic        o_dma_req,
+    output logic        o_dma_done,
+    output logic        o_dma_write_DV,
+    output logic        o_dma_read_DV,
+    output logic [31:0] o_dma_addr,
+    output logic [127:0] o_dma_write_data,
+    output logic [15:0] o_dma_wdf_mask,
     input      [127:0] i_dma_read_data,
     input             i_dma_ready,
     input             i_dma_grant,
@@ -114,8 +114,8 @@ module blitter_dma (
         input [15:0] fg;
         input [15:0] bg;
         input [ 7:0] a;
-        reg   [ 7:0] ia;
-        reg   [15:0] tr, tg, tb;    // 6b*8b + 6b*8b + 128 < 2^15, fits in 16b
+        logic   [ 7:0] ia;
+        logic   [15:0] tr, tg, tb;    // 6b*8b + 6b*8b + 128 < 2^15, fits in 16b
         begin
             ia = 8'd255 - a;
             tr = fg[15:11]*a + bg[15:11]*ia + 16'd128;  // R5
@@ -128,37 +128,37 @@ module blitter_dma (
     // -------------------------------------------------------------------------
     // Operand registers (software-written via MMIO)
     // -------------------------------------------------------------------------
-    reg [31:0] r_dst_addr;
-    reg [31:0] r_dst_stride;
-    reg [31:0] r_src_addr;
-    reg [31:0] r_src_stride;
-    reg [15:0] r_width;       // pixels (max 65535)
-    reg [15:0] r_height;      // rows   (max 65535)
-    reg [15:0] r_color;       // RGB565
-    reg [ 7:0] r_alpha;       // global alpha
-    reg [31:0] r_mask_addr;   // A8 mask base
-    reg [31:0] r_mask_stride;
-    reg [ 2:0] r_op;
-    reg        r_irq_en;
+    logic [31:0] r_dst_addr;
+    logic [31:0] r_dst_stride;
+    logic [31:0] r_src_addr;
+    logic [31:0] r_src_stride;
+    logic [15:0] r_width;       // pixels (max 65535)
+    logic [15:0] r_height;      // rows   (max 65535)
+    logic [15:0] r_color;       // RGB565
+    logic [ 7:0] r_alpha;       // global alpha
+    logic [31:0] r_mask_addr;   // A8 mask base
+    logic [31:0] r_mask_stride;
+    logic [ 2:0] r_op;
+    logic        r_irq_en;
 
     // -------------------------------------------------------------------------
     // Status / control handoff between the MMIO block and the engine FSM.
     // Single-owner discipline: the MMIO block produces 1-cycle pulses; the FSM
     // owns r_busy / r_done.
     // -------------------------------------------------------------------------
-    reg  r_start_pulse;       // MMIO → FSM: begin a blit
-    reg  r_done_clear_pulse;  // MMIO → FSM: clear DONE (W1C)
-    reg  r_busy;              // FSM-owned
-    reg  r_done;              // FSM-owned, sticky until W1C
-    reg [31:0] r_cycles;      // running cycle count during a blit
-    reg [31:0] r_cycles_last; // latched at completion (CYCLES register)
+    logic  r_start_pulse;       // MMIO → FSM: begin a blit
+    logic  r_done_clear_pulse;  // MMIO → FSM: clear DONE (W1C)
+    logic  r_busy;              // FSM-owned
+    logic  r_done;              // FSM-owned, sticky until W1C
+    logic [31:0] r_cycles;      // running cycle count during a blit
+    logic [31:0] r_cycles_last; // latched at completion (CYCLES register)
 
     assign o_irq = r_done & r_irq_en;
 
     // =========================================================================
     // MMIO write / read
     // =========================================================================
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (!i_Rst_L) begin
             r_dst_addr        <= 32'h0;
             r_dst_stride      <= 32'h0;
@@ -203,7 +203,7 @@ module blitter_dma (
         end
     end
 
-    always @* begin
+    always_comb begin
         case (i_mmio_addr)
             OFF_STATUS:      o_mmio_read_data = {62'b0, r_done, r_busy};
             OFF_DST_ADDR:    o_mmio_read_data = {32'b0, r_dst_addr};
@@ -244,42 +244,42 @@ module blitter_dma (
     localparam RDT_DST  = 2'd1;
     localparam RDT_MASK = 2'd2;
 
-    reg [4:0]  state;
+    logic [4:0]  state;
     // Blend pipeline registers (cut the long mask-addr -> alpha -> blend -> wbuf
     // path in two: S_BLEND latches these operands, S_PLACE does the blend math).
-    reg [15:0] r_fg_q;          // foreground pixel (src or COLOR)
-    reg [15:0] r_bg_q;          // background pixel (current dst)
-    reg [ 7:0] r_alpha_q;       // alpha (mask A8 or global)
+    logic [15:0] r_fg_q;          // foreground pixel (src or COLOR)
+    logic [15:0] r_bg_q;          // background pixel (current dst)
+    logic [ 7:0] r_alpha_q;       // alpha (mask A8 or global)
     // Stage-2 blend products (fg_ch*a, bg_ch*ia per channel) registered in
     // S_BLEND2 so S_PLACE only does add+pack — splits the blend565 chain so it
     // closes on the default impl strategy (was a 13-level path at the 10ns edge).
-    reg [15:0] r_mul_fg_r, r_mul_bg_r;   // R5 products
-    reg [15:0] r_mul_fg_g, r_mul_bg_g;   // G6 products
-    reg [15:0] r_mul_fg_b, r_mul_bg_b;   // B5 products
-    reg [15:0] r_x;             // current pixel column
-    reg [15:0] r_row;           // current row
-    reg [31:0] r_dst_row_base;  // byte address of current dst row start
-    reg [31:0] r_src_row_base;  // byte address of current src row start
-    reg [31:0] r_mask_row_base; // byte address of current mask row start
+    logic [15:0] r_mul_fg_r, r_mul_bg_r;   // R5 products
+    logic [15:0] r_mul_fg_g, r_mul_bg_g;   // G6 products
+    logic [15:0] r_mul_fg_b, r_mul_bg_b;   // B5 products
+    logic [15:0] r_x;             // current pixel column
+    logic [15:0] r_row;           // current row
+    logic [31:0] r_dst_row_base;  // byte address of current dst row start
+    logic [31:0] r_src_row_base;  // byte address of current src row start
+    logic [31:0] r_mask_row_base; // byte address of current mask row start
 
-    reg [127:0] r_wbuf;         // destination accumulator
-    reg [31:0]  r_wbuf_addr;    // 16-byte-aligned address of r_wbuf
-    reg [15:0]  r_wbuf_mask;    // per-byte write mask (1 = don't write)
-    reg         r_wbuf_open;    // a destination word is currently adopted
-    reg         r_wbuf_dirty;   // >=1 pixel written into the current word
+    logic [127:0] r_wbuf;         // destination accumulator
+    logic [31:0]  r_wbuf_addr;    // 16-byte-aligned address of r_wbuf
+    logic [15:0]  r_wbuf_mask;    // per-byte write mask (1 = don't write)
+    logic         r_wbuf_open;    // a destination word is currently adopted
+    logic         r_wbuf_dirty;   // >=1 pixel written into the current word
 
-    reg [127:0] r_rbuf;         // source read buffer
-    reg [31:0]  r_rbuf_addr;
-    reg         r_rbuf_valid;
+    logic [127:0] r_rbuf;         // source read buffer
+    logic [31:0]  r_rbuf_addr;
+    logic         r_rbuf_valid;
 
-    reg [127:0] r_mbuf;         // A8 mask read buffer
-    reg [31:0]  r_mbuf_addr;
-    reg         r_mbuf_valid;
+    logic [127:0] r_mbuf;         // A8 mask read buffer
+    logic [31:0]  r_mbuf_addr;
+    logic         r_mbuf_valid;
 
-    reg [1:0]   r_rd_target;    // which buffer the in-flight read fills
-    reg [31:0]  r_rd_addr;
-    reg [3:0]   r_gap;          // CDC settle countdown
-    reg         r_flush_final;  // 1 = the in-flight flush is the final one
+    logic [1:0]   r_rd_target;    // which buffer the in-flight read fills
+    logic [31:0]  r_rd_addr;
+    logic [3:0]   r_gap;          // CDC settle countdown
+    logic         r_flush_final;  // 1 = the in-flight flush is the final one
 
     // Op classification.
     wire w_is_blend = (r_op == OP_FILL_BLEND) ||
@@ -324,7 +324,7 @@ module blitter_dma (
     // cancels for verbatim data); unaligned re-packing is fixed.
     wire [127:0] w_dma_rd_swap = {i_dma_read_data[63:0], i_dma_read_data[127:64]};
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (!i_Rst_L) begin
             state          <= S_IDLE;
             r_busy         <= 1'b0;
@@ -438,7 +438,7 @@ module blitter_dma (
                 // bit-identical to blend565(); blended pixels just cost +1 cycle
                 // (negligible — the blitter is DDR-bound). Cursor is stable.
                 S_BLEND2: begin : blend_mul
-                    reg [7:0] ia;
+                    logic [7:0] ia;
                     ia = 8'd255 - r_alpha_q;
                     r_mul_fg_r <= r_fg_q[15:11] * r_alpha_q;
                     r_mul_bg_r <= r_bg_q[15:11] * ia;
@@ -454,7 +454,7 @@ module blitter_dma (
                     // Opaque: write w_fg directly (short path). Blend: add the
                     // registered products + 128 and pack (the light second half).
                     if (w_is_blend) begin : blend_add
-                        reg [15:0] tr, tg, tb;
+                        logic [15:0] tr, tg, tb;
                         tr = r_mul_fg_r + r_mul_bg_r + 16'd128;  // R5
                         tg = r_mul_fg_g + r_mul_bg_g + 16'd128;  // G6
                         tb = r_mul_fg_b + r_mul_bg_b + 16'd128;  // B5

@@ -5,8 +5,8 @@
 `timescale 1ns/1ps
 module tb_div_prep;
 
-   reg  [63:0] r_div_dividend, r_div_divisor, r_div_quotient, r_div_remainder;
-   reg  [6:0]  r_div_counter;
+   logic  [63:0] r_div_dividend, r_div_divisor, r_div_quotient, r_div_remainder;
+   logic  [6:0]  r_div_counter;
 
    // exact copies of the RTL wires
    wire [63:0] w_div_shifted = {r_div_remainder[62:0], r_div_dividend[63]};
@@ -17,7 +17,7 @@ module tb_div_prep;
    function [6:0] count_leading_zeros;
       input [63:0] val;
       integer clz_i;
-      reg [6:0] clz_result;
+      logic [6:0] clz_result;
       begin
          clz_result = 7'd64;
          for (clz_i = 0; clz_i < 64; clz_i = clz_i + 1) begin
@@ -37,7 +37,7 @@ module tb_div_prep;
       output [63:0] quotient;
       output [63:0] remainder;
       output integer iter_cycles;
-      reg [6:0] prep_clz;
+      logic [6:0] prep_clz;
       begin
          r_div_dividend  = dividend;
          r_div_divisor   = divisor;
@@ -76,7 +76,7 @@ module tb_div_prep;
    task check;
       input [63:0] dividend;
       input [63:0] divisor;
-      reg [63:0] q, r;
+      logic [63:0] q, r;
       integer c;
       begin
          if (divisor != 0) begin
@@ -91,7 +91,7 @@ module tb_div_prep;
    endtask
 
    integer i;
-   reg [63:0] a, b, q, r;
+   logic [63:0] a, b, q, r;
    integer c, total_c;
    initial begin
       // edge cases

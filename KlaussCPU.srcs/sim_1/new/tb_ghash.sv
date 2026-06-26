@@ -28,11 +28,11 @@
 
 module tb_ghash;
 
-    reg          clk;
-    reg          rst;
-    reg          start;
-    reg  [127:0] X;
-    reg  [127:0] H;
+    logic          clk;
+    logic          rst;
+    logic          start;
+    logic  [127:0] X;
+    logic  [127:0] H;
     wire [127:0] Z;
     wire         busy;
     wire         done;
@@ -90,7 +90,7 @@ module tb_ghash;
         end
     endtask
 
-    reg [127:0] Z1;
+    logic [127:0] Z1;
     localparam [127:0] H_TC2   = 128'h 66e94bd4_ef8a2c3b_884cfa59_ca342b2e;
     localparam [127:0] CT_TC2  = 128'h 0388dace_60b6a392_f328c2b9_71b2fe78;
     localparam [127:0] LEN_TC2 = 128'h 00000000_00000000_00000000_00000080;

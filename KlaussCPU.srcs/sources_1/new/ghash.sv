@@ -39,9 +39,9 @@ module ghash (
     input              i_start,      // 1-cycle pulse: latch X/H, begin multiply
     input      [127:0] i_X,          // X operand (already in NIST bit order)
     input      [127:0] i_H,          // H operand (already in NIST bit order)
-    output reg [127:0] o_Z,          // result Z = X • H
-    output reg         o_busy,
-    output reg         o_done
+    output logic [127:0] o_Z,          // result Z = X • H
+    output logic         o_busy,
+    output logic         o_done
 );
 
     // Reduction constant — x^128 + x^7 + x^2 + x + 1, with the implicit
@@ -49,17 +49,17 @@ module ghash (
     localparam [127:0] R_POLY = 128'h E1000000_00000000_00000000_00000000;
 
     // Internal state
-    reg [127:0] r_Z;          // accumulator (Z[i] in NIST notation)
-    reg [127:0] r_V;          // shifted operand (V[i] in NIST notation)
-    reg [127:0] r_X_shift;    // X with the current bit-to-process at MSB
-    reg [7:0]   r_count;      // 0..127
+    logic [127:0] r_Z;          // accumulator (Z[i] in NIST notation)
+    logic [127:0] r_V;          // shifted operand (V[i] in NIST notation)
+    logic [127:0] r_X_shift;    // X with the current bit-to-process at MSB
+    logic [7:0]   r_count;      // 0..127
 
     localparam ST_IDLE = 2'd0;
     localparam ST_RUN  = 2'd1;
     localparam ST_DONE = 2'd2;
-    reg [1:0] r_state;
+    logic [1:0] r_state;
 
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         if (i_rst) begin
             r_state   <= ST_IDLE;
             r_Z       <= 128'h0;

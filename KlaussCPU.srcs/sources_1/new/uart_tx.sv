@@ -11,7 +11,7 @@ module uart_tx
     input            i_Tx_DV,
     input      [7:0] i_Tx_Byte,
     output           o_Tx_Active,
-    output reg       o_Tx_Serial,
+    output logic       o_Tx_Serial,
     output           o_Tx_Done
 );
 
@@ -21,14 +21,14 @@ module uart_tx
     localparam s_TX_STOP_BIT = 3'b011;
     localparam s_CLEANUP = 3'b100;
 
-    reg [ 2:0] r_SM_Main = 0;
-    reg [15:0] r_Clock_Count = 0;
-    reg [ 2:0] r_Bit_Index = 0;
-    reg [ 7:0] r_Tx_Data = 0;
-    reg        r_Tx_Done = 0;
-    reg        r_Tx_Active = 0;
+    logic [ 2:0] r_SM_Main = 0;
+    logic [15:0] r_Clock_Count = 0;
+    logic [ 2:0] r_Bit_Index = 0;
+    logic [ 7:0] r_Tx_Data = 0;
+    logic        r_Tx_Done = 0;
+    logic        r_Tx_Active = 0;
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
 
         case (r_SM_Main)
             s_IDLE: begin

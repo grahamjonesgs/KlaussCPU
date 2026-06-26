@@ -29,13 +29,13 @@
 
 module tb_sha256_core;
 
-    reg          clk;
-    reg          rst;
-    reg          init;
-    reg          start;
-    reg  [511:0] block;
-    reg          h_load;
-    reg  [255:0] h_in;
+    logic          clk;
+    logic          rst;
+    logic          init;
+    logic          start;
+    logic  [511:0] block;
+    logic          h_load;
+    logic  [255:0] h_in;
     wire         busy;
     wire         done;
     wire [255:0] digest;

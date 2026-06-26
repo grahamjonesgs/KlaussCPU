@@ -52,15 +52,15 @@ module aes_core (
     input  wire [127:0] i_key,         // 128-bit key (consumed on i_key_load)
     input  wire [127:0] i_data_in,     // 128-bit plaintext / ciphertext
 
-    output reg          o_busy,
-    output reg          o_done,
-    output reg  [127:0] o_data_out
+    output logic          o_busy,
+    output logic          o_done,
+    output logic  [127:0] o_data_out
 );
 
     // -------------------------------------------------------------------------
     // Round-key storage: 11 × 128-bit (round 0 = original key).
     // -------------------------------------------------------------------------
-    reg [127:0] r_round_key [0:10];
+    logic [127:0] r_round_key [0:10];
 
     // -------------------------------------------------------------------------
     // FSM
@@ -71,14 +71,14 @@ module aes_core (
     localparam ST_DEC   = 3'd3;   // decryption in progress
     localparam ST_DONE  = 3'd4;
 
-    reg [2:0] r_state;
-    reg [3:0] r_round;        // 0..10 (encrypt counts up, decrypt counts down)
-    reg [127:0] r_state_data; // current 128-bit state
+    logic [2:0] r_state;
+    logic [3:0] r_round;        // 0..10 (encrypt counts up, decrypt counts down)
+    logic [127:0] r_state_data; // current 128-bit state
 
     // Round pipeline (see header).  r_sub holds the registered SubBytes /
     // InvSubBytes result; r_phase selects the round sub-cycle.
-    reg [127:0] r_sub;
-    reg         r_phase;
+    logic [127:0] r_sub;
+    logic         r_phase;
     localparam PH_SUB = 1'b0;  // cycle 1: latch S-box output into r_sub
     localparam PH_MIX = 1'b1;  // cycle 2: ShiftRows / MixColumns / AddRoundKey
 
@@ -148,7 +148,7 @@ module aes_core (
     function [127:0] shift_rows;
         input [127:0] s;
         integer r, c;
-        reg [127:0] out;
+        logic [127:0] out;
         begin
             for (r = 0; r < 4; r = r + 1)
                 for (c = 0; c < 4; c = c + 1)
@@ -160,7 +160,7 @@ module aes_core (
     function [127:0] inv_shift_rows;
         input [127:0] s;
         integer r, c;
-        reg [127:0] out;
+        logic [127:0] out;
         begin
             for (r = 0; r < 4; r = r + 1)
                 for (c = 0; c < 4; c = c + 1)
@@ -197,7 +197,7 @@ module aes_core (
 
     function [31:0] mix_col;
         input [31:0] col;
-        reg [7:0] a0, a1, a2, a3;
+        logic [7:0] a0, a1, a2, a3;
         begin
             a0 = col[7:0]; a1 = col[15:8]; a2 = col[23:16]; a3 = col[31:24];
             mix_col = {
@@ -211,7 +211,7 @@ module aes_core (
 
     function [31:0] inv_mix_col;
         input [31:0] col;
-        reg [7:0] a0, a1, a2, a3;
+        logic [7:0] a0, a1, a2, a3;
         begin
             a0 = col[7:0]; a1 = col[15:8]; a2 = col[23:16]; a3 = col[31:24];
             inv_mix_col = {
@@ -250,8 +250,8 @@ module aes_core (
         end
     endgenerate
 
-    reg [31:0] r_ks_word;       // word being processed by key schedule
-    reg [3:0]  r_ks_idx;        // round-key index being computed (1..10)
+    logic [31:0] r_ks_word;       // word being processed by key schedule
+    logic [3:0]  r_ks_idx;        // round-key index being computed (1..10)
     assign w_ks_sb_in[0] = r_ks_word[15:8];   // RotWord: lo byte was byte[1]
     assign w_ks_sb_in[1] = r_ks_word[23:16];
     assign w_ks_sb_in[2] = r_ks_word[31:24];
@@ -288,7 +288,7 @@ module aes_core (
     // Main state machine
     // -------------------------------------------------------------------------
     integer i;
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         if (i_rst) begin
             r_state    <= ST_IDLE;
             r_round    <= 4'd0;

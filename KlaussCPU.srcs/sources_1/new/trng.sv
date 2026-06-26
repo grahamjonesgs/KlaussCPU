@@ -59,7 +59,7 @@ module trng (
     input      [15:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,
-    output reg [63:0] o_mmio_read_data,
+    output logic [63:0] o_mmio_read_data,
     output            o_mmio_ready
 );
 
@@ -76,8 +76,8 @@ module trng (
     // -------------------------------------------------------------------------
     // Control register
     // -------------------------------------------------------------------------
-    reg r_enable;
-    reg r_reseed_pulse;
+    logic r_enable;
+    logic r_reseed_pulse;
 
     // -------------------------------------------------------------------------
     // 16 ring oscillators + double-FF synchroniser per channel.
@@ -92,7 +92,7 @@ module trng (
     // -------------------------------------------------------------------------
     wire [15:0] w_osc;
     (* DONT_TOUCH = "true" *) reg [15:0] r_osc_meta;   // first sample
-    reg [15:0] r_osc_sync;                              // second sample
+    logic [15:0] r_osc_sync;                              // second sample
 
     genvar gi;
     generate
@@ -102,7 +102,7 @@ module trng (
         end
     endgenerate
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_osc_meta <= 16'h0;
             r_osc_sync <= 16'h0;
@@ -128,11 +128,11 @@ module trng (
     // -------------------------------------------------------------------------
     localparam [5:0] RCT_LIMIT = 6'd32;
 
-    reg       r_rct_value;
-    reg [5:0] r_rct_count;
-    reg       r_rct_fail;
+    logic       r_rct_value;
+    logic [5:0] r_rct_count;
+    logic       r_rct_fail;
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_rct_value <= 1'b0;
             r_rct_count <= 6'd1;
@@ -165,12 +165,12 @@ module trng (
     // they are at one-cycle granularity here, because the 16 ROs are sampled
     // afresh each cycle.
     // -------------------------------------------------------------------------
-    reg       r_pair_state;     // 0 = waiting for first of pair, 1 = waiting for second
-    reg       r_first_bit;
-    reg       r_vn_bit;
-    reg       r_vn_valid;
+    logic       r_pair_state;     // 0 = waiting for first of pair, 1 = waiting for second
+    logic       r_first_bit;
+    logic       r_vn_bit;
+    logic       r_vn_valid;
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_pair_state <= 1'b0;
             r_first_bit  <= 1'b0;
@@ -201,11 +201,11 @@ module trng (
     // -------------------------------------------------------------------------
     // 64-bit accumulator — shift in one Von Neumann bit at a time.
     // -------------------------------------------------------------------------
-    reg [63:0] r_accum;
-    reg [5:0]  r_accum_count;
-    reg        r_accum_full_pulse;
+    logic [63:0] r_accum;
+    logic [5:0]  r_accum_count;
+    logic        r_accum_full_pulse;
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_accum             <= 64'h0;
             r_accum_count       <= 6'd0;
@@ -238,20 +238,20 @@ module trng (
     // ready from bus_splitter).  A level-sensitive pop would consume two FIFO
     // entries per software read.
     // -------------------------------------------------------------------------
-    reg [63:0] r_fifo [0:1];
-    reg [1:0]  r_fifo_count;   // 0, 1, or 2
-    reg        r_fifo_head;    // pop index
-    reg        r_fifo_tail;    // push index
+    logic [63:0] r_fifo [0:1];
+    logic [1:0]  r_fifo_count;   // 0, 1, or 2
+    logic        r_fifo_head;    // pop index
+    logic        r_fifo_tail;    // push index
 
-    reg  r_read_dv_prev;
-    always @(posedge i_Clk) begin
+    logic  r_read_dv_prev;
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) r_read_dv_prev <= 1'b0;
         else          r_read_dv_prev <= i_mmio_read_DV;
     end
     wire w_read_rising = i_mmio_read_DV && ~r_read_dv_prev;
     wire w_pop = w_read_rising && (i_mmio_addr == OFF_DATA) && (r_fifo_count != 2'd0);
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_fifo[0]    <= 64'h0;
             r_fifo[1]    <= 64'h0;
@@ -292,7 +292,7 @@ module trng (
     // -------------------------------------------------------------------------
     // MMIO write path
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_enable       <= 1'b0;
             r_reseed_pulse <= 1'b0;
@@ -309,7 +309,7 @@ module trng (
     // -------------------------------------------------------------------------
     // MMIO read path
     // -------------------------------------------------------------------------
-    always @* begin
+    always_comb begin
         o_mmio_read_data = 64'h0;
         case (i_mmio_addr)
             OFF_CTRL:   o_mmio_read_data = {63'h0, r_enable};

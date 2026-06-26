@@ -29,27 +29,27 @@ module uart_rx #(
     localparam s_CLEANUP    = 3'b100;
     localparam s_BREAK_WAIT = 3'b101;  // Wait for line to return high after break
 
-    reg        r_Rx_Data_R = 1'b1;
-    reg        r_Rx_Data = 1'b1;
+    logic        r_Rx_Data_R = 1'b1;
+    logic        r_Rx_Data = 1'b1;
 
-    reg [15:0] r_Clock_Count = 0;
-    reg [ 2:0] r_Bit_Index = 0;  //8 bits total
-    reg [ 7:0] r_Rx_Byte = 0;
-    reg        r_Rx_DV = 0;
-    reg        r_Break = 0;
-    reg [ 2:0] r_SM_Main = 0;
+    logic [15:0] r_Clock_Count = 0;
+    logic [ 2:0] r_Bit_Index = 0;  //8 bits total
+    logic [ 7:0] r_Rx_Byte = 0;
+    logic        r_Rx_DV = 0;
+    logic        r_Break = 0;
+    logic [ 2:0] r_SM_Main = 0;
 
     // Purpose: Double-register the incoming data.
     // This allows it to be used in the UART RX Clock Domain.
     // (It removes problems caused by metastability)
-    always @(posedge i_Clock) begin
+    always_ff @(posedge i_Clock) begin
         r_Rx_Data_R <= i_Rx_Serial;
         r_Rx_Data   <= r_Rx_Data_R;
     end
 
 
     // Purpose: Control RX state machine
-    always @(posedge i_Clock) begin
+    always_ff @(posedge i_Clock) begin
 
         case (r_SM_Main)
             s_IDLE: begin

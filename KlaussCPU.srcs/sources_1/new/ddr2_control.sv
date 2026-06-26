@@ -46,8 +46,8 @@ module ddr2_control (
     input [31:0] i_mem_addr,
     input [127:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
-    output reg [127:0] o_mem_read_data,
-    output reg o_mem_ready,
+    output logic [127:0] o_mem_read_data,
+    output logic o_mem_ready,
     output o_calib_done,          // MIG init_calib_complete (DDR2 ready)
     output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (CPU runs synchronous to it)
 
@@ -58,21 +58,21 @@ module ddr2_control (
    assign o_calib_done = calib_done;
    assign o_ui_clk = ui_clk;      // expose the MIG UI clock to clock the whole CPU synchronously
 
-   reg [26:0] app_addr = 0;
-   reg [2:0] app_cmd = 0;
-   reg app_en;
+   logic [26:0] app_addr = 0;
+   logic [2:0] app_cmd = 0;
+   logic app_en;
    wire app_rdy;
 
    // 2:1 PHY ratio: the MIG user interface is 64-bit (APP_DATA_WIDTH =
    // 2*nCK_PER_CLK*16 = 2*2*16). A 128-bit cache line is therefore TWO 64-bit
    // UI beats. beat0 = line[63:0] (pushed/returned first), beat1 = line[127:64].
-   reg  [63:0] app_wdf_data;
-   reg         app_wdf_end;        // 0 on beat0, 1 on beat1 (last beat of the burst)
-   reg         app_wdf_wren;
+   logic  [63:0] app_wdf_data;
+   logic         app_wdf_end;        // 0 on beat0, 1 on beat1 (last beat of the burst)
+   logic         app_wdf_wren;
    wire        app_wdf_rdy;
 
    wire [63:0] app_rd_data;
-   reg  [ 7:0] app_wdf_mask;       // 8 byte-mask bits per 64-bit beat
+   logic  [ 7:0] app_wdf_mask;       // 8 byte-mask bits per 64-bit beat
    wire        app_rd_data_end;
    wire        app_rd_data_valid;
 
@@ -105,9 +105,9 @@ module ddr2_control (
    localparam READ = 4'd4;
    localparam READ_DONE = 4'd5;
    localparam WRITE_B1 = 4'd6;   // push the second 64-bit write beat (2:1 UI)
-   reg [3:0] state = IDLE;
+   logic [3:0] state = IDLE;
 
-   reg rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
+   logic rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
 
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
@@ -165,7 +165,7 @@ module ddr2_control (
    );
 
 
-   always @(posedge ui_clk) begin
+   always_ff @(posedge ui_clk) begin
       if (ui_clk_sync_rst) begin
          state <= IDLE;
          app_en <= 0;

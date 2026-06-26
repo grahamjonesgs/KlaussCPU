@@ -12,9 +12,9 @@
 
 module aes_sbox (
     input  wire [7:0] i_byte,
-    output reg  [7:0] o_byte
+    output logic  [7:0] o_byte
 );
-    always @* begin
+    always_comb begin
         case (i_byte)
             8'h00: o_byte = 8'h63;  8'h01: o_byte = 8'h7c;  8'h02: o_byte = 8'h77;  8'h03: o_byte = 8'h7b;
             8'h04: o_byte = 8'hf2;  8'h05: o_byte = 8'h6b;  8'h06: o_byte = 8'h6f;  8'h07: o_byte = 8'hc5;
@@ -87,9 +87,9 @@ endmodule
 
 module aes_isbox (
     input  wire [7:0] i_byte,
-    output reg  [7:0] o_byte
+    output logic  [7:0] o_byte
 );
-    always @* begin
+    always_comb begin
         case (i_byte)
             8'h00: o_byte = 8'h52;  8'h01: o_byte = 8'h09;  8'h02: o_byte = 8'h6a;  8'h03: o_byte = 8'hd5;
             8'h04: o_byte = 8'h30;  8'h05: o_byte = 8'h36;  8'h06: o_byte = 8'ha5;  8'h07: o_byte = 8'h38;

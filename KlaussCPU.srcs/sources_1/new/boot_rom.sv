@@ -28,7 +28,7 @@ module boot_rom #(
 ) (
     input                   i_clk,
     input      [ADDR_W-1:0] i_dw_addr,      // doubleword index
-    output reg [63:0]       o_dword
+    output logic [63:0]       o_dword
 );
     (* ram_style = "block" *) reg [63:0] mem [0:DEPTH_DW-1];
 
@@ -36,7 +36,7 @@ module boot_rom #(
         $readmemh(INIT_FILE, mem);
     end
 
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         o_dword <= mem[i_dw_addr];
     end
 

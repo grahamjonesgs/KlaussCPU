@@ -51,7 +51,7 @@ MAX_BYTES_PER_CS+1
     output o_TX_Ready,  // Transmit Ready for next byte
 
     // RX (MISO) Signals
-    output reg [$clog2(
+    output logic [$clog2(
 MAX_BYTES_PER_CS+1
 )-1:0] o_RX_Count,  // Index RX byte
     output o_RX_DV,  // Data Valid pulse (1 clock cycle)
@@ -68,10 +68,10 @@ MAX_BYTES_PER_CS+1
    localparam TRANSFER = 2'b01;
    localparam CS_INACTIVE = 2'b10;
 
-   reg [1:0] r_SM_CS;
-   reg r_CS_n;
-   reg [$clog2(CS_INACTIVE_CLKS)-1:0] r_CS_Inactive_Count;
-   reg [$clog2(MAX_BYTES_PER_CS+1)-1:0] r_TX_Count;
+   logic [1:0] r_SM_CS;
+   logic r_CS_n;
+   logic [$clog2(CS_INACTIVE_CLKS)-1:0] r_CS_Inactive_Count;
+   logic [$clog2(MAX_BYTES_PER_CS+1)-1:0] r_TX_Count;
    wire w_Master_Ready;
 
    // Instantiate Master
@@ -100,7 +100,7 @@ MAX_BYTES_PER_CS+1
 
 
    // Purpose: Control CS line using State Machine
-   always @(posedge i_Clk or negedge i_Rst_L) begin
+   always_ff @(posedge i_Clk or negedge i_Rst_L) begin
       if (~i_Rst_L) begin
          r_SM_CS <= IDLE;
          r_CS_n <= 1'b1;  // Resets to high
@@ -147,11 +147,11 @@ MAX_BYTES_PER_CS+1
             end
          endcase  // case (r_SM_CS)
       end
-   end  // always @ (posedge i_Clk or negedge i_Rst_L)
+   end  // always_ff @(posedge i_Clk or negedge i_Rst_L)
 
 
    // Purpose: Keep track of RX_Count
-   always @(posedge i_Clk) begin
+   always_ff @(posedge i_Clk) begin
       begin
          if (r_CS_n) begin
             o_RX_Count <= 0;

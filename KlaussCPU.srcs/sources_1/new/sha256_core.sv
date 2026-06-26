@@ -45,8 +45,8 @@ module sha256_core (
     input              i_h_load,
     input      [255:0] i_h_in,        // {H7, H6, H5, H4, H3, H2, H1, H0}
 
-    output reg         o_busy,
-    output reg         o_done,
+    output logic         o_busy,
+    output logic         o_done,
     output     [255:0] o_digest
 );
 
@@ -147,11 +147,11 @@ module sha256_core (
     // -------------------------------------------------------------------------
     // State storage
     // -------------------------------------------------------------------------
-    reg [31:0] H [0:7];        // running hash state
-    reg [31:0] a, b, c, d, e, f, g, h;   // working vars during a block
-    reg [31:0] W [0:15];       // sliding message-schedule window
-    reg [6:0]  r_round;        // 0..63 during compression
-    reg [1:0]  r_state;
+    logic [31:0] H [0:7];        // running hash state
+    logic [31:0] a, b, c, d, e, f, g, h;   // working vars during a block
+    logic [31:0] W [0:15];       // sliding message-schedule window
+    logic [6:0]  r_round;        // 0..63 during compression
+    logic [1:0]  r_state;
 
     localparam ST_IDLE  = 2'd0;
     localparam ST_RUN   = 2'd1;
@@ -174,7 +174,7 @@ module sha256_core (
     // FSM
     // -------------------------------------------------------------------------
     integer i;
-    always @(posedge i_clk) begin
+    always_ff @(posedge i_clk) begin
         if (i_rst) begin
             r_state <= ST_IDLE;
             r_round <= 7'd0;

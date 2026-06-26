@@ -21,13 +21,13 @@
 
 module tb_hmac_sha256;
 
-    reg          clk;
-    reg          rst;
-    reg          init;
-    reg          start;
-    reg  [511:0] block;
-    reg          h_load;
-    reg  [255:0] h_in;
+    logic          clk;
+    logic          rst;
+    logic          init;
+    logic          start;
+    logic  [511:0] block;
+    logic          h_load;
+    logic  [255:0] h_in;
     wire         busy;
     wire         done;
     wire [255:0] digest;
@@ -93,10 +93,10 @@ module tb_hmac_sha256;
         end
     endtask
 
-    reg [255:0] inner_state;
-    reg [255:0] outer_state;
-    reg [255:0] inner_digest;
-    reg [255:0] final_tag;
+    logic [255:0] inner_state;
+    logic [255:0] outer_state;
+    logic [255:0] inner_digest;
+    logic [255:0] final_tag;
 
     // RFC 4231 TC1 expected HMAC tag.  Canonical byte-stream form is
     // b0344c61_..._2e32cff7.  o_digest is {H[7],...,H[0]}, so the literal

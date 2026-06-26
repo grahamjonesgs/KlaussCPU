@@ -19,17 +19,17 @@ module uart_rx_fifo #(
     output [3:0] o_Count
 );
 
-    reg [7:0] r_mem  [0:DEPTH-1];
-    reg [3:0] r_head;   // write pointer
-    reg [3:0] r_tail;   // read pointer
-    reg [4:0] r_count;  // 0..DEPTH (5 bits to hold value == DEPTH)
+    logic [7:0] r_mem  [0:DEPTH-1];
+    logic [3:0] r_head;   // write pointer
+    logic [3:0] r_tail;   // read pointer
+    logic [4:0] r_count;  // 0..DEPTH (5 bits to hold value == DEPTH)
 
     assign o_Empty     = (r_count == 5'd0);
     assign o_Full      = (r_count == DEPTH[4:0]);
     assign o_Count     = r_count[3:0];
     assign o_Peek_Byte = r_mem[r_tail];  // combinatorial lookahead
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (i_Reset) begin
             r_head  <= 4'd0;
             r_tail  <= 4'd0;

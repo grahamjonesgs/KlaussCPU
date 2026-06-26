@@ -50,7 +50,7 @@ module crypto_sha (
     input      [15:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,
-    output reg [63:0] o_mmio_read_data,
+    output logic [63:0] o_mmio_read_data,
     output            o_mmio_ready
 );
 
@@ -95,7 +95,7 @@ module crypto_sha (
     // Block-input storage (raw MMIO little-endian view).
     // BLOCK[i] at offset (0x10 + 8*i), i in 0..7.
     // -------------------------------------------------------------------------
-    reg [63:0] r_block_mmio [0:7];
+    logic [63:0] r_block_mmio [0:7];
 
     // Per-32-bit-word byteswap helper.
     function [31:0] bswap32;
@@ -117,18 +117,18 @@ module crypto_sha (
     // -------------------------------------------------------------------------
     // HMAC state cache + FSM declarations
     // -------------------------------------------------------------------------
-    reg [255:0] r_hmac_key;
-    reg [255:0] r_inner_state;       // owned by HMAC FSM block (driver-1)
-    reg [255:0] r_outer_state;       // owned by HMAC FSM block (driver-1)
-    reg         r_hmac_key_valid;    // owned by HMAC FSM block (driver-1)
-    reg [2:0]   r_hmac_fsm;
-    reg         r_hmac_use_outer_block;
-    reg         r_hmac_init_pulse;
-    reg         r_hmac_start_pulse;
-    reg         r_hmac_kl_trigger;       // 1-cycle pulse: software wrote HMAC_CTRL.KEY_LOAD
-    reg         r_hmac_keyzero_pulse;    // 1-cycle pulse: software wrote HMAC_CTRL.KEY_ZERO
-    reg         r_h_load_pulse;          // 1-cycle pulse to core's i_h_load
-    reg         r_h_load_sel;            // 0 = inner_state, 1 = outer_state
+    logic [255:0] r_hmac_key;
+    logic [255:0] r_inner_state;       // owned by HMAC FSM block (driver-1)
+    logic [255:0] r_outer_state;       // owned by HMAC FSM block (driver-1)
+    logic         r_hmac_key_valid;    // owned by HMAC FSM block (driver-1)
+    logic [2:0]   r_hmac_fsm;
+    logic         r_hmac_use_outer_block;
+    logic         r_hmac_init_pulse;
+    logic         r_hmac_start_pulse;
+    logic         r_hmac_kl_trigger;       // 1-cycle pulse: software wrote HMAC_CTRL.KEY_LOAD
+    logic         r_hmac_keyzero_pulse;    // 1-cycle pulse: software wrote HMAC_CTRL.KEY_ZERO
+    logic         r_h_load_pulse;          // 1-cycle pulse to core's i_h_load
+    logic         r_h_load_sel;            // 0 = inner_state, 1 = outer_state
 
     localparam HMAC_IDLE    = 3'd0;
     localparam HMAC_START_I = 3'd1;  // INIT sent last cycle → drive START with inner block
@@ -147,7 +147,7 @@ module crypto_sha (
     function [511:0] hmac_block;
         input [255:0] key;
         input [7:0]   pad;
-        reg [31:0] pad32;
+        logic [31:0] pad32;
         integer kk;
         begin
             pad32 = {4{pad}};
@@ -165,8 +165,8 @@ module crypto_sha (
     // Core instantiation — i_init/i_start/i_block are muxed between the
     // software MMIO path and the HMAC FSM path; i_h_load is HMAC-FSM-only.
     // -------------------------------------------------------------------------
-    reg          r_init_pulse;
-    reg          r_start_pulse;
+    logic          r_init_pulse;
+    logic          r_start_pulse;
     wire         w_core_busy;
     wire         w_core_done;
     wire [255:0] w_digest_core;
@@ -190,8 +190,8 @@ module crypto_sha (
     // INIT → START with one transition in between; software writes blocks
     // then writes CTRL.START on a separate MMIO cycle).  The pipeline reg
     // has the correct value latched in time.
-    reg [511:0] r_sha_block_pipe;
-    always @(posedge i_Clk) r_sha_block_pipe <= w_sha_block_pre;
+    logic [511:0] r_sha_block_pipe;
+    always_ff @(posedge i_Clk) r_sha_block_pipe <= w_sha_block_pre;
 
     (* KEEP_HIERARCHY = "yes" *)
     sha256_core u_sha (
@@ -210,7 +210,7 @@ module crypto_sha (
     // Sticky DONE flag — set when core asserts done, cleared on next INIT/START.
     // Gated by !w_hmac_busy so HMAC-FSM-driven SHA passes don't visibly mutate
     // the software-facing DONE bit.
-    reg r_done_latch;
+    logic r_done_latch;
 
     // -------------------------------------------------------------------------
     // Write path — software MMIO interface to SHA registers AND HMAC registers.
@@ -219,7 +219,7 @@ module crypto_sha (
     // consumed by the HMAC FSM (separate always block below).
     // -------------------------------------------------------------------------
     integer i;
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_init_pulse         <= 1'b0;
             r_start_pulse        <= 1'b0;
@@ -305,7 +305,7 @@ module crypto_sha (
     // the SHA core's i_init/i_start; it does NOT touch software's pulses or
     // BLOCK/DIGEST registers directly.
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_hmac_fsm             <= HMAC_IDLE;
             r_inner_state          <= 256'h0;
@@ -377,7 +377,7 @@ module crypto_sha (
     // -------------------------------------------------------------------------
     function [63:0] digest_pack;
         input [1:0] idx;       // 0..3
-        reg [31:0] lo, hi;
+        logic [31:0] lo, hi;
         begin
             lo = w_digest_core[(2*idx + 0) * 32 +: 32];
             hi = w_digest_core[(2*idx + 1) * 32 +: 32];
@@ -385,7 +385,7 @@ module crypto_sha (
         end
     endfunction
 
-    always @* begin
+    always_comb begin
         o_mmio_read_data = 64'h0;
         case (i_mmio_addr)
             OFF_STATUS:  o_mmio_read_data = { 62'h0, r_done_latch, w_core_busy };

@@ -42,16 +42,16 @@ module sd_spi (
     input      [15:0] i_mmio_addr,
     input      [63:0] i_mmio_write_data,
     input      [ 7:0] i_mmio_byte_en,
-    output reg [63:0] o_mmio_read_data,
+    output logic [63:0] o_mmio_read_data,
     output            o_mmio_ready,
 
     // ----- SD card pins (Nexys A7 microSD slot) -----
     input             i_sd_cd,         // card detect (board-dependent polarity)
     output            o_sd_reset_n,    // active-low slot power gate (0 = powered)
-    output reg        o_sd_sck,
-    output reg        o_sd_mosi,
+    output logic        o_sd_sck,
+    output logic        o_sd_mosi,
     input             i_sd_miso,
-    output reg        o_sd_cs_n,
+    output logic        o_sd_cs_n,
     output            o_sd_dat1,       // unused in SPI mode — drive high
     output            o_sd_dat2        // unused in SPI mode — drive high
 );
@@ -75,8 +75,8 @@ module sd_spi (
     // -----------------------------------------------------------------------
     // Control register
     // -----------------------------------------------------------------------
-    reg [15:0] r_clk_div;     // half-period of SCK, in i_Clk cycles minus 1
-    reg        r_pwr_en;      // 1 → slot powered (drives SD_RESET low)
+    logic [15:0] r_clk_div;     // half-period of SCK, in i_Clk cycles minus 1
+    logic        r_pwr_en;      // 1 → slot powered (drives SD_RESET low)
     // o_sd_cs_n is a reg, written directly from SD_CTRL[16] writes.
 
     assign o_sd_reset_n = ~r_pwr_en;
@@ -92,20 +92,20 @@ module sd_spi (
     // -----------------------------------------------------------------------
     localparam BYTE_IDLE = 1'b0, BYTE_SHIFT = 1'b1;
 
-    reg        r_byte_sm;
-    reg [ 2:0] r_bit_idx;       // 7 → 0
-    reg        r_sck_phase;     // 0 = SCK low half, 1 = SCK high half
-    reg [15:0] r_phase_count;
-    reg [ 7:0] r_tx_shift;
-    reg [ 7:0] r_rx_shift;
-    reg [ 7:0] r_rx_byte;
-    reg        r_byte_busy;
+    logic        r_byte_sm;
+    logic [ 2:0] r_bit_idx;       // 7 → 0
+    logic        r_sck_phase;     // 0 = SCK low half, 1 = SCK high half
+    logic [15:0] r_phase_count;
+    logic [ 7:0] r_tx_shift;
+    logic [ 7:0] r_rx_shift;
+    logic [ 7:0] r_rx_byte;
+    logic        r_byte_busy;
 
     wire w_kick_byte = i_mmio_write_DV
                        && (i_mmio_addr == OFF_DATA)
                        && !r_byte_busy;
 
-    always @(posedge i_Clk or negedge i_Rst_L) begin
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
         if (~i_Rst_L) begin
             r_byte_sm     <= BYTE_IDLE;
             r_bit_idx     <= 3'd7;
@@ -169,10 +169,10 @@ module sd_spi (
     // read, byte-enabled write). Small enough to keep in LUTRAM and avoids
     // adding a wait-state to o_mmio_ready.
     // -----------------------------------------------------------------------
-    reg [63:0] r_sector_buf [0:63];
+    logic [63:0] r_sector_buf [0:63];
 
     integer bi;
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (i_mmio_write_DV && is_buf) begin
             for (bi = 0; bi < 8; bi = bi + 1) begin
                 if (i_mmio_byte_en[bi])
@@ -184,7 +184,7 @@ module sd_spi (
     // -----------------------------------------------------------------------
     // Control register write
     // -----------------------------------------------------------------------
-    always @(posedge i_Clk or negedge i_Rst_L) begin
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
         if (~i_Rst_L) begin
             r_clk_div <= 16'd249;   // ~200 kHz init speed @ 100 MHz i_Clk
             o_sd_cs_n <= 1'b1;       // CS deasserted
@@ -199,7 +199,7 @@ module sd_spi (
     // -----------------------------------------------------------------------
     // Read mux — combinational. Returns 0 for undefined offsets.
     // -----------------------------------------------------------------------
-    always @* begin
+    always_comb begin
         o_mmio_read_data = 64'h0;
         if (is_buf) begin
             o_mmio_read_data = r_sector_buf[buf_idx];

@@ -41,22 +41,22 @@ module mem_read_write (
     input      [31:0] i_mem_addr,       // byte address (doubleword-aligned for 64-bit ops)
     input      [63:0] i_mem_write_data,
     input      [ 7:0] i_mem_byte_en,    // byte enables for writes (8'hFF = full doubleword)
-    output reg [63:0] o_mem_read_data,
-    output reg [63:0] o_mem_read_data_next, // next consecutive doubleword in same cache line
-    output reg        o_mem_next_valid,      // 1 when o_mem_read_data_next is valid (offset == 0)
-    output reg        o_mem_ready,
+    output logic [63:0] o_mem_read_data,
+    output logic [63:0] o_mem_read_data_next, // next consecutive doubleword in same cache line
+    output logic        o_mem_next_valid,      // 1 when o_mem_read_data_next is valid (offset == 0)
+    output logic        o_mem_ready,
 
     // Performance counters (RISC-V Zihpm-style cache events) and control.
     // i_stat_clear: 1-cycle pulse — zeros all counters on the next edge.
     // o_cache_info: read-only geometry register, see MMIO_MAP.md.
     input             i_stat_clear,
     output     [63:0] o_cache_info,
-    output reg [63:0] o_cnt_read_hits,
-    output reg [63:0] o_cnt_read_misses,
-    output reg [63:0] o_cnt_write_hits,
-    output reg [63:0] o_cnt_write_misses,
-    output reg [63:0] o_cnt_writebacks,
-    output reg [63:0] o_cnt_stall_cycles,
+    output logic [63:0] o_cnt_read_hits,
+    output logic [63:0] o_cnt_read_misses,
+    output logic [63:0] o_cnt_write_hits,
+    output logic [63:0] o_cnt_write_misses,
+    output logic [63:0] o_cnt_writebacks,
+    output logic [63:0] o_cnt_stall_cycles,
 
     // 50 MHz clock for Ethernet RMII REF_CLK — produced by clk_wiz_0
     // alongside the existing 200 MHz DDR reference clock.  Plumbed up to
@@ -127,25 +127,25 @@ module mem_read_write (
     wire        sys_clk_i;
     // The cache FSM (and the whole CPU above) runs on the MIG ui_clk so it is
     // SYNCHRONOUS with the cache↔MIG interface. `i_Clk` is kept as the name every
-    // `always @(posedge i_Clk)` already uses — it's now an internal net driven by
+    // `always_ff @(posedge i_Clk)` already uses — it's now an internal net driven by
     // the MIG ui_clk (w_ui_clk), not the board oscillator (i_Clk_board feeds the
     // MIG's 200 MHz reference via clk_wiz_0).
     wire        w_ui_clk;
     wire        i_Clk = w_ui_clk;
     assign      o_ui_clk = w_ui_clk;
-    reg  [ 9:0] por_counter = 32;
+    logic  [ 9:0] por_counter = 32;
     wire        resetn = (por_counter == 0);
 
     // Power-up values are explicit so simulation matches hardware (FPGA regs
     // init to 0); without these the DDR-side DVs are X until first assigned.
-    reg          o_ddr_mem_write_DV = 1'b0;
-    reg          o_ddr_mem_read_DV  = 1'b0;
-    reg  [ 31:0] o_ddr_mem_addr;
-    reg  [127:0] o_ddr_mem_write_data;
+    logic          o_ddr_mem_write_DV = 1'b0;
+    logic          o_ddr_mem_read_DV  = 1'b0;
+    logic  [ 31:0] o_ddr_mem_addr;
+    logic  [127:0] o_ddr_mem_write_data;
     wire [127:0] i_ddr_mem_read_data;
     wire         i_ddr_mem_ready;
     wire [ 15:0] w_app_wdf_mask;
-    reg  [ 15:0] r_app_wdf_mask;
+    logic  [ 15:0] r_app_wdf_mask;
 
     assign w_app_wdf_mask = r_app_wdf_mask;
 
@@ -158,7 +158,7 @@ module mem_read_write (
     // the blitter when the cache is idle, then back when the blitter pulses
     // i_dma_done — see the grant always-block near the FSM below.
     // -------------------------------------------------------------------------
-    reg          r_grant_blit = 1'b0;     // 0 = cache owns DDR, 1 = blitter owns
+    logic          r_grant_blit = 1'b0;     // 0 = cache owns DDR, 1 = blitter owns
 
     wire         mig_write_DV   = r_grant_blit ? i_dma_write_DV   : o_ddr_mem_write_DV;
     wire         mig_read_DV    = r_grant_blit ? i_dma_read_DV    : o_ddr_mem_read_DV;
@@ -176,13 +176,13 @@ module mem_read_write (
     // already active are ignored (the walk is idempotent anyway).
     //   r_mnt_mode: 0 = FLUSH (write back dirty), 1 = INVALIDATE (flush + clear valid)
     // -------------------------------------------------------------------------
-    reg r_mnt_pending = 1'b0;
-    reg r_mnt_mode    = 1'b0;
-    reg r_mnt_active  = 1'b0;     // set by the main FSM while a walk runs
+    logic r_mnt_pending = 1'b0;
+    logic r_mnt_mode    = 1'b0;
+    logic r_mnt_active  = 1'b0;     // set by the main FSM while a walk runs
 
     assign o_mnt_busy = r_mnt_active | r_mnt_pending;
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (r_mnt_active) begin
             r_mnt_pending <= 1'b0;             // being serviced — clear request
         end else if (i_flush_go || i_inval_go) begin
@@ -233,50 +233,50 @@ module mem_read_write (
 
     // Tag + valid bit (bit [TAG_BITS] = valid, bits [TAG_BITS-1:0] = tag)
     (* ram_style = "block" *)
-    reg [TAG_BITS:0] cache_val_addr_way0 [CACHE_SIZE-1:0];
+    logic [TAG_BITS:0] cache_val_addr_way0 [CACHE_SIZE-1:0];
 
     (* ram_style = "block" *)
-    reg [TAG_BITS:0] cache_val_addr_way1 [CACHE_SIZE-1:0];
+    logic [TAG_BITS:0] cache_val_addr_way1 [CACHE_SIZE-1:0];
 
     // 128-bit cache line data
     (* ram_style = "block" *)
-    reg [127:0] cache_val_data_way0 [CACHE_SIZE-1:0];
+    logic [127:0] cache_val_data_way0 [CACHE_SIZE-1:0];
 
     (* ram_style = "block" *)
-    reg [127:0] cache_val_data_way1 [CACHE_SIZE-1:0];
+    logic [127:0] cache_val_data_way1 [CACHE_SIZE-1:0];
 
     // Dirty bits — 1-bit wide, distributed RAM. Written via dedicated always
     // blocks below (separate from the FSM) so Vivado can infer DRAM cleanly.
     (* ram_style = "distributed" *)
-    reg cache_dirty_way0 [CACHE_SIZE-1:0];
+    logic cache_dirty_way0 [CACHE_SIZE-1:0];
 
     (* ram_style = "distributed" *)
-    reg cache_dirty_way1 [CACHE_SIZE-1:0];
+    logic cache_dirty_way1 [CACHE_SIZE-1:0];
 
     // LRU bit: 0 = way1 most-recently-used (evict way0)
     //          1 = way0 most-recently-used (evict way1)
     (* ram_style = "block" *)
-    reg cache_lru [CACHE_SIZE-1:0];
+    logic cache_lru [CACHE_SIZE-1:0];
 
     // -------------------------------------------------------------------------
     // Pipeline registers — filled in WAIT from BRAM reads, used in CHECK
     // -------------------------------------------------------------------------
-    reg [TAG_BITS:0]     r_tag_way0;
-    reg [TAG_BITS:0]     r_tag_way1;
-    reg                  r_dirty_way0;
-    reg                  r_dirty_way1;
-    reg                  r_lru;
-    reg [127:0]          r_data_way0;
-    reg [127:0]          r_data_way1;
+    logic [TAG_BITS:0]     r_tag_way0;
+    logic [TAG_BITS:0]     r_tag_way1;
+    logic                  r_dirty_way0;
+    logic                  r_dirty_way1;
+    logic                  r_lru;
+    logic [127:0]          r_data_way0;
+    logic [127:0]          r_data_way1;
 
     // Latched request (stable while CPU waits, but latching makes CDC clear)
-    reg [INDEX_BITS-1:0] r_cache_index;
-    reg [TAG_BITS-1:0]   r_cache_tag;
-    reg                  r_byte_offset;   // which doubleword in 128-bit cache line (0=upper, 1=lower)
-    reg [7:0]            r_byte_en;       // byte enables (8'hFF = full doubleword write)
-    reg [63:0]           r_write_data;
-    reg                  r_is_write;
-    reg [31:0]           r_computed_ddr_addr;
+    logic [INDEX_BITS-1:0] r_cache_index;
+    logic [TAG_BITS-1:0]   r_cache_tag;
+    logic                  r_byte_offset;   // which doubleword in 128-bit cache line (0=upper, 1=lower)
+    logic [7:0]            r_byte_en;       // byte enables (8'hFF = full doubleword write)
+    logic [63:0]           r_write_data;
+    logic                  r_is_write;
+    logic [31:0]           r_computed_ddr_addr;
 
     // -------------------------------------------------------------------------
     // Hit / evict decode — combinational from the registered BRAM outputs.
@@ -297,11 +297,11 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     // Miss-path pipeline registers
     // -------------------------------------------------------------------------
-    reg [127:0] r_evict_data_hold;     // dirty line being written back to DDR
-    reg [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
-    reg [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
-    reg         r_evict_way;          // which way to replace (miss paths)
-    reg [3:0]   r_gap_count;          // gap between writeback and refill. Single
+    logic [127:0] r_evict_data_hold;     // dirty line being written back to DDR
+    logic [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
+    logic [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
+    logic         r_evict_way;          // which way to replace (miss paths)
+    logic [3:0]   r_gap_count;          // gap between writeback and refill. Single
                                        // domain, so it only needs to let
                                        // ddr2_control go IDLE->WAIT (both DVs low)
                                        // before the refill DV. (WRITE/READ_EVICT_GAP)
@@ -335,7 +335,7 @@ module mem_read_write (
                                                   // CRASH_DUMP.md ERR=01 trace at PC=0x78.
     localparam MAINT                 = 16'd16384; // cache flush/invalidate walk (sub-FSM below)
 
-    reg [15:0] state = WAIT;
+    logic [15:0] state = WAIT;
 
     // -------------------------------------------------------------------------
     // Maintenance sub-FSM (inside the MAINT state). Walks r_cache_index 0..N-1,
@@ -353,7 +353,7 @@ module mem_read_write (
     localparam MS_W1_GAP  = 4'd6;
     localparam MS_CLR     = 4'd7;   // clear dirty (both modes) / valid (INVALIDATE)
     localparam MS_DONE    = 4'd8;
-    reg [3:0] r_mnt_sub = MS_READ;
+    logic [3:0] r_mnt_sub = MS_READ;
 
     // Unified cache-array READ index. The CPU (WAIT) and the maintenance walk
     // (MAINT/MS_READ) read the tag/dirty/data/lru arrays through THIS single
@@ -374,7 +374,7 @@ module mem_read_write (
     // (ui_clk can't start until resetn releases, resetn can't release without
     // ui_clk). The board clock is free-running, so it breaks the loop.
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk_board) begin
+    always_ff @(posedge i_Clk_board) begin
         if (por_counter > 0)
             por_counter <= por_counter - 1;
     end
@@ -424,20 +424,20 @@ module mem_read_write (
                       (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
     wire dirty1_din = w_write_hit_now || (state == WRITE_FETCH && w_cache_ddr_ready);
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (dirty0_wen) cache_dirty_way0[r_cache_index] <= dirty0_din;
     end
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (dirty1_wen) cache_dirty_way1[r_cache_index] <= dirty1_din;
     end
 
     // -------------------------------------------------------------------------
     // Main FSM
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin : fsm
+    always_ff @(posedge i_Clk) begin : fsm
 
-        reg [127:0] merged; // procedural variable for cache line merge
+        logic [127:0] merged; // procedural variable for cache line merge
 
         case (state)
 
@@ -531,9 +531,9 @@ module mem_read_write (
                         // write the BRAM now.  Dirty bit set via the
                         // combinatorial dirty0/1_wen wires (w_write_hit_now).
                         begin : write_hit_merge
-                            reg [127:0] hitline;
-                            reg [63:0]  old_dw;
-                            reg [63:0]  new_dw;
+                            logic [127:0] hitline;
+                            logic [63:0]  old_dw;
+                            logic [63:0]  new_dw;
                             hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
                             // Extract old doubleword at the target offset
                             // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
@@ -588,7 +588,7 @@ module mem_read_write (
                         // the "next" doubleword is only valid at offset 0
                         // (companion is the lower dw of the same line).
                         begin : read_hit_present
-                            reg [127:0] hitline;
+                            logic [127:0] hitline;
                             hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
                             if (r_byte_offset == 1'b0) begin
                                 o_mem_read_data      <= hitline[127:64];
@@ -673,8 +673,8 @@ module mem_read_write (
                     o_ddr_mem_read_DV <= 0;
 
                     begin : write_fetch_merge
-                        reg [63:0] old_dw;
-                        reg [63:0] new_dw;
+                        logic [63:0] old_dw;
+                        logic [63:0] new_dw;
                         // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
                         old_dw = r_byte_offset ? i_ddr_mem_read_data[63:0]
                                                : i_ddr_mem_read_data[127:64];
@@ -935,7 +935,7 @@ module mem_read_write (
     // be interrupted mid-CDC-gap. In the intended coherency sequence the blit
     // and the flush/invalidate never overlap anyway.
     // -------------------------------------------------------------------------
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (!r_grant_blit) begin
             if (!is_miss_path && !r_mnt_active && i_dma_req)
                 r_grant_blit <= 1'b1;
@@ -954,7 +954,7 @@ module mem_read_write (
         o_cnt_stall_cycles = 64'd0;
     end
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
         if (i_stat_clear) begin
             o_cnt_read_hits    <= 64'd0;
             o_cnt_read_misses  <= 64'd0;
