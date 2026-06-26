@@ -34,8 +34,8 @@ endtask
 // Increment PC by 1
 // Increment r_SM_msg
 task t_delay_reg;
-    reg [31:0] r_timeout_fraction;
-    reg [ 3:0] reg_1;
+    logic [31:0] r_timeout_fraction;
+    logic [ 3:0] reg_1;
     begin
 
         if(r_timing_start==0) // first cycle of timing

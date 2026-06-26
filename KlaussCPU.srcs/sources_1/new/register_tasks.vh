@@ -122,8 +122,8 @@ endtask
 // Add value to reg
 task t_add_value;
    input [31:0] i_value;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] hold;
+   logic        carry;
    begin
       {carry, hold} = {1'b0, r_reg_port_b} + {1'b0, i_value};
       r_alu_pipe_value    <= hold;
@@ -151,9 +151,9 @@ endtask
 // instead of the prior SETR + ADDR pair.
 task t_addi;
    input [31:0] i_value;
-   reg [63:0] sign_ext_imm;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] sign_ext_imm;
+   logic [63:0] hold;
+   logic        carry;
    begin
       sign_ext_imm = {{32{i_value[31]}}, i_value};
       {carry, hold} = {1'b0, r_reg_port_b} + {1'b0, sign_ext_imm};
@@ -172,8 +172,8 @@ endtask
 // Subtract value from reg
 task t_minus_value;
    input [31:0] i_value;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] hold;
+   logic        carry;
    begin
       {carry, hold} = {1'b0, r_reg_port_b} - {1'b0, i_value};
       r_alu_pipe_value    <= hold;
@@ -191,8 +191,8 @@ endtask
 
 // Decrement reg
 task t_dec_reg;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] hold;
+   logic        carry;
    begin
       {carry, hold} = {1'b0, r_reg_port_b} - {65'b1};
       r_alu_pipe_value    <= hold;
@@ -208,8 +208,8 @@ endtask
 
 // Increment reg
 task t_inc_reg;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] hold;
+   logic        carry;
    begin
       {carry, hold} = {1'b0, r_reg_port_b} + 65'b1;
       r_alu_pipe_value    <= hold;
@@ -226,10 +226,10 @@ endtask
 // Compare register to value (no register write)
 task t_compare_reg_value;
    input [31:0] i_value;
-   reg signed [63:0] s_reg;
-   reg signed [63:0] s_val;
-   reg [63:0] u_val;
-   reg [63:0] diff;
+   logic signed [63:0] s_reg;
+   logic signed [63:0] s_val;
+   logic [63:0] u_val;
+   logic [63:0] diff;
    begin
       s_reg = r_reg_port_b;
       s_val = {{32{i_value[31]}}, i_value};  // sign-extend 32-bit value to 64-bit
@@ -247,8 +247,8 @@ endtask
 
 // SUBR - rd = rs1 - rs2
 task t_subr3;
-   reg [63:0] hold;
-   reg        carry;
+   logic [63:0] hold;
+   logic        carry;
    begin
       {carry, hold} = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b};
       r_alu_pipe_value    <= hold;
@@ -316,7 +316,7 @@ endtask
 
 // Right shift arithmetical reg
 task t_right_shift_a_reg;
-   reg signed [63:0] signed_val;
+   logic signed [63:0] signed_val;
    begin
       signed_val = r_reg_port_b;
       r_writeback_value <= signed_val >>> 1;
@@ -328,9 +328,9 @@ endtask
 
 // CMPRR - set flags from first-second, no writeback (for use with conditional jumps)
 task t_cmprr3;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
-   reg [63:0] diff;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
+   logic [63:0] diff;
    begin
       s_a  = r_reg_port_a;
       s_b  = r_reg_port_b;
@@ -349,7 +349,7 @@ endtask
 // ADDR - rd = rs1 + rs2
 //=============================================================================
 task t_addr3;
-   reg [65:0] hold;
+   logic [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b};
       r_alu_pipe_value    <= hold[63:0];
@@ -367,7 +367,7 @@ endtask
 // ADDC RRR — rd = rs1 + rs2 + carry_flag  (add with carry)
 // Overflow: same-sign inputs producing opposite-sign result.
 task t_addc3;
-   reg [65:0] hold;
+   logic [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b} + {65'b0, r_carry_flag};
       r_alu_pipe_value    <= hold[63:0];
@@ -386,7 +386,7 @@ endtask
 // carry_flag acts as borrow-in (x86 SBB convention).
 // Overflow: operands have opposite signs and result sign differs from rs1.
 task t_subc3;
-   reg [65:0] hold;
+   logic [65:0] hold;
    begin
       hold = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b} - {65'b0, r_carry_flag};
       r_alu_pipe_value    <= hold[63:0];

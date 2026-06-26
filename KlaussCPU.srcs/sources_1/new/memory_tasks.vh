@@ -98,7 +98,7 @@ endtask
 // Little-endian 64-bit bus: byte_addr[2:0]=0 → bits[7:0] (LSB), 7→bits[63:56] (MSB)
 // 1-word instruction (PC+4)
 task t_memset8;
-   reg [2:0] byte_lane;
+   logic [2:0] byte_lane;
    begin
       if (r_extra_clock == 0) begin
          byte_lane        = r_reg_port_b[2:0];
@@ -151,7 +151,7 @@ endtask
 // MEMSET16 - Write 16-bit halfword to byte address in register
 // Little-endian 64-bit bus, 2-byte aligned
 task t_memset16;
-   reg [2:0] byte_lane;
+   logic [2:0] byte_lane;
    begin
       if (r_extra_clock == 0) begin
          byte_lane        = {r_reg_port_b[2:1], 1'b0};  // aligned to 2-byte boundary
@@ -246,8 +246,8 @@ endtask
 // phases 1-3. Safe because WRITEBACK only fires once we set r_SM<=WRITEBACK
 // in the final cycle of phase 1 or phase 3. PC += 4 (1-word RR instruction).
 task t_memget32;
-   reg [2:0]  offset;
-   reg [31:0] result;
+   logic [2:0]  offset;
+   logic [31:0] result;
    begin
       offset = r_reg_port_b[2:0];
 

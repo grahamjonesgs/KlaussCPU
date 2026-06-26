@@ -5,7 +5,7 @@
 // REQUIRES: r_reg_port_a and r_reg_port_b to be declared and updated each cycle:
 //   reg [31:0] r_reg_port_a;
 //   reg [31:0] r_reg_port_b;
-//   always @(posedge i_Clk) begin
+//   always_ff @(posedge i_Clk) begin
 //       r_reg_port_a <= r_register[r_reg_1];
 //       r_reg_port_b <= r_register[r_reg_2];
 //   end
@@ -41,7 +41,7 @@ endtask
 
 // ROLCR - Rotate left through carry (65-bit rotate)
 task t_rotate_left_carry;
-   reg [64:0] temp;
+   logic [64:0] temp;
    begin
       temp = {r_reg_port_b, r_carry_flag};
       r_writeback_value <= {temp[63:0]};
@@ -55,7 +55,7 @@ endtask
 
 // RORCR - Rotate right through carry (65-bit rotate)
 task t_rotate_right_carry;
-   reg [64:0] temp;
+   logic [64:0] temp;
    begin
       temp = {r_carry_flag, r_reg_port_b};
       r_writeback_value <= temp[64:1];
@@ -70,8 +70,8 @@ endtask
 // ROLV - Rotate left by N bits
 task t_rotate_left_n;
    input [31:0] i_count;
-   reg [5:0] count;
-   reg [63:0] result;
+   logic [5:0] count;
+   logic [63:0] result;
    begin
       count = i_count[5:0];  // Only use lower 6 bits (0-63)
       result = (r_reg_port_b << count) | (r_reg_port_b >> (64 - count));
@@ -86,8 +86,8 @@ endtask
 // RORV - Rotate right by N bits
 task t_rotate_right_n;
    input [31:0] i_count;
-   reg [5:0] count;
-   reg [63:0] result;
+   logic [5:0] count;
+   logic [63:0] result;
    begin
       count = i_count[5:0];
       result = (r_reg_port_b >> count) | (r_reg_port_b << (64 - count));
@@ -101,8 +101,8 @@ endtask
 
 // ROLR - rd = rs1 rol rs2[5:0]
 task t_rotate_left_reg;
-   reg [5:0] count;
-   reg [63:0] result;
+   logic [5:0] count;
+   logic [63:0] result;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a << count) | (r_reg_port_a >> (64 - count));
@@ -116,8 +116,8 @@ endtask
 
 // RORR - rd = rs1 ror rs2[5:0]
 task t_rotate_right_reg;
-   reg [5:0] count;
-   reg [63:0] result;
+   logic [5:0] count;
+   logic [63:0] result;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a >> count) | (r_reg_port_a << (64 - count));
@@ -209,7 +209,7 @@ endtask
 
 // BTSTRR - rd = (rs1 >> rs2[5:0]) & 1
 task t_bit_test_reg;
-   reg [5:0] bit_pos;
+   logic [5:0] bit_pos;
    begin
       bit_pos = r_reg_port_b[5:0];
       r_writeback_value <= {63'b0, r_reg_port_a[bit_pos]};
@@ -265,10 +265,10 @@ endtask
 // Operates on the low 32 bits of rs only; result zero-extended to 64 bits.
 task t_extract_bits;
    input [31:0] i_params;
-   reg [4:0] start_pos;
-   reg [4:0] length;
-   reg [31:0] mask;
-   reg [31:0] result;
+   logic [4:0] start_pos;
+   logic [4:0] length;
+   logic [31:0] mask;
+   logic [31:0] result;
    begin
       start_pos = i_params[4:0];
       length = i_params[12:8];
@@ -289,10 +289,10 @@ endtask
 // for [31:0], and are zero above bit 31 (32-bit result zero-extended).
 task t_deposit_bits;
    input [31:0] i_params;
-   reg [4:0] start_pos;
-   reg [4:0] length;
-   reg [31:0] mask;
-   reg [31:0] insert_val;
+   logic [4:0] start_pos;
+   logic [4:0] length;
+   logic [31:0] mask;
+   logic [31:0] insert_val;
    begin
       start_pos = i_params[4:0];
       length = i_params[12:8];
@@ -333,8 +333,8 @@ endtask
 
 // CMPLTR - rd = (rs1 < rs2) ? 1 : 0, signed
 task t_cmpltr;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -347,8 +347,8 @@ endtask
 
 // CMPLER - rd = (rs1 <= rs2) ? 1 : 0, signed
 task t_cmpler;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -361,8 +361,8 @@ endtask
 
 // CMPGTR - rd = (rs1 > rs2) ? 1 : 0, signed
 task t_cmpgtr;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -375,8 +375,8 @@ endtask
 
 // CMPGER - rd = (rs1 >= rs2) ? 1 : 0, signed
 task t_cmpger;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -506,8 +506,8 @@ endtask
 
 // DIVR - rd = rs1 / rs2, signed
 task t_div_regs_hw;
-   reg [63:0] abs_dividend;
-   reg [63:0] abs_divisor;
+   logic [63:0] abs_dividend;
+   logic [63:0] abs_divisor;
    begin
       if (r_reg_port_b == 64'b0) begin
          // Divide by zero
@@ -563,8 +563,8 @@ endtask
 
 // MODR - rd = rs1 % rs2, signed
 task t_mod_regs_hw;
-   reg [63:0] abs_dividend;
-   reg [63:0] abs_divisor;
+   logic [63:0] abs_dividend;
+   logic [63:0] abs_divisor;
    begin
       if (r_reg_port_b == 64'b0) begin
          r_writeback_value <= r_reg_port_a;  // Return dividend
@@ -619,8 +619,8 @@ endtask
 // DIVV - Divide by immediate value (signed, initialization only)
 task t_div_value_hw;
    input [31:0] i_value;
-   reg [63:0] abs_dividend;
-   reg [63:0] abs_divisor;
+   logic [63:0] abs_dividend;
+   logic [63:0] abs_divisor;
    begin
       if (i_value == 32'b0) begin
          r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
@@ -650,8 +650,8 @@ endtask
 // MODV - Modulo by immediate value (signed, initialization only)
 task t_mod_value_hw;
    input [31:0] i_value;
-   reg [63:0] abs_dividend;
-   reg [63:0] abs_divisor;
+   logic [63:0] abs_dividend;
+   logic [63:0] abs_divisor;
    begin
       if (i_value == 32'b0) begin
          // MOD by zero returns the dividend (rd % 0 == rd). MODV is in-place, so
@@ -772,7 +772,7 @@ endtask
 // SHLV - Shift left by N bits
 task t_left_shift_n;
    input [31:0] i_count;
-   reg [63:0] result;
+   logic [63:0] result;
    begin
       result = r_reg_port_b << i_count[5:0];
       r_writeback_value <= result;
@@ -786,7 +786,7 @@ endtask
 // SHRV - Shift right by N bits (logical)
 task t_right_shift_n;
    input [31:0] i_count;
-   reg [63:0] result;
+   logic [63:0] result;
    begin
       result = r_reg_port_b >> i_count[5:0];
       r_writeback_value <= result;
@@ -800,8 +800,8 @@ endtask
 // SHRAV - Shift right arithmetical by N bits
 task t_right_shift_a_n;
    input [31:0] i_count;
-   reg signed [63:0] signed_val;
-   reg [63:0] result;
+   logic signed [63:0] signed_val;
+   logic [63:0] result;
    begin
       signed_val = r_reg_port_b;
       result = signed_val >>> i_count[5:0];
@@ -815,8 +815,8 @@ endtask
 
 // MINR - rd = min(rs1, rs2), signed
 task t_min_regs;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -829,8 +829,8 @@ endtask
 
 // MAXR - rd = max(rs1, rs2), signed
 task t_max_regs;
-   reg signed [63:0] s_a;
-   reg signed [63:0] s_b;
+   logic signed [63:0] s_a;
+   logic signed [63:0] s_b;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
@@ -891,7 +891,7 @@ endtask
 
 // SARR - rd = rs1 >>> rs2[5:0], arithmetic right shift
 task t_sarr3;
-   reg signed [63:0] signed_val;
+   logic signed [63:0] signed_val;
    begin
       signed_val = r_reg_port_a;
       r_writeback_value <= signed_val >>> r_reg_port_b[5:0];
@@ -918,7 +918,7 @@ endtask
 // LDIDX - Load indexed: reg1 = mem[reg2 + immediate]
 task t_load_indexed;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
@@ -941,7 +941,7 @@ endtask
 // STIDX - Store indexed: mem[reg2 + immediate] = reg1
 task t_store_indexed;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
@@ -963,7 +963,7 @@ endtask
 // LDIDX64 - Load 64-bit doubleword indexed: reg1 = mem64[reg2 + immediate]
 task t_load_indexed64;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
@@ -986,7 +986,7 @@ endtask
 // STIDX64 - Store 64-bit doubleword indexed: mem64[reg2 + immediate] = reg1
 task t_store_indexed64;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset[31:0];
@@ -1012,7 +1012,7 @@ endtask
 // (avoids direct r_register[n] mux which causes timing violations)
 task t_load_indexed_reg;
    input [31:0] i_var1;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          // Stage 0: Save base address, redirect port B to offset register
@@ -1048,7 +1048,7 @@ endtask
 // Uses 3-stage pipeline to read offset register through existing read port
 task t_store_indexed_reg;
    input [31:0] i_var1;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          // Stage 0: Save base address and store data, redirect port B to offset register
@@ -1090,7 +1090,7 @@ endtask
 // LDIDX32 RRV — rd = zero_ext(mem32[(rs2 + imm32) & ~3])
 task t_load_indexed32;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
@@ -1115,7 +1115,7 @@ endtask
 // STIDX32 RRV — mem32[(rs2 + imm32) & ~3] = rs1[31:0]
 task t_store_indexed32;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;
@@ -1137,7 +1137,7 @@ endtask
 // LDIDX16 RRV — rd = zero_ext(mem16[(rs2 + imm32) & ~1])
 task t_load_indexed16;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
@@ -1168,8 +1168,8 @@ endtask
 // instead of LDIDX16 + SEXTH.
 task t_load_indexed16_s;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
-   reg [15:0] half_val;
+   logic [31:0] effective_addr;
+   logic [15:0] half_val;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
@@ -1198,8 +1198,8 @@ endtask
 // STIDX16 RRV — mem16[(rs2 + imm32) & ~1] = rs1[15:0]
 task t_store_indexed16;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
-   reg [2:0]  byte_lane;
+   logic [31:0] effective_addr;
+   logic [2:0]  byte_lane;
    begin
       if (r_extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;
@@ -1222,7 +1222,7 @@ endtask
 // LDIDX8 RRV — rd = zero_ext(mem8[rs2 + imm32])
 task t_load_indexed8;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
+   logic [31:0] effective_addr;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
@@ -1257,8 +1257,8 @@ endtask
 // instead of LDIDX8 + SEXTB.
 task t_load_indexed8_s;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
-   reg [7:0]  byte_val;
+   logic [31:0] effective_addr;
+   logic [7:0]  byte_val;
    begin
       if (r_extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
@@ -1291,8 +1291,8 @@ endtask
 // STIDX8 RRV — mem8[rs2 + imm32] = rs1[7:0]
 task t_store_indexed8;
    input [31:0] i_offset;
-   reg [31:0] effective_addr;
-   reg [2:0]  byte_lane;
+   logic [31:0] effective_addr;
+   logic [2:0]  byte_lane;
    begin
       if (r_extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;

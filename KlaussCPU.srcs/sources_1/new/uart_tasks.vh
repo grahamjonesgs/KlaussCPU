@@ -228,11 +228,11 @@ endtask
 // On completion: r_PC += 8 (2-word instruction: opcode + imm32).
 task t_tx_string_at_mem;
     input [31:0] i_location;
-    reg [3:0]  null_pos;
-    reg        has_null;
-    reg [2:0]  offset;          // addr & 7 — non-zero only on the first chunk
-    reg [3:0]  usable_bytes;    // 8 - offset
-    reg [63:0] shifted_data;    // doubleword right-shifted so requested byte → pos 0
+    logic [3:0]  null_pos;
+    logic        has_null;
+    logic [2:0]  offset;          // addr & 7 — non-zero only on the first chunk
+    logic [3:0]  usable_bytes;    // 8 - offset
+    logic [63:0] shifted_data;    // doubleword right-shifted so requested byte → pos 0
     begin
         if (r_tx_str_state_mem == 3'b000) begin
             // Latch base address and assert read DV. Then go to a 1-cycle
@@ -376,11 +376,11 @@ endtask
 // by `offset` bytes and scans only the lower `(8 - offset)` bytes; state 100
 // then realigns to the next 8-byte boundary so subsequent reads have offset 0.
 task t_tx_string_at_reg;
-    reg [3:0]  null_pos;
-    reg        has_null;
-    reg [2:0]  offset;
-    reg [3:0]  usable_bytes;
-    reg [63:0] shifted_data;
+    logic [3:0]  null_pos;
+    logic        has_null;
+    logic [2:0]  offset;
+    logic [3:0]  usable_bytes;
+    logic [63:0] shifted_data;
     begin
         if (r_tx_str_state_reg == 3'b000) begin
             r_tx_str_addr_reg  <= r_reg_port_b[26:0];
@@ -707,9 +707,9 @@ endfunction
 function [7:0] f_dump_byte;
     input [6:0] phase;
     input [4:0] pos;
-    reg   [3:0]  k;          // family index (which reg / stack / trace entry)
-    reg   [63:0] data;       // 64-bit data word for family lines
-    reg   [31:0] half;       // 32-bit V1H/OPCM half-word
+    logic   [3:0]  k;          // family index (which reg / stack / trace entry)
+    logic   [63:0] data;       // 64-bit data word for family lines
+    logic   [31:0] half;       // 32-bit V1H/OPCM half-word
     begin
         f_dump_byte = 8'h00;
         case (phase)
