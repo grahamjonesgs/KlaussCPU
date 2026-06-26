@@ -32,8 +32,8 @@ module KlaussCPU (
     input             i_SPI_LCD_MISO,
     output            o_SPI_LCD_MOSI,
     output            o_SPI_LCD_CS_n,
-    output reg        o_LCD_DC,
-    output reg        o_LCD_reset_n,
+    output logic        o_LCD_DC,
+    output logic        o_LCD_reset_n,
     output     [ 7:0] o_Anode_Activate,  // anode signals of the 7-segment LED display
     output     [ 7:0] o_LED_cathode,     // cathode patterns of the 7-segment LED display
     input      [15:0] i_switch,
@@ -83,7 +83,7 @@ module KlaussCPU (
 
    // Synchronous clocking: the WHOLE CPU runs on the MIG ui_clk (100 MHz at
    // 2:1), exposed by mem_read_write below as o_ui_clk. `i_Clk` is kept as the
-   // name every `always @(posedge i_Clk)` and `.i_Clk(i_Clk)` already uses — it is
+   // name every `always_ff @(posedge i_Clk)` and `.i_Clk(i_Clk)` already uses — it is
    // now an internal net driven by ui_clk, not the board oscillator. The board
    // oscillator (i_Clk_board) feeds only the MIG's 200 MHz reference (via clk_wiz
    // inside mem_read_write). This makes the cache↔MIG crossing a single domain.
@@ -92,40 +92,49 @@ module KlaussCPU (
 
    localparam STACK_TOP = 32'h800_0000;  // one doubleword (8 bytes) above top of 128 MiB byte address space
 
-   // State Machine Code
-   localparam OPCODE_REQUEST = 32'h1, OPCODE_FETCH = 32'h2, OPCODE_FETCH2 = 32'h4;
-   localparam VAR1_FETCH = 32'h8, VAR1_FETCH2 = 32'h10, WAITING = 32'h20;  // WAITING: interruptible core-suspend (WAIT opcode); uses the state bit above VAR1_FETCH2
-   localparam START_WAIT = 32'h40, UART_DELAY = 32'h80, OPCODE_EXECUTE = 32'h100;
-   localparam HCF_1 = 32'h200, HCF_2 = 32'h400, HCF_3 = 32'h800, HCF_4 = 32'h1_000;
-   localparam NO_PROGRAM = 32'h2_000, LOAD_START = 32'h4_000, LOADING_BYTE = 32'h8_000;
-   localparam LOAD_COMPLETE = 32'h10_000, LOAD_WAIT = 32'h20_000;
-   localparam DEBUG_DATA = 32'h40_000, DEBUG_DATA2 = 32'h80_000, DEBUG_DATA3 = 32'h100_000;
-   localparam DEBUG_WAIT = 32'h200_000;
-   localparam MULTIPLY_CALC      = 32'h0040_0000;  // DSP pipeline stage 2 (MREG)
-   localparam MULTIPLY_PIPE      = 32'h0100_0000;  // DSP pipeline stage 3 (PREG)
-   localparam MULTIPLY_WRITEBACK = 32'h0080_0000;  // Write result
-   localparam MULTIPLY_SETUP     = 32'h4000_0000;  // Setup operands for multiply
-   localparam WRITEBACK          = 32'h0200_0000;  // Register file writeback stage
-   localparam HALTED             = 32'h0400_0000;  // CPU halted, waiting for reset
-   localparam DIVIDE_STEP        = 32'h0800_0000;  // Division iteration state
-   localparam HALTED_BREAK       = 32'h1000_0000;  // Sending UART break before halt
-   localparam MULTIPLY_BREG      = 32'h2000_0000;  // DSP pipeline stage 1 (AREG/BREG)
-   localparam HCF_DUMP           = 32'h8000_0000;  // Crash dump UART emission (sub-state inside r_hcf_dump_phase / r_hcf_dump_sub)
-   // Pipeline register for the 64-bit ALU compute path. Arithmetic / compare
-   // tasks register their result + flags into r_alu_pipe_* (one cycle), then
-   // ALU_FINISH copies the intermediates out to the architectural flag regs
-   // and r_writeback_value (next cycle). Splits the long
-   //   r_reg_port_b → 16 CARRY4 → 7 LUT6 → r_carry_flag
-   // path into two shorter stages for timing closure.
-   localparam ALU_FINISH         = 33'h1_0000_0000;
-   // Divide normalization: one cycle between the div task and DIVIDE_STEP that
-   // pre-shifts the dividend by its leading-zero count, so the iteration loop
-   // runs (64 - clz) steps instead of a fixed 64. Bit-identical result — the
-   // skipped iterations shift zeros into the remainder and emit 0 quotient
-   // bits. Its own state keeps the CLZ + 64-bit shifter off both the
-   // OPCODE_EXECUTE decode region and DIVIDE_STEP's trial-subtract carry chain
-   // (the documented critical paths).
-   localparam DIVIDE_PREP        = 34'h2_0000_0000;
+   // State Machine Code — one-hot FSM packed into a 34-bit enum so the named
+   // states appear in the waveform and can be reasoned about by name.  Values
+   // are the EXACT one-hot bit patterns the design has always used (low 32
+   // states in bits 0..31, ALU_FINISH = bit 32, DIVIDE_PREP = bit 33).  The
+   // (* fsm_encoding = "one_hot" *) on r_SM pins the encoding Vivado previously
+   // inferred from these constants, so the synthesized hardware is unchanged.
+   // r_fault_sm (the crash-dump snapshot) stays a plain logic [33:0] so its
+   // nibble slicing in uart_tasks.vh keeps working.
+   typedef enum logic [33:0] {
+      OPCODE_REQUEST = 34'h1, OPCODE_FETCH = 34'h2, OPCODE_FETCH2 = 34'h4,
+      VAR1_FETCH = 34'h8, VAR1_FETCH2 = 34'h10, WAITING = 34'h20,  // WAITING: interruptible core-suspend (WAIT opcode); uses the state bit above VAR1_FETCH2
+      START_WAIT = 34'h40, UART_DELAY = 34'h80, OPCODE_EXECUTE = 34'h100,
+      HCF_1 = 34'h200, HCF_2 = 34'h400, HCF_3 = 34'h800, HCF_4 = 34'h1_000,
+      NO_PROGRAM = 34'h2_000, LOAD_START = 34'h4_000, LOADING_BYTE = 34'h8_000,
+      LOAD_COMPLETE = 34'h10_000, LOAD_WAIT = 34'h20_000,
+      DEBUG_DATA = 34'h40_000, DEBUG_DATA2 = 34'h80_000, DEBUG_DATA3 = 34'h100_000,
+      DEBUG_WAIT = 34'h200_000,
+      MULTIPLY_CALC      = 34'h0040_0000,  // DSP pipeline stage 2 (MREG)
+      MULTIPLY_PIPE      = 34'h0100_0000,  // DSP pipeline stage 3 (PREG)
+      MULTIPLY_WRITEBACK = 34'h0080_0000,  // Write result
+      MULTIPLY_SETUP     = 34'h4000_0000,  // Setup operands for multiply
+      WRITEBACK          = 34'h0200_0000,  // Register file writeback stage
+      HALTED             = 34'h0400_0000,  // CPU halted, waiting for reset
+      DIVIDE_STEP        = 34'h0800_0000,  // Division iteration state
+      HALTED_BREAK       = 34'h1000_0000,  // Sending UART break before halt
+      MULTIPLY_BREG      = 34'h2000_0000,  // DSP pipeline stage 1 (AREG/BREG)
+      HCF_DUMP           = 34'h8000_0000,  // Crash dump UART emission (sub-state inside r_hcf_dump_phase / r_hcf_dump_sub)
+      // ALU_FINISH (bit 32) — pipeline register for the 64-bit ALU compute path.
+      // Arithmetic / compare tasks register their result + flags into r_alu_pipe_*
+      // (one cycle), then ALU_FINISH copies the intermediates out to the
+      // architectural flag regs and r_writeback_value (next cycle). Splits the long
+      //   r_reg_port_b → 16 CARRY4 → 7 LUT6 → r_carry_flag
+      // path into two shorter stages for timing closure.
+      ALU_FINISH         = 34'h1_0000_0000,
+      // DIVIDE_PREP (bit 33) — divide normalization: one cycle between the div task
+      // and DIVIDE_STEP that pre-shifts the dividend by its leading-zero count, so
+      // the iteration loop runs (64 - clz) steps instead of a fixed 64. Bit-identical
+      // result — the skipped iterations shift zeros into the remainder and emit 0
+      // quotient bits. Its own state keeps the CLZ + 64-bit shifter off both the
+      // OPCODE_EXECUTE decode region and DIVIDE_STEP's trial-subtract carry chain
+      // (the documented critical paths).
+      DIVIDE_PREP        = 34'h2_0000_0000
+   } e_sm_t;
 
    // Error Codes
    localparam ERR_INV_OPCODE = 8'h1, ERR_INV_FSM_STATE = 8'h2, ERR_STACK = 8'h3;
@@ -154,18 +163,18 @@ module KlaussCPU (
    wire [7:0] w_uart_rx_value;  // Received value
    wire w_uart_rx_DV;  // receive flag
    wire w_uart_break;  // Break condition detected
-   reg  r_break_received;  // Set after break, cleared after command byte
+   logic  r_break_received;  // Set after break, cleared after command byte
 
    // UART RX FIFO — buffers bytes for the CPU to read via RXRB / RXRNB opcodes
    wire       w_rx_fifo_empty;
    wire       w_rx_fifo_full;
    wire [7:0] w_rx_fifo_byte;   // combinatorial peek at FIFO head
-   reg        r_rx_fifo_read;   // 1-cycle strobe: pop one byte from FIFO
+   logic        r_rx_fifo_read;   // 1-cycle strobe: pop one byte from FIFO
 
    // LCD control
-   reg [3:0] o_TX_LCD_Count;  // # bytes per CS low
-   reg [7:0] o_TX_LCD_Byte;  // Byte to transmit on MOSI
-   reg o_TX_LCD_DV;  // Data Valid Pulse with i_TX_Byte
+   logic [3:0] o_TX_LCD_Count;  // # bytes per CS low
+   logic [7:0] o_TX_LCD_Byte;  // Byte to transmit on MOSI
+   logic o_TX_LCD_DV;  // Data Valid Pulse with i_TX_Byte
    wire i_TX_LCD_Ready;  // Transmit Ready for next byte
 
    // RX (MISO) Signals
@@ -173,43 +182,43 @@ module KlaussCPU (
    wire i_RX_LCD_DV;  // Data Valid pulse (1 clock cycle)
    wire [7:0] i_RX_LCD_Byte;  // Byte received on MISO
 
-   reg [44:0] r_timeout_counter;  // Room for 32 bits plus the 13 left shift in the timing task
-   reg [44:0] r_timeout_max;
+   logic [44:0] r_timeout_counter;  // Room for 32 bits plus the 13 left shift in the timing task
+   logic [44:0] r_timeout_max;
 
    // Machine control
-   reg [33:0] r_SM;   // 34 bits: bit 32 is ALU_FINISH, bit 33 is DIVIDE_PREP
+   (* fsm_encoding = "one_hot" *) e_sm_t r_SM;   // 34 one-hot states (see e_sm_t); bit 32 = ALU_FINISH, bit 33 = DIVIDE_PREP
    // Snapshot of r_SM at fault time.  r_SM gets overwritten by the HCF chain
    // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping r_SM directly
    // is useless.  We continuously copy r_SM into r_fault_sm while the FSM is
    // in any *non-HCF* state; the moment the trap fires, r_fault_sm freezes
    // at the state that was running immediately before the transition into
    // HCF_1, which is what we actually want in the crash dump.
-   reg [33:0] r_fault_sm = 34'b0;
-   reg [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
-   reg [31:0] r_mem_read_addr;
+   logic [33:0] r_fault_sm = 34'b0;
+   logic [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
+   logic [31:0] r_mem_read_addr;
    wire [31:0] w_opcode;
    wire [31:0] w_var1;
    wire [31:0] w_var2;
    wire [31:0] w_mem;
-   reg [3:0] r_reg_1;
-   reg [3:0] r_reg_2;
-   reg [3:0] r_reg_dst;
-   reg [1:0] r_extra_clock;
-   reg [31:0] r_idx_base_addr;  // Saved base address for indexed register ops (byte addr) — driven/consumed in alu_extended_tasks.vh / uart_tasks.vh
-   reg r_hcf_message_sent;
-   reg [31:0] r_start_wait_counter;
+   logic [3:0] r_reg_1;
+   logic [3:0] r_reg_2;
+   logic [3:0] r_reg_dst;
+   logic [1:0] r_extra_clock;
+   logic [31:0] r_idx_base_addr;  // Saved base address for indexed register ops (byte addr) — driven/consumed in alu_extended_tasks.vh / uart_tasks.vh
+   logic r_hcf_message_sent;
+   logic [31:0] r_start_wait_counter;
 
    // Crash-dump trace ring buffer — captures {PC, opcode} of every dispatched
    // fetch in OPCODE_FETCH2.  On HCF entry the most recent 16 entries (newest at
    // r_trace_idx-1) are flushed over UART so a crash log shows the branch-history
    // leading up to the failing instruction, not just the failing instruction itself.
-   reg [63:0] r_trace_buf [0:15];
-   reg [3:0]  r_trace_idx;          // next-write index, wraps freely
+   logic [63:0] r_trace_buf [0:15];
+   logic [3:0]  r_trace_idx;          // next-write index, wraps freely
    // Free-running count of instructions committed since program load. 32-bit
    // wraps at ~4.3e9 — plenty for crash diagnostics. Reset on initial,
    // CPU_RESETN, and successful program load (LOAD_COMPLETE).
-   reg [31:0] r_instr_count;
-   reg        r_trace_full;         // 1 once the ring has wrapped at least once
+   logic [31:0] r_instr_count;
+   logic        r_trace_full;         // 1 once the ring has wrapped at least once
 
    // Crash dump UART state machine.  Lives entirely inside HCF_DUMP; the sub-state
    // r_hcf_dump_sub walks each line through the UART handshake used elsewhere
@@ -219,32 +228,32 @@ module KlaussCPU (
    // BYTE_BUILD streams r_msg one byte per cycle from f_dump_byte (see
    // uart_tasks.vh).  The legacy single-cycle build collapsed to a 207-input
    // 256-bit mux in synth; the byte-streamed form is an 8-bit mux instead.
-   reg [6:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
-   reg [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK, 101=BYTE_BUILD, 110=PRE_DISPLAY
-   reg [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
-   reg [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
-   reg        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
+   logic [6:0]  r_hcf_dump_phase;     // which dump line to emit (see DUMP_* localparams)
+   logic [2:0]  r_hcf_dump_sub;       // 000=PREP, 001=ACK, 010=DONE_WAIT, 011=STACK_FETCH, 100=BREAK, 101=BYTE_BUILD, 110=PRE_DISPLAY
+   logic [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
+   logic [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
+   logic        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
 
    //load control
    //reg          o_ram_write_DV;
-   reg [31:0] o_ram_write_value;
-   reg [31:0] o_ram_write_addr;
-   reg [31:0] r_ram_next_write_addr;
-   reg [7:0] rx_count;
-   reg [2:0] r_load_byte_counter;
-   reg [15:0] r_checksum;
-   reg [15:0] r_old_checksum;
-   reg [15:0] r_calc_checksum;
-   reg [15:0] r_rec_checksum;
-   reg [31:0] r_PC_requested;
+   logic [31:0] o_ram_write_value;
+   logic [31:0] o_ram_write_addr;
+   logic [31:0] r_ram_next_write_addr;
+   logic [7:0] rx_count;
+   logic [2:0] r_load_byte_counter;
+   logic [15:0] r_checksum;
+   logic [15:0] r_old_checksum;
+   logic [15:0] r_calc_checksum;
+   logic [15:0] r_rec_checksum;
+   logic [31:0] r_PC_requested;
 
    // Register control
-   reg [63:0] r_register[15:0];
-   reg r_zero_flag;
-   reg r_equal_flag;
-   reg r_carry_flag;
-   reg r_overflow_flag;
-   reg [7:0] r_error_code;
+   logic [63:0] r_register[15:0];
+   logic r_zero_flag;
+   logic r_equal_flag;
+   logic r_carry_flag;
+   logic r_overflow_flag;
+   logic [7:0] r_error_code;
 
    // -----------------------------------------------------------------------
    // ALU pipeline registers — written by arithmetic / compare tasks during
@@ -253,60 +262,60 @@ module KlaussCPU (
    // ops in exchange for breaking the 64-bit subtractor → carry-flag path.
    // r_alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
    // -----------------------------------------------------------------------
-   reg [63:0] r_alu_pipe_value;     // ARITH+CMP: subtract/add result
-   reg        r_alu_pipe_carry;     // ARITH only
-   reg        r_alu_pipe_overflow;  // ARITH only
-   reg        r_alu_pipe_equal;     // CMP only
-   reg        r_alu_pipe_less;      // CMP only (signed less-than)
-   reg        r_alu_pipe_ult;       // CMP only (unsigned less-than)
-   reg        r_alu_pipe_mode;      // 0 = ARITH (carry/overflow/sign/value), 1 = CMP (equal/less/ult/sign)
+   logic [63:0] r_alu_pipe_value;     // ARITH+CMP: subtract/add result
+   logic        r_alu_pipe_carry;     // ARITH only
+   logic        r_alu_pipe_overflow;  // ARITH only
+   logic        r_alu_pipe_equal;     // CMP only
+   logic        r_alu_pipe_less;      // CMP only (signed less-than)
+   logic        r_alu_pipe_ult;       // CMP only (unsigned less-than)
+   logic        r_alu_pipe_mode;      // 0 = ARITH (carry/overflow/sign/value), 1 = CMP (equal/less/ult/sign)
 
    // Display value
-   reg [31:0] r_seven_seg_value1;
-   reg [31:0] r_seven_seg_value2;
-   reg r_error_display_type;
-   reg [11:0] r_RGB_LED_1;
-   reg [11:0] r_RGB_LED_2;
+   logic [31:0] r_seven_seg_value1;
+   logic [31:0] r_seven_seg_value2;
+   logic r_error_display_type;
+   logic [11:0] r_RGB_LED_1;
+   logic [11:0] r_RGB_LED_2;
 
    // Stack control — stack now lives in DDR2 RAM, top of 128 MiB, growing down
    // SP = 32'h800_0000 means empty; PUSH: SP-=8, mem[SP]=val; POP: val=mem[SP], SP+=8
    // R15 is the frame pointer by convention (software convention only, no hardware enforcement)
-   reg [31:0] r_SP;           // byte address, always doubleword-aligned (bits [2:0] = 0)
-   reg        r_int_push_wait;  // set while waiting for DDR2 to complete interrupt PC-push
+   logic [31:0] r_SP;           // byte address, always doubleword-aligned (bits [2:0] = 0)
+   logic        r_int_push_wait;  // set while waiting for DDR2 to complete interrupt PC-push
 
    // UART send message
-   reg [255:0] r_msg;  // 32 bytes — longest message is 21 bytes (case 2 of t_tx_message)
-   reg [7:0] r_msg_length;
-   reg r_msg_send_DV;
-   reg r_mem_was_ready;  // driven/consumed in uart_tasks.vh
+   logic [255:0] r_msg;  // 32 bytes — longest message is 21 bytes (case 2 of t_tx_message)
+   logic [7:0] r_msg_length;
+   logic r_msg_send_DV;
+   logic r_mem_was_ready;  // driven/consumed in uart_tasks.vh
    wire i_msg_sent_DV;
    wire w_sending_msg;
 
    // String transmission state machines (for TXSTRMEM and TXSTRMEMR)
-   reg [2:0] r_tx_str_state_mem;   // State machine for TXSTRMEM (imm32 address)
-   reg [2:0] r_tx_str_state_reg;   // State machine for TXSTRMEMR (register address)
-   reg [26:0] r_tx_str_addr_mem;   // Current address for TXSTRMEM
-   reg [26:0] r_tx_str_addr_reg;   // Current address for TXSTRMEMR
-   reg        r_tx_str_done_mem;   // Persists has_null across UART handshake states (TXSTRMEM)
-   reg        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
+   logic [2:0] r_tx_str_state_mem;   // State machine for TXSTRMEM (imm32 address)
+   logic [2:0] r_tx_str_state_reg;   // State machine for TXSTRMEMR (register address)
+   logic [26:0] r_tx_str_addr_mem;   // Current address for TXSTRMEM
+   logic [26:0] r_tx_str_addr_reg;   // Current address for TXSTRMEMR
+   logic        r_tx_str_done_mem;   // Persists has_null across UART handshake states (TXSTRMEM)
+   logic        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
 
    // temp vars for timing
-   reg r_timing_start;
+   logic r_timing_start;
 
    // Interrupt handler
-   reg [31:0] r_interrupt_table[3:0];
-   reg r_timer_interrupt;
-   reg [31:0] r_timer_interrupt_counter;
-   reg [63:0] r_timer_interrupt_counter_sec;
+   logic [31:0] r_interrupt_table[3:0];
+   logic r_timer_interrupt;
+   logic [31:0] r_timer_interrupt_counter;
+   logic [63:0] r_timer_interrupt_counter_sec;
    // Per-source interrupt enable. Bit N = source N enabled (1) / masked (0).
    // Software-controlled via INTMASKR/INTMASKV. Hardware auto-clears the
    // dispatched source's bit on entry; IRET restores the 4-bit mask from the
    // stack slot (bits [42:39] of the saved context word).
-   reg [ 3:0] r_int_mask;
+   logic [ 3:0] r_int_mask;
    // Timer-interrupt period in raw clock cycles. Software-controlled via
    // TIMERSETR/TIMERSETV. Counter rolls over (and asserts r_timer_interrupt)
    // when r_timer_interrupt_counter > r_timer_period.
-   reg [31:0] r_timer_period;
+   logic [31:0] r_timer_period;
 
    // Interrupt-wake condition — an unmasked, vectored source is pending. This is
    // the SAME expression OPCODE_REQUEST uses to dispatch, factored out so the
@@ -327,15 +336,15 @@ module KlaussCPU (
    // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
    // r_clock_ms_div counts 0..99_999 (one ms at 100 MHz) before incrementing
    // r_clock_ms — 17 bits hold up to 131071 so 99_999 fits comfortably.
-   reg [63:0] r_clock_ms;
-   reg [16:0] r_clock_ms_div;
+   logic [63:0] r_clock_ms;
+   logic [16:0] r_clock_ms_div;
 
    // Memory
-   reg r_mem_write_DV;
-   reg r_mem_read_DV;
-   reg [31:0] r_mem_addr;      // byte address
-   reg [63:0] r_mem_write_data;
-   reg [ 7:0] r_mem_byte_en;   // byte enables: 8'hFF=full doubleword, else partial op
+   logic r_mem_write_DV;
+   logic r_mem_read_DV;
+   logic [31:0] r_mem_addr;      // byte address
+   logic [63:0] r_mem_write_data;
+   logic [ 7:0] r_mem_byte_en;   // byte enables: 8'hFF=full doubleword, else partial op
    wire [63:0] w_mem_read_data;
    wire [63:0] w_mem_read_data_next; // next doubleword in same cache line
    wire        w_mem_next_valid;     // 1 when w_mem_read_data_next is valid
@@ -426,40 +435,40 @@ module KlaussCPU (
    // decoded opcode, so the main CPU datapath / critical path is untouched.
    // -------------------------------------------------------------------------
    // Tier 0 — denominators
-   reg [47:0] r_perf_cycles;        // every i_Clk cycle
-   reg [47:0] r_perf_instr;         // retired (committed) instructions
+   logic [47:0] r_perf_cycles;        // every i_Clk cycle
+   logic [47:0] r_perf_instr;         // retired (committed) instructions
    // Tier 1 — cycle accounting (buckets are disjoint; sum ≈ cycles in steady run)
-   reg [47:0] r_perf_fetch_cycles;  // instruction fetch / decode states
-   reg [47:0] r_perf_exec_cycles;   // execute / ALU-finish / writeback (incl. mem stalls)
-   reg [47:0] r_perf_mul_cycles;    // multiply pipeline states
-   reg [47:0] r_perf_div_cycles;    // iterative divide state
-   reg [47:0] r_perf_int_cycles;    // interrupt context-push wait
-   reg [47:0] r_perf_idle_cycles;   // HALTED / HALTED_BREAK
-   reg [47:0] r_perf_mul_ops;       // multiply instructions
-   reg [47:0] r_perf_div_ops;       // divide / mod instructions
-   reg [47:0] r_perf_int_ops;       // interrupt dispatches
+   logic [47:0] r_perf_fetch_cycles;  // instruction fetch / decode states
+   logic [47:0] r_perf_exec_cycles;   // execute / ALU-finish / writeback (incl. mem stalls)
+   logic [47:0] r_perf_mul_cycles;    // multiply pipeline states
+   logic [47:0] r_perf_div_cycles;    // iterative divide state
+   logic [47:0] r_perf_int_cycles;    // interrupt context-push wait
+   logic [47:0] r_perf_idle_cycles;   // HALTED / HALTED_BREAK
+   logic [47:0] r_perf_mul_ops;       // multiply instructions
+   logic [47:0] r_perf_div_ops;       // divide / mod instructions
+   logic [47:0] r_perf_int_ops;       // interrupt dispatches
    // Tier 2 — instruction mix + branch behaviour
-   reg [47:0] r_perf_cnt_alu;
-   reg [47:0] r_perf_cnt_load;
-   reg [47:0] r_perf_cnt_store;
-   reg [47:0] r_perf_cnt_branch;        // conditional branches (cond jumps)
-   reg [47:0] r_perf_cnt_branch_taken;  // of those, the taken subset
-   reg [47:0] r_perf_cnt_jump;          // unconditional direct jumps (JMP/JMPREL)
-   reg [47:0] r_perf_cnt_call;          // direct + conditional calls
-   reg [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
-   reg [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
+   logic [47:0] r_perf_cnt_alu;
+   logic [47:0] r_perf_cnt_load;
+   logic [47:0] r_perf_cnt_store;
+   logic [47:0] r_perf_cnt_branch;        // conditional branches (cond jumps)
+   logic [47:0] r_perf_cnt_branch_taken;  // of those, the taken subset
+   logic [47:0] r_perf_cnt_jump;          // unconditional direct jumps (JMP/JMPREL)
+   logic [47:0] r_perf_cnt_call;          // direct + conditional calls
+   logic [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
+   logic [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
    // Fast-path-dispatch fire count (MMIO 0xA8): instructions that skipped the
    // FETCH2 bubble. A healthy 15-53% rate is itself live proof f_predecode_len is
    // exact — a wrong length fails the r_ir_pc==r_PC consume guard and collapses
    // the rate. (This slot replaced a passive predecode-mismatch validator, now
    // covered by the consume guard and the functional regression.)
-   reg [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
-   reg        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
-   reg        r_int_push_wait_d;        // edge-detect for interrupt dispatch
+   logic [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
+   logic        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
+   logic        r_int_push_wait_d;        // edge-detect for interrupt dispatch
    // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
    // (conditional encodings only), consumed by the perf block below.
-   reg        r_perf_br_valid;
-   reg        r_perf_br_taken;
+   logic        r_perf_br_valid;
+   logic        r_perf_br_taken;
    // Instruction-class codes (return value of f_perf_class)
    localparam PC_OTHER=3'd0, PC_ALU=3'd1, PC_LOAD=3'd2, PC_STORE=3'd3,
               PC_BRANCH=3'd4, PC_JUMP=3'd5, PC_CALL=3'd6, PC_INDIRECT=3'd7;
@@ -469,18 +478,18 @@ module KlaussCPU (
                                  && (w_mmio_addr[15:0]  == 16'h0000)
                                  && w_mmio_write_data[0];
 
-   reg  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always @*)
-   reg  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
-   reg         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
+   logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
+   logic  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
+   logic         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
    // MMIO writes complete in 1 cycle (write-side has no read-data path).
    // MMIO reads now take 2 cycles: cycle 1 captures decode into the FF,
    // cycle 2 asserts ready so the CPU FSM samples r_mmio_read_data.
    wire        w_mmio_ready = w_mmio_write_DV | r_mmio_read_dv_d;
    wire w_mem_ready;
-   reg [31:0] r_opcode_mem;
-   reg [31:0] r_var1_mem;
-   reg [31:0] r_var2_mem;
-   reg r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
+   logic [31:0] r_opcode_mem;
+   logic [31:0] r_var1_mem;
+   logic [31:0] r_var2_mem;
+   logic r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
 
    // -------------------------------------------------------------------------
    // 2-stage fetch|execute overlap. r_FPC is a prefetch pointer running ahead of
@@ -493,16 +502,16 @@ module KlaussCPU (
    // exact on hardware — a wrong length fails the guard and collapses the
    // fast-path rate). Execute stays serial; only the fetch front-end overlaps it.
    // -------------------------------------------------------------------------
-   reg [31:0] r_FPC;              // next-sequential prefetch PC (advanced by f_predecode_len)
-   reg        r_ir_valid;         // IR latch holds a valid prefetched instruction
-   reg [31:0] r_ir_pc;            // PC of the latched instruction (must == r_PC to consume)
-   reg [31:0] r_ir_opcode;        // its 32-bit opcode
-   reg [3:0]  r_ir_reg_1;
-   reg [3:0]  r_ir_reg_2;
-   reg [3:0]  r_ir_reg_dst;
-   reg [31:0] r_ir_var1;          // prefetched var1 (PC+4) when available in the IFB
-   reg        r_ir_var1_prefetched;
-   reg        r_ir_presettled;    // the execute tail already loaded r_reg_1/2 from
+   logic [31:0] r_FPC;              // next-sequential prefetch PC (advanced by f_predecode_len)
+   logic        r_ir_valid;         // IR latch holds a valid prefetched instruction
+   logic [31:0] r_ir_pc;            // PC of the latched instruction (must == r_PC to consume)
+   logic [31:0] r_ir_opcode;        // its 32-bit opcode
+   logic [3:0]  r_ir_reg_1;
+   logic [3:0]  r_ir_reg_2;
+   logic [3:0]  r_ir_reg_dst;
+   logic [31:0] r_ir_var1;          // prefetched var1 (PC+4) when available in the IFB
+   logic        r_ir_var1_prefetched;
+   logic        r_ir_presettled;    // the execute tail already loaded r_reg_1/2 from
                                   // this latch, so the registered read ports settle
                                   // during the tail and the fast-path dispatch can
                                   // skip the FETCH2 settle bubble (saves 1 cyc/instr).
@@ -528,9 +537,9 @@ module KlaussCPU (
    // per-line cache-access latency needs overlap (prefetch / pipeline), not
    // more buffer capacity.
    // -------------------------------------------------------------------------
-   reg [63:0] r_ifb_dw     [0:1];   // the two doublewords of one 16-byte line
-   reg [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
-   reg [ 1:0] r_ifb_dwval;          // per-slot valid
+   logic [63:0] r_ifb_dw     [0:1];   // the two doublewords of one 16-byte line
+   logic [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
+   logic [ 1:0] r_ifb_dwval;          // per-slot valid
 
    wire [28:0] w_ifb_pc_dw  = r_PC[31:3];         // dw holding the opcode at PC
    wire [28:0] w_ifb_pc1_dw = r_PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
@@ -563,40 +572,40 @@ module KlaussCPU (
                       (r_SM == DIVIDE_PREP)    || (r_SM == DIVIDE_STEP);
 
    // Debug
-   reg r_debug_flag;
-   reg r_debug_step_flag;
-   reg r_debug_step_run;
+   logic r_debug_flag;
+   logic r_debug_step_flag;
+   logic r_debug_step_run;
 
    wire w_reset_H;
-   reg r_boot_flash;
+   logic r_boot_flash;
    
    //=========================================================================
    // Additional flags for expanded comparisons
    //=========================================================================
-   reg r_sign_flag;      // Sign of last result (bit 63)
-   reg r_less_flag;      // Result of signed less-than comparison
-   reg r_ult_flag;       // Result of unsigned less-than comparison
+   logic r_sign_flag;      // Sign of last result (bit 63)
+   logic r_less_flag;      // Result of signed less-than comparison
+   logic r_ult_flag;       // Result of unsigned less-than comparison
 
-   reg r_mul_is_immediate;  // If true, increment PC by 2 instead of 1
+   logic r_mul_is_immediate;  // If true, increment PC by 2 instead of 1
    
    //=============================================================================
   // PIPELINED MULTIPLY REGISTERS
   //=============================================================================
 
   // Pipeline stage registers (active during s_multiply state)
-  reg [127:0] r_mul_pipe1;        // Stage 1: multiply result (maps to DSP48 MREG)
-  reg [127:0] r_mul_pipe2;        // Stage 2: registered output (maps to DSP48 PREG)
+  logic [127:0] r_mul_pipe1;        // Stage 1: multiply result (maps to DSP48 MREG)
+  logic [127:0] r_mul_pipe2;        // Stage 2: registered output (maps to DSP48 PREG)
   wire [63:0] r_mul_result_lo;
   wire [63:0] r_mul_result_hi;
   assign r_mul_result_lo = r_mul_pipe2[63:0];
   assign r_mul_result_hi = r_mul_pipe2[127:64];
 
-  reg        r_mul_is_high;      // Are we capturing high word?
-  reg        r_mul_is_unsigned;  // Unsigned operation?
-  reg [3:0]  r_mul_dest_reg;     // Destination register
+  logic        r_mul_is_high;      // Are we capturing high word?
+  logic        r_mul_is_unsigned;  // Unsigned operation?
+  logic [3:0]  r_mul_dest_reg;     // Destination register
   // Dedicated multiply operand capture (breaks path from register file)
-  reg [63:0] r_mul_operand_a;
-  reg [63:0] r_mul_operand_b;
+  logic [63:0] r_mul_operand_a;
+  logic [63:0] r_mul_operand_b;
 
   // Sign-extended (65-bit) operand latches. Doing the signed/unsigned mux
   // *here* (before the DSP) keeps the LUT2 off the operand_q -> DSP-cascade
@@ -604,11 +613,11 @@ module KlaussCPU (
   // For unsigned ops we zero-extend; for signed we sign-extend. A single
   // 65x65 signed multiply then gives the correct lower-128-bit result for
   // both cases.
-  reg [64:0] r_mul_operand_a_q;
-  reg [64:0] r_mul_operand_b_q;
+  logic [64:0] r_mul_operand_a_q;
+  logic [64:0] r_mul_operand_b_q;
 
   // Free-running 3-stage multiply pipeline (Vivado: DSP48 AREG/BREG + MREG + PREG)
-  always @(posedge i_Clk) begin
+  always_ff @(posedge i_Clk) begin
      // Stage 1: sign-extend & latch operands (absorbed into DSP AREG/BREG)
      r_mul_operand_a_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_a[63]), r_mul_operand_a};
      r_mul_operand_b_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_b[63]), r_mul_operand_b};
@@ -623,7 +632,7 @@ module KlaussCPU (
   // break/command handling, and reset logic. Initial values come from the
   // top-level initial block (r_clock_ms = 0, r_clock_ms_div = 0). 64-bit
   // counter wraps in ~5.8e8 years at 100 MHz; the divider wraps every 1 ms.
-  always @(posedge i_Clk) begin
+  always_ff @(posedge i_Clk) begin
      if (r_clock_ms_div >= 17'd99_999) begin
         r_clock_ms_div <= 17'd0;
         r_clock_ms     <= r_clock_ms + 64'd1;
@@ -637,18 +646,18 @@ module KlaussCPU (
    // Hardware divide using iterative but optimized state machine
    // For true single-cycle, you'd need a pipelined divider IP
    //=========================================================================
-   reg [63:0] r_div_dividend;
-   reg [63:0] r_div_divisor;
-   reg [63:0] r_div_quotient;
-   reg [63:0] r_div_remainder;
-   reg [6:0]  r_div_counter;
-   reg        r_div_busy;
-   reg        r_div_sign_q;      // Sign of quotient
-   reg        r_div_sign_r;      // Sign of remainder
-   reg        r_div_is_signed;
-   reg [1:0]  r_div_op;          // 0=none, 1=div, 2=mod
-   reg [3:0]  r_div_dest_reg;    // Destination register for division result
-   reg        r_div_pc_inc;      // 0=PC+1, 1=PC+2
+   logic [63:0] r_div_dividend;
+   logic [63:0] r_div_divisor;
+   logic [63:0] r_div_quotient;
+   logic [63:0] r_div_remainder;
+   logic [6:0]  r_div_counter;
+   logic        r_div_busy;
+   logic        r_div_sign_q;      // Sign of quotient
+   logic        r_div_sign_r;      // Sign of remainder
+   logic        r_div_is_signed;
+   logic [1:0]  r_div_op;          // 0=none, 1=div, 2=mod
+   logic [3:0]  r_div_dest_reg;    // Destination register for division result
+   logic        r_div_pc_inc;      // 0=PC+1, 1=PC+2
    
    localparam DIV_OP_NONE = 2'd0;
    localparam DIV_OP_DIV  = 2'd1;
@@ -666,16 +675,16 @@ module KlaussCPU (
    wire        w_div_borrow  = w_div_trial[64];
    
    // Dedicated read ports - registered every cycle
-   reg [63:0] r_reg_port_a;
-   reg [63:0] r_reg_port_b;
+   logic [63:0] r_reg_port_a;
+   logic [63:0] r_reg_port_b;
 
    // Writeback pipeline registers
-   reg [63:0] r_writeback_value;
-   reg [3:0]  r_writeback_reg;
-   reg        r_writeback_set_zero_flag;  // Set zero flag from writeback value in WRITEBACK stage
-   reg        r_wb_pending;               // writeback deferred into OPCODE_REQUEST dispatch (eliminates the WRITEBACK cycle)
+   logic [63:0] r_writeback_value;
+   logic [3:0]  r_writeback_reg;
+   logic        r_writeback_set_zero_flag;  // Set zero flag from writeback value in WRITEBACK stage
+   logic        r_wb_pending;               // writeback deferred into OPCODE_REQUEST dispatch (eliminates the WRITEBACK cycle)
 
-    always @(posedge i_Clk) begin
+    always_ff @(posedge i_Clk) begin
        // RAW forward: the execute-tail pre-settle moves the port read into the
        // deferred-writeback commit cycle, so forward a still-pending writeback
        // whose dest matches the operand (the value r_register WILL hold next
@@ -691,7 +700,7 @@ module KlaussCPU (
    // executing at the moment of the trap.  All five HCF states are excluded
    // — HCF_1 fires first, then the chain walks through HCF_DUMP / HCF_2..4
    // and would otherwise overwrite the snapshot before the dump emits.
-   always @(posedge i_Clk) begin
+   always_ff @(posedge i_Clk) begin
       if ((r_SM != HCF_1) && (r_SM != HCF_DUMP) &&
           (r_SM != HCF_2) && (r_SM != HCF_3) && (r_SM != HCF_4)) begin
          r_fault_sm <= r_SM;
@@ -700,8 +709,8 @@ module KlaussCPU (
 
    // UART TX break generation — holds o_uart_tx low to signal program end
    wire       w_uart_tx_serial;   // internal serial output from uart_send_msg
-   reg        r_break_active;     // when 1, overrides TX line to low (break)
-   reg [11:0] r_break_counter;    // countdown: 2500 clocks ≈ 7.5 frames at CLKS_PER_BIT=33
+   logic        r_break_active;     // when 1, overrides TX line to low (break)
+   logic [11:0] r_break_counter;    // countdown: 2500 clocks ≈ 7.5 frames at CLKS_PER_BIT=33
 
    // Mux: break takes priority over normal TX; idle state is line-high
    assign o_uart_tx  = r_break_active ? 1'b0 : w_uart_tx_serial;
@@ -911,15 +920,15 @@ module KlaussCPU (
    // -------------------------------------------------------------------------
 
    /* Internal LED register.  The top-level `o_led` port was converted from
-      `output reg` to `output wire` so we could once tap an ETH_TXEN
+      `output logic` to `output wire` so we could once tap an ETH_TXEN
       diagnostic into bit 0.  The diagnostic was removed (an ODDR driving
       a pin can't have its Q net read by fabric — REQP-1884), but the
       wire-port + internal reg + continuous assign pattern remains as a
-      neutral pass-through.  Same behaviour as the original output reg. */
-   reg [15:0] r_led;
+      neutral pass-through.  Same behaviour as the original output logic. */
+   logic [15:0] r_led;
    assign o_led = r_led;
 
-   always @* begin
+   always_comb begin
       r_mmio_read_data_comb = 64'h0;
       case (w_mmio_addr[27:16])
          12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
@@ -1015,7 +1024,7 @@ module KlaussCPU (
    // main CPU r_SM/r_PC clock enables. r_mmio_read_dv_d generates the
    // 1-cycle-delayed ready pulse so the CPU samples r_mmio_read_data on the
    // cycle after the read strobe.
-   always @(posedge i_Clk) begin
+   always_ff @(posedge i_Clk) begin
       r_mmio_read_data <= r_mmio_read_data_comb;
       r_mmio_read_dv_d <= w_mmio_read_DV;
    end
@@ -1093,12 +1102,12 @@ module KlaussCPU (
    // ==========================================================================
    wire        w_calib_done;
    wire [63:0] w_boot_dword;        // boot_rom read data (1-cycle latency)
-   reg  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
-   reg  [15:0] r_boot_len_dw;       // image length in doublewords (from word 0)
-   reg  [ 2:0] r_boot_phase;        // sub-state within NO_PROGRAM:
+   logic  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
+   logic  [15:0] r_boot_len_dw;       // image length in doublewords (from word 0)
+   logic  [ 2:0] r_boot_phase;        // sub-state within NO_PROGRAM:
                                     //   0=wait DDR calib, 1=read word 0 (image length),
                                     //   2=ROM read latency, 3=issue DDR write, 4=ack write / advance
-   reg         r_boot_active;       // 1 = boot copy pending/in-progress
+   logic         r_boot_active;       // 1 = boot copy pending/in-progress
 
    boot_rom #(
        .DEPTH_DW (32768),           // 256 KiB capacity — sized for netboot
@@ -1428,7 +1437,7 @@ rams_sp_nc rams_sp_nc1 (
          r_trace_buf[i] = 64'b0;
    end
 
-   always @(posedge i_Clk) begin
+   always_ff @(posedge i_Clk) begin
       if (w_reset_H) begin
 
          r_SM <= NO_PROGRAM;
@@ -2634,7 +2643,7 @@ end
             // path), and the CLZ + shifter here run register-to-register in
             // their own cycle.
             DIVIDE_PREP: begin : divide_prep
-               reg [6:0] prep_clz;
+               logic [6:0] prep_clz;
                prep_clz = count_leading_zeros(r_div_dividend);
                if (prep_clz[6]) begin
                   // dividend == 0 (clz = 64): quotient 0, remainder 0 —
@@ -2738,7 +2747,7 @@ end
             default: r_SM <= HCF_1;  // loop in error
          endcase  // case(r_SM)
       end  // else if (w_reset_H)
-   end  // always @(posedge i_Clk)
+   end  // always_ff @(posedge i_Clk)
 
    //=========================================================================
    // Instruction classifier for the performance counters. Returns one
@@ -2830,7 +2839,7 @@ end
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
    //=========================================================================
-   always @(posedge i_Clk) begin
+   always_ff @(posedge i_Clk) begin
       r_int_push_wait_d <= r_int_push_wait;
       if (w_reset_H || w_perf_stat_clear) begin
          r_perf_cycles           <= 64'd0;  r_perf_instr            <= 64'd0;
@@ -2930,7 +2939,7 @@ end
    function [6:0] count_leading_zeros;
       input [63:0] val;
       integer clz_i;
-      reg [6:0] clz_result;
+      logic [6:0] clz_result;
       begin
          clz_result = 7'd64;
          for (clz_i = 0; clz_i < 64; clz_i = clz_i + 1) begin
@@ -2946,7 +2955,7 @@ end
    function [6:0] count_trailing_zeros;
       input [63:0] val;
       integer ctz_i;
-      reg [6:0] ctz_result;
+      logic [6:0] ctz_result;
       begin
          ctz_result = 7'd64;
          for (ctz_i = 63; ctz_i >= 0; ctz_i = ctz_i - 1) begin
