@@ -2858,8 +2858,7 @@ end
          if (r_int_push_wait)
             r_perf_int_cycles <= r_perf_int_cycles + 64'd1;
          else if (r_SM == OPCODE_REQUEST || r_SM == OPCODE_FETCH  ||
-                  r_SM == OPCODE_FETCH2  || r_SM == VAR1_FETCH    ||
-                  r_SM == VAR1_FETCH2)
+                  r_SM == OPCODE_FETCH2  || r_SM == VAR1_FETCH)
             r_perf_fetch_cycles <= r_perf_fetch_cycles + 64'd1;
          else if (r_SM == OPCODE_EXECUTE || r_SM == ALU_FINISH ||
                   r_SM == WRITEBACK)

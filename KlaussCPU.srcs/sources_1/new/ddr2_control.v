@@ -166,7 +166,6 @@ module ddr2_control (
 
 
    always @(posedge ui_clk) begin
-      //always @ (posedge i_Clk) begin
       if (ui_clk_sync_rst) begin
          state <= IDLE;
          app_en <= 0;

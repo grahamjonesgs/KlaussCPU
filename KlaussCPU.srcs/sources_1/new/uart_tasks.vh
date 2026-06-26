@@ -532,8 +532,7 @@ endtask
 // t_tx_message — load one of the canned UART strings into r_msg/r_msg_length
 // and pulse r_msg_send_DV, selected by i_message_number:
 //   1 = "Load Complete OK"   2 = "Load Error, bad CRC"
-//   3 = "Test message"       4 = "Test message" (label says "Segmentation
-//       error..." but currently emits the same bytes as 3 — see FOR HUMAN REVIEW)
+//   3 = "Test message"       4 = "Segfault: exec data" (ERR_SEG_EXEC_DATA; unused)
 //   default = empty message (length 0)
 // Helper only: does NOT set r_SM or advance r_PC (caller drives those).
 task t_tx_message;
@@ -605,23 +604,31 @@ task t_tx_message;
                 r_msg[111:104] <= 8'h0D;
                 r_msg_length <= 14;
             end
-            4: // Segmentation error. Attempt to execute data.
+            4: // "Segfault: exec data" — ERR_SEG_EXEC_DATA report (currently unused;
+               //  the segmentation traps route through the HCF crash dump instead)
             begin
-                r_msg[7:0] <= 8'h54;
-                r_msg[15:8] <= 8'h65;
-                r_msg[23:16] <= 8'h73;
-                r_msg[31:24] <= 8'h74;
-                r_msg[39:32] <= 8'h20;
-                r_msg[47:40] <= 8'h6D;
-                r_msg[55:48] <= 8'h65;
-                r_msg[63:56] <= 8'h73;
-                r_msg[71:64] <= 8'h73;
-                r_msg[79:72] <= 8'h61;
-                r_msg[87:80] <= 8'h67;
-                r_msg[95:88] <= 8'h65;
-                r_msg[103:96] <= 8'h0A;
-                r_msg[111:104] <= 8'h0D;
-                r_msg_length <= 8'h0E;
+                r_msg[7:0]     <= 8'h53;  // S
+                r_msg[15:8]    <= 8'h65;  // e
+                r_msg[23:16]   <= 8'h67;  // g
+                r_msg[31:24]   <= 8'h66;  // f
+                r_msg[39:32]   <= 8'h61;  // a
+                r_msg[47:40]   <= 8'h75;  // u
+                r_msg[55:48]   <= 8'h6C;  // l
+                r_msg[63:56]   <= 8'h74;  // t
+                r_msg[71:64]   <= 8'h3A;  // :
+                r_msg[79:72]   <= 8'h20;  // space
+                r_msg[87:80]   <= 8'h65;  // e
+                r_msg[95:88]   <= 8'h78;  // x
+                r_msg[103:96]  <= 8'h65;  // e
+                r_msg[111:104] <= 8'h63;  // c
+                r_msg[119:112] <= 8'h20;  // space
+                r_msg[127:120] <= 8'h64;  // d
+                r_msg[135:128] <= 8'h61;  // a
+                r_msg[143:136] <= 8'h74;  // t
+                r_msg[151:144] <= 8'h61;  // a
+                r_msg[159:152] <= 8'h0A;  // \n
+                r_msg[167:160] <= 8'h0D;  // \r
+                r_msg_length <= 8'd21;
             end
             default: begin
                 r_msg[7:0]   <= 8'h00;
