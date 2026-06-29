@@ -224,27 +224,31 @@ module blitter_dma (
     // =========================================================================
     // Engine FSM
     // =========================================================================
-    localparam S_IDLE     = 5'd0;
-    localparam S_PIX      = 5'd1;   // evaluate current pixel
-    localparam S_PLACE    = 5'd2;   // write/blend pixel into the accumulator
-    localparam S_WF_REQ   = 5'd3;   // write-flush: acquire bus
-    localparam S_WF_DRIVE = 5'd4;   // write-flush: drive write, wait ready
-    localparam S_WF_GAP   = 5'd5;   // write-flush: CDC settle
-    localparam S_WF_REL   = 5'd6;   // write-flush: release bus, continue
-    localparam S_RD_REQ   = 5'd7;   // generic read: acquire bus
-    localparam S_RD_DRIVE = 5'd8;   // generic read: drive read, wait ready
-    localparam S_RD_REL   = 5'd9;   // generic read: release bus, continue
-    localparam S_END      = 5'd10;  // final flush dispatch
-    localparam S_FINISH   = 5'd11;  // mark done
-    localparam S_BLEND    = 5'd12;  // blend pipeline stage 1: latch operands (blend ops only)
-    localparam S_BLEND2   = 5'd13;  // blend pipeline stage 2: register the 6 products (multiplies)
+    // Blitter engine FSM — sequential enum (values 0..13, identical to the
+    // original 5'd0..5'd13 localparams; named states show in the waveform).
+    typedef enum logic [4:0] {
+        S_IDLE,        // evaluate-loop entry / idle
+        S_PIX,         // evaluate current pixel
+        S_PLACE,       // write/blend pixel into the accumulator
+        S_WF_REQ,      // write-flush: acquire bus
+        S_WF_DRIVE,    // write-flush: drive write, wait ready
+        S_WF_GAP,      // write-flush: CDC settle
+        S_WF_REL,      // write-flush: release bus, continue
+        S_RD_REQ,      // generic read: acquire bus
+        S_RD_DRIVE,    // generic read: drive read, wait ready
+        S_RD_REL,      // generic read: release bus, continue
+        S_END,         // final flush dispatch
+        S_FINISH,      // mark done
+        S_BLEND,       // blend pipeline stage 1: latch operands (blend ops only)
+        S_BLEND2       // blend pipeline stage 2: register the 6 products (multiplies)
+    } e_blit_state_t;
 
     // Read targets for the generic read sub-FSM.
     localparam RDT_SRC  = 2'd0;
     localparam RDT_DST  = 2'd1;
     localparam RDT_MASK = 2'd2;
 
-    logic [4:0]  state;
+    e_blit_state_t state;
     // Blend pipeline registers (cut the long mask-addr -> alpha -> blend -> wbuf
     // path in two: S_BLEND latches these operands, S_PLACE does the blend math).
     logic [15:0] r_fg_q;          // foreground pixel (src or COLOR)
