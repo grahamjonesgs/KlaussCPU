@@ -201,10 +201,7 @@ module KlaussCPU (
 
    // Register control
    logic [63:0] r_register[15:0];
-   logic r_zero_flag;
-   logic r_equal_flag;
-   logic r_carry_flag;
-   logic r_overflow_flag;
+   flags_t r_flags;   // Z E C V S L U condition flags (packed struct, see klauss_pkg)
    logic [7:0] r_error_code;
 
    // -----------------------------------------------------------------------
@@ -534,9 +531,7 @@ module KlaussCPU (
    //=========================================================================
    // Additional flags for expanded comparisons
    //=========================================================================
-   logic r_sign_flag;      // Sign of last result (bit 63)
-   logic r_less_flag;      // Result of signed less-than comparison
-   logic r_ult_flag;       // Result of unsigned less-than comparison
+   // (r_flags.sign / r_flags.less / r_flags.ult are now r_flags.sign/.less/.ult.)
 
    logic r_mul_is_immediate;  // If true, increment PC by 2 instead of 1
    
@@ -671,7 +666,7 @@ module KlaussCPU (
    // KEEP_HIERARCHY prevents Vivado from flattening these modules' logic into
    // surrounding CPU slices. Without it the placer can scatter sd_spi/splitter
    // cells across the CPU's 64-bit ALU carry chain, lengthening route delay on
-   // an already-tight critical path (r_reg_port_b → r_carry_flag, ~25 levels).
+   // an already-tight critical path (r_reg_port_b → r_flags.carry, ~25 levels).
    (* KEEP_HIERARCHY = "yes" *)
    bus_splitter bus_splitter_i (
        .i_clk(i_Clk),
@@ -1240,9 +1235,9 @@ rams_sp_nc rams_sp_nc1 (
  */
    integer i;
    initial begin
-      r_sign_flag <= 0;
-      r_less_flag <= 0;
-      r_ult_flag <= 0;
+      r_flags.sign <= 0;
+      r_flags.less <= 0;
+      r_flags.ult <= 0;
       r_div_busy <= 0;
       r_div_op <= DIV_OP_NONE;
       r_div_counter <= 0;
@@ -1310,10 +1305,10 @@ rams_sp_nc rams_sp_nc1 (
       r_timeout_counter = 0;
       o_LCD_reset_n = 1'b0;
       r_PC = 32'h0;
-      r_zero_flag = 0;
-      r_equal_flag = 0;
-      r_carry_flag = 0;
-      r_overflow_flag = 0;
+      r_flags.zero = 0;
+      r_flags.equal = 0;
+      r_flags.carry = 0;
+      r_flags.overflow = 0;
       r_error_code = 8'h0;
       r_timeout_counter = 32'b0;
       r_seven_seg_value1 = 32'h20_10_00_07;
@@ -1796,11 +1791,11 @@ rams_sp_nc rams_sp_nc1 (
                   o_ram_write_addr <= 32'h0;
                   o_TX_LCD_Byte <= 8'b0;
                   o_TX_LCD_Count <= 4'd1;
-                  r_carry_flag <= 1'b0;
+                  r_flags.carry <= 1'b0;
                   r_debug_flag <= 1'b0;
                   r_debug_step_flag <= 1'b0;
                   r_debug_step_run <= 1'b0;
-                  r_equal_flag <= 1'b0;
+                  r_flags.equal <= 1'b0;
                   r_error_code <= 8'h0;
                   r_hcf_message_sent <= 1'b0;
                   r_interrupt_table[0] <= 32'h0;  // clear all 4 handler vectors;
@@ -1808,7 +1803,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_interrupt_table[2] <= 32'h0;
                   r_interrupt_table[3] <= 32'h0;
                   r_msg_send_DV <= 1'b0;
-                  r_overflow_flag <= 1'b0;
+                  r_flags.overflow <= 1'b0;
                   r_PC <= r_PC_requested;
                   r_mem_byte_en <= 8'hFF;  // restore full-doubleword default after loader partial writes
                   r_ram_next_write_addr <= 32'h0;
@@ -1828,7 +1823,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_ir_valid <= 1'b0;            // no prefetched instruction yet
                   r_ir_presettled <= 1'b0;
                   r_timing_start <= 0;
-                  r_zero_flag <= 0;
+                  r_flags.zero <= 0;
                   t_tx_message(8'd1);  // Load OK message
                end else begin
                   r_SM <= HCF_1;  // Halt and catch fire error
@@ -1878,7 +1873,7 @@ rams_sp_nc rams_sp_nc1 (
                if (r_wb_pending) begin
                   r_register[r_writeback_reg] <= r_writeback_value;
                   if (r_writeback_set_zero_flag)
-                     r_zero_flag <= (r_writeback_value == 64'b0);
+                     r_flags.zero <= (r_writeback_value == 64'b0);
                   r_writeback_set_zero_flag <= 1'b0;
                   r_wb_pending <= 1'b0;
                end
@@ -1906,9 +1901,9 @@ rams_sp_nc rams_sp_nc1 (
                   // committing this same cycle (r_wb_pending block above), so the
                   // saved interrupt context stays precise.
                   r_mem_write_data <= {21'b0, r_int_mask,
-                                       ((r_wb_pending && r_writeback_set_zero_flag) ? (r_writeback_value == 64'b0) : r_zero_flag),
-                                       r_equal_flag, r_carry_flag,
-                                       r_overflow_flag, r_sign_flag, r_less_flag, r_ult_flag,
+                                       ((r_wb_pending && r_writeback_set_zero_flag) ? (r_writeback_value == 64'b0) : r_flags.zero),
+                                       r_flags.equal, r_flags.carry,
+                                       r_flags.overflow, r_flags.sign, r_flags.less, r_flags.ult,
                                        r_PC};
                   r_mem_byte_en    <= 8'hFF;
                   r_mem_write_DV   <= 1'b1;
@@ -2513,16 +2508,16 @@ MULTIPLY_WRITEBACK: begin
 
     // Flags from registered values
     if (r_mul_is_high) begin
-        r_zero_flag     <= (r_mul_result_hi == 64'b0);
-        r_sign_flag     <= r_mul_result_hi[63];
-        r_overflow_flag <= 1'b0;
+        r_flags.zero     <= (r_mul_result_hi == 64'b0);
+        r_flags.sign     <= r_mul_result_hi[63];
+        r_flags.overflow <= 1'b0;
     end else begin
-        r_zero_flag     <= (r_mul_result_lo == 64'b0);
-        r_sign_flag     <= r_mul_result_lo[63];
+        r_flags.zero     <= (r_mul_result_lo == 64'b0);
+        r_flags.sign     <= r_mul_result_lo[63];
         if (r_mul_is_unsigned)
-            r_overflow_flag <= (r_mul_result_hi != 64'b0);
+            r_flags.overflow <= (r_mul_result_hi != 64'b0);
         else
-            r_overflow_flag <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
+            r_flags.overflow <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
     end
 
     // PC increment depends on instruction type
@@ -2631,17 +2626,17 @@ end
                         r_writeback_value <= ~r_div_quotient + 1;
                      else
                         r_writeback_value <= r_div_quotient;
-                     r_zero_flag <= (r_div_quotient == 0) ? 1'b1 : 1'b0;
+                     r_flags.zero <= (r_div_quotient == 0) ? 1'b1 : 1'b0;
                   end
                   else begin  // DIV_OP_MOD
                      if (r_div_is_signed && r_div_sign_r)
                         r_writeback_value <= ~r_div_remainder + 1;
                      else
                         r_writeback_value <= r_div_remainder;
-                     r_zero_flag <= (r_div_remainder == 0) ? 1'b1 : 1'b0;
+                     r_flags.zero <= (r_div_remainder == 0) ? 1'b1 : 1'b0;
                   end
                   r_writeback_reg <= r_div_dest_reg;
-                  r_overflow_flag <= 1'b0;
+                  r_flags.overflow <= 1'b0;
                   r_div_op <= DIV_OP_NONE;
                   r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
                   // Execute-tail handoff: pre-load r_reg_1/2 from the prefetched
@@ -2659,7 +2654,7 @@ end
             WRITEBACK: begin
                r_register[r_writeback_reg] <= r_writeback_value;
                if (r_writeback_set_zero_flag)
-                  r_zero_flag <= (r_writeback_value == 64'b0);
+                  r_flags.zero <= (r_writeback_value == 64'b0);
                r_writeback_set_zero_flag <= 1'b0;
                r_SM <= OPCODE_REQUEST;
             end
@@ -2675,15 +2670,15 @@ end
             ALU_FINISH: begin
                if (r_alu_pipe_mode == 1'b0) begin       // ARITH
                   r_writeback_value <= r_alu_pipe_value;
-                  r_carry_flag      <= r_alu_pipe_carry;
-                  r_overflow_flag   <= r_alu_pipe_overflow;
-                  r_sign_flag       <= r_alu_pipe_value[63];
+                  r_flags.carry      <= r_alu_pipe_carry;
+                  r_flags.overflow   <= r_alu_pipe_overflow;
+                  r_flags.sign       <= r_alu_pipe_value[63];
                   r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
                end else begin                           // CMP
-                  r_equal_flag <= r_alu_pipe_equal;
-                  r_less_flag  <= r_alu_pipe_less;
-                  r_ult_flag   <= r_alu_pipe_ult;
-                  r_sign_flag  <= r_alu_pipe_value[63];
+                  r_flags.equal <= r_alu_pipe_equal;
+                  r_flags.less  <= r_alu_pipe_less;
+                  r_flags.ult   <= r_alu_pipe_ult;
+                  r_flags.sign  <= r_alu_pipe_value[63];
                   r_SM         <= OPCODE_REQUEST;
                end
                // Execute-tail handoff: the ALU already consumed its operands and

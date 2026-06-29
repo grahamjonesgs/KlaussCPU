@@ -77,4 +77,19 @@ package klauss_pkg;
    localparam DUMP_TRACE_BASE = 7'd31;  // T0..TF → phases 31..46 (newest-first)
    localparam DUMP_FOOTER     = 7'd47;  // last phase; on completion → HCF_2
 
+   // --- Architectural condition flags (r_flags) ----------------------------
+   // The 7 CPU condition flags as one packed struct.  Fields are written/read
+   // individually (incl. inside the interrupt-context save concat and GETFLAGS),
+   // so the field order is not load-bearing; it mirrors the crash-dump grouping
+   // (Z E C V / S L U) for readability.
+   typedef struct packed {
+      logic zero;       // Z: last result == 0
+      logic equal;      // E: last compare equal
+      logic carry;      // C: carry / borrow out
+      logic overflow;   // V: signed overflow
+      logic sign;       // S: sign of last result (bit 63)
+      logic less;       // L: signed less-than comparison
+      logic ult;        // U: unsigned less-than comparison
+   } flags_t;
+
 endpackage : klauss_pkg

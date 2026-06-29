@@ -45,7 +45,7 @@ endtask
 // 1-word, PC += 4.
 task t_set_reg_flags;
    begin
-      r_writeback_value <= {r_zero_flag, r_equal_flag, r_carry_flag, r_overflow_flag, 60'b0};
+      r_writeback_value <= {r_flags.zero, r_flags.equal, r_flags.carry, r_flags.overflow, 60'b0};
       r_writeback_reg <= r_reg_2;
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
@@ -369,7 +369,7 @@ endtask
 task t_addc3;
    logic [65:0] hold;
    begin
-      hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b} + {65'b0, r_carry_flag};
+      hold = {1'b0, r_reg_port_a} + {1'b0, r_reg_port_b} + {65'b0, r_flags.carry};
       r_alu_pipe_value    <= hold[63:0];
       r_alu_pipe_carry    <= hold[64];
       r_alu_pipe_overflow <= (r_reg_port_a[63] == r_reg_port_b[63]) &&
@@ -388,7 +388,7 @@ endtask
 task t_subc3;
    logic [65:0] hold;
    begin
-      hold = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b} - {65'b0, r_carry_flag};
+      hold = {1'b0, r_reg_port_a} - {1'b0, r_reg_port_b} - {65'b0, r_flags.carry};
       r_alu_pipe_value    <= hold[63:0];
       r_alu_pipe_carry    <= hold[64];
       r_alu_pipe_overflow <= (r_reg_port_a[63] != r_reg_port_b[63]) &&

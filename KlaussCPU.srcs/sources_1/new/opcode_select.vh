@@ -284,34 +284,34 @@ task t_opcode_select;
          // dispatch where the destination is a true absolute address.
          //=====================================================================
          32'h0000_1000: t_cond_jump(w_var1, 1'b1);             // JMP V jump to absolute byte addr imm32 (unconditional)
-         32'h0000_1001: t_cond_jump(w_var1, r_zero_flag);      // JMPZ V jump if zero_flag (arithmetic result was zero)
-         32'h0000_1002: t_cond_jump(w_var1, !r_zero_flag);     // JMPNZ V jump if not zero_flag
-         32'h0000_1003: t_cond_jump(w_var1, r_equal_flag);     // JMPE V jump if equal_flag (from CMPRR/CMPRV)
-         32'h0000_1004: t_cond_jump(w_var1, !r_equal_flag);    // JMPNE V jump if not equal_flag
-         32'h0000_1005: t_cond_jump(w_var1, r_carry_flag);     // JMPC V jump if carry_flag
-         32'h0000_1006: t_cond_jump(w_var1, !r_carry_flag);    // JMPNC V jump if not carry_flag
-         32'h0000_1007: t_cond_jump(w_var1, r_overflow_flag);  // JMPO V jump if overflow_flag
-         32'h0000_1008: t_cond_jump(w_var1, !r_overflow_flag); // JMPNO V jump if not overflow_flag
+         32'h0000_1001: t_cond_jump(w_var1, r_flags.zero);      // JMPZ V jump if zero_flag (arithmetic result was zero)
+         32'h0000_1002: t_cond_jump(w_var1, !r_flags.zero);     // JMPNZ V jump if not zero_flag
+         32'h0000_1003: t_cond_jump(w_var1, r_flags.equal);     // JMPE V jump if equal_flag (from CMPRR/CMPRV)
+         32'h0000_1004: t_cond_jump(w_var1, !r_flags.equal);    // JMPNE V jump if not equal_flag
+         32'h0000_1005: t_cond_jump(w_var1, r_flags.carry);     // JMPC V jump if carry_flag
+         32'h0000_1006: t_cond_jump(w_var1, !r_flags.carry);    // JMPNC V jump if not carry_flag
+         32'h0000_1007: t_cond_jump(w_var1, r_flags.overflow);  // JMPO V jump if overflow_flag
+         32'h0000_1008: t_cond_jump(w_var1, !r_flags.overflow); // JMPNO V jump if not overflow_flag
          32'h0000_1009: t_cond_call(w_var1, 1'b1);             // CALL V push PC+8 (ret addr), jump to imm32; SP-=8
-         32'h0000_100A: t_cond_call(w_var1, r_zero_flag);      // CALLZ V call if zero_flag; SP-=8
-         32'h0000_100B: t_cond_call(w_var1, !r_zero_flag);     // CALLNZ V call if not zero_flag; SP-=8
-         32'h0000_100C: t_cond_call(w_var1, r_equal_flag);     // CALLE V call if equal_flag; SP-=8
-         32'h0000_100D: t_cond_call(w_var1, !r_equal_flag);    // CALLNE V call if not equal_flag; SP-=8
-         32'h0000_100E: t_cond_call(w_var1, r_carry_flag);     // CALLC V call if carry_flag; SP-=8
-         32'h0000_100F: t_cond_call(w_var1, !r_carry_flag);    // CALLNC V call if not carry_flag; SP-=8
-         32'h0000_1010: t_cond_call(w_var1, r_overflow_flag);  // CALLO V call if overflow_flag; SP-=8
-         32'h0000_1011: t_cond_call(w_var1, !r_overflow_flag); // CALLNO V call if not overflow_flag; SP-=8
+         32'h0000_100A: t_cond_call(w_var1, r_flags.zero);      // CALLZ V call if zero_flag; SP-=8
+         32'h0000_100B: t_cond_call(w_var1, !r_flags.zero);     // CALLNZ V call if not zero_flag; SP-=8
+         32'h0000_100C: t_cond_call(w_var1, r_flags.equal);     // CALLE V call if equal_flag; SP-=8
+         32'h0000_100D: t_cond_call(w_var1, !r_flags.equal);    // CALLNE V call if not equal_flag; SP-=8
+         32'h0000_100E: t_cond_call(w_var1, r_flags.carry);     // CALLC V call if carry_flag; SP-=8
+         32'h0000_100F: t_cond_call(w_var1, !r_flags.carry);    // CALLNC V call if not carry_flag; SP-=8
+         32'h0000_1010: t_cond_call(w_var1, r_flags.overflow);  // CALLO V call if overflow_flag; SP-=8
+         32'h0000_1011: t_cond_call(w_var1, !r_flags.overflow); // CALLNO V call if not overflow_flag; SP-=8
          32'h0000_1012: t_ret;                                  // RET pop return addr (uses [31:0]); SP+=8
-         32'h0000_1013: t_cond_jump(w_var1, r_sign_flag);      // JMPS V jump if sign_flag (result was negative)
-         32'h0000_1014: t_cond_jump(w_var1, !r_sign_flag);     // JMPNS V jump if not sign_flag
-         32'h0000_1015: t_cond_jump(w_var1, r_less_flag);                        // JMPLT V jump if less_flag (signed <, from CMPRR/CMPRV)
-         32'h0000_1016: t_cond_jump(w_var1, r_less_flag | r_equal_flag);         // JMPLE V jump if less_flag|equal_flag (signed <=)
-         32'h0000_1017: t_cond_jump(w_var1, !r_less_flag & !r_equal_flag);       // JMPGT V jump if !less_flag&!equal_flag (signed >)
-         32'h0000_1018: t_cond_jump(w_var1, !r_less_flag);                       // JMPGE V jump if !less_flag (signed >=)
-         32'h0000_1019: t_cond_jump(w_var1, r_ult_flag);                         // JMPULT V jump if ult_flag (unsigned <, from CMPRR/CMPRV)
-         32'h0000_101A: t_cond_jump(w_var1, r_ult_flag | r_equal_flag);          // JMPULE V jump if ult_flag|equal_flag (unsigned <=)
-         32'h0000_101B: t_cond_jump(w_var1, !r_ult_flag & !r_equal_flag);        // JMPUGT V jump if !ult_flag&!equal_flag (unsigned >)
-         32'h0000_101C: t_cond_jump(w_var1, !r_ult_flag);                        // JMPUGE V jump if !ult_flag (unsigned >=)
+         32'h0000_1013: t_cond_jump(w_var1, r_flags.sign);      // JMPS V jump if sign_flag (result was negative)
+         32'h0000_1014: t_cond_jump(w_var1, !r_flags.sign);     // JMPNS V jump if not sign_flag
+         32'h0000_1015: t_cond_jump(w_var1, r_flags.less);                        // JMPLT V jump if less_flag (signed <, from CMPRR/CMPRV)
+         32'h0000_1016: t_cond_jump(w_var1, r_flags.less | r_flags.equal);         // JMPLE V jump if less_flag|equal_flag (signed <=)
+         32'h0000_1017: t_cond_jump(w_var1, !r_flags.less & !r_flags.equal);       // JMPGT V jump if !less_flag&!equal_flag (signed >)
+         32'h0000_1018: t_cond_jump(w_var1, !r_flags.less);                       // JMPGE V jump if !less_flag (signed >=)
+         32'h0000_1019: t_cond_jump(w_var1, r_flags.ult);                         // JMPULT V jump if ult_flag (unsigned <, from CMPRR/CMPRV)
+         32'h0000_101A: t_cond_jump(w_var1, r_flags.ult | r_flags.equal);          // JMPULE V jump if ult_flag|equal_flag (unsigned <=)
+         32'h0000_101B: t_cond_jump(w_var1, !r_flags.ult & !r_flags.equal);        // JMPUGT V jump if !ult_flag&!equal_flag (unsigned >)
+         32'h0000_101C: t_cond_jump(w_var1, !r_flags.ult);                        // JMPUGE V jump if !ult_flag (unsigned >=)
          32'h0000_102?: t_jump_reg;                             // JMPR R jump to absolute byte addr in rs2
 
          //=====================================================================
@@ -322,22 +322,22 @@ task t_opcode_select;
          // linker emits simm32 = target_addr - addr_of_this_opcode.
          //=====================================================================
          32'h0000_1030: t_cond_jump_rel(w_var1, 1'b1);                            // JMPREL V PC+=sign_ext(imm32) (unconditional)
-         32'h0000_1031: t_cond_jump_rel(w_var1, r_zero_flag);                     // JMPZREL V rel jump if zero_flag
-         32'h0000_1032: t_cond_jump_rel(w_var1, !r_zero_flag);                    // JMPNZREL V rel jump if not zero_flag
-         32'h0000_1033: t_cond_jump_rel(w_var1, r_equal_flag);                    // JMPEREL V rel jump if equal_flag
-         32'h0000_1034: t_cond_jump_rel(w_var1, !r_equal_flag);                   // JMPNEREL V rel jump if not equal_flag
-         32'h0000_1035: t_cond_jump_rel(w_var1, r_carry_flag);                    // JMPCREL V rel jump if carry_flag
-         32'h0000_1036: t_cond_jump_rel(w_var1, !r_carry_flag);                   // JMPNCREL V rel jump if not carry_flag
-         32'h0000_1037: t_cond_jump_rel(w_var1, r_sign_flag);                     // JMPSREL V rel jump if sign_flag
-         32'h0000_1038: t_cond_jump_rel(w_var1, !r_sign_flag);                    // JMPNSREL V rel jump if not sign_flag
-         32'h0000_1039: t_cond_jump_rel(w_var1, r_less_flag);                     // JMPLTREL V rel jump if less_flag (signed <)
-         32'h0000_103A: t_cond_jump_rel(w_var1, r_less_flag | r_equal_flag);      // JMPLEREL V rel jump if less|equal (signed <=)
-         32'h0000_103B: t_cond_jump_rel(w_var1, !r_less_flag & !r_equal_flag);    // JMPGTREL V rel jump if !less&!equal (signed >)
-         32'h0000_103C: t_cond_jump_rel(w_var1, !r_less_flag);                    // JMPGEREL V rel jump if !less_flag (signed >=)
-         32'h0000_103D: t_cond_jump_rel(w_var1, r_ult_flag);                      // JMPULTREL V rel jump if ult_flag (unsigned <)
-         32'h0000_103E: t_cond_jump_rel(w_var1, r_ult_flag | r_equal_flag);       // JMPULEREL V rel jump if ult|equal (unsigned <=)
-         32'h0000_103F: t_cond_jump_rel(w_var1, !r_ult_flag & !r_equal_flag);     // JMPUGTREL V rel jump if !ult&!equal (unsigned >)
-         32'h0000_1040: t_cond_jump_rel(w_var1, !r_ult_flag);                     // JMPUGEREL V rel jump if !ult_flag (unsigned >=)
+         32'h0000_1031: t_cond_jump_rel(w_var1, r_flags.zero);                     // JMPZREL V rel jump if zero_flag
+         32'h0000_1032: t_cond_jump_rel(w_var1, !r_flags.zero);                    // JMPNZREL V rel jump if not zero_flag
+         32'h0000_1033: t_cond_jump_rel(w_var1, r_flags.equal);                    // JMPEREL V rel jump if equal_flag
+         32'h0000_1034: t_cond_jump_rel(w_var1, !r_flags.equal);                   // JMPNEREL V rel jump if not equal_flag
+         32'h0000_1035: t_cond_jump_rel(w_var1, r_flags.carry);                    // JMPCREL V rel jump if carry_flag
+         32'h0000_1036: t_cond_jump_rel(w_var1, !r_flags.carry);                   // JMPNCREL V rel jump if not carry_flag
+         32'h0000_1037: t_cond_jump_rel(w_var1, r_flags.sign);                     // JMPSREL V rel jump if sign_flag
+         32'h0000_1038: t_cond_jump_rel(w_var1, !r_flags.sign);                    // JMPNSREL V rel jump if not sign_flag
+         32'h0000_1039: t_cond_jump_rel(w_var1, r_flags.less);                     // JMPLTREL V rel jump if less_flag (signed <)
+         32'h0000_103A: t_cond_jump_rel(w_var1, r_flags.less | r_flags.equal);      // JMPLEREL V rel jump if less|equal (signed <=)
+         32'h0000_103B: t_cond_jump_rel(w_var1, !r_flags.less & !r_flags.equal);    // JMPGTREL V rel jump if !less&!equal (signed >)
+         32'h0000_103C: t_cond_jump_rel(w_var1, !r_flags.less);                    // JMPGEREL V rel jump if !less_flag (signed >=)
+         32'h0000_103D: t_cond_jump_rel(w_var1, r_flags.ult);                      // JMPULTREL V rel jump if ult_flag (unsigned <)
+         32'h0000_103E: t_cond_jump_rel(w_var1, r_flags.ult | r_flags.equal);       // JMPULEREL V rel jump if ult|equal (unsigned <=)
+         32'h0000_103F: t_cond_jump_rel(w_var1, !r_flags.ult & !r_flags.equal);     // JMPUGTREL V rel jump if !ult&!equal (unsigned >)
+         32'h0000_1040: t_cond_jump_rel(w_var1, !r_flags.ult);                     // JMPUGEREL V rel jump if !ult_flag (unsigned >=)
          32'h0000_1041: t_cond_call_rel(w_var1, 1'b1);                            // CALLREL V push PC+8 (ret addr), PC+=sign_ext(imm32); SP-=8
 
          //=====================================================================

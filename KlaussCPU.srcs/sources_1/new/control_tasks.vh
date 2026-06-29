@@ -207,13 +207,13 @@ task t_iret;
       end else begin
          if (w_mem_ready) begin
             r_PC            <= w_mem_read_data[31:0];
-            r_zero_flag     <= w_mem_read_data[38];
-            r_equal_flag    <= w_mem_read_data[37];
-            r_carry_flag    <= w_mem_read_data[36];
-            r_overflow_flag <= w_mem_read_data[35];
-            r_sign_flag     <= w_mem_read_data[34];
-            r_less_flag     <= w_mem_read_data[33];
-            r_ult_flag      <= w_mem_read_data[32];
+            r_flags.zero     <= w_mem_read_data[38];
+            r_flags.equal    <= w_mem_read_data[37];
+            r_flags.carry    <= w_mem_read_data[36];
+            r_flags.overflow <= w_mem_read_data[35];
+            r_flags.sign     <= w_mem_read_data[34];
+            r_flags.less     <= w_mem_read_data[33];
+            r_flags.ult      <= w_mem_read_data[32];
             r_int_mask      <= w_mem_read_data[42:39];
             r_SP            <= r_SP + 8;
             r_mem_read_DV   <= 1'b0;

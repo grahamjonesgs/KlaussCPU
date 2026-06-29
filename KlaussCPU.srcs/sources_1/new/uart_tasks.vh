@@ -14,7 +14,7 @@ task t_rx_blocking;
             r_rx_fifo_read            <= 1'b1;
             r_writeback_value         <= {24'b0, w_rx_fifo_byte};
             r_writeback_reg           <= r_reg_2;
-            r_zero_flag               <= 1'b0;
+            r_flags.zero               <= 1'b0;
             r_SM <= WRITEBACK;
             r_PC <= r_PC + 4;
         end
@@ -29,14 +29,14 @@ endtask
 task t_rx_nonblocking;
     begin
         if (w_rx_fifo_empty) begin
-            r_zero_flag <= 1'b1;
+            r_flags.zero <= 1'b1;
             r_SM <= OPCODE_REQUEST;
             r_PC <= r_PC + 4;
         end else begin
             r_rx_fifo_read    <= 1'b1;
             r_writeback_value <= {24'b0, w_rx_fifo_byte};
             r_writeback_reg   <= r_reg_2;
-            r_zero_flag       <= 1'b0;
+            r_flags.zero       <= 1'b0;
             r_SM <= WRITEBACK;
             r_PC <= r_PC + 4;
         end
@@ -931,19 +931,19 @@ function [7:0] f_dump_byte;
                     5'd3:  f_dump_byte = " ";
                     5'd4:  f_dump_byte = "Z";
                     5'd5:  f_dump_byte = "=";
-                    5'd6:  f_dump_byte = r_zero_flag     ? "1" : "0";
+                    5'd6:  f_dump_byte = r_flags.zero     ? "1" : "0";
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "E";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = r_equal_flag    ? "1" : "0";
+                    5'd10: f_dump_byte = r_flags.equal    ? "1" : "0";
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "C";
                     5'd13: f_dump_byte = "=";
-                    5'd14: f_dump_byte = r_carry_flag    ? "1" : "0";
+                    5'd14: f_dump_byte = r_flags.carry    ? "1" : "0";
                     5'd15: f_dump_byte = " ";
                     5'd16: f_dump_byte = "V";
                     5'd17: f_dump_byte = "=";
-                    5'd18: f_dump_byte = r_overflow_flag ? "1" : "0";
+                    5'd18: f_dump_byte = r_flags.overflow ? "1" : "0";
                     5'd19: f_dump_byte = 8'h0D;
                     5'd20: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
@@ -959,15 +959,15 @@ function [7:0] f_dump_byte;
                     5'd3:  f_dump_byte = " ";
                     5'd4:  f_dump_byte = "S";
                     5'd5:  f_dump_byte = "=";
-                    5'd6:  f_dump_byte = r_sign_flag ? "1" : "0";
+                    5'd6:  f_dump_byte = r_flags.sign ? "1" : "0";
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "L";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = r_less_flag ? "1" : "0";
+                    5'd10: f_dump_byte = r_flags.less ? "1" : "0";
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "U";
                     5'd13: f_dump_byte = "=";
-                    5'd14: f_dump_byte = r_ult_flag  ? "1" : "0";
+                    5'd14: f_dump_byte = r_flags.ult  ? "1" : "0";
                     5'd15: f_dump_byte = 8'h0D;
                     5'd16: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;

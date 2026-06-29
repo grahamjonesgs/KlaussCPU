@@ -20,7 +20,7 @@ task t_rotate_left;
    begin
       r_writeback_value <= {r_reg_port_b[62:0], r_reg_port_b[63]};
       r_writeback_reg <= r_reg_2;
-      r_carry_flag <= r_reg_port_b[63];
+      r_flags.carry <= r_reg_port_b[63];
       r_writeback_set_zero_flag <= 1'b1;
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
@@ -32,7 +32,7 @@ task t_rotate_right;
    begin
       r_writeback_value <= {r_reg_port_b[0], r_reg_port_b[63:1]};
       r_writeback_reg <= r_reg_2;
-      r_carry_flag <= r_reg_port_b[0];
+      r_flags.carry <= r_reg_port_b[0];
       r_writeback_set_zero_flag <= 1'b1;
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
@@ -43,10 +43,10 @@ endtask
 task t_rotate_left_carry;
    logic [64:0] temp;
    begin
-      temp = {r_reg_port_b, r_carry_flag};
+      temp = {r_reg_port_b, r_flags.carry};
       r_writeback_value <= {temp[63:0]};
       r_writeback_reg <= r_reg_2;
-      r_carry_flag <= temp[64];
+      r_flags.carry <= temp[64];
       r_writeback_set_zero_flag <= 1'b1;
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
@@ -57,10 +57,10 @@ endtask
 task t_rotate_right_carry;
    logic [64:0] temp;
    begin
-      temp = {r_carry_flag, r_reg_port_b};
+      temp = {r_flags.carry, r_reg_port_b};
       r_writeback_value <= temp[64:1];
       r_writeback_reg <= r_reg_2;
-      r_carry_flag <= temp[0];
+      r_flags.carry <= temp[0];
       r_writeback_set_zero_flag <= 1'b1;
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
@@ -171,7 +171,7 @@ endtask
 task t_bit_test_value;
    input [31:0] i_bit;
    begin
-      r_zero_flag <= ~r_reg_port_b[i_bit[5:0]];
+      r_flags.zero <= ~r_reg_port_b[i_bit[5:0]];
       r_SM <= OPCODE_REQUEST;
       r_PC <= r_PC + 8;
    end
@@ -513,7 +513,7 @@ task t_div_regs_hw;
          // Divide by zero
          r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
          r_writeback_reg <= r_reg_dst;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
@@ -542,7 +542,7 @@ task t_divu_regs_hw;
       if (r_reg_port_b == 64'b0) begin
          r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
          r_writeback_reg <= r_reg_dst;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
@@ -569,7 +569,7 @@ task t_mod_regs_hw;
       if (r_reg_port_b == 64'b0) begin
          r_writeback_value <= r_reg_port_a;  // Return dividend
          r_writeback_reg <= r_reg_dst;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
@@ -597,7 +597,7 @@ task t_modu_regs_hw;
       if (r_reg_port_b == 64'b0) begin
          r_writeback_value <= r_reg_port_a;
          r_writeback_reg <= r_reg_dst;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
@@ -625,7 +625,7 @@ task t_div_value_hw;
       if (i_value == 32'b0) begin
          r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
          r_writeback_reg <= r_reg_2;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 8;
       end
@@ -659,7 +659,7 @@ task t_mod_value_hw;
          // explicitly to match the MODR / MODUR / DIVV by-zero handling.
          r_writeback_value <= r_reg_port_b;
          r_writeback_reg   <= r_reg_2;
-         r_overflow_flag <= 1'b1;
+         r_flags.overflow <= 1'b1;
          r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
          r_PC <= r_PC + 8;
       end
@@ -692,10 +692,10 @@ task t_abs_reg;
       if (r_reg_port_b[63]) begin
          r_writeback_value <= ~r_reg_port_b + 1;
          // Check for overflow (abs of -2^63)
-         r_overflow_flag <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
+         r_flags.overflow <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
       end else begin
          r_writeback_value <= r_reg_port_b;
-         r_overflow_flag <= 1'b0;  // non-negative input never overflows
+         r_flags.overflow <= 1'b0;  // non-negative input never overflows
       end
       r_writeback_reg <= r_reg_2;
       r_writeback_set_zero_flag <= 1'b1;
@@ -710,7 +710,7 @@ task t_sign_extend_byte;
       r_writeback_value <= {{56{r_reg_port_b[7]}}, r_reg_port_b[7:0]};
       r_writeback_reg <= r_reg_2;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= r_reg_port_b[7];
+      r_flags.sign <= r_reg_port_b[7];
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
@@ -722,7 +722,7 @@ task t_sign_extend_half;
       r_writeback_value <= {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]};
       r_writeback_reg <= r_reg_2;
       r_writeback_set_zero_flag <= 1'b1;
-      r_sign_flag <= r_reg_port_b[15];
+      r_flags.sign <= r_reg_port_b[15];
       r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
