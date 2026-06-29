@@ -96,10 +96,12 @@ module KlaussCPU (
    // states appear in the waveform and can be reasoned about by name.  Values
    // are the EXACT one-hot bit patterns the design has always used (low 32
    // states in bits 0..31, ALU_FINISH = bit 32, DIVIDE_PREP = bit 33).  The
-   // (* fsm_encoding = "one_hot" *) on r_SM pins the encoding Vivado previously
-   // inferred from these constants, so the synthesized hardware is unchanged.
-   // r_fault_sm (the crash-dump snapshot) stays a plain logic [33:0] so its
-   // nibble slicing in uart_tasks.vh keeps working.
+   // encoding is left to Vivado's FSM inference, which derives one-hot from
+   // these constants exactly as it did from the original localparams — so the
+   // synthesized hardware (FF count, encoding) matches the pre-conversion
+   // baseline and Vivado's FSM optimization is not disabled by a forced
+   // fsm_encoding attribute.  r_fault_sm (the crash-dump snapshot) stays a plain
+   // logic [33:0] so its nibble slicing in uart_tasks.vh keeps working.
    typedef enum logic [33:0] {
       OPCODE_REQUEST = 34'h1, OPCODE_FETCH = 34'h2, OPCODE_FETCH2 = 34'h4,
       VAR1_FETCH = 34'h8, VAR1_FETCH2 = 34'h10, WAITING = 34'h20,  // WAITING: interruptible core-suspend (WAIT opcode); uses the state bit above VAR1_FETCH2
@@ -186,7 +188,7 @@ module KlaussCPU (
    logic [44:0] r_timeout_max;
 
    // Machine control
-   (* fsm_encoding = "one_hot" *) e_sm_t r_SM;   // 34 one-hot states (see e_sm_t); bit 32 = ALU_FINISH, bit 33 = DIVIDE_PREP
+   e_sm_t r_SM;   // 34 one-hot states (see e_sm_t); bit 32 = ALU_FINISH, bit 33 = DIVIDE_PREP
    // Snapshot of r_SM at fault time.  r_SM gets overwritten by the HCF chain
    // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping r_SM directly
    // is useless.  We continuously copy r_SM into r_fault_sm while the FSM is
