@@ -115,7 +115,15 @@ module crypto_sha (
     logic [255:0] r_inner_state;       // owned by HMAC FSM block (driver-1)
     logic [255:0] r_outer_state;       // owned by HMAC FSM block (driver-1)
     logic         r_hmac_key_valid;    // owned by HMAC FSM block (driver-1)
-    logic [2:0]   r_hmac_fsm;
+    typedef enum logic [2:0] {
+        HMAC_IDLE,     // no HMAC operation in flight
+        HMAC_START_I,  // INIT sent last cycle → drive START with inner block
+        HMAC_WAIT_I,   // SHA running inner pass; wait for o_done
+        HMAC_INIT_O,   // re-INIT before outer pass
+        HMAC_START_O,
+        HMAC_WAIT_O
+    } e_hmac_state_t;
+    e_hmac_state_t r_hmac_fsm;
     logic         r_hmac_use_outer_block;
     logic         r_hmac_init_pulse;
     logic         r_hmac_start_pulse;
@@ -123,13 +131,6 @@ module crypto_sha (
     logic         r_hmac_keyzero_pulse;    // 1-cycle pulse: software wrote HMAC_CTRL.KEY_ZERO
     logic         r_h_load_pulse;          // 1-cycle pulse to core's i_h_load
     logic         r_h_load_sel;            // 0 = inner_state, 1 = outer_state
-
-    localparam HMAC_IDLE    = 3'd0;
-    localparam HMAC_START_I = 3'd1;  // INIT sent last cycle → drive START with inner block
-    localparam HMAC_WAIT_I  = 3'd2;  // SHA running inner pass; wait for o_done
-    localparam HMAC_INIT_O  = 3'd3;  // re-INIT before outer pass
-    localparam HMAC_START_O = 3'd4;
-    localparam HMAC_WAIT_O  = 3'd5;
 
     wire w_hmac_busy = (r_hmac_fsm != HMAC_IDLE);
 

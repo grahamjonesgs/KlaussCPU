@@ -237,10 +237,8 @@ module blitter_dma (
         S_BLEND2       // blend pipeline stage 2: register the 6 products (multiplies)
     } e_blit_state_t;
 
-    // Read targets for the generic read sub-FSM.
-    localparam RDT_SRC  = 2'd0;
-    localparam RDT_DST  = 2'd1;
-    localparam RDT_MASK = 2'd2;
+    // Read targets for the generic read sub-FSM (values 0..2 as before).
+    typedef enum logic [1:0] { RDT_SRC, RDT_DST, RDT_MASK } e_rdt_t;
 
     e_blit_state_t state;
     // Blend pipeline registers (cut the long mask-addr -> alpha -> blend -> wbuf
@@ -274,7 +272,7 @@ module blitter_dma (
     logic [31:0]  r_mbuf_addr;
     logic         r_mbuf_valid;
 
-    logic [1:0]   r_rd_target;    // which buffer the in-flight read fills
+    e_rdt_t       r_rd_target;    // which buffer the in-flight read fills
     logic [31:0]  r_rd_addr;
     logic [3:0]   r_gap;          // CDC settle countdown
     logic         r_flush_final;  // 1 = the in-flight flush is the final one

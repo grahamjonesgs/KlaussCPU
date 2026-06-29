@@ -127,8 +127,6 @@ module crypto_aes (
     logic         r_gcm_go_pulse;       // MMIO → FSM
     logic         r_gcm_reset_pulse;    // MMIO → FSM
     logic         r_gcm_start_pulse;    // FSM → ghash
-    logic [1:0]   r_gcm_fsm;
-
     // 3 states (still fits in 2 bits).
     //   GCM_IDLE     — no operation in flight.
     //   GCM_STARTING — pulse delivered to ghash; wait 1 cycle so ghash can
@@ -139,9 +137,8 @@ module crypto_aes (
     //                  ST_IDLE between operations) and capture the stale
     //                  o_Z as the new tag.
     //   GCM_WAIT     — multiply in progress; wait for fresh o_done.
-    localparam GCM_IDLE     = 2'd0;
-    localparam GCM_STARTING = 2'd1;
-    localparam GCM_WAIT     = 2'd2;
+    typedef enum logic [1:0] { GCM_IDLE, GCM_STARTING, GCM_WAIT } e_gcm_state_t;
+    e_gcm_state_t r_gcm_fsm;
 
     wire w_gcm_busy = (r_gcm_fsm != GCM_IDLE);
 

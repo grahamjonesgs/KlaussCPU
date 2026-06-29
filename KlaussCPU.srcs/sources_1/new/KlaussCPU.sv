@@ -602,13 +602,10 @@ module KlaussCPU (
    logic        r_div_sign_q;      // Sign of quotient
    logic        r_div_sign_r;      // Sign of remainder
    logic        r_div_is_signed;
-   logic [1:0]  r_div_op;          // 0=none, 1=div, 2=mod
+   typedef enum logic [1:0] { DIV_OP_NONE, DIV_OP_DIV, DIV_OP_MOD } e_div_op_t;
+   e_div_op_t   r_div_op;          // none / div / mod
    logic [3:0]  r_div_dest_reg;    // Destination register for division result
    logic        r_div_pc_inc;      // 0=PC+1, 1=PC+2
-   
-   localparam DIV_OP_NONE = 2'd0;
-   localparam DIV_OP_DIV  = 2'd1;
-   localparam DIV_OP_MOD  = 2'd2;
 
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
