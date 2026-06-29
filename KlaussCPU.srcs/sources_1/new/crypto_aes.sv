@@ -23,7 +23,7 @@
 // caller selects the relevant half (sub-64-bit MMIO accesses are not used
 // for this device — software uses MEMSET64/MEMGET64 throughout).
 //
-// MMIO timing: o_mmio_ready is asserted combinationally for any access. The
+// MMIO timing: mmio.ready is asserted combinationally for any access. The
 // CPU side absorbs the 1-cycle pipeline FF on the bus_splitter return path,
 // so reads complete on the cycle after the strobe (same as every other MMIO
 // device on this CPU).
@@ -33,14 +33,8 @@ module crypto_aes (
     input             i_Clk,
     input             i_Rst_L,
 
-    // MMIO interface (offsets within device window, addr[15:0]).
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [15:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,   // unused — software always uses 64-bit accesses
-    output logic [63:0] o_mmio_read_data,
-    output            o_mmio_ready
+    // MMIO peripheral bus (slave). Device-window offsets use mmio.addr[15:0].
+    mmio_if.slave     mmio
 );
 
     // -------------------------------------------------------------------------
@@ -81,9 +75,9 @@ module crypto_aes (
     localparam OFF_GCM_TAG0   = 16'h00B0;
     localparam OFF_GCM_TAG1   = 16'h00B8;
 
-    assign o_mmio_ready = 1'b1;
+    assign mmio.ready = 1'b1;
 
-    wire byte_en_unused = |i_mmio_byte_en;  // keep tools from pruning the port
+    wire byte_en_unused = |mmio.byte_en;  // keep tools from pruning the port
 
     // -------------------------------------------------------------------------
     // Data registers
@@ -233,44 +227,44 @@ module crypto_aes (
             if (w_core_done)
                 r_done_latch <= 1'b1;
 
-            if (i_mmio_write_DV) begin
-                case (i_mmio_addr)
+            if (mmio.write_DV) begin
+                case (mmio.addr[15:0])
                     OFF_CTRL: begin
-                        if (i_mmio_write_data[3]) begin
+                        if (mmio.write_data[3]) begin
                             // KEY_ZERO — wipe key (and round-key state inside core
                             // is left stale; software should follow with KEY_LOAD
                             // before reusing the engine).
                             r_key <= 128'h0;
                         end
-                        if (i_mmio_write_data[2]) begin
+                        if (mmio.write_data[2]) begin
                             r_key_load_pulse <= 1'b1;
                             r_done_latch     <= 1'b0;
                         end
-                        if (i_mmio_write_data[0]) begin
+                        if (mmio.write_data[0]) begin
                             // GO — encrypt or decrypt depending on ENC bit.
-                            if (i_mmio_write_data[1])
+                            if (mmio.write_data[1])
                                 r_go_enc_pulse <= 1'b1;
                             else
                                 r_go_dec_pulse <= 1'b1;
                             r_done_latch <= 1'b0;
                         end
                     end
-                    OFF_KEY0: r_key[63:0]    <= i_mmio_write_data;
-                    OFF_KEY1: r_key[127:64]  <= i_mmio_write_data;
-                    OFF_IN0:  r_data_in[63:0]   <= i_mmio_write_data;
-                    OFF_IN1:  r_data_in[127:64] <= i_mmio_write_data;
+                    OFF_KEY0: r_key[63:0]    <= mmio.write_data;
+                    OFF_KEY1: r_key[127:64]  <= mmio.write_data;
+                    OFF_IN0:  r_data_in[63:0]   <= mmio.write_data;
+                    OFF_IN1:  r_data_in[127:64] <= mmio.write_data;
                     OFF_GCM_CTRL: begin
                         // [0] GO    : kick (tag XOR X) • H accumulation
                         // [1] RESET : tag <= 0  (handed to FSM via pulse)
-                        if (i_mmio_write_data[0] && !w_gcm_busy)
+                        if (mmio.write_data[0] && !w_gcm_busy)
                             r_gcm_go_pulse <= 1'b1;
-                        if (i_mmio_write_data[1])
+                        if (mmio.write_data[1])
                             r_gcm_reset_pulse <= 1'b1;
                     end
-                    OFF_GCM_H0: r_gcm_H[63:0]    <= i_mmio_write_data;
-                    OFF_GCM_H1: r_gcm_H[127:64]  <= i_mmio_write_data;
-                    OFF_GCM_X0: r_gcm_X[63:0]    <= i_mmio_write_data;
-                    OFF_GCM_X1: r_gcm_X[127:64]  <= i_mmio_write_data;
+                    OFF_GCM_H0: r_gcm_H[63:0]    <= mmio.write_data;
+                    OFF_GCM_H1: r_gcm_H[127:64]  <= mmio.write_data;
+                    OFF_GCM_X0: r_gcm_X[63:0]    <= mmio.write_data;
+                    OFF_GCM_X1: r_gcm_X[127:64]  <= mmio.write_data;
                     default: ;  // ignored
                 endcase
             end
@@ -326,29 +320,29 @@ module crypto_aes (
     end
 
     // -------------------------------------------------------------------------
-    // Read path — combinational mux into o_mmio_read_data.  The mux output is
+    // Read path — combinational mux into mmio.read_data.  The mux output is
     // not registered here; the bus_splitter pipelines the return path so the
     // CPU samples the value one cycle after the read strobe.
     // -------------------------------------------------------------------------
     always_comb begin
-        o_mmio_read_data = 64'h0;
-        case (i_mmio_addr)
-            OFF_STATUS: o_mmio_read_data = {62'h0, r_done_latch, w_core_busy};
-            OFF_KEY0:   o_mmio_read_data = r_key[63:0];
-            OFF_KEY1:   o_mmio_read_data = r_key[127:64];
-            OFF_IN0:    o_mmio_read_data = r_data_in[63:0];
-            OFF_IN1:    o_mmio_read_data = r_data_in[127:64];
-            OFF_OUT0:   o_mmio_read_data = w_data_out[63:0];
-            OFF_OUT1:   o_mmio_read_data = w_data_out[127:64];
+        mmio.read_data = 64'h0;
+        case (mmio.addr[15:0])
+            OFF_STATUS: mmio.read_data = {62'h0, r_done_latch, w_core_busy};
+            OFF_KEY0:   mmio.read_data = r_key[63:0];
+            OFF_KEY1:   mmio.read_data = r_key[127:64];
+            OFF_IN0:    mmio.read_data = r_data_in[63:0];
+            OFF_IN1:    mmio.read_data = r_data_in[127:64];
+            OFF_OUT0:   mmio.read_data = w_data_out[63:0];
+            OFF_OUT1:   mmio.read_data = w_data_out[127:64];
             // GCM / GHASH
-            OFF_GCM_STATUS: o_mmio_read_data = {62'h0, r_gcm_done_latch, w_gcm_busy};
-            OFF_GCM_H0:     o_mmio_read_data = r_gcm_H[63:0];
-            OFF_GCM_H1:     o_mmio_read_data = r_gcm_H[127:64];
-            OFF_GCM_X0:     o_mmio_read_data = r_gcm_X[63:0];
-            OFF_GCM_X1:     o_mmio_read_data = r_gcm_X[127:64];
-            OFF_GCM_TAG0:   o_mmio_read_data = r_gcm_tag[63:0];
-            OFF_GCM_TAG1:   o_mmio_read_data = r_gcm_tag[127:64];
-            default:        o_mmio_read_data = 64'h0;
+            OFF_GCM_STATUS: mmio.read_data = {62'h0, r_gcm_done_latch, w_gcm_busy};
+            OFF_GCM_H0:     mmio.read_data = r_gcm_H[63:0];
+            OFF_GCM_H1:     mmio.read_data = r_gcm_H[127:64];
+            OFF_GCM_X0:     mmio.read_data = r_gcm_X[63:0];
+            OFF_GCM_X1:     mmio.read_data = r_gcm_X[127:64];
+            OFF_GCM_TAG0:   mmio.read_data = r_gcm_tag[63:0];
+            OFF_GCM_TAG1:   mmio.read_data = r_gcm_tag[127:64];
+            default:        mmio.read_data = 64'h0;
         endcase
     end
 

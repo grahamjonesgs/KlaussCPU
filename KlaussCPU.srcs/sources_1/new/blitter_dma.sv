@@ -46,7 +46,7 @@
 //
 // OP: 0 FILL, 1 COPY, 2 FILL_BLEND, 3 COPY_BLEND, 4 MASK_BLEND.
 //
-// MMIO timing matches the other devices: o_mmio_ready is combinational (the
+// MMIO timing matches the other devices: mmio.ready is combinational (the
 // bus_splitter return FF gives the CPU its 1-cycle read latency).
 //////////////////////////////////////////////////////////////////////////////////
 
@@ -54,14 +54,8 @@ module blitter_dma (
     input             i_Clk,
     input             i_Rst_L,
 
-    // -------- MMIO slave (offsets within device window, addr[15:0]) --------
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [15:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,    // unused — software uses 64-bit accesses
-    output logic [63:0] o_mmio_read_data,
-    output            o_mmio_ready,
+    // -------- MMIO peripheral bus (slave). Offsets use mmio.addr[15:0]. --------
+    mmio_if.slave     mmio,
 
     // -------- DDR master (master B on mem_read_write's arbiter) --------
     output logic        o_dma_req,
@@ -103,8 +97,8 @@ module blitter_dma (
     localparam OP_COPY_BLEND = 3'd3;
     localparam OP_MASK_BLEND = 3'd4;
 
-    assign o_mmio_ready = 1'b1;
-    wire byte_en_unused = |i_mmio_byte_en;  // keep the port from being pruned
+    assign mmio.ready = 1'b1;
+    wire byte_en_unused = |mmio.byte_en;  // keep the port from being pruned
 
     // -------------------------------------------------------------------------
     // RGB565 blend: out = (fg*a + bg*(255-a) + 128) >> 8, per channel.
@@ -177,26 +171,26 @@ module blitter_dma (
         end else begin
             r_start_pulse      <= 1'b0;   // pulses are 1 cycle
             r_done_clear_pulse <= 1'b0;
-            if (i_mmio_write_DV) begin
-                case (i_mmio_addr)
+            if (mmio.write_DV) begin
+                case (mmio.addr[15:0])
                     OFF_CTRL: begin
-                        if (i_mmio_write_data[0] && !r_busy) begin
-                            r_op          <= i_mmio_write_data[3:1];
-                            r_irq_en      <= i_mmio_write_data[4];
+                        if (mmio.write_data[0] && !r_busy) begin
+                            r_op          <= mmio.write_data[3:1];
+                            r_irq_en      <= mmio.write_data[4];
                             r_start_pulse <= 1'b1;
                         end
                     end
-                    OFF_STATUS:      r_done_clear_pulse <= i_mmio_write_data[1];
-                    OFF_DST_ADDR:    r_dst_addr    <= i_mmio_write_data[31:0];
-                    OFF_DST_STRIDE:  r_dst_stride  <= i_mmio_write_data[31:0];
-                    OFF_SRC_ADDR:    r_src_addr    <= i_mmio_write_data[31:0];
-                    OFF_SRC_STRIDE:  r_src_stride  <= i_mmio_write_data[31:0];
-                    OFF_WIDTH:       r_width       <= i_mmio_write_data[15:0];
-                    OFF_HEIGHT:      r_height      <= i_mmio_write_data[15:0];
-                    OFF_COLOR:       r_color       <= i_mmio_write_data[15:0];
-                    OFF_ALPHA:       r_alpha       <= i_mmio_write_data[7:0];
-                    OFF_MASK_ADDR:   r_mask_addr   <= i_mmio_write_data[31:0];
-                    OFF_MASK_STRIDE: r_mask_stride <= i_mmio_write_data[31:0];
+                    OFF_STATUS:      r_done_clear_pulse <= mmio.write_data[1];
+                    OFF_DST_ADDR:    r_dst_addr    <= mmio.write_data[31:0];
+                    OFF_DST_STRIDE:  r_dst_stride  <= mmio.write_data[31:0];
+                    OFF_SRC_ADDR:    r_src_addr    <= mmio.write_data[31:0];
+                    OFF_SRC_STRIDE:  r_src_stride  <= mmio.write_data[31:0];
+                    OFF_WIDTH:       r_width       <= mmio.write_data[15:0];
+                    OFF_HEIGHT:      r_height      <= mmio.write_data[15:0];
+                    OFF_COLOR:       r_color       <= mmio.write_data[15:0];
+                    OFF_ALPHA:       r_alpha       <= mmio.write_data[7:0];
+                    OFF_MASK_ADDR:   r_mask_addr   <= mmio.write_data[31:0];
+                    OFF_MASK_STRIDE: r_mask_stride <= mmio.write_data[31:0];
                     default: ;
                 endcase
             end
@@ -204,20 +198,20 @@ module blitter_dma (
     end
 
     always_comb begin
-        case (i_mmio_addr)
-            OFF_STATUS:      o_mmio_read_data = {62'b0, r_done, r_busy};
-            OFF_DST_ADDR:    o_mmio_read_data = {32'b0, r_dst_addr};
-            OFF_DST_STRIDE:  o_mmio_read_data = {32'b0, r_dst_stride};
-            OFF_SRC_ADDR:    o_mmio_read_data = {32'b0, r_src_addr};
-            OFF_SRC_STRIDE:  o_mmio_read_data = {32'b0, r_src_stride};
-            OFF_WIDTH:       o_mmio_read_data = {48'b0, r_width};
-            OFF_HEIGHT:      o_mmio_read_data = {48'b0, r_height};
-            OFF_COLOR:       o_mmio_read_data = {48'b0, r_color};
-            OFF_ALPHA:       o_mmio_read_data = {56'b0, r_alpha};
-            OFF_MASK_ADDR:   o_mmio_read_data = {32'b0, r_mask_addr};
-            OFF_MASK_STRIDE: o_mmio_read_data = {32'b0, r_mask_stride};
-            OFF_CYCLES:      o_mmio_read_data = {32'b0, r_cycles_last};
-            default:         o_mmio_read_data = 64'h0;
+        case (mmio.addr[15:0])
+            OFF_STATUS:      mmio.read_data = {62'b0, r_done, r_busy};
+            OFF_DST_ADDR:    mmio.read_data = {32'b0, r_dst_addr};
+            OFF_DST_STRIDE:  mmio.read_data = {32'b0, r_dst_stride};
+            OFF_SRC_ADDR:    mmio.read_data = {32'b0, r_src_addr};
+            OFF_SRC_STRIDE:  mmio.read_data = {32'b0, r_src_stride};
+            OFF_WIDTH:       mmio.read_data = {48'b0, r_width};
+            OFF_HEIGHT:      mmio.read_data = {48'b0, r_height};
+            OFF_COLOR:       mmio.read_data = {48'b0, r_color};
+            OFF_ALPHA:       mmio.read_data = {56'b0, r_alpha};
+            OFF_MASK_ADDR:   mmio.read_data = {32'b0, r_mask_addr};
+            OFF_MASK_STRIDE: mmio.read_data = {32'b0, r_mask_stride};
+            OFF_CYCLES:      mmio.read_data = {32'b0, r_cycles_last};
+            default:         mmio.read_data = 64'h0;
         endcase
     end
 

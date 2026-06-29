@@ -4,7 +4,7 @@
 // classic Wishbone slave.
 //
 // Address translation (byte-for-byte across the 192 KiB Eth window):
-//   eth_byte_addr  = i_mmio_addr - 32'hF006_0000
+//   eth_byte_addr  = mmio.addr - 32'hF006_0000
 //   wishbone_adr   = eth_byte_addr[19:2]      // word address; LiteEth ignores upper bits
 //
 // The CPU bus is 64-bit; LiteEth is 32-bit.  The 8 byte-enables tell us which
@@ -18,8 +18,8 @@
 // Wishbone signals always driven for single-transfer mode:
 //   o_wb_bte = 2'b00, o_wb_cti = 3'b000
 //
-// CPU holds i_mmio_addr / i_mmio_write_data / i_mmio_byte_en stable until
-// o_mmio_ready, so we don't have to latch the request — the WB outputs read
+// CPU holds mmio.addr / mmio.write_data / mmio.byte_en stable until
+// mmio.ready, so we don't have to latch the request — the WB outputs read
 // directly from the inputs each cycle.
 //////////////////////////////////////////////////////////////////////////////////
 
@@ -27,14 +27,8 @@ module eth_mmio_bridge (
     input             i_clk,
     input             i_rst,             // active-high
 
-    // -------- CPU MMIO side (matches bus_splitter MMIO output) --------
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [31:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,
-    output logic [63:0] o_mmio_read_data,
-    output logic        o_mmio_ready,
+    // -------- CPU MMIO side (slave; full 32-bit addr via mmio.addr) --------
+    mmio_if.slave     mmio,
 
     // -------- LiteEth Wishbone classic master --------
     output logic [29:0] o_wb_adr,
@@ -56,7 +50,7 @@ module eth_mmio_bridge (
 
     // ---- Address derivation (combinational from inputs) ----
     //
-    // The CPU may send i_mmio_addr either:
+    // The CPU may send mmio.addr either:
     //   (a) doubleword-aligned (low 3 bits = 0), with byte_en selecting
     //       which half is in play, OR
     //   (b) at the actual byte address (bit 2 reflecting which half)
@@ -68,21 +62,21 @@ module eth_mmio_bridge (
     // sends addr=0xF006_0004 with byte_en=0xF0 hits eth_word_addr=1,
     // and the +1 offset for the high half pushes the access to word 2
     // (ctrl_bus_errors) instead of word 1 (ctrl_scratch).
-    wire [31:0] eth_byte_aligned = {i_mmio_addr[31:3], 3'b000};
+    wire [31:0] eth_byte_aligned = {mmio.addr[31:3], 3'b000};
     wire [31:0] eth_byte_offset  = eth_byte_aligned - 32'hF006_0000;
     wire [29:0] eth_word_lo      = eth_byte_offset[31:2];        // bit 0 = 0
     wire [29:0] eth_word_hi      = eth_word_lo | 30'd1;          // bit 0 = 1 (+4 bytes)
-    wire        low_active       = |i_mmio_byte_en[3:0];
-    wire        high_active      = |i_mmio_byte_en[7:4];
-    wire        is_write         = i_mmio_write_DV;
-    wire        is_read          = i_mmio_read_DV;
+    wire        low_active       = |mmio.byte_en[3:0];
+    wire        high_active      = |mmio.byte_en[7:4];
+    wire        is_write         = mmio.write_DV;
+    wire        is_read          = mmio.read_DV;
 
     // ---- FSM ----
     localparam S_IDLE   = 3'd0;
     localparam S_LO     = 3'd1;          // driving low-half WB cycle
     localparam S_LO_GAP = 3'd2;          // STB low between LO and HI (only if both halves)
     localparam S_HI     = 3'd3;          // driving high-half WB cycle
-    localparam S_DONE   = 3'd4;          // pulse o_mmio_ready, then cool down
+    localparam S_DONE   = 3'd4;          // pulse mmio.ready, then cool down
     localparam S_COOL   = 3'd5;          // hold (not accepting) until strobe drops
 
     logic [2:0] state;
@@ -96,11 +90,11 @@ module eth_mmio_bridge (
             o_wb_we          <= 1'b0;
             o_wb_cyc         <= 1'b0;
             o_wb_stb         <= 1'b0;
-            o_mmio_ready     <= 1'b0;
-            o_mmio_read_data <= 64'b0;
+            mmio.ready     <= 1'b0;
+            mmio.read_data <= 64'b0;
         end else begin
             // Default: ready is a 1-cycle pulse, fired in S_DONE.
-            o_mmio_ready <= 1'b0;
+            mmio.ready <= 1'b0;
 
             case (state)
                 // ----------------------------------------------------------------
@@ -111,8 +105,8 @@ module eth_mmio_bridge (
                         if (low_active) begin
                             // Low-half cycle first (always, when low is active).
                             o_wb_adr   <= eth_word_lo;
-                            o_wb_dat_w <= i_mmio_write_data[31:0];
-                            o_wb_sel   <= i_mmio_byte_en[3:0];
+                            o_wb_dat_w <= mmio.write_data[31:0];
+                            o_wb_sel   <= mmio.byte_en[3:0];
                             o_wb_we    <= is_write;
                             o_wb_cyc   <= 1'b1;
                             o_wb_stb   <= 1'b1;
@@ -120,15 +114,15 @@ module eth_mmio_bridge (
                         end else if (high_active) begin
                             // Only high half active — skip straight to high cycle.
                             o_wb_adr   <= eth_word_hi;
-                            o_wb_dat_w <= i_mmio_write_data[63:32];
-                            o_wb_sel   <= i_mmio_byte_en[7:4];
+                            o_wb_dat_w <= mmio.write_data[63:32];
+                            o_wb_sel   <= mmio.byte_en[7:4];
                             o_wb_we    <= is_write;
                             o_wb_cyc   <= 1'b1;
                             o_wb_stb   <= 1'b1;
                             state      <= S_HI;
                         end else begin
                             // Degenerate access (no byte enables).  Just ack.
-                            o_mmio_read_data <= 64'b0;
+                            mmio.read_data <= 64'b0;
                             state            <= S_DONE;
                         end
                     end
@@ -137,7 +131,7 @@ module eth_mmio_bridge (
                 // ----------------------------------------------------------------
                 S_LO: begin
                     if (i_wb_ack) begin
-                        o_mmio_read_data[31:0] <= i_wb_dat_r;
+                        mmio.read_data[31:0] <= i_wb_dat_r;
                         if (high_active) begin
                             // Drop STB for one cycle, hold CYC, then issue HI.
                             o_wb_stb <= 1'b0;
@@ -154,8 +148,8 @@ module eth_mmio_bridge (
                 S_LO_GAP: begin
                     // One-cycle STB-low gap.  Set up high-half params and re-assert.
                     o_wb_adr   <= eth_word_hi;
-                    o_wb_dat_w <= i_mmio_write_data[63:32];
-                    o_wb_sel   <= i_mmio_byte_en[7:4];
+                    o_wb_dat_w <= mmio.write_data[63:32];
+                    o_wb_sel   <= mmio.byte_en[7:4];
                     // o_wb_we stays the same as the write/read direction
                     o_wb_stb   <= 1'b1;
                     state      <= S_HI;
@@ -164,7 +158,7 @@ module eth_mmio_bridge (
                 // ----------------------------------------------------------------
                 S_HI: begin
                     if (i_wb_ack) begin
-                        o_mmio_read_data[63:32] <= i_wb_dat_r;
+                        mmio.read_data[63:32] <= i_wb_dat_r;
                         o_wb_cyc <= 1'b0;
                         o_wb_stb <= 1'b0;
                         state    <= S_DONE;
@@ -174,13 +168,13 @@ module eth_mmio_bridge (
                 // ----------------------------------------------------------------
                 S_DONE: begin
                     // One-cycle ack to the CPU side; rdata is already valid.
-                    o_mmio_ready <= 1'b1;
+                    mmio.ready <= 1'b1;
                     state        <= S_COOL;
                 end
 
                 // ----------------------------------------------------------------
                 // S_COOL: hold WITHOUT accepting a new request until the CPU has
-                // dropped its strobe.  bus_splitter registers o_mmio_ready, so the
+                // dropped its strobe.  bus_splitter registers mmio.ready, so the
                 // CPU sees the S_DONE ack one cycle late and keeps i_mmio_*_DV
                 // asserted for an extra cycle.  Returning straight to S_IDLE would
                 // re-fire the entire Wishbone transaction again off that lingering

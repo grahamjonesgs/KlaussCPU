@@ -36,14 +36,8 @@ module sd_spi (
     input             i_Clk,
     input             i_Rst_L,
 
-    // ----- MMIO interface (offsets within device window, addr[15:0]) -----
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [15:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,
-    output logic [63:0] o_mmio_read_data,
-    output            o_mmio_ready,
+    // ----- MMIO peripheral bus (slave). Offsets use mmio.addr[15:0]. -----
+    mmio_if.slave     mmio,
 
     // ----- SD card pins (Nexys A7 microSD slot) -----
     input             i_sd_cd,         // card detect (board-dependent polarity)
@@ -65,12 +59,12 @@ module sd_spi (
     // Sector buffer: 0x200..0x3F8 (64 × 8-byte doublewords).
     // addr[9] selects buffer vs registers; addr[8:3] is the doubleword index.
 
-    wire is_buf = i_mmio_addr[9];
-    wire [5:0] buf_idx = i_mmio_addr[8:3];
+    wire is_buf = mmio.addr[9];
+    wire [5:0] buf_idx = mmio.addr[8:3];
 
     // MMIO ready: combinational always-1. Buffer is distributed RAM with
     // single-cycle read; register reads are also combinational.
-    assign o_mmio_ready = 1'b1;
+    assign mmio.ready = 1'b1;
 
     // -----------------------------------------------------------------------
     // Control register
@@ -101,8 +95,8 @@ module sd_spi (
     logic [ 7:0] r_rx_byte;
     logic        r_byte_busy;
 
-    wire w_kick_byte = i_mmio_write_DV
-                       && (i_mmio_addr == OFF_DATA)
+    wire w_kick_byte = mmio.write_DV
+                       && (mmio.addr[15:0] == OFF_DATA)
                        && !r_byte_busy;
 
     always_ff @(posedge i_Clk or negedge i_Rst_L) begin
@@ -125,8 +119,8 @@ module sd_spi (
                     r_phase_count <= 16'd0;
                     r_sck_phase   <= 1'b0;
                     if (w_kick_byte) begin
-                        r_tx_shift  <= i_mmio_write_data[7:0];
-                        o_sd_mosi   <= i_mmio_write_data[7];   // present MSB before first SCK edge
+                        r_tx_shift  <= mmio.write_data[7:0];
+                        o_sd_mosi   <= mmio.write_data[7];   // present MSB before first SCK edge
                         r_bit_idx   <= 3'd7;
                         r_byte_busy <= 1'b1;
                         r_byte_sm   <= BYTE_SHIFT;
@@ -167,16 +161,16 @@ module sd_spi (
     // -----------------------------------------------------------------------
     // Sector buffer — 64 × 64-bit = 512 bytes, distributed RAM (combinational
     // read, byte-enabled write). Small enough to keep in LUTRAM and avoids
-    // adding a wait-state to o_mmio_ready.
+    // adding a wait-state to mmio.ready.
     // -----------------------------------------------------------------------
     logic [63:0] r_sector_buf [0:63];
 
     integer bi;
     always_ff @(posedge i_Clk) begin
-        if (i_mmio_write_DV && is_buf) begin
+        if (mmio.write_DV && is_buf) begin
             for (bi = 0; bi < 8; bi = bi + 1) begin
-                if (i_mmio_byte_en[bi])
-                    r_sector_buf[buf_idx][bi*8 +: 8] <= i_mmio_write_data[bi*8 +: 8];
+                if (mmio.byte_en[bi])
+                    r_sector_buf[buf_idx][bi*8 +: 8] <= mmio.write_data[bi*8 +: 8];
             end
         end
     end
@@ -189,10 +183,10 @@ module sd_spi (
             r_clk_div <= 16'd249;   // ~200 kHz init speed @ 100 MHz i_Clk
             o_sd_cs_n <= 1'b1;       // CS deasserted
             r_pwr_en  <= 1'b0;       // slot off
-        end else if (i_mmio_write_DV && (i_mmio_addr == OFF_CTRL)) begin
-            r_clk_div <= i_mmio_write_data[15:0];
-            o_sd_cs_n <= i_mmio_write_data[16];
-            r_pwr_en  <= i_mmio_write_data[17];
+        end else if (mmio.write_DV && (mmio.addr[15:0] == OFF_CTRL)) begin
+            r_clk_div <= mmio.write_data[15:0];
+            o_sd_cs_n <= mmio.write_data[16];
+            r_pwr_en  <= mmio.write_data[17];
         end
     end
 
@@ -200,15 +194,15 @@ module sd_spi (
     // Read mux — combinational. Returns 0 for undefined offsets.
     // -----------------------------------------------------------------------
     always_comb begin
-        o_mmio_read_data = 64'h0;
+        mmio.read_data = 64'h0;
         if (is_buf) begin
-            o_mmio_read_data = r_sector_buf[buf_idx];
+            mmio.read_data = r_sector_buf[buf_idx];
         end else begin
-            case (i_mmio_addr)
-                OFF_CTRL:   o_mmio_read_data = {46'b0, r_pwr_en, o_sd_cs_n, r_clk_div};
-                OFF_DATA:   o_mmio_read_data = {56'b0, r_rx_byte};
-                OFF_STATUS: o_mmio_read_data = {62'b0, i_sd_cd, r_byte_busy};
-                default:    o_mmio_read_data = 64'h0;
+            case (mmio.addr[15:0])
+                OFF_CTRL:   mmio.read_data = {46'b0, r_pwr_en, o_sd_cs_n, r_clk_div};
+                OFF_DATA:   mmio.read_data = {56'b0, r_rx_byte};
+                OFF_STATUS: mmio.read_data = {62'b0, i_sd_cd, r_byte_busy};
+                default:    mmio.read_data = 64'h0;
             endcase
         end
     end

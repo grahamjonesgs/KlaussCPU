@@ -719,17 +719,17 @@ module KlaussCPU (
    wire [63:0] w_sd_read_data;
    wire        w_sd_ready;
 
+   mmio_if sd_bus();
+   assign sd_bus.write_DV   = w_sd_write_DV;
+   assign sd_bus.read_DV    = w_sd_read_DV;
+   assign sd_bus.addr       = w_mmio_addr;
+   assign sd_bus.write_data = w_mmio_write_data;
+   assign sd_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
    sd_spi sd_spi_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_mmio_write_DV(w_sd_write_DV),
-       .i_mmio_read_DV(w_sd_read_DV),
-       .i_mmio_addr(w_mmio_addr[15:0]),
-       .i_mmio_write_data(w_mmio_write_data),
-       .i_mmio_byte_en(w_mmio_byte_en),
-       .o_mmio_read_data(w_sd_read_data),
-       .o_mmio_ready(w_sd_ready),
+       .mmio(sd_bus),
        .i_sd_cd(i_SD_CD),
        .o_sd_reset_n(o_SD_RESET),
        .o_sd_sck(o_SD_SCK),
@@ -739,6 +739,8 @@ module KlaussCPU (
        .o_sd_dat1(o_SD_DAT1),
        .o_sd_dat2(o_SD_DAT2)
    );
+   assign w_sd_read_data = sd_bus.read_data;
+   assign w_sd_ready     = sd_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
@@ -749,18 +751,20 @@ module KlaussCPU (
    wire [63:0] w_aes_read_data;
    wire        w_aes_ready;
 
+   mmio_if aes_bus();
+   assign aes_bus.write_DV   = w_aes_write_DV;
+   assign aes_bus.read_DV    = w_aes_read_DV;
+   assign aes_bus.addr       = w_mmio_addr;
+   assign aes_bus.write_data = w_mmio_write_data;
+   assign aes_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
    crypto_aes crypto_aes_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_mmio_write_DV(w_aes_write_DV),
-       .i_mmio_read_DV(w_aes_read_DV),
-       .i_mmio_addr(w_mmio_addr[15:0]),
-       .i_mmio_write_data(w_mmio_write_data),
-       .i_mmio_byte_en(w_mmio_byte_en),
-       .o_mmio_read_data(w_aes_read_data),
-       .o_mmio_ready(w_aes_ready)
+       .mmio(aes_bus)
    );
+   assign w_aes_read_data = aes_bus.read_data;
+   assign w_aes_ready     = aes_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto SHA-256 — device id 0x00B. See CRYPTO_PLAN.md §6 and MMIO_MAP.md.
@@ -771,18 +775,20 @@ module KlaussCPU (
    wire [63:0] w_sha_read_data;
    wire        w_sha_ready;
 
+   mmio_if sha_bus();
+   assign sha_bus.write_DV   = w_sha_write_DV;
+   assign sha_bus.read_DV    = w_sha_read_DV;
+   assign sha_bus.addr       = w_mmio_addr;
+   assign sha_bus.write_data = w_mmio_write_data;
+   assign sha_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
    crypto_sha crypto_sha_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_mmio_write_DV(w_sha_write_DV),
-       .i_mmio_read_DV(w_sha_read_DV),
-       .i_mmio_addr(w_mmio_addr[15:0]),
-       .i_mmio_write_data(w_mmio_write_data),
-       .i_mmio_byte_en(w_mmio_byte_en),
-       .o_mmio_read_data(w_sha_read_data),
-       .o_mmio_ready(w_sha_ready)
+       .mmio(sha_bus)
    );
+   assign w_sha_read_data = sha_bus.read_data;
+   assign w_sha_ready     = sha_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto TRNG — device id 0x00C. See CRYPTO_PLAN.md §7 and MMIO_MAP.md.
@@ -793,18 +799,23 @@ module KlaussCPU (
    wire [63:0] w_trng_read_data;
    wire        w_trng_ready;
 
+   // MMIO bus to the TRNG slave (pilot of the mmio_if interface refactor).
+   // Broadcast request driven in; per-peripheral decoded strobes driven in;
+   // read_data/ready read back into the existing MMIO mux wires.
+   mmio_if trng_bus();
+   assign trng_bus.write_DV   = w_trng_write_DV;
+   assign trng_bus.read_DV    = w_trng_read_DV;
+   assign trng_bus.addr       = w_mmio_addr;        // slave uses mmio.addr[15:0]
+   assign trng_bus.write_data = w_mmio_write_data;
+   assign trng_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
    trng trng_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_mmio_write_DV(w_trng_write_DV),
-       .i_mmio_read_DV(w_trng_read_DV),
-       .i_mmio_addr(w_mmio_addr[15:0]),
-       .i_mmio_write_data(w_mmio_write_data),
-       .i_mmio_byte_en(w_mmio_byte_en),
-       .o_mmio_read_data(w_trng_read_data),
-       .o_mmio_ready(w_trng_ready)
+       .mmio(trng_bus)
    );
+   assign w_trng_read_data = trng_bus.read_data;
+   assign w_trng_ready     = trng_bus.ready;
 
    // -------------------------------------------------------------------------
    // 2D DMA blitter — device id 0x00E. MMIO slave for operands + START/STATUS;
@@ -830,17 +841,17 @@ module KlaussCPU (
    wire         w_blit_dma_grant;
    wire         w_blit_irq;          // DONE interrupt — wired to the CPU interrupt controller (source 1)
 
+   mmio_if blit_bus();
+   assign blit_bus.write_DV   = w_blit_write_DV;
+   assign blit_bus.read_DV    = w_blit_read_DV;
+   assign blit_bus.addr       = w_mmio_addr;
+   assign blit_bus.write_data = w_mmio_write_data;
+   assign blit_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
    blitter_dma blitter_dma_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_mmio_write_DV(w_blit_write_DV),
-       .i_mmio_read_DV(w_blit_read_DV),
-       .i_mmio_addr(w_mmio_addr[15:0]),
-       .i_mmio_write_data(w_mmio_write_data),
-       .i_mmio_byte_en(w_mmio_byte_en),
-       .o_mmio_read_data(w_blit_read_data),
-       .o_mmio_ready(w_blit_ready),
+       .mmio(blit_bus),
        .o_dma_req(w_blit_dma_req),
        .o_dma_done(w_blit_dma_done),
        .o_dma_write_DV(w_blit_dma_write_DV),
@@ -853,6 +864,8 @@ module KlaussCPU (
        .i_dma_grant(w_blit_dma_grant),
        .o_irq(w_blit_irq)
    );
+   assign w_blit_read_data = blit_bus.read_data;
+   assign w_blit_ready     = blit_bus.ready;
 
    // -------------------------------------------------------------------------
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
@@ -1073,17 +1086,17 @@ module KlaussCPU (
    // CPU window 0xF006_0000..0xF008_FFFF, byte-for-byte translated to LiteEth.
    // ==========================================================================
 
+   // CPU MMIO side (from bus_splitter Eth port; full 32-bit addr)
+   mmio_if eth_bus();
+   assign eth_bus.write_DV   = w_eth_write_DV;
+   assign eth_bus.read_DV    = w_eth_read_DV;
+   assign eth_bus.addr       = w_eth_addr;
+   assign eth_bus.write_data = w_eth_write_data;
+   assign eth_bus.byte_en    = w_eth_byte_en;
    eth_mmio_bridge eth_mmio_bridge_i (
        .i_clk             (i_Clk),
        .i_rst             (~CPU_RESETN),
-       // CPU MMIO side (from bus_splitter Eth port)
-       .i_mmio_write_DV   (w_eth_write_DV),
-       .i_mmio_read_DV    (w_eth_read_DV),
-       .i_mmio_addr       (w_eth_addr),
-       .i_mmio_write_data (w_eth_write_data),
-       .i_mmio_byte_en    (w_eth_byte_en),
-       .o_mmio_read_data  (w_eth_read_data),
-       .o_mmio_ready      (w_eth_ready),
+       .mmio              (eth_bus),
        // LiteEth Wishbone master
        .o_wb_adr          (w_eth_wb_adr),
        .o_wb_dat_w        (w_eth_wb_dat_w),
@@ -1097,6 +1110,8 @@ module KlaussCPU (
        .i_wb_ack          (w_eth_wb_ack),
        .i_wb_err          (w_eth_wb_err)
    );
+   assign w_eth_read_data = eth_bus.read_data;
+   assign w_eth_ready     = eth_bus.ready;
 
    liteeth_core liteeth_core_i (
        .sys_clock          (i_Clk),

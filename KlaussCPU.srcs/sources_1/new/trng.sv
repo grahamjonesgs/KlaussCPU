@@ -53,14 +53,8 @@ module trng (
     input             i_Clk,
     input             i_Rst_L,
 
-    // MMIO interface (offsets within device window, addr[15:0]).
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [15:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,
-    output logic [63:0] o_mmio_read_data,
-    output            o_mmio_ready
+    // MMIO peripheral bus (slave). Device-window offsets use mmio.addr[15:0].
+    mmio_if.slave     mmio
 );
 
     // -------------------------------------------------------------------------
@@ -70,8 +64,8 @@ module trng (
     localparam OFF_STATUS = 16'h0008;
     localparam OFF_DATA   = 16'h0010;
 
-    assign o_mmio_ready = 1'b1;
-    wire byte_en_unused = |i_mmio_byte_en;
+    assign mmio.ready = 1'b1;
+    wire byte_en_unused = |mmio.byte_en;
 
     // -------------------------------------------------------------------------
     // Control register
@@ -233,7 +227,7 @@ module trng (
     // If the FIFO is full when a push fires, the new word is dropped — this is
     // by design: software reads are the limiting factor, never the source.
     //
-    // Edge-detect the read strobe: the CPU keeps i_mmio_read_DV asserted for
+    // Edge-detect the read strobe: the CPU keeps mmio.read_DV asserted for
     // two cycles (one to drive the device, one waiting for the registered
     // ready from bus_splitter).  A level-sensitive pop would consume two FIFO
     // entries per software read.
@@ -246,10 +240,10 @@ module trng (
     logic  r_read_dv_prev;
     always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) r_read_dv_prev <= 1'b0;
-        else          r_read_dv_prev <= i_mmio_read_DV;
+        else          r_read_dv_prev <= mmio.read_DV;
     end
-    wire w_read_rising = i_mmio_read_DV && ~r_read_dv_prev;
-    wire w_pop = w_read_rising && (i_mmio_addr == OFF_DATA) && (r_fifo_count != 2'd0);
+    wire w_read_rising = mmio.read_DV && ~r_read_dv_prev;
+    wire w_pop = w_read_rising && (mmio.addr[15:0] == OFF_DATA) && (r_fifo_count != 2'd0);
 
     always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
@@ -298,9 +292,9 @@ module trng (
             r_reseed_pulse <= 1'b0;
         end else begin
             r_reseed_pulse <= 1'b0;
-            if (i_mmio_write_DV && i_mmio_addr == OFF_CTRL) begin
-                r_enable       <= i_mmio_write_data[0];
-                if (i_mmio_write_data[1])
+            if (mmio.write_DV && mmio.addr[15:0] == OFF_CTRL) begin
+                r_enable       <= mmio.write_data[0];
+                if (mmio.write_data[1])
                     r_reseed_pulse <= 1'b1;
             end
         end
@@ -310,12 +304,12 @@ module trng (
     // MMIO read path
     // -------------------------------------------------------------------------
     always_comb begin
-        o_mmio_read_data = 64'h0;
-        case (i_mmio_addr)
-            OFF_CTRL:   o_mmio_read_data = {63'h0, r_enable};
-            OFF_STATUS: o_mmio_read_data = {62'h0, w_health_ok, w_ready};
-            OFF_DATA:   o_mmio_read_data = r_fifo[r_fifo_head];
-            default:    o_mmio_read_data = 64'h0;
+        mmio.read_data = 64'h0;
+        case (mmio.addr[15:0])
+            OFF_CTRL:   mmio.read_data = {63'h0, r_enable};
+            OFF_STATUS: mmio.read_data = {62'h0, w_health_ok, w_ready};
+            OFF_DATA:   mmio.read_data = r_fifo[r_fifo_head];
+            default:    mmio.read_data = 64'h0;
         endcase
     end
 

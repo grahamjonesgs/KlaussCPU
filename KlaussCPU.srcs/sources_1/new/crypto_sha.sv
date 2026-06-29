@@ -44,14 +44,8 @@ module crypto_sha (
     input             i_Clk,
     input             i_Rst_L,
 
-    // MMIO interface (offsets within device window, addr[15:0]).
-    input             i_mmio_write_DV,
-    input             i_mmio_read_DV,
-    input      [15:0] i_mmio_addr,
-    input      [63:0] i_mmio_write_data,
-    input      [ 7:0] i_mmio_byte_en,
-    output logic [63:0] o_mmio_read_data,
-    output            o_mmio_ready
+    // MMIO peripheral bus (slave). Device-window offsets use mmio.addr[15:0].
+    mmio_if.slave     mmio
 );
 
     // -------------------------------------------------------------------------
@@ -88,8 +82,8 @@ module crypto_sha (
     localparam OFF_HMAC_KEY2   = 16'h00A0;
     localparam OFF_HMAC_KEY3   = 16'h00A8;
 
-    assign o_mmio_ready = 1'b1;
-    wire byte_en_unused = |i_mmio_byte_en;  // software always uses 64-bit MMIO accesses
+    assign mmio.ready = 1'b1;
+    wire byte_en_unused = |mmio.byte_en;  // software always uses 64-bit MMIO accesses
 
     // -------------------------------------------------------------------------
     // Block-input storage (raw MMIO little-endian view).
@@ -243,26 +237,26 @@ module crypto_sha (
             if (w_core_done && !w_hmac_busy)
                 r_done_latch <= 1'b1;
 
-            if (i_mmio_write_DV) begin
-                case (i_mmio_addr)
+            if (mmio.write_DV) begin
+                case (mmio.addr[15:0])
                     OFF_CTRL: begin
-                        if (i_mmio_write_data[0]) begin
+                        if (mmio.write_data[0]) begin
                             r_init_pulse <= 1'b1;
                             r_done_latch <= 1'b0;
                         end
-                        if (i_mmio_write_data[1]) begin
+                        if (mmio.write_data[1]) begin
                             r_start_pulse <= 1'b1;
                             r_done_latch  <= 1'b0;
                         end
                     end
-                    OFF_BLOCK0 + 16'h00: r_block_mmio[0] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h08: r_block_mmio[1] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h10: r_block_mmio[2] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h18: r_block_mmio[3] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h20: r_block_mmio[4] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h28: r_block_mmio[5] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h30: r_block_mmio[6] <= i_mmio_write_data;
-                    OFF_BLOCK0 + 16'h38: r_block_mmio[7] <= i_mmio_write_data;
+                    OFF_BLOCK0 + 16'h00: r_block_mmio[0] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h08: r_block_mmio[1] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h10: r_block_mmio[2] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h18: r_block_mmio[3] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h20: r_block_mmio[4] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h28: r_block_mmio[5] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h30: r_block_mmio[6] <= mmio.write_data;
+                    OFF_BLOCK0 + 16'h38: r_block_mmio[7] <= mmio.write_data;
                     OFF_HMAC_CTRL: begin
                         // [0] KEY_LOAD: kick the HMAC FSM to compute midstates.
                         //               Ignored if the FSM is already running.
@@ -271,25 +265,25 @@ module crypto_sha (
                         // [3] KEY_ZERO: wipe key here; route a pulse to the
                         //               HMAC FSM block so it clears the
                         //               midstates + valid flag (it owns them).
-                        if (i_mmio_write_data[3]) begin
+                        if (mmio.write_data[3]) begin
                             r_hmac_key           <= 256'h0;
                             r_hmac_keyzero_pulse <= 1'b1;
                         end
-                        if (i_mmio_write_data[0] && !w_hmac_busy)
+                        if (mmio.write_data[0] && !w_hmac_busy)
                             r_hmac_kl_trigger <= 1'b1;
-                        if (i_mmio_write_data[1] && !w_hmac_busy && !w_core_busy) begin
+                        if (mmio.write_data[1] && !w_hmac_busy && !w_core_busy) begin
                             r_h_load_pulse <= 1'b1;
                             r_h_load_sel   <= 1'b0;   // inner
                         end
-                        if (i_mmio_write_data[2] && !w_hmac_busy && !w_core_busy) begin
+                        if (mmio.write_data[2] && !w_hmac_busy && !w_core_busy) begin
                             r_h_load_pulse <= 1'b1;
                             r_h_load_sel   <= 1'b1;   // outer
                         end
                     end
-                    OFF_HMAC_KEY0: r_hmac_key[63:0]    <= i_mmio_write_data;
-                    OFF_HMAC_KEY1: r_hmac_key[127:64]  <= i_mmio_write_data;
-                    OFF_HMAC_KEY2: r_hmac_key[191:128] <= i_mmio_write_data;
-                    OFF_HMAC_KEY3: r_hmac_key[255:192] <= i_mmio_write_data;
+                    OFF_HMAC_KEY0: r_hmac_key[63:0]    <= mmio.write_data;
+                    OFF_HMAC_KEY1: r_hmac_key[127:64]  <= mmio.write_data;
+                    OFF_HMAC_KEY2: r_hmac_key[191:128] <= mmio.write_data;
+                    OFF_HMAC_KEY3: r_hmac_key[255:192] <= mmio.write_data;
                     default: ;  // ignored
                 endcase
             end
@@ -386,28 +380,28 @@ module crypto_sha (
     endfunction
 
     always_comb begin
-        o_mmio_read_data = 64'h0;
-        case (i_mmio_addr)
-            OFF_STATUS:  o_mmio_read_data = { 62'h0, r_done_latch, w_core_busy };
-            OFF_BLOCK0 + 16'h00: o_mmio_read_data = r_block_mmio[0];
-            OFF_BLOCK0 + 16'h08: o_mmio_read_data = r_block_mmio[1];
-            OFF_BLOCK0 + 16'h10: o_mmio_read_data = r_block_mmio[2];
-            OFF_BLOCK0 + 16'h18: o_mmio_read_data = r_block_mmio[3];
-            OFF_BLOCK0 + 16'h20: o_mmio_read_data = r_block_mmio[4];
-            OFF_BLOCK0 + 16'h28: o_mmio_read_data = r_block_mmio[5];
-            OFF_BLOCK0 + 16'h30: o_mmio_read_data = r_block_mmio[6];
-            OFF_BLOCK0 + 16'h38: o_mmio_read_data = r_block_mmio[7];
-            OFF_DIGEST0 + 16'h00: o_mmio_read_data = digest_pack(2'd0);
-            OFF_DIGEST0 + 16'h08: o_mmio_read_data = digest_pack(2'd1);
-            OFF_DIGEST0 + 16'h10: o_mmio_read_data = digest_pack(2'd2);
-            OFF_DIGEST0 + 16'h18: o_mmio_read_data = digest_pack(2'd3);
+        mmio.read_data = 64'h0;
+        case (mmio.addr[15:0])
+            OFF_STATUS:  mmio.read_data = { 62'h0, r_done_latch, w_core_busy };
+            OFF_BLOCK0 + 16'h00: mmio.read_data = r_block_mmio[0];
+            OFF_BLOCK0 + 16'h08: mmio.read_data = r_block_mmio[1];
+            OFF_BLOCK0 + 16'h10: mmio.read_data = r_block_mmio[2];
+            OFF_BLOCK0 + 16'h18: mmio.read_data = r_block_mmio[3];
+            OFF_BLOCK0 + 16'h20: mmio.read_data = r_block_mmio[4];
+            OFF_BLOCK0 + 16'h28: mmio.read_data = r_block_mmio[5];
+            OFF_BLOCK0 + 16'h30: mmio.read_data = r_block_mmio[6];
+            OFF_BLOCK0 + 16'h38: mmio.read_data = r_block_mmio[7];
+            OFF_DIGEST0 + 16'h00: mmio.read_data = digest_pack(2'd0);
+            OFF_DIGEST0 + 16'h08: mmio.read_data = digest_pack(2'd1);
+            OFF_DIGEST0 + 16'h10: mmio.read_data = digest_pack(2'd2);
+            OFF_DIGEST0 + 16'h18: mmio.read_data = digest_pack(2'd3);
             // HMAC registers
-            OFF_HMAC_STATUS: o_mmio_read_data = { 62'h0, r_hmac_key_valid, w_hmac_busy };
-            OFF_HMAC_KEY0:   o_mmio_read_data = r_hmac_key[63:0];
-            OFF_HMAC_KEY1:   o_mmio_read_data = r_hmac_key[127:64];
-            OFF_HMAC_KEY2:   o_mmio_read_data = r_hmac_key[191:128];
-            OFF_HMAC_KEY3:   o_mmio_read_data = r_hmac_key[255:192];
-            default:     o_mmio_read_data = 64'h0;
+            OFF_HMAC_STATUS: mmio.read_data = { 62'h0, r_hmac_key_valid, w_hmac_busy };
+            OFF_HMAC_KEY0:   mmio.read_data = r_hmac_key[63:0];
+            OFF_HMAC_KEY1:   mmio.read_data = r_hmac_key[127:64];
+            OFF_HMAC_KEY2:   mmio.read_data = r_hmac_key[191:128];
+            OFF_HMAC_KEY3:   mmio.read_data = r_hmac_key[255:192];
+            default:     mmio.read_data = 64'h0;
         endcase
     end
 
