@@ -58,8 +58,8 @@ task t_stack_pop_reg;
          r_extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg   <= r_reg_2;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd   <= r_reg_2;
             r_SP              <= r_SP + 8;
             r_mem_read_DV     <= 1'b0;
             r_SM              <= WRITEBACK;
@@ -73,8 +73,8 @@ endtask
 // 1-word instruction (PC+4)
 task t_get_sp;
    begin
-      r_writeback_value <= {32'b0, r_SP};
-      r_writeback_reg   <= r_reg_2;
+      r_wb.value <= {32'b0, r_SP};
+      r_wb.rd   <= r_reg_2;
       r_SM              <= WRITEBACK;
       r_PC              <= r_PC + 4;
    end

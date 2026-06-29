@@ -207,7 +207,7 @@ module KlaussCPU (
    // -----------------------------------------------------------------------
    // ALU pipeline registers — written by arithmetic / compare tasks during
    // OPCODE_EXECUTE; consumed in ALU_FINISH (next cycle) to drive the
-   // architectural flags + r_writeback_value. Adds +1 cycle to ADD/SUB/CMP
+   // architectural flags + r_wb.value. Adds +1 cycle to ADD/SUB/CMP
    // ops in exchange for breaking the 64-bit subtractor → carry-flag path.
    // r_alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
    // -----------------------------------------------------------------------
@@ -623,10 +623,7 @@ module KlaussCPU (
    logic [63:0] r_reg_port_b;
 
    // Writeback pipeline registers
-   logic [63:0] r_writeback_value;
-   logic [3:0]  r_writeback_reg;
-   logic        r_writeback_set_zero_flag;  // Set zero flag from writeback value in WRITEBACK stage
-   logic        r_wb_pending;               // writeback deferred into OPCODE_REQUEST dispatch (eliminates the WRITEBACK cycle)
+   wb_t r_wb;   // deferred-writeback bundle: .value/.rd/.set_zero/.pending (RAW-forward source)
 
     always_ff @(posedge i_Clk) begin
        // RAW forward: the execute-tail pre-settle moves the port read into the
@@ -634,10 +631,10 @@ module KlaussCPU (
        // whose dest matches the operand (the value r_register WILL hold next
        // cycle). This mux is on the port INPUT (reg-file read), not the
        // r_reg_port_b->carry-flag OUTPUT path, so the tight carry chain is
-       // untouched. On the slow (FETCH2) path r_wb_pending is already 0 when the
+       // untouched. On the slow (FETCH2) path r_wb.pending is already 0 when the
        // port reads, so it is a no-op there.
-       r_reg_port_a <= (r_wb_pending && (r_writeback_reg == r_reg_1)) ? r_writeback_value : r_register[r_reg_1];
-       r_reg_port_b <= (r_wb_pending && (r_writeback_reg == r_reg_2)) ? r_writeback_value : r_register[r_reg_2];
+       r_reg_port_a <= (r_wb.pending && (r_wb.rd == r_reg_1)) ? r_wb.value : r_register[r_reg_1];
+       r_reg_port_b <= (r_wb.pending && (r_wb.rd == r_reg_2)) ? r_wb.value : r_register[r_reg_2];
    end
 
    // Track the last non-HCF FSM state so the crash dump can show what was
@@ -1351,8 +1348,8 @@ rams_sp_nc rams_sp_nc1 (
       r_debug_step_flag = 0;
       r_debug_step_run = 0;
       r_break_received = 0;
-      r_writeback_set_zero_flag = 0;
-      r_wb_pending        = 0;
+      r_wb.set_zero = 0;
+      r_wb.pending        = 0;
       r_alu_pipe_value    = 64'b0;
       r_alu_pipe_carry    = 1'b0;
       r_alu_pipe_overflow = 1'b0;
@@ -1405,7 +1402,7 @@ rams_sp_nc rams_sp_nc1 (
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
          r_int_push_wait <= 1'b0;
-         r_wb_pending    <= 1'b0;
+         r_wb.pending    <= 1'b0;
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_register[i] <= 64'b0;
@@ -1882,12 +1879,12 @@ rams_sp_nc rams_sp_nc1 (
                // next instruction observes the result with no RAW hazard. This
                // removes the dedicated WRITEBACK cycle (~ -1 cyc/instr on the
                // writeback-producing op classes).
-               if (r_wb_pending) begin
-                  r_register[r_writeback_reg] <= r_writeback_value;
-                  if (r_writeback_set_zero_flag)
-                     r_flags.zero <= (r_writeback_value == 64'b0);
-                  r_writeback_set_zero_flag <= 1'b0;
-                  r_wb_pending <= 1'b0;
+               if (r_wb.pending) begin
+                  r_register[r_wb.rd] <= r_wb.value;
+                  if (r_wb.set_zero)
+                     r_flags.zero <= (r_wb.value == 64'b0);
+                  r_wb.set_zero <= 1'b0;
+                  r_wb.pending <= 1'b0;
                end
 
                if (r_int_push_wait) begin
@@ -1910,10 +1907,10 @@ rams_sp_nc rams_sp_nc1 (
                   r_SP             <= r_SP - 8;
                   r_mem_addr       <= r_SP - 32'd8;
                   // Zero flag pushed as it will be AFTER any deferred writeback
-                  // committing this same cycle (r_wb_pending block above), so the
+                  // committing this same cycle (r_wb.pending block above), so the
                   // saved interrupt context stays precise.
                   r_mem_write_data <= {21'b0, r_int_mask,
-                                       ((r_wb_pending && r_writeback_set_zero_flag) ? (r_writeback_value == 64'b0) : r_flags.zero),
+                                       ((r_wb.pending && r_wb.set_zero) ? (r_wb.value == 64'b0) : r_flags.zero),
                                        r_flags.equal, r_flags.carry,
                                        r_flags.overflow, r_flags.sign, r_flags.less, r_flags.ult,
                                        r_PC};
@@ -2513,10 +2510,10 @@ end
 MULTIPLY_WRITEBACK: begin
     // Stage result into writeback pipeline
     if (r_mul_is_high)
-        r_writeback_value <= r_mul_result_hi;
+        r_wb.value <= r_mul_result_hi;
     else
-        r_writeback_value <= r_mul_result_lo;
-    r_writeback_reg <= r_mul_dest_reg;
+        r_wb.value <= r_mul_result_lo;
+    r_wb.rd <= r_mul_dest_reg;
 
     // Flags from registered values
     if (r_mul_is_high) begin
@@ -2547,7 +2544,7 @@ MULTIPLY_WRITEBACK: begin
         r_reg_2         <= r_ir_reg_2;
         r_ir_presettled <= 1'b1;
     end
-    r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+    r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
 end
 
             HALTED_BREAK: begin
@@ -2635,19 +2632,19 @@ end
                   // Division complete - write result based on op type
                   if (r_div_op == DIV_OP_DIV) begin
                      if (r_div_is_signed && r_div_sign_q)
-                        r_writeback_value <= ~r_div_quotient + 1;
+                        r_wb.value <= ~r_div_quotient + 1;
                      else
-                        r_writeback_value <= r_div_quotient;
+                        r_wb.value <= r_div_quotient;
                      r_flags.zero <= (r_div_quotient == 0) ? 1'b1 : 1'b0;
                   end
                   else begin  // DIV_OP_MOD
                      if (r_div_is_signed && r_div_sign_r)
-                        r_writeback_value <= ~r_div_remainder + 1;
+                        r_wb.value <= ~r_div_remainder + 1;
                      else
-                        r_writeback_value <= r_div_remainder;
+                        r_wb.value <= r_div_remainder;
                      r_flags.zero <= (r_div_remainder == 0) ? 1'b1 : 1'b0;
                   end
-                  r_writeback_reg <= r_div_dest_reg;
+                  r_wb.rd <= r_div_dest_reg;
                   r_flags.overflow <= 1'b0;
                   r_div_op <= DIV_OP_NONE;
                   r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
@@ -2659,15 +2656,15 @@ end
                      r_reg_2         <= r_ir_reg_2;
                      r_ir_presettled <= 1'b1;
                   end
-                  r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+                  r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
                end
             end
 
             WRITEBACK: begin
-               r_register[r_writeback_reg] <= r_writeback_value;
-               if (r_writeback_set_zero_flag)
-                  r_flags.zero <= (r_writeback_value == 64'b0);
-               r_writeback_set_zero_flag <= 1'b0;
+               r_register[r_wb.rd] <= r_wb.value;
+               if (r_wb.set_zero)
+                  r_flags.zero <= (r_wb.value == 64'b0);
+               r_wb.set_zero <= 1'b0;
                r_SM <= OPCODE_REQUEST;
             end
 
@@ -2681,11 +2678,11 @@ end
             //==================================================================
             ALU_FINISH: begin
                if (r_alu_pipe_mode == 1'b0) begin       // ARITH
-                  r_writeback_value <= r_alu_pipe_value;
+                  r_wb.value <= r_alu_pipe_value;
                   r_flags.carry      <= r_alu_pipe_carry;
                   r_flags.overflow   <= r_alu_pipe_overflow;
                   r_flags.sign       <= r_alu_pipe_value[63];
-                  r_SM              <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+                  r_SM              <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
                end else begin                           // CMP
                   r_flags.equal <= r_alu_pipe_equal;
                   r_flags.less  <= r_alu_pipe_less;

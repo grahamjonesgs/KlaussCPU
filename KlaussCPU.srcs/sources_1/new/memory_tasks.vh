@@ -60,8 +60,8 @@ task t_set_reg_from_mem_value;
         else
         begin
          if (w_mem_ready) begin
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg <= r_reg_2;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd <= r_reg_2;
             r_SM <= WRITEBACK;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 8;
@@ -84,8 +84,8 @@ task t_set_reg_from_mem_reg;
         else
         begin
          if (w_mem_ready) begin
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg <= r_reg_1;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd <= r_reg_1;
             r_SM <= WRITEBACK;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 4;
@@ -131,16 +131,16 @@ task t_memget8;
          if (w_mem_ready) begin
             r_mem_read_DV <= 1'b0;
             case (r_reg_port_b[2:0])
-               3'b000: r_writeback_value <= {56'b0, w_mem_read_data[7:0]};
-               3'b001: r_writeback_value <= {56'b0, w_mem_read_data[15:8]};
-               3'b010: r_writeback_value <= {56'b0, w_mem_read_data[23:16]};
-               3'b011: r_writeback_value <= {56'b0, w_mem_read_data[31:24]};
-               3'b100: r_writeback_value <= {56'b0, w_mem_read_data[39:32]};
-               3'b101: r_writeback_value <= {56'b0, w_mem_read_data[47:40]};
-               3'b110: r_writeback_value <= {56'b0, w_mem_read_data[55:48]};
-               3'b111: r_writeback_value <= {56'b0, w_mem_read_data[63:56]};
+               3'b000: r_wb.value <= {56'b0, w_mem_read_data[7:0]};
+               3'b001: r_wb.value <= {56'b0, w_mem_read_data[15:8]};
+               3'b010: r_wb.value <= {56'b0, w_mem_read_data[23:16]};
+               3'b011: r_wb.value <= {56'b0, w_mem_read_data[31:24]};
+               3'b100: r_wb.value <= {56'b0, w_mem_read_data[39:32]};
+               3'b101: r_wb.value <= {56'b0, w_mem_read_data[47:40]};
+               3'b110: r_wb.value <= {56'b0, w_mem_read_data[55:48]};
+               3'b111: r_wb.value <= {56'b0, w_mem_read_data[63:56]};
             endcase
-            r_writeback_reg <= r_reg_1;
+            r_wb.rd <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 4;
          end
@@ -183,12 +183,12 @@ task t_memget16;
          if (w_mem_ready) begin
             r_mem_read_DV <= 1'b0;
             case (r_reg_port_b[2:1])
-               2'b00: r_writeback_value <= {48'b0, w_mem_read_data[15:0]};
-               2'b01: r_writeback_value <= {48'b0, w_mem_read_data[31:16]};
-               2'b10: r_writeback_value <= {48'b0, w_mem_read_data[47:32]};
-               2'b11: r_writeback_value <= {48'b0, w_mem_read_data[63:48]};
+               2'b00: r_wb.value <= {48'b0, w_mem_read_data[15:0]};
+               2'b01: r_wb.value <= {48'b0, w_mem_read_data[31:16]};
+               2'b10: r_wb.value <= {48'b0, w_mem_read_data[47:32]};
+               2'b11: r_wb.value <= {48'b0, w_mem_read_data[63:48]};
             endcase
-            r_writeback_reg <= r_reg_1;
+            r_wb.rd <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 4;
          end
@@ -234,7 +234,7 @@ endtask
 // State machine (r_extra_clock):
 //   0: issue first read at addr (cache aligns to 8-byte boundary internally).
 //   1: wait first ready. Extract bytes; either writeback (single-read case) or
-//      stash dw0 in r_writeback_value and re-assert DV for the second read.
+//      stash dw0 in r_wb.value and re-assert DV for the second read.
 //   2: bubble — lets the cache's stale o_mem_ready (from the first read's
 //      READ_CACHE2 → PRE_WAIT path) clear before phase 3 starts polling. The
 //      cache's WAIT body in this cycle drives ready low and latches the new
@@ -242,7 +242,7 @@ endtask
 //   3: wait second ready. Combine the saved high bytes of dw0 with the low
 //      bytes of dw1, then writeback.
 //
-// Stash mechanism: r_writeback_value is used as scratch storage for dw0 in
+// Stash mechanism: r_wb.value is used as scratch storage for dw0 in
 // phases 1-3. Safe because WRITEBACK only fires once we set r_SM<=WRITEBACK
 // in the final cycle of phase 1 or phase 3. PC += 4 (1-word RR instruction).
 task t_memget32;
@@ -267,8 +267,8 @@ task t_memget32;
                   3'd4:    result = w_mem_read_data[63:32];
                   default: result = 32'b0;
                endcase
-               r_writeback_value <= {32'b0, result};
-               r_writeback_reg   <= r_reg_1;
+               r_wb.value <= {32'b0, result};
+               r_wb.rd   <= r_reg_1;
                r_SM              <= WRITEBACK;
                r_PC              <= r_PC + 4;
             end else if (w_mem_next_valid) begin
@@ -279,13 +279,13 @@ task t_memget32;
                   3'd7:    result = {w_mem_read_data_next[23:0], w_mem_read_data[63:56]};
                   default: result = 32'b0;
                endcase
-               r_writeback_value <= {32'b0, result};
-               r_writeback_reg   <= r_reg_1;
+               r_wb.value <= {32'b0, result};
+               r_wb.rd   <= r_reg_1;
                r_SM              <= WRITEBACK;
                r_PC              <= r_PC + 4;
             end else begin
                // Cross-cache-line span: stash dw0, issue second read at next dw.
-               r_writeback_value <= w_mem_read_data;
+               r_wb.value <= w_mem_read_data;
                r_mem_addr        <= {r_reg_port_b[31:3], 3'b000} + 32'd8;
                r_mem_read_DV     <= 1'b1;
                r_extra_clock     <= 2'd2;
@@ -296,15 +296,15 @@ task t_memget32;
       end else begin  // r_extra_clock == 2'd3
          if (w_mem_ready) begin
             r_mem_read_DV <= 1'b0;
-            // dw1 = w_mem_read_data; dw0 = r_writeback_value (stashed in phase 1).
+            // dw1 = w_mem_read_data; dw0 = r_wb.value (stashed in phase 1).
             case (offset)
-               3'd5:    result = {w_mem_read_data[7:0],  r_writeback_value[63:40]};
-               3'd6:    result = {w_mem_read_data[15:0], r_writeback_value[63:48]};
-               3'd7:    result = {w_mem_read_data[23:0], r_writeback_value[63:56]};
+               3'd5:    result = {w_mem_read_data[7:0],  r_wb.value[63:40]};
+               3'd6:    result = {w_mem_read_data[15:0], r_wb.value[63:48]};
+               3'd7:    result = {w_mem_read_data[23:0], r_wb.value[63:56]};
                default: result = 32'b0;
             endcase
-            r_writeback_value <= {32'b0, result};
-            r_writeback_reg   <= r_reg_1;
+            r_wb.value <= {32'b0, result};
+            r_wb.rd   <= r_reg_1;
             r_SM              <= WRITEBACK;
             r_PC              <= r_PC + 4;
          end
@@ -341,8 +341,8 @@ task t_memget64;
       end else begin
          if (w_mem_ready) begin
             r_mem_read_DV     <= 1'b0;
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg   <= r_reg_1;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd   <= r_reg_1;
             r_SM              <= WRITEBACK;
             r_PC              <= r_PC + 4;
          end

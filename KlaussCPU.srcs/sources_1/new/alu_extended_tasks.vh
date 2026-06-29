@@ -18,11 +18,11 @@
 // ROLR - Rotate left by 1
 task t_rotate_left;
    begin
-      r_writeback_value <= {r_reg_port_b[62:0], r_reg_port_b[63]};
-      r_writeback_reg <= r_reg_2;
+      r_wb.value <= {r_reg_port_b[62:0], r_reg_port_b[63]};
+      r_wb.rd <= r_reg_2;
       r_flags.carry <= r_reg_port_b[63];
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -30,11 +30,11 @@ endtask
 // RORR - Rotate right by 1
 task t_rotate_right;
    begin
-      r_writeback_value <= {r_reg_port_b[0], r_reg_port_b[63:1]};
-      r_writeback_reg <= r_reg_2;
+      r_wb.value <= {r_reg_port_b[0], r_reg_port_b[63:1]};
+      r_wb.rd <= r_reg_2;
       r_flags.carry <= r_reg_port_b[0];
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -44,11 +44,11 @@ task t_rotate_left_carry;
    logic [64:0] temp;
    begin
       temp = {r_reg_port_b, r_flags.carry};
-      r_writeback_value <= {temp[63:0]};
-      r_writeback_reg <= r_reg_2;
+      r_wb.value <= {temp[63:0]};
+      r_wb.rd <= r_reg_2;
       r_flags.carry <= temp[64];
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -58,11 +58,11 @@ task t_rotate_right_carry;
    logic [64:0] temp;
    begin
       temp = {r_flags.carry, r_reg_port_b};
-      r_writeback_value <= temp[64:1];
-      r_writeback_reg <= r_reg_2;
+      r_wb.value <= temp[64:1];
+      r_wb.rd <= r_reg_2;
       r_flags.carry <= temp[0];
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -75,10 +75,10 @@ task t_rotate_left_n;
    begin
       count = i_count[5:0];  // Only use lower 6 bits (0-63)
       result = (r_reg_port_b << count) | (r_reg_port_b >> (64 - count));
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -91,10 +91,10 @@ task t_rotate_right_n;
    begin
       count = i_count[5:0];
       result = (r_reg_port_b >> count) | (r_reg_port_b << (64 - count));
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -106,10 +106,10 @@ task t_rotate_left_reg;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a << count) | (r_reg_port_a >> (64 - count));
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_dst;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_dst;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -121,10 +121,10 @@ task t_rotate_right_reg;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a >> count) | (r_reg_port_a << (64 - count));
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_dst;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_dst;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -138,9 +138,9 @@ endtask
 task t_bit_set_value;
    input [31:0] i_bit;
    begin
-      r_writeback_value <= r_reg_port_b | (64'b1 << i_bit[5:0]);
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_b | (64'b1 << i_bit[5:0]);
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -149,9 +149,9 @@ endtask
 task t_bit_clear_value;
    input [31:0] i_bit;
    begin
-      r_writeback_value <= r_reg_port_b & ~(64'b1 << i_bit[5:0]);
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_b & ~(64'b1 << i_bit[5:0]);
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -160,9 +160,9 @@ endtask
 task t_bit_toggle_value;
    input [31:0] i_bit;
    begin
-      r_writeback_value <= r_reg_port_b ^ (64'b1 << i_bit[5:0]);
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_b ^ (64'b1 << i_bit[5:0]);
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -180,9 +180,9 @@ endtask
 // BSETRR - rd = rs1 with bit rs2 set
 task t_bit_set_reg;
    begin
-      r_writeback_value <= r_reg_port_a | (64'b1 << r_reg_port_b[5:0]);
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_a | (64'b1 << r_reg_port_b[5:0]);
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -190,9 +190,9 @@ endtask
 // BCLRRR - rd = rs1 with bit rs2 cleared
 task t_bit_clear_reg;
    begin
-      r_writeback_value <= r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]);
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]);
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -200,9 +200,9 @@ endtask
 // BTGLRR - rd = rs1 with bit rs2 toggled
 task t_bit_toggle_reg;
    begin
-      r_writeback_value <= r_reg_port_a ^ (64'b1 << r_reg_port_b[5:0]);
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_a ^ (64'b1 << r_reg_port_b[5:0]);
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -212,9 +212,9 @@ task t_bit_test_reg;
    logic [5:0] bit_pos;
    begin
       bit_pos = r_reg_port_b[5:0];
-      r_writeback_value <= {63'b0, r_reg_port_a[bit_pos]};
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {63'b0, r_reg_port_a[bit_pos]};
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -222,10 +222,10 @@ endtask
 // POPCNT - Population count (count 1 bits)
 task t_popcnt;
    begin
-      r_writeback_value <= {57'b0, popcount(r_reg_port_b)};
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {57'b0, popcount(r_reg_port_b)};
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -233,9 +233,9 @@ endtask
 // CLZ - Count leading zeros
 task t_clz;
    begin
-      r_writeback_value <= {57'b0, count_leading_zeros(r_reg_port_b)};
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {57'b0, count_leading_zeros(r_reg_port_b)};
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -243,9 +243,9 @@ endtask
 // CTZ - Count trailing zeros
 task t_ctz;
    begin
-      r_writeback_value <= {57'b0, count_trailing_zeros(r_reg_port_b)};
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {57'b0, count_trailing_zeros(r_reg_port_b)};
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -253,9 +253,9 @@ endtask
 // BITREV - Reverse all bits
 task t_bit_reverse;
    begin
-      r_writeback_value <= bit_reverse(r_reg_port_b);
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= bit_reverse(r_reg_port_b);
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -274,10 +274,10 @@ task t_extract_bits;
       length = i_params[12:8];
       mask = (32'hFFFFFFFF >> (32 - length));
       result = (r_reg_port_b >> start_pos) & mask;
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -298,9 +298,9 @@ task t_deposit_bits;
       length = i_params[12:8];
       mask = (32'hFFFFFFFF >> (32 - length)) << start_pos;
       insert_val = (r_reg_port_a << start_pos) & mask;
-      r_writeback_value <= (r_reg_port_b & ~mask) | insert_val;
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_b & ~mask) | insert_val;
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -314,9 +314,9 @@ endtask
 // CMPEQR - rd = (rs1 == rs2) ? 1 : 0
 task t_cmpeqr;
    begin
-      r_writeback_value <= (r_reg_port_a == r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a == r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -324,9 +324,9 @@ endtask
 // CMPNER - rd = (rs1 != rs2) ? 1 : 0
 task t_cmpner;
    begin
-      r_writeback_value <= (r_reg_port_a != r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a != r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -338,9 +338,9 @@ task t_cmpltr;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a < s_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a < s_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -352,9 +352,9 @@ task t_cmpler;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a <= s_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a <= s_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -366,9 +366,9 @@ task t_cmpgtr;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a > s_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a > s_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -380,9 +380,9 @@ task t_cmpger;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a >= s_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a >= s_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -390,9 +390,9 @@ endtask
 // CMPULTR - rd = (rs1 < rs2) ? 1 : 0, unsigned
 task t_cmpultr;
    begin
-      r_writeback_value <= (r_reg_port_a < r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a < r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -400,9 +400,9 @@ endtask
 // CMPULER - rd = (rs1 <= rs2) ? 1 : 0, unsigned
 task t_cmpuler;
    begin
-      r_writeback_value <= (r_reg_port_a <= r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a <= r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -410,9 +410,9 @@ endtask
 // CMPUGTR - rd = (rs1 > rs2) ? 1 : 0, unsigned
 task t_cmpugtr;
    begin
-      r_writeback_value <= (r_reg_port_a > r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a > r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -420,9 +420,9 @@ endtask
 // CMPUGER - rd = (rs1 >= rs2) ? 1 : 0, unsigned
 task t_cmpuger;
    begin
-      r_writeback_value <= (r_reg_port_a >= r_reg_port_b) ? 32'b1 : 32'b0;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (r_reg_port_a >= r_reg_port_b) ? 32'b1 : 32'b0;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -511,10 +511,10 @@ task t_div_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
          // Divide by zero
-         r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
-         r_writeback_reg <= r_reg_dst;
+         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         r_wb.rd <= r_reg_dst;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
       else begin
@@ -540,10 +540,10 @@ endtask
 task t_divu_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
-         r_writeback_reg <= r_reg_dst;
+         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         r_wb.rd <= r_reg_dst;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
       else begin
@@ -567,10 +567,10 @@ task t_mod_regs_hw;
    logic [63:0] abs_divisor;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_writeback_value <= r_reg_port_a;  // Return dividend
-         r_writeback_reg <= r_reg_dst;
+         r_wb.value <= r_reg_port_a;  // Return dividend
+         r_wb.rd <= r_reg_dst;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
       else begin
@@ -595,10 +595,10 @@ endtask
 task t_modu_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_writeback_value <= r_reg_port_a;
-         r_writeback_reg <= r_reg_dst;
+         r_wb.value <= r_reg_port_a;
+         r_wb.rd <= r_reg_dst;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 4;
       end
       else begin
@@ -623,10 +623,10 @@ task t_div_value_hw;
    logic [63:0] abs_divisor;
    begin
       if (i_value == 32'b0) begin
-         r_writeback_value <= 64'hFFFFFFFFFFFFFFFF;
-         r_writeback_reg <= r_reg_2;
+         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         r_wb.rd <= r_reg_2;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 8;
       end
       else begin
@@ -657,10 +657,10 @@ task t_mod_value_hw;
          // MOD by zero returns the dividend (rd % 0 == rd). MODV is in-place, so
          // rd already holds the dividend (read on r_reg_port_b); write it back
          // explicitly to match the MODR / MODUR / DIVV by-zero handling.
-         r_writeback_value <= r_reg_port_b;
-         r_writeback_reg   <= r_reg_2;
+         r_wb.value <= r_reg_port_b;
+         r_wb.rd   <= r_reg_2;
          r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
          r_PC <= r_PC + 8;
       end
       else begin
@@ -690,16 +690,16 @@ endtask
 task t_abs_reg;
    begin
       if (r_reg_port_b[63]) begin
-         r_writeback_value <= ~r_reg_port_b + 1;
+         r_wb.value <= ~r_reg_port_b + 1;
          // Check for overflow (abs of -2^63)
          r_flags.overflow <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
       end else begin
-         r_writeback_value <= r_reg_port_b;
+         r_wb.value <= r_reg_port_b;
          r_flags.overflow <= 1'b0;  // non-negative input never overflows
       end
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -707,11 +707,11 @@ endtask
 // SEXTB - Sign extend byte to 64 bits
 task t_sign_extend_byte;
    begin
-      r_writeback_value <= {{56{r_reg_port_b[7]}}, r_reg_port_b[7:0]};
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
+      r_wb.value <= {{56{r_reg_port_b[7]}}, r_reg_port_b[7:0]};
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
       r_flags.sign <= r_reg_port_b[7];
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -719,11 +719,11 @@ endtask
 // SEXTH - Sign extend halfword to 64 bits
 task t_sign_extend_half;
    begin
-      r_writeback_value <= {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]};
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
+      r_wb.value <= {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]};
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
       r_flags.sign <= r_reg_port_b[15];
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -731,10 +731,10 @@ endtask
 // ZEXTB - Zero extend byte to 64 bits
 task t_zero_extend_byte;
    begin
-      r_writeback_value <= {56'b0, r_reg_port_b[7:0]};
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {56'b0, r_reg_port_b[7:0]};
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -742,10 +742,10 @@ endtask
 // ZEXTH - Zero extend halfword to 64 bits
 task t_zero_extend_half;
    begin
-      r_writeback_value <= {48'b0, r_reg_port_b[15:0]};
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= {48'b0, r_reg_port_b[15:0]};
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -753,7 +753,7 @@ endtask
 // BSWAP - Byte swap (endian conversion, 8 bytes)
 task t_byte_swap;
    begin
-      r_writeback_value <= {
+      r_wb.value <= {
          r_reg_port_b[7:0],
          r_reg_port_b[15:8],
          r_reg_port_b[23:16],
@@ -763,8 +763,8 @@ task t_byte_swap;
          r_reg_port_b[55:48],
          r_reg_port_b[63:56]
       };
-      r_writeback_reg <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.rd <= r_reg_2;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -775,10 +775,10 @@ task t_left_shift_n;
    logic [63:0] result;
    begin
       result = r_reg_port_b << i_count[5:0];
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -789,10 +789,10 @@ task t_right_shift_n;
    logic [63:0] result;
    begin
       result = r_reg_port_b >> i_count[5:0];
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -805,10 +805,10 @@ task t_right_shift_a_n;
    begin
       signed_val = r_reg_port_b;
       result = signed_val >>> i_count[5:0];
-      r_writeback_value <= result;
-      r_writeback_reg <= r_reg_2;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= result;
+      r_wb.rd <= r_reg_2;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 8;
    end
 endtask
@@ -820,9 +820,9 @@ task t_min_regs;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a < s_b) ? r_reg_port_a : r_reg_port_b;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a < s_b) ? r_reg_port_a : r_reg_port_b;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -834,9 +834,9 @@ task t_max_regs;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_writeback_value <= (s_a > s_b) ? r_reg_port_a : r_reg_port_b;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= (s_a > s_b) ? r_reg_port_a : r_reg_port_b;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -844,10 +844,10 @@ endtask
 // MINUR - rd = min(rs1, rs2), unsigned
 task t_minu_regs;
    begin
-      r_writeback_value <= (r_reg_port_a < r_reg_port_b) ?
+      r_wb.value <= (r_reg_port_a < r_reg_port_b) ?
                               r_reg_port_a : r_reg_port_b;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -855,10 +855,10 @@ endtask
 // MAXUR - rd = max(rs1, rs2), unsigned
 task t_maxu_regs;
    begin
-      r_writeback_value <= (r_reg_port_a > r_reg_port_b) ?
+      r_wb.value <= (r_reg_port_a > r_reg_port_b) ?
                               r_reg_port_a : r_reg_port_b;
-      r_writeback_reg <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.rd <= r_reg_dst;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -870,10 +870,10 @@ endtask
 // SHLR - rd = rs1 << rs2[5:0], logical left shift
 task t_shlr3;
    begin
-      r_writeback_value <= r_reg_port_a << r_reg_port_b[5:0];
-      r_writeback_reg <= r_reg_dst;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_a << r_reg_port_b[5:0];
+      r_wb.rd <= r_reg_dst;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -881,10 +881,10 @@ endtask
 // SHRR - rd = rs1 >> rs2[5:0], logical right shift
 task t_shrr3;
    begin
-      r_writeback_value <= r_reg_port_a >> r_reg_port_b[5:0];
-      r_writeback_reg <= r_reg_dst;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= r_reg_port_a >> r_reg_port_b[5:0];
+      r_wb.rd <= r_reg_dst;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -894,10 +894,10 @@ task t_sarr3;
    logic signed [63:0] signed_val;
    begin
       signed_val = r_reg_port_a;
-      r_writeback_value <= signed_val >>> r_reg_port_b[5:0];
-      r_writeback_reg <= r_reg_dst;
-      r_writeback_set_zero_flag <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb_pending <= 1'b1;
+      r_wb.value <= signed_val >>> r_reg_port_b[5:0];
+      r_wb.rd <= r_reg_dst;
+      r_wb.set_zero <= 1'b1;
+      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
       r_PC <= r_PC + 4;
    end
 endtask
@@ -928,8 +928,8 @@ task t_load_indexed;
       end
       else begin
          if (w_mem_ready) begin
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg <= r_reg_1;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd <= r_reg_1;
             r_SM <= WRITEBACK;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 8;
@@ -973,8 +973,8 @@ task t_load_indexed64;
       end
       else begin
          if (w_mem_ready) begin
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg   <= r_reg_1;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd   <= r_reg_1;
             r_SM              <= WRITEBACK;
             r_mem_read_DV     <= 1'b0;
             r_PC              <= r_PC + 8;
@@ -1033,8 +1033,8 @@ task t_load_indexed_reg;
          end
          else if (w_mem_ready) begin
             // Stage 2b: Memory ready, capture result
-            r_writeback_value <= w_mem_read_data;
-            r_writeback_reg <= r_reg_1;
+            r_wb.value <= w_mem_read_data;
+            r_wb.rd <= r_reg_1;
             r_SM <= WRITEBACK;
             r_mem_read_DV <= 1'b0;
             r_PC <= r_PC + 8;
@@ -1101,10 +1101,10 @@ task t_load_indexed32;
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
             r_mem_read_DV     <= 1'b0;
-            r_writeback_value <= effective_addr[2] ?
+            r_wb.value <= effective_addr[2] ?
                {32'b0, w_mem_read_data[63:32]} :
                {32'b0, w_mem_read_data[31:0]};
-            r_writeback_reg <= r_reg_1;
+            r_wb.rd <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 8;
          end
@@ -1149,12 +1149,12 @@ task t_load_indexed16;
             effective_addr = r_reg_port_b[31:0] + i_offset;
             r_mem_read_DV <= 1'b0;
             case (effective_addr[2:1])
-               2'b00: r_writeback_value <= {48'b0, w_mem_read_data[15:0]};
-               2'b01: r_writeback_value <= {48'b0, w_mem_read_data[31:16]};
-               2'b10: r_writeback_value <= {48'b0, w_mem_read_data[47:32]};
-               2'b11: r_writeback_value <= {48'b0, w_mem_read_data[63:48]};
+               2'b00: r_wb.value <= {48'b0, w_mem_read_data[15:0]};
+               2'b01: r_wb.value <= {48'b0, w_mem_read_data[31:16]};
+               2'b10: r_wb.value <= {48'b0, w_mem_read_data[47:32]};
+               2'b11: r_wb.value <= {48'b0, w_mem_read_data[63:48]};
             endcase
-            r_writeback_reg <= r_reg_1;
+            r_wb.rd <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 8;
          end
@@ -1186,8 +1186,8 @@ task t_load_indexed16_s;
                2'b10: half_val = w_mem_read_data[47:32];
                2'b11: half_val = w_mem_read_data[63:48];
             endcase
-            r_writeback_value <= {{48{half_val[15]}}, half_val};
-            r_writeback_reg   <= r_reg_1;
+            r_wb.value <= {{48{half_val[15]}}, half_val};
+            r_wb.rd   <= r_reg_1;
             r_SM              <= WRITEBACK;
             r_PC              <= r_PC + 8;
          end
@@ -1234,16 +1234,16 @@ task t_load_indexed8;
             effective_addr = r_reg_port_b[31:0] + i_offset;
             r_mem_read_DV <= 1'b0;
             case (effective_addr[2:0])
-               3'b000: r_writeback_value <= {56'b0, w_mem_read_data[7:0]};
-               3'b001: r_writeback_value <= {56'b0, w_mem_read_data[15:8]};
-               3'b010: r_writeback_value <= {56'b0, w_mem_read_data[23:16]};
-               3'b011: r_writeback_value <= {56'b0, w_mem_read_data[31:24]};
-               3'b100: r_writeback_value <= {56'b0, w_mem_read_data[39:32]};
-               3'b101: r_writeback_value <= {56'b0, w_mem_read_data[47:40]};
-               3'b110: r_writeback_value <= {56'b0, w_mem_read_data[55:48]};
-               3'b111: r_writeback_value <= {56'b0, w_mem_read_data[63:56]};
+               3'b000: r_wb.value <= {56'b0, w_mem_read_data[7:0]};
+               3'b001: r_wb.value <= {56'b0, w_mem_read_data[15:8]};
+               3'b010: r_wb.value <= {56'b0, w_mem_read_data[23:16]};
+               3'b011: r_wb.value <= {56'b0, w_mem_read_data[31:24]};
+               3'b100: r_wb.value <= {56'b0, w_mem_read_data[39:32]};
+               3'b101: r_wb.value <= {56'b0, w_mem_read_data[47:40]};
+               3'b110: r_wb.value <= {56'b0, w_mem_read_data[55:48]};
+               3'b111: r_wb.value <= {56'b0, w_mem_read_data[63:56]};
             endcase
-            r_writeback_reg <= r_reg_1;
+            r_wb.rd <= r_reg_1;
             r_SM            <= WRITEBACK;
             r_PC            <= r_PC + 8;
          end
@@ -1279,8 +1279,8 @@ task t_load_indexed8_s;
                3'b110: byte_val = w_mem_read_data[55:48];
                3'b111: byte_val = w_mem_read_data[63:56];
             endcase
-            r_writeback_value <= {{56{byte_val[7]}}, byte_val};
-            r_writeback_reg   <= r_reg_1;
+            r_wb.value <= {{56{byte_val[7]}}, byte_val};
+            r_wb.rd   <= r_reg_1;
             r_SM              <= WRITEBACK;
             r_PC              <= r_PC + 8;
          end

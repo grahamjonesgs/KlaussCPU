@@ -12,8 +12,8 @@ task t_rx_blocking;
             r_SM <= OPCODE_EXECUTE;  // retry next clock
         end else begin
             r_rx_fifo_read            <= 1'b1;
-            r_writeback_value         <= {24'b0, w_rx_fifo_byte};
-            r_writeback_reg           <= r_reg_2;
+            r_wb.value         <= {24'b0, w_rx_fifo_byte};
+            r_wb.rd           <= r_reg_2;
             r_flags.zero               <= 1'b0;
             r_SM <= WRITEBACK;
             r_PC <= r_PC + 4;
@@ -34,8 +34,8 @@ task t_rx_nonblocking;
             r_PC <= r_PC + 4;
         end else begin
             r_rx_fifo_read    <= 1'b1;
-            r_writeback_value <= {24'b0, w_rx_fifo_byte};
-            r_writeback_reg   <= r_reg_2;
+            r_wb.value <= {24'b0, w_rx_fifo_byte};
+            r_wb.rd   <= r_reg_2;
             r_flags.zero       <= 1'b0;
             r_SM <= WRITEBACK;
             r_PC <= r_PC + 4;

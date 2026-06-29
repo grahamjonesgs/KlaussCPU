@@ -92,4 +92,14 @@ package klauss_pkg;
       logic ult;        // U: unsigned less-than comparison
    } flags_t;
 
+   // --- Deferred-writeback bundle (r_wb) -----------------------------------
+   // The P4.1 RAW-forwarding/writeback state that moves together through the
+   // pipeline.  Field is `rd` (not `reg`, which is a keyword).
+   typedef struct packed {
+      logic [63:0] value;     // result to write back
+      logic [3:0]  rd;        // destination register index
+      logic        set_zero;  // set the zero flag from `value` at writeback
+      logic        pending;   // a writeback is deferred/in-flight (RAW-forward source)
+   } wb_t;
+
 endpackage : klauss_pkg
