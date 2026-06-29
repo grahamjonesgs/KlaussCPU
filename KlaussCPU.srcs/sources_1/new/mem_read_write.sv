@@ -11,12 +11,12 @@
 // (~20-50 cycles).
 //
 // 64-bit data bus: 128-bit cache line holds 2 × 64-bit doublewords.
-// Doubleword offset within line: i_mem_addr[3] (0=upper [127:64], 1=lower [63:0])
+// Doubleword offset within line: cpu.addr[3] (0=upper [127:64], 1=lower [63:0])
 // Cache index: addr[3+INDEX_BITS:4], Tag: addr[31:4+INDEX_BITS]
 //
-// External interface: i_mem_write_DV, i_mem_read_DV, i_mem_addr[31:0],
-// i_mem_write_data[63:0], i_mem_byte_en[7:0], o_mem_read_data[63:0],
-// o_mem_ready.
+// External interface: cpu.write_DV, cpu.read_DV, cpu.addr[31:0],
+// cpu.write_data[63:0], cpu.byte_en[7:0], cpu.read_data[63:0],
+// cpu.ready.
 //////////////////////////////////////////////////////////////////////////////////
 
 module mem_read_write (
@@ -36,15 +36,8 @@ module mem_read_write (
     output [ 1:0] ddr2_dm,
     output [ 0:0] ddr2_odt,
 
-    input             i_mem_write_DV,
-    input             i_mem_read_DV,
-    input      [31:0] i_mem_addr,       // byte address (doubleword-aligned for 64-bit ops)
-    input      [63:0] i_mem_write_data,
-    input      [ 7:0] i_mem_byte_en,    // byte enables for writes (8'hFF = full doubleword)
-    output logic [63:0] o_mem_read_data,
-    output logic [63:0] o_mem_read_data_next, // next consecutive doubleword in same cache line
-    output logic        o_mem_next_valid,      // 1 when o_mem_read_data_next is valid (offset == 0)
-    output logic        o_mem_ready,
+    // CPU-side memory bus (slave): request in, read_data/next/ready out.
+    membus_if.slave   cpu,
 
     // Performance counters (RISC-V Zihpm-style cache events) and control.
     // i_stat_clear: 1-cycle pulse — zeros all counters on the next edge.
@@ -206,8 +199,8 @@ module mem_read_write (
     assign o_dma_ready = w_blit_ddr_ready;
 
     // -------------------------------------------------------------------------
-    // Address decode — combinational from i_mem_addr (32-bit byte address).
-    // CPU holds i_mem_addr stable until o_mem_ready, so these are stable
+    // Address decode — combinational from cpu.addr (32-bit byte address).
+    // CPU holds cpu.addr stable until cpu.ready, so these are stable
     // throughout any multi-cycle operation.
     //
     // DDR2 MIG address is in 16-bit half-word units (BL8 = 128-bit burst).
@@ -218,10 +211,10 @@ module mem_read_write (
     //   0 = upper doubleword [127:64], 1 = lower doubleword [63:0]
     // Cache index: addr[4+INDEX_BITS-1:4], Tag: addr[31:4+INDEX_BITS]
     // -------------------------------------------------------------------------
-    wire [31:0]           w_computed_ddr_addr = {i_mem_addr[31:4], 4'b0000};
-    wire [INDEX_BITS-1:0] w_cache_index       = i_mem_addr[4+INDEX_BITS-1:4];
-    wire [TAG_BITS-1:0]   w_cache_tag         = i_mem_addr[31:4+INDEX_BITS];
-    wire                  w_byte_offset       = i_mem_addr[3];    // doubleword within cache line
+    wire [31:0]           w_computed_ddr_addr = {cpu.addr[31:4], 4'b0000};
+    wire [INDEX_BITS-1:0] w_cache_index       = cpu.addr[4+INDEX_BITS-1:4];
+    wire [TAG_BITS-1:0]   w_cache_tag         = cpu.addr[31:4+INDEX_BITS];
+    wire                  w_byte_offset       = cpu.addr[3];    // doubleword within cache line
 
     // -------------------------------------------------------------------------
     // Cache arrays — ALL in BRAM (dirty bits in distributed RAM — narrow 1-bit
@@ -331,7 +324,7 @@ module mem_read_write (
                                                   // causing a spurious re-latch of the same request.
                                                   // The phantom ready pulses produced by those
                                                   // re-latches were observed to drive opcode
-                                                  // fetches off stale o_mem_read_data — see
+                                                  // fetches off stale cpu.read_data — see
                                                   // CRASH_DUMP.md ERR=01 trace at PC=0x78.
     localparam MAINT                 = 16'd16384; // cache flush/invalidate walk (sub-FSM below)
 
@@ -443,25 +436,25 @@ module mem_read_write (
 
             // ------------------------------------------------------------------
             // PRE_WAIT runs the cycle after a transaction completes (each
-            // completion path sets o_mem_ready=1 and state<=PRE_WAIT).  The
+            // completion path sets cpu.ready=1 and state<=PRE_WAIT).  The
             // ready pulse must be visible to the CPU for exactly one cycle:
             // longer than that and a CPU FSM that issues a back-to-back
             // request (e.g. OPCODE_REQUEST → OPCODE_FETCH on the timer-
             // interrupt push→fetch path) will see the *previous* transaction's
             // stale ready in its new state and latch garbage from
-            // o_mem_read_data.  Clearing ready here — not in WAIT — gives a
+            // cpu.read_data.  Clearing ready here — not in WAIT — gives a
             // clean low edge before the next request can be picked up.
             //
             // COOL_DOWN is inserted after PRE_WAIT so that WAIT re-entry is
             // delayed one extra cycle.  Required because bus_splitter now
-            // registers o_mem_ready: the CPU sees ready one cycle after this
+            // registers cpu.ready: the CPU sees ready one cycle after this
             // module asserts it, and so it drops r_mem_*_DV one cycle later
             // than the legacy combinational-splitter path expected.  Without
             // the dead cycle, WAIT runs while the CPU's DV is still high and
             // re-latches the same request — see CRASH_DUMP.md notes.
             PRE_WAIT: begin
-                o_mem_ready      <= 0;
-                o_mem_next_valid <= 0;
+                cpu.ready      <= 0;
+                cpu.next_valid <= 0;
                 state            <= COOL_DOWN;
             end
 
@@ -481,8 +474,8 @@ module mem_read_write (
             // All results are available next cycle in CHECK.
             // ------------------------------------------------------------------
             WAIT: begin
-                o_mem_ready      <= 0;
-                o_mem_next_valid <= 0;
+                cpu.ready      <= 0;
+                cpu.next_valid <= 0;
                 if (r_mnt_pending) begin
                     // Cache maintenance has priority over CPU requests: a pending
                     // flush/invalidate is consumed here, while the CPU stalls on
@@ -491,7 +484,7 @@ module mem_read_write (
                     r_cache_index <= {INDEX_BITS{1'b0}};
                     r_mnt_sub     <= MS_READ;
                     state         <= MAINT;
-                end else if (i_mem_write_DV || i_mem_read_DV) begin
+                end else if (cpu.write_DV || cpu.read_DV) begin
                     // Issue all BRAM reads in parallel (single read port: w_rd_index).
                     r_tag_way0          <= cache_val_addr_way0[w_rd_index];
                     r_tag_way1          <= cache_val_addr_way1[w_rd_index];
@@ -504,9 +497,9 @@ module mem_read_write (
                     r_cache_index       <= w_cache_index;
                     r_cache_tag         <= w_cache_tag;
                     r_byte_offset       <= w_byte_offset;
-                    r_byte_en           <= i_mem_byte_en;
-                    r_write_data        <= i_mem_write_data;
-                    r_is_write          <= i_mem_write_DV;
+                    r_byte_en           <= cpu.byte_en;
+                    r_write_data        <= cpu.write_data;
+                    r_is_write          <= cpu.write_DV;
                     r_computed_ddr_addr <= w_computed_ddr_addr;
                     state               <= CHECK;
                 end
@@ -562,7 +555,7 @@ module mem_read_write (
                             cache_val_data_way1[r_cache_index] <= merged;
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
-                        o_mem_ready <= 1;
+                        cpu.ready <= 1;
                         state       <= PRE_WAIT;
 
                     end else begin
@@ -591,18 +584,18 @@ module mem_read_write (
                             logic [127:0] hitline;
                             hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
                             if (r_byte_offset == 1'b0) begin
-                                o_mem_read_data      <= hitline[127:64];
-                                o_mem_read_data_next <= hitline[63:0];
-                                o_mem_next_valid     <= 1'b1;
+                                cpu.read_data      <= hitline[127:64];
+                                cpu.read_data_next <= hitline[63:0];
+                                cpu.next_valid     <= 1'b1;
                             end else begin
-                                o_mem_read_data      <= hitline[63:0];
-                                o_mem_read_data_next <= 64'h0;
-                                o_mem_next_valid     <= 1'b0;
+                                cpu.read_data      <= hitline[63:0];
+                                cpu.read_data_next <= 64'h0;
+                                cpu.next_valid     <= 1'b0;
                             end
                         end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
-                        o_mem_ready <= 1;
+                        cpu.ready <= 1;
                         state       <= PRE_WAIT;
 
                     end else begin
@@ -638,12 +631,12 @@ module mem_read_write (
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_write_DV <= 0;
                     // CRITICAL: do NOT change o_ddr_mem_addr here. ddr2_control
-                    // samples i_mem_write_DV directly (same ui_clk domain), but
+                    // samples cpu.write_DV directly (same ui_clk domain), but
                     // its FSM only returns WRITE_DONE->IDLE->WAIT once BOTH DVs
                     // read low (the IDLE gate there). For a cycle or two after we
                     // drop write_DV it can still be draining its write, and if it
                     // re-enters WAIT->WRITE while write_DV still reads high it
-                    // latches app_addr from the live i_mem_addr. If we have already
+                    // latches app_addr from the live cpu.addr. If we have already
                     // changed addr to the refill target, that spurious write
                     // commits the eviction line's data to the refill address —
                     // corrupting DRAM.  Hold the eviction address through the
@@ -706,7 +699,7 @@ module mem_read_write (
 
                     // Line installed as DIRTY — will be written back to DDR on eviction.
                     // Dirty bit set via dirty0/1_din combinatorial wires above.
-                    o_mem_ready <= 1;
+                    cpu.ready <= 1;
                     state       <= PRE_WAIT;
                 end
             end
@@ -765,16 +758,16 @@ module mem_read_write (
 
                     // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
                     if (r_byte_offset == 1'b0) begin
-                        o_mem_read_data      <= i_ddr_mem_read_data[127:64];
-                        o_mem_read_data_next <= i_ddr_mem_read_data[63:0];
-                        o_mem_next_valid     <= 1'b1;
+                        cpu.read_data      <= i_ddr_mem_read_data[127:64];
+                        cpu.read_data_next <= i_ddr_mem_read_data[63:0];
+                        cpu.next_valid     <= 1'b1;
                     end else begin
-                        o_mem_read_data      <= i_ddr_mem_read_data[63:0];
-                        o_mem_read_data_next <= 64'h0;
-                        o_mem_next_valid     <= 1'b0;
+                        cpu.read_data      <= i_ddr_mem_read_data[63:0];
+                        cpu.read_data_next <= 64'h0;
+                        cpu.next_valid     <= 1'b0;
                     end
 
-                    o_mem_ready <= 1;
+                    cpu.ready <= 1;
                     state       <= PRE_WAIT;
                 end
             end

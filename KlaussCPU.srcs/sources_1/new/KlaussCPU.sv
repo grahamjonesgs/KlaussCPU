@@ -304,15 +304,8 @@ module KlaussCPU (
    //   4'hF → MMIO, else DRAM. CPU FSM sees only the original r_mem_*/w_mem_*
    //   signals; routing is invisible above this line.
    // -------------------------------------------------------------------------
-   wire        w_dram_write_DV;
-   wire        w_dram_read_DV;
-   wire [31:0] w_dram_addr;
-   wire [63:0] w_dram_write_data;
-   wire [ 7:0] w_dram_byte_en;
-   wire [63:0] w_dram_read_data;
-   wire [63:0] w_dram_read_data_next;
-   wire        w_dram_next_valid;
-   wire        w_dram_ready;
+   // (The bus_splitter<->mem_read_write DRAM bus is now the dram_mem interface
+   //  instance, declared near the bus_splitter instantiation below.)
 
    wire        w_mmio_write_DV;
    wire        w_mmio_read_DV;
@@ -661,29 +654,26 @@ module KlaussCPU (
    // surrounding CPU slices. Without it the placer can scatter sd_spi/splitter
    // cells across the CPU's 64-bit ALU carry chain, lengthening route delay on
    // an already-tight critical path (r_reg_port_b → r_flags.carry, ~25 levels).
+   // CPU memory bus (FSM <-> bus_splitter) and DRAM bus (bus_splitter <-> cache),
+   // both via membus_if.  The FSM still drives r_mem_* / observes w_mem_*; these
+   // assigns bridge those wires to the interface (request out, response back).
+   membus_if cpu_mem();
+   membus_if dram_mem();
+   assign cpu_mem.write_DV      = r_mem_write_DV;
+   assign cpu_mem.read_DV       = r_mem_read_DV;
+   assign cpu_mem.addr          = r_mem_addr;
+   assign cpu_mem.write_data    = r_mem_write_data;
+   assign cpu_mem.byte_en       = r_mem_byte_en;
+   assign w_mem_read_data       = cpu_mem.read_data;
+   assign w_mem_read_data_next  = cpu_mem.read_data_next;
+   assign w_mem_next_valid      = cpu_mem.next_valid;
+   assign w_mem_ready           = cpu_mem.ready;
+
    (* KEEP_HIERARCHY = "yes" *)
    bus_splitter bus_splitter_i (
        .i_clk(i_Clk),
-       // CPU side — same names the FSM has always driven/observed
-       .i_mem_write_DV(r_mem_write_DV),
-       .i_mem_read_DV(r_mem_read_DV),
-       .i_mem_addr(r_mem_addr),
-       .i_mem_write_data(r_mem_write_data),
-       .i_mem_byte_en(r_mem_byte_en),
-       .o_mem_read_data(w_mem_read_data),
-       .o_mem_read_data_next(w_mem_read_data_next),
-       .o_mem_next_valid(w_mem_next_valid),
-       .o_mem_ready(w_mem_ready),
-       // DRAM side
-       .o_dram_write_DV(w_dram_write_DV),
-       .o_dram_read_DV(w_dram_read_DV),
-       .o_dram_addr(w_dram_addr),
-       .o_dram_write_data(w_dram_write_data),
-       .o_dram_byte_en(w_dram_byte_en),
-       .i_dram_read_data(w_dram_read_data),
-       .i_dram_read_data_next(w_dram_read_data_next),
-       .i_dram_next_valid(w_dram_next_valid),
-       .i_dram_ready(w_dram_ready),
+       .cpu(cpu_mem),     // CPU side  (FSM request / response)
+       .dram(dram_mem),   // DRAM side (to mem_read_write)
        // MMIO side (existing peripherals)
        .o_mmio_write_DV(w_mmio_write_DV),
        .o_mmio_read_DV(w_mmio_read_DV),
@@ -1002,15 +992,7 @@ module KlaussCPU (
        .ddr2_dm(ddr2_dm),
        .ddr2_odt(ddr2_odt),
 
-       .i_mem_write_DV(w_dram_write_DV),
-       .i_mem_read_DV(w_dram_read_DV),
-       .i_mem_addr(w_dram_addr),
-       .i_mem_write_data(w_dram_write_data),
-       .i_mem_byte_en(w_dram_byte_en),
-       .o_mem_read_data(w_dram_read_data),
-       .o_mem_read_data_next(w_dram_read_data_next),
-       .o_mem_next_valid(w_dram_next_valid),
-       .o_mem_ready(w_dram_ready),
+       .cpu(dram_mem),   // DRAM-side membus from bus_splitter
 
        // Cache performance counters and clear pulse.
        .i_stat_clear(w_cache_stat_clear),
