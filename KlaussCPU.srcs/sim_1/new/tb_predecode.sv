@@ -2,8 +2,9 @@
 // Local unit test for f_predecode_len (P4.1a). Catches transcription/casez-order
 // errors fast, before the synth cycle. Ground truth for the ISA lengths is the
 // board-empirical mismatch counter (separate); this locks the function behavior.
+// f_predecode_len now lives in klauss_pkg (compile klauss_pkg.sv alongside this tb).
+import klauss_pkg::*;
 module tb_predecode;
-  `include "functions.vh"
 
   integer errors = 0;
   task check;
