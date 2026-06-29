@@ -113,7 +113,6 @@ module KlaussCPU (
    wire       w_rx_fifo_empty;
    wire       w_rx_fifo_full;
    wire [7:0] w_rx_fifo_byte;   // combinatorial peek at FIFO head
-   logic        r_rx_fifo_read;   // 1-cycle strobe: pop one byte from FIFO
 
    // LCD control
    logic [3:0] o_TX_LCD_Count;  // # bytes per CS low
@@ -126,37 +125,28 @@ module KlaussCPU (
    wire i_RX_LCD_DV;  // Data Valid pulse (1 clock cycle)
    wire [7:0] i_RX_LCD_Byte;  // Byte received on MISO
 
-   logic [44:0] r_timeout_counter;  // Room for 32 bits plus the 13 left shift in the timing task
-   logic [44:0] r_timeout_max;
 
    // Machine control
-   e_sm_t r_SM;   // 34 one-hot states (see e_sm_t); bit 32 = ALU_FINISH, bit 33 = DIVIDE_PREP
 
    // Invariant: the FSM is one-hot every cycle (guards the manual one-hot state
    // allocation the design depends on).  Concurrent SVA — Vivado synthesis
    // ignores it (netlist unaffected); it is checked under xsim/formal.  Gated on
    // !$isunknown so it skips the power-up window before the initial block runs.
    a_sm_onehot: assert property (@(posedge i_Clk)
-                                 (!$isunknown(r_SM)) |-> $onehot(r_SM))
-      else $error("r_SM not one-hot: %h", r_SM);
-   // Snapshot of r_SM at fault time.  r_SM gets overwritten by the HCF chain
-   // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping r_SM directly
-   // is useless.  We continuously copy r_SM into r_fault_sm while the FSM is
+                                 (!$isunknown(st.SM)) |-> $onehot(st.SM))
+      else $error("st.SM not one-hot: %h", st.SM);
+   // Snapshot of st.SM at fault time.  st.SM gets overwritten by the HCF chain
+   // (HCF_1 → HCF_DUMP → ...) before the dump emits, so dumping st.SM directly
+   // is useless.  We continuously copy st.SM into r_fault_sm while the FSM is
    // in any *non-HCF* state; the moment the trap fires, r_fault_sm freezes
    // at the state that was running immediately before the transition into
    // HCF_1, which is what we actually want in the crash dump.
    logic [33:0] r_fault_sm = 34'b0;
-   logic [31:0] r_PC;           // byte address, always word-aligned (bits [1:0] = 0)
    logic [31:0] r_mem_read_addr;
    wire [31:0] w_opcode;
    wire [31:0] w_var1;
    wire [31:0] w_var2;
    wire [31:0] w_mem;
-   logic [3:0] r_reg_1;
-   logic [3:0] r_reg_2;
-   logic [3:0] r_reg_dst;
-   logic [1:0] r_extra_clock;
-   logic [31:0] r_idx_base_addr;  // Saved base address for indexed register ops (byte addr) — driven/consumed in alu_extended_tasks.vh / uart_tasks.vh
    logic r_hcf_message_sent;
    logic [31:0] r_start_wait_counter;
 
@@ -201,42 +191,27 @@ module KlaussCPU (
 
    // Register control
    logic [63:0] r_register[15:0];
-   flags_t r_flags;   // Z E C V S L U condition flags (packed struct, see klauss_pkg)
-   logic [7:0] r_error_code;
 
    // -----------------------------------------------------------------------
    // ALU pipeline registers — written by arithmetic / compare tasks during
    // OPCODE_EXECUTE; consumed in ALU_FINISH (next cycle) to drive the
-   // architectural flags + r_wb.value. Adds +1 cycle to ADD/SUB/CMP
+   // architectural flags + st.wb.value. Adds +1 cycle to ADD/SUB/CMP
    // ops in exchange for breaking the 64-bit subtractor → carry-flag path.
-   // r_alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
+   // st.alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
    // -----------------------------------------------------------------------
-   logic [63:0] r_alu_pipe_value;     // ARITH+CMP: subtract/add result
-   logic        r_alu_pipe_carry;     // ARITH only
-   logic        r_alu_pipe_overflow;  // ARITH only
-   logic        r_alu_pipe_equal;     // CMP only
-   logic        r_alu_pipe_less;      // CMP only (signed less-than)
-   logic        r_alu_pipe_ult;       // CMP only (unsigned less-than)
-   logic        r_alu_pipe_mode;      // 0 = ARITH (carry/overflow/sign/value), 1 = CMP (equal/less/ult/sign)
 
    // Display value
-   logic [31:0] r_seven_seg_value1;
-   logic [31:0] r_seven_seg_value2;
    logic r_error_display_type;
-   logic [11:0] r_RGB_LED_1;
-   logic [11:0] r_RGB_LED_2;
 
    // Stack control — stack now lives in DDR2 RAM, top of 128 MiB, growing down
    // SP = 32'h800_0000 means empty; PUSH: SP-=8, mem[SP]=val; POP: val=mem[SP], SP+=8
    // R15 is the frame pointer by convention (software convention only, no hardware enforcement)
-   logic [31:0] r_SP;           // byte address, always doubleword-aligned (bits [2:0] = 0)
    logic        r_int_push_wait;  // set while waiting for DDR2 to complete interrupt PC-push
 
    // UART send message
    logic [255:0] r_msg;  // 32 bytes — longest message is 21 bytes (case 2 of t_tx_message)
    logic [7:0] r_msg_length;
    logic r_msg_send_DV;
-   logic r_mem_was_ready;  // driven/consumed in uart_tasks.vh
    wire i_msg_sent_DV;
    wire w_sending_msg;
 
@@ -249,7 +224,6 @@ module KlaussCPU (
    logic        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
 
    // temp vars for timing
-   logic r_timing_start;
 
    // Interrupt handler
    logic [31:0] r_interrupt_table[3:0];
@@ -260,7 +234,6 @@ module KlaussCPU (
    // Software-controlled via INTMASKR/INTMASKV. Hardware auto-clears the
    // dispatched source's bit on entry; IRET restores the 4-bit mask from the
    // stack slot (bits [42:39] of the saved context word).
-   logic [ 3:0] r_int_mask;
    // Timer-interrupt period in raw clock cycles. Software-controlled via
    // TIMERSETR/TIMERSETV. Counter rolls over (and asserts r_timer_interrupt)
    // when r_timer_interrupt_counter > r_timer_period.
@@ -276,8 +249,8 @@ module KlaussCPU (
    // A source fires only when it has a non-zero vector AND its mask bit is set.
    // w_irq_sel picks the source to dispatch; timer (0) has priority over blitter
    // (1). Sources 2..3 remain free for future devices — OR them in here.
-   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && r_int_mask[0];
-   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && r_int_mask[1];
+   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && st.int_mask[0];
+   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && st.int_mask[1];
    wire w_irq_ready = w_irq_src0 || w_irq_src1;
    wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : 2'd1;
 
@@ -289,11 +262,6 @@ module KlaussCPU (
    logic [16:0] r_clock_ms_div;
 
    // Memory
-   logic r_mem_write_DV;
-   logic r_mem_read_DV;
-   logic [31:0] r_mem_addr;      // byte address
-   logic [63:0] r_mem_write_data;
-   logic [ 7:0] r_mem_byte_en;   // byte enables: 8'hFF=full doubleword, else partial op
    wire [63:0] w_mem_read_data;
    wire [63:0] w_mem_read_data_next; // next doubleword in same cache line
    wire        w_mem_next_valid;     // 1 when w_mem_read_data_next is valid
@@ -401,7 +369,7 @@ module KlaussCPU (
    logic [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
    // Fast-path-dispatch fire count (MMIO 0xA8): instructions that skipped the
    // FETCH2 bubble. A healthy 15-53% rate is itself live proof f_predecode_len is
-   // exact — a wrong length fails the r_ir_pc==r_PC consume guard and collapses
+   // exact — a wrong length fails the r_ir_pc==st.PC consume guard and collapses
    // the rate. (This slot replaced a passive predecode-mismatch validator, now
    // covered by the consume guard and the functional regression.)
    logic [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
@@ -435,10 +403,10 @@ module KlaussCPU (
 
    // -------------------------------------------------------------------------
    // 2-stage fetch|execute overlap. r_FPC is a prefetch pointer running ahead of
-   // r_PC; a single-entry instruction-register (IR) latch holds one decoded
+   // st.PC; a single-entry instruction-register (IR) latch holds one decoded
    // instruction. The latch is filled from the instruction buffer under a
    // bus-idle execute tail (the prefetch, below) and consumed by the fast-path
-   // dispatch in OPCODE_REQUEST. The consume guard r_ir_pc == r_PC is the
+   // dispatch in OPCODE_REQUEST. The consume guard r_ir_pc == st.PC is the
    // independent safety net: a mismatch degrades to a normal re-fetch, never a
    // wrong instruction. The sequential length comes from f_predecode_len (proven
    // exact on hardware — a wrong length fails the guard and collapses the
@@ -446,14 +414,14 @@ module KlaussCPU (
    // -------------------------------------------------------------------------
    logic [31:0] r_FPC;              // next-sequential prefetch PC (advanced by f_predecode_len)
    logic        r_ir_valid;         // IR latch holds a valid prefetched instruction
-   logic [31:0] r_ir_pc;            // PC of the latched instruction (must == r_PC to consume)
+   logic [31:0] r_ir_pc;            // PC of the latched instruction (must == st.PC to consume)
    logic [31:0] r_ir_opcode;        // its 32-bit opcode
    logic [3:0]  r_ir_reg_1;
    logic [3:0]  r_ir_reg_2;
    logic [3:0]  r_ir_reg_dst;
    logic [31:0] r_ir_var1;          // prefetched var1 (PC+4) when available in the IFB
    logic        r_ir_var1_prefetched;
-   logic        r_ir_presettled;    // the execute tail already loaded r_reg_1/2 from
+   logic        r_ir_presettled;    // the execute tail already loaded st.reg_1/2 from
                                   // this latch, so the registered read ports settle
                                   // during the tail and the fast-path dispatch can
                                   // skip the FETCH2 settle bubble (saves 1 cyc/instr).
@@ -463,7 +431,7 @@ module KlaussCPU (
    // the last cache line read for opcodes. Sequential fetches that land in the
    // buffered line skip OPCODE_FETCH's ~5-cycle cache round-trip (a cache *hit*
    // still costs ~5 cycles through the cache pipeline + bus_splitter register).
-   // Per-doubleword granularity so serving reuses the exact r_PC[2] half-select
+   // Per-doubleword granularity so serving reuses the exact st.PC[2] half-select
    // the cache path uses — no 128-bit repacking. Filled in OPCODE_FETCH on a
    // miss; checked in OPCODE_REQUEST; invalidated when a store writes a buffered
    // line (keeps self-modifying code / the Zephyr LLEXT loader coherent — the
@@ -483,8 +451,8 @@ module KlaussCPU (
    logic [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
    logic [ 1:0] r_ifb_dwval;          // per-slot valid
 
-   wire [28:0] w_ifb_pc_dw  = r_PC[31:3];         // dw holding the opcode at PC
-   wire [28:0] w_ifb_pc1_dw = r_PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
+   wire [28:0] w_ifb_pc_dw  = st.PC[31:3];         // dw holding the opcode at PC
+   wire [28:0] w_ifb_pc1_dw = st.PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
    wire w_ifb_op_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc_dw);
    wire w_ifb_op_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc_dw);
    wire w_ifb_op_hit  = w_ifb_op_hit0 | w_ifb_op_hit1;
@@ -508,10 +476,10 @@ module KlaussCPU (
    wire [63:0] w_ifb_fpcv1_data = w_ifb_fpcv1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
    // Execute-tail states where the memory bus is idle and a one-entry IFB-hit
    // prefetch may fill the IR latch without contending for the cache port.
-   wire w_exec_tail = (r_SM == OPCODE_EXECUTE) || (r_SM == ALU_FINISH)    ||
-                      (r_SM == MULTIPLY_SETUP) || (r_SM == MULTIPLY_BREG) ||
-                      (r_SM == MULTIPLY_CALC)  || (r_SM == MULTIPLY_PIPE) ||
-                      (r_SM == DIVIDE_PREP)    || (r_SM == DIVIDE_STEP);
+   wire w_exec_tail = (st.SM == OPCODE_EXECUTE) || (st.SM == ALU_FINISH)    ||
+                      (st.SM == MULTIPLY_SETUP) || (st.SM == MULTIPLY_BREG) ||
+                      (st.SM == MULTIPLY_CALC)  || (st.SM == MULTIPLY_PIPE) ||
+                      (st.SM == DIVIDE_PREP)    || (st.SM == DIVIDE_STEP);
 
    // Debug
    logic r_debug_flag;
@@ -524,9 +492,8 @@ module KlaussCPU (
    //=========================================================================
    // Additional flags for expanded comparisons
    //=========================================================================
-   // (r_flags.sign / r_flags.less / r_flags.ult are now r_flags.sign/.less/.ult.)
+   // (st.flags.sign / st.flags.less / st.flags.ult are now st.flags.sign/.less/.ult.)
 
-   logic r_mul_is_immediate;  // If true, increment PC by 2 instead of 1
    
    //=============================================================================
   // PIPELINED MULTIPLY REGISTERS
@@ -540,12 +507,7 @@ module KlaussCPU (
   assign r_mul_result_lo = r_mul_pipe2[63:0];
   assign r_mul_result_hi = r_mul_pipe2[127:64];
 
-  logic        r_mul_is_high;      // Are we capturing high word?
-  logic        r_mul_is_unsigned;  // Unsigned operation?
-  logic [3:0]  r_mul_dest_reg;     // Destination register
   // Dedicated multiply operand capture (breaks path from register file)
-  logic [63:0] r_mul_operand_a;
-  logic [63:0] r_mul_operand_b;
 
   // Sign-extended (65-bit) operand latches. Doing the signed/unsigned mux
   // *here* (before the DSP) keeps the LUT2 off the operand_q -> DSP-cascade
@@ -559,8 +521,8 @@ module KlaussCPU (
   // Free-running 3-stage multiply pipeline (Vivado: DSP48 AREG/BREG + MREG + PREG)
   always_ff @(posedge i_Clk) begin
      // Stage 1: sign-extend & latch operands (absorbed into DSP AREG/BREG)
-     r_mul_operand_a_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_a[63]), r_mul_operand_a};
-     r_mul_operand_b_q <= {(r_mul_is_unsigned ? 1'b0 : r_mul_operand_b[63]), r_mul_operand_b};
+     r_mul_operand_a_q <= {(st.mul_is_unsigned ? 1'b0 : st.mul_operand_a[63]), st.mul_operand_a};
+     r_mul_operand_b_q <= {(st.mul_is_unsigned ? 1'b0 : st.mul_operand_b[63]), st.mul_operand_b};
      // Stage 2: multiply (MREG) - lower 128 bits of 130-bit signed product
      r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
      // Stage 3: register (PREG)
@@ -587,7 +549,7 @@ module KlaussCPU (
    // For true single-cycle, you'd need a pipelined divider IP
    //=========================================================================
    // Multi-cycle divide pipeline state, grouped (all fields move together
-   // through the DIVIDE_PREP/DIVIDE_STEP FSM; accessed as r_div.<field>).
+   // through the DIVIDE_PREP/DIVIDE_STEP FSM; accessed as st.div.<field>).
    typedef enum logic [1:0] { DIV_OP_NONE, DIV_OP_DIV, DIV_OP_MOD } e_div_op_t;
    typedef struct packed {
       logic [63:0] dividend;
@@ -603,7 +565,59 @@ module KlaussCPU (
       logic [3:0]  dest_reg;    // destination register for the result
       logic        pc_inc;      // 0=PC+1, 1=PC+2
    } div_state_t;
-   div_state_t r_div;
+
+   // ========================================================================
+   // cpu_state_t — the CPU core datapath state bundled into one struct so the
+   // execute tasks operate on it explicitly.  Stage A: module-scope `st`, tasks
+   // still see it directly via `include.  Stage B moves the tasks into a package
+   // taking `ref cpu_state_t st`.  EXCLUDED (kept module-scope): r_msg (XDC
+   // *r_msg_reg* multicycle exception), the LCD output ports, r_perf_br_*, and
+   // r_ir_presettled — handled in Stage B.
+   // ========================================================================
+   typedef struct packed {
+      e_sm_t       SM;
+      logic [31:0] PC;
+      logic [31:0] SP;
+      flags_t      flags;
+      wb_t         wb;
+      div_state_t  div;
+      logic [63:0] alu_pipe_value;
+      logic        alu_pipe_carry;
+      logic        alu_pipe_overflow;
+      logic        alu_pipe_equal;
+      logic        alu_pipe_less;
+      logic        alu_pipe_ult;
+      logic        alu_pipe_mode;
+      logic [31:0] mem_addr;
+      logic        mem_read_DV;
+      logic        mem_write_DV;
+      logic [63:0] mem_write_data;
+      logic [ 7:0] mem_byte_en;
+      logic        mem_was_ready;
+      logic [ 1:0] extra_clock;
+      logic [63:0] mul_operand_a;
+      logic [63:0] mul_operand_b;
+      logic [ 3:0] mul_dest_reg;
+      logic        mul_is_high;
+      logic        mul_is_unsigned;
+      logic        mul_is_immediate;
+      logic [ 3:0] reg_1;
+      logic [ 3:0] reg_2;
+      logic [ 3:0] reg_dst;
+      logic [ 7:0] error_code;
+      logic [ 3:0] int_mask;
+      logic [31:0] idx_base_addr;
+      logic [31:0] seven_seg_value1;
+      logic [31:0] seven_seg_value2;
+      logic [15:0] led;
+      logic [11:0] RGB_LED_1;
+      logic [11:0] RGB_LED_2;
+      logic [44:0] timeout_counter;
+      logic [44:0] timeout_max;
+      logic        timing_start;
+      logic        rx_fifo_read;
+   } cpu_state_t;
+   cpu_state_t st;
 
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
@@ -612,8 +626,8 @@ module KlaussCPU (
    // result (no borrow => result >= 0 => quotient bit 1, take the difference;
    // borrow => quotient bit 0, keep the shifted remainder).  Driving the
    // quotient-bit mux from w_div_borrow halves the logic on this path.
-   wire [63:0] w_div_shifted = {r_div.remainder[62:0], r_div.dividend[63]};
-   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, r_div.divisor};
+   wire [63:0] w_div_shifted = {st.div.remainder[62:0], st.div.dividend[63]};
+   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, st.div.divisor};
    wire        w_div_borrow  = w_div_trial[64];
    
    // Dedicated read ports - registered every cycle
@@ -621,7 +635,6 @@ module KlaussCPU (
    logic [63:0] r_reg_port_b;
 
    // Writeback pipeline registers
-   wb_t r_wb;   // deferred-writeback bundle: .value/.rd/.set_zero/.pending (RAW-forward source)
 
     always_ff @(posedge i_Clk) begin
        // RAW forward: the execute-tail pre-settle moves the port read into the
@@ -629,10 +642,10 @@ module KlaussCPU (
        // whose dest matches the operand (the value r_register WILL hold next
        // cycle). This mux is on the port INPUT (reg-file read), not the
        // r_reg_port_b->carry-flag OUTPUT path, so the tight carry chain is
-       // untouched. On the slow (FETCH2) path r_wb.pending is already 0 when the
+       // untouched. On the slow (FETCH2) path st.wb.pending is already 0 when the
        // port reads, so it is a no-op there.
-       r_reg_port_a <= (r_wb.pending && (r_wb.rd == r_reg_1)) ? r_wb.value : r_register[r_reg_1];
-       r_reg_port_b <= (r_wb.pending && (r_wb.rd == r_reg_2)) ? r_wb.value : r_register[r_reg_2];
+       r_reg_port_a <= (st.wb.pending && (st.wb.rd == st.reg_1)) ? st.wb.value : r_register[st.reg_1];
+       r_reg_port_b <= (st.wb.pending && (st.wb.rd == st.reg_2)) ? st.wb.value : r_register[st.reg_2];
    end
 
    // Track the last non-HCF FSM state so the crash dump can show what was
@@ -640,9 +653,9 @@ module KlaussCPU (
    // — HCF_1 fires first, then the chain walks through HCF_DUMP / HCF_2..4
    // and would otherwise overwrite the snapshot before the dump emits.
    always_ff @(posedge i_Clk) begin
-      if ((r_SM != HCF_1) && (r_SM != HCF_DUMP) &&
-          (r_SM != HCF_2) && (r_SM != HCF_3) && (r_SM != HCF_4)) begin
-         r_fault_sm <= r_SM;
+      if ((st.SM != HCF_1) && (st.SM != HCF_DUMP) &&
+          (st.SM != HCF_2) && (st.SM != HCF_3) && (st.SM != HCF_4)) begin
+         r_fault_sm <= st.SM;
       end
    end
 
@@ -658,17 +671,17 @@ module KlaussCPU (
    // KEEP_HIERARCHY prevents Vivado from flattening these modules' logic into
    // surrounding CPU slices. Without it the placer can scatter sd_spi/splitter
    // cells across the CPU's 64-bit ALU carry chain, lengthening route delay on
-   // an already-tight critical path (r_reg_port_b → r_flags.carry, ~25 levels).
+   // an already-tight critical path (r_reg_port_b → st.flags.carry, ~25 levels).
    // CPU memory bus (FSM <-> bus_splitter) and DRAM bus (bus_splitter <-> cache),
    // both via membus_if.  The FSM still drives r_mem_* / observes w_mem_*; these
    // assigns bridge those wires to the interface (request out, response back).
    membus_if cpu_mem();
    membus_if dram_mem();
-   assign cpu_mem.write_DV      = r_mem_write_DV;
-   assign cpu_mem.read_DV       = r_mem_read_DV;
-   assign cpu_mem.addr          = r_mem_addr;
-   assign cpu_mem.write_data    = r_mem_write_data;
-   assign cpu_mem.byte_en       = r_mem_byte_en;
+   assign cpu_mem.write_DV      = st.mem_write_DV;
+   assign cpu_mem.read_DV       = st.mem_read_DV;
+   assign cpu_mem.addr          = st.mem_addr;
+   assign cpu_mem.write_data    = st.mem_write_data;
+   assign cpu_mem.byte_en       = st.mem_byte_en;
    assign w_mem_read_data       = cpu_mem.read_data;
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
@@ -860,7 +873,7 @@ module KlaussCPU (
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
    // The result is registered into r_mmio_read_data (FF) below to break the
    // long combinational path from peripheral state regs through bus_splitter
-   // and into the UART helpers' FSMs (which gate the main CPU r_SM/r_PC CE).
+   // and into the UART helpers' FSMs (which gate the main CPU st.SM/st.PC CE).
    // Reads therefore take 2 cycles: address valid in cycle N → comb decode in
    // cycle N → registered into r_mmio_read_data at edge N+1 → ready pulses in
    // cycle N+1 so the CPU FSM samples it.
@@ -874,8 +887,7 @@ module KlaussCPU (
       a pin can't have its Q net read by fabric — REQP-1884), but the
       wire-port + internal reg + continuous assign pattern remains as a
       neutral pass-through.  Same behaviour as the original output logic. */
-   logic [15:0] r_led;
-   assign o_led = r_led;
+   assign o_led = st.led;
 
    always_comb begin
       r_mmio_read_data_comb = 64'h0;
@@ -883,22 +895,22 @@ module KlaussCPU (
          12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
          12'h002: begin  // RGB LEDs
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {52'b0, r_RGB_LED_1};
-               16'h0008: r_mmio_read_data_comb = {52'b0, r_RGB_LED_2};
+               16'h0000: r_mmio_read_data_comb = {52'b0, st.RGB_LED_1};
+               16'h0008: r_mmio_read_data_comb = {52'b0, st.RGB_LED_2};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h003: begin  // 7-segment display (raw padded values)
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {32'b0, r_seven_seg_value2};
-               16'h0008: r_mmio_read_data_comb = {32'b0, r_seven_seg_value1};
-               16'h0010: r_mmio_read_data_comb = {r_seven_seg_value1, r_seven_seg_value2};
+               16'h0000: r_mmio_read_data_comb = {32'b0, st.seven_seg_value2};
+               16'h0008: r_mmio_read_data_comb = {32'b0, st.seven_seg_value1};
+               16'h0010: r_mmio_read_data_comb = {st.seven_seg_value1, st.seven_seg_value2};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h004: begin  // LEDs (RW) and switches (RO)
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {48'b0, r_led};
+               16'h0000: r_mmio_read_data_comb = {48'b0, st.led};
                16'h0008: r_mmio_read_data_comb = {48'b0, i_switch};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
@@ -924,7 +936,7 @@ module KlaussCPU (
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {60'b0, r_int_mask};
+               16'h0000: r_mmio_read_data_comb = {60'b0, st.int_mask};
                16'h0008: r_mmio_read_data_comb = {62'b0, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
@@ -970,7 +982,7 @@ module KlaussCPU (
    // Pipeline FF on the MMIO read return path. The FF on r_mmio_read_data
    // breaks the path from peripheral RAMs/regs (notably the SD sector buffer)
    // through bus_splitter and into uart_send_msg/uart_rx, which gate the
-   // main CPU r_SM/r_PC clock enables. r_mmio_read_dv_d generates the
+   // main CPU st.SM/st.PC clock enables. r_mmio_read_dv_d generates the
    // 1-cycle-delayed ready pulse so the CPU samples r_mmio_read_data on the
    // cycle after the read strobe.
    always_ff @(posedge i_Clk) begin
@@ -1174,13 +1186,13 @@ module KlaussCPU (
    );
 
    // Write to FIFO only when the byte is not consumed by the break/command
-   // handler (!r_break_received) or the program loader (r_SM != LOADING_BYTE).
+   // handler (!r_break_received) or the program loader (st.SM != LOADING_BYTE).
    uart_rx_fifo uart_rx_fifo1 (
        .i_Clk        (i_Clk),
        .i_Reset      (w_reset_H),
-       .i_Write_En   (w_uart_rx_DV & !r_break_received & (r_SM != LOADING_BYTE)),
+       .i_Write_En   (w_uart_rx_DV & !r_break_received & (st.SM != LOADING_BYTE)),
        .i_Write_Byte (w_uart_rx_value),
-       .i_Read_En    (r_rx_fifo_read),
+       .i_Read_En    (st.rx_fifo_read),
        .o_Peek_Byte  (w_rx_fifo_byte),
        .o_Empty      (w_rx_fifo_empty),
        .o_Full       (w_rx_fifo_full),
@@ -1191,8 +1203,8 @@ module KlaussCPU (
    Seven_seg_LED_Display_Controller Seven_seg_LED_Display_Controller1 (
        .i_sysclk(i_Clk),
        .i_reset(w_reset_H),
-       .i_displayed_number1(r_seven_seg_value1),  // Number to display
-       .i_displayed_number2(r_seven_seg_value2),  // Number to display
+       .i_displayed_number1(st.seven_seg_value1),  // Number to display
+       .i_displayed_number2(st.seven_seg_value2),  // Number to display
        .o_Anode_Activate(o_Anode_Activate),
        .o_LED_cathode(o_LED_cathode)
    );
@@ -1218,7 +1230,7 @@ module KlaussCPU (
    /*
 rams_sp_nc rams_sp_nc1 (
                .i_clk(i_Clk),
-               .i_opcode_read_addr(r_PC),
+               .i_opcode_read_addr(st.PC),
                .i_mem_read_addr(r_mem_read_addr),
                .o_dout_opcode(w_opcode),
                .o_dout_mem(w_mem),
@@ -1231,15 +1243,15 @@ rams_sp_nc rams_sp_nc1 (
  */
    integer i;
    initial begin
-      r_flags.sign <= 0;
-      r_flags.less <= 0;
-      r_flags.ult <= 0;
-      r_div.busy <= 0;
-      r_div.op <= DIV_OP_NONE;
-      r_div.counter <= 0;
+      st.flags.sign <= 0;
+      st.flags.less <= 0;
+      st.flags.ult <= 0;
+      st.div.busy <= 0;
+      st.div.op <= DIV_OP_NONE;
+      st.div.counter <= 0;
        for (i = 0; i < 16; i = i + 1)
        r_register[i] = 64'b0;
-      r_mul_is_immediate = 0;
+      st.mul_is_immediate = 0;
    end
    
    assign w_opcode = r_opcode_mem;
@@ -1247,12 +1259,12 @@ rams_sp_nc rams_sp_nc1 (
    assign w_var2   = r_var2_mem;
    
 
-   // Stack module removed — stack now uses DDR2 RAM via r_SP register
+   // Stack module removed — stack now uses DDR2 RAM via st.SP register
 
    RGB_LED RGB_LED (
        .i_sysclk(i_Clk),
-       .LED1(r_RGB_LED_1),
-       .LED2(r_RGB_LED_2),
+       .LED1(st.RGB_LED_1),
+       .LED2(st.RGB_LED_2),
        .o_LED_RGB_1(o_LED_RGB_1),
        .o_LED_RGB_2(o_LED_RGB_2)
    );
@@ -1261,14 +1273,14 @@ rams_sp_nc rams_sp_nc1 (
    /*ila_0  myila(.clk(i_Clk),
              .probe0(w_opcode),
              .probe1(0),
-             .probe2(r_PC),
-             .probe3(r_SM),
+             .probe2(st.PC),
+             .probe3(st.SM),
              .probe4(r_var1_mem),
              .probe5(0),
              .probe6(0),
              .probe7(0),
-             .probe8(r_mem_read_DV),
-             .probe9(r_mem_addr),
+             .probe8(st.mem_read_DV),
+             .probe9(st.mem_addr),
              .probe10(w_mem_ready),
              .probe11(w_var1),
              .probe12(w_mem_read_data),
@@ -1294,57 +1306,57 @@ rams_sp_nc rams_sp_nc1 (
    initial begin
       o_TX_LCD_Count = 4'd1;
       o_TX_LCD_Byte = 8'b0;
-      r_SM = NO_PROGRAM;
+      st.SM = NO_PROGRAM;
       r_boot_active = 1'b1;
       r_boot_phase = 3'd0;
       r_boot_dw_addr = 15'd0;
-      r_timeout_counter = 0;
+      st.timeout_counter = 0;
       o_LCD_reset_n = 1'b0;
-      r_PC = 32'h0;
-      r_flags.zero = 0;
-      r_flags.equal = 0;
-      r_flags.carry = 0;
-      r_flags.overflow = 0;
-      r_error_code = 8'h0;
-      r_timeout_counter = 32'b0;
-      r_seven_seg_value1 = 32'h20_10_00_07;
-      r_seven_seg_value2 = 32'h21_21_21_21;
-      r_led <= 16'h0;
+      st.PC = 32'h0;
+      st.flags.zero = 0;
+      st.flags.equal = 0;
+      st.flags.carry = 0;
+      st.flags.overflow = 0;
+      st.error_code = 8'h0;
+      st.timeout_counter = 32'b0;
+      st.seven_seg_value1 = 32'h20_10_00_07;
+      st.seven_seg_value2 = 32'h21_21_21_21;
+      st.led <= 16'h0;
       rx_count = 8'b0;
       o_ram_write_addr = 32'h0;
       r_ram_next_write_addr = 32'h0;
-      r_SP = 32'h800_0000;          // empty-descending stack, top of 128 MiB byte space
+      st.SP = 32'h800_0000;          // empty-descending stack, top of 128 MiB byte space
       r_int_push_wait = 1'b0;
       r_msg_send_DV <= 1'b0;
       r_hcf_message_sent <= 1'b0;
-      r_RGB_LED_1 = 12'h000;
-      r_RGB_LED_2 = 12'h000;
-      r_timing_start <= 0;
+      st.RGB_LED_1 = 12'h000;
+      st.RGB_LED_2 = 12'h000;
+      st.timing_start <= 0;
       r_timer_interrupt_counter <= 0;
       r_timer_interrupt_counter_sec <= 0;
-      r_int_mask <= 4'h0;            // all sources masked at power-up
+      st.int_mask <= 4'h0;            // all sources masked at power-up
       r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
       r_clock_ms <= 64'h0;
       r_clock_ms_div <= 17'h0;
-      r_mem_write_DV <= 0;
-      r_mem_read_DV <= 0;
-      r_mem_byte_en <= 8'hFF;
+      st.mem_write_DV <= 0;
+      st.mem_read_DV <= 0;
+      st.mem_byte_en <= 8'hFF;
       r_msg = 256'b0;
       r_boot_flash = 0;
       r_debug_flag = 0;
       r_debug_step_flag = 0;
       r_debug_step_run = 0;
       r_break_received = 0;
-      r_wb.set_zero = 0;
-      r_wb.pending        = 0;
-      r_alu_pipe_value    = 64'b0;
-      r_alu_pipe_carry    = 1'b0;
-      r_alu_pipe_overflow = 1'b0;
-      r_alu_pipe_equal    = 1'b0;
-      r_alu_pipe_less     = 1'b0;
-      r_alu_pipe_ult      = 1'b0;
-      r_alu_pipe_mode     = 1'b0;
-      r_rx_fifo_read  = 0;
+      st.wb.set_zero = 0;
+      st.wb.pending        = 0;
+      st.alu_pipe_value    = 64'b0;
+      st.alu_pipe_carry    = 1'b0;
+      st.alu_pipe_overflow = 1'b0;
+      st.alu_pipe_equal    = 1'b0;
+      st.alu_pipe_less     = 1'b0;
+      st.alu_pipe_ult      = 1'b0;
+      st.alu_pipe_mode     = 1'b0;
+      st.rx_fifo_read  = 0;
       r_break_active  = 0;
       r_break_counter = 0;
       r_var1_prefetched = 0;
@@ -1383,13 +1395,13 @@ rams_sp_nc rams_sp_nc1 (
    always_ff @(posedge i_Clk) begin
       if (w_reset_H) begin
 
-         r_SM <= NO_PROGRAM;
-         r_SP <= 32'h800_0000;
+         st.SM <= NO_PROGRAM;
+         st.SP <= 32'h800_0000;
          r_boot_active   <= 1'b1;   // arm the resident boot-ROM copy
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
          r_int_push_wait <= 1'b0;
-         r_wb.pending    <= 1'b0;
+         st.wb.pending    <= 1'b0;
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_register[i] <= 64'b0;
@@ -1417,17 +1429,17 @@ rams_sp_nc rams_sp_nc1 (
          r_break_received <= 1'b0;  // consume the break — one command per break
          case (w_uart_rx_value)
             8'h53: begin // 'S' — load start
-               r_SM <= LOADING_BYTE;
+               st.SM <= LOADING_BYTE;
                r_load_byte_counter <= 0;
                o_ram_write_addr <= 32'h0;
                r_ram_next_write_addr <= 32'h0;
                r_checksum <= 16'h0;
                r_old_checksum <= 16'h0;
-               r_RGB_LED_1 <= 12'h0;
-               r_RGB_LED_2 <= 12'h0;
-               r_led <= 16'h0;
-               r_mem_write_DV <= 1'b0;
-               r_mem_read_DV <= 1'b0;
+               st.RGB_LED_1 <= 12'h0;
+               st.RGB_LED_2 <= 12'h0;
+               st.led <= 16'h0;
+               st.mem_write_DV <= 1'b0;
+               st.mem_read_DV <= 1'b0;
             end
             8'h47: r_debug_flag      <= 1;  // 'G' — debug on
             8'h67: r_debug_flag      <= 0;  // 'g' — debug off
@@ -1438,7 +1450,7 @@ rams_sp_nc rams_sp_nc1 (
          endcase
       end else begin
          r_msg_send_DV  <= 1'b0;
-         r_rx_fifo_read <= 1'b0;
+         st.rx_fifo_read <= 1'b0;
          r_perf_br_valid <= 1'b0;  // 1-cycle strobe; jump tasks re-assert it
          r_fastpath_fired <= 1'b0; // default; the fast-path dispatch below asserts it
 
@@ -1447,9 +1459,9 @@ rams_sp_nc rams_sp_nc1 (
          // instruction's sequential successor, set at the dispatch below /
          // OPCODE_FETCH2). Buffer-hit-only — no cache request — so it never
          // contends for the memory port; the !r_mem_*_DV guards exclude load/store
-         // and store cycles. The execute-tail handoff then pre-loads r_reg_1/2 from
+         // and store cycles. The execute-tail handoff then pre-loads st.reg_1/2 from
          // this latch so the fast-path dispatch can skip the FETCH2 bubble.
-         if (w_exec_tail && !r_ir_valid && !r_mem_read_DV && !r_mem_write_DV
+         if (w_exec_tail && !r_ir_valid && !st.mem_read_DV && !st.mem_write_DV
              && w_ifb_fpc_hit) begin
             r_ir_pc      <= r_FPC;
             r_ir_opcode  <= r_FPC[2] ? w_ifb_fpc_data[63:32] : w_ifb_fpc_data[31:0];
@@ -1472,17 +1484,17 @@ rams_sp_nc rams_sp_nc1 (
          // drops it so the next fetch re-reads the modified bytes (self-
          // modifying code / Zephyr LLEXT loader). MMIO stores (top nibble F)
          // can't alias code, so they're excluded.
-         if (r_mem_write_DV && (r_mem_addr[31:28] != 4'hF)) begin
-            if (r_ifb_dwval[0] && (r_ifb_dwaddr[0] == r_mem_addr[31:3]))
+         if (st.mem_write_DV && (st.mem_addr[31:28] != 4'hF)) begin
+            if (r_ifb_dwval[0] && (r_ifb_dwaddr[0] == st.mem_addr[31:3]))
                r_ifb_dwval[0] <= 1'b0;
-            if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == r_mem_addr[31:3]))
+            if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == st.mem_addr[31:3]))
                r_ifb_dwval[1] <= 1'b0;
             // Self-modifying-code poison: a store into the latched instruction's
             // dword (or the next dword, where a spilled var1 lives) invalidates the
             // prefetched IR so stale code is never consumed (same discipline as the
             // instruction buffer above).
-            if (r_ir_valid && ((r_ir_pc[31:3] == r_mem_addr[31:3]) ||
-                               (r_ir_pc[31:3] + 1'b1 == r_mem_addr[31:3]))) begin
+            if (r_ir_valid && ((r_ir_pc[31:3] == st.mem_addr[31:3]) ||
+                               (r_ir_pc[31:3] + 1'b1 == st.mem_addr[31:3]))) begin
                r_ir_valid      <= 1'b0;
                r_ir_presettled <= 1'b0;
             end
@@ -1503,7 +1515,7 @@ rams_sp_nc rams_sp_nc1 (
 
          //=====================================================================
          // MMIO write handler — fires when bus_splitter routes a CPU store
-         // (LD/ST opcode → r_mem_write_DV) to an MMIO address (top nibble 'F).
+         // (LD/ST opcode → st.mem_write_DV) to an MMIO address (top nibble 'F).
          // Peripheral state regs are touched here AND by the legacy opcode
          // tasks (e.g. t_led_rgb1_value, t_7_seg1_reg). Both paths converge
          // on the same registers — no double-driver conflict because they
@@ -1521,22 +1533,22 @@ rams_sp_nc rams_sp_nc1 (
             case (w_mmio_addr[27:16])
                12'h002: begin  // RGB LEDs
                   case (w_mmio_addr[15:0])
-                     16'h0000: r_RGB_LED_1 <= w_mmio_write_data[11:0];
-                     16'h0008: r_RGB_LED_2 <= w_mmio_write_data[11:0];
+                     16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
+                     16'h0008: st.RGB_LED_2 <= w_mmio_write_data[11:0];
                      default: ;
                   endcase
                end
                12'h003: begin  // 7-segment display
                   case (w_mmio_addr[15:0])
                      // SEG_LOW: 4 hex digits → lower display (value2)
-                     16'h0000: r_seven_seg_value2 <= {
+                     16'h0000: st.seven_seg_value2 <= {
                         4'h0, w_mmio_write_data[15:12],
                         4'h0, w_mmio_write_data[11:8],
                         4'h0, w_mmio_write_data[7:4],
                         4'h0, w_mmio_write_data[3:0]
                      };
                      // SEG_HIGH: 4 hex digits → upper display (value1)
-                     16'h0008: r_seven_seg_value1 <= {
+                     16'h0008: st.seven_seg_value1 <= {
                         4'h0, w_mmio_write_data[15:12],
                         4'h0, w_mmio_write_data[11:8],
                         4'h0, w_mmio_write_data[7:4],
@@ -1544,13 +1556,13 @@ rams_sp_nc rams_sp_nc1 (
                      };
                      // SEG_ALL: 8 hex digits across both displays
                      16'h0010: begin
-                        r_seven_seg_value1 <= {
+                        st.seven_seg_value1 <= {
                            4'h0, w_mmio_write_data[31:28],
                            4'h0, w_mmio_write_data[27:24],
                            4'h0, w_mmio_write_data[23:20],
                            4'h0, w_mmio_write_data[19:16]
                         };
-                        r_seven_seg_value2 <= {
+                        st.seven_seg_value2 <= {
                            4'h0, w_mmio_write_data[15:12],
                            4'h0, w_mmio_write_data[11:8],
                            4'h0, w_mmio_write_data[7:4],
@@ -1559,21 +1571,21 @@ rams_sp_nc rams_sp_nc1 (
                      end
                      // SEG_BLANK: any write blanks both displays
                      16'h0018: begin
-                        r_seven_seg_value1 <= 32'h22222222;
-                        r_seven_seg_value2 <= 32'h22222222;
+                        st.seven_seg_value1 <= 32'h22222222;
+                        st.seven_seg_value2 <= 32'h22222222;
                      end
                      default: ;
                   endcase
                end
                12'h004: begin  // 16-bit LED bar
                   case (w_mmio_addr[15:0])
-                     16'h0000: r_led <= w_mmio_write_data[15:0];
+                     16'h0000: st.led <= w_mmio_write_data[15:0];
                      default: ;
                   endcase
                end
                12'h00F: begin  // Interrupt controller / timer
                   case (w_mmio_addr[15:0])
-                     16'h0000: r_int_mask           <= w_mmio_write_data[3:0];
+                     16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
                      // 16'h0008 (INT_PENDING) is read-only; writes ignored
                      16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
                      16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
@@ -1591,16 +1603,16 @@ rams_sp_nc rams_sp_nc1 (
             endcase
          end
 
-         case (r_SM)
+         case (st.SM)
             NO_PROGRAM: begin
-               r_seven_seg_value1 <= 32'h22222222;
-               r_seven_seg_value2 <= 32'h22222222;
+               st.seven_seg_value1 <= 32'h22222222;
+               st.seven_seg_value2 <= 32'h22222222;
 
                if (r_boot_active) begin
                   // ---- Resident boot-ROM → DDR copy (sub-FSM in r_boot_phase) ----
                   // Marker on the upper display so a stuck copy is distinguishable
                   // from a blank idle board ("b00t").
-                  r_seven_seg_value1 <= 32'h0B000704;
+                  st.seven_seg_value1 <= 32'h0B000704;
                   case (r_boot_phase)
                      3'd0: begin
                         // Wait for DDR calibration, then present word 0.
@@ -1626,15 +1638,15 @@ rams_sp_nc rams_sp_nc1 (
                      end
                      3'd3: begin
                         // Issue the full 64-bit DDR write of this doubleword.
-                        r_mem_addr       <= {14'd0, r_boot_dw_addr, 3'b0};
-                        r_mem_write_data <= w_boot_dword;
-                        r_mem_byte_en    <= 8'hFF;
-                        r_mem_write_DV   <= 1'b1;
+                        st.mem_addr       <= {14'd0, r_boot_dw_addr, 3'b0};
+                        st.mem_write_data <= w_boot_dword;
+                        st.mem_byte_en    <= 8'hFF;
+                        st.mem_write_DV   <= 1'b1;
                         r_boot_phase     <= 3'd4;
                      end
                      3'd4: begin
                         if (w_mem_ready) begin
-                           r_mem_write_DV <= 1'b0;
+                           st.mem_write_DV <= 1'b0;
                            if (r_boot_dw_addr == r_boot_len_dw - 1'b1) begin
                               // Hand off to the normal run path.  Equal checksums
                               // bypass LOAD_COMPLETE's verify; entry = 0x20.
@@ -1642,8 +1654,8 @@ rams_sp_nc rams_sp_nc1 (
                               r_PC_requested  <= 32'h0000_0020;
                               r_calc_checksum <= 16'h0;
                               r_rec_checksum  <= 16'h0;
-                              r_SP            <= 32'h800_0000;
-                              r_SM            <= LOAD_COMPLETE;
+                              st.SP            <= 32'h800_0000;
+                              st.SM            <= LOAD_COMPLETE;
                            end else begin
                               r_boot_dw_addr <= r_boot_dw_addr + 1'b1;
                               r_boot_phase   <= 3'd2;  // ROM latency before next
@@ -1657,14 +1669,14 @@ rams_sp_nc rams_sp_nc1 (
                   // load — alternate the two RGB LEDs once per second.
                   case (r_boot_flash)
                      0: begin
-                        r_RGB_LED_1  <= 12'h010;
-                        r_RGB_LED_2  <= 12'h100;
+                        st.RGB_LED_1  <= 12'h010;
+                        st.RGB_LED_2  <= 12'h100;
                         //o_led[0]<=1;
                         r_boot_flash <= 1;
                      end
                      default: begin
-                        r_RGB_LED_1  <= 12'h100;
-                        r_RGB_LED_2  <= 12'h010;
+                        st.RGB_LED_1  <= 12'h100;
+                        st.RGB_LED_2  <= 12'h010;
                         //o_led[0]<=0;
                         r_boot_flash <= 0;
                      end
@@ -1675,12 +1687,12 @@ rams_sp_nc rams_sp_nc1 (
             LOADING_BYTE: begin
 
                if (w_mem_ready) begin
-                  r_mem_write_DV <= 1'b0;
+                  st.mem_write_DV <= 1'b0;
                end
-               r_SP <= 32'h800_0000;  // reset stack pointer during program load
+               st.SP <= 32'h800_0000;  // reset stack pointer during program load
                r_int_push_wait <= 1'b0;
 
-               r_seven_seg_value1 <= {
+               st.seven_seg_value1 <= {
                   8'h24,
                   4'h0,
                   r_ram_next_write_addr[27:24],
@@ -1689,7 +1701,7 @@ rams_sp_nc rams_sp_nc1 (
                   4'h0,
                   r_ram_next_write_addr[19:16]
                };
-               r_seven_seg_value2 <= {
+               st.seven_seg_value2 <= {
                   4'h0,
                   r_ram_next_write_addr[15:12],
                   4'h0,
@@ -1707,7 +1719,7 @@ rams_sp_nc rams_sp_nc1 (
                      8'h58: // End char X
                         begin
                         if (r_load_byte_counter == 0) begin
-                           r_SM <= LOAD_COMPLETE;
+                           st.SM <= LOAD_COMPLETE;
                            r_calc_checksum<=r_old_checksum+o_ram_write_addr[17:2]*2+o_ram_write_value[31:16]; //adding number of words to checksum (addr>>2=word count)
                            r_rec_checksum <= o_ram_write_value[15:0];
                            o_ram_write_value <= 32'h0;
@@ -1715,8 +1727,8 @@ rams_sp_nc rams_sp_nc1 (
                         end // (r_load_byte_counter==0)
                             else
                             begin
-                           r_SM <= HCF_1;  // Halt and catch fire error
-                           r_error_code <= ERR_DATA_LOAD;
+                           st.SM <= HCF_1;  // Halt and catch fire error
+                           st.error_code <= ERR_DATA_LOAD;
                         end  // else (r_load_byte_counter==7)
                      end  // case 8'h58
                      8'h5A: // Start data flag Z
@@ -1743,28 +1755,28 @@ rams_sp_nc rams_sp_nc1 (
                         endcase  //r_load_byte_counter
                         if (r_load_byte_counter == 7) begin
                            r_load_byte_counter <= 0;
-                           case (r_RGB_LED_1)
-                              12'h050: r_RGB_LED_1 <= 12'h005;
-                              default: r_RGB_LED_1 <= 12'h050;
+                           case (st.RGB_LED_1)
+                              12'h050: st.RGB_LED_1 <= 12'h005;
+                              default: st.RGB_LED_1 <= 12'h050;
                            endcase
                            o_ram_write_addr <= r_ram_next_write_addr;
                            r_ram_next_write_addr <= r_ram_next_write_addr + 4;  // byte addr: 4 bytes per word
                            if (r_ram_next_write_addr>32'h7FF_FFFC) // Nexys has 128 MiB DDR2, last valid word at byte addr 0x7FF_FFFC
                                 begin
-                              r_SM <= HCF_1;  // Halt and catch fire error
-                              r_error_code <= ERR_OVERFLOW;
+                              st.SM <= HCF_1;  // Halt and catch fire error
+                              st.error_code <= ERR_OVERFLOW;
                            end
-                           r_mem_addr <= r_ram_next_write_addr;
+                           st.mem_addr <= r_ram_next_write_addr;
                            // Place 32-bit word in the correct half of the 64-bit doubleword.
                            // Little-endian layout: addr[2]==0 → LOW half [31:0]; addr[2]==1 → HIGH half [63:32].
                            if (r_ram_next_write_addr[2] == 1'b0) begin
-                              r_mem_write_data <= {32'b0, o_ram_write_value};
-                              r_mem_byte_en    <= 8'h0F;
+                              st.mem_write_data <= {32'b0, o_ram_write_value};
+                              st.mem_byte_en    <= 8'h0F;
                            end else begin
-                              r_mem_write_data <= {o_ram_write_value, 32'b0};
-                              r_mem_byte_en    <= 8'hF0;
+                              st.mem_write_data <= {o_ram_write_value, 32'b0};
+                              st.mem_byte_en    <= 8'hF0;
                            end
-                           r_mem_write_DV <= 1'b1;
+                           st.mem_write_DV <= 1'b1;
 
                            r_old_checksum <= r_checksum;
                            r_checksum <= r_checksum + o_ram_write_value[31:16] + o_ram_write_value[15:0];
@@ -1779,51 +1791,51 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             LOAD_COMPLETE: begin
-               r_seven_seg_value1 <= 32'h22222222;  // Blank 7 seg
+               st.seven_seg_value1 <= 32'h22222222;  // Blank 7 seg
                if (r_calc_checksum==r_rec_checksum) // Last value received should be checksum
                 begin  // Reset all flags and jump to first instruction
                   o_LCD_reset_n <= 1'b0;
-                  r_led <= 16'h0;
+                  st.led <= 16'h0;
                   o_ram_write_addr <= 32'h0;
                   o_TX_LCD_Byte <= 8'b0;
                   o_TX_LCD_Count <= 4'd1;
-                  r_flags.carry <= 1'b0;
+                  st.flags.carry <= 1'b0;
                   r_debug_flag <= 1'b0;
                   r_debug_step_flag <= 1'b0;
                   r_debug_step_run <= 1'b0;
-                  r_flags.equal <= 1'b0;
-                  r_error_code <= 8'h0;
+                  st.flags.equal <= 1'b0;
+                  st.error_code <= 8'h0;
                   r_hcf_message_sent <= 1'b0;
                   r_interrupt_table[0] <= 32'h0;  // clear all 4 handler vectors;
                   r_interrupt_table[1] <= 32'h0;  // a 0 vector disables that source
                   r_interrupt_table[2] <= 32'h0;
                   r_interrupt_table[3] <= 32'h0;
                   r_msg_send_DV <= 1'b0;
-                  r_flags.overflow <= 1'b0;
-                  r_PC <= r_PC_requested;
-                  r_mem_byte_en <= 8'hFF;  // restore full-doubleword default after loader partial writes
+                  st.flags.overflow <= 1'b0;
+                  st.PC <= r_PC_requested;
+                  st.mem_byte_en <= 8'hFF;  // restore full-doubleword default after loader partial writes
                   r_ram_next_write_addr <= 32'h0;
-                  r_RGB_LED_1 <= 12'h000;
-                  r_RGB_LED_2 <= 12'h000;
-                  r_seven_seg_value1 <= 32'h22_22_22_22;
-                  r_seven_seg_value2 <= 32'h22_22_22_22;
-                  r_SM <= START_WAIT;
-                  r_timeout_counter <= 0;
+                  st.RGB_LED_1 <= 12'h000;
+                  st.RGB_LED_2 <= 12'h000;
+                  st.seven_seg_value1 <= 32'h22_22_22_22;
+                  st.seven_seg_value2 <= 32'h22_22_22_22;
+                  st.SM <= START_WAIT;
+                  st.timeout_counter <= 0;
                   r_timer_interrupt <= 0;
                   r_timer_interrupt_counter <= 0;
-                  r_int_mask <= 4'h0;            // all sources masked until program enables
+                  st.int_mask <= 4'h0;            // all sources masked until program enables
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
                   r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
                   r_FPC <= r_PC_requested;       // prefetch pointer starts at the entry point
                   r_ir_valid <= 1'b0;            // no prefetched instruction yet
                   r_ir_presettled <= 1'b0;
-                  r_timing_start <= 0;
-                  r_flags.zero <= 0;
+                  st.timing_start <= 0;
+                  st.flags.zero <= 0;
                   t_tx_message(8'd1);  // Load OK message
                end else begin
-                  r_SM <= HCF_1;  // Halt and catch fire error
-                  r_error_code <= ERR_CHECKSUM_LOAD;
+                  st.SM <= HCF_1;  // Halt and catch fire error
+                  st.error_code <= ERR_CHECKSUM_LOAD;
                   t_tx_message(8'd2);  // Load error message
                end
             end
@@ -1832,13 +1844,13 @@ rams_sp_nc rams_sp_nc1 (
             START_WAIT: begin
                r_msg_send_DV <= 1'b0;
                if (r_start_wait_counter == 0) begin
-                  r_SM <= OPCODE_REQUEST;
-                  r_seven_seg_value1 <= 32'h22_22_22_22;
-                  r_seven_seg_value2 <= 32'h22_22_22_22;
+                  st.SM <= OPCODE_REQUEST;
+                  st.seven_seg_value1 <= 32'h22_22_22_22;
+                  st.seven_seg_value2 <= 32'h22_22_22_22;
                end else begin
                   r_start_wait_counter <= r_start_wait_counter - 1;
-                  r_seven_seg_value1 <= 32'h21_21_21_21;
-                  r_seven_seg_value2 <= 32'h21_21_21_21;
+                  st.seven_seg_value1 <= 32'h21_21_21_21;
+                  st.seven_seg_value2 <= 32'h21_21_21_21;
                end
             end
 
@@ -1846,119 +1858,119 @@ rams_sp_nc rams_sp_nc1 (
             UART_DELAY: begin
                r_msg_send_DV <= 1'b0;
                if (!w_sending_msg) begin
-                  r_SM <= OPCODE_REQUEST;
+                  st.SM <= OPCODE_REQUEST;
                end
 
             end
 
             OPCODE_REQUEST: begin
                r_msg_send_DV <= 1'b0;
-               r_extra_clock <= 2'b0;  // always reset — all instructions rely on this
+               st.extra_clock <= 2'b0;  // always reset — all instructions rely on this
                r_tx_str_state_mem <= 3'b0;  // reset string transmission state machine (TXSTRMEM)
                r_tx_str_state_reg <= 3'b0;  // reset string transmission state machine (TXSTRMEMR)
-               r_mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
+               st.mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
 
                // Execute-occupancy fusion: commit the previous
                // instruction's register writeback here, in parallel with the
                // fetch dispatch below. r_register and the dispatch's
-               // r_mem_addr/r_PC are disjoint resources, and the register read
+               // st.mem_addr/st.PC are disjoint resources, and the register read
                // ports are sampled at OPCODE_FETCH2 (after this write), so the
                // next instruction observes the result with no RAW hazard. This
                // removes the dedicated WRITEBACK cycle (~ -1 cyc/instr on the
                // writeback-producing op classes).
-               if (r_wb.pending) begin
-                  r_register[r_wb.rd] <= r_wb.value;
-                  if (r_wb.set_zero)
-                     r_flags.zero <= (r_wb.value == 64'b0);
-                  r_wb.set_zero <= 1'b0;
-                  r_wb.pending <= 1'b0;
+               if (st.wb.pending) begin
+                  r_register[st.wb.rd] <= st.wb.value;
+                  if (st.wb.set_zero)
+                     st.flags.zero <= (st.wb.value == 64'b0);
+                  st.wb.set_zero <= 1'b0;
+                  st.wb.pending <= 1'b0;
                end
 
                if (r_int_push_wait) begin
                   // Waiting for DDR2 to finish the timer-interrupt PC push
                   if (w_mem_ready) begin
-                     r_mem_write_DV  <= 1'b0;
+                     st.mem_write_DV  <= 1'b0;
                      r_int_push_wait <= 1'b0;
-                     r_mem_addr      <= r_PC;  // r_PC already set to interrupt target
-                     r_mem_read_DV   <= 1'b1;
-                     r_SM            <= OPCODE_FETCH;
+                     st.mem_addr      <= st.PC;  // st.PC already set to interrupt target
+                     st.mem_read_DV   <= 1'b1;
+                     st.SM            <= OPCODE_FETCH;
                   end
                end else if (w_irq_ready) begin
                   // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
                   // Slot layout (64-bit doubleword):
                   //   [63:43] = 0
-                  //   [42:39] = r_int_mask (per-source enables, restored by IRET)
+                  //   [42:39] = st.int_mask (per-source enables, restored by IRET)
                   //   [38]    = zero,    [37] = equal,  [36] = carry,
                   //   [35]    = overflow,[34] = sign,   [33] = less, [32] = ult
                   //   [31:0]  = PC (resume address)
-                  r_SP             <= r_SP - 8;
-                  r_mem_addr       <= r_SP - 32'd8;
+                  st.SP             <= st.SP - 8;
+                  st.mem_addr       <= st.SP - 32'd8;
                   // Zero flag pushed as it will be AFTER any deferred writeback
-                  // committing this same cycle (r_wb.pending block above), so the
+                  // committing this same cycle (st.wb.pending block above), so the
                   // saved interrupt context stays precise.
-                  r_mem_write_data <= {21'b0, r_int_mask,
-                                       ((r_wb.pending && r_wb.set_zero) ? (r_wb.value == 64'b0) : r_flags.zero),
-                                       r_flags.equal, r_flags.carry,
-                                       r_flags.overflow, r_flags.sign, r_flags.less, r_flags.ult,
-                                       r_PC};
-                  r_mem_byte_en    <= 8'hFF;
-                  r_mem_write_DV   <= 1'b1;
+                  st.mem_write_data <= {21'b0, st.int_mask,
+                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),
+                                       st.flags.equal, st.flags.carry,
+                                       st.flags.overflow, st.flags.sign, st.flags.less, st.flags.ult,
+                                       st.PC};
+                  st.mem_byte_en    <= 8'hFF;
+                  st.mem_write_DV   <= 1'b1;
                   // Source-selected dispatch (timer=0 priority, blitter=1). The
-                  // pushed mask above is the pre-dispatch r_int_mask, so IRET
+                  // pushed mask above is the pre-dispatch st.int_mask, so IRET
                   // re-enables this source. Timer pending is hardware-cleared
                   // here; the blitter is level/sticky and acked by the ISR
                   // (write STATUS.DONE W1C) before IRET.
                   if (w_irq_sel == 2'd0) r_timer_interrupt <= 1'b0;
-                  r_int_mask[w_irq_sel] <= 1'b0;  // mask this source while handler runs; IRET restores
-                  r_PC             <= r_interrupt_table[w_irq_sel];
+                  st.int_mask[w_irq_sel] <= 1'b0;  // mask this source while handler runs; IRET restores
+                  st.PC             <= r_interrupt_table[w_irq_sel];
                   r_int_push_wait  <= 1'b1;
                   r_ir_valid       <= 1'b0;   // discard the speculative fall-through
                   r_ir_presettled  <= 1'b0;   // (IRQ redirect; precise interrupts preserved)
                   // stay in OPCODE_REQUEST until push completes
-               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == r_PC) begin
+               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC) begin
                   // Fast-path dispatch: the prefetched IR was pre-settled into
-                  // r_reg_1/2 during the previous instruction's execute tail, so the
+                  // st.reg_1/2 during the previous instruction's execute tail, so the
                   // reg-file read ports are already valid — skip the OPCODE_FETCH2
                   // settle bubble and go straight to EXECUTE (saves 1 cyc/instr).
                   // Ordered AFTER w_irq_ready so a pending interrupt always wins.
                   r_opcode_mem      <= r_ir_opcode;
-                  r_reg_dst         <= r_ir_reg_dst;
+                  st.reg_dst         <= r_ir_reg_dst;
                   r_var1_mem        <= r_ir_var1;
                   r_var1_prefetched <= r_ir_var1_prefetched;
                   // Crash trace + retire counter: FETCH2 (their usual home) is skipped
                   // on this path, so the unique commit gate moves here.
-                  r_trace_buf[r_trace_idx] <= {r_PC, r_ir_opcode};
+                  r_trace_buf[r_trace_idx] <= {st.PC, r_ir_opcode};
                   r_trace_idx              <= r_trace_idx + 4'd1;
                   if (r_trace_idx == 4'd15) r_trace_full <= 1'b1;
                   r_instr_count <= r_instr_count + 32'd1;
-                  r_FPC <= r_PC + f_predecode_len(r_ir_opcode);  // next sequential prefetch
+                  r_FPC <= st.PC + f_predecode_len(r_ir_opcode);  // next sequential prefetch
                   r_fastpath_fired <= 1'b1;  // a retired instruction that skips FETCH2 (counts in r_perf_instr + r_perf_fastpath)
                   r_ir_valid      <= 1'b0;
                   r_ir_presettled <= 1'b0;
                   if (r_ir_var1_prefetched) begin
                      if (r_debug_flag && r_ir_opcode[31:12] != 20'h0000F)
-                        r_SM <= DEBUG_DATA;
+                        st.SM <= DEBUG_DATA;
                      else
-                        r_SM <= OPCODE_EXECUTE;
+                        st.SM <= OPCODE_EXECUTE;
                   end else begin
-                     r_SM          <= VAR1_FETCH;   // var1 not buffered — fetch it (also settles)
-                     r_mem_addr    <= (r_PC + 4);
-                     r_mem_read_DV <= 1'b1;
+                     st.SM          <= VAR1_FETCH;   // var1 not buffered — fetch it (also settles)
+                     st.mem_addr    <= (st.PC + 4);
+                     st.mem_read_DV <= 1'b1;
                   end
                end else if (w_ifb_op_hit) begin
                   // Instruction-buffer hit: serve the opcode now and skip the
                   // OPCODE_FETCH cache round-trip. var1 (PC+4) is prefetched
                   // from the buffer when available; otherwise OPCODE_FETCH2
                   // falls through to VAR1_FETCH exactly as on a non-prefetch.
-                  r_opcode_mem <= r_PC[2] ? w_ifb_op_dw[63:32] : w_ifb_op_dw[31:0];
+                  r_opcode_mem <= st.PC[2] ? w_ifb_op_dw[63:32] : w_ifb_op_dw[31:0];
                   // Latch register fields a cycle early — the opcode is available
                   // combinationally on an IFB hit, so the registered reg-file
                   // reads settle during OPCODE_FETCH2 and the VAR1_FETCH2 bubble
                   // is no longer needed (fetch sequencing 3 cycles -> 2).
-                  r_reg_1   <= r_PC[2] ? w_ifb_op_dw[39:36] : w_ifb_op_dw[7:4];
-                  r_reg_2   <= r_PC[2] ? w_ifb_op_dw[35:32] : w_ifb_op_dw[3:0];
-                  r_reg_dst <= r_PC[2] ? w_ifb_op_dw[43:40] : w_ifb_op_dw[11:8];
-                  if (r_PC[2] == 1'b0) begin
+                  st.reg_1   <= st.PC[2] ? w_ifb_op_dw[39:36] : w_ifb_op_dw[7:4];
+                  st.reg_2   <= st.PC[2] ? w_ifb_op_dw[35:32] : w_ifb_op_dw[3:0];
+                  st.reg_dst <= st.PC[2] ? w_ifb_op_dw[43:40] : w_ifb_op_dw[11:8];
+                  if (st.PC[2] == 1'b0) begin
                      r_var1_mem        <= w_ifb_op_dw[63:32];  // var1 shares this dw
                      r_var1_prefetched <= 1'b1;
                   end else if (w_ifb_v1_hit) begin
@@ -1969,13 +1981,13 @@ rams_sp_nc rams_sp_nc1 (
                   end
                   r_ir_valid      <= 1'b0;   // drop the prefetch (served from the buffer, not pre-settled)
                   r_ir_presettled <= 1'b0;
-                  r_SM <= OPCODE_FETCH2;
+                  st.SM <= OPCODE_FETCH2;
                end else begin
                   r_ir_valid      <= 1'b0;   // drop any stale prefetch on a cache-miss fetch
                   r_ir_presettled <= 1'b0;
-                  r_mem_addr    <= r_PC;
-                  r_mem_read_DV <= 1'b1;
-                  r_SM          <= OPCODE_FETCH;
+                  st.mem_addr    <= st.PC;
+                  st.mem_read_DV <= 1'b1;
+                  st.SM          <= OPCODE_FETCH;
                end
             end
 
@@ -1985,16 +1997,16 @@ rams_sp_nc rams_sp_nc1 (
                   // Little-endian layout:
                   //   [31:0]  = bytes at the doubleword-aligned base address  (PC[2]==0)
                   //   [63:32] = bytes at base+4                               (PC[2]==1)
-                  r_opcode_mem  <= r_PC[2] ? w_mem_read_data[63:32]
+                  r_opcode_mem  <= st.PC[2] ? w_mem_read_data[63:32]
                                            : w_mem_read_data[31:0];
                   // Latch register fields here (a cycle earlier than the old
                   // OPCODE_FETCH2) so the registered reg reads settle by the time
                   // OPCODE_FETCH2 hands off to OPCODE_EXECUTE — no VAR1_FETCH2.
-                  r_reg_1   <= r_PC[2] ? w_mem_read_data[39:36] : w_mem_read_data[7:4];
-                  r_reg_2   <= r_PC[2] ? w_mem_read_data[35:32] : w_mem_read_data[3:0];
-                  r_reg_dst <= r_PC[2] ? w_mem_read_data[43:40] : w_mem_read_data[11:8];
-                  r_mem_read_DV <= 1'b0;
-                  if (r_PC[2] == 0) begin
+                  st.reg_1   <= st.PC[2] ? w_mem_read_data[39:36] : w_mem_read_data[7:4];
+                  st.reg_2   <= st.PC[2] ? w_mem_read_data[35:32] : w_mem_read_data[3:0];
+                  st.reg_dst <= st.PC[2] ? w_mem_read_data[43:40] : w_mem_read_data[11:8];
+                  st.mem_read_DV <= 1'b0;
+                  if (st.PC[2] == 0) begin
                      // var1 (at PC+4) is in the HIGH half of the same doubleword — always here.
                      r_var1_mem        <= w_mem_read_data[63:32];
                      r_var1_prefetched <= 1'b1;
@@ -2010,16 +2022,16 @@ rams_sp_nc rams_sp_nc1 (
                   // requested doubleword (w_mem_read_data) and, when valid, the
                   // line companion (w_mem_read_data_next, addr bit 3 toggled).
                   r_ifb_dw[0]     <= w_mem_read_data;
-                  r_ifb_dwaddr[0] <= r_mem_addr[31:3];
+                  r_ifb_dwaddr[0] <= st.mem_addr[31:3];
                   r_ifb_dwval[0]  <= 1'b1;
                   if (w_mem_next_valid) begin
                      r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= {r_mem_addr[31:4], ~r_mem_addr[3]};
+                     r_ifb_dwaddr[1] <= {st.mem_addr[31:4], ~st.mem_addr[3]};
                      r_ifb_dwval[1]  <= 1'b1;
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;
                   end
-                  r_SM <= OPCODE_FETCH2;
+                  st.SM <= OPCODE_FETCH2;
                end  // if ready asserted, else will loop until ready
             end
 
@@ -2029,7 +2041,7 @@ rams_sp_nc rams_sp_nc1 (
                // committed for execution" gate (it precedes every path into
                // OPCODE_EXECUTE, including the debug-step and interrupt-handler
                // paths), so this gives one entry per executed instruction.
-               r_trace_buf[r_trace_idx] <= {r_PC, w_opcode};
+               r_trace_buf[r_trace_idx] <= {st.PC, w_opcode};
                r_trace_idx              <= r_trace_idx + 4'd1;
                if (r_trace_idx == 4'd15)
                   r_trace_full <= 1'b1;
@@ -2041,21 +2053,21 @@ rams_sp_nc rams_sp_nc1 (
                // successor (the fast path does this in OPCODE_REQUEST instead). The
                // predecode is proven exact, so r_FPC tracks the fall-through; a
                // control-flow redirect just makes the next dispatch recompute it.
-               r_FPC <= r_PC + f_predecode_len(w_opcode);
-               // Register fields (r_reg_1/2/dst) were latched a cycle earlier in
+               r_FPC <= st.PC + f_predecode_len(w_opcode);
+               // Register fields (st.reg_1/2/dst) were latched a cycle earlier in
                // OPCODE_REQUEST (IFB hit) or OPCODE_FETCH (miss), so r_reg_port_a/b
                // are already settling — the old VAR1_FETCH2 bubble is gone.
                if (r_var1_prefetched) begin
                   // var1 already in r_var1_mem — go straight to execute.
                   if (r_debug_flag && w_opcode[31:12] != 20'h0000F) begin
-                     r_SM <= DEBUG_DATA;
+                     st.SM <= DEBUG_DATA;
                   end else begin
-                     r_SM <= OPCODE_EXECUTE;
+                     st.SM <= OPCODE_EXECUTE;
                   end
                end else begin
-                  r_SM          <= VAR1_FETCH;
-                  r_mem_addr    <= (r_PC + 4);
-                  r_mem_read_DV <= 1'b1;
+                  st.SM          <= VAR1_FETCH;
+                  st.mem_addr    <= (st.PC + 4);
+                  st.mem_read_DV <= 1'b1;
                end
             end
 
@@ -2073,25 +2085,25 @@ rams_sp_nc rams_sp_nc1 (
                   // returned here is the NEXT code line — exactly what the
                   // following fetch at PC+8 needs.  Without this refill that
                   // fetch pays a second full cache round-trip for data the CPU
-                  // just had in its hands.  r_mem_addr still holds PC+4 (set in
+                  // just had in its hands.  st.mem_addr still holds PC+4 (set in
                   // OPCODE_FETCH2), so the tagging matches OPCODE_FETCH's
                   // refill verbatim.
                   r_ifb_dw[0]     <= w_mem_read_data;
-                  r_ifb_dwaddr[0] <= r_mem_addr[31:3];
+                  r_ifb_dwaddr[0] <= st.mem_addr[31:3];
                   r_ifb_dwval[0]  <= 1'b1;
                   if (w_mem_next_valid) begin
                      r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= {r_mem_addr[31:4], ~r_mem_addr[3]};
+                     r_ifb_dwaddr[1] <= {st.mem_addr[31:4], ~st.mem_addr[3]};
                      r_ifb_dwval[1]  <= 1'b1;
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;
                   end
                   if (r_debug_flag&&w_opcode[31:12]!=20'h0000F) begin  // Ignore delay/NOP opcodes (0x0000_F???)
-                     r_SM <= DEBUG_DATA;
+                     st.SM <= DEBUG_DATA;
                   end else begin
-                     r_SM <= OPCODE_EXECUTE;
+                     st.SM <= OPCODE_EXECUTE;
                   end
-                  r_mem_read_DV <= 1'b0;
+                  st.mem_read_DV <= 1'b0;
 
                end  // if ready asserted, else will loop until ready
             end
@@ -2099,21 +2111,21 @@ rams_sp_nc rams_sp_nc1 (
 
             DEBUG_DATA: begin
                t_debug_message;
-               r_SM <= DEBUG_DATA2;
+               st.SM <= DEBUG_DATA2;
             end
 
             DEBUG_DATA2: begin
                r_msg_send_DV <= 1'b0;
-               r_SM <= DEBUG_DATA3;
+               st.SM <= DEBUG_DATA3;
             end
 
             DEBUG_DATA3: begin
                if (!w_sending_msg) begin
-                  r_SM <= OPCODE_EXECUTE;
+                  st.SM <= OPCODE_EXECUTE;
                   if (r_debug_step_flag == 1'b1) begin
-                     r_SM <= DEBUG_WAIT;
+                     st.SM <= DEBUG_WAIT;
                   end else begin
-                     r_SM <= OPCODE_EXECUTE;
+                     st.SM <= OPCODE_EXECUTE;
                   end
                end
             end
@@ -2121,7 +2133,7 @@ rams_sp_nc rams_sp_nc1 (
             DEBUG_WAIT: begin
                if (r_debug_step_run == 1'b1) begin
                   r_debug_step_run <= 1'b0;
-                  r_SM <= OPCODE_EXECUTE;
+                  st.SM <= OPCODE_EXECUTE;
                end
             end
 
@@ -2139,10 +2151,10 @@ rams_sp_nc rams_sp_nc1 (
                   r_hcf_dump_sub     <= 3'b000;
                   r_hcf_stack_loaded <= 1'b0;
                   r_break_counter    <= 12'd0;  // clean start for the post-dump UART break
-                  r_SM               <= HCF_DUMP;
+                  st.SM               <= HCF_DUMP;
                end else begin
-                  r_timeout_counter <= 0;
-                  r_SM              <= HCF_2;
+                  st.timeout_counter <= 0;
+                  st.SM              <= HCF_2;
                end
             end
 
@@ -2162,31 +2174,31 @@ rams_sp_nc rams_sp_nc1 (
                          && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4)
                          && !r_hcf_stack_loaded) begin
                            // Skip DDR2 reads past the top of the stack region
-                           // (r_SP+offset >= STACK_TOP).  Substitute an FFs
+                           // (st.SP+offset >= STACK_TOP).  Substitute an FFs
                            // sentinel and mark loaded so the next PREP emits
                            // the line directly.  Prevents OOB DDR2 access when
-                           // the stack is empty (r_SP at initial 0x0800_0000).
-                           if ((r_SP + ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3))
+                           // the stack is empty (st.SP at initial 0x0800_0000).
+                           if ((st.SP + ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3))
                                  >= STACK_TOP) begin
                               r_hcf_stack_data   <= 64'hFFFF_FFFF_FFFF_FFFF;
                               r_hcf_stack_loaded <= 1'b1;
                            end else begin
-                              r_mem_addr     <= r_SP +
+                              st.mem_addr     <= st.SP +
                                  ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3);
-                              r_mem_read_DV  <= 1'b1;
+                              st.mem_read_DV  <= 1'b1;
                               r_hcf_dump_sub <= 3'b011;
                            end
                         end else if (r_hcf_dump_phase == DUMP_V1H && !r_hcf_stack_loaded) begin
                            // Read DRAM at PC+8 to recover the hi32 of a 64-bit
                            // immediate (V64 encoding: lo32 at PC+4, hi32 at PC+8).
-                           r_mem_addr     <= r_PC + 32'd8;
-                           r_mem_read_DV  <= 1'b1;
+                           st.mem_addr     <= st.PC + 32'd8;
+                           st.mem_read_DV  <= 1'b1;
                            r_hcf_dump_sub <= 3'b011;
                         end else if (r_hcf_dump_phase == DUMP_OPCM && !r_hcf_stack_loaded) begin
                            // Re-read DRAM at PC.  If this disagrees with OPC,
                            // the opcode cache is incoherent with DRAM.
-                           r_mem_addr     <= r_PC;
-                           r_mem_read_DV  <= 1'b1;
+                           st.mem_addr     <= st.PC;
+                           st.mem_read_DV  <= 1'b1;
                            r_hcf_dump_sub <= 3'b011;
                         end else if (r_hcf_dump_phase >= DUMP_REG_BASE
                                   && r_hcf_dump_phase <  DUMP_STACK_BASE
@@ -2277,7 +2289,7 @@ rams_sp_nc rams_sp_nc1 (
                      if (w_mem_ready) begin
                         r_hcf_stack_data   <= w_mem_read_data;
                         r_hcf_stack_loaded <= 1'b1;
-                        r_mem_read_DV      <= 1'b0;
+                        st.mem_read_DV      <= 1'b0;
                         r_hcf_dump_sub     <= 3'b000;
                      end
                   end
@@ -2315,7 +2327,7 @@ rams_sp_nc rams_sp_nc1 (
                         r_break_counter <= r_break_counter - 1;
                         if (r_break_counter == 12'd1) begin
                            r_break_active    <= 1'b0;
-                           r_timeout_counter <= 0;
+                           st.timeout_counter <= 0;
                            r_hcf_dump_sub    <= 3'b110;
                         end
                      end
@@ -2326,11 +2338,11 @@ rams_sp_nc rams_sp_nc1 (
                   // read whatever was on the 7-seg at the moment of the fault
                   // before HCF_2 overwrites it with the error display.
                   3'b110: begin
-                     if (r_timeout_counter >= 45'd300_000_000) begin
-                        r_timeout_counter <= 0;
-                        r_SM              <= HCF_2;
+                     if (st.timeout_counter >= 45'd300_000_000) begin
+                        st.timeout_counter <= 0;
+                        st.SM              <= HCF_2;
                      end else begin
-                        r_timeout_counter <= r_timeout_counter + 1;
+                        st.timeout_counter <= st.timeout_counter + 1;
                      end
                   end
 
@@ -2339,32 +2351,32 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             HCF_2: begin
-               r_seven_seg_value1[31:8] <= 24'h230C0F;
-               r_seven_seg_value1[7:0] <= r_error_code;
-               r_seven_seg_value2 <= 32'h22_22_22_22;
-               r_timeout_max <= 32'd100_000_000;
-               if (r_timeout_counter >= r_timeout_max) begin
-                  r_timeout_counter <= 0;
-                  r_SM <= HCF_3;
-               end  // if(r_timeout_counter>=DELAY_TIME)
+               st.seven_seg_value1[31:8] <= 24'h230C0F;
+               st.seven_seg_value1[7:0] <= st.error_code;
+               st.seven_seg_value2 <= 32'h22_22_22_22;
+               st.timeout_max <= 32'd100_000_000;
+               if (st.timeout_counter >= st.timeout_max) begin
+                  st.timeout_counter <= 0;
+                  st.SM <= HCF_3;
+               end  // if(st.timeout_counter>=DELAY_TIME)
                 else
                 begin
-                  r_timeout_counter <= r_timeout_counter + 1;
-               end  // else if(r_timeout_counter>=DELAY_TIME)
+                  st.timeout_counter <= st.timeout_counter + 1;
+               end  // else if(st.timeout_counter>=DELAY_TIME)
             end
             HCF_3: begin
-               r_timeout_counter <= 0;
-               r_SM <= HCF_4;
+               st.timeout_counter <= 0;
+               st.SM <= HCF_4;
                r_error_display_type <= ~r_error_display_type;
             end
             HCF_4: begin
                if (r_error_display_type) begin
                   // Error codes 0x1..0x9 — see ERR_* localparams above (ERR_INV_OPCODE .. ERR_TRAP).
 
-                  case (r_error_code)
+                  case (st.error_code)
                      ERR_CHECKSUM_LOAD:
                      // incoming checksum
-                     r_seven_seg_value1 <= {
+                     st.seven_seg_value1 <= {
                         4'h0,
                         r_rec_checksum[15:12],
                         4'h0,
@@ -2376,7 +2388,7 @@ rams_sp_nc rams_sp_nc1 (
                      };
                      ERR_DATA_LOAD:  // Load counter
               begin
-                        r_seven_seg_value1 <= {
+                        st.seven_seg_value1 <= {
                            8'h24,
                            8'h24,
                            4'h0,
@@ -2384,7 +2396,7 @@ rams_sp_nc rams_sp_nc1 (
                            4'h0,
                            r_ram_next_write_addr[19:16]
                         };
-                        r_seven_seg_value2 <= {
+                        st.seven_seg_value2 <= {
                            4'h0,
                            r_ram_next_write_addr[15:12],
                            4'h0,
@@ -2398,9 +2410,9 @@ rams_sp_nc rams_sp_nc1 (
                      default: // Also for opcode 1
                             // Blank then Program counter
                      begin
-                        r_seven_seg_value1 <= {8'h22, 8'h22, 4'h0, r_PC[23:20], 4'h0, r_PC[19:16]};
-                        r_seven_seg_value2 <= {
-                           4'h0, r_PC[15:12], 4'h0, r_PC[11:8], 4'h0, r_PC[7:4], 4'h0, r_PC[3:0]
+                        st.seven_seg_value1 <= {8'h22, 8'h22, 4'h0, st.PC[23:20], 4'h0, st.PC[19:16]};
+                        st.seven_seg_value2 <= {
+                           4'h0, st.PC[15:12], 4'h0, st.PC[11:8], 4'h0, st.PC[7:4], 4'h0, st.PC[3:0]
                         };
                      end
 
@@ -2410,10 +2422,10 @@ rams_sp_nc rams_sp_nc1 (
                 else
                 begin
 
-                  case (r_error_code)
+                  case (st.error_code)
                      ERR_CHECKSUM_LOAD:
                      // Calculated checksum
-                     r_seven_seg_value1 <= {
+                     st.seven_seg_value1 <= {
                         4'h0,
                         r_calc_checksum[15:12],
                         4'h0,
@@ -2426,15 +2438,15 @@ rams_sp_nc rams_sp_nc1 (
 
                      ERR_DATA_LOAD: begin
                         // Three blanks then loading byte counter
-                        r_seven_seg_value1 <= 32'h22_22_22_22;
-                        r_seven_seg_value2 <= {8'h22, 8'h22, 8'h22, 6'h0, r_load_byte_counter[1:0]};
+                        st.seven_seg_value1 <= 32'h22_22_22_22;
+                        st.seven_seg_value2 <= {8'h22, 8'h22, 8'h22, 6'h0, r_load_byte_counter[1:0]};
                      end
                      default // Also for opcode 1
                         // Show the full 32-bit opcode across both displays:
                         //   7seg1 = w_opcode[31:16] (upper 4 hex digits)
                         //   7seg2 = w_opcode[15:0]  (lower 4 hex digits)
                      begin
-                        r_seven_seg_value1 <= {
+                        st.seven_seg_value1 <= {
                            4'h0,
                            w_opcode[31:28],
                            4'h0,
@@ -2444,7 +2456,7 @@ rams_sp_nc rams_sp_nc1 (
                            4'h0,
                            w_opcode[19:16]
                         };
-                        r_seven_seg_value2 <= {
+                        st.seven_seg_value2 <= {
                            4'h0,
                            w_opcode[15:12],
                            4'h0,
@@ -2460,78 +2472,78 @@ rams_sp_nc rams_sp_nc1 (
 
                end  // else if (r_error_display_type)
 
-               r_timeout_max <= 32'd100_000_000;
-               if (r_timeout_counter >= r_timeout_max) begin
-                  r_timeout_counter <= 0;
-                  r_SM <= HCF_1;
-               end  // if(r_timeout_counter>=DELAY_TIME)
+               st.timeout_max <= 32'd100_000_000;
+               if (st.timeout_counter >= st.timeout_max) begin
+                  st.timeout_counter <= 0;
+                  st.SM <= HCF_1;
+               end  // if(st.timeout_counter>=DELAY_TIME)
                 else
                 begin
-                  r_timeout_counter <= r_timeout_counter + 1;
-               end  // else if(r_timeout_counter>=DELAY_TIME)
+                  st.timeout_counter <= st.timeout_counter + 1;
+               end  // else if(st.timeout_counter>=DELAY_TIME)
 
             end
             
              MULTIPLY_SETUP: begin
-    // Operands now valid in r_mul_operand_a/b; this cycle they propagate
+    // Operands now valid in st.mul_operand_a/b; this cycle they propagate
     // into r_mul_operand_a_q/b_q (absorbed into DSP48E1 AREG/BREG).
-    r_SM <= MULTIPLY_BREG;
+    st.SM <= MULTIPLY_BREG;
 end
 
 MULTIPLY_BREG: begin
     // Wait for DSP input registers (AREG/BREG) - multiply now starting
-    r_SM <= MULTIPLY_CALC;
+    st.SM <= MULTIPLY_CALC;
 end
 
 MULTIPLY_CALC: begin
     // Wait for pipeline stage 2 (MREG) - multiply is computed
     // by the free-running pipeline from r_mul_operand_a_q/b_q
-    r_SM <= MULTIPLY_PIPE;
+    st.SM <= MULTIPLY_PIPE;
 end
 
 MULTIPLY_PIPE: begin
     // Wait for pipeline stage 3 (PREG) - result now in r_mul_result_hi/lo
-    r_SM <= MULTIPLY_WRITEBACK;
+    st.SM <= MULTIPLY_WRITEBACK;
 end
 
 MULTIPLY_WRITEBACK: begin
     // Stage result into writeback pipeline
-    if (r_mul_is_high)
-        r_wb.value <= r_mul_result_hi;
+    if (st.mul_is_high)
+        st.wb.value <= r_mul_result_hi;
     else
-        r_wb.value <= r_mul_result_lo;
-    r_wb.rd <= r_mul_dest_reg;
+        st.wb.value <= r_mul_result_lo;
+    st.wb.rd <= st.mul_dest_reg;
 
     // Flags from registered values
-    if (r_mul_is_high) begin
-        r_flags.zero     <= (r_mul_result_hi == 64'b0);
-        r_flags.sign     <= r_mul_result_hi[63];
-        r_flags.overflow <= 1'b0;
+    if (st.mul_is_high) begin
+        st.flags.zero     <= (r_mul_result_hi == 64'b0);
+        st.flags.sign     <= r_mul_result_hi[63];
+        st.flags.overflow <= 1'b0;
     end else begin
-        r_flags.zero     <= (r_mul_result_lo == 64'b0);
-        r_flags.sign     <= r_mul_result_lo[63];
-        if (r_mul_is_unsigned)
-            r_flags.overflow <= (r_mul_result_hi != 64'b0);
+        st.flags.zero     <= (r_mul_result_lo == 64'b0);
+        st.flags.sign     <= r_mul_result_lo[63];
+        if (st.mul_is_unsigned)
+            st.flags.overflow <= (r_mul_result_hi != 64'b0);
         else
-            r_flags.overflow <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
+            st.flags.overflow <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
     end
 
     // PC increment depends on instruction type
-    if (r_mul_is_immediate)
-        r_PC <= r_PC + 8;
+    if (st.mul_is_immediate)
+        st.PC <= st.PC + 8;
     else
-        r_PC <= r_PC + 4;
+        st.PC <= st.PC + 4;
 
-    // Execute-tail handoff: pre-load r_reg_1/2 from the prefetched latch (the
-    // multiply used r_mul_operand_*_q, not r_reg_1/2) so the next dispatch skips
-    // FETCH2. r_PC becomes the successor this cycle; OPCODE_REQUEST's r_ir_pc==r_PC
+    // Execute-tail handoff: pre-load st.reg_1/2 from the prefetched latch (the
+    // multiply used r_mul_operand_*_q, not st.reg_1/2) so the next dispatch skips
+    // FETCH2. st.PC becomes the successor this cycle; OPCODE_REQUEST's r_ir_pc==st.PC
     // guard confirms the match next cycle.
     if (r_ir_valid) begin
-        r_reg_1         <= r_ir_reg_1;
-        r_reg_2         <= r_ir_reg_2;
+        st.reg_1         <= r_ir_reg_1;
+        st.reg_2         <= r_ir_reg_2;
         r_ir_presettled <= 1'b1;
     end
-    r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
+    st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
 end
 
             HALTED_BREAK: begin
@@ -2547,7 +2559,7 @@ end
                   r_break_counter <= r_break_counter - 1;
                   if (r_break_counter == 12'd1) begin
                      r_break_active <= 1'b0;
-                     r_SM           <= HALTED;
+                     st.SM           <= HALTED;
                   end
                end
             end
@@ -2563,7 +2575,7 @@ end
             // LEVEL-sensitive on w_irq_ready and re-evaluated every cycle, so an
             // interrupt arriving on or after the WAIT cycle is never lost (this
             // is what makes the software idiom "enable-interrupts; WAIT" safe).
-            // t_wait already advanced r_PC to the instruction after WAIT, so the
+            // t_wait already advanced st.PC to the instruction after WAIT, so the
             // normal dispatch in OPCODE_REQUEST saves that PC and IRET resumes
             // past the WAIT. If an interrupt is already pending when WAIT runs,
             // this exits next cycle — it never sleeps with work pending.
@@ -2571,7 +2583,7 @@ end
             // like any other state.
             WAITING: begin
                if (w_irq_ready)
-                  r_SM <= OPCODE_REQUEST;
+                  st.SM <= OPCODE_REQUEST;
             end
 
             // DIVIDE_PREP — skip the leading-zero iterations of restoring
@@ -2587,72 +2599,72 @@ end
             // their own cycle.
             DIVIDE_PREP: begin : divide_prep
                logic [6:0] prep_clz;
-               prep_clz = count_leading_zeros(r_div.dividend);
+               prep_clz = count_leading_zeros(st.div.dividend);
                if (prep_clz[6]) begin
                   // dividend == 0 (clz = 64): quotient 0, remainder 0 —
                   // go straight to DIVIDE_STEP's finish branch.
-                  r_div.counter <= 7'd64;
+                  st.div.counter <= 7'd64;
                end else begin
-                  r_div.dividend <= r_div.dividend << prep_clz[5:0];
-                  r_div.counter  <= {1'b0, prep_clz[5:0]};
+                  st.div.dividend <= st.div.dividend << prep_clz[5:0];
+                  st.div.counter  <= {1'b0, prep_clz[5:0]};
                end
-               r_SM <= DIVIDE_STEP;
+               st.SM <= DIVIDE_STEP;
             end
 
             DIVIDE_STEP: begin
                // Shared division iteration - avoids re-evaluating opcode casez each cycle
-               if (r_div.counter < 7'd64) begin
+               if (st.div.counter < 7'd64) begin
                   // Restoring division step — single subtract (w_div_trial),
                   // borrow-out (w_div_borrow) selects quotient bit and remainder.
                   if (!w_div_borrow) begin
-                     r_div.remainder <= w_div_trial[63:0];
-                     r_div.quotient  <= {r_div.quotient[62:0], 1'b1};
+                     st.div.remainder <= w_div_trial[63:0];
+                     st.div.quotient  <= {st.div.quotient[62:0], 1'b1};
                   end
                   else begin
-                     r_div.remainder <= w_div_shifted;
-                     r_div.quotient  <= {r_div.quotient[62:0], 1'b0};
+                     st.div.remainder <= w_div_shifted;
+                     st.div.quotient  <= {st.div.quotient[62:0], 1'b0};
                   end
-                  r_div.dividend <= {r_div.dividend[62:0], 1'b0};
-                  r_div.counter <= r_div.counter + 1;
+                  st.div.dividend <= {st.div.dividend[62:0], 1'b0};
+                  st.div.counter <= st.div.counter + 1;
                end
                else begin
                   // Division complete - write result based on op type
-                  if (r_div.op == DIV_OP_DIV) begin
-                     if (r_div.is_signed && r_div.sign_q)
-                        r_wb.value <= ~r_div.quotient + 1;
+                  if (st.div.op == DIV_OP_DIV) begin
+                     if (st.div.is_signed && st.div.sign_q)
+                        st.wb.value <= ~st.div.quotient + 1;
                      else
-                        r_wb.value <= r_div.quotient;
-                     r_flags.zero <= (r_div.quotient == 0) ? 1'b1 : 1'b0;
+                        st.wb.value <= st.div.quotient;
+                     st.flags.zero <= (st.div.quotient == 0) ? 1'b1 : 1'b0;
                   end
                   else begin  // DIV_OP_MOD
-                     if (r_div.is_signed && r_div.sign_r)
-                        r_wb.value <= ~r_div.remainder + 1;
+                     if (st.div.is_signed && st.div.sign_r)
+                        st.wb.value <= ~st.div.remainder + 1;
                      else
-                        r_wb.value <= r_div.remainder;
-                     r_flags.zero <= (r_div.remainder == 0) ? 1'b1 : 1'b0;
+                        st.wb.value <= st.div.remainder;
+                     st.flags.zero <= (st.div.remainder == 0) ? 1'b1 : 1'b0;
                   end
-                  r_wb.rd <= r_div.dest_reg;
-                  r_flags.overflow <= 1'b0;
-                  r_div.op <= DIV_OP_NONE;
-                  r_PC <= r_PC + (r_div.pc_inc ? 8 : 4);
-                  // Execute-tail handoff: pre-load r_reg_1/2 from the prefetched
-                  // latch (the divide used r_div_* regs, not r_reg_1/2) so the next
+                  st.wb.rd <= st.div.dest_reg;
+                  st.flags.overflow <= 1'b0;
+                  st.div.op <= DIV_OP_NONE;
+                  st.PC <= st.PC + (st.div.pc_inc ? 8 : 4);
+                  // Execute-tail handoff: pre-load st.reg_1/2 from the prefetched
+                  // latch (the divide used r_div_* regs, not st.reg_1/2) so the next
                   // dispatch skips FETCH2.
                   if (r_ir_valid) begin
-                     r_reg_1         <= r_ir_reg_1;
-                     r_reg_2         <= r_ir_reg_2;
+                     st.reg_1         <= r_ir_reg_1;
+                     st.reg_2         <= r_ir_reg_2;
                      r_ir_presettled <= 1'b1;
                   end
-                  r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
+                  st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
                end
             end
 
             WRITEBACK: begin
-               r_register[r_wb.rd] <= r_wb.value;
-               if (r_wb.set_zero)
-                  r_flags.zero <= (r_wb.value == 64'b0);
-               r_wb.set_zero <= 1'b0;
-               r_SM <= OPCODE_REQUEST;
+               r_register[st.wb.rd] <= st.wb.value;
+               if (st.wb.set_zero)
+                  st.flags.zero <= (st.wb.value == 64'b0);
+               st.wb.set_zero <= 1'b0;
+               st.SM <= OPCODE_REQUEST;
             end
 
             //==================================================================
@@ -2664,31 +2676,31 @@ end
             // OPCODE_REQUEST (CMP ops, no rd). Mode bit selects.
             //==================================================================
             ALU_FINISH: begin
-               if (r_alu_pipe_mode == 1'b0) begin       // ARITH
-                  r_wb.value <= r_alu_pipe_value;
-                  r_flags.carry      <= r_alu_pipe_carry;
-                  r_flags.overflow   <= r_alu_pipe_overflow;
-                  r_flags.sign       <= r_alu_pipe_value[63];
-                  r_SM              <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
+               if (st.alu_pipe_mode == 1'b0) begin       // ARITH
+                  st.wb.value <= st.alu_pipe_value;
+                  st.flags.carry      <= st.alu_pipe_carry;
+                  st.flags.overflow   <= st.alu_pipe_overflow;
+                  st.flags.sign       <= st.alu_pipe_value[63];
+                  st.SM              <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
                end else begin                           // CMP
-                  r_flags.equal <= r_alu_pipe_equal;
-                  r_flags.less  <= r_alu_pipe_less;
-                  r_flags.ult   <= r_alu_pipe_ult;
-                  r_flags.sign  <= r_alu_pipe_value[63];
-                  r_SM         <= OPCODE_REQUEST;
+                  st.flags.equal <= st.alu_pipe_equal;
+                  st.flags.less  <= st.alu_pipe_less;
+                  st.flags.ult   <= st.alu_pipe_ult;
+                  st.flags.sign  <= st.alu_pipe_value[63];
+                  st.SM         <= OPCODE_REQUEST;
                end
                // Execute-tail handoff: the ALU already consumed its operands and
-               // r_PC is the successor, so pre-load r_reg_1/2 from the prefetched
+               // st.PC is the successor, so pre-load st.reg_1/2 from the prefetched
                // latch — the read ports settle now and the fast-path dispatch skips FETCH2.
                if (r_ir_valid) begin
-                  r_reg_1         <= r_ir_reg_1;
-                  r_reg_2         <= r_ir_reg_2;
+                  st.reg_1         <= r_ir_reg_1;
+                  st.reg_2         <= r_ir_reg_2;
                   r_ir_presettled <= 1'b1;
                end
             end
 
-            default: r_SM <= HCF_1;  // loop in error
-         endcase  // case(r_SM)
+            default: st.SM <= HCF_1;  // loop in error
+         endcase  // case(st.SM)
       end  // else if (w_reset_H)
    end  // always_ff @(posedge i_Clk)
 
@@ -2777,7 +2789,7 @@ end
 
    //=========================================================================
    // Performance-counter block (Tier 0/1/2). Its own always block: reads
-   // existing FSM state (r_SM, r_div.counter, r_int_push_wait), the decoded
+   // existing FSM state (st.SM, st.div.counter, r_int_push_wait), the decoded
    // opcode (w_opcode) and the branch-outcome strobe set by the jump tasks.
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
@@ -2801,7 +2813,7 @@ end
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;
-         if (r_SM == OPCODE_FETCH2 || r_fastpath_fired) r_perf_instr <= r_perf_instr + 64'd1;
+         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired) r_perf_instr <= r_perf_instr + 64'd1;
          if (r_fastpath_fired) r_perf_fastpath <= r_perf_fastpath + 64'd1;  // fast-path-dispatch fire count (MMIO 0xA8)
 
          // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
@@ -2809,29 +2821,29 @@ end
          // to keep the fetch bucket clean.
          if (r_int_push_wait)
             r_perf_int_cycles <= r_perf_int_cycles + 64'd1;
-         else if (r_SM == OPCODE_REQUEST || r_SM == OPCODE_FETCH  ||
-                  r_SM == OPCODE_FETCH2  || r_SM == VAR1_FETCH)
+         else if (st.SM == OPCODE_REQUEST || st.SM == OPCODE_FETCH  ||
+                  st.SM == OPCODE_FETCH2  || st.SM == VAR1_FETCH)
             r_perf_fetch_cycles <= r_perf_fetch_cycles + 64'd1;
-         else if (r_SM == OPCODE_EXECUTE || r_SM == ALU_FINISH ||
-                  r_SM == WRITEBACK)
+         else if (st.SM == OPCODE_EXECUTE || st.SM == ALU_FINISH ||
+                  st.SM == WRITEBACK)
             r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
-         else if (r_SM == MULTIPLY_SETUP || r_SM == MULTIPLY_BREG ||
-                  r_SM == MULTIPLY_CALC  || r_SM == MULTIPLY_PIPE ||
-                  r_SM == MULTIPLY_WRITEBACK)
+         else if (st.SM == MULTIPLY_SETUP || st.SM == MULTIPLY_BREG ||
+                  st.SM == MULTIPLY_CALC  || st.SM == MULTIPLY_PIPE ||
+                  st.SM == MULTIPLY_WRITEBACK)
             r_perf_mul_cycles <= r_perf_mul_cycles + 64'd1;
-         else if (r_SM == DIVIDE_STEP || r_SM == DIVIDE_PREP)
+         else if (st.SM == DIVIDE_STEP || st.SM == DIVIDE_PREP)
             r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
-         else if (r_SM == HALTED || r_SM == HALTED_BREAK || r_SM == WAITING)
+         else if (st.SM == HALTED || st.SM == HALTED_BREAK || st.SM == WAITING)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
 
          // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
          // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
-         if (r_SM == MULTIPLY_SETUP)
+         if (st.SM == MULTIPLY_SETUP)
             r_perf_mul_ops <= r_perf_mul_ops + 64'd1;
          // DIVIDE_PREP is the unique 1-cycle entry state per divide (the old
          // counter==0 test no longer fires once per op — prep starts the
          // counter at clz, and a zero dividend skips the iterations entirely).
-         if (r_SM == DIVIDE_PREP)
+         if (st.SM == DIVIDE_PREP)
             r_perf_div_ops <= r_perf_div_ops + 64'd1;
          if (r_int_push_wait && !r_int_push_wait_d)
             r_perf_int_ops <= r_perf_int_ops + 64'd1;
@@ -2843,7 +2855,7 @@ end
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
 
          // Tier 2 — instruction mix: one class per committed instruction.
-         if (r_SM == OPCODE_FETCH2) begin
+         if (st.SM == OPCODE_FETCH2) begin
             case (f_perf_class(w_opcode))
                PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
                PC_LOAD:     r_perf_cnt_load     <= r_perf_cnt_load     + 64'd1;
@@ -2857,7 +2869,7 @@ end
          end
 
          // (the passive predecode-mismatch validator was retired — superseded by the
-         // r_ir_pc==r_PC consume guard, the functional regression, and the
+         // r_ir_pc==st.PC consume guard, the functional regression, and the
          // fast-path fire-rate counter which collapses on any predecode error.)
       end
    end

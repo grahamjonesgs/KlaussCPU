@@ -6,9 +6,9 @@
 task t_led_value;
    input [31:0] i_state;
    begin
-      r_led <= i_state[15:0];
-      r_SM  <= OPCODE_REQUEST;
-      r_PC  <= r_PC + 8;
+      st.led <= i_state[15:0];
+      st.SM  <= OPCODE_REQUEST;
+      st.PC  <= st.PC + 8;
    end
 endtask
 
@@ -18,9 +18,9 @@ endtask
 // Increment r_SM_msg
 task t_led_reg;
    begin
-      r_led <= r_reg_port_b[15:0];
-      r_SM  <= OPCODE_REQUEST;
-      r_PC  <= r_PC + 4;
+      st.led <= r_reg_port_b[15:0];
+      st.SM  <= OPCODE_REQUEST;
+      st.PC  <= st.PC + 4;
    end
 endtask
 
@@ -31,9 +31,9 @@ endtask
 task t_led_rgb1_value;
    input [31:0] i_state;
    begin
-      r_RGB_LED_1 <= i_state[11:0];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 8;
+      st.RGB_LED_1 <= i_state[11:0];
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -43,9 +43,9 @@ endtask
 // Increment r_SM_msg
 task t_led_rgb1_reg;
    begin
-      r_RGB_LED_1 <= r_reg_port_b[11:0];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.RGB_LED_1 <= r_reg_port_b[11:0];
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -56,9 +56,9 @@ endtask
 task t_led_rgb2_value;
    input [31:0] i_state;
    begin
-      r_RGB_LED_2 <= i_state[11:0];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 8;
+      st.RGB_LED_2 <= i_state[11:0];
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -68,9 +68,9 @@ endtask
 // Increment r_SM_msg
 task t_led_rgb2_reg;
    begin
-      r_RGB_LED_2 <= r_reg_port_b[11:0];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.RGB_LED_2 <= r_reg_port_b[11:0];
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -81,10 +81,10 @@ endtask
 // 1-word, PC += 4.
 task t_get_switch_reg;
    begin
-      r_wb.value <= {r_reg_port_b[31:16], i_switch};
-      r_wb.rd <= r_reg_2;
-      r_SM <= WRITEBACK;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {r_reg_port_b[31:16], i_switch};
+      st.wb.rd <= st.reg_2;
+      st.SM <= WRITEBACK;
+      st.PC <= st.PC + 4;
    end
 endtask
 

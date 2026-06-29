@@ -6,25 +6,25 @@
 task t_delay;
     input [31:0] i_timeout_fraction;
     begin
-        if(r_timing_start==0) // first cycle of timing
+        if(st.timing_start==0) // first cycle of timing
         begin
-            r_timeout_max <= i_timeout_fraction << 13;
-            r_timeout_counter <= 0;
-            r_timing_start <= 1;
+            st.timeout_max <= i_timeout_fraction << 13;
+            st.timeout_counter <= 0;
+            st.timing_start <= 1;
         end // if first loop
         else
         begin
-            if (r_timeout_counter >= r_timeout_max) begin
-                r_timeout_counter <= 0;
-                r_timing_start <= 0;
-                r_SM <= OPCODE_REQUEST;
-                r_PC <= r_PC + 8;
-            end  // if(r_timeout_counter>=DELAY_TIME)
+            if (st.timeout_counter >= st.timeout_max) begin
+                st.timeout_counter <= 0;
+                st.timing_start <= 0;
+                st.SM <= OPCODE_REQUEST;
+                st.PC <= st.PC + 8;
+            end  // if(st.timeout_counter>=DELAY_TIME)
             else
             begin
-                r_timeout_counter <= r_timeout_counter + 1;
-                r_SM <= OPCODE_EXECUTE;  // redo loop on same opcode
-            end  // else if(r_timeout_counter>=DELAY_TIME)
+                st.timeout_counter <= st.timeout_counter + 1;
+                st.SM <= OPCODE_EXECUTE;  // redo loop on same opcode
+            end  // else if(st.timeout_counter>=DELAY_TIME)
         end  // if subsequent loop
     end
 endtask
@@ -38,26 +38,26 @@ task t_delay_reg;
     logic [ 3:0] reg_1;
     begin
 
-        if(r_timing_start==0) // first cycle of timing
+        if(st.timing_start==0) // first cycle of timing
         begin
             r_timeout_fraction = r_reg_port_b;
-            r_timeout_max <= r_timeout_fraction << 13;
-            r_timeout_counter <= 0;
-            r_timing_start <= 1;
+            st.timeout_max <= r_timeout_fraction << 13;
+            st.timeout_counter <= 0;
+            st.timing_start <= 1;
         end // if first loop
         else
         begin
-            if (r_timeout_counter >= r_timeout_max) begin
-                r_timeout_counter <= 0;
-                r_timing_start <= 0;
-                r_SM <= OPCODE_REQUEST;
-                r_PC <= r_PC + 4;
-            end  // if(r_timeout_counter>=DELAY_TIME)
+            if (st.timeout_counter >= st.timeout_max) begin
+                st.timeout_counter <= 0;
+                st.timing_start <= 0;
+                st.SM <= OPCODE_REQUEST;
+                st.PC <= st.PC + 4;
+            end  // if(st.timeout_counter>=DELAY_TIME)
             else
             begin
-                r_timeout_counter <= r_timeout_counter + 1;
-                r_SM <= OPCODE_EXECUTE;  // redo loop on same opcode
-            end  // else if(r_timeout_counter>=DELAY_TIME)
+                st.timeout_counter <= st.timeout_counter + 1;
+                st.SM <= OPCODE_EXECUTE;  // redo loop on same opcode
+            end  // else if(st.timeout_counter>=DELAY_TIME)
         end  // if subsequent loop
     end
 endtask

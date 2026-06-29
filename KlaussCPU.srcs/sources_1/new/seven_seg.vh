@@ -11,11 +11,11 @@
 task t_7_seg1_value;
    input [31:0] i_byte;
    begin
-      r_seven_seg_value1 <= {
+      st.seven_seg_value1 <= {
          4'h0, i_byte[15:12], 4'h0, i_byte[11:8], 4'h0, i_byte[7:4], 4'h0, i_byte[3:0]
       };
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 8;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -26,11 +26,11 @@ endtask
 task t_7_seg2_value;
    input [31:0] i_byte;
    begin
-      r_seven_seg_value2 <= {
+      st.seven_seg_value2 <= {
          4'h0, i_byte[15:12], 4'h0, i_byte[11:8], 4'h0, i_byte[7:4], 4'h0, i_byte[3:0]
       };
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 8;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -41,7 +41,7 @@ endtask
 
 task t_7_seg1_reg;
    begin
-      r_seven_seg_value1 <= {
+      st.seven_seg_value1 <= {
          4'h0,
          r_reg_port_b[15:12],
          4'h0,
@@ -51,8 +51,8 @@ task t_7_seg1_reg;
          4'h0,
          r_reg_port_b[3:0]
       };
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -63,7 +63,7 @@ endtask
 
 task t_7_seg2_reg;
    begin
-      r_seven_seg_value2 <= {
+      st.seven_seg_value2 <= {
          4'h0,
          r_reg_port_b[15:12],
          4'h0,
@@ -73,8 +73,8 @@ task t_7_seg2_reg;
          4'h0,
          r_reg_port_b[3:0]
       };
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -84,7 +84,7 @@ endtask
 // Increment r_SM_msg
 task t_7_seg_reg;
    begin
-      r_seven_seg_value1 <= {
+      st.seven_seg_value1 <= {
          4'h0,
          r_reg_port_b[31:28],
          4'h0,
@@ -94,7 +94,7 @@ task t_7_seg_reg;
          4'h0,
          r_reg_port_b[19:16]
       };
-      r_seven_seg_value2 <= {
+      st.seven_seg_value2 <= {
          4'h0,
          r_reg_port_b[15:12],
          4'h0,
@@ -104,8 +104,8 @@ task t_7_seg_reg;
          4'h0,
          r_reg_port_b[3:0]
       };
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -118,10 +118,10 @@ endtask
 
 task t_7_seg_blank;
    begin
-      r_seven_seg_value1 <= 32'h22222222;
-      r_seven_seg_value2 <= 32'h22222222;
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 4;
+      st.seven_seg_value1 <= 32'h22222222;
+      st.seven_seg_value2 <= 32'h22222222;
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 4;
    end
 endtask
 

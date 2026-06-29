@@ -6,8 +6,8 @@
 //   reg [31:0] r_reg_port_a;
 //   reg [31:0] r_reg_port_b;
 //   always_ff @(posedge i_Clk) begin
-//       r_reg_port_a <= r_register[r_reg_1];
-//       r_reg_port_b <= r_register[r_reg_2];
+//       r_reg_port_a <= r_register[st.reg_1];
+//       r_reg_port_b <= r_register[st.reg_2];
 //   end
 //=============================================================================
 
@@ -18,24 +18,24 @@
 // ROLR - Rotate left by 1
 task t_rotate_left;
    begin
-      r_wb.value <= {r_reg_port_b[62:0], r_reg_port_b[63]};
-      r_wb.rd <= r_reg_2;
-      r_flags.carry <= r_reg_port_b[63];
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {r_reg_port_b[62:0], r_reg_port_b[63]};
+      st.wb.rd <= st.reg_2;
+      st.flags.carry <= r_reg_port_b[63];
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // RORR - Rotate right by 1
 task t_rotate_right;
    begin
-      r_wb.value <= {r_reg_port_b[0], r_reg_port_b[63:1]};
-      r_wb.rd <= r_reg_2;
-      r_flags.carry <= r_reg_port_b[0];
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {r_reg_port_b[0], r_reg_port_b[63:1]};
+      st.wb.rd <= st.reg_2;
+      st.flags.carry <= r_reg_port_b[0];
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -43,13 +43,13 @@ endtask
 task t_rotate_left_carry;
    logic [64:0] temp;
    begin
-      temp = {r_reg_port_b, r_flags.carry};
-      r_wb.value <= {temp[63:0]};
-      r_wb.rd <= r_reg_2;
-      r_flags.carry <= temp[64];
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      temp = {r_reg_port_b, st.flags.carry};
+      st.wb.value <= {temp[63:0]};
+      st.wb.rd <= st.reg_2;
+      st.flags.carry <= temp[64];
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -57,13 +57,13 @@ endtask
 task t_rotate_right_carry;
    logic [64:0] temp;
    begin
-      temp = {r_flags.carry, r_reg_port_b};
-      r_wb.value <= temp[64:1];
-      r_wb.rd <= r_reg_2;
-      r_flags.carry <= temp[0];
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      temp = {st.flags.carry, r_reg_port_b};
+      st.wb.value <= temp[64:1];
+      st.wb.rd <= st.reg_2;
+      st.flags.carry <= temp[0];
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -75,11 +75,11 @@ task t_rotate_left_n;
    begin
       count = i_count[5:0];  // Only use lower 6 bits (0-63)
       result = (r_reg_port_b << count) | (r_reg_port_b >> (64 - count));
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -91,11 +91,11 @@ task t_rotate_right_n;
    begin
       count = i_count[5:0];
       result = (r_reg_port_b >> count) | (r_reg_port_b << (64 - count));
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -106,11 +106,11 @@ task t_rotate_left_reg;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a << count) | (r_reg_port_a >> (64 - count));
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_dst;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_dst;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -121,11 +121,11 @@ task t_rotate_right_reg;
    begin
       count = r_reg_port_b[5:0];
       result = (r_reg_port_a >> count) | (r_reg_port_a << (64 - count));
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_dst;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_dst;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -138,10 +138,10 @@ endtask
 task t_bit_set_value;
    input [31:0] i_bit;
    begin
-      r_wb.value <= r_reg_port_b | (64'b1 << i_bit[5:0]);
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= r_reg_port_b | (64'b1 << i_bit[5:0]);
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -149,10 +149,10 @@ endtask
 task t_bit_clear_value;
    input [31:0] i_bit;
    begin
-      r_wb.value <= r_reg_port_b & ~(64'b1 << i_bit[5:0]);
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= r_reg_port_b & ~(64'b1 << i_bit[5:0]);
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -160,10 +160,10 @@ endtask
 task t_bit_toggle_value;
    input [31:0] i_bit;
    begin
-      r_wb.value <= r_reg_port_b ^ (64'b1 << i_bit[5:0]);
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= r_reg_port_b ^ (64'b1 << i_bit[5:0]);
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -171,39 +171,39 @@ endtask
 task t_bit_test_value;
    input [31:0] i_bit;
    begin
-      r_flags.zero <= ~r_reg_port_b[i_bit[5:0]];
-      r_SM <= OPCODE_REQUEST;
-      r_PC <= r_PC + 8;
+      st.flags.zero <= ~r_reg_port_b[i_bit[5:0]];
+      st.SM <= OPCODE_REQUEST;
+      st.PC <= st.PC + 8;
    end
 endtask
 
 // BSETRR - rd = rs1 with bit rs2 set
 task t_bit_set_reg;
    begin
-      r_wb.value <= r_reg_port_a | (64'b1 << r_reg_port_b[5:0]);
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= r_reg_port_a | (64'b1 << r_reg_port_b[5:0]);
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // BCLRRR - rd = rs1 with bit rs2 cleared
 task t_bit_clear_reg;
    begin
-      r_wb.value <= r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]);
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]);
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // BTGLRR - rd = rs1 with bit rs2 toggled
 task t_bit_toggle_reg;
    begin
-      r_wb.value <= r_reg_port_a ^ (64'b1 << r_reg_port_b[5:0]);
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= r_reg_port_a ^ (64'b1 << r_reg_port_b[5:0]);
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -212,51 +212,51 @@ task t_bit_test_reg;
    logic [5:0] bit_pos;
    begin
       bit_pos = r_reg_port_b[5:0];
-      r_wb.value <= {63'b0, r_reg_port_a[bit_pos]};
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {63'b0, r_reg_port_a[bit_pos]};
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // POPCNT - Population count (count 1 bits)
 task t_popcnt;
    begin
-      r_wb.value <= {57'b0, popcount(r_reg_port_b)};
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {57'b0, popcount(r_reg_port_b)};
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CLZ - Count leading zeros
 task t_clz;
    begin
-      r_wb.value <= {57'b0, count_leading_zeros(r_reg_port_b)};
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {57'b0, count_leading_zeros(r_reg_port_b)};
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CTZ - Count trailing zeros
 task t_ctz;
    begin
-      r_wb.value <= {57'b0, count_trailing_zeros(r_reg_port_b)};
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {57'b0, count_trailing_zeros(r_reg_port_b)};
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // BITREV - Reverse all bits
 task t_bit_reverse;
    begin
-      r_wb.value <= bit_reverse(r_reg_port_b);
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= bit_reverse(r_reg_port_b);
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -274,16 +274,16 @@ task t_extract_bits;
       length = i_params[12:8];
       mask = (32'hFFFFFFFF >> (32 - length));
       result = (r_reg_port_b >> start_pos) & mask;
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
 // BDEP - Deposit bit field (insert bits at position)
-// Uses r_reg_1 as source, r_reg_2 as destination
+// Uses st.reg_1 as source, st.reg_2 as destination
 // Descriptor: imm[4:0] = start position (0-31), imm[12:8] = length (0-31).
 // Operates on the low 32 bits only; high bits of rd come from rs2 unchanged
 // for [31:0], and are zero above bit 31 (32-bit result zero-extended).
@@ -298,10 +298,10 @@ task t_deposit_bits;
       length = i_params[12:8];
       mask = (32'hFFFFFFFF >> (32 - length)) << start_pos;
       insert_val = (r_reg_port_a << start_pos) & mask;
-      r_wb.value <= (r_reg_port_b & ~mask) | insert_val;
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= (r_reg_port_b & ~mask) | insert_val;
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -314,20 +314,20 @@ endtask
 // CMPEQR - rd = (rs1 == rs2) ? 1 : 0
 task t_cmpeqr;
    begin
-      r_wb.value <= (r_reg_port_a == r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a == r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CMPNER - rd = (rs1 != rs2) ? 1 : 0
 task t_cmpner;
    begin
-      r_wb.value <= (r_reg_port_a != r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a != r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -338,10 +338,10 @@ task t_cmpltr;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a < s_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a < s_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -352,10 +352,10 @@ task t_cmpler;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a <= s_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a <= s_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -366,10 +366,10 @@ task t_cmpgtr;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a > s_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a > s_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -380,50 +380,50 @@ task t_cmpger;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a >= s_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a >= s_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CMPULTR - rd = (rs1 < rs2) ? 1 : 0, unsigned
 task t_cmpultr;
    begin
-      r_wb.value <= (r_reg_port_a < r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a < r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CMPULER - rd = (rs1 <= rs2) ? 1 : 0, unsigned
 task t_cmpuler;
    begin
-      r_wb.value <= (r_reg_port_a <= r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a <= r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CMPUGTR - rd = (rs1 > rs2) ? 1 : 0, unsigned
 task t_cmpugtr;
    begin
-      r_wb.value <= (r_reg_port_a > r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a > r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // CMPUGER - rd = (rs1 >= rs2) ? 1 : 0, unsigned
 task t_cmpuger;
    begin
-      r_wb.value <= (r_reg_port_a >= r_reg_port_b) ? 32'b1 : 32'b0;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (r_reg_port_a >= r_reg_port_b) ? 32'b1 : 32'b0;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -436,52 +436,52 @@ endtask
 // MULR - rd = rs1 * rs2, signed lo
 task t_mul_regs_hw;
 begin
-    r_mul_operand_a   <= r_reg_port_a;
-    r_mul_operand_b   <= r_reg_port_b;
-    r_mul_dest_reg    <= r_reg_dst;
-    r_mul_is_high     <= 1'b0;
-    r_mul_is_unsigned <= 1'b0;
-    r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_SETUP;
+    st.mul_operand_a   <= r_reg_port_a;
+    st.mul_operand_b   <= r_reg_port_b;
+    st.mul_dest_reg    <= st.reg_dst;
+    st.mul_is_high     <= 1'b0;
+    st.mul_is_unsigned <= 1'b0;
+    st.mul_is_immediate <= 1'b0;
+    st.SM              <= MULTIPLY_SETUP;
 end
 endtask
 
 // MULUR - rd = rs1 * rs2, unsigned lo
 task t_mulu_regs_hw;
 begin
-    r_mul_operand_a   <= r_reg_port_a;
-    r_mul_operand_b   <= r_reg_port_b;
-    r_mul_dest_reg    <= r_reg_dst;
-    r_mul_is_high     <= 1'b0;
-    r_mul_is_unsigned <= 1'b1;
-    r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_SETUP;
+    st.mul_operand_a   <= r_reg_port_a;
+    st.mul_operand_b   <= r_reg_port_b;
+    st.mul_dest_reg    <= st.reg_dst;
+    st.mul_is_high     <= 1'b0;
+    st.mul_is_unsigned <= 1'b1;
+    st.mul_is_immediate <= 1'b0;
+    st.SM              <= MULTIPLY_SETUP;
 end
 endtask
 
 // MULHR - rd = high(rs1 * rs2), signed
 task t_mulh_regs_hw;
 begin
-    r_mul_operand_a   <= r_reg_port_a;
-    r_mul_operand_b   <= r_reg_port_b;
-    r_mul_dest_reg    <= r_reg_dst;
-    r_mul_is_high     <= 1'b1;
-    r_mul_is_unsigned <= 1'b0;
-    r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_SETUP;
+    st.mul_operand_a   <= r_reg_port_a;
+    st.mul_operand_b   <= r_reg_port_b;
+    st.mul_dest_reg    <= st.reg_dst;
+    st.mul_is_high     <= 1'b1;
+    st.mul_is_unsigned <= 1'b0;
+    st.mul_is_immediate <= 1'b0;
+    st.SM              <= MULTIPLY_SETUP;
 end
 endtask
 
 // MULHUR - rd = high(rs1 * rs2), unsigned
 task t_mulhu_regs_hw;
 begin
-    r_mul_operand_a   <= r_reg_port_a;
-    r_mul_operand_b   <= r_reg_port_b;
-    r_mul_dest_reg    <= r_reg_dst;
-    r_mul_is_high     <= 1'b1;
-    r_mul_is_unsigned <= 1'b1;
-    r_mul_is_immediate <= 1'b0;
-    r_SM              <= MULTIPLY_SETUP;
+    st.mul_operand_a   <= r_reg_port_a;
+    st.mul_operand_b   <= r_reg_port_b;
+    st.mul_dest_reg    <= st.reg_dst;
+    st.mul_is_high     <= 1'b1;
+    st.mul_is_unsigned <= 1'b1;
+    st.mul_is_immediate <= 1'b0;
+    st.SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -489,13 +489,13 @@ endtask
 task t_mul_value_hw;
    input [31:0] i_value;
 begin
-    r_mul_operand_a   <= r_reg_port_b;      // Register value
-    r_mul_operand_b   <= {{32{i_value[31]}}, i_value};  // sign-extend imm32 (signed MULV; mul pipe sign-extends from bit 63)
-    r_mul_dest_reg    <= r_reg_2;           // Result goes back to same register
-    r_mul_is_high     <= 1'b0;
-    r_mul_is_unsigned <= 1'b0;
-    r_mul_is_immediate <= 1'b1;             // Flag for PC increment
-    r_SM              <= MULTIPLY_SETUP;
+    st.mul_operand_a   <= r_reg_port_b;      // Register value
+    st.mul_operand_b   <= {{32{i_value[31]}}, i_value};  // sign-extend imm32 (signed MULV; mul pipe sign-extends from bit 63)
+    st.mul_dest_reg    <= st.reg_2;           // Result goes back to same register
+    st.mul_is_high     <= 1'b0;
+    st.mul_is_unsigned <= 1'b0;
+    st.mul_is_immediate <= 1'b1;             // Flag for PC increment
+    st.SM              <= MULTIPLY_SETUP;
 end
 endtask
 
@@ -511,27 +511,27 @@ task t_div_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
          // Divide by zero
-         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
-         r_wb.rd <= r_reg_dst;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 4;
+         st.wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         st.wb.rd <= st.reg_dst;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 4;
       end
       else begin
          abs_dividend = r_reg_port_a[63] ? (~r_reg_port_a + 1) : r_reg_port_a;
          abs_divisor = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
-         r_div.dividend <= abs_dividend;
-         r_div.divisor <= abs_divisor;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.sign_q <= r_reg_port_a[63] ^ r_reg_port_b[63];
-         r_div.sign_r <= r_reg_port_a[63];
-         r_div.is_signed <= 1'b1;
-         r_div.op <= DIV_OP_DIV;
-         r_div.dest_reg <= r_reg_dst;
-         r_div.pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= abs_dividend;
+         st.div.divisor <= abs_divisor;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.sign_q <= r_reg_port_a[63] ^ r_reg_port_b[63];
+         st.div.sign_r <= r_reg_port_a[63];
+         st.div.is_signed <= 1'b1;
+         st.div.op <= DIV_OP_DIV;
+         st.div.dest_reg <= st.reg_dst;
+         st.div.pc_inc <= 1'b0;  // PC += 1
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -540,23 +540,23 @@ endtask
 task t_divu_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
-         r_wb.rd <= r_reg_dst;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 4;
+         st.wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         st.wb.rd <= st.reg_dst;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 4;
       end
       else begin
-         r_div.dividend <= r_reg_port_a;
-         r_div.divisor <= r_reg_port_b;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.is_signed <= 1'b0;
-         r_div.op <= DIV_OP_DIV;
-         r_div.dest_reg <= r_reg_dst;
-         r_div.pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= r_reg_port_a;
+         st.div.divisor <= r_reg_port_b;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.is_signed <= 1'b0;
+         st.div.op <= DIV_OP_DIV;
+         st.div.dest_reg <= st.reg_dst;
+         st.div.pc_inc <= 1'b0;  // PC += 1
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -567,26 +567,26 @@ task t_mod_regs_hw;
    logic [63:0] abs_divisor;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_wb.value <= r_reg_port_a;  // Return dividend
-         r_wb.rd <= r_reg_dst;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 4;
+         st.wb.value <= r_reg_port_a;  // Return dividend
+         st.wb.rd <= st.reg_dst;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 4;
       end
       else begin
          abs_dividend = r_reg_port_a[63] ? (~r_reg_port_a + 1) : r_reg_port_a;
          abs_divisor = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
-         r_div.dividend <= abs_dividend;
-         r_div.divisor <= abs_divisor;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.sign_r <= r_reg_port_a[63];  // Remainder sign follows dividend
-         r_div.is_signed <= 1'b1;
-         r_div.op <= DIV_OP_MOD;
-         r_div.dest_reg <= r_reg_dst;
-         r_div.pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= abs_dividend;
+         st.div.divisor <= abs_divisor;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.sign_r <= r_reg_port_a[63];  // Remainder sign follows dividend
+         st.div.is_signed <= 1'b1;
+         st.div.op <= DIV_OP_MOD;
+         st.div.dest_reg <= st.reg_dst;
+         st.div.pc_inc <= 1'b0;  // PC += 1
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -595,23 +595,23 @@ endtask
 task t_modu_regs_hw;
    begin
       if (r_reg_port_b == 64'b0) begin
-         r_wb.value <= r_reg_port_a;
-         r_wb.rd <= r_reg_dst;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 4;
+         st.wb.value <= r_reg_port_a;
+         st.wb.rd <= st.reg_dst;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 4;
       end
       else begin
-         r_div.dividend <= r_reg_port_a;
-         r_div.divisor <= r_reg_port_b;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.is_signed <= 1'b0;
-         r_div.op <= DIV_OP_MOD;
-         r_div.dest_reg <= r_reg_dst;
-         r_div.pc_inc <= 1'b0;  // PC += 1
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= r_reg_port_a;
+         st.div.divisor <= r_reg_port_b;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.is_signed <= 1'b0;
+         st.div.op <= DIV_OP_MOD;
+         st.div.dest_reg <= st.reg_dst;
+         st.div.pc_inc <= 1'b0;  // PC += 1
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -623,26 +623,26 @@ task t_div_value_hw;
    logic [63:0] abs_divisor;
    begin
       if (i_value == 32'b0) begin
-         r_wb.value <= 64'hFFFFFFFFFFFFFFFF;
-         r_wb.rd <= r_reg_2;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 8;
+         st.wb.value <= 64'hFFFFFFFFFFFFFFFF;
+         st.wb.rd <= st.reg_2;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 8;
       end
       else begin
          abs_dividend = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
          abs_divisor = i_value[31] ? (~{{32{i_value[31]}}, i_value} + 1) : {{32{1'b0}}, i_value};
-         r_div.dividend <= abs_dividend;
-         r_div.divisor <= abs_divisor;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.sign_q <= r_reg_port_b[63] ^ i_value[31];
-         r_div.is_signed <= 1'b1;
-         r_div.op <= DIV_OP_DIV;
-         r_div.dest_reg <= r_reg_2;
-         r_div.pc_inc <= 1'b1;  // PC += 2
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= abs_dividend;
+         st.div.divisor <= abs_divisor;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.sign_q <= r_reg_port_b[63] ^ i_value[31];
+         st.div.is_signed <= 1'b1;
+         st.div.op <= DIV_OP_DIV;
+         st.div.dest_reg <= st.reg_2;
+         st.div.pc_inc <= 1'b1;  // PC += 2
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -657,26 +657,26 @@ task t_mod_value_hw;
          // MOD by zero returns the dividend (rd % 0 == rd). MODV is in-place, so
          // rd already holds the dividend (read on r_reg_port_b); write it back
          // explicitly to match the MODR / MODUR / DIVV by-zero handling.
-         r_wb.value <= r_reg_port_b;
-         r_wb.rd   <= r_reg_2;
-         r_flags.overflow <= 1'b1;
-         r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-         r_PC <= r_PC + 8;
+         st.wb.value <= r_reg_port_b;
+         st.wb.rd   <= st.reg_2;
+         st.flags.overflow <= 1'b1;
+         st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+         st.PC <= st.PC + 8;
       end
       else begin
          abs_dividend = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
          abs_divisor = i_value[31] ? (~{{32{i_value[31]}}, i_value} + 1) : {{32{1'b0}}, i_value};
-         r_div.dividend <= abs_dividend;
-         r_div.divisor <= abs_divisor;
-         r_div.quotient <= 64'b0;
-         r_div.remainder <= 64'b0;
-         r_div.counter <= 7'd0;
-         r_div.sign_r <= r_reg_port_b[63];
-         r_div.is_signed <= 1'b1;
-         r_div.op <= DIV_OP_MOD;
-         r_div.dest_reg <= r_reg_2;
-         r_div.pc_inc <= 1'b1;  // PC += 2
-         r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
+         st.div.dividend <= abs_dividend;
+         st.div.divisor <= abs_divisor;
+         st.div.quotient <= 64'b0;
+         st.div.remainder <= 64'b0;
+         st.div.counter <= 7'd0;
+         st.div.sign_r <= r_reg_port_b[63];
+         st.div.is_signed <= 1'b1;
+         st.div.op <= DIV_OP_MOD;
+         st.div.dest_reg <= st.reg_2;
+         st.div.pc_inc <= 1'b1;  // PC += 2
+         st.SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
 endtask
@@ -690,70 +690,70 @@ endtask
 task t_abs_reg;
    begin
       if (r_reg_port_b[63]) begin
-         r_wb.value <= ~r_reg_port_b + 1;
+         st.wb.value <= ~r_reg_port_b + 1;
          // Check for overflow (abs of -2^63)
-         r_flags.overflow <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
+         st.flags.overflow <= (r_reg_port_b == 64'h8000000000000000) ? 1'b1 : 1'b0;
       end else begin
-         r_wb.value <= r_reg_port_b;
-         r_flags.overflow <= 1'b0;  // non-negative input never overflows
+         st.wb.value <= r_reg_port_b;
+         st.flags.overflow <= 1'b0;  // non-negative input never overflows
       end
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // SEXTB - Sign extend byte to 64 bits
 task t_sign_extend_byte;
    begin
-      r_wb.value <= {{56{r_reg_port_b[7]}}, r_reg_port_b[7:0]};
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_flags.sign <= r_reg_port_b[7];
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {{56{r_reg_port_b[7]}}, r_reg_port_b[7:0]};
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.flags.sign <= r_reg_port_b[7];
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // SEXTH - Sign extend halfword to 64 bits
 task t_sign_extend_half;
    begin
-      r_wb.value <= {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]};
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_flags.sign <= r_reg_port_b[15];
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]};
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.flags.sign <= r_reg_port_b[15];
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // ZEXTB - Zero extend byte to 64 bits
 task t_zero_extend_byte;
    begin
-      r_wb.value <= {56'b0, r_reg_port_b[7:0]};
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {56'b0, r_reg_port_b[7:0]};
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // ZEXTH - Zero extend halfword to 64 bits
 task t_zero_extend_half;
    begin
-      r_wb.value <= {48'b0, r_reg_port_b[15:0]};
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= {48'b0, r_reg_port_b[15:0]};
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // BSWAP - Byte swap (endian conversion, 8 bytes)
 task t_byte_swap;
    begin
-      r_wb.value <= {
+      st.wb.value <= {
          r_reg_port_b[7:0],
          r_reg_port_b[15:8],
          r_reg_port_b[23:16],
@@ -763,9 +763,9 @@ task t_byte_swap;
          r_reg_port_b[55:48],
          r_reg_port_b[63:56]
       };
-      r_wb.rd <= r_reg_2;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.rd <= st.reg_2;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -775,11 +775,11 @@ task t_left_shift_n;
    logic [63:0] result;
    begin
       result = r_reg_port_b << i_count[5:0];
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -789,11 +789,11 @@ task t_right_shift_n;
    logic [63:0] result;
    begin
       result = r_reg_port_b >> i_count[5:0];
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -805,11 +805,11 @@ task t_right_shift_a_n;
    begin
       signed_val = r_reg_port_b;
       result = signed_val >>> i_count[5:0];
-      r_wb.value <= result;
-      r_wb.rd <= r_reg_2;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 8;
+      st.wb.value <= result;
+      st.wb.rd <= st.reg_2;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 8;
    end
 endtask
 
@@ -820,10 +820,10 @@ task t_min_regs;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a < s_b) ? r_reg_port_a : r_reg_port_b;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a < s_b) ? r_reg_port_a : r_reg_port_b;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -834,32 +834,32 @@ task t_max_regs;
    begin
       s_a = r_reg_port_a;
       s_b = r_reg_port_b;
-      r_wb.value <= (s_a > s_b) ? r_reg_port_a : r_reg_port_b;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= (s_a > s_b) ? r_reg_port_a : r_reg_port_b;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // MINUR - rd = min(rs1, rs2), unsigned
 task t_minu_regs;
    begin
-      r_wb.value <= (r_reg_port_a < r_reg_port_b) ?
+      st.wb.value <= (r_reg_port_a < r_reg_port_b) ?
                               r_reg_port_a : r_reg_port_b;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // MAXUR - rd = max(rs1, rs2), unsigned
 task t_maxu_regs;
    begin
-      r_wb.value <= (r_reg_port_a > r_reg_port_b) ?
+      st.wb.value <= (r_reg_port_a > r_reg_port_b) ?
                               r_reg_port_a : r_reg_port_b;
-      r_wb.rd <= r_reg_dst;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.rd <= st.reg_dst;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -870,22 +870,22 @@ endtask
 // SHLR - rd = rs1 << rs2[5:0], logical left shift
 task t_shlr3;
    begin
-      r_wb.value <= r_reg_port_a << r_reg_port_b[5:0];
-      r_wb.rd <= r_reg_dst;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= r_reg_port_a << r_reg_port_b[5:0];
+      st.wb.rd <= st.reg_dst;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // SHRR - rd = rs1 >> rs2[5:0], logical right shift
 task t_shrr3;
    begin
-      r_wb.value <= r_reg_port_a >> r_reg_port_b[5:0];
-      r_wb.rd <= r_reg_dst;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= r_reg_port_a >> r_reg_port_b[5:0];
+      st.wb.rd <= st.reg_dst;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
@@ -894,19 +894,19 @@ task t_sarr3;
    logic signed [63:0] signed_val;
    begin
       signed_val = r_reg_port_a;
-      r_wb.value <= signed_val >>> r_reg_port_b[5:0];
-      r_wb.rd <= r_reg_dst;
-      r_wb.set_zero <= 1'b1;
-      r_SM <= OPCODE_REQUEST; r_wb.pending <= 1'b1;
-      r_PC <= r_PC + 4;
+      st.wb.value <= signed_val >>> r_reg_port_b[5:0];
+      st.wb.rd <= st.reg_dst;
+      st.wb.set_zero <= 1'b1;
+      st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
+      st.PC <= st.PC + 4;
    end
 endtask
 
 // JMPR - Jump to address in register
 task t_jump_reg;
    begin
-      r_PC <= r_reg_port_b[31:0];
-      r_SM <= OPCODE_REQUEST;
+      st.PC <= r_reg_port_b[31:0];
+      st.SM <= OPCODE_REQUEST;
    end
 endtask
 
@@ -920,19 +920,19 @@ task t_load_indexed;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
-         r_mem_addr <= effective_addr;
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr <= effective_addr;
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end
       else begin
          if (w_mem_ready) begin
-            r_wb.value <= w_mem_read_data;
-            r_wb.rd <= r_reg_1;
-            r_SM <= WRITEBACK;
-            r_mem_read_DV <= 1'b0;
-            r_PC <= r_PC + 8;
+            st.wb.value <= w_mem_read_data;
+            st.wb.rd <= st.reg_1;
+            st.SM <= WRITEBACK;
+            st.mem_read_DV <= 1'b0;
+            st.PC <= st.PC + 8;
          end
       end
    end
@@ -943,18 +943,18 @@ task t_store_indexed;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
-         r_mem_addr <= effective_addr;
-         r_mem_write_data <= r_reg_port_a;
-         r_mem_write_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr <= effective_addr;
+         st.mem_write_data <= r_reg_port_a;
+         st.mem_write_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end
       else begin
          if (w_mem_ready) begin
-            r_SM <= OPCODE_REQUEST;
-            r_mem_write_DV <= 1'b0;
-            r_PC <= r_PC + 8;
+            st.SM <= OPCODE_REQUEST;
+            st.mem_write_DV <= 1'b0;
+            st.PC <= st.PC + 8;
          end
       end
    end
@@ -965,19 +965,19 @@ task t_load_indexed64;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset[31:0];
-         r_mem_addr    <= {effective_addr[31:3], 3'b000};  // 8-byte aligned
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= {effective_addr[31:3], 3'b000};  // 8-byte aligned
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end
       else begin
          if (w_mem_ready) begin
-            r_wb.value <= w_mem_read_data;
-            r_wb.rd   <= r_reg_1;
-            r_SM              <= WRITEBACK;
-            r_mem_read_DV     <= 1'b0;
-            r_PC              <= r_PC + 8;
+            st.wb.value <= w_mem_read_data;
+            st.wb.rd   <= st.reg_1;
+            st.SM              <= WRITEBACK;
+            st.mem_read_DV     <= 1'b0;
+            st.PC              <= st.PC + 8;
          end
       end
    end
@@ -988,19 +988,19 @@ task t_store_indexed64;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset[31:0];
-         r_mem_addr       <= {effective_addr[31:3], 3'b000};  // 8-byte aligned
-         r_mem_write_data <= r_reg_port_a;
-         r_mem_byte_en    <= 8'hFF;
-         r_mem_write_DV   <= 1'b1;
-         r_extra_clock    <= 1'b1;
+         st.mem_addr       <= {effective_addr[31:3], 3'b000};  // 8-byte aligned
+         st.mem_write_data <= r_reg_port_a;
+         st.mem_byte_en    <= 8'hFF;
+         st.mem_write_DV   <= 1'b1;
+         st.extra_clock    <= 1'b1;
       end
       else begin
          if (w_mem_ready) begin
-            r_SM           <= OPCODE_REQUEST;
-            r_mem_write_DV <= 1'b0;
-            r_PC           <= r_PC + 8;
+            st.SM           <= OPCODE_REQUEST;
+            st.mem_write_DV <= 1'b0;
+            st.PC           <= st.PC + 8;
          end
       end
    end
@@ -1014,30 +1014,30 @@ task t_load_indexed_reg;
    input [31:0] i_var1;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          // Stage 0: Save base address, redirect port B to offset register
-         r_idx_base_addr <= r_reg_port_b[31:0];
-         r_reg_2 <= i_var1[3:0];
-         r_extra_clock <= 2'd1;
+         st.idx_base_addr <= r_reg_port_b[31:0];
+         st.reg_2 <= i_var1[3:0];
+         st.extra_clock <= 2'd1;
       end
-      else if (r_extra_clock == 1) begin
+      else if (st.extra_clock == 1) begin
          // Stage 1: Wait for read port to update with offset register value
-         r_extra_clock <= 2'd2;
+         st.extra_clock <= 2'd2;
       end
       else begin
-         if (!r_mem_read_DV) begin
+         if (!st.mem_read_DV) begin
             // Stage 2a: Compute effective address and start memory read
-            effective_addr = r_idx_base_addr + r_reg_port_b[31:0];
-            r_mem_addr <= effective_addr;
-            r_mem_read_DV <= 1'b1;
+            effective_addr = st.idx_base_addr + r_reg_port_b[31:0];
+            st.mem_addr <= effective_addr;
+            st.mem_read_DV <= 1'b1;
          end
          else if (w_mem_ready) begin
             // Stage 2b: Memory ready, capture result
-            r_wb.value <= w_mem_read_data;
-            r_wb.rd <= r_reg_1;
-            r_SM <= WRITEBACK;
-            r_mem_read_DV <= 1'b0;
-            r_PC <= r_PC + 8;
+            st.wb.value <= w_mem_read_data;
+            st.wb.rd <= st.reg_1;
+            st.SM <= WRITEBACK;
+            st.mem_read_DV <= 1'b0;
+            st.PC <= st.PC + 8;
          end
       end
    end
@@ -1050,29 +1050,29 @@ task t_store_indexed_reg;
    input [31:0] i_var1;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          // Stage 0: Save base address and store data, redirect port B to offset register
-         r_idx_base_addr <= r_reg_port_b[31:0];
-         r_mem_write_data <= r_reg_port_a;
-         r_reg_2 <= i_var1[3:0];
-         r_extra_clock <= 2'd1;
+         st.idx_base_addr <= r_reg_port_b[31:0];
+         st.mem_write_data <= r_reg_port_a;
+         st.reg_2 <= i_var1[3:0];
+         st.extra_clock <= 2'd1;
       end
-      else if (r_extra_clock == 1) begin
+      else if (st.extra_clock == 1) begin
          // Stage 1: Wait for read port to update with offset register value
-         r_extra_clock <= 2'd2;
+         st.extra_clock <= 2'd2;
       end
       else begin
-         if (!r_mem_write_DV) begin
+         if (!st.mem_write_DV) begin
             // Stage 2a: Compute effective address and start memory write
-            effective_addr = r_idx_base_addr + r_reg_port_b[31:0];
-            r_mem_addr <= effective_addr;
-            r_mem_write_DV <= 1'b1;
+            effective_addr = st.idx_base_addr + r_reg_port_b[31:0];
+            st.mem_addr <= effective_addr;
+            st.mem_write_DV <= 1'b1;
          end
          else if (w_mem_ready) begin
             // Stage 2b: Memory write complete
-            r_SM <= OPCODE_REQUEST;
-            r_mem_write_DV <= 1'b0;
-            r_PC <= r_PC + 8;
+            st.SM <= OPCODE_REQUEST;
+            st.mem_write_DV <= 1'b0;
+            st.PC <= st.PC + 8;
          end
       end
    end
@@ -1081,7 +1081,7 @@ endtask
 // ---------------------------------------------------------------------------
 // Sub-word indexed load/store  (RRV, 2-word instructions, PC += 8)
 // effective_addr = r_reg_port_b[31:0] + zero_ext(i_offset)
-// Data register  = r_reg_port_a  (stores: source;  loads: dest = r_reg_1)
+// Data register  = r_reg_port_a  (stores: source;  loads: dest = st.reg_1)
 // Big-endian 64-bit bus — same byte-lane conventions as MEMGET/MEMSET tasks.
 // r_reg_port_b remains stable across both cycles (no writeback until WRITEBACK
 // state), so the lane selector can be recomputed in cycle 1 from the same inputs.
@@ -1092,21 +1092,21 @@ task t_load_indexed32;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr    <= {effective_addr[31:2], 2'b00};
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= {effective_addr[31:2], 2'b00};
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
-            r_mem_read_DV     <= 1'b0;
-            r_wb.value <= effective_addr[2] ?
+            st.mem_read_DV     <= 1'b0;
+            st.wb.value <= effective_addr[2] ?
                {32'b0, w_mem_read_data[63:32]} :
                {32'b0, w_mem_read_data[31:0]};
-            r_wb.rd <= r_reg_1;
-            r_SM            <= WRITEBACK;
-            r_PC            <= r_PC + 8;
+            st.wb.rd <= st.reg_1;
+            st.SM            <= WRITEBACK;
+            st.PC            <= st.PC + 8;
          end
       end
    end
@@ -1117,18 +1117,18 @@ task t_store_indexed32;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr       <= {effective_addr[31:2], 2'b00};
-         r_mem_write_data <= {r_reg_port_a[31:0], r_reg_port_a[31:0]};
-         r_mem_byte_en    <= effective_addr[2] ? 8'b1111_0000 : 8'b0000_1111;
-         r_mem_write_DV   <= 1'b1;
-         r_extra_clock    <= 1'b1;
+         st.mem_addr       <= {effective_addr[31:2], 2'b00};
+         st.mem_write_data <= {r_reg_port_a[31:0], r_reg_port_a[31:0]};
+         st.mem_byte_en    <= effective_addr[2] ? 8'b1111_0000 : 8'b0000_1111;
+         st.mem_write_DV   <= 1'b1;
+         st.extra_clock    <= 1'b1;
       end else begin
          if (w_mem_ready) begin
-            r_mem_write_DV <= 1'b0;
-            r_SM           <= OPCODE_REQUEST;
-            r_PC           <= r_PC + 8;
+            st.mem_write_DV <= 1'b0;
+            st.SM           <= OPCODE_REQUEST;
+            st.PC           <= st.PC + 8;
          end
       end
    end
@@ -1139,24 +1139,24 @@ task t_load_indexed16;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr    <= {effective_addr[31:1], 1'b0};
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= {effective_addr[31:1], 1'b0};
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
-            r_mem_read_DV <= 1'b0;
+            st.mem_read_DV <= 1'b0;
             case (effective_addr[2:1])
-               2'b00: r_wb.value <= {48'b0, w_mem_read_data[15:0]};
-               2'b01: r_wb.value <= {48'b0, w_mem_read_data[31:16]};
-               2'b10: r_wb.value <= {48'b0, w_mem_read_data[47:32]};
-               2'b11: r_wb.value <= {48'b0, w_mem_read_data[63:48]};
+               2'b00: st.wb.value <= {48'b0, w_mem_read_data[15:0]};
+               2'b01: st.wb.value <= {48'b0, w_mem_read_data[31:16]};
+               2'b10: st.wb.value <= {48'b0, w_mem_read_data[47:32]};
+               2'b11: st.wb.value <= {48'b0, w_mem_read_data[63:48]};
             endcase
-            r_wb.rd <= r_reg_1;
-            r_SM            <= WRITEBACK;
-            r_PC            <= r_PC + 8;
+            st.wb.rd <= st.reg_1;
+            st.SM            <= WRITEBACK;
+            st.PC            <= st.PC + 8;
          end
       end
    end
@@ -1171,25 +1171,25 @@ task t_load_indexed16_s;
    logic [31:0] effective_addr;
    logic [15:0] half_val;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr    <= {effective_addr[31:1], 1'b0};
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= {effective_addr[31:1], 1'b0};
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
-            r_mem_read_DV <= 1'b0;
+            st.mem_read_DV <= 1'b0;
             case (effective_addr[2:1])
                2'b00: half_val = w_mem_read_data[15:0];
                2'b01: half_val = w_mem_read_data[31:16];
                2'b10: half_val = w_mem_read_data[47:32];
                2'b11: half_val = w_mem_read_data[63:48];
             endcase
-            r_wb.value <= {{48{half_val[15]}}, half_val};
-            r_wb.rd   <= r_reg_1;
-            r_SM              <= WRITEBACK;
-            r_PC              <= r_PC + 8;
+            st.wb.value <= {{48{half_val[15]}}, half_val};
+            st.wb.rd   <= st.reg_1;
+            st.SM              <= WRITEBACK;
+            st.PC              <= st.PC + 8;
          end
       end
    end
@@ -1201,19 +1201,19 @@ task t_store_indexed16;
    logic [31:0] effective_addr;
    logic [2:0]  byte_lane;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;
          byte_lane        = {effective_addr[2:1], 1'b0};
-         r_mem_addr       <= {effective_addr[31:1], 1'b0};
-         r_mem_write_data <= {4{r_reg_port_a[15:0]}};
-         r_mem_byte_en    <= 8'b0000_0011 << byte_lane;
-         r_mem_write_DV   <= 1'b1;
-         r_extra_clock    <= 1'b1;
+         st.mem_addr       <= {effective_addr[31:1], 1'b0};
+         st.mem_write_data <= {4{r_reg_port_a[15:0]}};
+         st.mem_byte_en    <= 8'b0000_0011 << byte_lane;
+         st.mem_write_DV   <= 1'b1;
+         st.extra_clock    <= 1'b1;
       end else begin
          if (w_mem_ready) begin
-            r_mem_write_DV <= 1'b0;
-            r_SM           <= OPCODE_REQUEST;
-            r_PC           <= r_PC + 8;
+            st.mem_write_DV <= 1'b0;
+            st.SM           <= OPCODE_REQUEST;
+            st.PC           <= st.PC + 8;
          end
       end
    end
@@ -1224,28 +1224,28 @@ task t_load_indexed8;
    input [31:0] i_offset;
    logic [31:0] effective_addr;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr    <= effective_addr;
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= effective_addr;
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
-            r_mem_read_DV <= 1'b0;
+            st.mem_read_DV <= 1'b0;
             case (effective_addr[2:0])
-               3'b000: r_wb.value <= {56'b0, w_mem_read_data[7:0]};
-               3'b001: r_wb.value <= {56'b0, w_mem_read_data[15:8]};
-               3'b010: r_wb.value <= {56'b0, w_mem_read_data[23:16]};
-               3'b011: r_wb.value <= {56'b0, w_mem_read_data[31:24]};
-               3'b100: r_wb.value <= {56'b0, w_mem_read_data[39:32]};
-               3'b101: r_wb.value <= {56'b0, w_mem_read_data[47:40]};
-               3'b110: r_wb.value <= {56'b0, w_mem_read_data[55:48]};
-               3'b111: r_wb.value <= {56'b0, w_mem_read_data[63:56]};
+               3'b000: st.wb.value <= {56'b0, w_mem_read_data[7:0]};
+               3'b001: st.wb.value <= {56'b0, w_mem_read_data[15:8]};
+               3'b010: st.wb.value <= {56'b0, w_mem_read_data[23:16]};
+               3'b011: st.wb.value <= {56'b0, w_mem_read_data[31:24]};
+               3'b100: st.wb.value <= {56'b0, w_mem_read_data[39:32]};
+               3'b101: st.wb.value <= {56'b0, w_mem_read_data[47:40]};
+               3'b110: st.wb.value <= {56'b0, w_mem_read_data[55:48]};
+               3'b111: st.wb.value <= {56'b0, w_mem_read_data[63:56]};
             endcase
-            r_wb.rd <= r_reg_1;
-            r_SM            <= WRITEBACK;
-            r_PC            <= r_PC + 8;
+            st.wb.rd <= st.reg_1;
+            st.SM            <= WRITEBACK;
+            st.PC            <= st.PC + 8;
          end
       end
    end
@@ -1260,15 +1260,15 @@ task t_load_indexed8_s;
    logic [31:0] effective_addr;
    logic [7:0]  byte_val;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr = r_reg_port_b[31:0] + i_offset;
-         r_mem_addr    <= effective_addr;
-         r_mem_read_DV <= 1'b1;
-         r_extra_clock <= 1'b1;
+         st.mem_addr    <= effective_addr;
+         st.mem_read_DV <= 1'b1;
+         st.extra_clock <= 1'b1;
       end else begin
          if (w_mem_ready) begin
             effective_addr = r_reg_port_b[31:0] + i_offset;
-            r_mem_read_DV <= 1'b0;
+            st.mem_read_DV <= 1'b0;
             case (effective_addr[2:0])
                3'b000: byte_val = w_mem_read_data[7:0];
                3'b001: byte_val = w_mem_read_data[15:8];
@@ -1279,10 +1279,10 @@ task t_load_indexed8_s;
                3'b110: byte_val = w_mem_read_data[55:48];
                3'b111: byte_val = w_mem_read_data[63:56];
             endcase
-            r_wb.value <= {{56{byte_val[7]}}, byte_val};
-            r_wb.rd   <= r_reg_1;
-            r_SM              <= WRITEBACK;
-            r_PC              <= r_PC + 8;
+            st.wb.value <= {{56{byte_val[7]}}, byte_val};
+            st.wb.rd   <= st.reg_1;
+            st.SM              <= WRITEBACK;
+            st.PC              <= st.PC + 8;
          end
       end
    end
@@ -1294,19 +1294,19 @@ task t_store_indexed8;
    logic [31:0] effective_addr;
    logic [2:0]  byte_lane;
    begin
-      if (r_extra_clock == 0) begin
+      if (st.extra_clock == 0) begin
          effective_addr   = r_reg_port_b[31:0] + i_offset;
          byte_lane        = effective_addr[2:0];
-         r_mem_addr       <= effective_addr;
-         r_mem_write_data <= {8{r_reg_port_a[7:0]}};
-         r_mem_byte_en    <= 8'b0000_0001 << byte_lane;
-         r_mem_write_DV   <= 1'b1;
-         r_extra_clock    <= 1'b1;
+         st.mem_addr       <= effective_addr;
+         st.mem_write_data <= {8{r_reg_port_a[7:0]}};
+         st.mem_byte_en    <= 8'b0000_0001 << byte_lane;
+         st.mem_write_DV   <= 1'b1;
+         st.extra_clock    <= 1'b1;
       end else begin
          if (w_mem_ready) begin
-            r_mem_write_DV <= 1'b0;
-            r_SM           <= OPCODE_REQUEST;
-            r_PC           <= r_PC + 8;
+            st.mem_write_DV <= 1'b0;
+            st.SM           <= OPCODE_REQUEST;
+            st.PC           <= st.PC + 8;
          end
       end
    end

@@ -9,14 +9,14 @@
 task t_rx_blocking;
     begin
         if (w_rx_fifo_empty) begin
-            r_SM <= OPCODE_EXECUTE;  // retry next clock
+            st.SM <= OPCODE_EXECUTE;  // retry next clock
         end else begin
-            r_rx_fifo_read            <= 1'b1;
-            r_wb.value         <= {24'b0, w_rx_fifo_byte};
-            r_wb.rd           <= r_reg_2;
-            r_flags.zero               <= 1'b0;
-            r_SM <= WRITEBACK;
-            r_PC <= r_PC + 4;
+            st.rx_fifo_read            <= 1'b1;
+            st.wb.value         <= {24'b0, w_rx_fifo_byte};
+            st.wb.rd           <= st.reg_2;
+            st.flags.zero               <= 1'b0;
+            st.SM <= WRITEBACK;
+            st.PC <= st.PC + 4;
         end
     end
 endtask
@@ -29,22 +29,22 @@ endtask
 task t_rx_nonblocking;
     begin
         if (w_rx_fifo_empty) begin
-            r_flags.zero <= 1'b1;
-            r_SM <= OPCODE_REQUEST;
-            r_PC <= r_PC + 4;
+            st.flags.zero <= 1'b1;
+            st.SM <= OPCODE_REQUEST;
+            st.PC <= st.PC + 4;
         end else begin
-            r_rx_fifo_read    <= 1'b1;
-            r_wb.value <= {24'b0, w_rx_fifo_byte};
-            r_wb.rd   <= r_reg_2;
-            r_flags.zero       <= 1'b0;
-            r_SM <= WRITEBACK;
-            r_PC <= r_PC + 4;
+            st.rx_fifo_read    <= 1'b1;
+            st.wb.value <= {24'b0, w_rx_fifo_byte};
+            st.wb.rd   <= st.reg_2;
+            st.flags.zero       <= 1'b0;
+            st.SM <= WRITEBACK;
+            st.PC <= st.PC + 4;
         end
     end
 endtask
 
 // t_debug_message — build "PC is <hex>\r" into r_msg and pulse r_msg_send_DV.
-// Helper only: does NOT set r_SM or advance r_PC (caller drives those).
+// Helper only: does NOT set st.SM or advance st.PC (caller drives those).
 // Prints PC[26:0] as 7 hex chars (PC[26:24] shown as a single nibble).
 task t_debug_message;
     begin
@@ -56,13 +56,13 @@ task t_debug_message;
             r_msg[39:32] <= 8'h73;  // s
             r_msg[47:40] <= 8'h20;  //  
 
-            r_msg[55:48] <= return_ascii_from_hex({1'b0, r_PC[26:24]});
-            r_msg[63:56] <= return_ascii_from_hex(r_PC[23:20]);
-            r_msg[71:64] <= return_ascii_from_hex(r_PC[19:16]);
-            r_msg[79:72] <= return_ascii_from_hex(r_PC[15:12]);
-            r_msg[87:80] <= return_ascii_from_hex(r_PC[11:8]);
-            r_msg[95:88] <= return_ascii_from_hex(r_PC[7:4]);
-            r_msg[103:96] <= return_ascii_from_hex(r_PC[3:0]);
+            r_msg[55:48] <= return_ascii_from_hex({1'b0, st.PC[26:24]});
+            r_msg[63:56] <= return_ascii_from_hex(st.PC[23:20]);
+            r_msg[71:64] <= return_ascii_from_hex(st.PC[19:16]);
+            r_msg[79:72] <= return_ascii_from_hex(st.PC[15:12]);
+            r_msg[87:80] <= return_ascii_from_hex(st.PC[11:8]);
+            r_msg[95:88] <= return_ascii_from_hex(st.PC[7:4]);
+            r_msg[103:96] <= return_ascii_from_hex(st.PC[3:0]);
 
             r_msg[111:104] <= 8'h0D;  // CR
 
@@ -80,8 +80,8 @@ task t_test_message;
     begin
         if (!w_sending_msg) begin
             t_tx_message(8'd3);
-            r_SM <= OPCODE_REQUEST;
-            r_PC <= r_PC + 4;
+            st.SM <= OPCODE_REQUEST;
+            st.PC <= st.PC + 4;
         end
     end
 endtask
@@ -92,20 +92,20 @@ endtask
 // Increment r_SM_msg
 task t_tx_char_from_reg_value;
     begin
-        if (r_extra_clock == 0) begin
-            r_mem_addr <= r_reg_port_b[26:0];
-            r_mem_read_DV <= 1'b1;
-            r_mem_was_ready <=1'b0;
-            r_extra_clock <= 1'b1;
+        if (st.extra_clock == 0) begin
+            st.mem_addr <= r_reg_port_b[26:0];
+            st.mem_read_DV <= 1'b1;
+            st.mem_was_ready <=1'b0;
+            st.extra_clock <= 1'b1;
         end // if first loop
         else
         begin
             if (w_mem_ready) begin
-                r_mem_read_DV <= 1'b0;
-                r_mem_was_ready <= 1'b1;
+                st.mem_read_DV <= 1'b0;
+                st.mem_was_ready <= 1'b1;
                 
             end       
-            if ((w_mem_ready||r_mem_was_ready) && !w_sending_msg) begin
+            if ((w_mem_ready||st.mem_was_ready) && !w_sending_msg) begin
                 // Little-endian: select the byte at the given byte-lane offset within
                 // the 64-bit doubleword.  addr[2:0]=0 → bits[7:0] (LSByte), 7 → bits[63:56].
                 case (r_reg_port_b[2:0])
@@ -120,9 +120,9 @@ task t_tx_char_from_reg_value;
                 endcase
                 r_msg_length <= 8'h1;
                 r_msg_send_DV <= 1'b1;
-                r_SM <= UART_DELAY;
-                r_mem_read_DV <= 1'b0;
-                r_PC <= r_PC + 4;
+                st.SM <= UART_DELAY;
+                st.mem_read_DV <= 1'b0;
+                st.PC <= st.PC + 4;
             end  // if ready asserted, else will loop until ready
         end  // if subsequent loop
     end
@@ -134,20 +134,20 @@ endtask
 // Increment r_SM_msg
 task t_tx_value_of_mem_at_reg;
     begin
-        if (r_extra_clock == 0) begin
-            r_mem_addr <= r_reg_port_b[26:0];
-            r_mem_read_DV <= 1'b1;
-            r_mem_was_ready <=1'b0;
-            r_extra_clock <= 1'b1;
+        if (st.extra_clock == 0) begin
+            st.mem_addr <= r_reg_port_b[26:0];
+            st.mem_read_DV <= 1'b1;
+            st.mem_was_ready <=1'b0;
+            st.extra_clock <= 1'b1;
         end // if first loop
         else
         begin
             if (w_mem_ready) begin
-                r_mem_read_DV <= 1'b0;
-                r_mem_was_ready <= 1'b1;
+                st.mem_read_DV <= 1'b0;
+                st.mem_was_ready <= 1'b1;
                 
             end       
-            if ((w_mem_ready||r_mem_was_ready) && !w_sending_msg) begin
+            if ((w_mem_ready||st.mem_was_ready) && !w_sending_msg) begin
                 // Print all 64 bits as 16 hex chars, MSB first.
                 r_msg[7:0]    <= return_ascii_from_hex(w_mem_read_data[63:60]);
                 r_msg[15:8]   <= return_ascii_from_hex(w_mem_read_data[59:56]);
@@ -167,9 +167,9 @@ task t_tx_value_of_mem_at_reg;
                 r_msg[127:120]<= return_ascii_from_hex(w_mem_read_data[3:0]);
                 r_msg_length <= 8'h10;
                 r_msg_send_DV <= 1'b1;
-                r_SM <= UART_DELAY;
-                r_mem_read_DV <= 1'b0;
-                r_PC <= r_PC + 4;
+                st.SM <= UART_DELAY;
+                st.mem_read_DV <= 1'b0;
+                st.PC <= st.PC + 4;
             end  // if ready asserted, else will loop until ready
         end  // if subsequent loop
     end
@@ -182,20 +182,20 @@ endtask
 task t_tx_value_of_mem;
     input [31:0] i_location;
     begin
-        if (r_extra_clock == 0) begin
-            r_mem_addr <= i_location[26:0];
-            r_mem_read_DV <= 1'b1;
-            r_mem_was_ready <=1'b0;
-            r_extra_clock <= 1'b1;
+        if (st.extra_clock == 0) begin
+            st.mem_addr <= i_location[26:0];
+            st.mem_read_DV <= 1'b1;
+            st.mem_was_ready <=1'b0;
+            st.extra_clock <= 1'b1;
         end // if first loop
         else
         begin
             if (w_mem_ready) begin
-                r_mem_read_DV <= 1'b0;
-                r_mem_was_ready <= 1'b1;
+                st.mem_read_DV <= 1'b0;
+                st.mem_was_ready <= 1'b1;
                 
             end       
-            if ((w_mem_ready||r_mem_was_ready) && !w_sending_msg) begin
+            if ((w_mem_ready||st.mem_was_ready) && !w_sending_msg) begin
                 // Print all 64 bits as 16 hex chars, MSB first.
                 r_msg[7:0]    <= return_ascii_from_hex(w_mem_read_data[63:60]);
                 r_msg[15:8]   <= return_ascii_from_hex(w_mem_read_data[59:56]);
@@ -215,9 +215,9 @@ task t_tx_value_of_mem;
                 r_msg[127:120]<= return_ascii_from_hex(w_mem_read_data[3:0]);
                 r_msg_length <= 8'h10;
                 r_msg_send_DV <= 1'b1;
-                r_SM <= UART_DELAY;
-                r_mem_read_DV <= 1'b0;
-                r_PC <= r_PC + 8;
+                st.SM <= UART_DELAY;
+                st.mem_read_DV <= 1'b0;
+                st.PC <= st.PC + 8;
             end  // if ready asserted, else will loop until ready
         end  // if subsequent loop
     end
@@ -225,7 +225,7 @@ endtask
 
 // Send null-terminated string from memory location (at imm32).
 // Mirror of t_tx_string_at_reg — see that task for the state-machine commentary.
-// On completion: r_PC += 8 (2-word instruction: opcode + imm32).
+// On completion: st.PC += 8 (2-word instruction: opcode + imm32).
 task t_tx_string_at_mem;
     input [31:0] i_location;
     logic [3:0]  null_pos;
@@ -242,8 +242,8 @@ task t_tx_string_at_mem;
             // fetch in OPCODE_FETCH2 → VAR1_FETCH path), which would otherwise
             // make state 010 scan the var1 doubleword instead of the string.
             r_tx_str_addr_mem  <= i_location[26:0];
-            r_mem_addr         <= i_location[26:0];
-            r_mem_read_DV      <= 1'b1;
+            st.mem_addr         <= i_location[26:0];
+            st.mem_read_DV      <= 1'b1;
             r_tx_str_state_mem <= 3'b110;
         end
         else if (r_tx_str_state_mem == 3'b110) begin
@@ -251,7 +251,7 @@ task t_tx_string_at_mem;
         end
         else if (r_tx_str_state_mem == 3'b001) begin
             if (w_mem_ready) begin
-                r_mem_read_DV      <= 1'b0;
+                st.mem_read_DV      <= 1'b0;
                 r_tx_str_state_mem <= 3'b010;
             end
         end
@@ -304,8 +304,8 @@ task t_tx_string_at_mem;
                 r_msg[63:0]       <= shifted_data;
 
                 if (has_null && null_pos == 4'h0) begin
-                    r_SM               <= UART_DELAY;
-                    r_PC               <= r_PC + 8;
+                    st.SM               <= UART_DELAY;
+                    st.PC               <= st.PC + 8;
                     r_tx_str_state_mem <= 3'b000;
                 end else begin
                     r_msg_length       <= has_null ? {4'b0, null_pos} : {4'b0, usable_bytes};
@@ -323,15 +323,15 @@ task t_tx_string_at_mem;
         else if (r_tx_str_state_mem == 3'b100) begin
             if (i_msg_sent_DV) begin
                 if (r_tx_str_done_mem) begin
-                    r_SM               <= UART_DELAY;
-                    r_PC               <= r_PC + 8;
+                    st.SM               <= UART_DELAY;
+                    st.PC               <= st.PC + 8;
                     r_tx_str_state_mem <= 3'b000;
                 end else begin
                     // Advance to next 8-byte boundary. For an aligned current
                     // addr this is a regular +8; for an unaligned first chunk
                     // it rounds up so subsequent reads see offset 0.
-                    r_mem_addr         <= (r_tx_str_addr_mem + 8) & ~32'h7;
-                    r_mem_read_DV      <= 1'b1;
+                    st.mem_addr         <= (r_tx_str_addr_mem + 8) & ~32'h7;
+                    st.mem_read_DV      <= 1'b1;
                     r_tx_str_addr_mem  <= (r_tx_str_addr_mem + 8) & ~32'h7;
                     r_tx_str_state_mem <= 3'b001;
                 end
@@ -366,7 +366,7 @@ endtask
 //        need the 110 bubble because by the time i_msg_sent_DV fires the cache
 //        has been idle for thousands of cycles and ready is firmly 0.
 //
-// On completion: r_PC += 4 (1-word instruction).
+// On completion: st.PC += 4 (1-word instruction).
 //
 // Unaligned base addresses: the cache returns 8-byte aligned doublewords
 // regardless of the requested low bits, so for a string starting at addr
@@ -384,8 +384,8 @@ task t_tx_string_at_reg;
     begin
         if (r_tx_str_state_reg == 3'b000) begin
             r_tx_str_addr_reg  <= r_reg_port_b[26:0];
-            r_mem_addr         <= r_reg_port_b[26:0];
-            r_mem_read_DV      <= 1'b1;
+            st.mem_addr         <= r_reg_port_b[26:0];
+            st.mem_read_DV      <= 1'b1;
             r_tx_str_state_reg <= 3'b110;
         end
         else if (r_tx_str_state_reg == 3'b110) begin
@@ -393,7 +393,7 @@ task t_tx_string_at_reg;
         end
         else if (r_tx_str_state_reg == 3'b001) begin
             if (w_mem_ready) begin
-                r_mem_read_DV      <= 1'b0;
+                st.mem_read_DV      <= 1'b0;
                 r_tx_str_state_reg <= 3'b010;
             end
         end
@@ -439,8 +439,8 @@ task t_tx_string_at_reg;
                     // a subsequent chunk's byte 0 is null after prior chunks were
                     // already sent. Either way, this chunk has zero bytes to send;
                     // length=0 would otherwise underflow the UART byte counter.
-                    r_SM               <= UART_DELAY;
-                    r_PC               <= r_PC + 4;
+                    st.SM               <= UART_DELAY;
+                    st.PC               <= st.PC + 4;
                     r_tx_str_state_reg <= 3'b000;
                 end else begin
                     r_msg_length       <= has_null ? {4'b0, null_pos} : {4'b0, usable_bytes};
@@ -461,16 +461,16 @@ task t_tx_string_at_reg;
             // Wait for UART completion pulse (one cycle, fires on s_CLEANUP entry).
             if (i_msg_sent_DV) begin
                 if (r_tx_str_done_reg) begin
-                    r_SM               <= UART_DELAY;
-                    r_PC               <= r_PC + 4;
+                    st.SM               <= UART_DELAY;
+                    st.PC               <= st.PC + 4;
                     r_tx_str_state_reg <= 3'b000;
                 end else begin
                     // Round up to the next 8-byte boundary. For an aligned
                     // current addr this is a regular +8; for an unaligned
                     // first chunk it skips the partial bytes so subsequent
                     // chunks see offset 0 in state 010.
-                    r_mem_addr         <= (r_tx_str_addr_reg + 8) & ~32'h7;
-                    r_mem_read_DV      <= 1'b1;
+                    st.mem_addr         <= (r_tx_str_addr_reg + 8) & ~32'h7;
+                    st.mem_read_DV      <= 1'b1;
                     r_tx_str_addr_reg  <= (r_tx_str_addr_reg + 8) & ~32'h7;
                     r_tx_str_state_reg <= 3'b001;
                 end
@@ -491,8 +491,8 @@ task t_tx_newline;
             r_msg[15:8] <= 8'h0D;
             r_msg_length <= 8'h2;
             r_msg_send_DV <= 1'b1;
-            r_SM <= UART_DELAY;
-            r_PC <= r_PC + 4;
+            st.SM <= UART_DELAY;
+            st.PC <= st.PC + 4;
         end
     end
 endtask
@@ -522,8 +522,8 @@ task t_tx_reg;
             r_msg[127:120] <= return_ascii_from_hex(r_reg_port_b[3:0]);
             r_msg_length <= 8'h10;
             r_msg_send_DV <= 1'b1;
-            r_SM <= UART_DELAY;
-            r_PC <= r_PC + 4;
+            st.SM <= UART_DELAY;
+            st.PC <= st.PC + 4;
         end
     end
 endtask
@@ -534,7 +534,7 @@ endtask
 //   1 = "Load Complete OK"   2 = "Load Error, bad CRC"
 //   3 = "Test message"       4 = "Segfault: exec data" (ERR_SEG_EXEC_DATA; unused)
 //   default = empty message (length 0)
-// Helper only: does NOT set r_SM or advance r_PC (caller drives those).
+// Helper only: does NOT set st.SM or advance st.PC (caller drives those).
 task t_tx_message;
     input [7:0] i_message_number;
     begin
@@ -749,20 +749,20 @@ function [7:0] f_dump_byte;
                     5'd1:  f_dump_byte = "R";
                     5'd2:  f_dump_byte = "R";
                     5'd3:  f_dump_byte = "=";
-                    5'd4:  f_dump_byte = return_ascii_from_hex(r_error_code[7:4]);
-                    5'd5:  f_dump_byte = return_ascii_from_hex(r_error_code[3:0]);
+                    5'd4:  f_dump_byte = return_ascii_from_hex(st.error_code[7:4]);
+                    5'd5:  f_dump_byte = return_ascii_from_hex(st.error_code[3:0]);
                     5'd6:  f_dump_byte = " ";
                     5'd7:  f_dump_byte = "P";
                     5'd8:  f_dump_byte = "C";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = return_ascii_from_hex(r_PC[31:28]);
-                    5'd11: f_dump_byte = return_ascii_from_hex(r_PC[27:24]);
-                    5'd12: f_dump_byte = return_ascii_from_hex(r_PC[23:20]);
-                    5'd13: f_dump_byte = return_ascii_from_hex(r_PC[19:16]);
-                    5'd14: f_dump_byte = return_ascii_from_hex(r_PC[15:12]);
-                    5'd15: f_dump_byte = return_ascii_from_hex(r_PC[11: 8]);
-                    5'd16: f_dump_byte = return_ascii_from_hex(r_PC[ 7: 4]);
-                    5'd17: f_dump_byte = return_ascii_from_hex(r_PC[ 3: 0]);
+                    5'd10: f_dump_byte = return_ascii_from_hex(st.PC[31:28]);
+                    5'd11: f_dump_byte = return_ascii_from_hex(st.PC[27:24]);
+                    5'd12: f_dump_byte = return_ascii_from_hex(st.PC[23:20]);
+                    5'd13: f_dump_byte = return_ascii_from_hex(st.PC[19:16]);
+                    5'd14: f_dump_byte = return_ascii_from_hex(st.PC[15:12]);
+                    5'd15: f_dump_byte = return_ascii_from_hex(st.PC[11: 8]);
+                    5'd16: f_dump_byte = return_ascii_from_hex(st.PC[ 7: 4]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(st.PC[ 3: 0]);
                     5'd18: f_dump_byte = 8'h0D;
                     5'd19: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
@@ -788,14 +788,14 @@ function [7:0] f_dump_byte;
                     5'd13: f_dump_byte = "S";
                     5'd14: f_dump_byte = "P";
                     5'd15: f_dump_byte = "=";
-                    5'd16: f_dump_byte = return_ascii_from_hex(r_SP[31:28]);
-                    5'd17: f_dump_byte = return_ascii_from_hex(r_SP[27:24]);
-                    5'd18: f_dump_byte = return_ascii_from_hex(r_SP[23:20]);
-                    5'd19: f_dump_byte = return_ascii_from_hex(r_SP[19:16]);
-                    5'd20: f_dump_byte = return_ascii_from_hex(r_SP[15:12]);
-                    5'd21: f_dump_byte = return_ascii_from_hex(r_SP[11: 8]);
-                    5'd22: f_dump_byte = return_ascii_from_hex(r_SP[ 7: 4]);
-                    5'd23: f_dump_byte = return_ascii_from_hex(r_SP[ 3: 0]);
+                    5'd16: f_dump_byte = return_ascii_from_hex(st.SP[31:28]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(st.SP[27:24]);
+                    5'd18: f_dump_byte = return_ascii_from_hex(st.SP[23:20]);
+                    5'd19: f_dump_byte = return_ascii_from_hex(st.SP[19:16]);
+                    5'd20: f_dump_byte = return_ascii_from_hex(st.SP[15:12]);
+                    5'd21: f_dump_byte = return_ascii_from_hex(st.SP[11: 8]);
+                    5'd22: f_dump_byte = return_ascii_from_hex(st.SP[ 7: 4]);
+                    5'd23: f_dump_byte = return_ascii_from_hex(st.SP[ 3: 0]);
                     5'd24: f_dump_byte = 8'h0D;
                     5'd25: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
@@ -821,14 +821,14 @@ function [7:0] f_dump_byte;
                     5'd13: f_dump_byte = "D";
                     5'd14: f_dump_byte = "X";
                     5'd15: f_dump_byte = "=";
-                    5'd16: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[31:28]);
-                    5'd17: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[27:24]);
-                    5'd18: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[23:20]);
-                    5'd19: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[19:16]);
-                    5'd20: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[15:12]);
-                    5'd21: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[11: 8]);
-                    5'd22: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[ 7: 4]);
-                    5'd23: f_dump_byte = return_ascii_from_hex(r_idx_base_addr[ 3: 0]);
+                    5'd16: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[31:28]);
+                    5'd17: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[27:24]);
+                    5'd18: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[23:20]);
+                    5'd19: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[19:16]);
+                    5'd20: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[15:12]);
+                    5'd21: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[11: 8]);
+                    5'd22: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[ 7: 4]);
+                    5'd23: f_dump_byte = return_ascii_from_hex(st.idx_base_addr[ 3: 0]);
                     5'd24: f_dump_byte = 8'h0D;
                     5'd25: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
@@ -836,8 +836,8 @@ function [7:0] f_dump_byte;
             end
 
             DUMP_V1H: begin
-                // "V1H=xxxxxxxx\r\n"  (hi32 picked by r_PC[2])
-                half = r_PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
+                // "V1H=xxxxxxxx\r\n"  (hi32 picked by st.PC[2])
+                half = st.PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
                 case (pos)
                     5'd0:  f_dump_byte = "V";
                     5'd1:  f_dump_byte = "1";
@@ -859,7 +859,7 @@ function [7:0] f_dump_byte;
 
             DUMP_OPCM: begin
                 // "OPCM=xxxxxxxx\r\n"
-                half = r_PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
+                half = st.PC[2] ? r_hcf_stack_data[63:32] : r_hcf_stack_data[31:0];
                 case (pos)
                     5'd0:  f_dump_byte = "O";
                     5'd1:  f_dump_byte = "P";
@@ -931,19 +931,19 @@ function [7:0] f_dump_byte;
                     5'd3:  f_dump_byte = " ";
                     5'd4:  f_dump_byte = "Z";
                     5'd5:  f_dump_byte = "=";
-                    5'd6:  f_dump_byte = r_flags.zero     ? "1" : "0";
+                    5'd6:  f_dump_byte = st.flags.zero     ? "1" : "0";
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "E";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = r_flags.equal    ? "1" : "0";
+                    5'd10: f_dump_byte = st.flags.equal    ? "1" : "0";
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "C";
                     5'd13: f_dump_byte = "=";
-                    5'd14: f_dump_byte = r_flags.carry    ? "1" : "0";
+                    5'd14: f_dump_byte = st.flags.carry    ? "1" : "0";
                     5'd15: f_dump_byte = " ";
                     5'd16: f_dump_byte = "V";
                     5'd17: f_dump_byte = "=";
-                    5'd18: f_dump_byte = r_flags.overflow ? "1" : "0";
+                    5'd18: f_dump_byte = st.flags.overflow ? "1" : "0";
                     5'd19: f_dump_byte = 8'h0D;
                     5'd20: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
@@ -959,15 +959,15 @@ function [7:0] f_dump_byte;
                     5'd3:  f_dump_byte = " ";
                     5'd4:  f_dump_byte = "S";
                     5'd5:  f_dump_byte = "=";
-                    5'd6:  f_dump_byte = r_flags.sign ? "1" : "0";
+                    5'd6:  f_dump_byte = st.flags.sign ? "1" : "0";
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "L";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = r_flags.less ? "1" : "0";
+                    5'd10: f_dump_byte = st.flags.less ? "1" : "0";
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "U";
                     5'd13: f_dump_byte = "=";
-                    5'd14: f_dump_byte = r_flags.ult  ? "1" : "0";
+                    5'd14: f_dump_byte = st.flags.ult  ? "1" : "0";
                     5'd15: f_dump_byte = 8'h0D;
                     5'd16: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
