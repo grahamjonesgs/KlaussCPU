@@ -586,19 +586,24 @@ module KlaussCPU (
    // Hardware divide using iterative but optimized state machine
    // For true single-cycle, you'd need a pipelined divider IP
    //=========================================================================
-   logic [63:0] r_div_dividend;
-   logic [63:0] r_div_divisor;
-   logic [63:0] r_div_quotient;
-   logic [63:0] r_div_remainder;
-   logic [6:0]  r_div_counter;
-   logic        r_div_busy;
-   logic        r_div_sign_q;      // Sign of quotient
-   logic        r_div_sign_r;      // Sign of remainder
-   logic        r_div_is_signed;
+   // Multi-cycle divide pipeline state, grouped (all fields move together
+   // through the DIVIDE_PREP/DIVIDE_STEP FSM; accessed as r_div.<field>).
    typedef enum logic [1:0] { DIV_OP_NONE, DIV_OP_DIV, DIV_OP_MOD } e_div_op_t;
-   e_div_op_t   r_div_op;          // none / div / mod
-   logic [3:0]  r_div_dest_reg;    // Destination register for division result
-   logic        r_div_pc_inc;      // 0=PC+1, 1=PC+2
+   typedef struct packed {
+      logic [63:0] dividend;
+      logic [63:0] divisor;
+      logic [63:0] quotient;
+      logic [63:0] remainder;
+      logic [6:0]  counter;
+      logic        busy;
+      logic        sign_q;      // sign of quotient
+      logic        sign_r;      // sign of remainder
+      logic        is_signed;
+      e_div_op_t   op;          // none / div / mod
+      logic [3:0]  dest_reg;    // destination register for the result
+      logic        pc_inc;      // 0=PC+1, 1=PC+2
+   } div_state_t;
+   div_state_t r_div;
 
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
@@ -607,8 +612,8 @@ module KlaussCPU (
    // result (no borrow => result >= 0 => quotient bit 1, take the difference;
    // borrow => quotient bit 0, keep the shifted remainder).  Driving the
    // quotient-bit mux from w_div_borrow halves the logic on this path.
-   wire [63:0] w_div_shifted = {r_div_remainder[62:0], r_div_dividend[63]};
-   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, r_div_divisor};
+   wire [63:0] w_div_shifted = {r_div.remainder[62:0], r_div.dividend[63]};
+   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, r_div.divisor};
    wire        w_div_borrow  = w_div_trial[64];
    
    // Dedicated read ports - registered every cycle
@@ -1229,9 +1234,9 @@ rams_sp_nc rams_sp_nc1 (
       r_flags.sign <= 0;
       r_flags.less <= 0;
       r_flags.ult <= 0;
-      r_div_busy <= 0;
-      r_div_op <= DIV_OP_NONE;
-      r_div_counter <= 0;
+      r_div.busy <= 0;
+      r_div.op <= DIV_OP_NONE;
+      r_div.counter <= 0;
        for (i = 0; i < 16; i = i + 1)
        r_register[i] = 64'b0;
       r_mul_is_immediate = 0;
@@ -2582,54 +2587,54 @@ end
             // their own cycle.
             DIVIDE_PREP: begin : divide_prep
                logic [6:0] prep_clz;
-               prep_clz = count_leading_zeros(r_div_dividend);
+               prep_clz = count_leading_zeros(r_div.dividend);
                if (prep_clz[6]) begin
                   // dividend == 0 (clz = 64): quotient 0, remainder 0 —
                   // go straight to DIVIDE_STEP's finish branch.
-                  r_div_counter <= 7'd64;
+                  r_div.counter <= 7'd64;
                end else begin
-                  r_div_dividend <= r_div_dividend << prep_clz[5:0];
-                  r_div_counter  <= {1'b0, prep_clz[5:0]};
+                  r_div.dividend <= r_div.dividend << prep_clz[5:0];
+                  r_div.counter  <= {1'b0, prep_clz[5:0]};
                end
                r_SM <= DIVIDE_STEP;
             end
 
             DIVIDE_STEP: begin
                // Shared division iteration - avoids re-evaluating opcode casez each cycle
-               if (r_div_counter < 7'd64) begin
+               if (r_div.counter < 7'd64) begin
                   // Restoring division step — single subtract (w_div_trial),
                   // borrow-out (w_div_borrow) selects quotient bit and remainder.
                   if (!w_div_borrow) begin
-                     r_div_remainder <= w_div_trial[63:0];
-                     r_div_quotient  <= {r_div_quotient[62:0], 1'b1};
+                     r_div.remainder <= w_div_trial[63:0];
+                     r_div.quotient  <= {r_div.quotient[62:0], 1'b1};
                   end
                   else begin
-                     r_div_remainder <= w_div_shifted;
-                     r_div_quotient  <= {r_div_quotient[62:0], 1'b0};
+                     r_div.remainder <= w_div_shifted;
+                     r_div.quotient  <= {r_div.quotient[62:0], 1'b0};
                   end
-                  r_div_dividend <= {r_div_dividend[62:0], 1'b0};
-                  r_div_counter <= r_div_counter + 1;
+                  r_div.dividend <= {r_div.dividend[62:0], 1'b0};
+                  r_div.counter <= r_div.counter + 1;
                end
                else begin
                   // Division complete - write result based on op type
-                  if (r_div_op == DIV_OP_DIV) begin
-                     if (r_div_is_signed && r_div_sign_q)
-                        r_wb.value <= ~r_div_quotient + 1;
+                  if (r_div.op == DIV_OP_DIV) begin
+                     if (r_div.is_signed && r_div.sign_q)
+                        r_wb.value <= ~r_div.quotient + 1;
                      else
-                        r_wb.value <= r_div_quotient;
-                     r_flags.zero <= (r_div_quotient == 0) ? 1'b1 : 1'b0;
+                        r_wb.value <= r_div.quotient;
+                     r_flags.zero <= (r_div.quotient == 0) ? 1'b1 : 1'b0;
                   end
                   else begin  // DIV_OP_MOD
-                     if (r_div_is_signed && r_div_sign_r)
-                        r_wb.value <= ~r_div_remainder + 1;
+                     if (r_div.is_signed && r_div.sign_r)
+                        r_wb.value <= ~r_div.remainder + 1;
                      else
-                        r_wb.value <= r_div_remainder;
-                     r_flags.zero <= (r_div_remainder == 0) ? 1'b1 : 1'b0;
+                        r_wb.value <= r_div.remainder;
+                     r_flags.zero <= (r_div.remainder == 0) ? 1'b1 : 1'b0;
                   end
-                  r_wb.rd <= r_div_dest_reg;
+                  r_wb.rd <= r_div.dest_reg;
                   r_flags.overflow <= 1'b0;
-                  r_div_op <= DIV_OP_NONE;
-                  r_PC <= r_PC + (r_div_pc_inc ? 8 : 4);
+                  r_div.op <= DIV_OP_NONE;
+                  r_PC <= r_PC + (r_div.pc_inc ? 8 : 4);
                   // Execute-tail handoff: pre-load r_reg_1/2 from the prefetched
                   // latch (the divide used r_div_* regs, not r_reg_1/2) so the next
                   // dispatch skips FETCH2.
@@ -2772,7 +2777,7 @@ end
 
    //=========================================================================
    // Performance-counter block (Tier 0/1/2). Its own always block: reads
-   // existing FSM state (r_SM, r_div_counter, r_int_push_wait), the decoded
+   // existing FSM state (r_SM, r_div.counter, r_int_push_wait), the decoded
    // opcode (w_opcode) and the branch-outcome strobe set by the jump tasks.
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.

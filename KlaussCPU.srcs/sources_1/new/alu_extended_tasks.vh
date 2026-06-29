@@ -520,17 +520,17 @@ task t_div_regs_hw;
       else begin
          abs_dividend = r_reg_port_a[63] ? (~r_reg_port_a + 1) : r_reg_port_a;
          abs_divisor = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
-         r_div_dividend <= abs_dividend;
-         r_div_divisor <= abs_divisor;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_sign_q <= r_reg_port_a[63] ^ r_reg_port_b[63];
-         r_div_sign_r <= r_reg_port_a[63];
-         r_div_is_signed <= 1'b1;
-         r_div_op <= DIV_OP_DIV;
-         r_div_dest_reg <= r_reg_dst;
-         r_div_pc_inc <= 1'b0;  // PC += 1
+         r_div.dividend <= abs_dividend;
+         r_div.divisor <= abs_divisor;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.sign_q <= r_reg_port_a[63] ^ r_reg_port_b[63];
+         r_div.sign_r <= r_reg_port_a[63];
+         r_div.is_signed <= 1'b1;
+         r_div.op <= DIV_OP_DIV;
+         r_div.dest_reg <= r_reg_dst;
+         r_div.pc_inc <= 1'b0;  // PC += 1
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
@@ -547,15 +547,15 @@ task t_divu_regs_hw;
          r_PC <= r_PC + 4;
       end
       else begin
-         r_div_dividend <= r_reg_port_a;
-         r_div_divisor <= r_reg_port_b;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_is_signed <= 1'b0;
-         r_div_op <= DIV_OP_DIV;
-         r_div_dest_reg <= r_reg_dst;
-         r_div_pc_inc <= 1'b0;  // PC += 1
+         r_div.dividend <= r_reg_port_a;
+         r_div.divisor <= r_reg_port_b;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.is_signed <= 1'b0;
+         r_div.op <= DIV_OP_DIV;
+         r_div.dest_reg <= r_reg_dst;
+         r_div.pc_inc <= 1'b0;  // PC += 1
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
@@ -576,16 +576,16 @@ task t_mod_regs_hw;
       else begin
          abs_dividend = r_reg_port_a[63] ? (~r_reg_port_a + 1) : r_reg_port_a;
          abs_divisor = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
-         r_div_dividend <= abs_dividend;
-         r_div_divisor <= abs_divisor;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_sign_r <= r_reg_port_a[63];  // Remainder sign follows dividend
-         r_div_is_signed <= 1'b1;
-         r_div_op <= DIV_OP_MOD;
-         r_div_dest_reg <= r_reg_dst;
-         r_div_pc_inc <= 1'b0;  // PC += 1
+         r_div.dividend <= abs_dividend;
+         r_div.divisor <= abs_divisor;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.sign_r <= r_reg_port_a[63];  // Remainder sign follows dividend
+         r_div.is_signed <= 1'b1;
+         r_div.op <= DIV_OP_MOD;
+         r_div.dest_reg <= r_reg_dst;
+         r_div.pc_inc <= 1'b0;  // PC += 1
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
@@ -602,15 +602,15 @@ task t_modu_regs_hw;
          r_PC <= r_PC + 4;
       end
       else begin
-         r_div_dividend <= r_reg_port_a;
-         r_div_divisor <= r_reg_port_b;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_is_signed <= 1'b0;
-         r_div_op <= DIV_OP_MOD;
-         r_div_dest_reg <= r_reg_dst;
-         r_div_pc_inc <= 1'b0;  // PC += 1
+         r_div.dividend <= r_reg_port_a;
+         r_div.divisor <= r_reg_port_b;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.is_signed <= 1'b0;
+         r_div.op <= DIV_OP_MOD;
+         r_div.dest_reg <= r_reg_dst;
+         r_div.pc_inc <= 1'b0;  // PC += 1
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
@@ -632,16 +632,16 @@ task t_div_value_hw;
       else begin
          abs_dividend = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
          abs_divisor = i_value[31] ? (~{{32{i_value[31]}}, i_value} + 1) : {{32{1'b0}}, i_value};
-         r_div_dividend <= abs_dividend;
-         r_div_divisor <= abs_divisor;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_sign_q <= r_reg_port_b[63] ^ i_value[31];
-         r_div_is_signed <= 1'b1;
-         r_div_op <= DIV_OP_DIV;
-         r_div_dest_reg <= r_reg_2;
-         r_div_pc_inc <= 1'b1;  // PC += 2
+         r_div.dividend <= abs_dividend;
+         r_div.divisor <= abs_divisor;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.sign_q <= r_reg_port_b[63] ^ i_value[31];
+         r_div.is_signed <= 1'b1;
+         r_div.op <= DIV_OP_DIV;
+         r_div.dest_reg <= r_reg_2;
+         r_div.pc_inc <= 1'b1;  // PC += 2
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
@@ -666,16 +666,16 @@ task t_mod_value_hw;
       else begin
          abs_dividend = r_reg_port_b[63] ? (~r_reg_port_b + 1) : r_reg_port_b;
          abs_divisor = i_value[31] ? (~{{32{i_value[31]}}, i_value} + 1) : {{32{1'b0}}, i_value};
-         r_div_dividend <= abs_dividend;
-         r_div_divisor <= abs_divisor;
-         r_div_quotient <= 64'b0;
-         r_div_remainder <= 64'b0;
-         r_div_counter <= 7'd0;
-         r_div_sign_r <= r_reg_port_b[63];
-         r_div_is_signed <= 1'b1;
-         r_div_op <= DIV_OP_MOD;
-         r_div_dest_reg <= r_reg_2;
-         r_div_pc_inc <= 1'b1;  // PC += 2
+         r_div.dividend <= abs_dividend;
+         r_div.divisor <= abs_divisor;
+         r_div.quotient <= 64'b0;
+         r_div.remainder <= 64'b0;
+         r_div.counter <= 7'd0;
+         r_div.sign_r <= r_reg_port_b[63];
+         r_div.is_signed <= 1'b1;
+         r_div.op <= DIV_OP_MOD;
+         r_div.dest_reg <= r_reg_2;
+         r_div.pc_inc <= 1'b1;  // PC += 2
          r_SM <= DIVIDE_PREP;  // normalize (skip leading-zero iterations), then iterate
       end
    end
