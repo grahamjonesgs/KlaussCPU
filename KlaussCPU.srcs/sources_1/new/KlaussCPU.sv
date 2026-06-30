@@ -627,6 +627,34 @@ module KlaussCPU (
    } cpu_state_t;
    cpu_state_t st;
 
+   // ========================================================================
+   // M1 PROTOTYPE (Phase-0 de-risk, branch m1-prototype): one opcode (ADDR)
+   // expressed as a next-state FUNCTION that returns the whole cpu_state_t by
+   // value, applied via a single central NBA in OPCODE_EXECUTE. Goal: prove
+   // Vivado synthesizes a ~1000-bit packed-struct return correctly on the board,
+   // before committing to the full 168-task lift. Reads only its args + the
+   // snapshot `s` (never the local `n`) — the NBA->blocking discipline. Seeds
+   // n=s and reproduces the per-cycle st.rx_fifo_read default (the central NBA
+   // owns all per-cycle defaults). Faithful copy of task t_addr3.
+   // ========================================================================
+   function automatic cpu_state_t f_addr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+      cpu_state_t  n;
+      logic [65:0] hold;
+      n = s;                  // default-hold (reproduce NBA "unassigned keeps value")
+      n.rx_fifo_read = 1'b0;  // reproduce the unconditional per-cycle default
+      hold = {1'b0, reg_a} + {1'b0, reg_b};
+      n.alu_pipe_value    = hold[63:0];
+      n.alu_pipe_carry    = hold[64];
+      n.alu_pipe_overflow = (reg_a[63] == reg_b[63]) &&
+                            (hold[63] != reg_a[63]) ? 1'b1 : 1'b0;
+      n.alu_pipe_mode     = 1'b0;
+      n.wb.set_zero = 1'b1;
+      n.wb.rd       = s.reg_dst;
+      n.SM          = ALU_FINISH;
+      n.PC          = s.PC + 4;
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2146,7 +2174,14 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             OPCODE_EXECUTE: begin
-               t_opcode_select;
+               casez (w_opcode[31:0])
+                  // M1 PROTOTYPE: ADDR via next-state function + single central
+                  // NBA of the whole struct. Every other opcode is unchanged
+                  // (the existing side-effect dispatcher). This is the sole st
+                  // write in the ADDR branch, so the whole-struct NBA wins.
+                  32'h0001_0???: st <= f_addr3(st, r_reg_port_a, r_reg_port_b);
+                  default:       t_opcode_select;
+               endcase
             end  // case OPCODE_EXECUTE
 
             HCF_1: begin
