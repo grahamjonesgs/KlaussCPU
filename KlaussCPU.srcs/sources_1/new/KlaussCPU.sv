@@ -1364,12 +1364,10 @@ rams_sp_nc rams_sp_nc1 (
 
    `include "timing_tasks.vh"
    `include "LCD_tasks.vh"
-   `include "led_tasks.vh"
    `include "register_tasks.vh"
    `include "control_tasks.vh"
    `include "stack_tasks.vh"
    // functions.vh lifted into klauss_pkg (pure helpers; imported above).
-   `include "seven_seg.vh"
    `include "opcode_select.vh"
    `include "uart_tasks.vh"
    `include "memory_tasks.vh"

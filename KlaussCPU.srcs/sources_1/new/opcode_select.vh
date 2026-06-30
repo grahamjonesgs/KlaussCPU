@@ -350,21 +350,13 @@ task t_opcode_select;
          32'h0000_2023: t_lcd_reset_value(w_var1);             // LCD V drive LCD reset line with imm[0]
 
          //=====================================================================
-         // Board I/O — LEDs, switches, 7-segment displays (3xxx)
+         // Board I/O — LEDs / switches / 7-segment: RETIRED (0x3xxx opcodes
+         // removed). These peripherals are now driven via MMIO: RGB 0xF002,
+         // 7-seg 0xF003, LEDs/switches 0xF004 (see MMIO_MAP.md). The dedicated
+         // opcodes + their handlers (led_tasks.vh, seven_seg.vh) are deleted.
+         // NOTE: UART stays opcode-driven (its MMIO is still TBD); LCD/SPI
+         // 0x2xxx also stays (not yet on MMIO).
          //=====================================================================
-         32'h0000_300?: t_led_reg;                             // LEDR R set LEDs from rs2
-         32'h0000_301?: t_get_switch_reg;                      // SWR R rd=switch status word
-         32'h0000_302?: t_7_seg1_reg;                          // 7SEG1R R set 7-seg display 1 from rs2
-         32'h0000_303?: t_7_seg2_reg;                          // 7SEG2R R set 7-seg display 2 from rs2
-         32'h0000_304?: t_7_seg_reg;                           // 7SEGR R set both 7-seg displays from rs2
-         32'h0000_305?: t_led_rgb1_reg;                        // RGB1R R set RGB LED 1 from rs2
-         32'h0000_306?: t_led_rgb2_reg;                        // RGB2R R set RGB LED 2 from rs2
-         32'h0000_3070: t_led_value(w_var1);                   // LEDV V set LEDs from imm32
-         32'h0000_3071: t_7_seg1_value(w_var1);                // 7SEG1V V set 7-seg display 1 from imm32
-         32'h0000_3072: t_7_seg2_value(w_var1);                // 7SEG2V V set 7-seg display 2 from imm32
-         32'h0000_3073: t_7_seg_blank;                         // 7SEGBLANK blank both 7-seg displays
-         32'h0000_3074: t_led_rgb1_value(w_var1);              // RGB1V V set RGB LED 1 from imm32
-         32'h0000_3075: t_led_rgb2_value(w_var1);              // RGB2V V set RGB LED 2 from imm32
 
          //=====================================================================
          // Stack control (4xxx)
