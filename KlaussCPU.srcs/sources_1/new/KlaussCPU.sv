@@ -628,87 +628,66 @@ module KlaussCPU (
    cpu_state_t st;
 
    // ========================================================================
-   // M1 PROTOTYPE (Phase-0 de-risk, branch m1-prototype): one opcode (ADDR)
-   // expressed as a next-state FUNCTION that returns the whole cpu_state_t by
-   // value, applied via a single central NBA in OPCODE_EXECUTE. Goal: prove
-   // Vivado synthesizes a ~1000-bit packed-struct return correctly on the board,
-   // before committing to the full 168-task lift. Reads only its args + the
-   // snapshot `s` (never the local `n`) — the NBA->blocking discipline. Seeds
-   // n=s and reproduces the per-cycle st.rx_fifo_read default (the central NBA
-   // owns all per-cycle defaults). Faithful copy of task t_addr3.
+   // f_alu — unified next-state ALU (M1 rollout). ONE function for the whole
+   // ALU op-class (RRR + reg-immediate + compares), selected by `op`. The caller
+   // passes the two operands (extending the immediate sign/zero as the opcode
+   // requires), the destination register index `rd`, and the next PC. The
+   // general add/sub overflow formulas below reduce to each opcode's simplified
+   // form when the immediate is zero-extended (b[63]==0), so no precision is lost.
+   // Discipline (proven by the f_addr3 board test): seed n=s, reproduce the
+   // rx_fifo_read default, read only args + snapshot s, blocking writes, return n.
+   // Subsumes t_addr3/subr3/andr3/orr3/xorr3/addc3/subc3/cmprr3 +
+   // add_value/minus_value/addi/and_reg_value/or_reg_value/xor_reg_value/
+   // compare_reg_value/inc_reg/dec_reg.
    // ========================================================================
-   function automatic cpu_state_t f_addr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+   typedef enum logic [2:0] {
+      ALU_ADD, ALU_SUB, ALU_ADC, ALU_SBC, ALU_AND, ALU_OR, ALU_XOR, ALU_CMP
+   } alu_op_e;
+
+   function automatic cpu_state_t f_alu(cpu_state_t s, logic [63:0] a, logic [63:0] b,
+                                        alu_op_e op, logic [3:0] rd, logic [31:0] pc_next);
       cpu_state_t  n;
-      logic [65:0] hold;
-      n = s;                  // default-hold (reproduce NBA "unassigned keeps value")
-      n.rx_fifo_read = 1'b0;  // reproduce the unconditional per-cycle default
-      hold = {1'b0, reg_a} + {1'b0, reg_b};
-      n.alu_pipe_value    = hold[63:0];
-      n.alu_pipe_carry    = hold[64];
-      n.alu_pipe_overflow = (reg_a[63] == reg_b[63]) &&
-                            (hold[63] != reg_a[63]) ? 1'b1 : 1'b0;
-      n.alu_pipe_mode     = 1'b0;
-      n.wb.set_zero = 1'b1;
-      n.wb.rd       = s.reg_dst;
-      n.SM          = ALU_FINISH;
-      n.PC          = s.PC + 4;
-      return n;
-   endfunction
-
-   // --- 3-register ALU class (M1 rollout, register_tasks): next-state functions.
-   // Same discipline as f_addr3: seed n=s, reproduce the rx_fifo_read default,
-   // read only args + snapshot s, blocking writes to n, return n. ---
-   function automatic cpu_state_t f_subr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
-      cpu_state_t  n;
-      logic [63:0] hold;
-      logic        carry;
+      logic [64:0] sum;
+      logic        cin;
       n = s;
       n.rx_fifo_read = 1'b0;
-      {carry, hold} = {1'b0, reg_a} - {1'b0, reg_b};
-      n.alu_pipe_value    = hold;
-      n.alu_pipe_carry    = carry;
-      n.alu_pipe_overflow = (reg_a[63]&&!reg_b[63]&&!hold[63])||(!reg_a[63]&&reg_b[63]&&hold[63]) ? 1'b1 : 1'b0;
-      n.alu_pipe_mode     = 1'b0;
-      n.wb.set_zero = 1'b1;
-      n.wb.rd       = s.reg_dst;
-      n.SM          = ALU_FINISH;
-      n.PC          = s.PC + 4;
-      return n;
-   endfunction
-
-   function automatic cpu_state_t f_andr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      n.wb.value = reg_a & reg_b;
-      n.wb.rd    = s.reg_dst;
-      n.SM       = OPCODE_REQUEST;
-      n.wb.pending = 1'b1;
-      n.PC       = s.PC + 4;
-      return n;
-   endfunction
-
-   function automatic cpu_state_t f_orr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      n.wb.value = reg_a | reg_b;
-      n.wb.rd    = s.reg_dst;
-      n.SM       = OPCODE_REQUEST;
-      n.wb.pending = 1'b1;
-      n.PC       = s.PC + 4;
-      return n;
-   endfunction
-
-   function automatic cpu_state_t f_xorr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      n.wb.value = reg_a ^ reg_b;
-      n.wb.rd    = s.reg_dst;
-      n.SM       = OPCODE_REQUEST;
-      n.wb.pending = 1'b1;
-      n.PC       = s.PC + 4;
+      n.PC           = pc_next;
+      case (op)
+         ALU_AND, ALU_OR, ALU_XOR: begin
+            // bitwise: direct register writeback, no flags, single-cycle
+            n.wb.value   = (op == ALU_AND) ? (a & b) : (op == ALU_OR) ? (a | b) : (a ^ b);
+            n.wb.rd      = rd;
+            n.wb.pending = 1'b1;
+            n.SM         = OPCODE_REQUEST;
+         end
+         ALU_CMP: begin
+            // compare: set equal/less/ult flags via ALU_FINISH, no register write
+            n.alu_pipe_value = a - b;
+            n.alu_pipe_equal = (a == b)                  ? 1'b1 : 1'b0;
+            n.alu_pipe_less  = ($signed(a) < $signed(b)) ? 1'b1 : 1'b0;
+            n.alu_pipe_ult   = (a < b)                   ? 1'b1 : 1'b0;
+            n.alu_pipe_mode  = 1'b1;   // CMP
+            n.SM             = ALU_FINISH;
+         end
+         default: begin
+            // ADD / SUB / ADC / SBC : alu_pipe + carry/overflow flags via ALU_FINISH
+            cin = (op == ALU_ADC || op == ALU_SBC) ? s.flags.carry : 1'b0;
+            if (op == ALU_ADD || op == ALU_ADC)
+               sum = {1'b0, a} + {1'b0, b} + {64'b0, cin};
+            else
+               sum = {1'b0, a} - {1'b0, b} - {64'b0, cin};
+            n.alu_pipe_value = sum[63:0];
+            n.alu_pipe_carry = sum[64];
+            if (op == ALU_ADD || op == ALU_ADC)
+               n.alu_pipe_overflow = (a[63] == b[63]) && (sum[63] != a[63]) ? 1'b1 : 1'b0;
+            else
+               n.alu_pipe_overflow = (a[63] != b[63]) && (sum[63] != a[63]) ? 1'b1 : 1'b0;
+            n.alu_pipe_mode = 1'b0;   // ARITH
+            n.wb.set_zero   = 1'b1;
+            n.wb.rd         = rd;
+            n.SM            = ALU_FINISH;
+         end
+      endcase
       return n;
    endfunction
 
@@ -2232,15 +2211,29 @@ rams_sp_nc rams_sp_nc1 (
 
             OPCODE_EXECUTE: begin
                casez (w_opcode[31:0])
-                  // M1 PROTOTYPE: ADDR via next-state function + single central
-                  // NBA of the whole struct. Every other opcode is unchanged
-                  // (the existing side-effect dispatcher). This is the sole st
-                  // write in the ADDR branch, so the whole-struct NBA wins.
-                  32'h0001_0???: st <= f_addr3(st, r_reg_port_a, r_reg_port_b);
-                  32'h0002_0???: st <= f_subr3(st, r_reg_port_a, r_reg_port_b);
-                  32'h0003_0???: st <= f_andr3(st, r_reg_port_a, r_reg_port_b);
-                  32'h0004_0???: st <= f_orr3 (st, r_reg_port_a, r_reg_port_b);
-                  32'h0005_0???: st <= f_xorr3(st, r_reg_port_a, r_reg_port_b);
+                  // M1 ROLLOUT: the ALU op-class routed through the unified
+                  // next-state function f_alu (one central NBA per opcode). Every
+                  // other opcode still goes to the existing dispatcher (default).
+                  // RRR forms: a=reg_a, b=reg_b, rd=reg_dst, PC+4.
+                  32'h0001_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, st.PC + 4);  // ADDR
+                  32'h0002_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, st.PC + 4);  // SUBR
+                  32'h0003_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4);  // ANDR
+                  32'h0004_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4);  // ORR
+                  32'h0005_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4);  // XORR
+                  32'h0006_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, st.PC + 4);  // ADDC
+                  32'h0007_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, st.PC + 4);  // SUBC
+                  32'h0000_05??: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, st.PC + 4);  // CMPRR (flags only)
+                  // reg-immediate forms: a=reg_b, b=ext(imm), rd per format, PC+8.
+                  32'h0000_02??: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_ADD, st.reg_1, st.PC + 8);  // ADDI (sign-ext, rd=reg_1)
+                  32'h0000_081?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_ADD, st.reg_2, st.PC + 8);             // ADDV (zero-ext)
+                  32'h0000_082?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_SUB, st.reg_2, st.PC + 8);             // MINUSV (zero-ext)
+                  32'h0000_083?: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_CMP, st.reg_2, st.PC + 8);  // CMPRV (sign-ext, flags only)
+                  32'h0000_086?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8);             // ANDV
+                  32'h0000_087?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8);             // ORV
+                  32'h0000_088?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8);             // XORV
+                  // INC/DEC: a=reg_b, b=1, rd=reg_2, PC+4.
+                  32'h0000_084?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_ADD, st.reg_2, st.PC + 4);  // INCR
+                  32'h0000_085?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_SUB, st.reg_2, st.PC + 4);  // DECR
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
