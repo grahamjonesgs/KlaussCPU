@@ -655,6 +655,63 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // --- 3-register ALU class (M1 rollout, register_tasks): next-state functions.
+   // Same discipline as f_addr3: seed n=s, reproduce the rx_fifo_read default,
+   // read only args + snapshot s, blocking writes to n, return n. ---
+   function automatic cpu_state_t f_subr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+      cpu_state_t  n;
+      logic [63:0] hold;
+      logic        carry;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      {carry, hold} = {1'b0, reg_a} - {1'b0, reg_b};
+      n.alu_pipe_value    = hold;
+      n.alu_pipe_carry    = carry;
+      n.alu_pipe_overflow = (reg_a[63]&&!reg_b[63]&&!hold[63])||(!reg_a[63]&&reg_b[63]&&hold[63]) ? 1'b1 : 1'b0;
+      n.alu_pipe_mode     = 1'b0;
+      n.wb.set_zero = 1'b1;
+      n.wb.rd       = s.reg_dst;
+      n.SM          = ALU_FINISH;
+      n.PC          = s.PC + 4;
+      return n;
+   endfunction
+
+   function automatic cpu_state_t f_andr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value = reg_a & reg_b;
+      n.wb.rd    = s.reg_dst;
+      n.SM       = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC       = s.PC + 4;
+      return n;
+   endfunction
+
+   function automatic cpu_state_t f_orr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value = reg_a | reg_b;
+      n.wb.rd    = s.reg_dst;
+      n.SM       = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC       = s.PC + 4;
+      return n;
+   endfunction
+
+   function automatic cpu_state_t f_xorr3(cpu_state_t s, logic [63:0] reg_a, logic [63:0] reg_b);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value = reg_a ^ reg_b;
+      n.wb.rd    = s.reg_dst;
+      n.SM       = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC       = s.PC + 4;
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2180,6 +2237,10 @@ rams_sp_nc rams_sp_nc1 (
                   // (the existing side-effect dispatcher). This is the sole st
                   // write in the ADDR branch, so the whole-struct NBA wins.
                   32'h0001_0???: st <= f_addr3(st, r_reg_port_a, r_reg_port_b);
+                  32'h0002_0???: st <= f_subr3(st, r_reg_port_a, r_reg_port_b);
+                  32'h0003_0???: st <= f_andr3(st, r_reg_port_a, r_reg_port_b);
+                  32'h0004_0???: st <= f_orr3 (st, r_reg_port_a, r_reg_port_b);
+                  32'h0005_0???: st <= f_xorr3(st, r_reg_port_a, r_reg_port_b);
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
