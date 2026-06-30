@@ -691,6 +691,51 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ========================================================================
+   // f_cmpr — boolean compares (rd = (a REL b) ? 1 : 0) + min/max select.
+   // All 14 ops are single-cycle: compute a value from (a,b), write wb.value,
+   // OPCODE_REQUEST, PC+4. Same discipline as f_alu (seed n=s, reproduce the
+   // rx_fifo_read default, read only args + snapshot s, blocking, return n).
+   // Collapses t_cmpeqr..t_cmpuger (10) + t_min/max/minu/maxu_regs (4).
+   // ========================================================================
+   typedef enum logic [3:0] {
+      CMP_EQ, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE,
+      CMP_ULT, CMP_ULE, CMP_UGT, CMP_UGE,
+      CMP_MIN, CMP_MAX, CMP_MINU, CMP_MAXU
+   } cmp_op_e;
+
+   function automatic cpu_state_t f_cmpr(cpu_state_t s, logic [63:0] a, logic [63:0] b, cmp_op_e op);
+      cpu_state_t         n;
+      logic signed [63:0] sa, sb;
+      logic [63:0]        val;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      sa = a; sb = b;
+      case (op)
+         CMP_EQ:   val = (a  == b ) ? 64'b1 : 64'b0;
+         CMP_NE:   val = (a  != b ) ? 64'b1 : 64'b0;
+         CMP_LT:   val = (sa <  sb) ? 64'b1 : 64'b0;
+         CMP_LE:   val = (sa <= sb) ? 64'b1 : 64'b0;
+         CMP_GT:   val = (sa >  sb) ? 64'b1 : 64'b0;
+         CMP_GE:   val = (sa >= sb) ? 64'b1 : 64'b0;
+         CMP_ULT:  val = (a  <  b ) ? 64'b1 : 64'b0;
+         CMP_ULE:  val = (a  <= b ) ? 64'b1 : 64'b0;
+         CMP_UGT:  val = (a  >  b ) ? 64'b1 : 64'b0;
+         CMP_UGE:  val = (a  >= b ) ? 64'b1 : 64'b0;
+         CMP_MIN:  val = (sa <  sb) ? a : b;
+         CMP_MAX:  val = (sa >  sb) ? a : b;
+         CMP_MINU: val = (a  <  b ) ? a : b;
+         CMP_MAXU: val = (a  >  b ) ? a : b;
+         default:  val = 64'b0;
+      endcase
+      n.wb.value   = val;
+      n.wb.rd      = s.reg_dst;
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = s.PC + 4;
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2232,6 +2277,21 @@ rams_sp_nc rams_sp_nc1 (
                   // INC/DEC: a=reg_b, b=1, rd=reg_2, PC+4.
                   32'h0000_084?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_ADD, st.reg_2, st.PC + 4);  // INCR
                   32'h0000_085?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_SUB, st.reg_2, st.PC + 4);  // DECR
+                  // Boolean compares (-> rd=0/1) + min/max select, via f_cmpr.
+                  32'h0030_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_EQ);   // CMPEQR
+                  32'h0031_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_NE);   // CMPNER
+                  32'h0032_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LT);   // CMPLTR
+                  32'h0033_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LE);   // CMPLER
+                  32'h0034_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GT);   // CMPGTR
+                  32'h0035_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GE);   // CMPGER
+                  32'h0036_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULT);  // CMPULTR
+                  32'h0037_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULE);  // CMPULER
+                  32'h0038_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGT);  // CMPUGTR
+                  32'h0039_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGE);  // CMPUGER
+                  32'h0040_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MIN);  // MINR
+                  32'h0041_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX);  // MAXR
+                  32'h0042_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU); // MINUR
+                  32'h0043_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU); // MAXUR
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
