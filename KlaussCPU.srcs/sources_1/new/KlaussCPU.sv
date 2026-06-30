@@ -568,11 +568,19 @@ module KlaussCPU (
 
    // ========================================================================
    // cpu_state_t — the CPU core datapath state bundled into one struct so the
-   // execute tasks operate on it explicitly.  Stage A: module-scope `st`, tasks
-   // still see it directly via `include.  Stage B moves the tasks into a package
-   // taking `ref cpu_state_t st`.  EXCLUDED (kept module-scope): r_msg (XDC
-   // *r_msg_reg* multicycle exception), the LCD output ports, r_perf_br_*, and
-   // r_ir_presettled — handled in Stage B.
+   // execute tasks operate on it explicitly.  The tasks are `include'd and read/
+   // write this module-scope `st` directly with non-blocking assignments — the
+   // working, board-verified arrangement.
+   //
+   // WARNING — do NOT try to pass `st` into the tasks by `ref`: it was attempted
+   // and PROVEN NON-VIABLE.  A non-blocking assignment through a `ref` argument is
+   // illegal SystemVerilog (IEEE 1800 sec 10.3: no NBA to automatic vars; sec 12.4.2:
+   // a ref arg is forbidden where automatic vars are) AND Vivado synthesizes it
+   // silently into INCORRECT hardware (every program hung on its first memory write).
+   // The supported way to give a task an explicit, package-able interface is the
+   // next-state-FUNCTION form: function automatic cpu_state_t t_x(cpu_state_t s, ...)
+   // that blocking-writes a local copy and returns it, applied via a single
+   // st <= t_x(st, ...) NBA.  (ref post-mortem lives on branch sv-vh-task-lift.)
    // ========================================================================
    typedef struct packed {
       e_sm_t       SM;
