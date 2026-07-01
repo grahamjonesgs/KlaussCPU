@@ -883,6 +883,76 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ========================================================================
+   // Tier 3 — multi-cycle DDR2 handshakes (extra_clock pattern). The mem bus
+   // (st.mem_*) is written via the returned st; w_mem_ready / w_mem_read_data are
+   // passed as READ-ONLY args. The FSM clears extra_clock on the next opcode
+   // (unchanged). Standalone (not converted): POP/GETSP/PUSHV64, MEMGET32.
+   // ========================================================================
+
+   // f_push — DDR2 stack push (PUSHR/PUSHV/CALLR). Caller passes pushed data + final PC.
+   function automatic cpu_state_t f_push(cpu_state_t s, logic [63:0] data, logic [31:0] pc_final,
+                                         logic mem_ready);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.SP             = s.SP - 8;
+         n.mem_addr       = s.SP - 32'd8;
+         n.mem_write_data = data;
+         n.mem_byte_en    = 8'hFF;
+         n.mem_write_DV   = 1'b1;
+         n.extra_clock    = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_write_DV = 1'b0;
+         n.SM           = OPCODE_REQUEST;
+         n.PC           = pc_final;
+      end
+      return n;
+   endfunction
+
+   // f_mem_store — DDR2 store (MEMSET*/MEMSETR). Caller passes addr/data/byte_en/PC.
+   // byte_en explicit -> fixes the latent stale-be the full-width RR/RV stores relied on.
+   function automatic cpu_state_t f_mem_store(cpu_state_t s, logic mem_ready, logic [31:0] addr,
+                                              logic [63:0] data, logic [7:0] be, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr       = addr;
+         n.mem_write_data = data;
+         n.mem_byte_en    = be;
+         n.mem_write_DV   = 1'b1;
+         n.extra_clock    = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_write_DV = 1'b0;
+         n.SM           = OPCODE_REQUEST;
+         n.PC           = pc_next;
+      end
+      return n;
+   endfunction
+
+   // f_mem_load — DDR2 load -> WRITEBACK (MEMREAD*/MEMGET8/16/64). Caller precomputes
+   // the zero-extended value from w_mem_read_data (only consumed in the ready cycle).
+   function automatic cpu_state_t f_mem_load(cpu_state_t s, logic mem_ready, logic [31:0] addr,
+                                             logic [63:0] value_ext, logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = addr;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_read_DV = 1'b0;
+         n.wb.value    = value_ext;
+         n.wb.rd       = rd;
+         n.SM          = WRITEBACK;
+         n.PC          = pc_next;
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2498,6 +2568,23 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_4050: st <= f_sp_set(st, st.SP + $signed(w_var1),     st.PC + 8);  // ADDSP
                   32'h0000_F00?: st <= f_delay (st, r_reg_port_b[31:0],          st.PC + 4);  // DELAYR
                   32'h0000_F013: st <= f_delay (st, w_var1,                      st.PC + 8);  // DELAYV
+                  // Tier 3 — stack push (f_push).
+                  32'h0000_400?: st <= f_push(st, r_reg_port_b,                 st.PC + 4,           w_mem_ready); // PUSH
+                  32'h0000_4020: st <= f_push(st, {32'b0, w_var1},             st.PC + 8,           w_mem_ready); // PUSHV
+                  32'h0000_407?: st <= f_push(st, {32'b0, st.PC + 32'd4},      r_reg_port_b[31:0],  w_mem_ready); // CALLR
+                  // Tier 3 — DDR2 stores (f_mem_store; caller passes explicit byte_en).
+                  32'h0000_70??: st <= f_mem_store(st, w_mem_ready, r_reg_port_b[31:0],           r_reg_port_a,                          8'hFF, st.PC + 4); // MEMSET64RR
+                  32'h0000_720?: st <= f_mem_store(st, w_mem_ready, w_var1[31:0],                 r_reg_port_b,                          8'hFF, st.PC + 8); // MEMSETR
+                  32'h0000_74??: st <= f_mem_store(st, w_mem_ready, r_reg_port_b[31:0],           {8{r_reg_port_a[7:0]}},                8'b0000_0001 << r_reg_port_b[2:0], st.PC + 4); // MEMSET8
+                  32'h0000_76??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:1], 1'b0},   {4{r_reg_port_a[15:0]}},               8'b0000_0011 << {r_reg_port_b[2:1], 1'b0}, st.PC + 4); // MEMSET16
+                  32'h0000_78??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:2], 2'b00},  {r_reg_port_a[31:0], r_reg_port_a[31:0]}, r_reg_port_b[2] ? 8'b1111_0000 : 8'b0000_1111, st.PC + 4); // MEMSET32
+                  32'h0000_7A??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:3], 3'b000}, r_reg_port_a,                          8'hFF, st.PC + 4); // MEMSET64
+                  // Tier 3 — DDR2 loads -> WRITEBACK (f_mem_load; arm pre-extracts the value).
+                  32'h0000_71??: st <= f_mem_load(st, w_mem_ready, r_reg_port_b[31:0],          w_mem_read_data,                                              st.reg_1, st.PC + 4); // MEMREADRR
+                  32'h0000_721?: st <= f_mem_load(st, w_mem_ready, w_var1[31:0],                w_mem_read_data,                                              st.reg_2, st.PC + 8); // MEMREADR
+                  32'h0000_75??: st <= f_mem_load(st, w_mem_ready, r_reg_port_b[31:0],          {56'b0, w_mem_read_data[(r_reg_port_b[2:0] * 8) +: 8]},        st.reg_1, st.PC + 4); // MEMGET8
+                  32'h0000_77??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:1], 1'b0},  {48'b0, w_mem_read_data[(r_reg_port_b[2:1] * 16) +: 16]},      st.reg_1, st.PC + 4); // MEMGET16
+                  32'h0000_7B??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:3], 3'b000}, w_mem_read_data,                                             st.reg_1, st.PC + 4); // MEMGET64
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
