@@ -1103,6 +1103,207 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ------------------------------------------------------------------------
+   // Tier 3d — single-cycle stragglers + non-branch control. Fills the gaps
+   // Tier 1 missed (SEXTB/SEXTH set the sign flag; ABSR sets overflow — neither
+   // fits the plain f_wb) plus the simple control ops (NOP/HALT/WAIT/RESET/TRAP)
+   // and the DDR2-read handshakes RET/POP/IRET (mirror f_mem_load + SP bump).
+   // ------------------------------------------------------------------------
+
+   // f_wb_ns — writeback that also sets the SIGN flag from value[63] (SEXTB/SEXTH;
+   // the sign-extended result's MSB equals the source sign bit). Zero via set_zero.
+   function automatic cpu_state_t f_wb_ns(cpu_state_t s, logic [63:0] value, logic [3:0] rd,
+                                          logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value   = value;
+      n.wb.rd      = rd;
+      n.wb.set_zero = 1'b1;
+      n.flags.sign = value[63];
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
+   // f_abs — ABSR: rd = |rs| (signed). Sets zero (set_zero) + overflow (only on
+   // |INT64_MIN|, which can't be represented).
+   function automatic cpu_state_t f_abs(cpu_state_t s, logic [63:0] rs, logic [3:0] rd,
+                                        logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (rs[63]) begin
+         n.wb.value       = ~rs + 64'd1;
+         n.flags.overflow = (rs == 64'h8000000000000000) ? 1'b1 : 1'b0;
+      end else begin
+         n.wb.value       = rs;
+         n.flags.overflow = 1'b0;
+      end
+      n.wb.rd      = rd;
+      n.wb.set_zero = 1'b1;
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
+   // f_bextr — BEXTR: rd = zero_ext((rs >> start) & ((1<<len)-1)). 32-bit locals
+   // reproduce the exact width behaviour (result truncated to [31:0], zero-ext).
+   function automatic cpu_state_t f_bextr(cpu_state_t s, logic [63:0] rs, logic [31:0] params,
+                                          logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      logic [4:0]  start_pos;
+      logic [4:0]  length;
+      logic [31:0] mask;
+      logic [31:0] result;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      start_pos = params[4:0];
+      length    = params[12:8];
+      mask      = (32'hFFFFFFFF >> (32 - length));
+      result    = (rs >> start_pos) & mask;
+      n.wb.value   = result;          // zero-extended to 64
+      n.wb.rd      = rd;
+      n.wb.set_zero = 1'b1;
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
+   // f_bdep — BDEP: deposit len bits of src at start into base. 32-bit low half
+   // only; result zero-extended above bit 31 (matches t_deposit_bits widths).
+   function automatic cpu_state_t f_bdep(cpu_state_t s, logic [63:0] base_rs2, logic [63:0] src_rs1,
+                                         logic [31:0] params, logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      logic [4:0]  start_pos;
+      logic [4:0]  length;
+      logic [31:0] mask;
+      logic [31:0] insert_val;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      start_pos  = params[4:0];
+      length     = params[12:8];
+      mask       = (32'hFFFFFFFF >> (32 - length)) << start_pos;
+      insert_val = (src_rs1 << start_pos) & mask;
+      n.wb.value   = (base_rs2 & ~mask) | insert_val;
+      n.wb.rd      = rd;
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
+   // f_setr64 — SETR64: rd = {hi32, lo32}. 3-word instr; hi32 self-fetched from
+   // PC+8 via a DDR2 read (only 2 words are pre-fetched). lane-select on PC[2].
+   function automatic cpu_state_t f_setr64(cpu_state_t s, logic mem_ready, logic [63:0] rdata,
+                                           logic [31:0] lo, logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = s.PC + 8;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_read_DV = 1'b0;
+         n.wb.value    = {(s.PC[2] ? rdata[63:32] : rdata[31:0]), lo};
+         n.wb.rd       = rd;
+         n.SM          = OPCODE_REQUEST;
+         n.wb.pending  = 1'b1;
+         n.PC          = pc_next;
+      end
+      return n;
+   endfunction
+
+   // f_ctrl — set SM + PC only (NOP/WAIT/RESET/HALT). HALT passes PC unchanged.
+   function automatic cpu_state_t f_ctrl(cpu_state_t s, e_sm_t new_sm, logic [31:0] new_pc);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.SM = new_sm;
+      n.PC = new_pc;
+      return n;
+   endfunction
+
+   // f_trap — TRAP: crash-dump via HCF_1 with ERR_TRAP.
+   function automatic cpu_state_t f_trap(cpu_state_t s);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.error_code = ERR_TRAP;
+      n.SM         = HCF_1;
+      return n;
+   endfunction
+
+   // f_ret — RET: pop return addr from DDR2 stack -> PC; SP+=8. (Like f_mem_load
+   // but targets PC + bumps SP instead of a register writeback.)
+   function automatic cpu_state_t f_ret(cpu_state_t s, logic mem_ready, logic [63:0] rdata);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = s.SP;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.PC          = rdata[31:0];
+         n.SP          = s.SP + 8;
+         n.mem_read_DV = 1'b0;
+         n.SM          = OPCODE_REQUEST;
+      end
+      return n;
+   endfunction
+
+   // f_pop — POP: pop 64-bit from stack into rd (via WRITEBACK state); SP+=8.
+   function automatic cpu_state_t f_pop(cpu_state_t s, logic mem_ready, logic [63:0] rdata,
+                                        logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = s.SP;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.wb.value    = rdata;
+         n.wb.rd       = rd;
+         n.SP          = s.SP + 8;
+         n.mem_read_DV = 1'b0;
+         n.SM          = WRITEBACK;
+         n.PC          = pc_next;
+      end
+      return n;
+   endfunction
+
+   // f_iret — IRET: pop the saved context slot -> PC + flags[38:32] + int_mask[42:39]; SP+=8.
+   function automatic cpu_state_t f_iret(cpu_state_t s, logic mem_ready, logic [63:0] rdata);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = s.SP;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.PC              = rdata[31:0];
+         n.flags.zero      = rdata[38];
+         n.flags.equal     = rdata[37];
+         n.flags.carry     = rdata[36];
+         n.flags.overflow  = rdata[35];
+         n.flags.sign      = rdata[34];
+         n.flags.less      = rdata[33];
+         n.flags.ult       = rdata[32];
+         n.int_mask        = rdata[42:39];
+         n.SP              = s.SP + 8;
+         n.mem_read_DV     = 1'b0;
+         n.SM              = OPCODE_REQUEST;
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2751,6 +2952,29 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_C5??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_8,  1'b0, st.PC + 8); // STIDX8
                   32'h0000_0E??: st <= f_ld_idxreg(st, w_mem_ready, r_reg_port_b[31:0], w_mem_read_data, w_var1[3:0], st.PC + 8); // LDIDX64R
                   32'h0000_73??: st <= f_st_idxreg(st, w_mem_ready, r_reg_port_b[31:0], r_reg_port_a,   w_var1[3:0], st.PC + 8); // STIDX64R
+
+                  // Tier 3d — single-cycle stragglers + non-branch control
+                  32'h0020_0???: st <= f_wb(st, r_reg_port_a << r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHLR (RRR)
+                  32'h0021_0???: st <= f_wb(st, r_reg_port_a >> r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHRR (RRR)
+                  32'h0022_0???: st <= f_wb(st, $signed(r_reg_port_a) >>> r_reg_port_b[5:0], st.reg_dst, 1'b1, st.PC + 4); // SARR (RRR)
+                  32'h0000_095?: st <= f_wb(st, {56'b0, r_reg_port_b[7:0]},                  st.reg_2, 1'b1, st.PC + 4); // ZEXTB
+                  32'h0000_096?: st <= f_wb(st, {48'b0, r_reg_port_b[15:0]},                 st.reg_2, 1'b1, st.PC + 4); // ZEXTH
+                  32'h0000_097?: st <= f_wb(st, {r_reg_port_b[7:0], r_reg_port_b[15:8], r_reg_port_b[23:16], r_reg_port_b[31:24], r_reg_port_b[39:32], r_reg_port_b[47:40], r_reg_port_b[55:48], r_reg_port_b[63:56]}, st.reg_2, 1'b0, st.PC + 4); // BSWAP
+                  32'h0000_403?: st <= f_wb(st, {32'b0, st.SP},                              st.reg_2, 1'b0, st.PC + 4); // GETSP
+                  32'h0000_08C?: st <= f_wb_ns(st, {{56{r_reg_port_b[7]}},  r_reg_port_b[7:0]},  st.reg_2, st.PC + 4); // SEXTB (sets sign)
+                  32'h0000_094?: st <= f_wb_ns(st, {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]}, st.reg_2, st.PC + 4); // SEXTH (sets sign)
+                  32'h0000_08B?: st <= f_abs  (st, r_reg_port_b, st.reg_2, st.PC + 4);                                  // ABSR (sets overflow)
+                  32'h0000_0AC?: st <= f_bextr(st, r_reg_port_b,               w_var1, st.reg_2, st.PC + 8);            // BEXTR
+                  32'h0000_0AD?: st <= f_bdep (st, r_reg_port_b, r_reg_port_a, w_var1, st.reg_2, st.PC + 8);            // BDEP
+                  32'h0000_0FE?: st <= f_setr64(st, w_mem_ready, w_mem_read_data, w_var1, st.reg_2, st.PC + 12);        // SETR64 (self-fetch hi32)
+                  32'h0000_F010: st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 4); // NOP
+                  32'h0000_6012: st <= f_ctrl(st, WAITING,        st.PC + 4); // WAIT
+                  32'h0000_F012: st <= f_ctrl(st, OPCODE_REQUEST, 32'h4);     // RESET
+                  32'h0000_F011: st <= f_ctrl(st, HALTED_BREAK,   st.PC);     // HALT
+                  32'h0000_F014: st <= f_trap(st);                            // TRAP
+                  32'h0000_1012: st <= f_ret (st, w_mem_ready, w_mem_read_data);                  // RET
+                  32'h0000_401?: st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_2, st.PC + 4); // POP
+                  32'h0000_6011: st <= f_iret(st, w_mem_ready, w_mem_read_data);                  // IRET
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
