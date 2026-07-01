@@ -736,6 +736,27 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ========================================================================
+   // f_wb — generic single-cycle register writeback. The caller precomputes the
+   // value (and the destination reg + next PC); `set_zero` gates the zero-flag
+   // update — ops that don't set it leave st.wb.set_zero as-is (matching the
+   // originals, which simply didn't assign it). Collapses COPY/SETR/LEAPC/SETFR/
+   // NEGR/NOTR/SHLR1/SHRR1/SHLAR/SHRAR/SEXTW/ZEXTW.
+   // ========================================================================
+   function automatic cpu_state_t f_wb(cpu_state_t s, logic [63:0] value, logic [3:0] rd,
+                                       logic set_zero, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value   = value;
+      n.wb.rd      = rd;
+      if (set_zero) n.wb.set_zero = 1'b1;
+      n.SM         = OPCODE_REQUEST;
+      n.wb.pending = 1'b1;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2292,6 +2313,19 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0041_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX);  // MAXR
                   32'h0042_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU); // MINUR
                   32'h0043_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU); // MAXUR
+                  // Single-value register writeback (caller precomputes value), via f_wb.
+                  32'h0000_01??: st <= f_wb(st, r_reg_port_b, st.reg_1, 1'b0, st.PC + 4);                                // COPY
+                  32'h0000_080?: st <= f_wb(st, {{32{w_var1[31]}}, w_var1}, st.reg_2, 1'b0, st.PC + 8);                  // SETR (sign-ext)
+                  32'h0000_089?: st <= f_wb(st, {st.flags.zero, st.flags.equal, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_2, 1'b0, st.PC + 4);  // SETFR
+                  32'h0000_08A?: st <= f_wb(st, ~r_reg_port_b + 64'd1, st.reg_2, 1'b1, st.PC + 4);                       // NEGR
+                  32'h0000_08D?: st <= f_wb(st, r_reg_port_b << 1, st.reg_2, 1'b0, st.PC + 4);                          // SHLR1
+                  32'h0000_08E?: st <= f_wb(st, r_reg_port_b >> 1, st.reg_2, 1'b0, st.PC + 4);                          // SHRR1
+                  32'h0000_08F?: st <= f_wb(st, r_reg_port_b << 1, st.reg_2, 1'b0, st.PC + 4);                          // SHLAR (== <<1)
+                  32'h0000_090?: st <= f_wb(st, $signed(r_reg_port_b) >>> 1, st.reg_2, 1'b0, st.PC + 4);                // SHRAR
+                  32'h0000_098?: st <= f_wb(st, ~r_reg_port_b, st.reg_2, 1'b1, st.PC + 4);                              // NOTR
+                  32'h0000_099?: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_2, 1'b0, st.PC + 8);                    // LEAPC
+                  32'h0000_0F0?: st <= f_wb(st, {{32{r_reg_port_b[31]}}, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4); // SEXTW
+                  32'h0000_0F1?: st <= f_wb(st, {32'b0, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4);                // ZEXTW
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
