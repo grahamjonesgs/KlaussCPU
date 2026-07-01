@@ -953,6 +953,156 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ------------------------------------------------------------------------
+   // Tier 3b/3c — indexed load/store (LDIDX*/STIDX*). effective_addr = rs2+imm
+   // (or rs2+reg for the *R forms). f_ld_idx/f_st_idx take the RAW effective
+   // address + raw data and do all alignment / lane-select / byte-enable
+   // internally (mirrors t_load_indexed* / t_store_indexed* exactly). The *reg
+   // forms are 3-stage: they redirect read-port B via reg_2 to fetch the offset
+   // register, so portb is re-sampled each cycle from the returned st.
+   // ------------------------------------------------------------------------
+   typedef enum logic [1:0] { MSZ_8 = 2'd0, MSZ_16 = 2'd1, MSZ_32 = 2'd2, MSZ_64 = 2'd3 } mem_sz_e;
+
+   // f_ld_idx — indexed load of 8/16/32/64 bits, zero- or sign-extended.
+   // force_align only affects MSZ_64 (LDIDX64 raw vs LDIDX64A 8-byte aligned);
+   // sub-word sizes always align to their natural boundary.
+   function automatic cpu_state_t f_ld_idx(cpu_state_t s, logic mem_ready,
+         logic [31:0] eaddr, logic [63:0] rdata, mem_sz_e sz, logic is_signed,
+         logic force_align, logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      logic [63:0] val;
+      logic [7:0]  b8;
+      logic [15:0] h16;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         case (sz)
+            MSZ_8:   n.mem_addr = eaddr;
+            MSZ_16:  n.mem_addr = {eaddr[31:1], 1'b0};
+            MSZ_32:  n.mem_addr = {eaddr[31:2], 2'b00};
+            default: n.mem_addr = force_align ? {eaddr[31:3], 3'b000} : eaddr; // MSZ_64
+         endcase
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_read_DV = 1'b0;
+         b8  = rdata[(eaddr[2:0] * 8)  +: 8];
+         h16 = rdata[(eaddr[2:1] * 16) +: 16];
+         case (sz)
+            MSZ_8:   val = is_signed ? {{56{b8[7]}},   b8}  : {56'b0, b8};
+            MSZ_16:  val = is_signed ? {{48{h16[15]}}, h16} : {48'b0, h16};
+            MSZ_32:  val = eaddr[2] ? {32'b0, rdata[63:32]} : {32'b0, rdata[31:0]};
+            default: val = rdata; // MSZ_64
+         endcase
+         n.wb.value = val;
+         n.wb.rd    = rd;
+         n.SM       = WRITEBACK;
+         n.PC       = pc_next;
+      end
+      return n;
+   endfunction
+
+   // f_st_idx — indexed store of 8/16/32/64 bits. sdata = raw rs1 (replicated
+   // internally). MSZ_64 writes byte_en=0xFF explicitly (Tier-3a convention:
+   // the old STIDX64 task left byte_en stale — a full-doubleword store must
+   // enable all 8 lanes). force_align only affects MSZ_64.
+   function automatic cpu_state_t f_st_idx(cpu_state_t s, logic mem_ready,
+         logic [31:0] eaddr, logic [63:0] sdata, mem_sz_e sz, logic force_align,
+         logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         case (sz)
+            MSZ_8: begin
+               n.mem_addr       = eaddr;
+               n.mem_write_data = {8{sdata[7:0]}};
+               n.mem_byte_en    = 8'b0000_0001 << eaddr[2:0];
+            end
+            MSZ_16: begin
+               n.mem_addr       = {eaddr[31:1], 1'b0};
+               n.mem_write_data = {4{sdata[15:0]}};
+               n.mem_byte_en    = 8'b0000_0011 << {eaddr[2:1], 1'b0};
+            end
+            MSZ_32: begin
+               n.mem_addr       = {eaddr[31:2], 2'b00};
+               n.mem_write_data = {sdata[31:0], sdata[31:0]};
+               n.mem_byte_en    = eaddr[2] ? 8'b1111_0000 : 8'b0000_1111;
+            end
+            default: begin // MSZ_64
+               n.mem_addr       = force_align ? {eaddr[31:3], 3'b000} : eaddr;
+               n.mem_write_data = sdata;
+               n.mem_byte_en    = 8'hFF;
+            end
+         endcase
+         n.mem_write_DV = 1'b1;
+         n.extra_clock  = 1'b1;
+      end else if (mem_ready) begin
+         n.mem_write_DV = 1'b0;
+         n.SM           = OPCODE_REQUEST;
+         n.PC           = pc_next;
+      end
+      return n;
+   endfunction
+
+   // f_ld_idxreg — LDIDX64R: rd = mem64[rs2 + reg[off_reg]]. 3-stage: cycle 0
+   // saves base + redirects port B to off_reg; cycle 1 lets the port settle;
+   // cycle 2 issues the read from base+offset (portb now == offset value).
+   function automatic cpu_state_t f_ld_idxreg(cpu_state_t s, logic mem_ready,
+         logic [31:0] portb, logic [63:0] rdata, logic [3:0] off_reg, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.idx_base_addr = portb;
+         n.reg_2         = off_reg;
+         n.extra_clock   = 2'd1;
+      end else if (s.extra_clock == 1) begin
+         n.extra_clock = 2'd2;
+      end else begin
+         if (!s.mem_read_DV) begin
+            n.mem_addr    = s.idx_base_addr + portb;
+            n.mem_read_DV = 1'b1;
+         end else if (mem_ready) begin
+            n.wb.value    = rdata;
+            n.wb.rd       = s.reg_1;
+            n.SM          = WRITEBACK;
+            n.mem_read_DV = 1'b0;
+            n.PC          = pc_next;
+         end
+      end
+      return n;
+   endfunction
+
+   // f_st_idxreg — STIDX64R: mem64[rs2 + reg[off_reg]] = rs1. Mirror of the
+   // load form; captures rs1 into mem_write_data in cycle 0 (before the port
+   // redirect). byte_en=0xFF (full doubleword; Tier-3a convention).
+   function automatic cpu_state_t f_st_idxreg(cpu_state_t s, logic mem_ready,
+         logic [31:0] portb, logic [63:0] porta, logic [3:0] off_reg, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.idx_base_addr  = portb;
+         n.mem_write_data = porta;
+         n.mem_byte_en    = 8'hFF;
+         n.reg_2          = off_reg;
+         n.extra_clock    = 2'd1;
+      end else if (s.extra_clock == 1) begin
+         n.extra_clock = 2'd2;
+      end else begin
+         if (!s.mem_write_DV) begin
+            n.mem_addr     = s.idx_base_addr + portb;
+            n.mem_write_DV = 1'b1;
+         end else if (mem_ready) begin
+            n.SM           = OPCODE_REQUEST;
+            n.mem_write_DV = 1'b0;
+            n.PC           = pc_next;
+         end
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2585,6 +2735,22 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_75??: st <= f_mem_load(st, w_mem_ready, r_reg_port_b[31:0],          {56'b0, w_mem_read_data[(r_reg_port_b[2:0] * 8) +: 8]},        st.reg_1, st.PC + 4); // MEMGET8
                   32'h0000_77??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:1], 1'b0},  {48'b0, w_mem_read_data[(r_reg_port_b[2:1] * 16) +: 16]},      st.reg_1, st.PC + 4); // MEMGET16
                   32'h0000_7B??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:3], 3'b000}, w_mem_read_data,                                             st.reg_1, st.PC + 4); // MEMGET64
+
+                  // Tier 3b/3c — indexed load/store (LDIDX*/STIDX*), effective_addr = rs2 + imm32 (PC += 8)
+                  32'h0000_0C??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX64 (raw addr)
+                  32'h0000_FC??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b1, st.reg_1, st.PC + 8); // LDIDX64A (8-byte aligned)
+                  32'h0000_C0??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_32, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX32
+                  32'h0000_C2??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX16
+                  32'h0000_C7??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b1, 1'b0, st.reg_1, st.PC + 8); // LDIDX16_S
+                  32'h0000_C4??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX8
+                  32'h0000_C6??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b1, 1'b0, st.reg_1, st.PC + 8); // LDIDX8_S
+                  32'h0000_0D??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_64, 1'b0, st.PC + 8); // STIDX64 (raw addr, be=0xFF)
+                  32'h0000_FD??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_64, 1'b1, st.PC + 8); // STIDX64A (8-byte aligned)
+                  32'h0000_C1??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_32, 1'b0, st.PC + 8); // STIDX32
+                  32'h0000_C3??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_16, 1'b0, st.PC + 8); // STIDX16
+                  32'h0000_C5??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_8,  1'b0, st.PC + 8); // STIDX8
+                  32'h0000_0E??: st <= f_ld_idxreg(st, w_mem_ready, r_reg_port_b[31:0], w_mem_read_data, w_var1[3:0], st.PC + 8); // LDIDX64R
+                  32'h0000_73??: st <= f_st_idxreg(st, w_mem_ready, r_reg_port_b[31:0], r_reg_port_a,   w_var1[3:0], st.PC + 8); // STIDX64R
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
