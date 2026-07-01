@@ -788,6 +788,101 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ========================================================================
+   // Tier 2 — setup / simple-state ops.
+   // ========================================================================
+
+   // f_delay — DELAYV/DELAYR spin-wait (multi-cycle: st.timing_start/
+   // timeout_counter/timeout_max). fraction<<13 ticks; re-enters OPCODE_EXECUTE.
+   function automatic cpu_state_t f_delay(cpu_state_t s, logic [31:0] fraction, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.timing_start == 1'b0) begin
+         n.timeout_max     = fraction << 13;
+         n.timeout_counter = 0;
+         n.timing_start    = 1'b1;   // SM stays OPCODE_EXECUTE (n=s) -> re-enter
+      end else if (s.timeout_counter >= s.timeout_max) begin
+         n.timeout_counter = 0;
+         n.timing_start    = 1'b0;
+         n.SM              = OPCODE_REQUEST;
+         n.PC              = pc_next;
+      end else begin
+         n.timeout_counter = s.timeout_counter + 1;
+         n.SM              = OPCODE_EXECUTE;
+      end
+      return n;
+   endfunction
+
+   // f_sp_set — SETSP/ADDSP (single-cycle SP write). Caller computes new_sp.
+   function automatic cpu_state_t f_sp_set(cpu_state_t s, logic [31:0] new_sp, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.SP = new_sp;
+      n.SM = OPCODE_REQUEST;
+      n.PC = pc_next;
+      return n;
+   endfunction
+
+   // f_mul_setup — seed the multiply pipeline (MULR/MULUR/MULHR/MULHUR/MULV).
+   // Single NBA into MULTIPLY_SETUP; the pipeline (FSM) does the rest incl. the
+   // PC increment (via mul_is_immediate). No PC write here.
+   function automatic cpu_state_t f_mul_setup(cpu_state_t s, logic [63:0] op_a, logic [63:0] op_b,
+                                              logic [3:0] dest, logic is_high, logic is_unsigned,
+                                              logic is_immediate);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read      = 1'b0;
+      n.mul_operand_a     = op_a;
+      n.mul_operand_b     = op_b;
+      n.mul_dest_reg      = dest;
+      n.mul_is_high       = is_high;
+      n.mul_is_unsigned   = is_unsigned;
+      n.mul_is_immediate  = is_immediate;
+      n.SM                = MULTIPLY_SETUP;
+      return n;
+   endfunction
+
+   // f_div_setup — seed the divide pipeline (DIVR/DIVUR/MODR/MODUR/DIVV/MODV),
+   // CENTRALISING the divide-by-zero guard (was a per-op copy incl. the MODV bug).
+   // by-zero: DIV->all-ones, MOD->dividend, overflow flag, single-cycle writeback.
+   // else: abs operands (signed) into div_state, SM=DIVIDE_PREP; the iterative
+   // divider (FSM) finishes + increments PC per div.pc_inc (= is_immediate). The
+   // divisor==0 test covers both reg (rs2==0) and immediate (sext(imm)==0) forms.
+   function automatic cpu_state_t f_div_setup(cpu_state_t s, logic [63:0] dividend, logic [63:0] divisor,
+                                              logic is_signed, logic is_mod, logic is_immediate,
+                                              logic [3:0] dest);
+      cpu_state_t  n;
+      logic [63:0] abs_dividend, abs_divisor;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (divisor == 64'b0) begin
+         n.wb.value       = is_mod ? dividend : 64'hFFFFFFFFFFFFFFFF;
+         n.wb.rd          = dest;
+         n.flags.overflow = 1'b1;
+         n.SM             = OPCODE_REQUEST;
+         n.wb.pending     = 1'b1;
+         n.PC             = is_immediate ? (s.PC + 32'd8) : (s.PC + 32'd4);
+      end else begin
+         abs_dividend = (is_signed && dividend[63]) ? (~dividend + 64'd1) : dividend;
+         abs_divisor  = (is_signed && divisor[63])  ? (~divisor  + 64'd1) : divisor;
+         n.div.dividend  = abs_dividend;
+         n.div.divisor   = abs_divisor;
+         n.div.quotient  = 64'b0;
+         n.div.remainder = 64'b0;
+         n.div.counter   = 7'd0;
+         n.div.sign_q    = dividend[63] ^ divisor[63];
+         n.div.sign_r    = dividend[63];
+         n.div.is_signed = is_signed;
+         n.div.op        = is_mod ? DIV_OP_MOD : DIV_OP_DIV;
+         n.div.dest_reg  = dest;
+         n.div.pc_inc    = is_immediate;
+         n.SM            = DIVIDE_PREP;
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2385,6 +2480,24 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_0F9?: st <= f_rot1(st, {r_reg_port_b[0], r_reg_port_b[63:1]}, r_reg_port_b[0],   st.reg_2, st.PC + 4); // RORR1
                   32'h0000_0FA?: st <= f_rot1(st, {r_reg_port_b[62:0], st.flags.carry}, r_reg_port_b[63],   st.reg_2, st.PC + 4); // ROLCR
                   32'h0000_0FB?: st <= f_rot1(st, {st.flags.carry, r_reg_port_b[63:1]}, r_reg_port_b[0],    st.reg_2, st.PC + 4); // RORCR
+                  // Tier 2 — multiply pipeline seed (f_mul_setup).
+                  32'h0010_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b0, 1'b0); // MULR
+                  32'h0011_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b1, 1'b0); // MULUR
+                  32'h0012_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b0, 1'b0); // MULHR
+                  32'h0013_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b1, 1'b0); // MULHUR
+                  32'h0000_0B8?: st <= f_mul_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, st.reg_2, 1'b0, 1'b0, 1'b1); // MULV
+                  // Tier 2 — divide pipeline seed (f_div_setup; centralised /0 guard).
+                  32'h0014_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b0, 1'b0, st.reg_dst); // DIVR
+                  32'h0015_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b0, 1'b0, st.reg_dst); // DIVUR
+                  32'h0016_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b1, 1'b0, st.reg_dst); // MODR
+                  32'h0017_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b1, 1'b0, st.reg_dst); // MODUR
+                  32'h0000_0B9?: st <= f_div_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b0, 1'b1, st.reg_2); // DIVV
+                  32'h0000_0BA?: st <= f_div_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b1, 1'b1, st.reg_2); // MODV
+                  // Tier 2 — SP set + delay.
+                  32'h0000_404?: st <= f_sp_set(st, r_reg_port_b[31:0],          st.PC + 4);  // SETSP
+                  32'h0000_4050: st <= f_sp_set(st, st.SP + $signed(w_var1),     st.PC + 8);  // ADDSP
+                  32'h0000_F00?: st <= f_delay (st, r_reg_port_b[31:0],          st.PC + 4);  // DELAYR
+                  32'h0000_F013: st <= f_delay (st, w_var1,                      st.PC + 8);  // DELAYV
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
