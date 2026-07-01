@@ -470,6 +470,11 @@ module KlaussCPU (
    wire w_ifb_fpc_hit1  = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc_dw);
    wire w_ifb_fpc_hit   = w_ifb_fpc_hit0 | w_ifb_fpc_hit1;
    wire [63:0] w_ifb_fpc_data = w_ifb_fpc_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   // Tier-4 branch not-taken pre-settle: reg_1/2 for the fall-through successor
+   // (mirrors the cond-jump/call tasks; only meaningful when !r_ir_valid & fpc hit).
+   wire        w_ps_ok = (!r_ir_valid && w_ifb_fpc_hit);
+   wire [3:0]  w_ps_r1 = r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+   wire [3:0]  w_ps_r2 = r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
    wire w_ifb_fpcv1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
@@ -1300,6 +1305,61 @@ module KlaussCPU (
          n.SP              = s.SP + 8;
          n.mem_read_DV     = 1'b0;
          n.SM              = OPCODE_REQUEST;
+      end
+      return n;
+   endfunction
+
+   // ------------------------------------------------------------------------
+   // Tier 4 — branch family. f_cond_jump / f_cond_call handle both absolute and
+   // PC-relative forms (is_rel). Taken: jump (calls first push return PC+8 via
+   // the DDR2 extra_clock handshake). Not-taken: fall through (PC+8) and pre-settle
+   // reg_1/2 for the successor (ps_* computed in the arm). The perf-branch strobe
+   // (jumps only) and r_ir_presettled are driven by the ARM's own NBAs (they are
+   // module-scope 1-cycle strobes, so they stay out of st).
+   // ------------------------------------------------------------------------
+   function automatic cpu_state_t f_cond_jump(cpu_state_t s, logic cond, logic [31:0] i_value,
+         logic is_rel, logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.SM = OPCODE_REQUEST;
+      if (cond) begin
+         n.PC = is_rel ? (s.PC + i_value) : i_value;
+      end else begin
+         n.PC = s.PC + 8;
+         if (ps_ok) begin
+            n.reg_1 = ps_r1;
+            n.reg_2 = ps_r2;
+         end
+      end
+      return n;
+   endfunction
+
+   function automatic cpu_state_t f_cond_call(cpu_state_t s, logic mem_ready, logic cond,
+         logic [31:0] i_value, logic is_rel, logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (cond) begin
+         if (s.extra_clock == 0) begin
+            n.SP             = s.SP - 8;
+            n.mem_addr       = s.SP - 32'd8;
+            n.mem_write_data = {32'b0, s.PC + 32'd8};   // return after 2-word instruction
+            n.mem_byte_en    = 8'hFF;
+            n.mem_write_DV   = 1'b1;
+            n.extra_clock    = 1'b1;
+         end else if (mem_ready) begin
+            n.mem_write_DV = 1'b0;
+            n.SM           = OPCODE_REQUEST;
+            n.PC           = is_rel ? (s.PC + i_value) : i_value;
+         end
+      end else begin
+         n.SM = OPCODE_REQUEST;
+         n.PC = s.PC + 8;
+         if (ps_ok) begin
+            n.reg_1 = ps_r1;
+            n.reg_2 = ps_r2;
+         end
       end
       return n;
    endfunction
@@ -2975,6 +3035,56 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_1012: st <= f_ret (st, w_mem_ready, w_mem_read_data);                  // RET
                   32'h0000_401?: st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_2, st.PC + 4); // POP
                   32'h0000_6011: st <= f_iret(st, w_mem_ready, w_mem_read_data);                  // IRET
+
+                  // Tier 4 — branch family (cond jumps/calls, abs+rel). perf_br + not-taken
+                  // pre-settle driven from the arm (module-scope); JMPR folds into f_ctrl.
+                  32'h0000_102?: st <= f_ctrl(st, OPCODE_REQUEST, r_reg_port_b[31:0]); // JMPR
+                  32'h0000_1000: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // JMP
+                  32'h0000_1001: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZ
+                  32'h0000_1002: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZ
+                  32'h0000_1003: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPE
+                  32'h0000_1004: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNE
+                  32'h0000_1005: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPC
+                  32'h0000_1006: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNC
+                  32'h0000_1007: begin st <= f_cond_jump(st, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.overflow; if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPO
+                  32'h0000_1008: begin st <= f_cond_jump(st, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.overflow; if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNO
+                  32'h0000_1013: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPS
+                  32'h0000_1014: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNS
+                  32'h0000_1015: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLT
+                  32'h0000_1016: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLE
+                  32'h0000_1017: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGT
+                  32'h0000_1018: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGE
+                  32'h0000_1019: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULT
+                  32'h0000_101A: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULE
+                  32'h0000_101B: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGT
+                  32'h0000_101C: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGE
+                  32'h0000_1030: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // JMPREL
+                  32'h0000_1031: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZREL
+                  32'h0000_1032: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZREL
+                  32'h0000_1033: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPEREL
+                  32'h0000_1034: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNEREL
+                  32'h0000_1035: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPCREL
+                  32'h0000_1036: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNCREL
+                  32'h0000_1037: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPSREL
+                  32'h0000_1038: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNSREL
+                  32'h0000_1039: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLTREL
+                  32'h0000_103A: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLEREL
+                  32'h0000_103B: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGTREL
+                  32'h0000_103C: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGEREL
+                  32'h0000_103D: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULTREL
+                  32'h0000_103E: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULEREL
+                  32'h0000_103F: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGTREL
+                  32'h0000_1040: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGEREL
+                  32'h0000_1009: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // CALL
+                  32'h0000_100A: begin st <= f_cond_call(st, w_mem_ready, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLZ
+                  32'h0000_100B: begin st <= f_cond_call(st, w_mem_ready, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNZ
+                  32'h0000_100C: begin st <= f_cond_call(st, w_mem_ready, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLE
+                  32'h0000_100D: begin st <= f_cond_call(st, w_mem_ready, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNE
+                  32'h0000_100E: begin st <= f_cond_call(st, w_mem_ready, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLC
+                  32'h0000_100F: begin st <= f_cond_call(st, w_mem_ready, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNC
+                  32'h0000_1010: begin st <= f_cond_call(st, w_mem_ready, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLO
+                  32'h0000_1011: begin st <= f_cond_call(st, w_mem_ready, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNO
+                  32'h0000_1041: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // CALLREL
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
