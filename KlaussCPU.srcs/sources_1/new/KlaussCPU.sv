@@ -757,6 +757,37 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // f_rot1 — rotate-by-1 / rotate-through-carry: like f_wb but also sets
+   // flags.carry (+ set_zero). Caller precomputes the rotated value + carry_out.
+   // Collapses ROLR1/RORR1/ROLCR/RORCR.
+   function automatic cpu_state_t f_rot1(cpu_state_t s, logic [63:0] value, logic carry_out,
+                                         logic [3:0] rd, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.wb.value    = value;
+      n.wb.rd       = rd;
+      n.flags.carry = carry_out;
+      n.wb.set_zero = 1'b1;
+      n.SM          = OPCODE_REQUEST;
+      n.wb.pending  = 1'b1;
+      n.PC          = pc_next;
+      return n;
+   endfunction
+
+   // f_btst — BTST (bit test): flag-only, no register writeback. zero flag = NOT
+   // the tested bit (zero if the bit is 0).
+   function automatic cpu_state_t f_btst(cpu_state_t s, logic [63:0] src, logic [5:0] pos,
+                                         logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      n.flags.zero = ~src[pos];
+      n.SM         = OPCODE_REQUEST;
+      n.PC         = pc_next;
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -2326,6 +2357,34 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_099?: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_2, 1'b0, st.PC + 8);                    // LEAPC
                   32'h0000_0F0?: st <= f_wb(st, {{32{r_reg_port_b[31]}}, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4); // SEXTW
                   32'h0000_0F1?: st <= f_wb(st, {32'b0, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4);                // ZEXTW
+                  // Bit set/clear/toggle (reg + value forms) via f_wb.
+                  32'h0050_0???: st <= f_wb(st, r_reg_port_a |  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BSETRR
+                  32'h0051_0???: st <= f_wb(st, r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BCLRRR
+                  32'h0052_0???: st <= f_wb(st, r_reg_port_a ^  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BTGLRR
+                  32'h0053_0???: st <= f_wb(st, {63'b0, r_reg_port_a[r_reg_port_b[5:0]]}, st.reg_dst, 1'b0, st.PC + 4);     // BTSTRR
+                  32'h0000_0A0?: st <= f_wb(st, r_reg_port_b |  (64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BSET
+                  32'h0000_0A1?: st <= f_wb(st, r_reg_port_b & ~(64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BCLR
+                  32'h0000_0A2?: st <= f_wb(st, r_reg_port_b ^  (64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BTGL
+                  32'h0000_0A3?: st <= f_btst(st, r_reg_port_b, w_var1[5:0], st.PC + 8);                                    // BTST (flag-only)
+                  // Unary bit-count / reverse via f_wb (helper funcs).
+                  32'h0000_0A8?: st <= f_wb(st, {57'b0, popcount(r_reg_port_b)},              st.reg_2, 1'b1, st.PC + 4);    // POPCNT
+                  32'h0000_0A9?: st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_b)},   st.reg_2, 1'b0, st.PC + 4);    // CLZ
+                  32'h0000_0AA?: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_b)},  st.reg_2, 1'b0, st.PC + 4);    // CTZ
+                  32'h0000_0AB?: st <= f_wb(st, bit_reverse(r_reg_port_b),                    st.reg_2, 1'b0, st.PC + 4);    // BITREV
+                  // Shift-by-N (logical/arith) via f_wb.
+                  32'h0000_091?: st <= f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHLV
+                  32'h0000_092?: st <= f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHRV
+                  32'h0000_093?: st <= f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8);          // SHRAV
+                  // Rotate-by-N + rotate-reg (no carry) via f_wb.
+                  32'h0000_0FC?: st <= f_wb(st, (r_reg_port_b << w_var1[5:0]) | (r_reg_port_b >> (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // ROLV
+                  32'h0000_0FD?: st <= f_wb(st, (r_reg_port_b >> w_var1[5:0]) | (r_reg_port_b << (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // RORV
+                  32'h0023_0???: st <= f_wb(st, (r_reg_port_a << r_reg_port_b[5:0]) | (r_reg_port_a >> (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // ROLR
+                  32'h0024_0???: st <= f_wb(st, (r_reg_port_a >> r_reg_port_b[5:0]) | (r_reg_port_a << (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // RORR
+                  // Rotate-by-1 + rotate-through-carry via f_rot1 (sets flags.carry).
+                  32'h0000_0F8?: st <= f_rot1(st, {r_reg_port_b[62:0], r_reg_port_b[63]}, r_reg_port_b[63], st.reg_2, st.PC + 4); // ROLR1
+                  32'h0000_0F9?: st <= f_rot1(st, {r_reg_port_b[0], r_reg_port_b[63:1]}, r_reg_port_b[0],   st.reg_2, st.PC + 4); // RORR1
+                  32'h0000_0FA?: st <= f_rot1(st, {r_reg_port_b[62:0], st.flags.carry}, r_reg_port_b[63],   st.reg_2, st.PC + 4); // ROLCR
+                  32'h0000_0FB?: st <= f_rot1(st, {st.flags.carry, r_reg_port_b[63:1]}, r_reg_port_b[0],    st.reg_2, st.PC + 4); // RORCR
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
