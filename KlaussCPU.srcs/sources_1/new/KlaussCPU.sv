@@ -2365,95 +2365,10 @@ rams_sp_nc rams_sp_nc1 (
             r_timer_interrupt_counter_sec <= r_timer_interrupt_counter_sec + 1;
          end
 
-         //=====================================================================
-         // MMIO write handler — fires when bus_splitter routes a CPU store
-         // (LD/ST opcode → st.mem_write_DV) to an MMIO address (top nibble 'F).
-         // Peripheral state regs are touched here AND by the legacy opcode
-         // tasks (e.g. t_led_rgb1_value, t_7_seg1_reg). Both paths converge
-         // on the same registers — no double-driver conflict because they
-         // never fire on the same cycle (legacy opcodes run during
-         // OPCODE_EXECUTE; MMIO writes complete during memory-task states
-         // that do not otherwise touch these regs).
-         //
-         // Write handler runs BEFORE the FSM case statement, so any state
-         // that assigns these regs explicitly (NO_PROGRAM boot animation,
-         // LOADING_BYTE display, HCF blanking) overrides the MMIO write.
-         // Address decode: addr[27:16]=device, addr[15:0]=register offset.
-         // See doc/MMIO_MAP.md for the full memory map.
-         //=====================================================================
-         if (w_mmio_write_DV) begin
-            case (w_mmio_addr[27:16])
-               12'h002: begin  // RGB LEDs
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
-                     16'h0008: st.RGB_LED_2 <= w_mmio_write_data[11:0];
-                     default: ;
-                  endcase
-               end
-               12'h003: begin  // 7-segment display
-                  case (w_mmio_addr[15:0])
-                     // SEG_LOW: 4 hex digits → lower display (value2)
-                     16'h0000: st.seven_seg_value2 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
-                     // SEG_HIGH: 4 hex digits → upper display (value1)
-                     16'h0008: st.seven_seg_value1 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
-                     // SEG_ALL: 8 hex digits across both displays
-                     16'h0010: begin
-                        st.seven_seg_value1 <= {
-                           4'h0, w_mmio_write_data[31:28],
-                           4'h0, w_mmio_write_data[27:24],
-                           4'h0, w_mmio_write_data[23:20],
-                           4'h0, w_mmio_write_data[19:16]
-                        };
-                        st.seven_seg_value2 <= {
-                           4'h0, w_mmio_write_data[15:12],
-                           4'h0, w_mmio_write_data[11:8],
-                           4'h0, w_mmio_write_data[7:4],
-                           4'h0, w_mmio_write_data[3:0]
-                        };
-                     end
-                     // SEG_BLANK: any write blanks both displays
-                     16'h0018: begin
-                        st.seven_seg_value1 <= 32'h22222222;
-                        st.seven_seg_value2 <= 32'h22222222;
-                     end
-                     default: ;
-                  endcase
-               end
-               12'h004: begin  // 16-bit LED bar
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.led <= w_mmio_write_data[15:0];
-                     default: ;
-                  endcase
-               end
-               12'h00F: begin  // Interrupt controller / timer
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
-                     // 16'h0008 (INT_PENDING) is read-only; writes ignored
-                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
-                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
-                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
-                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
-                     16'h0030: begin
-                        r_timer_period            <= w_mmio_write_data[31:0];
-                        r_timer_interrupt_counter <= 32'h0;  // restart with new period
-                     end
-                     // 16'h0038 (TIMER_COUNT) is read-only; writes ignored
-                     default: ;
-                  endcase
-               end
-               default: ;
-            endcase
-         end
+         // NOTE: the MMIO write handler now runs AFTER this case(st.SM) — see the
+         // block just past the endcase. It was moved there so a converted store's
+         // whole-struct `st <= f_x(st)` NBA in OPCODE_EXECUTE cannot clobber the
+         // peripheral st fields (esp. st.int_mask) it writes on the same cycle.
 
          case (st.SM)
             NO_PROGRAM: begin
@@ -3762,6 +3677,86 @@ end
 
             default: st.SM <= HCF_1;  // loop in error
          endcase  // case(st.SM)
+
+         // MMIO write handler — MOVED to AFTER case(st.SM): a converted store's
+         // whole-struct `st <= f_x(st)` NBA in OPCODE_EXECUTE would otherwise clobber
+         // the peripheral st fields (esp. st.int_mask) that this handler writes in the
+         // same cycle. Running after the case makes the MMIO write win (correct: a
+         // memory-mapped store must take effect). Boot/HCF display-override states issue
+         // no MMIO stores, so nothing legitimate is overridden.
+         if (w_mmio_write_DV) begin
+            case (w_mmio_addr[27:16])
+               12'h002: begin  // RGB LEDs
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
+                     16'h0008: st.RGB_LED_2 <= w_mmio_write_data[11:0];
+                     default: ;
+                  endcase
+               end
+               12'h003: begin  // 7-segment display
+                  case (w_mmio_addr[15:0])
+                     // SEG_LOW: 4 hex digits → lower display (value2)
+                     16'h0000: st.seven_seg_value2 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_HIGH: 4 hex digits → upper display (value1)
+                     16'h0008: st.seven_seg_value1 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_ALL: 8 hex digits across both displays
+                     16'h0010: begin
+                        st.seven_seg_value1 <= {
+                           4'h0, w_mmio_write_data[31:28],
+                           4'h0, w_mmio_write_data[27:24],
+                           4'h0, w_mmio_write_data[23:20],
+                           4'h0, w_mmio_write_data[19:16]
+                        };
+                        st.seven_seg_value2 <= {
+                           4'h0, w_mmio_write_data[15:12],
+                           4'h0, w_mmio_write_data[11:8],
+                           4'h0, w_mmio_write_data[7:4],
+                           4'h0, w_mmio_write_data[3:0]
+                        };
+                     end
+                     // SEG_BLANK: any write blanks both displays
+                     16'h0018: begin
+                        st.seven_seg_value1 <= 32'h22222222;
+                        st.seven_seg_value2 <= 32'h22222222;
+                     end
+                     default: ;
+                  endcase
+               end
+               12'h004: begin  // 16-bit LED bar
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.led <= w_mmio_write_data[15:0];
+                     default: ;
+                  endcase
+               end
+               12'h00F: begin  // Interrupt controller / timer
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
+                     // 16'h0008 (INT_PENDING) is read-only; writes ignored
+                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
+                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
+                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
+                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
+                     16'h0030: begin
+                        r_timer_period            <= w_mmio_write_data[31:0];
+                        r_timer_interrupt_counter <= 32'h0;  // restart with new period
+                     end
+                     // 16'h0038 (TIMER_COUNT) is read-only; writes ignored
+                     default: ;
+                  endcase
+               end
+               default: ;
+            endcase
+         end
       end  // else if (w_reset_H)
    end  // always_ff @(posedge i_Clk)
 
