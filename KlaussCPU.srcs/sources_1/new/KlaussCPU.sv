@@ -1364,6 +1364,115 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ------------------------------------------------------------------------
+   // Tier 5 — the two bespoke multi-cycle opcodes (one function each; not shared
+   // with anything, but the same next-state form as the rest — no old tasks left).
+   // ------------------------------------------------------------------------
+
+   // f_pushv64 — PUSHV64: push a 64-bit immediate {hi32,lo32}. 3-word instr, so
+   // hi32 is self-fetched from PC+8 (read), then the doubleword is pushed (write).
+   function automatic cpu_state_t f_pushv64(cpu_state_t s, logic mem_ready, logic [63:0] rdata,
+                                            logic [31:0] lo);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (s.extra_clock == 0) begin
+         n.mem_addr    = s.PC + 8;          // fetch hi32 from PC+8
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 1'b1;
+      end else if (s.extra_clock == 1) begin
+         if (mem_ready) begin
+            n.mem_read_DV    = 1'b0;
+            n.SP             = s.SP - 8;
+            n.mem_addr       = s.SP - 32'd8;
+            n.mem_write_data = {(s.PC[2] ? rdata[63:32] : rdata[31:0]), lo};
+            n.mem_byte_en    = 8'hFF;
+            n.mem_write_DV   = 1'b1;
+            n.extra_clock    = 2'd2;
+         end
+      end else begin // extra_clock == 2
+         if (mem_ready) begin
+            n.mem_write_DV = 1'b0;
+            n.SM           = OPCODE_REQUEST;
+            n.PC           = s.PC + 12;
+         end
+      end
+      return n;
+   endfunction
+
+   // f_memget32 — MEMGET32: unaligned 32-bit load. offset<=4 -> one dword;
+   // offset 5-7 same cache line -> cache lookahead (rdata_next/next_valid);
+   // else cross-line span -> second read (dw0 stashed in wb.value between reads).
+   function automatic cpu_state_t f_memget32(cpu_state_t s, logic mem_ready, logic [63:0] rdata,
+         logic [63:0] rdata_next, logic next_valid, logic [31:0] portb);
+      cpu_state_t n;
+      logic [2:0]  offset;
+      logic [31:0] result;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      offset = portb[2:0];
+      result = 32'b0;
+      if (s.extra_clock == 2'd0) begin
+         n.mem_addr    = portb;
+         n.mem_read_DV = 1'b1;
+         n.extra_clock = 2'd1;
+      end else if (s.extra_clock == 2'd1) begin
+         if (mem_ready) begin
+            n.mem_read_DV = 1'b0;
+            if (offset <= 3'd4) begin
+               case (offset)
+                  3'd0:    result = rdata[31:0];
+                  3'd1:    result = rdata[39:8];
+                  3'd2:    result = rdata[47:16];
+                  3'd3:    result = rdata[55:24];
+                  3'd4:    result = rdata[63:32];
+                  default: result = 32'b0;
+               endcase
+               n.wb.value = {32'b0, result};
+               n.wb.rd    = s.reg_1;
+               n.SM       = WRITEBACK;
+               n.PC       = s.PC + 4;
+            end else if (next_valid) begin
+               // Span within same cache line — use cache lookahead.
+               case (offset)
+                  3'd5:    result = {rdata_next[7:0],  rdata[63:40]};
+                  3'd6:    result = {rdata_next[15:0], rdata[63:48]};
+                  3'd7:    result = {rdata_next[23:0], rdata[63:56]};
+                  default: result = 32'b0;
+               endcase
+               n.wb.value = {32'b0, result};
+               n.wb.rd    = s.reg_1;
+               n.SM       = WRITEBACK;
+               n.PC       = s.PC + 4;
+            end else begin
+               // Cross-cache-line span: stash dw0, issue second read at next dw.
+               n.wb.value    = rdata;
+               n.mem_addr    = {portb[31:3], 3'b000} + 32'd8;
+               n.mem_read_DV = 1'b1;
+               n.extra_clock = 2'd2;
+            end
+         end
+      end else if (s.extra_clock == 2'd2) begin
+         n.extra_clock = 2'd3;
+      end else begin // extra_clock == 2'd3
+         if (mem_ready) begin
+            n.mem_read_DV = 1'b0;
+            // dw1 = rdata; dw0 = s.wb.value (stashed in phase 1).
+            case (offset)
+               3'd5:    result = {rdata[7:0],  s.wb.value[63:40]};
+               3'd6:    result = {rdata[15:0], s.wb.value[63:48]};
+               3'd7:    result = {rdata[23:0], s.wb.value[63:56]};
+               default: result = 32'b0;
+            endcase
+            n.wb.value = {32'b0, result};
+            n.wb.rd    = s.reg_1;
+            n.SM       = WRITEBACK;
+            n.PC       = s.PC + 4;
+         end
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -3085,6 +3194,10 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_1010: begin st <= f_cond_call(st, w_mem_ready, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLO
                   32'h0000_1011: begin st <= f_cond_call(st, w_mem_ready, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNO
                   32'h0000_1041: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // CALLREL
+
+                  // Tier 5 — the two bespoke multi-cycle opcodes
+                  32'h0000_4060: st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]); // PUSHV64 (self-fetch hi32)
+                  32'h0000_79??: st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_b[31:0]); // MEMGET32
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
