@@ -2177,16 +2177,11 @@ rams_sp_nc rams_sp_nc1 (
 
             ); */
 
-   `include "timing_tasks.vh"
-   `include "LCD_tasks.vh"
-   `include "register_tasks.vh"
-   `include "control_tasks.vh"
-   `include "stack_tasks.vh"
-   // functions.vh lifted into klauss_pkg (pure helpers; imported above).
-   `include "opcode_select.vh"
+   // All opcode-handler tasks + the t_opcode_select dispatcher were converted to
+   // next-state functions (f_*) or retired (UART->MMIO); only uart_tasks.vh
+   // remains, holding live FSM-state helpers (t_tx_message/t_debug_message loader
+   // & debug messages) + the HCF crash-dump formatter (f_dump_*).
    `include "uart_tasks.vh"
-   `include "memory_tasks.vh"
-   `include "alu_extended_tasks.vh"    
 
    initial begin
       o_TX_LCD_Count = 4'd1;
@@ -3152,7 +3147,10 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_2021: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
                   32'h0000_2022: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
                   32'h0000_2023: begin st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 8); o_LCD_reset_n <= w_var1[0]; end // LCD reset
-                  default:       t_opcode_select;
+                  default: begin  // invalid opcode -> crash-dump (was t_opcode_select's default)
+                     st.SM         <= HCF_1;
+                     st.error_code <= ERR_INV_OPCODE;
+                  end
                endcase
             end  // case OPCODE_EXECUTE
 
