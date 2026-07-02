@@ -216,12 +216,7 @@ module KlaussCPU (
    wire w_sending_msg;
 
    // String transmission state machines (for TXSTRMEM and TXSTRMEMR)
-   logic [2:0] r_tx_str_state_mem;   // State machine for TXSTRMEM (imm32 address)
-   logic [2:0] r_tx_str_state_reg;   // State machine for TXSTRMEMR (register address)
-   logic [26:0] r_tx_str_addr_mem;   // Current address for TXSTRMEM
-   logic [26:0] r_tx_str_addr_reg;   // Current address for TXSTRMEMR
-   logic        r_tx_str_done_mem;   // Persists has_null across UART handshake states (TXSTRMEM)
-   logic        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
+   // (r_tx_str_* string-streaming state removed — TXSTRMEM/TXSTRMEMR retired; UART is MMIO)
 
    // temp vars for timing
 
@@ -1481,36 +1476,11 @@ module KlaussCPU (
    endfunction
 
    // ------------------------------------------------------------------------
-   // Tier 6a/6b — UART-RX (st-only) and LCD-SPI. LCD writes module output ports
-   // (o_TX_LCD_*/o_LCD_*), which are NOT in st, so f_lcd handles only the st part
-   // and the arm drives the ports via its own NBAs (the r_perf_br pattern).
+   // Tier 6b — LCD-SPI. LCD writes module output ports (o_TX_LCD_*/o_LCD_*),
+   // which are NOT in st, so f_lcd handles only the st part and the arm drives
+   // the ports via its own NBAs (the r_perf_br pattern). (UART-RX was also
+   // converted here but is now RETIRED — UART is MMIO at 0xF001.)
    // ------------------------------------------------------------------------
-
-   // f_rx — RXRB (blocking) / RXRNB (non-blocking) UART receive. Reads the RX
-   // FIFO head via args; pops it (rx_fifo_read pulse) into rd when data present.
-   function automatic cpu_state_t f_rx(cpu_state_t s, logic is_blocking, logic fifo_empty,
-                                       logic [7:0] fifo_byte);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      if (fifo_empty) begin
-         if (is_blocking) begin
-            n.SM = OPCODE_EXECUTE;        // blocking: retry next cycle
-         end else begin
-            n.flags.zero = 1'b1;          // non-blocking: signal "no data"
-            n.SM         = OPCODE_REQUEST;
-            n.PC         = s.PC + 4;
-         end
-      end else begin
-         n.rx_fifo_read = 1'b1;           // pop the byte
-         n.wb.value     = {56'b0, fifo_byte};
-         n.wb.rd        = s.reg_2;
-         n.flags.zero   = 1'b0;
-         n.SM           = WRITEBACK;
-         n.PC           = s.PC + 4;
-      end
-      return n;
-   endfunction
 
    // f_lcd — st part of the SPI-DC LCD writes: on i_TX_LCD_Ready, clear the
    // timeout and advance; otherwise hold (stay in OPCODE_EXECUTE, retry). The
@@ -2696,8 +2666,6 @@ rams_sp_nc rams_sp_nc1 (
             OPCODE_REQUEST: begin
                r_msg_send_DV <= 1'b0;
                st.extra_clock <= 2'b0;  // always reset — all instructions rely on this
-               r_tx_str_state_mem <= 3'b0;  // reset string transmission state machine (TXSTRMEM)
-               r_tx_str_state_reg <= 3'b0;  // reset string transmission state machine (TXSTRMEMR)
                st.mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
 
                // Execute-occupancy fusion: commit the previous
@@ -3177,11 +3145,8 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_4060: st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]); // PUSHV64 (self-fetch hi32)
                   32'h0000_79??: st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_b[31:0]); // MEMGET32
 
-                  // Tier 6a — UART receive (st-only)
-                  32'h0000_505?: st <= f_rx(st, 1'b1, w_rx_fifo_empty, w_rx_fifo_byte); // RXRB  (blocking)
-                  32'h0000_506?: st <= f_rx(st, 1'b0, w_rx_fifo_empty, w_rx_fifo_byte); // RXRNB (non-blocking)
-
                   // Tier 6b — LCD SPI-DC writes; f_lcd = st part, arm drives the o_*LCD* ports
+                  // (UART-RX opcodes 0x505x/0x506x retired — UART is MMIO at 0xF001.)
                   32'h0000_200?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // CDCDMR
                   32'h0000_201?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
                   32'h0000_2021: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV

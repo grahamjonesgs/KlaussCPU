@@ -374,19 +374,8 @@ task t_opcode_select;
          32'h0000_4060: t_stack_push_value64(w_var1, w_var2);  // PUSHV64 V64 push {hi32,lo32} (64-bit) onto stack; SP-=8; PC+=12
          32'h0000_407?: t_call_reg;                            // CALLR R push PC+4 (ret addr, zero-ext), jump to rs2; SP-=8
 
-         //=====================================================================
-         // UART communication (5xxx) — debug output
-         //=====================================================================
-         32'h0000_5000: t_test_message;                        // TESTMSG send fixed test string over UART
-         32'h0000_5001: t_tx_newline;                          // NEWLINE send UART newline (CR+LF)
-         32'h0000_5002: t_tx_value_of_mem(w_var1);             // TXMEM V send 64-bit value at mem[imm32] as hex over UART
-         32'h0000_5003: t_tx_string_at_mem(w_var1);            // TXSTRMEM V send null-terminated string at mem[imm32] over UART
-         32'h0000_501?: t_tx_reg;                              // TXR R send rs2 (64-bit) as hex over UART
-         32'h0000_502?: t_tx_value_of_mem_at_reg;              // TXMEMR R send 64-bit value at mem[rs2] as hex over UART
-         32'h0000_503?: t_tx_char_from_reg_value;              // TXCHARMEMR R send byte at mem[rs2] as ASCII char over UART
-         32'h0000_504?: t_tx_string_at_reg;                    // TXSTRMEMR R send null-terminated string at mem[rs2] over UART
-         32'h0000_505?: t_rx_blocking;                         // RXRB R blocking receive: rd=UART byte (waits until byte available)
-         32'h0000_506?: t_rx_nonblocking;                      // RXRNB R non-blocking receive: rd=UART byte; zero_flag=1 if FIFO empty
+         // UART (5xxx) RETIRED — now MMIO at 0xF001_0000 (see MMIO_MAP.md).
+         // Opcodes 0x5000-0x506x deleted; software uses the TX/RX/STATUS registers.
 
          //=====================================================================
          // Interrupt control (6xxx)
