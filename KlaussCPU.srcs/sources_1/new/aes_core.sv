@@ -79,6 +79,11 @@ module aes_core (
     // InvSubBytes result; r_phase selects the round sub-cycle.
     logic [127:0] r_sub;
     logic         r_phase;
+    // r_sel_key: the AddRoundKey key for the NEXT PH_MIX, registered during PH_SUB
+    // (when it is off the critical path). This pulls the r_round -> 11:1 round-key
+    // mux out of the PH_MIX combinational cloud (round-key -> AddRoundKey ->
+    // next-round S-box address), which was the design's worst timing path.
+    logic [127:0] r_sel_key;
     localparam PH_SUB = 1'b0;  // cycle 1: latch S-box output into r_sub
     localparam PH_MIX = 1'b1;  // cycle 2: ShiftRows / MixColumns / AddRoundKey
 
@@ -278,11 +283,14 @@ module aes_core (
     // -------------------------------------------------------------------------
     // Stage-2 (PH_MIX) round data is computed from the registered S-box output
     // r_sub, not the combinational w_after_sub/w_after_isub — that register is
-    // the pipeline cut that shortens the round's critical path.
-    wire [127:0] w_enc_full   = mix_columns(shift_rows(r_sub)) ^ r_round_key[r_round + 1];
-    wire [127:0] w_enc_final  = shift_rows(r_sub) ^ r_round_key[10];
-    wire [127:0] w_dec_full   = inv_mix_columns(inv_shift_rows(r_sub) ^ r_round_key[r_round - 1]);
-    wire [127:0] w_dec_final  = inv_shift_rows(r_sub) ^ r_round_key[0];
+    // the pipeline cut that shortens the round's critical path. The AddRoundKey
+    // key is r_sel_key (registered a phase earlier), so the r_round->key-mux is
+    // off this path. For encrypt r_sel_key == r_round_key[r_round+1] (== [10] on
+    // the final round); for decrypt r_sel_key == r_round_key[r_round-1] (== [0]).
+    wire [127:0] w_enc_full   = mix_columns(shift_rows(r_sub)) ^ r_sel_key;
+    wire [127:0] w_enc_final  = shift_rows(r_sub) ^ r_sel_key;
+    wire [127:0] w_dec_full   = inv_mix_columns(inv_shift_rows(r_sub) ^ r_sel_key);
+    wire [127:0] w_dec_final  = inv_shift_rows(r_sub) ^ r_sel_key;
 
     // -------------------------------------------------------------------------
     // Main state machine
@@ -299,6 +307,7 @@ module aes_core (
             o_data_out <= 128'h0;
             r_state_data <= 128'h0;
             r_sub        <= 128'h0;
+            r_sel_key    <= 128'h0;
             r_phase      <= PH_SUB;
             for (i = 0; i < 11; i = i + 1)
                 r_round_key[i] <= 128'h0;
@@ -343,9 +352,12 @@ module aes_core (
 
                 ST_ENC: begin
                     if (r_phase == PH_SUB) begin
-                        // Stage 1: register SubBytes of the current state.
-                        r_sub   <= w_after_sub;
-                        r_phase <= PH_MIX;
+                        // Stage 1: register SubBytes of the current state, and the
+                        // round key the coming PH_MIX AddRoundKey will need (off the
+                        // critical path here).
+                        r_sub     <= w_after_sub;
+                        r_sel_key <= r_round_key[r_round + 1];
+                        r_phase   <= PH_MIX;
                     end else begin
                         // Stage 2: ShiftRows / MixColumns / AddRoundKey.
                         r_phase <= PH_SUB;
@@ -362,9 +374,11 @@ module aes_core (
 
                 ST_DEC: begin
                     if (r_phase == PH_SUB) begin
-                        // Stage 1: register InvSubBytes of the current state.
-                        r_sub   <= w_after_isub;
-                        r_phase <= PH_MIX;
+                        // Stage 1: register InvSubBytes of the current state, and the
+                        // round key the coming PH_MIX AddRoundKey will need.
+                        r_sub     <= w_after_isub;
+                        r_sel_key <= r_round_key[r_round - 1];
+                        r_phase   <= PH_MIX;
                     end else begin
                         // Stage 2: InvShiftRows / AddRoundKey / InvMixColumns.
                         r_phase <= PH_SUB;
