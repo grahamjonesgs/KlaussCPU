@@ -216,12 +216,7 @@ module KlaussCPU (
    wire w_sending_msg;
 
    // String transmission state machines (for TXSTRMEM and TXSTRMEMR)
-   logic [2:0] r_tx_str_state_mem;   // State machine for TXSTRMEM (imm32 address)
-   logic [2:0] r_tx_str_state_reg;   // State machine for TXSTRMEMR (register address)
-   logic [26:0] r_tx_str_addr_mem;   // Current address for TXSTRMEM
-   logic [26:0] r_tx_str_addr_reg;   // Current address for TXSTRMEMR
-   logic        r_tx_str_done_mem;   // Persists has_null across UART handshake states (TXSTRMEM)
-   logic        r_tx_str_done_reg;   // Persists has_null across UART handshake states (TXSTRMEMR)
+   // (r_tx_str_* string-streaming state removed — TXSTRMEM/TXSTRMEMR retired; UART is MMIO)
 
    // temp vars for timing
 
@@ -391,6 +386,13 @@ module KlaussCPU (
    logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
    logic  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
    logic         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
+   // UART MMIO (0xF001) RX pop-on-read: w_uart_rx_rd_sel is high for the whole read
+   // handshake; r_uart_rx_rd_d delays it by a cycle so w_uart_rx_pop is a single
+   // pulse (pop the FIFO exactly once, on the cycle the head byte is captured).
+   wire          w_uart_rx_rd_sel = w_mmio_read_DV & (w_mmio_addr[27:16] == 12'h001)
+                                                    & (w_mmio_addr[15:0]  == 16'h0008);
+   logic         r_uart_rx_rd_d;
+   wire          w_uart_rx_pop    = w_uart_rx_rd_sel & ~r_uart_rx_rd_d;
    // MMIO writes complete in 1 cycle (write-side has no read-data path).
    // MMIO reads now take 2 cycles: cycle 1 captures decode into the FF,
    // cycle 2 asserts ready so the CPU FSM samples r_mmio_read_data.
@@ -470,6 +472,11 @@ module KlaussCPU (
    wire w_ifb_fpc_hit1  = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc_dw);
    wire w_ifb_fpc_hit   = w_ifb_fpc_hit0 | w_ifb_fpc_hit1;
    wire [63:0] w_ifb_fpc_data = w_ifb_fpc_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   // Tier-4 branch not-taken pre-settle: reg_1/2 for the fall-through successor
+   // (mirrors the cond-jump/call tasks; only meaningful when !r_ir_valid & fpc hit).
+   wire        w_ps_ok = (!r_ir_valid && w_ifb_fpc_hit);
+   wire [3:0]  w_ps_r1 = r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
+   wire [3:0]  w_ps_r2 = r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
    wire w_ifb_fpcv1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
@@ -550,81 +557,8 @@ module KlaussCPU (
    //=========================================================================
    // Multi-cycle divide pipeline state, grouped (all fields move together
    // through the DIVIDE_PREP/DIVIDE_STEP FSM; accessed as st.div.<field>).
-   typedef enum logic [1:0] { DIV_OP_NONE, DIV_OP_DIV, DIV_OP_MOD } e_div_op_t;
-   typedef struct packed {
-      logic [63:0] dividend;
-      logic [63:0] divisor;
-      logic [63:0] quotient;
-      logic [63:0] remainder;
-      logic [6:0]  counter;
-      logic        busy;
-      logic        sign_q;      // sign of quotient
-      logic        sign_r;      // sign of remainder
-      logic        is_signed;
-      e_div_op_t   op;          // none / div / mod
-      logic [3:0]  dest_reg;    // destination register for the result
-      logic        pc_inc;      // 0=PC+1, 1=PC+2
-   } div_state_t;
-
-   // ========================================================================
-   // cpu_state_t — the CPU core datapath state bundled into one struct so the
-   // execute tasks operate on it explicitly.  The tasks are `include'd and read/
-   // write this module-scope `st` directly with non-blocking assignments — the
-   // working, board-verified arrangement.
-   //
-   // WARNING — do NOT try to pass `st` into the tasks by `ref`: it was attempted
-   // and PROVEN NON-VIABLE.  A non-blocking assignment through a `ref` argument is
-   // illegal SystemVerilog (IEEE 1800 sec 10.3: no NBA to automatic vars; sec 12.4.2:
-   // a ref arg is forbidden where automatic vars are) AND Vivado synthesizes it
-   // silently into INCORRECT hardware (every program hung on its first memory write).
-   // The supported way to give a task an explicit, package-able interface is the
-   // next-state-FUNCTION form: function automatic cpu_state_t t_x(cpu_state_t s, ...)
-   // that blocking-writes a local copy and returns it, applied via a single
-   // st <= t_x(st, ...) NBA.  (ref post-mortem lives on branch sv-vh-task-lift.)
-   // ========================================================================
-   typedef struct packed {
-      e_sm_t       SM;
-      logic [31:0] PC;
-      logic [31:0] SP;
-      flags_t      flags;
-      wb_t         wb;
-      div_state_t  div;
-      logic [63:0] alu_pipe_value;
-      logic        alu_pipe_carry;
-      logic        alu_pipe_overflow;
-      logic        alu_pipe_equal;
-      logic        alu_pipe_less;
-      logic        alu_pipe_ult;
-      logic        alu_pipe_mode;
-      logic [31:0] mem_addr;
-      logic        mem_read_DV;
-      logic        mem_write_DV;
-      logic [63:0] mem_write_data;
-      logic [ 7:0] mem_byte_en;
-      logic        mem_was_ready;
-      logic [ 1:0] extra_clock;
-      logic [63:0] mul_operand_a;
-      logic [63:0] mul_operand_b;
-      logic [ 3:0] mul_dest_reg;
-      logic        mul_is_high;
-      logic        mul_is_unsigned;
-      logic        mul_is_immediate;
-      logic [ 3:0] reg_1;
-      logic [ 3:0] reg_2;
-      logic [ 3:0] reg_dst;
-      logic [ 7:0] error_code;
-      logic [ 3:0] int_mask;
-      logic [31:0] idx_base_addr;
-      logic [31:0] seven_seg_value1;
-      logic [31:0] seven_seg_value2;
-      logic [15:0] led;
-      logic [11:0] RGB_LED_1;
-      logic [11:0] RGB_LED_2;
-      logic [44:0] timeout_counter;
-      logic [44:0] timeout_max;
-      logic        timing_start;
-      logic        rx_fifo_read;
-   } cpu_state_t;
+   // cpu_state_t + all f_* next-state functions + their enums (alu_op_e/
+   // cmp_op_e/mem_sz_e) + div_state_t live in klauss_pkg.sv (imported above).
    cpu_state_t st;
 
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
@@ -901,6 +835,14 @@ module KlaussCPU (
       r_mmio_read_data_comb = 64'h0;
       case (w_mmio_addr[27:16])
          12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
+         12'h001: begin  // UART
+            case (w_mmio_addr[15:0])
+               16'h0008: r_mmio_read_data_comb = {56'b0, w_rx_fifo_byte};  // RX_DATA (peek; FIFO pops on read)
+               // STATUS: bit0 = TX busy, bit1 = RX empty, bit2 = RX full
+               16'h0010: r_mmio_read_data_comb = {61'b0, w_rx_fifo_full, w_rx_fifo_empty, w_sending_msg};
+               default:  r_mmio_read_data_comb = 64'h0;
+            endcase
+         end
          12'h002: begin  // RGB LEDs
             case (w_mmio_addr[15:0])
                16'h0000: r_mmio_read_data_comb = {52'b0, st.RGB_LED_1};
@@ -996,6 +938,7 @@ module KlaussCPU (
    always_ff @(posedge i_Clk) begin
       r_mmio_read_data <= r_mmio_read_data_comb;
       r_mmio_read_dv_d <= w_mmio_read_DV;
+      r_uart_rx_rd_d   <= w_uart_rx_rd_sel;
    end
 
    mem_read_write mem_read_write (
@@ -1200,7 +1143,7 @@ module KlaussCPU (
        .i_Reset      (w_reset_H),
        .i_Write_En   (w_uart_rx_DV & !r_break_received & (st.SM != LOADING_BYTE)),
        .i_Write_Byte (w_uart_rx_value),
-       .i_Read_En    (st.rx_fifo_read),
+       .i_Read_En    (st.rx_fifo_read | w_uart_rx_pop),
        .o_Peek_Byte  (w_rx_fifo_byte),
        .o_Empty      (w_rx_fifo_empty),
        .o_Full       (w_rx_fifo_full),
@@ -1298,18 +1241,11 @@ rams_sp_nc rams_sp_nc1 (
 
             ); */
 
-   `include "timing_tasks.vh"
-   `include "LCD_tasks.vh"
-   `include "led_tasks.vh"
-   `include "register_tasks.vh"
-   `include "control_tasks.vh"
-   `include "stack_tasks.vh"
-   // functions.vh lifted into klauss_pkg (pure helpers; imported above).
-   `include "seven_seg.vh"
-   `include "opcode_select.vh"
+   // All opcode-handler tasks + the t_opcode_select dispatcher were converted to
+   // next-state functions (f_*) or retired (UART->MMIO); only uart_tasks.vh
+   // remains, holding live FSM-state helpers (t_tx_message/t_debug_message loader
+   // & debug messages) + the HCF crash-dump formatter (f_dump_*).
    `include "uart_tasks.vh"
-   `include "memory_tasks.vh"
-   `include "alu_extended_tasks.vh"    
 
    initial begin
       o_TX_LCD_Count = 4'd1;
@@ -1521,95 +1457,10 @@ rams_sp_nc rams_sp_nc1 (
             r_timer_interrupt_counter_sec <= r_timer_interrupt_counter_sec + 1;
          end
 
-         //=====================================================================
-         // MMIO write handler — fires when bus_splitter routes a CPU store
-         // (LD/ST opcode → st.mem_write_DV) to an MMIO address (top nibble 'F).
-         // Peripheral state regs are touched here AND by the legacy opcode
-         // tasks (e.g. t_led_rgb1_value, t_7_seg1_reg). Both paths converge
-         // on the same registers — no double-driver conflict because they
-         // never fire on the same cycle (legacy opcodes run during
-         // OPCODE_EXECUTE; MMIO writes complete during memory-task states
-         // that do not otherwise touch these regs).
-         //
-         // Write handler runs BEFORE the FSM case statement, so any state
-         // that assigns these regs explicitly (NO_PROGRAM boot animation,
-         // LOADING_BYTE display, HCF blanking) overrides the MMIO write.
-         // Address decode: addr[27:16]=device, addr[15:0]=register offset.
-         // See doc/MMIO_MAP.md for the full memory map.
-         //=====================================================================
-         if (w_mmio_write_DV) begin
-            case (w_mmio_addr[27:16])
-               12'h002: begin  // RGB LEDs
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
-                     16'h0008: st.RGB_LED_2 <= w_mmio_write_data[11:0];
-                     default: ;
-                  endcase
-               end
-               12'h003: begin  // 7-segment display
-                  case (w_mmio_addr[15:0])
-                     // SEG_LOW: 4 hex digits → lower display (value2)
-                     16'h0000: st.seven_seg_value2 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
-                     // SEG_HIGH: 4 hex digits → upper display (value1)
-                     16'h0008: st.seven_seg_value1 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
-                     // SEG_ALL: 8 hex digits across both displays
-                     16'h0010: begin
-                        st.seven_seg_value1 <= {
-                           4'h0, w_mmio_write_data[31:28],
-                           4'h0, w_mmio_write_data[27:24],
-                           4'h0, w_mmio_write_data[23:20],
-                           4'h0, w_mmio_write_data[19:16]
-                        };
-                        st.seven_seg_value2 <= {
-                           4'h0, w_mmio_write_data[15:12],
-                           4'h0, w_mmio_write_data[11:8],
-                           4'h0, w_mmio_write_data[7:4],
-                           4'h0, w_mmio_write_data[3:0]
-                        };
-                     end
-                     // SEG_BLANK: any write blanks both displays
-                     16'h0018: begin
-                        st.seven_seg_value1 <= 32'h22222222;
-                        st.seven_seg_value2 <= 32'h22222222;
-                     end
-                     default: ;
-                  endcase
-               end
-               12'h004: begin  // 16-bit LED bar
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.led <= w_mmio_write_data[15:0];
-                     default: ;
-                  endcase
-               end
-               12'h00F: begin  // Interrupt controller / timer
-                  case (w_mmio_addr[15:0])
-                     16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
-                     // 16'h0008 (INT_PENDING) is read-only; writes ignored
-                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
-                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
-                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
-                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
-                     16'h0030: begin
-                        r_timer_period            <= w_mmio_write_data[31:0];
-                        r_timer_interrupt_counter <= 32'h0;  // restart with new period
-                     end
-                     // 16'h0038 (TIMER_COUNT) is read-only; writes ignored
-                     default: ;
-                  endcase
-               end
-               default: ;
-            endcase
-         end
+         // NOTE: the MMIO write handler now runs AFTER this case(st.SM) — see the
+         // block just past the endcase. It was moved there so a converted store's
+         // whole-struct `st <= f_x(st)` NBA in OPCODE_EXECUTE cannot clobber the
+         // peripheral st fields (esp. st.int_mask) it writes on the same cycle.
 
          case (st.SM)
             NO_PROGRAM: begin
@@ -1874,8 +1725,6 @@ rams_sp_nc rams_sp_nc1 (
             OPCODE_REQUEST: begin
                r_msg_send_DV <= 1'b0;
                st.extra_clock <= 2'b0;  // always reset — all instructions rely on this
-               r_tx_str_state_mem <= 3'b0;  // reset string transmission state machine (TXSTRMEM)
-               r_tx_str_state_reg <= 3'b0;  // reset string transmission state machine (TXSTRMEMR)
                st.mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
 
                // Execute-occupancy fusion: commit the previous
@@ -2146,7 +1995,227 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             OPCODE_EXECUTE: begin
-               t_opcode_select;
+               casez (w_opcode[31:0])
+                  // M1 ROLLOUT: the ALU op-class routed through the unified
+                  // next-state function f_alu (one central NBA per opcode). Every
+                  // other opcode still goes to the existing dispatcher (default).
+                  // RRR forms: a=reg_a, b=reg_b, rd=reg_dst, PC+4.
+                  32'h0001_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, st.PC + 4);  // ADDR
+                  32'h0002_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, st.PC + 4);  // SUBR
+                  32'h0003_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4);  // ANDR
+                  32'h0004_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4);  // ORR
+                  32'h0005_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4);  // XORR
+                  32'h0006_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, st.PC + 4);  // ADDC
+                  32'h0007_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, st.PC + 4);  // SUBC
+                  32'h0000_05??: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, st.PC + 4);  // CMPRR (flags only)
+                  // reg-immediate forms: a=reg_b, b=ext(imm), rd per format, PC+8.
+                  32'h0000_02??: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_ADD, st.reg_1, st.PC + 8);  // ADDI (sign-ext, rd=reg_1)
+                  32'h0000_081?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_ADD, st.reg_2, st.PC + 8);             // ADDV (zero-ext)
+                  32'h0000_082?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_SUB, st.reg_2, st.PC + 8);             // MINUSV (zero-ext)
+                  32'h0000_083?: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_CMP, st.reg_2, st.PC + 8);  // CMPRV (sign-ext, flags only)
+                  32'h0000_086?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8);             // ANDV
+                  32'h0000_087?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8);             // ORV
+                  32'h0000_088?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8);             // XORV
+                  // INC/DEC: a=reg_b, b=1, rd=reg_2, PC+4.
+                  32'h0000_084?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_ADD, st.reg_2, st.PC + 4);  // INCR
+                  32'h0000_085?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_SUB, st.reg_2, st.PC + 4);  // DECR
+                  // Boolean compares (-> rd=0/1) + min/max select, via f_cmpr.
+                  32'h0030_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_EQ);   // CMPEQR
+                  32'h0031_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_NE);   // CMPNER
+                  32'h0032_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LT);   // CMPLTR
+                  32'h0033_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LE);   // CMPLER
+                  32'h0034_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GT);   // CMPGTR
+                  32'h0035_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GE);   // CMPGER
+                  32'h0036_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULT);  // CMPULTR
+                  32'h0037_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULE);  // CMPULER
+                  32'h0038_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGT);  // CMPUGTR
+                  32'h0039_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGE);  // CMPUGER
+                  32'h0040_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MIN);  // MINR
+                  32'h0041_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX);  // MAXR
+                  32'h0042_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU); // MINUR
+                  32'h0043_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU); // MAXUR
+                  // Single-value register writeback (caller precomputes value), via f_wb.
+                  32'h0000_01??: st <= f_wb(st, r_reg_port_b, st.reg_1, 1'b0, st.PC + 4);                                // COPY
+                  32'h0000_080?: st <= f_wb(st, {{32{w_var1[31]}}, w_var1}, st.reg_2, 1'b0, st.PC + 8);                  // SETR (sign-ext)
+                  32'h0000_089?: st <= f_wb(st, {st.flags.zero, st.flags.equal, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_2, 1'b0, st.PC + 4);  // SETFR
+                  32'h0000_08A?: st <= f_wb(st, ~r_reg_port_b + 64'd1, st.reg_2, 1'b1, st.PC + 4);                       // NEGR
+                  32'h0000_08D?: st <= f_wb(st, r_reg_port_b << 1, st.reg_2, 1'b0, st.PC + 4);                          // SHLR1
+                  32'h0000_08E?: st <= f_wb(st, r_reg_port_b >> 1, st.reg_2, 1'b0, st.PC + 4);                          // SHRR1
+                  32'h0000_08F?: st <= f_wb(st, r_reg_port_b << 1, st.reg_2, 1'b0, st.PC + 4);                          // SHLAR (== <<1)
+                  32'h0000_090?: st <= f_wb(st, $signed(r_reg_port_b) >>> 1, st.reg_2, 1'b0, st.PC + 4);                // SHRAR
+                  32'h0000_098?: st <= f_wb(st, ~r_reg_port_b, st.reg_2, 1'b1, st.PC + 4);                              // NOTR
+                  32'h0000_099?: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_2, 1'b0, st.PC + 8);                    // LEAPC
+                  32'h0000_0F0?: st <= f_wb(st, {{32{r_reg_port_b[31]}}, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4); // SEXTW
+                  32'h0000_0F1?: st <= f_wb(st, {32'b0, r_reg_port_b[31:0]}, st.reg_2, 1'b0, st.PC + 4);                // ZEXTW
+                  // Bit set/clear/toggle (reg + value forms) via f_wb.
+                  32'h0050_0???: st <= f_wb(st, r_reg_port_a |  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BSETRR
+                  32'h0051_0???: st <= f_wb(st, r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BCLRRR
+                  32'h0052_0???: st <= f_wb(st, r_reg_port_a ^  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BTGLRR
+                  32'h0053_0???: st <= f_wb(st, {63'b0, r_reg_port_a[r_reg_port_b[5:0]]}, st.reg_dst, 1'b0, st.PC + 4);     // BTSTRR
+                  32'h0000_0A0?: st <= f_wb(st, r_reg_port_b |  (64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BSET
+                  32'h0000_0A1?: st <= f_wb(st, r_reg_port_b & ~(64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BCLR
+                  32'h0000_0A2?: st <= f_wb(st, r_reg_port_b ^  (64'b1 << w_var1[5:0]), st.reg_2, 1'b0, st.PC + 8);         // BTGL
+                  32'h0000_0A3?: st <= f_btst(st, r_reg_port_b, w_var1[5:0], st.PC + 8);                                    // BTST (flag-only)
+                  // Unary bit-count / reverse via f_wb (helper funcs).
+                  32'h0000_0A8?: st <= f_wb(st, {57'b0, popcount(r_reg_port_b)},              st.reg_2, 1'b1, st.PC + 4);    // POPCNT
+                  32'h0000_0A9?: st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_b)},   st.reg_2, 1'b0, st.PC + 4);    // CLZ
+                  32'h0000_0AA?: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_b)},  st.reg_2, 1'b0, st.PC + 4);    // CTZ
+                  32'h0000_0AB?: st <= f_wb(st, bit_reverse(r_reg_port_b),                    st.reg_2, 1'b0, st.PC + 4);    // BITREV
+                  // Shift-by-N (logical/arith) via f_wb.
+                  32'h0000_091?: st <= f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHLV
+                  32'h0000_092?: st <= f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHRV
+                  32'h0000_093?: st <= f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8);          // SHRAV
+                  // Rotate-by-N + rotate-reg (no carry) via f_wb.
+                  32'h0000_0FC?: st <= f_wb(st, (r_reg_port_b << w_var1[5:0]) | (r_reg_port_b >> (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // ROLV
+                  32'h0000_0FD?: st <= f_wb(st, (r_reg_port_b >> w_var1[5:0]) | (r_reg_port_b << (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // RORV
+                  32'h0023_0???: st <= f_wb(st, (r_reg_port_a << r_reg_port_b[5:0]) | (r_reg_port_a >> (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // ROLR
+                  32'h0024_0???: st <= f_wb(st, (r_reg_port_a >> r_reg_port_b[5:0]) | (r_reg_port_a << (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // RORR
+                  // Rotate-by-1 + rotate-through-carry via f_rot1 (sets flags.carry).
+                  32'h0000_0F8?: st <= f_rot1(st, {r_reg_port_b[62:0], r_reg_port_b[63]}, r_reg_port_b[63], st.reg_2, st.PC + 4); // ROLR1
+                  32'h0000_0F9?: st <= f_rot1(st, {r_reg_port_b[0], r_reg_port_b[63:1]}, r_reg_port_b[0],   st.reg_2, st.PC + 4); // RORR1
+                  32'h0000_0FA?: st <= f_rot1(st, {r_reg_port_b[62:0], st.flags.carry}, r_reg_port_b[63],   st.reg_2, st.PC + 4); // ROLCR
+                  32'h0000_0FB?: st <= f_rot1(st, {st.flags.carry, r_reg_port_b[63:1]}, r_reg_port_b[0],    st.reg_2, st.PC + 4); // RORCR
+                  // Tier 2 — multiply pipeline seed (f_mul_setup).
+                  32'h0010_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b0, 1'b0); // MULR
+                  32'h0011_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b1, 1'b0); // MULUR
+                  32'h0012_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b0, 1'b0); // MULHR
+                  32'h0013_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b1, 1'b0); // MULHUR
+                  32'h0000_0B8?: st <= f_mul_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, st.reg_2, 1'b0, 1'b0, 1'b1); // MULV
+                  // Tier 2 — divide pipeline seed (f_div_setup; centralised /0 guard).
+                  32'h0014_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b0, 1'b0, st.reg_dst); // DIVR
+                  32'h0015_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b0, 1'b0, st.reg_dst); // DIVUR
+                  32'h0016_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b1, 1'b0, st.reg_dst); // MODR
+                  32'h0017_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b1, 1'b0, st.reg_dst); // MODUR
+                  32'h0000_0B9?: st <= f_div_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b0, 1'b1, st.reg_2); // DIVV
+                  32'h0000_0BA?: st <= f_div_setup(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b1, 1'b1, st.reg_2); // MODV
+                  // Tier 2 — SP set + delay.
+                  32'h0000_404?: st <= f_sp_set(st, r_reg_port_b[31:0],          st.PC + 4);  // SETSP
+                  32'h0000_4050: st <= f_sp_set(st, st.SP + $signed(w_var1),     st.PC + 8);  // ADDSP
+                  32'h0000_F00?: st <= f_delay (st, r_reg_port_b[31:0],          st.PC + 4);  // DELAYR
+                  32'h0000_F013: st <= f_delay (st, w_var1,                      st.PC + 8);  // DELAYV
+                  // Tier 3 — stack push (f_push).
+                  32'h0000_400?: st <= f_push(st, r_reg_port_b,                 st.PC + 4,           w_mem_ready); // PUSH
+                  32'h0000_4020: st <= f_push(st, {32'b0, w_var1},             st.PC + 8,           w_mem_ready); // PUSHV
+                  32'h0000_407?: st <= f_push(st, {32'b0, st.PC + 32'd4},      r_reg_port_b[31:0],  w_mem_ready); // CALLR
+                  // Tier 3 — DDR2 stores (f_mem_store; caller passes explicit byte_en).
+                  32'h0000_70??: st <= f_mem_store(st, w_mem_ready, r_reg_port_b[31:0],           r_reg_port_a,                          8'hFF, st.PC + 4); // MEMSET64RR
+                  32'h0000_720?: st <= f_mem_store(st, w_mem_ready, w_var1[31:0],                 r_reg_port_b,                          8'hFF, st.PC + 8); // MEMSETR
+                  32'h0000_74??: st <= f_mem_store(st, w_mem_ready, r_reg_port_b[31:0],           {8{r_reg_port_a[7:0]}},                8'b0000_0001 << r_reg_port_b[2:0], st.PC + 4); // MEMSET8
+                  32'h0000_76??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:1], 1'b0},   {4{r_reg_port_a[15:0]}},               8'b0000_0011 << {r_reg_port_b[2:1], 1'b0}, st.PC + 4); // MEMSET16
+                  32'h0000_78??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:2], 2'b00},  {r_reg_port_a[31:0], r_reg_port_a[31:0]}, r_reg_port_b[2] ? 8'b1111_0000 : 8'b0000_1111, st.PC + 4); // MEMSET32
+                  32'h0000_7A??: st <= f_mem_store(st, w_mem_ready, {r_reg_port_b[31:3], 3'b000}, r_reg_port_a,                          8'hFF, st.PC + 4); // MEMSET64
+                  // Tier 3 — DDR2 loads -> WRITEBACK (f_mem_load; arm pre-extracts the value).
+                  32'h0000_71??: st <= f_mem_load(st, w_mem_ready, r_reg_port_b[31:0],          w_mem_read_data,                                              st.reg_1, st.PC + 4); // MEMREADRR
+                  32'h0000_721?: st <= f_mem_load(st, w_mem_ready, w_var1[31:0],                w_mem_read_data,                                              st.reg_2, st.PC + 8); // MEMREADR
+                  32'h0000_75??: st <= f_mem_load(st, w_mem_ready, r_reg_port_b[31:0],          {56'b0, w_mem_read_data[(r_reg_port_b[2:0] * 8) +: 8]},        st.reg_1, st.PC + 4); // MEMGET8
+                  32'h0000_77??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:1], 1'b0},  {48'b0, w_mem_read_data[(r_reg_port_b[2:1] * 16) +: 16]},      st.reg_1, st.PC + 4); // MEMGET16
+                  32'h0000_7B??: st <= f_mem_load(st, w_mem_ready, {r_reg_port_b[31:3], 3'b000}, w_mem_read_data,                                             st.reg_1, st.PC + 4); // MEMGET64
+
+                  // Tier 3b/3c — indexed load/store (LDIDX*/STIDX*), effective_addr = rs2 + imm32 (PC += 8)
+                  32'h0000_0C??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX64 (raw addr)
+                  32'h0000_FC??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b1, st.reg_1, st.PC + 8); // LDIDX64A (8-byte aligned)
+                  32'h0000_C0??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_32, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX32
+                  32'h0000_C2??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX16
+                  32'h0000_C7??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b1, 1'b0, st.reg_1, st.PC + 8); // LDIDX16_S
+                  32'h0000_C4??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b0, 1'b0, st.reg_1, st.PC + 8); // LDIDX8
+                  32'h0000_C6??: st <= f_ld_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b1, 1'b0, st.reg_1, st.PC + 8); // LDIDX8_S
+                  32'h0000_0D??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_64, 1'b0, st.PC + 8); // STIDX64 (raw addr, be=0xFF)
+                  32'h0000_FD??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_64, 1'b1, st.PC + 8); // STIDX64A (8-byte aligned)
+                  32'h0000_C1??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_32, 1'b0, st.PC + 8); // STIDX32
+                  32'h0000_C3??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_16, 1'b0, st.PC + 8); // STIDX16
+                  32'h0000_C5??: st <= f_st_idx(st, w_mem_ready, r_reg_port_b[31:0] + w_var1[31:0], r_reg_port_a, MSZ_8,  1'b0, st.PC + 8); // STIDX8
+                  32'h0000_0E??: st <= f_ld_idxreg(st, w_mem_ready, r_reg_port_b[31:0], w_mem_read_data, w_var1[3:0], st.PC + 8); // LDIDX64R
+                  32'h0000_73??: st <= f_st_idxreg(st, w_mem_ready, r_reg_port_b[31:0], r_reg_port_a,   w_var1[3:0], st.PC + 8); // STIDX64R
+
+                  // Tier 3d — single-cycle stragglers + non-branch control
+                  32'h0020_0???: st <= f_wb(st, r_reg_port_a << r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHLR (RRR)
+                  32'h0021_0???: st <= f_wb(st, r_reg_port_a >> r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHRR (RRR)
+                  32'h0022_0???: st <= f_wb(st, $signed(r_reg_port_a) >>> r_reg_port_b[5:0], st.reg_dst, 1'b1, st.PC + 4); // SARR (RRR)
+                  32'h0000_095?: st <= f_wb(st, {56'b0, r_reg_port_b[7:0]},                  st.reg_2, 1'b1, st.PC + 4); // ZEXTB
+                  32'h0000_096?: st <= f_wb(st, {48'b0, r_reg_port_b[15:0]},                 st.reg_2, 1'b1, st.PC + 4); // ZEXTH
+                  32'h0000_097?: st <= f_wb(st, {r_reg_port_b[7:0], r_reg_port_b[15:8], r_reg_port_b[23:16], r_reg_port_b[31:24], r_reg_port_b[39:32], r_reg_port_b[47:40], r_reg_port_b[55:48], r_reg_port_b[63:56]}, st.reg_2, 1'b0, st.PC + 4); // BSWAP
+                  32'h0000_403?: st <= f_wb(st, {32'b0, st.SP},                              st.reg_2, 1'b0, st.PC + 4); // GETSP
+                  32'h0000_08C?: st <= f_wb_ns(st, {{56{r_reg_port_b[7]}},  r_reg_port_b[7:0]},  st.reg_2, st.PC + 4); // SEXTB (sets sign)
+                  32'h0000_094?: st <= f_wb_ns(st, {{48{r_reg_port_b[15]}}, r_reg_port_b[15:0]}, st.reg_2, st.PC + 4); // SEXTH (sets sign)
+                  32'h0000_08B?: st <= f_abs  (st, r_reg_port_b, st.reg_2, st.PC + 4);                                  // ABSR (sets overflow)
+                  32'h0000_0AC?: st <= f_bextr(st, r_reg_port_b,               w_var1, st.reg_2, st.PC + 8);            // BEXTR
+                  32'h0000_0AD?: st <= f_bdep (st, r_reg_port_b, r_reg_port_a, w_var1, st.reg_2, st.PC + 8);            // BDEP
+                  32'h0000_0FE?: st <= f_setr64(st, w_mem_ready, w_mem_read_data, w_var1, st.reg_2, st.PC + 12);        // SETR64 (self-fetch hi32)
+                  32'h0000_F010: st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 4); // NOP
+                  32'h0000_6012: st <= f_ctrl(st, WAITING,        st.PC + 4); // WAIT
+                  32'h0000_F012: st <= f_ctrl(st, OPCODE_REQUEST, 32'h4);     // RESET
+                  32'h0000_F011: st <= f_ctrl(st, HALTED_BREAK,   st.PC);     // HALT
+                  32'h0000_F014: st <= f_trap(st);                            // TRAP
+                  32'h0000_1012: st <= f_ret (st, w_mem_ready, w_mem_read_data);                  // RET
+                  32'h0000_401?: st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_2, st.PC + 4); // POP
+                  32'h0000_6011: st <= f_iret(st, w_mem_ready, w_mem_read_data);                  // IRET
+
+                  // Tier 4 — branch family (cond jumps/calls, abs+rel). perf_br + not-taken
+                  // pre-settle driven from the arm (module-scope); JMPR folds into f_ctrl.
+                  32'h0000_102?: st <= f_ctrl(st, OPCODE_REQUEST, r_reg_port_b[31:0]); // JMPR
+                  32'h0000_1000: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // JMP
+                  32'h0000_1001: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZ
+                  32'h0000_1002: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZ
+                  32'h0000_1003: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPE
+                  32'h0000_1004: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNE
+                  32'h0000_1005: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPC
+                  32'h0000_1006: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNC
+                  32'h0000_1007: begin st <= f_cond_jump(st, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.overflow; if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPO
+                  32'h0000_1008: begin st <= f_cond_jump(st, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.overflow; if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNO
+                  32'h0000_1013: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPS
+                  32'h0000_1014: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNS
+                  32'h0000_1015: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLT
+                  32'h0000_1016: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLE
+                  32'h0000_1017: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGT
+                  32'h0000_1018: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGE
+                  32'h0000_1019: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULT
+                  32'h0000_101A: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULE
+                  32'h0000_101B: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGT
+                  32'h0000_101C: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGE
+                  32'h0000_1030: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // JMPREL
+                  32'h0000_1031: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZREL
+                  32'h0000_1032: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZREL
+                  32'h0000_1033: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPEREL
+                  32'h0000_1034: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNEREL
+                  32'h0000_1035: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPCREL
+                  32'h0000_1036: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNCREL
+                  32'h0000_1037: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPSREL
+                  32'h0000_1038: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNSREL
+                  32'h0000_1039: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLTREL
+                  32'h0000_103A: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLEREL
+                  32'h0000_103B: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGTREL
+                  32'h0000_103C: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGEREL
+                  32'h0000_103D: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULTREL
+                  32'h0000_103E: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULEREL
+                  32'h0000_103F: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGTREL
+                  32'h0000_1040: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGEREL
+                  32'h0000_1009: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // CALL
+                  32'h0000_100A: begin st <= f_cond_call(st, w_mem_ready, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLZ
+                  32'h0000_100B: begin st <= f_cond_call(st, w_mem_ready, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNZ
+                  32'h0000_100C: begin st <= f_cond_call(st, w_mem_ready, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLE
+                  32'h0000_100D: begin st <= f_cond_call(st, w_mem_ready, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNE
+                  32'h0000_100E: begin st <= f_cond_call(st, w_mem_ready, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLC
+                  32'h0000_100F: begin st <= f_cond_call(st, w_mem_ready, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNC
+                  32'h0000_1010: begin st <= f_cond_call(st, w_mem_ready, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLO
+                  32'h0000_1011: begin st <= f_cond_call(st, w_mem_ready, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNO
+                  32'h0000_1041: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // CALLREL
+
+                  // Tier 5 — the two bespoke multi-cycle opcodes
+                  32'h0000_4060: st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]); // PUSHV64 (self-fetch hi32)
+                  32'h0000_79??: st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_b[31:0]); // MEMGET32
+
+                  // Tier 6b — LCD SPI-DC writes; f_lcd = st part, arm drives the o_*LCD* ports
+                  // (UART-RX opcodes 0x505x/0x506x retired — UART is MMIO at 0xF001.)
+                  32'h0000_200?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // CDCDMR
+                  32'h0000_201?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
+                  32'h0000_2021: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
+                  32'h0000_2022: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
+                  32'h0000_2023: begin st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 8); o_LCD_reset_n <= w_var1[0]; end // LCD reset
+                  default: begin  // invalid opcode -> crash-dump (was t_opcode_select's default)
+                     st.SM         <= HCF_1;
+                     st.error_code <= ERR_INV_OPCODE;
+                  end
+               endcase
             end  // case OPCODE_EXECUTE
 
             HCF_1: begin
@@ -2709,6 +2778,98 @@ end
 
             default: st.SM <= HCF_1;  // loop in error
          endcase  // case(st.SM)
+
+         // MMIO write handler — MOVED to AFTER case(st.SM): a converted store's
+         // whole-struct `st <= f_x(st)` NBA in OPCODE_EXECUTE would otherwise clobber
+         // the peripheral st fields (esp. st.int_mask) that this handler writes in the
+         // same cycle. Running after the case makes the MMIO write win (correct: a
+         // memory-mapped store must take effect). Boot/HCF display-override states issue
+         // no MMIO stores, so nothing legitimate is overridden.
+         if (w_mmio_write_DV) begin
+            case (w_mmio_addr[27:16])
+               12'h001: begin  // UART TX
+                  case (w_mmio_addr[15:0])
+                     // TX_DATA: write low byte -> transmit one byte via the message
+                     // sender (length=1). SW must poll STATUS.TX-busy (bit0) first.
+                     16'h0000: begin
+                        r_msg[7:0]    <= w_mmio_write_data[7:0];
+                        r_msg_length  <= 8'd1;
+                        r_msg_send_DV <= 1'b1;
+                     end
+                     default: ;
+                  endcase
+               end
+               12'h002: begin  // RGB LEDs
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
+                     16'h0008: st.RGB_LED_2 <= w_mmio_write_data[11:0];
+                     default: ;
+                  endcase
+               end
+               12'h003: begin  // 7-segment display
+                  case (w_mmio_addr[15:0])
+                     // SEG_LOW: 4 hex digits → lower display (value2)
+                     16'h0000: st.seven_seg_value2 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_HIGH: 4 hex digits → upper display (value1)
+                     16'h0008: st.seven_seg_value1 <= {
+                        4'h0, w_mmio_write_data[15:12],
+                        4'h0, w_mmio_write_data[11:8],
+                        4'h0, w_mmio_write_data[7:4],
+                        4'h0, w_mmio_write_data[3:0]
+                     };
+                     // SEG_ALL: 8 hex digits across both displays
+                     16'h0010: begin
+                        st.seven_seg_value1 <= {
+                           4'h0, w_mmio_write_data[31:28],
+                           4'h0, w_mmio_write_data[27:24],
+                           4'h0, w_mmio_write_data[23:20],
+                           4'h0, w_mmio_write_data[19:16]
+                        };
+                        st.seven_seg_value2 <= {
+                           4'h0, w_mmio_write_data[15:12],
+                           4'h0, w_mmio_write_data[11:8],
+                           4'h0, w_mmio_write_data[7:4],
+                           4'h0, w_mmio_write_data[3:0]
+                        };
+                     end
+                     // SEG_BLANK: any write blanks both displays
+                     16'h0018: begin
+                        st.seven_seg_value1 <= 32'h22222222;
+                        st.seven_seg_value2 <= 32'h22222222;
+                     end
+                     default: ;
+                  endcase
+               end
+               12'h004: begin  // 16-bit LED bar
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.led <= w_mmio_write_data[15:0];
+                     default: ;
+                  endcase
+               end
+               12'h00F: begin  // Interrupt controller / timer
+                  case (w_mmio_addr[15:0])
+                     16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
+                     // 16'h0008 (INT_PENDING) is read-only; writes ignored
+                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
+                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
+                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
+                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
+                     16'h0030: begin
+                        r_timer_period            <= w_mmio_write_data[31:0];
+                        r_timer_interrupt_counter <= 32'h0;  // restart with new period
+                     end
+                     // 16'h0038 (TIMER_COUNT) is read-only; writes ignored
+                     default: ;
+                  endcase
+               end
+               default: ;
+            endcase
+         end
       end  // else if (w_reset_H)
    end  // always_ff @(posedge i_Clk)
 
