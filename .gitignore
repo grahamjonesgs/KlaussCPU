@@ -31,3 +31,13 @@ ip_upgrade.log
 .Xil/
 *.bak
 *~
+
+# Vivado xvlog/xsim compile artifacts
+xsim.dir/
+*.sdb
+*.rlx
+xvlog.pb
+xvlog.log
+xelab.*
+*.jou
+webtalk*.log
