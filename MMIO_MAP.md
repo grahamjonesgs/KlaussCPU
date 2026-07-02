@@ -969,12 +969,35 @@ NIST-compliant CSPRNG (HMAC-DRBG over SHA-256) — see
 software CSPRNG provides the FIPS-conformant conditioning + reseed
 discipline.
 
-## Reserved (planned)
+## UART — base `0xF001_0000`  (IMPLEMENTED)
 
-### UART — base `0xF001_0000`
+Byte-level UART. TX writes one byte to the message sender (length=1); RX reads
+pop the existing receive FIFO; STATUS exposes flow-control bits. Formatting
+(hex, strings) is done in software — the hardware is a byte pipe. (The legacy
+UART opcodes remain for now; they will be retired once software uses these
+registers.)
 
-Will expose TX (write triggers send), RX (read consumes a FIFO byte), and
-STATUS (TX busy / RX FIFO empty / RX FIFO full bits). Detailed layout TBD.
+| Offset | Name      | Access | Behaviour |
+|--------|-----------|--------|-----------|
+| `0x0000` | `TX_DATA` | W | Write bits[7:0] → transmit one byte. **Poll `STATUS.TX_BUSY==0` before writing** (single-buffered; a write while busy corrupts the in-flight byte). |
+| `0x0008` | `RX_DATA` | R | Returns the head RX byte in bits[7:0] and **pops** the FIFO (read-to-consume). Read only when `STATUS.RX_EMPTY==0`. |
+| `0x0010` | `STATUS`  | R | bit0 `TX_BUSY` (sender transmitting), bit1 `RX_EMPTY`, bit2 `RX_FULL`. |
+
+C sketch:
+```c
+#define UART_BASE   0xF0010000u
+#define UART_TX     (*(volatile uint32_t *)(UART_BASE + 0x0000))
+#define UART_RX     (*(volatile uint32_t *)(UART_BASE + 0x0008))
+#define UART_STATUS (*(volatile uint32_t *)(UART_BASE + 0x0010))
+#define UART_TX_BUSY  (1u<<0)
+#define UART_RX_EMPTY (1u<<1)
+#define UART_RX_FULL  (1u<<2)
+
+static void uart_putc(char c){ while (UART_STATUS & UART_TX_BUSY){} UART_TX = (unsigned char)c; }
+static int  uart_getc(void){ if (UART_STATUS & UART_RX_EMPTY) return -1; return (int)(UART_RX & 0xFF); }
+```
+Note: the hardware crash-dump path still uses its own message formatter over the
+same physical UART; it is independent of these registers.
 
 ## Software view
 

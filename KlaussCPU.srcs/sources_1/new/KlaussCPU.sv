@@ -391,6 +391,13 @@ module KlaussCPU (
    logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
    logic  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
    logic         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
+   // UART MMIO (0xF001) RX pop-on-read: w_uart_rx_rd_sel is high for the whole read
+   // handshake; r_uart_rx_rd_d delays it by a cycle so w_uart_rx_pop is a single
+   // pulse (pop the FIFO exactly once, on the cycle the head byte is captured).
+   wire          w_uart_rx_rd_sel = w_mmio_read_DV & (w_mmio_addr[27:16] == 12'h001)
+                                                    & (w_mmio_addr[15:0]  == 16'h0008);
+   logic         r_uart_rx_rd_d;
+   wire          w_uart_rx_pop    = w_uart_rx_rd_sel & ~r_uart_rx_rd_d;
    // MMIO writes complete in 1 cycle (write-side has no read-data path).
    // MMIO reads now take 2 cycles: cycle 1 captures decode into the FF,
    // cycle 2 asserts ready so the CPU FSM samples r_mmio_read_data.
@@ -1794,6 +1801,14 @@ module KlaussCPU (
       r_mmio_read_data_comb = 64'h0;
       case (w_mmio_addr[27:16])
          12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
+         12'h001: begin  // UART
+            case (w_mmio_addr[15:0])
+               16'h0008: r_mmio_read_data_comb = {56'b0, w_rx_fifo_byte};  // RX_DATA (peek; FIFO pops on read)
+               // STATUS: bit0 = TX busy, bit1 = RX empty, bit2 = RX full
+               16'h0010: r_mmio_read_data_comb = {61'b0, w_rx_fifo_full, w_rx_fifo_empty, w_sending_msg};
+               default:  r_mmio_read_data_comb = 64'h0;
+            endcase
+         end
          12'h002: begin  // RGB LEDs
             case (w_mmio_addr[15:0])
                16'h0000: r_mmio_read_data_comb = {52'b0, st.RGB_LED_1};
@@ -1889,6 +1904,7 @@ module KlaussCPU (
    always_ff @(posedge i_Clk) begin
       r_mmio_read_data <= r_mmio_read_data_comb;
       r_mmio_read_dv_d <= w_mmio_read_DV;
+      r_uart_rx_rd_d   <= w_uart_rx_rd_sel;
    end
 
    mem_read_write mem_read_write (
@@ -2093,7 +2109,7 @@ module KlaussCPU (
        .i_Reset      (w_reset_H),
        .i_Write_En   (w_uart_rx_DV & !r_break_received & (st.SM != LOADING_BYTE)),
        .i_Write_Byte (w_uart_rx_value),
-       .i_Read_En    (st.rx_fifo_read),
+       .i_Read_En    (st.rx_fifo_read | w_uart_rx_pop),
        .o_Peek_Byte  (w_rx_fifo_byte),
        .o_Empty      (w_rx_fifo_empty),
        .o_Full       (w_rx_fifo_full),
@@ -3744,6 +3760,18 @@ end
          // no MMIO stores, so nothing legitimate is overridden.
          if (w_mmio_write_DV) begin
             case (w_mmio_addr[27:16])
+               12'h001: begin  // UART TX
+                  case (w_mmio_addr[15:0])
+                     // TX_DATA: write low byte -> transmit one byte via the message
+                     // sender (length=1). SW must poll STATUS.TX-busy (bit0) first.
+                     16'h0000: begin
+                        r_msg[7:0]    <= w_mmio_write_data[7:0];
+                        r_msg_length  <= 8'd1;
+                        r_msg_send_DV <= 1'b1;
+                     end
+                     default: ;
+                  endcase
+               end
                12'h002: begin  // RGB LEDs
                   case (w_mmio_addr[15:0])
                      16'h0000: st.RGB_LED_1 <= w_mmio_write_data[11:0];
