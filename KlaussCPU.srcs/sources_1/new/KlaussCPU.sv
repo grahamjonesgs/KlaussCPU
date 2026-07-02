@@ -1473,6 +1473,53 @@ module KlaussCPU (
       return n;
    endfunction
 
+   // ------------------------------------------------------------------------
+   // Tier 6a/6b — UART-RX (st-only) and LCD-SPI. LCD writes module output ports
+   // (o_TX_LCD_*/o_LCD_*), which are NOT in st, so f_lcd handles only the st part
+   // and the arm drives the ports via its own NBAs (the r_perf_br pattern).
+   // ------------------------------------------------------------------------
+
+   // f_rx — RXRB (blocking) / RXRNB (non-blocking) UART receive. Reads the RX
+   // FIFO head via args; pops it (rx_fifo_read pulse) into rd when data present.
+   function automatic cpu_state_t f_rx(cpu_state_t s, logic is_blocking, logic fifo_empty,
+                                       logic [7:0] fifo_byte);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (fifo_empty) begin
+         if (is_blocking) begin
+            n.SM = OPCODE_EXECUTE;        // blocking: retry next cycle
+         end else begin
+            n.flags.zero = 1'b1;          // non-blocking: signal "no data"
+            n.SM         = OPCODE_REQUEST;
+            n.PC         = s.PC + 4;
+         end
+      end else begin
+         n.rx_fifo_read = 1'b1;           // pop the byte
+         n.wb.value     = {56'b0, fifo_byte};
+         n.wb.rd        = s.reg_2;
+         n.flags.zero   = 1'b0;
+         n.SM           = WRITEBACK;
+         n.PC           = s.PC + 4;
+      end
+      return n;
+   endfunction
+
+   // f_lcd — st part of the SPI-DC LCD writes: on i_TX_LCD_Ready, clear the
+   // timeout and advance; otherwise hold (stay in OPCODE_EXECUTE, retry). The
+   // arm drives o_TX_LCD_Byte / o_LCD_DC / o_TX_LCD_DV alongside this.
+   function automatic cpu_state_t f_lcd(cpu_state_t s, logic ready, logic [31:0] pc_next);
+      cpu_state_t n;
+      n = s;
+      n.rx_fifo_read = 1'b0;
+      if (ready) begin
+         n.timeout_counter = 0;
+         n.SM              = OPCODE_REQUEST;
+         n.PC              = pc_next;
+      end
+      return n;
+   endfunction
+
    // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
    // instead of a separate 64-bit comparator + 64-bit subtractor in series.
    // In restoring division the ">=" test and the subtract are the same
@@ -3113,6 +3160,17 @@ rams_sp_nc rams_sp_nc1 (
                   // Tier 5 — the two bespoke multi-cycle opcodes
                   32'h0000_4060: st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]); // PUSHV64 (self-fetch hi32)
                   32'h0000_79??: st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_b[31:0]); // MEMGET32
+
+                  // Tier 6a — UART receive (st-only)
+                  32'h0000_505?: st <= f_rx(st, 1'b1, w_rx_fifo_empty, w_rx_fifo_byte); // RXRB  (blocking)
+                  32'h0000_506?: st <= f_rx(st, 1'b0, w_rx_fifo_empty, w_rx_fifo_byte); // RXRNB (non-blocking)
+
+                  // Tier 6b — LCD SPI-DC writes; f_lcd = st part, arm drives the o_*LCD* ports
+                  32'h0000_200?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // CDCDMR
+                  32'h0000_201?: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_b[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
+                  32'h0000_2021: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
+                  32'h0000_2022: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
+                  32'h0000_2023: begin st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 8); o_LCD_reset_n <= w_var1[0]; end // LCD reset
                   default:       t_opcode_select;
                endcase
             end  // case OPCODE_EXECUTE
