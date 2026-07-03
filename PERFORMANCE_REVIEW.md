@@ -34,11 +34,19 @@ sources (`KlaussCPU.sv`, `klauss_pkg.sv`, `mem_read_write.sv`, `bus_splitter.sv`
 
 ## 0. Executive summary — ranked by value ÷ (effort × risk)
 
+> **Update 2026-07-03 — verified against the real LLVM backend** at
+> `/media/psf/src/klausscpu-llvm/llvm/lib/Target/KlaussCPU` (this review was
+> first written from the in-tree markdown docs, which lag the actual code).
+> Several LLVM items are **already implemented**; see the new **§G
+> reconciliation** for the file-cited, item-by-item verdict. The struck-through
+> rows below are done. The standing LLVM-only wins are **A3, B2, E3, and the
+> cost-model half of A4**.
+
 | # | Recommendation | Type | Est. effect | Fmax risk |
 |---|---|---|---|---|
-| 1 | Callee-saved register split in the ABI (§A1) | LLVM only | ~15 cyc per avoided spill pair; biggest win on real call-heavy code | none |
-| 2 | Fold (negative) imm32 offsets into LDIDX/STIDX addressing (§A2) | LLVM + docs | ~5–6 cyc + 8 B per frame/GEP access that currently goes through ADDI | none |
-| 3 | Flag reuse: delete redundant CMPs, count-down loops (§A3) | LLVM only | ~4–7 cyc per loop iteration in counted loops | none |
+| ~~1~~ | ~~Callee-saved register split (§A1)~~ — **already done**: R4–R7 are callee-saved (§G) | — | — | — |
+| ~~2~~ | ~~Fold (negative) imm32 offsets into LDIDX/STIDX (§A2)~~ — **already done**: `simm32` + general fold patterns (§G) | — | — | — |
+| 3 | Flag reuse: delete redundant CMPs, count-down loops (§A3) — **stands** | LLVM only | ~4–7 cyc per loop iteration in counted loops | none |
 | 4 | Retire loads/POP through deferred writeback, not the WRITEBACK state (§B1) | tiny RTL | −1 cyc per load/POP, guaranteed | minimal |
 | 5 | Add LDIDX32_S (sign-extending i32 load) (§B2) | tiny RTL + LLVM | −4 B and ~−3 cyc per signed-int load | small (3 decode arms) |
 | 6 | Pre-settle successors of 1-cycle ops (§C1) | RTL, decode cluster | −1 cyc per instruction following a 1-cycle op | must be timing-gated |
@@ -601,5 +609,65 @@ Worth recording so future reviews don't re-litigate them:
   completing in CHECK) is well matched to the FPGA; the wins are in the
   handshake, the miss path, and the second port — not in reorganizing the
   arrays.
-- `LDIDX`/`STIDX` effective-address hardware handles negative offsets today;
-  only the documentation and backend patterns say otherwise (§A2).
+- `LDIDX`/`STIDX` effective-address hardware handles negative offsets today —
+  and, verified 2026-07-03, the **real backend already models them as `simm32`
+  and folds them** (§A2/§G); only the RTL-side markdown docs
+  (CPU_ARCHITECTURE.md, LLVM_NEW_INSTRUCTIONS.md) still say `zero_ext`, which is
+  now purely a doc bug to fix.
+
+---
+
+## G. Reconciliation with the actual LLVM backend (2026-07-03)
+
+Sections A–E were written from the in-tree markdown (`llvm_backend_plan.md`,
+`LLVM_NEW_INSTRUCTIONS.md`), which describe an **earlier** state of the backend.
+Reading the real out-of-tree sources at
+`/media/psf/src/klausscpu-llvm/llvm/lib/Target/KlaussCPU` changes the verdict on
+several LLVM items. Every row is cited to real backend source.
+
+| Rec | Verdict | Evidence in the real backend |
+|---|---|---|
+| **A1** callee-saved split | **ALREADY DONE** | `CSR_KlaussCPU = (add R4,R5,R6,R7)` (KlaussCPUCallingConv.td:37); `CalleeSavedRegs[] = {R4,R5,R6,R7}` (KlaussCPURegisterInfo.cpp:37-40). Not "caller-saved-everything." |
+| **A2** fold imm offsets (incl. negative) | **ALREADY DONE** | Offsets are `simm32` (KlaussCPUInstrInfo.td:269,282); general `(load (add GPR, simm32_imm))→LDIDX64` / store / i32 / i8_S / i16_S fold patterns (td:768,776,798-800,1049-1051); `eliminateFrameIndex` folds the frame offset (incl. negative `BaseOffset`) into the load/store imm (KlaussCPURegisterInfo.cpp:89-95); spills emit LDIDX64/STIDX64 directly (KlaussCPUInstrInfo.cpp:41,64). ADDI is only the variable-index fallback. |
+| **A3** flag reuse / compare elimination | **STANDS** | No `optimizeCompareInstr`/`analyzeCompare` anywhere in the backend; `BR_CC` emits a fresh `CMPRR_I`/`CMPRV_I` before every conditional jump (KlaussCPUISelDAGToDAG.cpp:367-412). Count-down loops still emit a redundant compare; identical compares are not CSE'd. |
+| **A4** code-size cost model / no-unroll | **PARTIAL** | INCR/DECR peephole **is** done (`(add GPR,1)→INCR`, `(add GPR,-1)→DECR`, td:752-753). But **no `KlaussCPUTargetTransformInfo` exists** — no `getUnrollingPreferences`, no cost hooks — so LLVM unrolls/inlines on generic defaults with no signal that fetch is the bottleneck. The TTI half stands. |
+| **A5** leaf link-register convention | **STANDS** (low priority) | `CLI.IsTailCall = false` unconditionally (KlaussCPUISelLowering.cpp:676); CALL always saves LR to the DDR2 stack. But **E3 dominates** — see below. |
+| **A6** fall-through block layout | **ALREADY DONE** (MI level) | `analyzeBranch`/`insertBranch`/`removeBranch` implemented (KlaussCPUInstrInfo.cpp:100-217), so the default `MachineBlockPlacement` runs. Only front-end (`__builtin_expect`/PGO) hints remain, and those are minor. |
+| **A7** branchless SELECT (min/max/abs) | **ALREADY DONE** | `SMIN/SMAX/UMIN/UMAX` and `ABS` are all `Legal` (KlaussCPUISelLowering.cpp:155-158,170), so DAGCombiner forms them branchlessly before SELECT. The remaining `SELECT`→diamond (td/EmitInstrWithCustomInserter) is only for genuine ternaries — acceptable. |
+| **B2** LDIDX32_S (signed i32 load) | **STANDS** | `setLoadExtAction(SEXTLOAD, i64, i32, Expand)` (KlaussCPUISelLowering.cpp:92-93); no `LDIDX32_S` opcode in the td (only 8_S/16_S at td:674-675); signed `int` load still lowers to `LDIDX32 + SEXTW` (SEXTW = `sext_inreg i32`, td:540-541). Needs the RTL arm **and** the backend `Legal` + pattern. |
+| **E3** SP-relative addressing → FP elimination | **STANDS — stronger than stated** | The backend **always** emits a frame pointer: `emitPrologue` unconditionally does `PUSH R15; GETSP R15; [ADDSP -N]` and `emitEpilogue` `SETSP R15; POP R15` (KlaussCPUFrameLowering.cpp:80-108); `getReservedRegs` always reserves R15 (KlaussCPURegisterInfo.cpp:62). So **every** function — even a leaf with no locals — pays a PUSH/POP R15 stack round trip and loses R15 from allocation (15 usable GPRs). There is no `hasFP()` gate and no shrink-wrapping. `LDIDXSP/STIDXSP` (the §E3 hardware ops) are the enabler that lets the backend drop the frame pointer. |
+| **E4** flag-free ADD/SUB emission | **STANDS** (paired) | Backend models no flag liveness (same gap as A3), so it cannot know when carry/overflow are dead; depends on both A3-style flag modeling and the §E4 hardware mode. |
+
+**Net effect on the LLVM plan:** the two items I had ranked #1 and #2 (A1, A2)
+are already implemented and well-engineered — drop them. The real standing
+LLVM-only work, in priority order, is:
+
+1. **A3 — compare/flag optimization** (`optimizeCompareInstr` + count-down loop
+   flag reuse). Biggest pure-software CPI win on loop-heavy code; nothing in the
+   backend does it today.
+2. **E3 — frame-pointer elimination**, enabled by adding `LDIDXSP`/`STIDXSP` to
+   the RTL. Frees a 16th register and deletes the unconditional PUSH/POP R15
+   from every function. This is the single largest register-pressure +
+   per-call-overhead lever, and it is currently paid on 100% of functions.
+3. **B2 — `LDIDX32_S`** (RTL arm + `setLoadExtAction(SEXTLOAD,i64,i32,Legal)` +
+   pattern). Removes a SEXTW from every sign-relevant `int` load.
+4. **A4 (TTI half)** — add a `KlaussCPUTargetTransformInfo` that reports high
+   instruction cost / low unroll preference, so LLVM stops unrolling and
+   over-inlining on a fetch-bound core with a one-line IFB.
+5. **A5** — leaf link-register convention (minor; mostly subsumed once E3 lands,
+   since the dominant per-call cost is the FP push/pop, not the return-address
+   push).
+
+**One correctness-driven regression to be aware of (not a recommendation):**
+jump tables are disabled (`setMinimumJumpTableEntries(INT_MAX)`,
+KlaussCPUISelLowering.cpp:132) to work around a register-allocator reload bug on
+indirect-branch predecessor edges. Dense `switch` statements therefore compile
+to binary-search compare chains (more branches, more I-footprint) instead of a
+single indexed jump. Re-enabling once the RA limitation is fixed would help
+switch-heavy code — but that is a correctness prerequisite, not a perf knob to
+flip now.
+
+**Doc-hygiene item (zero code):** `CPU_ARCHITECTURE.md` §5/§8.3 and
+`LLVM_NEW_INSTRUCTIONS.md` still document LDIDX/STIDX offsets as
+`zero_ext(imm32)`. The hardware and the backend both treat them as signed
+32-bit; fix the wording so it stops contradicting the shipped `simm32` patterns.
