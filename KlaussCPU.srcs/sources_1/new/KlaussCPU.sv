@@ -87,8 +87,8 @@ module KlaussCPU (
    // now an internal net driven by ui_clk, not the board oscillator. The board
    // oscillator (i_Clk_board) feeds only the MIG's 200 MHz reference (via clk_wiz
    // inside mem_read_write). This makes the cache↔MIG crossing a single domain.
-   wire i_Clk = w_ui_clk;
    wire w_ui_clk;
+   wire i_Clk = w_ui_clk;
 
    localparam STACK_TOP = 32'h800_0000;  // one doubleword (8 bytes) above top of 128 MiB byte address space
 
@@ -941,6 +941,11 @@ module KlaussCPU (
       r_uart_rx_rd_d   <= w_uart_rx_rd_sel;
    end
 
+   // Declared here (ahead of its use in the .o_calib_done port below) so strict
+   // SystemVerilog (xvlog -sv) doesn't implicitly net it at first use and then
+   // flag a redeclaration; the boot-ROM block below consumes it.
+   wire        w_calib_done;
+
    mem_read_write mem_read_write (
        .i_Clk_board(i_Clk_board),   // board oscillator -> clk_wiz -> MIG 200MHz ref
        .o_ui_clk(w_ui_clk),         // MIG ui_clk (100MHz) -> drives i_Clk for the whole CPU
@@ -1004,7 +1009,7 @@ module KlaussCPU (
    // and hands off to LOAD_COMPLETE — so netboot runs exactly as a UART load,
    // with no UART bootstrap.  A UART break+'S' still preempts to reflash.
    // ==========================================================================
-   wire        w_calib_done;
+   // (w_calib_done declared above the mem_read_write instantiation — see note there)
    wire [63:0] w_boot_dword;        // boot_rom read data (1-cycle latency)
    logic  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
    logic  [15:0] r_boot_len_dw;       // image length in doublewords (from word 0)
@@ -2002,9 +2007,9 @@ rams_sp_nc rams_sp_nc1 (
                   // RRR forms: a=reg_a, b=reg_b, rd=reg_dst, PC+4.
                   32'h0001_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, st.PC + 4);  // ADDR
                   32'h0002_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, st.PC + 4);  // SUBR
-                  32'h0003_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4);  // ANDR
-                  32'h0004_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4);  // ORR
-                  32'h0005_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4);  // XORR
+                  32'h0003_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR (C1)
+                  32'h0004_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR (C1)
+                  32'h0005_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR (C1)
                   32'h0006_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, st.PC + 4);  // ADDC
                   32'h0007_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, st.PC + 4);  // SUBC
                   32'h0000_05??: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, st.PC + 4);  // CMPRR (flags only)
@@ -2013,9 +2018,9 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_081?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_ADD, st.reg_2, st.PC + 8);             // ADDV (zero-ext)
                   32'h0000_082?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_SUB, st.reg_2, st.PC + 8);             // MINUSV (zero-ext)
                   32'h0000_083?: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_CMP, st.reg_2, st.PC + 8);  // CMPRV (sign-ext, flags only)
-                  32'h0000_086?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8);             // ANDV
-                  32'h0000_087?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8);             // ORV
-                  32'h0000_088?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8);             // XORV
+                  32'h0000_086?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV (C1)
+                  32'h0000_087?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV (C1)
+                  32'h0000_088?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV (C1)
                   // INC/DEC: a=reg_b, b=1, rd=reg_2, PC+4.
                   32'h0000_084?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_ADD, st.reg_2, st.PC + 4);  // INCR
                   32'h0000_085?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_SUB, st.reg_2, st.PC + 4);  // DECR
@@ -2062,9 +2067,9 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_0AA?: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_b)},  st.reg_2, 1'b0, st.PC + 4);    // CTZ
                   32'h0000_0AB?: st <= f_wb(st, bit_reverse(r_reg_port_b),                    st.reg_2, 1'b0, st.PC + 4);    // BITREV
                   // Shift-by-N (logical/arith) via f_wb.
-                  32'h0000_091?: st <= f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHLV
-                  32'h0000_092?: st <= f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8);          // SHRV
-                  32'h0000_093?: st <= f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8);          // SHRAV
+                  32'h0000_091?: begin st <= f_ps(f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHLV (C1)
+                  32'h0000_092?: begin st <= f_ps(f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRV (C1)
+                  32'h0000_093?: begin st <= f_ps(f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRAV (C1)
                   // Rotate-by-N + rotate-reg (no carry) via f_wb.
                   32'h0000_0FC?: st <= f_wb(st, (r_reg_port_b << w_var1[5:0]) | (r_reg_port_b >> (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // ROLV
                   32'h0000_0FD?: st <= f_wb(st, (r_reg_port_b >> w_var1[5:0]) | (r_reg_port_b << (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // RORV

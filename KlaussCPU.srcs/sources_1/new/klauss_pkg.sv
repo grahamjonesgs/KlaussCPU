@@ -1060,6 +1060,22 @@ package klauss_pkg;
       return n;
    endfunction
 
+   // f_ps (C1) — apply the fall-through pre-settle to a COMPUTED next-state:
+   // pre-load reg_1/2 for the sequential successor (its opcode's register fields,
+   // read from the IFB at r_FPC via w_ps_r1/w_ps_r2) so the fast-path dispatch can
+   // skip the FETCH2 bubble after a single-cycle op. Pure function composition —
+   // wrap a 1-cycle op's result: st <= f_ps(f_wb(...), w_ps_ok, w_ps_r1, w_ps_r2);
+   // the arm arms r_ir_presettled when w_ps_ok. Mirrors f_cond_jump's inline
+   // not-taken pre-settle; one whole-struct NBA, so no partial-override clobber.
+   function automatic cpu_state_t f_ps(cpu_state_t n, logic ps_ok,
+                                       logic [3:0] ps_r1, logic [3:0] ps_r2);
+      if (ps_ok) begin
+         n.reg_1 = ps_r1;
+         n.reg_2 = ps_r2;
+      end
+      return n;
+   endfunction
+
    // ------------------------------------------------------------------------
    // Tier 5 — the two bespoke multi-cycle opcodes (one function each; not shared
    // with anything, but the same next-state form as the rest — no old tasks left).

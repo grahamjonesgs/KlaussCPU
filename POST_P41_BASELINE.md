@@ -1,5 +1,12 @@
 # Post-P4.1 performance baseline — 2026-07-03
 
+> ⚠ **The CPI numbers below are STALE (2026-07-06).** The ELFs were rebuilt afterward:
+> same instruction counts but different memory layout → different cache-miss patterns,
+> so the memory-sensitive kernels shifted (e.g. ptr_chase 6.804→7.152, muldiv
+> 4.944→5.211) even though the RTL is byte-identical (clean-master WNS still +0.077).
+> **Use the current-ELF clean-master anchor in PERFORMANCE_REVIEW.md ("Baseline caveat"
+> table) for any CPI comparison.** The timing (WNS/Fmax) numbers here remain valid.
+
 The reference every recommendation in [PERFORMANCE_REVIEW.md](PERFORMANCE_REVIEW.md)
 must be measured against. Captured on-silicon **after** the P4.1 fetch/execute
 overlap (and the DDR 2:1 clock rework) landed — [PHASE0_BASELINE.md](PHASE0_BASELINE.md)

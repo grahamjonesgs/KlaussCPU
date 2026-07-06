@@ -61,6 +61,116 @@ set of smaller LLVM scheduling/layout policies (§A4–A7).
 
 ---
 
+## Progress log — 2026-07-03 (on-silicon)
+
+Everything below was built, JTAG-flashed to the Nexys A7, and measured against the
+POST_P41 baseline (`perf_baseline`, 6 kernels), with the functional regression
+(queens/bst/test_64bit) as the correctness gate. The build→flash→**QSPI**→measure
+loop is now fully validated (Vivado 2025.2 batch, Spansion `s25fl128s` QSPI).
+
+### Done & validated
+- **A1, A2, A6, A7** — already implemented in the real LLVM backend (see §G); never gaps.
+- **A4 (TTI/no-unroll)** — implemented in the backend, default-on.
+- **§F re-baseline + measurement loop** — done; POST_P41 on-silicon baseline captured.
+
+### Tried, measured, NOT kept
+- **A3a (flag reuse)** — built + measured on silicon. Net **+1.1% cycles (worse)**:
+  it fires in only one loop (mem_stream), never reaches branchy/calls_fib (LSR moves
+  their exit-compares off zero), and the 8-byte code shift causes alignment collateral
+  (±5% swings on cache-sensitive kernels). **Left default-OFF.** Correct, just not worth it.
+- **B1 (loads/POP via deferred writeback)** — built (WNS +0.113), but **functionally
+  buggy on silicon**: retiring the load one cycle early re-issues the *next* memory
+  access into the cache `COOL_DOWN` window → phantom-ready race → `ERR_INV_OPCODE`
+  crashes (perf_baseline/netboot/Zephyr). Regression (queens/bst) missed it; mem_stream
+  caught it. **Reverted.** Coupled to §D2 — not safe standalone.
+- **B5 (drop MULTIPLY_PIPE)** — bundled with B1, reverted with it (tiny win alone).
+- **C1 (pre-settle 1-cycle ops)** — built (WNS **+0.131**, correct, regression green:
+  queens 11/11, bst 11/11, test_64bit 36/36). **RE-MEASURED 2026-07-06 vs the correct
+  current-ELF baseline → a CLEAN ALL-AROUND WIN, no regressions** (2 runs, deterministic):
+
+  | kernel | master | C1 | Δ |
+  |---|---|---|---|
+  | alu | 4.437 | 4.125 | **−7.0%** |
+  | branchy | 4.676 | 4.302 | **−8.0%** |
+  | muldiv | 5.211 | 4.944 | **−5.1%** |
+  | ptr_chase | 7.152 | 7.044 | **−1.5%** |
+  | mem_stream | 8.812 | 8.812 | 0 |
+  | calls_fib | 6.394 | 6.394 | 0 |
+
+  The earlier "ptr_chase **+3.5%** / calls_fib **+1.9%** losses" were **stale-baseline
+  artifacts** (same trap as §D2): measured against the old-ELF doc numbers. Against the
+  same-ELF clean master, C1 is faster-or-neutral on all six kernels. Raised alu fast-path
+  43.8%→75%. *Refined-C1* (gate pre-settle off memory-op successors) was a dead end —
+  byte-identical perf, worse timing (+0.059). **Plain C1 is the biggest single lever
+  found and is shippable as-is (WNS +0.131). RECOMMEND LANDING.**
+
+### ⚠ Baseline caveat — the POST_P41 doc CPI is stale (re-anchor 2026-07-06)
+The ELFs were rebuilt between the 2026-07-03 doc capture and now: **same instruction
+counts, different memory layout → different cache-miss patterns**, so the
+memory-sensitive kernels shifted even though the RTL is byte-identical (clean-master
+WNS reproduces at **+0.077**). Only compare CPI against a baseline measured with the
+**same ELF set**. The definitive current-ELF clean-master anchor:
+
+| kernel | doc (2026-07-03, stale) | **clean master (2026-07-06)** | miss |
+|---|---|---|---|
+| alu | 4.437 | **4.437** | 0 |
+| branchy | 4.676 | **4.676** | 0 |
+| mem_stream | 8.441 | **8.812** | 909 |
+| ptr_chase | 6.804 | **7.152** | 1230 |
+| calls_fib | 6.272 | **6.394** | 0 |
+| muldiv | 4.944 | **5.211** | 0 |
+
+alu/branchy match (compute-bound, ~0 misses); the memory kernels drifted with the ELF
+rebuild. **Every result below is re-stated against the clean-master column.**
+
+### §D2 tested — CORRECT and fully NEUTRAL (2026-07-06; corrects an earlier mis-verdict)
+Robust WAIT-accept framing (accept only on rising DV edge or changed address, with an
+`r_req_pending` latch); COOL_DOWN retained. Built + flashed + measured.
+
+- **Correctness: PASS** — all 6 kernels, clean halt, **no `ERR_INV_OPCODE`** (the exact
+  crash B1 hit). The phantom re-latch is closed.
+- **Performance: NEUTRAL — bit-identical to clean master on all 6 kernels** (alu 4.437,
+  mem_stream 8.812, ptr_chase 7.152, branchy 4.676, calls_fib 6.394, muldiv 5.211).
+- **Correction:** the earlier "net-negative, ~1 cyc/hit tax" verdict was an artifact of
+  comparing D2 (new ELFs) against the **stale doc baseline** (old ELFs). Against the
+  same-ELF clean master, D2 costs **nothing**. This matches the static analysis (the
+  edge/addr framing IS neutral) — the model was right; the baseline was wrong.
+- **Consequence:** §D2 **is** the zero-cost, crash-proof handshake fix the linchpin
+  theory wanted. It safely enables **B1** (early load retire) and **C1** (earlier
+  dispatch) without the phantom-ready race. Re-landing B1/C1 **on top of D2** is back on
+  the table as a clean path (stash `mem_read_write.sv` D2 edits were reverted but are
+  trivially reproducible; C1 is stash@{1}).
+
+### §C2 tested — REAL win on loop-heavy kernels (2026-07-06)
+Dedicated backward-branch-target ("loop-head") slot; op+var1 hit muxes extended;
+backward-taken detected with zero per-arm edits via `r_perf_br_valid/taken` +
+`r_branch_src_pc`. Built + flashed + measured (2 runs, bit-identical / deterministic).
+
+- **branchy 4.676 → 4.540 (−2.9%)**, **mem_stream 8.812 → 8.622 (−2.2%)** — both have
+  loops that span >1 cache line, so the head was evicted every iteration and now hits
+  the sticky slot. alu/ptr_chase/calls_fib/muldiv **neutral** (ptr_chase's loop fits one
+  line → no benefit). No crash, no regression. (Below the doc's −0.3/−0.5 CPI estimate;
+  actual −0.14/−0.19, but a genuine isolated win on 2 of 6 kernels.)
+- **Timing: WNS +0.011 — meets, but too thin to ship.** The var1 hit-mux went 2→4-way
+  (three 29-bit tag compares as selects); `r_var1_mem` dropped from +1.5 to +0.011.
+  **Fix before landing:** register the target-slot hit result (move the compare off the
+  dispatch path), or fold the two dw-slots into a single line-tag slot (one compare).
+
+### Key cross-cutting finding — §D2 is the linchpin (CONFIRMED zero-cost 2026-07-06)
+The cache/DDR level-DV handshake (`mem_read_write.sv` PRE_WAIT/COOL_DOWN "phantom ready"
+guard) is the root cause B1 crashed on. **§D2 closes it at zero CPI cost (measured)** —
+so it is the enabler: (a) makes **B1** safe, (b) lets **C1** dispatch earlier without the
+race, (c) de-risks **C4/D1/D3**. Recommended order: **§D2 → re-land B1 + C1 → then C4**;
+land **§C2** (with its timing fix) independently — it's orthogonal (front-end fetch).
+~~**§B6** (LED-path Fmax reclaim).~~ *(2026-07-06: §B6 OBSOLETE — WNS is the MMIO-read
+mux at +0.182, walled by the SHA-256 core at +0.230. No cheap Fmax. See §B6 correction.)*
+
+Timing reference (post-route WNS, all met at 100 MHz): master **+0.077** ns · B1/B5
+**+0.113** · C1 **+0.131** · refined-C1 **+0.059** · D2 **+0.182** · **C2 +0.011 (needs
+fix)**. WNS varies ±0.12 ns run-to-run at the same RTL, so treat these as ± that.
+
+---
+
 ## A. Zero-RTL wins: compiler, ABI, and documentation
 
 These change no hardware, carry no timing risk, and several of them are the
@@ -275,7 +385,34 @@ multiply (6 → 5 including dispatch), zero datapath change. Verify against the
 DSP48 inference (the state names vs. actual register stages are already one
 off; the product registers, not the names, are what matter).
 
-### B6. Reclaim the Fmax margin hiding behind the LED reset path [Confirmed, corrected]
+### B6. Reclaim Fmax margin — OBSOLETE / not bankable (re-measured 2026-07-06 on the routed netlist)
+
+> **Correction (2026-07-06):** B6 as written is stale. The LED reset path is **no
+> longer the binding path**, and there is **no cheap Fmax to reclaim**. Opening the
+> current routed checkpoint and listing the worst-50 setup paths (clk_pll_i,
+> 100 MHz) shows:
+>
+> | slack | count | endpoint |
+> |---|---|---|
+> | **+0.182** (WNS) | 2 | `st.mem_addr → r_mmio_read_data` — the **MMIO read-data mux** (9 levels, 79% routing, wide fan-in over every MMIO source) |
+> | +0.216 | 8 | `r_perf_cnt_indirect` CE (perf-counter indirect read) |
+> | +0.229 | 2 | `r_mmio_read_data[7]` |
+> | **+0.230** | 38+ | **`crypto_sha_i/u_sha/a_reg`** — the SHA-256 round function |
+>
+> The **SHA-256 core is a wall at +0.230**: 38+ paths pile there. Fixing the two
+> MMIO-mux paths and the perf-counter paths lifts WNS from +0.182 to at most
+> **+0.230 = +0.048 ns (~+0.5 MHz)** — negligible — and the SHA core then caps
+> everything. `r_mmio_read_data` is *already* registered (KlaussCPU.sv:387) to
+> break the long path, so the cheap pipelining is spent. The claimed "+0.78 ns of
+> datapath slack behind a stale LED path" **does not exist for the shipping design**
+> — the divide/forwarding datapath may well have that slack, but it is masked by
+> the SHA / MMIO-mux / perf-counter *control-path* cluster, not by the LED path.
+> **Net: no isolated Fmax win. Do NOT sequence other items behind B6.** A real Fmax
+> gain now requires pipelining the SHA-256 datapath (large, correctness-critical,
+> reduces SHA throughput) — out of proportion to a ~2 MHz ceiling bump that also
+> collides with the DDR/MIG 100 MHz `ui_clk` domain. Deprioritized.
+
+_Original (obsolete) analysis retained below for history:_
 
 The design's binding setup path is `r_SM_reg[19]/C → r_led_reg[12]/R`
 (+0.070 ns, PHASE0_BASELINE.md Part C) — FSM state decode into a *display
@@ -576,7 +713,7 @@ numbers; re-baseline).
    the six `perf_baseline` kernels and record the post-P4.1 fetch/exec split
    and the fast-path counter before starting anything above; re-rank §C by the
    new numbers.
-2. **Order of work:** §B6 (timing margin) → §A1–A3 + B1/B2 (cheap, big) → §C4
+2. **Order of work:** ~~§B6 (timing margin) →~~ *(§B6 obsolete — no cheap Fmax, SHA-walled)* §A1–A3 + B1/B2 (cheap, big) → §C4
    spike (decides the front-end strategy) → §C1/C2 → §D1–D3 → §E1/E2 → rest.
 3. **The predecode triplication hazard** (dispatch casez, `f_predecode_len`,
    `f_perf_class`) is now a *performance* regression vector: a missed
