@@ -141,20 +141,24 @@ Robust WAIT-accept framing (accept only on rising DV edge or changed address, wi
   the table as a clean path (stash `mem_read_write.sv` D2 edits were reverted but are
   trivially reproducible; C1 is stash@{1}).
 
-### §C2 tested — REAL win on loop-heavy kernels (2026-07-06)
+### §C2 — LANDED on top of C1 (2026-07-06)
 Dedicated backward-branch-target ("loop-head") slot; op+var1 hit muxes extended;
-backward-taken detected with zero per-arm edits via `r_perf_br_valid/taken` +
-`r_branch_src_pc`. Built + flashed + measured (2 runs, bit-identical / deterministic).
+backward-taken detected with **zero per-arm edits** via `r_perf_br_valid/taken` +
+`r_branch_src_pc`. Deterministic (2 bit-identical runs), regression green (queens 11/11,
+bst 11/11, test_64bit 36/36), no crash.
 
-- **branchy 4.676 → 4.540 (−2.9%)**, **mem_stream 8.812 → 8.622 (−2.2%)** — both have
-  loops that span >1 cache line, so the head was evicted every iteration and now hits
-  the sticky slot. alu/ptr_chase/calls_fib/muldiv **neutral** (ptr_chase's loop fits one
-  line → no benefit). No crash, no regression. (Below the doc's −0.3/−0.5 CPI estimate;
-  actual −0.14/−0.19, but a genuine isolated win on 2 of 6 kernels.)
-- **Timing: WNS +0.011 — meets, but too thin to ship.** The var1 hit-mux went 2→4-way
-  (three 29-bit tag compares as selects); `r_var1_mem` dropped from +1.5 to +0.011.
-  **Fix before landing:** register the target-slot hit result (move the compare off the
-  dispatch path), or fold the two dw-slots into a single line-tag slot (one compare).
+- **On master (C2 alone):** branchy 4.676 → 4.540 (−2.9%), mem_stream 8.812 → 8.622
+  (−2.2%) — both loops span >1 cache line, so the head was evicted each iteration and
+  now hits the sticky slot.
+- **On top of C1 (as landed):** unique add is **mem_stream −2.2%** only. C2's branchy
+  benefit is **fully subsumed by C1** (C1 already pre-settles the branch loop → head
+  stays available → C2's slot never fires there). The 6 micro-kernels under-represent
+  loop-heavy code, though — C2 helps *any* loop spanning >1 line with a backward branch,
+  so on real workloads the benefit is plausibly broader than this one kernel shows.
+- **Timing fix (landed):** the first cut used two per-dw slots → a 4-way var1 mux → WNS
+  **+0.011** (too thin). Redesigned to a **single 16-byte-line slot** (`r_tgt_line` +
+  one `r_tgt_lineaddr` tag) → one compare, 3-way mux → **WNS +0.098** (meets; −0.033 vs
+  C1's +0.131). Accepted as the shipping cost; re-check WNS if later changes tighten it.
 
 ### Key cross-cutting finding — §D2 is the linchpin (CONFIRMED zero-cost 2026-07-06)
 The cache/DDR level-DV handshake (`mem_read_write.sv` PRE_WAIT/COOL_DOWN "phantom ready"

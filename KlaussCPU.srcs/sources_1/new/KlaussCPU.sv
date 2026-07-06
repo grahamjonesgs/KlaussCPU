@@ -453,16 +453,38 @@ module KlaussCPU (
    logic [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
    logic [ 1:0] r_ifb_dwval;          // per-slot valid
 
+   // §C2 — dedicated backward-branch-target slot ("loop-head cache"). A single
+   // sticky 16-byte-line buffer (ONE line tag), filled ONLY on a taken backward
+   // *conditional* branch target fetch (loop back-edges — keyed off
+   // r_perf_br_valid/taken so JMP/call/ret never thrash it). It is NOT evicted by
+   // the forward sequential fetches that fill r_ifb_* while the loop body runs, so
+   // the loop head — which the 2-slot IFB loses every iteration once the body spans
+   // a second line — hits here instead of paying the full 6-cycle target fetch.
+   // One line tag (vs two per-dw tags) keeps the added dispatch-mux depth to a
+   // single compare + 3:1 mux, so the var1 path stays off the timing edge. Same
+   // SMC-store invalidation as r_ifb_*.
+   logic [127:0] r_tgt_line;              // [63:0]=low dw, [127:64]=high dw of the line
+   logic [27:0]  r_tgt_lineaddr;          // line-aligned tag = addr[31:4]
+   logic         r_tgt_val;
+   logic [31:0]  r_branch_src_pc = 32'b0; // PC of the instr executing in OPCODE_EXECUTE
+   logic         r_cap_to_tgt    = 1'b0;  // in-flight OPCODE_FETCH is a bwd-branch target
+
    wire [28:0] w_ifb_pc_dw  = st.PC[31:3];         // dw holding the opcode at PC
    wire [28:0] w_ifb_pc1_dw = st.PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
    wire w_ifb_op_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc_dw);
    wire w_ifb_op_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc_dw);
-   wire w_ifb_op_hit  = w_ifb_op_hit0 | w_ifb_op_hit1;
-   wire [63:0] w_ifb_op_dw = w_ifb_op_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   wire w_tgt_op_hit  = r_tgt_val && (r_tgt_lineaddr == w_ifb_pc_dw[28:1]);
+   wire [63:0] w_tgt_op_dw = w_ifb_pc_dw[0] ? r_tgt_line[127:64] : r_tgt_line[63:0];
+   wire w_ifb_op_hit  = w_ifb_op_hit0 | w_ifb_op_hit1 | w_tgt_op_hit;
+   wire [63:0] w_ifb_op_dw = w_ifb_op_hit0 ? r_ifb_dw[0] :
+                             w_ifb_op_hit1 ? r_ifb_dw[1] : w_tgt_op_dw;
    wire w_ifb_v1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc1_dw);
    wire w_ifb_v1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc1_dw);
-   wire w_ifb_v1_hit  = w_ifb_v1_hit0 | w_ifb_v1_hit1;
-   wire [63:0] w_ifb_v1_dw = w_ifb_v1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   wire w_tgt_v1_hit  = r_tgt_val && (r_tgt_lineaddr == w_ifb_pc1_dw[28:1]);
+   wire [63:0] w_tgt_v1_dw = w_ifb_pc1_dw[0] ? r_tgt_line[127:64] : r_tgt_line[63:0];
+   wire w_ifb_v1_hit  = w_ifb_v1_hit0 | w_ifb_v1_hit1 | w_tgt_v1_hit;
+   wire [63:0] w_ifb_v1_dw = w_ifb_v1_hit0 ? r_ifb_dw[0] :
+                             w_ifb_v1_hit1 ? r_ifb_dw[1] : w_tgt_v1_dw;
 
    // Instruction-buffer lookup mirrored on the prefetch pointer r_FPC (the
    // prefetch reads the buffered line at r_FPC; no cache request, never the bus).
@@ -481,6 +503,12 @@ module KlaussCPU (
    wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
    wire [63:0] w_ifb_fpcv1_data = w_ifb_fpcv1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
+   // §C2 — taken backward conditional branch (loop back-edge). r_perf_br_valid/taken
+   // are asserted only by the JMPcc arms (not JMP/call/ret), and r_branch_src_pc
+   // holds the branch's own PC (registered in OPCODE_EXECUTE), so this is precise at
+   // the OPCODE_REQUEST cycle that follows the branch. Feeds only r_cap_to_tgt (a
+   // register), off the dispatch critical path.
+   wire w_bwd_target = r_perf_br_valid && r_perf_br_taken && (st.PC < r_branch_src_pc);
    // Execute-tail states where the memory bus is idle and a one-entry IFB-hit
    // prefetch may fill the IR latch without contending for the cache port.
    wire w_exec_tail = (st.SM == OPCODE_EXECUTE) || (st.SM == ALU_FINISH)    ||
@@ -1316,6 +1344,8 @@ rams_sp_nc rams_sp_nc1 (
       r_trace_full = 1'b0;
       r_instr_count = 32'h0;
       r_ifb_dwval = 2'b0;
+      r_tgt_val = 1'b0;
+      r_cap_to_tgt = 1'b0;
       r_perf_br_valid = 1'b0;
       r_perf_br_taken = 1'b0;
       r_int_push_wait_d = 1'b0;
@@ -1358,6 +1388,8 @@ rams_sp_nc rams_sp_nc1 (
          r_trace_full <= 1'b0;
          r_instr_count <= 32'h0;
          r_ifb_dwval <= 2'b0;
+         r_tgt_val <= 1'b0;
+         r_cap_to_tgt <= 1'b0;
          r_ir_valid <= 1'b0;
          r_ir_presettled <= 1'b0;
          r_FPC <= 32'h0;
@@ -1438,6 +1470,10 @@ rams_sp_nc rams_sp_nc1 (
                r_ifb_dwval[0] <= 1'b0;
             if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == st.mem_addr[31:3]))
                r_ifb_dwval[1] <= 1'b0;
+            // §C2 loop-head slot obeys the same SMC-store invalidation (a store
+            // into either dw of the cached line drops it).
+            if (r_tgt_val && (r_tgt_lineaddr == st.mem_addr[31:4]))
+               r_tgt_val <= 1'b0;
             // Self-modifying-code poison: a store into the latched instruction's
             // dword (or the next dword, where a spilled var1 lives) invalidates the
             // prefetched IR so stale code is never consumed (same discipline as the
@@ -1691,6 +1727,8 @@ rams_sp_nc rams_sp_nc1 (
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
                   r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
+                  r_tgt_val <= 1'b0;              // §C2: drop the loop-head slot too
+                  r_cap_to_tgt <= 1'b0;
                   r_FPC <= r_PC_requested;       // prefetch pointer starts at the entry point
                   r_ir_valid <= 1'b0;            // no prefetched instruction yet
                   r_ir_presettled <= 1'b0;
@@ -1756,6 +1794,7 @@ rams_sp_nc rams_sp_nc1 (
                      st.mem_addr      <= st.PC;  // st.PC already set to interrupt target
                      st.mem_read_DV   <= 1'b1;
                      st.SM            <= OPCODE_FETCH;
+                     r_cap_to_tgt     <= 1'b0;   // §C2: an IRQ redirect is never a loop back-edge
                   end
                end else if (w_irq_ready) begin
                   // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
@@ -1850,6 +1889,7 @@ rams_sp_nc rams_sp_nc1 (
                   st.mem_addr    <= st.PC;
                   st.mem_read_DV <= 1'b1;
                   st.SM          <= OPCODE_FETCH;
+                  r_cap_to_tgt   <= w_bwd_target;  // §C2: capture this line into the loop-head slot iff it's a bwd-branch target
                end
             end
 
@@ -1892,6 +1932,27 @@ rams_sp_nc rams_sp_nc1 (
                      r_ifb_dwval[1]  <= 1'b1;
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;
+                  end
+                  // §C2: this fetch is a taken backward-branch target (loop head).
+                  // Mirror the whole line into the sticky loop-head slot so
+                  // subsequent iterations hit it after the body evicts the IFB
+                  // slots. Store in canonical order (low dw at [63:0]) so the hit
+                  // read indexes by PC[3]. Only cache when the companion dw came
+                  // back (loop heads normally get the full 128-bit line); either
+                  // way consume r_cap_to_tgt so a later fetch never fills it.
+                  if (r_cap_to_tgt) begin
+                     if (w_mem_next_valid) begin
+                        if (st.mem_addr[3] == 1'b0) begin
+                           r_tgt_line[63:0]   <= w_mem_read_data;
+                           r_tgt_line[127:64] <= w_mem_read_data_next;
+                        end else begin
+                           r_tgt_line[63:0]   <= w_mem_read_data_next;
+                           r_tgt_line[127:64] <= w_mem_read_data;
+                        end
+                        r_tgt_lineaddr <= st.mem_addr[31:4];
+                        r_tgt_val      <= 1'b1;
+                     end
+                     r_cap_to_tgt <= 1'b0;
                   end
                   st.SM <= OPCODE_FETCH2;
                end  // if ready asserted, else will loop until ready
@@ -2000,6 +2061,7 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             OPCODE_EXECUTE: begin
+               r_branch_src_pc <= st.PC;   // §C2: snapshot this instr's PC; next OPCODE_REQUEST uses it to detect a taken *backward* branch (loop back-edge). Module-scope reg — not clobbered by the arms' whole-struct `st <=`.
                casez (w_opcode[31:0])
                   // M1 ROLLOUT: the ALU op-class routed through the unified
                   // next-state function f_alu (one central NBA per opcode). Every
