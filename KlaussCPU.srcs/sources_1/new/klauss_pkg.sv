@@ -93,8 +93,10 @@ package klauss_pkg;
    } flags_t;
 
    // --- Deferred-writeback bundle (r_wb) -----------------------------------
-   // The P4.1 RAW-forwarding/writeback state that moves together through the
-   // pipeline.  Field is `rd` (not `reg`, which is a keyword).
+   // Deferred register writeback carried in cpu_state_t: the fetch/execute
+   // overlap commits it in OPCODE_REQUEST (parallel with dispatch), with a
+   // read-port forward mux covering the RAW hazard. Field is `rd` (not `reg`,
+   // which is a keyword).
    typedef struct packed {
       logic [63:0] value;     // result to write back
       logic [3:0]  rd;        // destination register index
@@ -248,7 +250,7 @@ package klauss_pkg;
 
 
    // ========================================================================
-   // CPU datapath state type + the M1 next-state functions (moved out of the
+   // CPU datapath state type + the unified next-state functions (moved out of the
    // KlaussCPU module so tb/tools can share them). Pure: (cpu_state_t s, args)
    // -> cpu_state_t. Order: types/enums first, then the f_* functions.
    // ========================================================================
@@ -329,7 +331,7 @@ package klauss_pkg;
    } cpu_state_t;
 
    // ========================================================================
-   // f_alu — unified next-state ALU (M1 rollout). ONE function for the whole
+   // f_alu — unified next-state ALU. ONE function for the whole
    // ALU op-class (RRR + reg-immediate + compares), selected by `op`. The caller
    // passes the two operands (extending the immediate sign/zero as the opcode
    // requires), the destination register index `rd`, and the next PC. The
@@ -1060,7 +1062,7 @@ package klauss_pkg;
       return n;
    endfunction
 
-   // f_ps (C1) — apply the fall-through pre-settle to a COMPUTED next-state:
+   // f_ps — apply the fall-through pre-settle to a COMPUTED next-state:
    // pre-load reg_1/2 for the sequential successor (its opcode's register fields,
    // read from the IFB at r_FPC via w_ps_r1/w_ps_r2) so the fast-path dispatch can
    // skip the FETCH2 bubble after a single-cycle op. Pure function composition —

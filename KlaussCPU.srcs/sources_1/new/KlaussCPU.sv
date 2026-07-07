@@ -453,7 +453,7 @@ module KlaussCPU (
    logic [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
    logic [ 1:0] r_ifb_dwval;          // per-slot valid
 
-   // §C2 — dedicated backward-branch-target slot ("loop-head cache"). A single
+   // Dedicated backward-branch-target slot ("loop-head cache"). A single
    // sticky 16-byte-line buffer (ONE line tag), filled ONLY on a taken backward
    // *conditional* branch target fetch (loop back-edges — keyed off
    // r_perf_br_valid/taken so JMP/call/ret never thrash it). It is NOT evicted by
@@ -503,7 +503,7 @@ module KlaussCPU (
    wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
    wire [63:0] w_ifb_fpcv1_data = w_ifb_fpcv1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
-   // §C2 — taken backward conditional branch (loop back-edge). r_perf_br_valid/taken
+   // Taken backward conditional branch (loop back-edge). r_perf_br_valid/taken
    // are asserted only by the JMPcc arms (not JMP/call/ret), and r_branch_src_pc
    // holds the branch's own PC (registered in OPCODE_EXECUTE), so this is precise at
    // the OPCODE_REQUEST cycle that follows the branch. Feeds only r_cap_to_tgt (a
@@ -1470,7 +1470,7 @@ rams_sp_nc rams_sp_nc1 (
                r_ifb_dwval[0] <= 1'b0;
             if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == st.mem_addr[31:3]))
                r_ifb_dwval[1] <= 1'b0;
-            // §C2 loop-head slot obeys the same SMC-store invalidation (a store
+            // Loop-head slot obeys the same SMC-store invalidation (a store
             // into either dw of the cached line drops it).
             if (r_tgt_val && (r_tgt_lineaddr == st.mem_addr[31:4]))
                r_tgt_val <= 1'b0;
@@ -1727,7 +1727,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
                   r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
-                  r_tgt_val <= 1'b0;              // §C2: drop the loop-head slot too
+                  r_tgt_val <= 1'b0;              // drop the loop-head slot too
                   r_cap_to_tgt <= 1'b0;
                   r_FPC <= r_PC_requested;       // prefetch pointer starts at the entry point
                   r_ir_valid <= 1'b0;            // no prefetched instruction yet
@@ -1794,7 +1794,7 @@ rams_sp_nc rams_sp_nc1 (
                      st.mem_addr      <= st.PC;  // st.PC already set to interrupt target
                      st.mem_read_DV   <= 1'b1;
                      st.SM            <= OPCODE_FETCH;
-                     r_cap_to_tgt     <= 1'b0;   // §C2: an IRQ redirect is never a loop back-edge
+                     r_cap_to_tgt     <= 1'b0;   // an IRQ redirect is never a loop back-edge
                   end
                end else if (w_irq_ready) begin
                   // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
@@ -1889,7 +1889,7 @@ rams_sp_nc rams_sp_nc1 (
                   st.mem_addr    <= st.PC;
                   st.mem_read_DV <= 1'b1;
                   st.SM          <= OPCODE_FETCH;
-                  r_cap_to_tgt   <= w_bwd_target;  // §C2: capture this line into the loop-head slot iff it's a bwd-branch target
+                  r_cap_to_tgt   <= w_bwd_target;  // capture this line into the loop-head slot iff it's a bwd-branch target
                end
             end
 
@@ -1933,7 +1933,7 @@ rams_sp_nc rams_sp_nc1 (
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;
                   end
-                  // §C2: this fetch is a taken backward-branch target (loop head).
+                  // This fetch is a taken backward-branch target (loop head).
                   // Mirror the whole line into the sticky loop-head slot so
                   // subsequent iterations hit it after the body evicts the IFB
                   // slots. Store in canonical order (low dw at [63:0]) so the hit
@@ -2061,17 +2061,20 @@ rams_sp_nc rams_sp_nc1 (
             end
 
             OPCODE_EXECUTE: begin
-               r_branch_src_pc <= st.PC;   // §C2: snapshot this instr's PC; next OPCODE_REQUEST uses it to detect a taken *backward* branch (loop back-edge). Module-scope reg — not clobbered by the arms' whole-struct `st <=`.
+               // Snapshot this instr's PC so the next OPCODE_REQUEST can tell a
+               // taken branch is *backward* (loop back-edge) for the loop-head
+               // cache. Module-scope reg — not clobbered by the arms' whole-struct `st <=`.
+               r_branch_src_pc <= st.PC;
                casez (w_opcode[31:0])
-                  // M1 ROLLOUT: the ALU op-class routed through the unified
-                  // next-state function f_alu (one central NBA per opcode). Every
-                  // other opcode still goes to the existing dispatcher (default).
+                  // The ALU op-class routed through the unified next-state
+                  // function f_alu (one central NBA per opcode). Every other
+                  // opcode still goes to the existing dispatcher (default).
                   // RRR forms: a=reg_a, b=reg_b, rd=reg_dst, PC+4.
                   32'h0001_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, st.PC + 4);  // ADDR
                   32'h0002_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, st.PC + 4);  // SUBR
-                  32'h0003_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR (C1)
-                  32'h0004_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR (C1)
-                  32'h0005_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR (C1)
+                  32'h0003_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR
+                  32'h0004_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR
+                  32'h0005_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR
                   32'h0006_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, st.PC + 4);  // ADDC
                   32'h0007_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, st.PC + 4);  // SUBC
                   32'h0000_05??: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, st.PC + 4);  // CMPRR (flags only)
@@ -2080,9 +2083,9 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_081?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_ADD, st.reg_2, st.PC + 8);             // ADDV (zero-ext)
                   32'h0000_082?: st <= f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_SUB, st.reg_2, st.PC + 8);             // MINUSV (zero-ext)
                   32'h0000_083?: st <= f_alu(st, r_reg_port_b, {{32{w_var1[31]}}, w_var1}, ALU_CMP, st.reg_2, st.PC + 8);  // CMPRV (sign-ext, flags only)
-                  32'h0000_086?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV (C1)
-                  32'h0000_087?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV (C1)
-                  32'h0000_088?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV (C1)
+                  32'h0000_086?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_AND, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV
+                  32'h0000_087?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_OR,  st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV
+                  32'h0000_088?: begin st <= f_ps(f_alu(st, r_reg_port_b, {32'b0, w_var1}, ALU_XOR, st.reg_2, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV
                   // INC/DEC: a=reg_b, b=1, rd=reg_2, PC+4.
                   32'h0000_084?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_ADD, st.reg_2, st.PC + 4);  // INCR
                   32'h0000_085?: st <= f_alu(st, r_reg_port_b, 64'd1, ALU_SUB, st.reg_2, st.PC + 4);  // DECR
@@ -2129,9 +2132,9 @@ rams_sp_nc rams_sp_nc1 (
                   32'h0000_0AA?: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_b)},  st.reg_2, 1'b0, st.PC + 4);    // CTZ
                   32'h0000_0AB?: st <= f_wb(st, bit_reverse(r_reg_port_b),                    st.reg_2, 1'b0, st.PC + 4);    // BITREV
                   // Shift-by-N (logical/arith) via f_wb.
-                  32'h0000_091?: begin st <= f_ps(f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHLV (C1)
-                  32'h0000_092?: begin st <= f_ps(f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRV (C1)
-                  32'h0000_093?: begin st <= f_ps(f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRAV (C1)
+                  32'h0000_091?: begin st <= f_ps(f_wb(st, r_reg_port_b << w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHLV
+                  32'h0000_092?: begin st <= f_ps(f_wb(st, r_reg_port_b >> w_var1[5:0],           st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRV
+                  32'h0000_093?: begin st <= f_ps(f_wb(st, $signed(r_reg_port_b) >>> w_var1[5:0], st.reg_2, 1'b1, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRAV
                   // Rotate-by-N + rotate-reg (no carry) via f_wb.
                   32'h0000_0FC?: st <= f_wb(st, (r_reg_port_b << w_var1[5:0]) | (r_reg_port_b >> (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // ROLV
                   32'h0000_0FD?: st <= f_wb(st, (r_reg_port_b >> w_var1[5:0]) | (r_reg_port_b << (64 - w_var1[5:0])), st.reg_2,   1'b1, st.PC + 8); // RORV
