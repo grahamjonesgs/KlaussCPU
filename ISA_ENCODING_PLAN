@@ -1,0 +1,306 @@
+# ISA Encoding v2 — Positional Opcode Numbering Plan
+
+Proposal for re-numbering the KlaussCPU opcode space so that every property
+the hardware needs early (length, class, size, signedness, condition, flag
+behaviour) lives in fixed bit positions, and enumeration is reduced to "which
+operation within a class". Replaces the current two-format scheme (RRR with
+upper-16 ≠ 0 vs legacy upper-16 = 0) and its hand-synchronized length /
+dispatch / perf-class tables.
+
+Design principle: **a fixed bit for every property needed before (or instead
+of) full decode; a lookup only for operation semantics.**
+
+---
+
+## 1. Word layout
+
+All instructions are 1–3 × 32-bit words. Word 0:
+
+```
+ 31 30 29    26 25                 16 15    12 11    8 7     4 3     0
+┌─────┬────────┬─────────────────────┬────────┬───────┬───────┬───────┐
+│ LEN │ CLASS  │ attributes + OP     │ x/COND │  rd   │  rs1  │  rs2  │
+└─────┴────────┴─────────────────────┴────────┴───────┴───────┴───────┘
+```
+
+| Field | Bits | Meaning |
+|---|---|---|
+| LEN   | [31:30] | words: `01`=1, `10`=2, `11`=3. `00` = **illegal** |
+| CLASS | [29:26] | major class (table below) |
+| attr/OP | [25:16] | class-specific attribute bits + minor opcode |
+| x     | [15:12] | class-specific (branch condition, shift-count LSB, else reserved-0) |
+| rd    | [11:8]  | destination (loads: dest; stores: data source) |
+| rs1   | [7:4]   | first source / base address |
+| rs2   | [3:0]   | second source / offset register / indirect target |
+
+Register fields are in the positions the current RRR format already uses, so
+the unconditional register-port latching (`KlaussCPU.sv` ~1412, ~1827) becomes
+correct for every instruction with no format cases. Immediate words (imm32 at
+PC+4, optional hi32 at PC+8) are unchanged in placement.
+
+Unassigned CLASS values, OP values, and attribute combinations **trap**
+(ERR_INV_OPCODE) so the space stays reclaimable and encoding bugs surface
+loudly.
+
+## 2. Class map (CLASS = [29:26])
+
+| CLASS | Meaning | Notes |
+|---|---|---|
+| 0x0 | illegal | `0x0000_0000` double-traps (LEN=00 as well) |
+| 0x1 | ALU reg-reg | add/sub/adc/sbc/and/or/xor/min/max/minu/maxu |
+| 0x2 | ALU immediate | same OP numbering; mov covers SETR + SETR64 via LEN |
+| 0x3 | compare | flag-setting CMP and boolean rd=0/1 forms |
+| 0x4 | shift / rotate / bit | count/position embedded → 1-word |
+| 0x5 | unary | copy/neg/not/abs/extend/bswap/bitrev/popcnt/clz/ctz/flags |
+| 0x6 | load | all sizes × signs × address modes |
+| 0x7 | store | mirror of load; bit [26] alone = "is store" |
+| 0x8 | branch | condition field; jump and call unified via LINK bit |
+| 0x9 | stack / SP | push/pop/getsp/setsp/addsp, ret, iret |
+| 0xA | mul / div | signedness / high-half / mod as attribute bits |
+| 0xB | system | nop/halt/wait/reset/trap/delay |
+| 0xC | I/O | LCD residue (candidate for MMIO retirement instead) |
+| 0xD–0xE | reserved | future classes |
+| 0xF | illegal | `0xFFFF_FFFF` (erased/floating bus) traps |
+
+## 3. Per-class field assignments
+
+Exact bit packing within [25:16] is adjustable; the invariants that matter are
+LEN/CLASS/register positions and one-attribute-one-bit.
+
+### 0x1 ALU reg-reg (LEN=01) / 0x2 ALU immediate (LEN=10 or 11)
+
+```
+[25:22] OP   0=ADD 1=SUB 2=ADC 3=SBC 4=AND 5=OR 6=XOR
+             7=MIN 8=MAX 9=MINU 10=MAXU 14=LEA(PC+imm, class 2) 15=MOV(class 2)
+[21]    F    1 = set flags (Z/C/V/S as applicable), 0 = flag-neutral
+[20]    SGN  class 2 only: sign- vs zero-extend imm32
+```
+
+- `rd = rs1 OP rs2` / `rd = rs1 OP ext(imm32)`. rd ≠ rs everywhere — the
+  in-place-only immediate forms (ADDV/ANDV/…) cease to exist as a category.
+- MOV: LEN=10 → `SETR` (imm32, extended per SGN); LEN=11 → `SETR64` (imm64,
+  hi32 self-fetched at PC+8 exactly as `f_setr64` does today). No separate
+  opcode for the 64-bit form — **LEN is the disambiguator**.
+- LEN=11 on any other OP is *architecturally reserved* for future imm64 forms
+  (AND64I etc.); traps until implemented.
+- The F bit replaces the current inconsistent per-opcode flag matrix: flag
+  update becomes the compiler's per-instruction choice, which also lets it
+  keep flags live across unrelated ops.
+
+### 0x3 compare (LEN=01 reg-reg, LEN=10 reg-imm)
+
+```
+[25:23] PRED 0=EQ 1=LT 2=LE 3=ULT 4=ULE
+[22]    INV  invert predicate (gives NE/GE/GT/UGE/UGT)
+[21]    B    0 = flag-setting CMP (writes E/L/U flags + Z; no rd write)
+             1 = boolean: rd = predicate ? 1 : 0 (no flags)
+[20]    SGN  reg-imm form: imm32 extension
+```
+
+- Replaces CMPRR/CMPRV + the ten CMPxxR boolean opcodes. GT/GE/UGT/UGE come
+  from INV, not separate encodings.
+- Recommendation folded in: flag-setting CMP drives **Z** on equality, which
+  makes the E flag and the whole JMPE/JMPNE family redundant (see §4 branch).
+
+### 0x4 shift / rotate / bit (LEN=01; BEXTR/BDEP LEN=10)
+
+```
+[25:22] OP   0=SHL 1=SHR 2=SAR 3=ROL 4=ROR 5=RCL 6=RCR
+             8=BSET 9=BCLR 10=BTGL 11=BTST 12=BEXTR 13=BDEP
+[21]    SRC  0 = count/position from rs2[5:0], 1 = embedded immediate
+[20:15] N    embedded 6-bit count / bit position (SRC=1)
+[14]    F    set flags (Z; carry for RCL/RCR/rotates)
+```
+
+- **Shift-by-constant and bit-set/clear/test-by-constant become 1-word**
+  (today SHLV/BSET/… are 2-word). The by-1 opcodes (SHLR1/SHRR1/SHRAR/SHLAR/
+  ROLR1/RORR1) disappear — they are N=1 encodings. The SHLAR/SHLR1 duplicate
+  resolves itself.
+- BEXTR/BDEP keep LEN=10 with start/len packed in the imm32 word (they need
+  two 6-bit parameters; widen to 64-bit fields while re-specifying).
+- BTST convention must be picked once: recommend rd = bit value (boolean,
+  matching class 3) with F optionally also setting Z. Kills the current
+  BTSTRR-vs-BTST mismatch.
+
+### 0x5 unary (LEN=01)
+
+```
+[25:22] OP   0=COPY 1=NEG 2=NOT 3=ABS 4=SEXT 5=ZEXT 6=BSWAP 7=BITREV
+             8=POPCNT 9=CLZ 10=CTZ 12=GETF 13=SETF
+[21:20] SIZE SEXT/ZEXT only: 00=8 01=16 10=32
+[19]    F    set flags (Z; S for SEXT/ABS)
+```
+
+- `rd = OP(rs1)`. SEXTB/H/W and ZEXTB/H/W collapse to two OPs × SIZE.
+- GETF/SETF read/write **all 7 flags** (fixes SETFR's 4-of-7 visibility and
+  adds the missing restore path — software context switch becomes possible).
+
+### 0x6 load / 0x7 store
+
+```
+[25:24] SIZE 00=8 01=16 10=32 11=64
+[23]    SGN  loads: sign-extend result. Stores: reserved-0
+[22:21] MODE 00 = addr in rs1               (LEN=01)
+             01 = rs1 + imm32               (LEN=10)
+             10 = absolute imm32            (LEN=10)
+             11 = rs1 + rs2                 (LEN=01)
+[20]    A    alignment policy bit — see note
+```
+
+- Loads: `rd = ext(mem[EA])`. Stores: `mem[EA] = rd-field register` (same bit
+  positions, direction flipped; SGN meaningless for stores).
+- This one pattern covers the entire current menagerie — MEMGET*/MEMSET*
+  (mode 00), LDIDX*/STIDX* (mode 01), MEMREADR/MEMSETR (mode 10),
+  LDIDX64R/STIDX64R (mode 11) — **~24 dispatch arms → 2**, parameterized
+  straight into `f_ld_idx`/`f_st_idx`'s existing `(sz, is_signed)` arguments.
+- Every SIZE × SGN × MODE point exists automatically: the missing LDIDX32_S,
+  MEMGET8_S/16_S/32_S, and sub-64 reg+reg forms are free bit combinations.
+- Alignment: recommend **one** defined behaviour (natural alignment enforced,
+  misalignment traps via a new ERR code) and keep bit [20] reserved; if the
+  unaligned-tolerant MEMGET32 path must stay, A=1 selects it. Either way the
+  LDIDX64 vs LDIDX64A duplication is retired.
+- Class codes 0x6/0x7 differ only in bit [26], so "is this a store" — needed
+  by the IFB coherence poison logic — is a 1-bit test instead of a dozen
+  range matches.
+
+### 0x8 branch (LEN=10 imm target; LEN=01 register target)
+
+```
+[25]    LINK 1 = push return address (call)
+[24]    REL  1 = PC-relative target
+[23]    RIND 1 = target in rs2[31:0] (LEN=01), 0 = target/displacement imm32
+[22:19] COND 0=always 1=Z 2=C 3=V 4=S 5=LT 6=LE 7=ULT 8=ULE
+[18]    INV  invert condition
+```
+
+- One dispatch arm + one 9:1 flag mux replaces the current ~60 branch/call
+  arms. JMP/JMPR/CALL/CALLR/JMPccREL/… are all field combinations.
+- Assumes CMP drives Z (§3 class 0x3), so no E predicate is needed; if that
+  change is rejected, COND=9 becomes E.
+- Conditional indirect calls/jumps exist for free; the question of whether
+  conditional CALLs are worth their opcodes dissolves — they no longer cost
+  encodings.
+
+### 0x9 stack / SP
+
+```
+[25:22] OP   0=PUSH(rs1)  1=PUSHI(imm32, LEN=10; imm64, LEN=11)
+             2=POP(rd)    3=GETSP(rd)   4=SETSP(rs1)
+             5=ADDSP(imm32 sign-extended, LEN=10)
+             6=RET        7=IRET
+```
+
+### 0xA mul / div
+
+```
+[25:24] OP   0=MUL 1=DIV 2=MOD
+[23]    SGN  signed
+[22]    H    high 64 bits (MUL only)
+```
+
+- Reg-reg LEN=01 (`rd = rs1 op rs2`); reg-imm LEN=10. Covers all eleven
+  current ops; MULHV/DIVUV/MODUV (currently missing) come free.
+- Divide-by-zero semantics unchanged (centralised in `f_div_setup`).
+
+### 0xB system (LEN=01; DELAY-imm LEN=10)
+
+```
+[21:16] OP   0=NOP 1=HALT 2=WAIT 3=RESET 4=TRAP 5=DELAY(rs1 / imm32 via LEN)
+```
+
+### 0xC I/O
+
+LCD residue: `[25:24] OP` (0=CMD, 1=DATA, 2=RESET), `[23]` source = rs1 vs
+imm (LEN). Alternative worth considering during implementation: retire LCD to
+MMIO like UART/LED/7-seg and leave class 0xC wholly reserved.
+
+## 4. Worked example
+
+`ADDR R3, R1, R2` (today `0x0001_0312`):
+LEN=01, CLASS=0x1, OP=ADD(0), F=1, rd=3, rs1=1, rs2=2
+
+```
+01 0001 | 0000 1 00000 | 0000 | 0011 0001 0010   =  0x4420_0312
+```
+
+Other examples at field level:
+
+| Instruction | LEN | CLASS | fields |
+|---|---|---|---|
+| `ADDI R3,R15,-32` | 10 | 0x2 | OP=ADD, SGN=1, rd=3, rs1=15 + imm32 |
+| `SETR64 R5,imm64` | 11 | 0x2 | OP=MOV, rd=5 + imm32 ×2 |
+| `LDIDX16_S R4,R2,#o` | 10 | 0x6 | SIZE=16, SGN=1, MODE=01, rd=4, rs1=2 + imm32 |
+| `JMPULE addr` | 10 | 0x8 | COND=ULE + imm32 |
+| `CALLR R6` | 01 | 0x8 | LINK=1, RIND=1, COND=always, rs2=6 |
+| `SHL R5,R7,#7` | 01 | 0x4 | OP=SHL, SRC=1, N=7, rd=5, rs1=7 — **1 word** |
+
+## 5. Hardware implications
+
+Derived instead of enumerated:
+
+```systemverilog
+wire [1:0]  w_len     = w_opcode[31:30];
+wire [3:0]  w_class   = w_opcode[29:26];
+wire [3:0]  w_ilen_b  = {w_len, 2'b00};                    // 4/8/12 bytes
+wire [31:0] w_pc_next = st.PC + {28'b0, w_ilen_b};
+wire        w_is_store = (w_opcode[29:27] == 3'b011) & w_opcode[26];
+```
+
+- `f_predecode_len` (≈45-arm casez, already drifted once — DELAYV) → 1 line.
+- Per-arm `st.PC + 4/8/12` literals → `w_pc_next` (removes the second
+  hand-synced copy of length).
+- `f_perf_class` → CLASS field read (removes the third).
+- Dispatch casez: ~160 arms → ~20 (roughly one per class/mode), each passing
+  attribute fields into the existing `f_*` next-state functions, whose
+  signatures (`f_alu` op enum, `f_ld_idx` sz/is_signed, `f_cond_jump` cond)
+  already match this factoring.
+- Fetch/IFB, WRITEBACK, ALU_FINISH, multiply/divide pipelines: unchanged.
+- Internal opcode-pattern checks must move to fields — e.g. the debug-skip
+  test `w_opcode[31:12] != 20'h0000F` (KlaussCPU.sv ~1808/1919/1958) becomes
+  a CLASS≠0xB test.
+- Illegal-instruction coverage improves: LEN=00 (zeroed DDR2, wild jump into
+  data, any pre-v2 binary — their first word has [31:30]=00), CLASS 0x0/0xF
+  (all-ones bus patterns) and reserved combinations all trap deterministically
+  at fetch/dispatch instead of relying on casez default fall-through.
+- Branch predicate concentrates into one 9:1 flag mux where today each opcode
+  hardwires its test — same total logic, one place; worth a timing glance,
+  expected fine on this FSM machine.
+- No cycle-count change per instruction *except* code-density wins: 1-word
+  constant shifts/bit-ops, fewer COPYs (rd≠rs immediates), one-instruction
+  signed-int loads.
+
+## 6. Toolchain and migration implications
+
+- **Full flag day.** Assembler and LLVM backend re-emit every instruction;
+  all `.hex` images, boot-ROM programs and netboot payloads regenerate; docs
+  rewrite. The LLVM side gets simpler: classes map 1:1 onto tablegen format
+  classes (`let Inst{31-30}`, `Inst{29-26}`, per-class field defs replace
+  per-instruction magic numbers).
+- Old binaries fail **fast and loud**: first instruction has [31:30]=00 →
+  immediate crash dump. No silent misexecution during the transition.
+- Loader/checksum/netboot move bytes and are unaffected.
+- `tb_predecode` reduces to checking the LEN rule; add an assertion that any
+  arm consuming `w_var1` sees LEN≥10 (cross-check field vs semantics).
+- Crash dumps become self-describing (LEN/CLASS readable straight off the
+  `OPC=` line).
+- Keep one generated, machine-readable opcode table as the single source for
+  the RTL dispatch skeleton, the assembler, the LLVM `.td` encodings and the
+  doc tables. The encoding makes length/class underivable-from-two-places by
+  construction; the generator keeps the *semantic* assignments (OP numbers ↔
+  mnemonics) in one place across tools.
+- Optional staging: claim LEN bits alone first (bits [31:30] are zero in
+  every current instruction, so it is a mechanical OR in the toolchain and a
+  3-line predecoder) and do the class restructure as a second flag day. LEN
+  keeps its position and meaning across both steps, so nothing is thrown
+  away. Cost of staging: two re-encodes instead of one.
+
+## 7. Decisions to settle before implementation
+
+1. CMP drives Z (retires the E flag + JMPE family)? — recommended yes.
+2. BTST result convention: rd=0/1 (recommended) vs flag-only.
+3. Alignment policy: trap on misalignment (recommended, new ERR code) vs
+   silent masking vs keep unaligned-tolerant bit [20] for 32-bit loads.
+4. LCD: class 0xC opcodes vs retire to MMIO.
+5. Keep DELAYR/DELAYV (vs WAIT + timer)?
+6. Trap vs ignore for reserved attribute combinations — recommended trap.
+7. Staged migration (LEN first) vs single flag day.

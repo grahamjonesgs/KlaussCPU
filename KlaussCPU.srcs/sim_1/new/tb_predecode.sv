@@ -1,8 +1,9 @@
 `timescale 1ns/1ps
-// Local unit test for f_predecode_len (P4.1a). Catches transcription/casez-order
-// errors fast, before the synth cycle. Ground truth for the ISA lengths is the
-// board-empirical mismatch counter (separate); this locks the function behavior.
-// f_predecode_len now lives in klauss_pkg (compile klauss_pkg.sv alongside this tb).
+// Local unit test for f_predecode_len. ISA v2: length = LEN field (word0
+// [31:30]: 01=4B, 10=8B, 11=12B), so this now locks the field extraction and
+// the illegal-LEN=00 fallback rather than an enumerated table. Representative
+// opcodes from ISA_ENCODING_V2_MAP.md, one or more per class per length.
+// f_predecode_len lives in klauss_pkg (compile klauss_pkg.sv alongside this tb).
 import klauss_pkg::*;
 module tb_predecode;
 
@@ -18,53 +19,43 @@ module tb_predecode;
   endtask
 
   initial begin
-    // len-12 — the only two (most fragile arm; must beat broader patterns)
-    check(32'h0000_0FE0, 12); check(32'h0000_0FEF, 12);   // SETR64
-    check(32'h0000_4060, 12);                              // PUSHV64
-    // 08xx high-risk split: len-8 RV (immediate) vs len-4 R
-    check(32'h0000_0800, 8); check(32'h0000_0810, 8); check(32'h0000_0820, 8);
-    check(32'h0000_0830, 8); check(32'h0000_0860, 8); check(32'h0000_0870, 8);
-    check(32'h0000_0880, 8);
-    check(32'h0000_0840, 4); check(32'h0000_0850, 4); check(32'h0000_0890, 4);
-    check(32'h0000_08A0, 4); check(32'h0000_08F0, 4);
-    // 09xx / 0Axx / 0Bxx len-8 RV
-    check(32'h0000_0910, 8); check(32'h0000_0920, 8); check(32'h0000_0930, 8);
-    check(32'h0000_0990, 8); check(32'h0000_0A00, 8); check(32'h0000_0A30, 8);
-    check(32'h0000_0AC0, 8); check(32'h0000_0AD0, 8);
-    check(32'h0000_0B80, 8); check(32'h0000_0B90, 8); check(32'h0000_0BA0, 8);
-    // 09xx / 0Axx / 0Bxx / 0Fxx len-4 R (default)
-    check(32'h0000_0900, 4); check(32'h0000_0940, 4); check(32'h0000_09F0, 4);
-    check(32'h0000_0A40, 4); check(32'h0000_0AE0, 4); check(32'h0000_0B00, 4);
-    check(32'h0000_0F00, 4); check(32'h0000_0F10, 4); check(32'h0000_0F80, 4);
-    check(32'h0000_0FC0, 8); check(32'h0000_0FD0, 8);     // ROLV/RORV len-8
-    // 3-reg ALU (upper16 != 0) -> 4
-    check(32'h0001_0000, 4); check(32'h0007_0123, 4); check(32'h0050_0FFF, 4);
-    // loads/stores len-8 (RRV / V indexed-absolute)
-    check(32'h0000_0C00, 8); check(32'h0000_0D55, 8); check(32'h0000_0EFF, 8);
-    check(32'h0000_C000, 8); check(32'h0000_C700, 8); check(32'h0000_C300, 8);
-    check(32'h0000_FC00, 8); check(32'h0000_FD00, 8);
-    check(32'h0000_7200, 8); check(32'h0000_7210, 8); check(32'h0000_7300, 8);
-    // loads/stores len-4 (register-indirect forms)
-    check(32'h0000_7000, 4); check(32'h0000_7100, 4); check(32'h0000_7500, 4);
-    check(32'h0000_7900, 4); check(32'h0000_4000, 4); check(32'h0000_4010, 4);
-    // flow control len-8 (absolute V + PC-rel V)
-    check(32'h0000_1000, 8); check(32'h0000_1001, 8); check(32'h0000_1011, 8);
-    check(32'h0000_101C, 8); check(32'h0000_1030, 8); check(32'h0000_1041, 8);
-    // flow control len-4 (RET / JMPR / IRET / CALLR)
-    check(32'h0000_1012, 4); check(32'h0000_1020, 4); check(32'h0000_102F, 4);
-    check(32'h0000_6011, 4); check(32'h0000_4070, 4); check(32'h0000_407F, 4);
-    // V-form io / stack len-8
-    check(32'h0000_3070, 8); check(32'h0000_3072, 8); check(32'h0000_3075, 8);
-    check(32'h0000_2021, 8); check(32'h0000_2023, 8); check(32'h0000_4020, 8);
-    check(32'h0000_4050, 8); check(32'h0000_5002, 8); check(32'h0000_5003, 8);
-    // single-word forms (default 4)
-    check(32'h0000_0100, 4); check(32'h0000_0500, 4);     // COPY / CMPRR
-    check(32'h0000_0200, 8);                              // ADDI RRV len-8
-    check(32'h0000_3000, 4); check(32'h0000_3060, 4);     // LED/7seg reg forms
-    check(32'h0000_F011, 4); check(32'h0000_F012, 4);     // HALT / WAIT
-    check(32'h0000_0000, 4);                              // NOP
+    // ---- LEN=11 (3 words, 12 B) ----
+    check(32'hCBC0_0500, 12);  // SETR64 R5
+    check(32'hE440_0000, 12);  // PUSHV64
+    // ---- LEN=10 (2 words, 8 B) ----
+    check(32'h8830_0310, 8);   // ADDI  (class 2)
+    check(32'h8BD0_0200, 8);   // SETR
+    check(32'h8C10_0010, 8);   // CMPRV (class 3)
+    check(32'h9300_0450, 8);   // BEXTR (class 4)
+    check(32'h9B20_0420, 8);   // LDIDX64 (class 6)
+    check(32'h9F40_0300, 8);   // MEMSETR (class 7)
+    check(32'hA048_0000, 8);   // JMPE (class 8)
+    check(32'hA200_0000, 8);   // CALL
+    check(32'hA440_0000, 8);   // PUSHV (class 9)
+    check(32'hA880_0120, 8);   // MULV (class A)
+    check(32'hAC05_0000, 8);   // DELAYV (class B)
+    check(32'hB000_0000, 8);   // LCDCMDV (class C)
+    // ---- LEN=01 (1 word, 4 B) ----
+    check(32'h4420_0312, 4);   // ADDR (class 1)
+    check(32'h4C00_0012, 4);   // CMPRR (class 3)
+    check(32'h5020_8010, 4);   // SHLR1 (class 4, embedded N)
+    check(32'h5020_C310, 4);   // SHLV #1 (class 4, F=1)
+    check(32'h5400_0120, 4);   // COPY (class 5)
+    check(32'h5B00_0210, 4);   // MEMREADRR (class 6)
+    check(32'h5B60_0432, 4);   // LDIDX64R (mode 11 — was 2 words in v1)
+    check(32'h5F60_0432, 4);   // STIDX64R (mode 11 — was 2 words in v1)
+    check(32'h6080_0003, 4);   // JMPR (class 8, RIND)
+    check(32'h6480_0200, 4);   // POP (class 9)
+    check(32'h6580_0000, 4);   // RET
+    check(32'h6880_0312, 4);   // MULR (class A)
+    check(32'h6C00_0000, 4);   // NOP (class B)
+    check(32'h7000_0010, 4);   // LCDCMDR (class C)
+    // ---- LEN=00 (illegal: any v1 binary word / zeroed DDR2) -> 4, traps at dispatch ----
+    check(32'h0000_0000, 4);
+    check(32'h0001_0312, 4);   // v1 ADDR — must read as illegal-length 4
+    check(32'h3FFF_FFFF, 4);
 
-    if (errors == 0) $display("PREDECODE UNIT TEST: ALL %0d CHECKS PASS", 0);
+    if (errors == 0) $display("PREDECODE UNIT TEST: ALL CHECKS PASS");
     else $display("PREDECODE UNIT TEST: %0d FAILURES", errors);
     $finish;
   end

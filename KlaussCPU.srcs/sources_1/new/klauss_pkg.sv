@@ -106,8 +106,7 @@ package klauss_pkg;
 
    // --- Pure helper functions (were functions.vh) --------------------------
    // No module-scope coupling — args in, value out — so they lift cleanly into
-   // the package. Bodies are unchanged; f_predecode_len's casez MUST stay in
-   // lock-step with opcode_select.vh's dispatch.
+   // the package.
 
    // ASCII hex digit ('0'-'9','A'-'F') -> 4-bit nibble; any non-hex input -> 0x0
    function automatic [3:0] return_hex_from_ascii;
@@ -162,89 +161,19 @@ package klauss_pkg;
    endfunction
 
    // f_predecode_len — encoded instruction length in BYTES (4/8/12) from the
-   // 32-bit opcode alone, for the fetch pipeline. MUST be kept in lock-step with
-   // opcode_select.vh (see that file). Independently enumerated.
+   // 32-bit opcode alone, for the fetch pipeline. ISA encoding v2 carries the
+   // word count in the LEN field (bits [31:30]: 01=1, 10=2, 11=3 words), so the
+   // length is a field read — no enumerated table to keep in lock-step with the
+   // dispatch. LEN=00 is architecturally illegal (any pre-v2 binary word);
+   // return 4 so the fetch completes and the dispatch default traps it.
    function automatic [3:0] f_predecode_len;
       input [31:0] opcode;
       begin
-         // 3-register ALU: upper 16 bits non-zero (NNNN_0???) — always 1 word.
-         if (opcode[31:16] != 16'h0000) begin
-            f_predecode_len = 4'd4;
-         end else begin
-            casez (opcode[15:0])
-               // ---- 3-word V64 (12 B) — the only two; MUST precede broader arms ----
-               16'h0FE?: f_predecode_len = 4'd12;   // SETR64
-               16'h4060: f_predecode_len = 4'd12;   // PUSHV64
-               // ---- 2-word ops (8 B): RV / RRV / V ----
-               16'h02??: f_predecode_len = 4'd8;    // ADDI  RRV
-               16'h080?: f_predecode_len = 4'd8;    // SETR  RV
-               16'h081?: f_predecode_len = 4'd8;    // ADDV  RV
-               16'h082?: f_predecode_len = 4'd8;    // MINUSV RV
-               16'h083?: f_predecode_len = 4'd8;    // CMPRV RV
-               16'h086?: f_predecode_len = 4'd8;    // ANDV  RV
-               16'h087?: f_predecode_len = 4'd8;    // ORV   RV
-               16'h088?: f_predecode_len = 4'd8;    // XORV  RV
-               16'h091?: f_predecode_len = 4'd8;    // SHLV  RV
-               16'h092?: f_predecode_len = 4'd8;    // SHRV  RV
-               16'h093?: f_predecode_len = 4'd8;    // SHRAV RV
-               16'h099?: f_predecode_len = 4'd8;    // LEAPC RV
-               16'h0A0?: f_predecode_len = 4'd8;    // BSET  RV
-               16'h0A1?: f_predecode_len = 4'd8;    // BCLR  RV
-               16'h0A2?: f_predecode_len = 4'd8;    // BTGL  RV
-               16'h0A3?: f_predecode_len = 4'd8;    // BTST  RV
-               16'h0AC?: f_predecode_len = 4'd8;    // BEXTR RV
-               16'h0AD?: f_predecode_len = 4'd8;    // BDEP  RV
-               16'h0B8?: f_predecode_len = 4'd8;    // MULV  RV
-               16'h0B9?: f_predecode_len = 4'd8;    // DIVV  RV
-               16'h0BA?: f_predecode_len = 4'd8;    // MODV  RV
-               16'h0C??: f_predecode_len = 4'd8;    // LDIDX64  RRV
-               16'h0D??: f_predecode_len = 4'd8;    // STIDX64  RRV
-               16'h0E??: f_predecode_len = 4'd8;    // LDIDX64R RRV
-               16'h0FC?: f_predecode_len = 4'd8;    // ROLV  RV
-               16'h0FD?: f_predecode_len = 4'd8;    // RORV  RV
-               16'hC0??: f_predecode_len = 4'd8;    // LDIDX32   RRV
-               16'hC1??: f_predecode_len = 4'd8;    // STIDX32   RRV
-               16'hC2??: f_predecode_len = 4'd8;    // LDIDX16   RRV
-               16'hC3??: f_predecode_len = 4'd8;    // STIDX16   RRV
-               16'hC4??: f_predecode_len = 4'd8;    // LDIDX8    RRV
-               16'hC5??: f_predecode_len = 4'd8;    // STIDX8    RRV
-               16'hC6??: f_predecode_len = 4'd8;    // LDIDX8_S  RRV
-               16'hC7??: f_predecode_len = 4'd8;    // LDIDX16_S RRV
-               // Flow control absolute V (1000-1011, 1013-101C) — 2 word.
-               16'h1000,16'h1001,16'h1002,16'h1003,16'h1004,16'h1005,
-               16'h1006,16'h1007,16'h1008,16'h1009,16'h100A,16'h100B,
-               16'h100C,16'h100D,16'h100E,16'h100F,16'h1010,16'h1011:
-                         f_predecode_len = 4'd8;
-               16'h1013,16'h1014,16'h1015,16'h1016,16'h1017,16'h1018,
-               16'h1019,16'h101A,16'h101B,16'h101C:
-                         f_predecode_len = 4'd8;
-               // PC-relative flow control 1030-1041 — all 2-word V.
-               16'h1030,16'h1031,16'h1032,16'h1033,16'h1034,16'h1035,
-               16'h1036,16'h1037,16'h1038,16'h1039,16'h103A,16'h103B,
-               16'h103C,16'h103D,16'h103E,16'h103F,16'h1040,16'h1041:
-                         f_predecode_len = 4'd8;
-               // LCD / 7seg / LED / stack / UART / mem immediate (V) forms
-               16'h2021: f_predecode_len = 4'd8;    // LCDCMDV  V
-               16'h2022: f_predecode_len = 4'd8;    // LCDDATAV V
-               16'h2023: f_predecode_len = 4'd8;    // LCD      V
-               16'h3070: f_predecode_len = 4'd8;    // LEDV     V
-               16'h3071: f_predecode_len = 4'd8;    // 7SEG1V   V
-               16'h3072: f_predecode_len = 4'd8;    // 7SEG2V   V
-               16'h3074: f_predecode_len = 4'd8;    // RGB1V    V
-               16'h3075: f_predecode_len = 4'd8;    // RGB2V    V
-               16'h4020: f_predecode_len = 4'd8;    // PUSHV    V
-               16'h4050: f_predecode_len = 4'd8;    // ADDSP    V
-               16'h5002: f_predecode_len = 4'd8;    // TXMEM    V
-               16'h5003: f_predecode_len = 4'd8;    // TXSTRMEM V
-               16'h720?: f_predecode_len = 4'd8;    // MEMSETR  RV
-               16'h721?: f_predecode_len = 4'd8;    // MEMREADR RV
-               16'h73??: f_predecode_len = 4'd8;    // STIDX64R RRV
-               16'hFC??: f_predecode_len = 4'd8;    // LDIDX64A RRV
-               16'hFD??: f_predecode_len = 4'd8;    // STIDX64A RRV
-               // ---- everything else 1-word (4 B) ----
-               default:  f_predecode_len = 4'd4;
-            endcase
-         end
+         case (opcode[31:30])
+            2'b10:   f_predecode_len = 4'd8;
+            2'b11:   f_predecode_len = 4'd12;
+            default: f_predecode_len = 4'd4;   // 01 = 1 word; 00 = illegal (traps at dispatch)
+         endcase
       end
    endfunction
 
@@ -748,63 +677,10 @@ package klauss_pkg;
       return n;
    endfunction
 
-   // f_ld_idxreg — LDIDX64R: rd = mem64[rs2 + reg[off_reg]]. 3-stage: cycle 0
-   // saves base + redirects port B to off_reg; cycle 1 lets the port settle;
-   // cycle 2 issues the read from base+offset (portb now == offset value).
-   function automatic cpu_state_t f_ld_idxreg(cpu_state_t s, logic mem_ready,
-         logic [31:0] portb, logic [63:0] rdata, logic [3:0] off_reg, logic [31:0] pc_next);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      if (s.extra_clock == 0) begin
-         n.idx_base_addr = portb;
-         n.reg_2         = off_reg;
-         n.extra_clock   = 2'd1;
-      end else if (s.extra_clock == 1) begin
-         n.extra_clock = 2'd2;
-      end else begin
-         if (!s.mem_read_DV) begin
-            n.mem_addr    = s.idx_base_addr + portb;
-            n.mem_read_DV = 1'b1;
-         end else if (mem_ready) begin
-            n.wb.value    = rdata;
-            n.wb.rd       = s.reg_1;
-            n.SM          = WRITEBACK;
-            n.mem_read_DV = 1'b0;
-            n.PC          = pc_next;
-         end
-      end
-      return n;
-   endfunction
-
-   // f_st_idxreg — STIDX64R: mem64[rs2 + reg[off_reg]] = rs1. Mirror of the
-   // load form; captures rs1 into mem_write_data in cycle 0 (before the port
-   // redirect). byte_en=0xFF (full doubleword; Tier-3a convention).
-   function automatic cpu_state_t f_st_idxreg(cpu_state_t s, logic mem_ready,
-         logic [31:0] portb, logic [63:0] porta, logic [3:0] off_reg, logic [31:0] pc_next);
-      cpu_state_t n;
-      n = s;
-      n.rx_fifo_read = 1'b0;
-      if (s.extra_clock == 0) begin
-         n.idx_base_addr  = portb;
-         n.mem_write_data = porta;
-         n.mem_byte_en    = 8'hFF;
-         n.reg_2          = off_reg;
-         n.extra_clock    = 2'd1;
-      end else if (s.extra_clock == 1) begin
-         n.extra_clock = 2'd2;
-      end else begin
-         if (!s.mem_write_DV) begin
-            n.mem_addr     = s.idx_base_addr + portb;
-            n.mem_write_DV = 1'b1;
-         end else if (mem_ready) begin
-            n.SM           = OPCODE_REQUEST;
-            n.mem_write_DV = 1'b0;
-            n.PC           = pc_next;
-         end
-      end
-      return n;
-   endfunction
+   // (f_ld_idxreg / f_st_idxreg retired with ISA v2: the reg+reg indexed forms
+   // carry the offset register in rs2, which is already on read port B, so
+   // LDIDX64R/STIDX64R dispatch through f_ld_idx/f_st_idx with eaddr=rs1+rs2 —
+   // no port-redirect dance, 1 word, standard 2-cycle DDR2 handshake.)
 
    // ------------------------------------------------------------------------
    // Tier 3d — single-cycle stragglers + non-branch control. Fills the gaps
@@ -878,7 +754,8 @@ package klauss_pkg;
 
    // f_bdep — BDEP: deposit len bits of src at start into base. 32-bit low half
    // only; result zero-extended above bit 31 (matches t_deposit_bits widths).
-   function automatic cpu_state_t f_bdep(cpu_state_t s, logic [63:0] base_rs2, logic [63:0] src_rs1,
+   // v2 operand order: base = rs1 (port A), src = rs2 (port B).
+   function automatic cpu_state_t f_bdep(cpu_state_t s, logic [63:0] base, logic [63:0] src,
                                          logic [31:0] params, logic [3:0] rd, logic [31:0] pc_next);
       cpu_state_t n;
       logic [4:0]  start_pos;
@@ -890,8 +767,8 @@ package klauss_pkg;
       start_pos  = params[4:0];
       length     = params[12:8];
       mask       = (32'hFFFFFFFF >> (32 - length)) << start_pos;
-      insert_val = (src_rs1 << start_pos) & mask;
-      n.wb.value   = (base_rs2 & ~mask) | insert_val;
+      insert_val = (src << start_pos) & mask;
+      n.wb.value   = (base & ~mask) | insert_val;
       n.wb.rd      = rd;
       n.SM         = OPCODE_REQUEST;
       n.wb.pending = 1'b1;
@@ -1117,17 +994,18 @@ package klauss_pkg;
    // f_memget32 — MEMGET32: unaligned 32-bit load. offset<=4 -> one dword;
    // offset 5-7 same cache line -> cache lookahead (rdata_next/next_valid);
    // else cross-line span -> second read (dw0 stashed in wb.value between reads).
+   // `addr` = the base register value (v2: rs1 / port A); `rd` = destination.
    function automatic cpu_state_t f_memget32(cpu_state_t s, logic mem_ready, logic [63:0] rdata,
-         logic [63:0] rdata_next, logic next_valid, logic [31:0] portb);
+         logic [63:0] rdata_next, logic next_valid, logic [31:0] addr, logic [3:0] rd);
       cpu_state_t n;
       logic [2:0]  offset;
       logic [31:0] result;
       n = s;
       n.rx_fifo_read = 1'b0;
-      offset = portb[2:0];
+      offset = addr[2:0];
       result = 32'b0;
       if (s.extra_clock == 2'd0) begin
-         n.mem_addr    = portb;
+         n.mem_addr    = addr;
          n.mem_read_DV = 1'b1;
          n.extra_clock = 2'd1;
       end else if (s.extra_clock == 2'd1) begin
@@ -1143,7 +1021,7 @@ package klauss_pkg;
                   default: result = 32'b0;
                endcase
                n.wb.value = {32'b0, result};
-               n.wb.rd    = s.reg_1;
+               n.wb.rd    = rd;
                n.SM       = WRITEBACK;
                n.PC       = s.PC + 4;
             end else if (next_valid) begin
@@ -1155,13 +1033,13 @@ package klauss_pkg;
                   default: result = 32'b0;
                endcase
                n.wb.value = {32'b0, result};
-               n.wb.rd    = s.reg_1;
+               n.wb.rd    = rd;
                n.SM       = WRITEBACK;
                n.PC       = s.PC + 4;
             end else begin
                // Cross-cache-line span: stash dw0, issue second read at next dw.
                n.wb.value    = rdata;
-               n.mem_addr    = {portb[31:3], 3'b000} + 32'd8;
+               n.mem_addr    = {addr[31:3], 3'b000} + 32'd8;
                n.mem_read_DV = 1'b1;
                n.extra_clock = 2'd2;
             end
@@ -1179,7 +1057,7 @@ package klauss_pkg;
                default: result = 32'b0;
             endcase
             n.wb.value = {32'b0, result};
-            n.wb.rd    = s.reg_1;
+            n.wb.rd    = rd;
             n.SM       = WRITEBACK;
             n.PC       = s.PC + 4;
          end
