@@ -499,6 +499,7 @@ module KlaussCPU (
    wire        w_ps_ok = (!r_ir_valid && w_ifb_fpc_hit);
    wire [3:0]  w_ps_r1 = r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
    wire [3:0]  w_ps_r2 = r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
+   wire [3:0]  w_ps_rd = r_FPC[2] ? w_ifb_fpc_data[43:40] : w_ifb_fpc_data[11:8];
    wire w_ifb_fpcv1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
    wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
@@ -1243,6 +1244,62 @@ rams_sp_nc rams_sp_nc1 (
    end
    
    assign w_opcode = r_opcode_mem;
+
+   // ── ISA v2 field decode (see ISA_ENCODING_V2_MAP.md) ────────────────────
+   // Every property the dispatch needs is a fixed-position field read; the
+   // casez below enumerates only "which operation within a class".
+   wire [1:0]  w_len     = w_opcode[31:30];               // 01=1w 10=2w 11=3w, 00=illegal
+   wire [3:0]  w_class   = w_opcode[29:26];
+   wire [31:0] w_pc_next = st.PC + {26'b0, w_len, 2'b00}; // +4 / +8 / +12 from LEN
+   // classes 1/2 (ALU) + shared minor-opcode field [25:22]
+   wire [3:0]  w_aluop   = w_opcode[25:22];
+   wire        w_fbit    = w_opcode[21];                  // F: set flags
+   wire        w_sgnbit  = w_opcode[20];                  // SGN: imm32 sign- vs zero-extend
+   wire [63:0] w_imm_ext = w_sgnbit ? {{32{w_var1[31]}}, w_var1} : {32'b0, w_var1};
+   // class 3 (compare)
+   wire [2:0]  w_cpred   = w_opcode[25:23];
+   wire        w_cinv    = w_opcode[22];
+   wire        w_cbool   = w_opcode[21];
+   // class 4 (shift/rotate/bit)
+   wire        w_shsrc   = w_opcode[21];                  // 1 = embedded count N
+   wire [5:0]  w_shn     = w_opcode[20:15];
+   wire        w_shf     = w_opcode[14];                  // F: set Z
+   wire [5:0]  w_shcnt   = w_shsrc ? w_shn : r_reg_port_b[5:0];
+   // class 5 (unary)
+   wire [1:0]  w_unsz    = w_opcode[21:20];               // SEXT/ZEXT size
+   wire        w_unf     = w_opcode[19];                  // F: set Z
+   wire [63:0] w_sext_val = (w_unsz == 2'd0) ? {{56{r_reg_port_a[7]}},  r_reg_port_a[7:0]}  :
+                            (w_unsz == 2'd1) ? {{48{r_reg_port_a[15]}}, r_reg_port_a[15:0]} :
+                                               {{32{r_reg_port_a[31]}}, r_reg_port_a[31:0]};
+   wire [63:0] w_zext_val = (w_unsz == 2'd0) ? {56'b0, r_reg_port_a[7:0]}  :
+                            (w_unsz == 2'd1) ? {48'b0, r_reg_port_a[15:0]} :
+                                               {32'b0, r_reg_port_a[31:0]};
+   // classes 6/7 (load/store)
+   wire [1:0]  w_msz     = w_opcode[25:24];               // 00=8 01=16 10=32 11=64
+   wire        w_msgn    = w_opcode[23];
+   wire [1:0]  w_mmode   = w_opcode[22:21];               // 00=[rs1] 01=rs1+imm 10=[imm] 11=rs1+rs2
+   wire        w_malign  = w_opcode[20];
+   wire [31:0] w_eaddr   = (w_mmode == 2'b00) ? r_reg_port_a[31:0] :
+                           (w_mmode == 2'b01) ? r_reg_port_a[31:0] + w_var1 :
+                           (w_mmode == 2'b10) ? w_var1 :
+                                                r_reg_port_a[31:0] + r_reg_port_b[31:0];
+   // class 8 (branch)
+   wire        w_blink   = w_opcode[25];
+   wire        w_brel    = w_opcode[24];
+   wire        w_brind   = w_opcode[23];
+   wire [3:0]  w_bcond   = w_opcode[22:19];
+   wire        w_binv    = w_opcode[18];
+   wire [1:0]  w_bcvt    = f_cond_eval(st.flags, w_bcond, w_binv);  // {valid, taken}
+   // class A (mul/div)
+   wire [1:0]  w_mdop    = w_opcode[25:24];               // 0=MUL 1=DIV 2=MOD
+   wire        w_mdsgn   = w_opcode[23];
+   wire        w_mdhigh  = w_opcode[22];
+   wire [63:0] w_imm_ext_md = w_mdsgn ? {{32{w_var1[31]}}, w_var1} : {32'b0, w_var1};
+
+// Reserved attribute combinations and non-zero reserved fields trap here, the
+// same ERR_INV_OPCODE path as the casez default — the encoding space stays
+// loudly reclaimable.
+`define OPC_TRAP begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
    assign w_var1   = r_var1_mem;
    assign w_var2   = r_var2_mem;
    
@@ -1832,19 +1889,13 @@ rams_sp_nc rams_sp_nc1 (
                   r_ir_valid       <= 1'b0;   // discard the speculative fall-through
                   r_ir_presettled  <= 1'b0;   // (IRQ redirect; precise interrupts preserved)
                   // stay in OPCODE_REQUEST until push completes
-               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC
-                            && r_ir_opcode[29:26] != 4'h7) begin
+               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC) begin
                   // Fast-path dispatch: the prefetched IR was pre-settled into
-                  // st.reg_1/2 during the previous instruction's execute tail, so the
-                  // reg-file read ports are already valid — skip the OPCODE_FETCH2
+                  // st.reg_1/2/dst during the previous instruction's execute tail,
+                  // so all three reg-file read ports (incl. port C, the v2 store
+                  // data source) are already valid — skip the OPCODE_FETCH2
                   // settle bubble and go straight to EXECUTE (saves 1 cyc/instr).
                   // Ordered AFTER w_irq_ready so a pending interrupt always wins.
-                  // ISA v2: class-7 stores are excluded — their DATA comes from the
-                  // rd field via r_reg_port_c, and only reg_1/reg_2 are pre-settled
-                  // in the execute tail; st.reg_dst is latched HERE, so port C would
-                  // still hold the previous instruction's rd register in EXECUTE.
-                  // Stores take the FETCH2 path instead (port C settles there).
-                  // TODO(simplification pass): pre-settle reg_dst too and lift this.
                   r_opcode_mem      <= r_ir_opcode;
                   st.reg_dst         <= r_ir_reg_dst;
                   r_var1_mem        <= r_ir_var1;
@@ -2077,242 +2128,271 @@ rams_sp_nc rams_sp_nc1 (
                // cache. Module-scope reg — not clobbered by the arms' whole-struct `st <=`.
                r_branch_src_pc <= st.PC;
                casez (w_opcode[31:0])
-                  // ISA encoding v2 (see ISA_ENCODING_V2_MAP.md): LEN[31:30],
-                  // CLASS[29:26], attributes/OP [25:16], rd[11:8], rs1[7:4],
-                  // rs2[3:0]. This is the flag-day renumbering checkpoint:
-                  // one arm per instruction, same next-state functions, same
-                  // semantics as v1 — only the numbers and operand fields moved.
-                  // Unused register fields must be 0 (patterns match strictly).
-                  //
-                  // Class 1 ALU reg-reg: rd = rs1 OP rs2, PC+4.
-                  32'h4420_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, st.PC + 4);  // ADDR
-                  32'h4460_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, st.PC + 4);  // SUBR
-                  32'h4500_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR
-                  32'h4540_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR
-                  32'h4580_0???: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR
-                  32'h44A0_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, st.PC + 4);  // ADDC
-                  32'h44E0_0???: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, st.PC + 4);  // SUBC
-                  // Class 3 flag-setting compare (B=0): E/L/U flags, no rd write.
-                  32'h4C00_00??: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, st.PC + 4);  // CMPRR (flags only)
-                  // Class 2 ALU immediate: rd = rs1 OP ext(imm32), PC+8. The v1
-                  // in-place forms (ADDV/ANDV/...) are these encodings with rd==rs1.
-                  32'h8830_0??0: st <= f_alu(st, r_reg_port_a, {{32{w_var1[31]}}, w_var1}, ALU_ADD, st.reg_dst, st.PC + 8);  // ADDI (sign-ext)
-                  32'h8820_0??0: st <= f_alu(st, r_reg_port_a, {32'b0, w_var1}, ALU_ADD, st.reg_dst, st.PC + 8);             // ADDV (zero-ext)
-                  32'h8860_0??0: st <= f_alu(st, r_reg_port_a, {32'b0, w_var1}, ALU_SUB, st.reg_dst, st.PC + 8);             // MINUSV (zero-ext)
-                  32'h8C10_00?0: st <= f_alu(st, r_reg_port_a, {{32{w_var1[31]}}, w_var1}, ALU_CMP, st.reg_dst, st.PC + 8);  // CMPRV (sign-ext, flags only)
-                  32'h8900_0??0: begin st <= f_ps(f_alu(st, r_reg_port_a, {32'b0, w_var1}, ALU_AND, st.reg_dst, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV
-                  32'h8940_0??0: begin st <= f_ps(f_alu(st, r_reg_port_a, {32'b0, w_var1}, ALU_OR,  st.reg_dst, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV
-                  32'h8980_0??0: begin st <= f_ps(f_alu(st, r_reg_port_a, {32'b0, w_var1}, ALU_XOR, st.reg_dst, st.PC + 8), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV
-                  // Class 5 INC/DEC: rd = rs1 +/- 1, PC+4.
-                  32'h5788_0??0: st <= f_alu(st, r_reg_port_a, 64'd1, ALU_ADD, st.reg_dst, st.PC + 4);  // INCR
-                  32'h57C8_0??0: st <= f_alu(st, r_reg_port_a, 64'd1, ALU_SUB, st.reg_dst, st.PC + 4);  // DECR
-                  // Class 3 boolean compares (B=1, PRED+INV -> rd=0/1) via f_cmpr.
-                  32'h4C20_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_EQ);   // CMPEQR
-                  32'h4C60_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_NE);   // CMPNER
-                  32'h4CA0_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LT);   // CMPLTR
-                  32'h4D20_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_LE);   // CMPLER
-                  32'h4D60_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GT);   // CMPGTR (LE+INV)
-                  32'h4CE0_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_GE);   // CMPGER (LT+INV)
-                  32'h4DA0_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULT);  // CMPULTR
-                  32'h4E20_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_ULE);  // CMPULER
-                  32'h4E60_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGT);  // CMPUGTR (ULE+INV)
-                  32'h4DE0_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_UGE);  // CMPUGER (ULT+INV)
-                  // Class 1 min/max select.
-                  32'h45C0_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MIN);  // MINR
-                  32'h4600_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX);  // MAXR
-                  32'h4640_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU); // MINUR
-                  32'h4680_0???: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU); // MAXUR
-                  // Class 5 unary (rd = OP(rs1)) + class 2 MOV/LEA, via f_wb.
-                  32'h5400_0??0: st <= f_wb(st, r_reg_port_a, st.reg_dst, 1'b0, st.PC + 4);                              // COPY
-                  32'h8BD0_0?00: st <= f_wb(st, {{32{w_var1[31]}}, w_var1}, st.reg_dst, 1'b0, st.PC + 8);                // SETR (MOV, sign-ext)
-                  32'h5700_0?00: st <= f_wb(st, {st.flags.zero, st.flags.equal, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_dst, 1'b0, st.PC + 4);  // SETFR (GETF slot, v1 semantics)
-                  32'h5448_0??0: st <= f_wb(st, ~r_reg_port_a + 64'd1, st.reg_dst, 1'b1, st.PC + 4);                     // NEGR
-                  // Class 4 shift-by-1 (SRC=1, N=1, F=0). SHLAR is the same encoding as SHLR1.
-                  32'b01_0100_0000_1_000001_0_00_????_????_0000: st <= f_wb(st, r_reg_port_a << 1, st.reg_dst, 1'b0, st.PC + 4);            // SHLR1 / SHLAR
-                  32'b01_0100_0001_1_000001_0_00_????_????_0000: st <= f_wb(st, r_reg_port_a >> 1, st.reg_dst, 1'b0, st.PC + 4);            // SHRR1
-                  32'b01_0100_0010_1_000001_0_00_????_????_0000: st <= f_wb(st, $signed(r_reg_port_a) >>> 1, st.reg_dst, 1'b0, st.PC + 4);  // SHRAR
-                  32'h5488_0??0: st <= f_wb(st, ~r_reg_port_a, st.reg_dst, 1'b1, st.PC + 4);                             // NOTR
-                  32'h8B80_0?00: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_dst, 1'b0, st.PC + 8);                   // LEAPC
-                  32'h5520_0??0: st <= f_wb(st, {{32{r_reg_port_a[31]}}, r_reg_port_a[31:0]}, st.reg_dst, 1'b0, st.PC + 4); // SEXTW
-                  32'h5560_0??0: st <= f_wb(st, {32'b0, r_reg_port_a[31:0]}, st.reg_dst, 1'b0, st.PC + 4);               // ZEXTW
-                  // Class 4 bit set/clear/toggle/test. SRC=0: position in rs2[5:0];
-                  // SRC=1: position embedded at [20:15] — now 1 word (v1 was 2).
-                  32'h5200_0???: st <= f_wb(st, r_reg_port_a |  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BSETRR
-                  32'h5240_0???: st <= f_wb(st, r_reg_port_a & ~(64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BCLRRR
-                  32'h5280_0???: st <= f_wb(st, r_reg_port_a ^  (64'b1 << r_reg_port_b[5:0]), st.reg_dst, 1'b0, st.PC + 4); // BTGLRR
-                  32'h52C0_0???: st <= f_wb(st, {63'b0, r_reg_port_a[r_reg_port_b[5:0]]}, st.reg_dst, 1'b0, st.PC + 4);     // BTSTRR (rd=bit)
-                  32'b01_0100_1000_1_??????_0_00_????_????_0000: st <= f_wb(st, r_reg_port_a |  (64'b1 << w_opcode[20:15]), st.reg_dst, 1'b0, st.PC + 4); // BSET #N
-                  32'b01_0100_1001_1_??????_0_00_????_????_0000: st <= f_wb(st, r_reg_port_a & ~(64'b1 << w_opcode[20:15]), st.reg_dst, 1'b0, st.PC + 4); // BCLR #N
-                  32'b01_0100_1010_1_??????_0_00_????_????_0000: st <= f_wb(st, r_reg_port_a ^  (64'b1 << w_opcode[20:15]), st.reg_dst, 1'b0, st.PC + 4); // BTGL #N
-                  32'b01_0100_1011_1_??????_0_00_0000_????_0000: st <= f_btst(st, r_reg_port_a, w_opcode[20:15], st.PC + 4);                              // BTST #N (flag-only)
-                  // Class 5 bit-count / reverse via f_wb (helper funcs).
-                  32'h5608_0??0: st <= f_wb(st, {57'b0, popcount(r_reg_port_a)},              st.reg_dst, 1'b1, st.PC + 4);    // POPCNT
-                  32'h5640_0??0: st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_a)},   st.reg_dst, 1'b0, st.PC + 4);    // CLZ
-                  32'h5680_0??0: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_a)},  st.reg_dst, 1'b0, st.PC + 4);    // CTZ
-                  32'h55C0_0??0: st <= f_wb(st, bit_reverse(r_reg_port_a),                    st.reg_dst, 1'b0, st.PC + 4);    // BITREV
-                  // Class 4 shift-by-N (SRC=1, F=1, N at [20:15]) — now 1 word.
-                  32'b01_0100_0000_1_??????_1_00_????_????_0000: begin st <= f_ps(f_wb(st, r_reg_port_a << w_opcode[20:15],           st.reg_dst, 1'b1, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHLV #N
-                  32'b01_0100_0001_1_??????_1_00_????_????_0000: begin st <= f_ps(f_wb(st, r_reg_port_a >> w_opcode[20:15],           st.reg_dst, 1'b1, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRV #N
-                  32'b01_0100_0010_1_??????_1_00_????_????_0000: begin st <= f_ps(f_wb(st, $signed(r_reg_port_a) >>> w_opcode[20:15], st.reg_dst, 1'b1, st.PC + 4), w_ps_ok, w_ps_r1, w_ps_r2); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // SHRAV #N
-                  // Class 4 rotates. N=1 exact arms (== v1 ROLR1/RORR1, set Z+C via
-                  // f_rot1) MUST precede the generic-N arms (Z only, as v1 ROLV/RORV).
-                  32'b01_0100_0011_1_000001_1_00_????_????_0000: st <= f_rot1(st, {r_reg_port_a[62:0], r_reg_port_a[63]}, r_reg_port_a[63], st.reg_dst, st.PC + 4); // ROLR1 / ROLV #1
-                  32'b01_0100_0100_1_000001_1_00_????_????_0000: st <= f_rot1(st, {r_reg_port_a[0], r_reg_port_a[63:1]}, r_reg_port_a[0],   st.reg_dst, st.PC + 4); // RORR1 / RORV #1
-                  32'b01_0100_0011_1_??????_1_00_????_????_0000: st <= f_wb(st, (r_reg_port_a << w_opcode[20:15]) | (r_reg_port_a >> (64 - w_opcode[20:15])), st.reg_dst, 1'b1, st.PC + 4); // ROLV #N
-                  32'b01_0100_0100_1_??????_1_00_????_????_0000: st <= f_wb(st, (r_reg_port_a >> w_opcode[20:15]) | (r_reg_port_a << (64 - w_opcode[20:15])), st.reg_dst, 1'b1, st.PC + 4); // RORV #N
-                  32'h50C0_4???: st <= f_wb(st, (r_reg_port_a << r_reg_port_b[5:0]) | (r_reg_port_a >> (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // ROLR
-                  32'h5100_4???: st <= f_wb(st, (r_reg_port_a >> r_reg_port_b[5:0]) | (r_reg_port_a << (64 - r_reg_port_b[5:0])), st.reg_dst, 1'b1, st.PC + 4); // RORR
-                  // Class 4 rotate-through-carry (RCL/RCR, N=1) via f_rot1.
-                  32'b01_0100_0101_1_000001_1_00_????_????_0000: st <= f_rot1(st, {r_reg_port_a[62:0], st.flags.carry}, r_reg_port_a[63], st.reg_dst, st.PC + 4); // ROLCR
-                  32'b01_0100_0110_1_000001_1_00_????_????_0000: st <= f_rot1(st, {st.flags.carry, r_reg_port_a[63:1]}, r_reg_port_a[0],  st.reg_dst, st.PC + 4); // RORCR
-                  // Class A — multiply pipeline seed (f_mul_setup).
-                  32'h6880_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b0, 1'b0); // MULR
-                  32'h6800_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b0, 1'b1, 1'b0); // MULUR
-                  32'h68C0_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b0, 1'b0); // MULHR
-                  32'h6840_0???: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, 1'b1, 1'b1, 1'b0); // MULHUR
-                  32'hA880_0??0: st <= f_mul_setup(st, r_reg_port_a, {{32{w_var1[31]}}, w_var1}, st.reg_dst, 1'b0, 1'b0, 1'b1); // MULV
-                  // Class A — divide pipeline seed (f_div_setup; centralised /0 guard).
-                  32'h6980_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b0, 1'b0, st.reg_dst); // DIVR
-                  32'h6900_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b0, 1'b0, st.reg_dst); // DIVUR
-                  32'h6A80_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b1, 1'b1, 1'b0, st.reg_dst); // MODR
-                  32'h6A00_0???: st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, 1'b0, 1'b1, 1'b0, st.reg_dst); // MODUR
-                  32'hA980_0??0: st <= f_div_setup(st, r_reg_port_a, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b0, 1'b1, st.reg_dst); // DIVV
-                  32'hAA80_0??0: st <= f_div_setup(st, r_reg_port_a, {{32{w_var1[31]}}, w_var1}, 1'b1, 1'b1, 1'b1, st.reg_dst); // MODV
-                  // Class 9 SP set + class B delay.
-                  32'h6500_00?0: st <= f_sp_set(st, r_reg_port_a[31:0],          st.PC + 4);  // SETSP
-                  32'hA540_0000: st <= f_sp_set(st, st.SP + $signed(w_var1),     st.PC + 8);  // ADDSP
-                  32'h6C05_00?0: st <= f_delay (st, r_reg_port_a[31:0],          st.PC + 4);  // DELAYR
-                  32'hAC05_0000: st <= f_delay (st, w_var1,                      st.PC + 8);  // DELAYV
-                  // Class 9 stack push + class 8 indirect call (f_push).
-                  32'h6400_00?0: st <= f_push(st, r_reg_port_a,                 st.PC + 4,           w_mem_ready); // PUSH
-                  32'hA440_0000: st <= f_push(st, {32'b0, w_var1},             st.PC + 8,           w_mem_ready); // PUSHV
-                  32'h6280_000?: st <= f_push(st, {32'b0, st.PC + 32'd4},      r_reg_port_b[31:0],  w_mem_ready); // CALLR (target=rs2)
-                  // Class 7 stores, MODE 00/10: EA = rs1 (port A) or imm32; DATA =
-                  // rd field via the new port C (f_mem_store; explicit byte_en).
-                  32'h5F00_0??0: st <= f_mem_store(st, w_mem_ready, r_reg_port_a[31:0],           r_reg_port_c,                          8'hFF, st.PC + 4); // MEMSET64RR (raw)
-                  32'h9F40_0?00: st <= f_mem_store(st, w_mem_ready, w_var1[31:0],                 r_reg_port_c,                          8'hFF, st.PC + 8); // MEMSETR (abs imm32)
-                  32'h5C00_0??0: st <= f_mem_store(st, w_mem_ready, r_reg_port_a[31:0],           {8{r_reg_port_c[7:0]}},                8'b0000_0001 << r_reg_port_a[2:0], st.PC + 4); // MEMSET8
-                  32'h5D00_0??0: st <= f_mem_store(st, w_mem_ready, {r_reg_port_a[31:1], 1'b0},   {4{r_reg_port_c[15:0]}},               8'b0000_0011 << {r_reg_port_a[2:1], 1'b0}, st.PC + 4); // MEMSET16
-                  32'h5E00_0??0: st <= f_mem_store(st, w_mem_ready, {r_reg_port_a[31:2], 2'b00},  {r_reg_port_c[31:0], r_reg_port_c[31:0]}, r_reg_port_a[2] ? 8'b1111_0000 : 8'b0000_1111, st.PC + 4); // MEMSET32
-                  32'h5F10_0??0: st <= f_mem_store(st, w_mem_ready, {r_reg_port_a[31:3], 3'b000}, r_reg_port_c,                          8'hFF, st.PC + 4); // MEMSET64 (aligned)
-                  // Class 6 loads, MODE 00/10 -> WRITEBACK (f_mem_load; arm pre-extracts the value).
-                  32'h5B00_0??0: st <= f_mem_load(st, w_mem_ready, r_reg_port_a[31:0],          w_mem_read_data,                                              st.reg_dst, st.PC + 4); // MEMREADRR (raw)
-                  32'h9B40_0?00: st <= f_mem_load(st, w_mem_ready, w_var1[31:0],                w_mem_read_data,                                              st.reg_dst, st.PC + 8); // MEMREADR (abs imm32)
-                  32'h5800_0??0: st <= f_mem_load(st, w_mem_ready, r_reg_port_a[31:0],          {56'b0, w_mem_read_data[(r_reg_port_a[2:0] * 8) +: 8]},        st.reg_dst, st.PC + 4); // MEMGET8
-                  32'h5900_0??0: st <= f_mem_load(st, w_mem_ready, {r_reg_port_a[31:1], 1'b0},  {48'b0, w_mem_read_data[(r_reg_port_a[2:1] * 16) +: 16]},      st.reg_dst, st.PC + 4); // MEMGET16
-                  32'h5B10_0??0: st <= f_mem_load(st, w_mem_ready, {r_reg_port_a[31:3], 3'b000}, w_mem_read_data,                                             st.reg_dst, st.PC + 4); // MEMGET64 (aligned)
+                  // ═══ ISA v2 field-driven dispatch ════════════════════════
+                  // One casez arm per (CLASS, LEN); the attribute fields select
+                  // the operation and parameterize the shared next-state
+                  // functions (see ISA_ENCODING_V2_MAP.md). Reserved fields are
+                  // matched as 0 in the patterns; reserved attribute
+                  // combinations `OPC_TRAP via the inner defaults.
 
-                  // Class 6/7 MODE 01 indexed load/store: EA = rs1 + imm32 (PC += 8).
-                  32'h9B20_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b0, st.reg_dst, st.PC + 8); // LDIDX64 (raw addr)
-                  32'h9B30_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b1, st.reg_dst, st.PC + 8); // LDIDX64A (8-byte aligned)
-                  32'h9A20_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_32, 1'b0, 1'b0, st.reg_dst, st.PC + 8); // LDIDX32
-                  32'h9920_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b0, 1'b0, st.reg_dst, st.PC + 8); // LDIDX16
-                  32'h99A0_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_16, 1'b1, 1'b0, st.reg_dst, st.PC + 8); // LDIDX16_S
-                  32'h9820_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b0, 1'b0, st.reg_dst, st.PC + 8); // LDIDX8
-                  32'h98A0_0??0: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], w_mem_read_data, MSZ_8,  1'b1, 1'b0, st.reg_dst, st.PC + 8); // LDIDX8_S
-                  32'h9F20_0??0: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], r_reg_port_c, MSZ_64, 1'b0, st.PC + 8); // STIDX64 (raw addr, be=0xFF)
-                  32'h9F30_0??0: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], r_reg_port_c, MSZ_64, 1'b1, st.PC + 8); // STIDX64A (8-byte aligned)
-                  32'h9E20_0??0: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], r_reg_port_c, MSZ_32, 1'b0, st.PC + 8); // STIDX32
-                  32'h9D20_0??0: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], r_reg_port_c, MSZ_16, 1'b0, st.PC + 8); // STIDX16
-                  32'h9C20_0??0: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + w_var1[31:0], r_reg_port_c, MSZ_8,  1'b0, st.PC + 8); // STIDX8
-                  // Class 6/7 MODE 11 (EA = rs1 + rs2): the v2 encoding carries the
-                  // offset register in rs2 (already on port B), so these are now
-                  // 1-word and use the plain 2-cycle f_ld_idx/f_st_idx handshake
-                  // (the v1 3-stage port-redirect dance is gone).
-                  32'h5B60_0???: st <= f_ld_idx(st, w_mem_ready, r_reg_port_a[31:0] + r_reg_port_b[31:0], w_mem_read_data, MSZ_64, 1'b0, 1'b0, st.reg_dst, st.PC + 4); // LDIDX64R
-                  32'h5F60_0???: st <= f_st_idx(st, w_mem_ready, r_reg_port_a[31:0] + r_reg_port_b[31:0], r_reg_port_c, MSZ_64, 1'b0, st.PC + 4); // STIDX64R
+                  // ── Class 1 (LEN=01): ALU reg-reg — rd = rs1 OP rs2 ──
+                  32'b01_0001_????_?0_0000_0000_????_????_????:
+                     case ({w_aluop, w_fbit})
+                        {4'd0,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, w_pc_next);  // ADDR
+                        {4'd1,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, w_pc_next);  // SUBR
+                        {4'd2,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, w_pc_next);  // ADDC
+                        {4'd3,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, w_pc_next);  // SUBC
+                        {4'd4,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR
+                        {4'd5,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR
+                        {4'd6,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR
+                        {4'd7,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MIN,  w_pc_next);  // MINR
+                        {4'd8,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX,  w_pc_next);  // MAXR
+                        {4'd9,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU, w_pc_next);  // MINUR
+                        {4'd10, 1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU, w_pc_next);  // MAXUR
+                        default: `OPC_TRAP
+                     endcase
 
-                  // Class 4 shifts by register count (SRC=0, count = rs2[5:0]).
-                  32'h5000_4???: st <= f_wb(st, r_reg_port_a << r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHLR
-                  32'h5040_4???: st <= f_wb(st, r_reg_port_a >> r_reg_port_b[5:0],           st.reg_dst, 1'b1, st.PC + 4); // SHRR
-                  32'h5080_4???: st <= f_wb(st, $signed(r_reg_port_a) >>> r_reg_port_b[5:0], st.reg_dst, 1'b1, st.PC + 4); // SARR
-                  // Class 5 extends / bswap + class 9 GETSP.
-                  32'h5548_0??0: st <= f_wb(st, {56'b0, r_reg_port_a[7:0]},                  st.reg_dst, 1'b1, st.PC + 4); // ZEXTB
-                  32'h5558_0??0: st <= f_wb(st, {48'b0, r_reg_port_a[15:0]},                 st.reg_dst, 1'b1, st.PC + 4); // ZEXTH
-                  32'h5580_0??0: st <= f_wb(st, {r_reg_port_a[7:0], r_reg_port_a[15:8], r_reg_port_a[23:16], r_reg_port_a[31:24], r_reg_port_a[39:32], r_reg_port_a[47:40], r_reg_port_a[55:48], r_reg_port_a[63:56]}, st.reg_dst, 1'b0, st.PC + 4); // BSWAP
-                  32'h64C0_0?00: st <= f_wb(st, {32'b0, st.SP},                              st.reg_dst, 1'b0, st.PC + 4); // GETSP
-                  32'h5508_0??0: st <= f_wb_ns(st, {{56{r_reg_port_a[7]}},  r_reg_port_a[7:0]},  st.reg_dst, st.PC + 4); // SEXTB (sets sign)
-                  32'h5518_0??0: st <= f_wb_ns(st, {{48{r_reg_port_a[15]}}, r_reg_port_a[15:0]}, st.reg_dst, st.PC + 4); // SEXTH (sets sign)
-                  32'h54C8_0??0: st <= f_abs  (st, r_reg_port_a, st.reg_dst, st.PC + 4);                                  // ABSR (sets overflow)
-                  // Class 4 BEXTR/BDEP (LEN=10; start/len packed in imm32).
-                  32'h9300_0??0: st <= f_bextr(st, r_reg_port_a,               w_var1, st.reg_dst, st.PC + 8);            // BEXTR
-                  32'h9340_0???: st <= f_bdep (st, r_reg_port_a, r_reg_port_b, w_var1, st.reg_dst, st.PC + 8);            // BDEP (base=rs1, src=rs2)
-                  32'hCBC0_0?00: st <= f_setr64(st, w_mem_ready, w_mem_read_data, w_var1, st.reg_dst, st.PC + 12);        // SETR64 (MOV LEN=11, self-fetch hi32)
-                  // Class B system + class 9 RET/POP/IRET.
-                  32'h6C00_0000: st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 4); // NOP
-                  32'h6C02_0000: st <= f_ctrl(st, WAITING,        st.PC + 4); // WAIT
-                  32'h6C03_0000: st <= f_ctrl(st, OPCODE_REQUEST, 32'h4);     // RESET
-                  32'h6C01_0000: st <= f_ctrl(st, HALTED_BREAK,   st.PC);     // HALT
-                  32'h6C04_0000: st <= f_trap(st);                            // TRAP
-                  32'h6580_0000: st <= f_ret (st, w_mem_ready, w_mem_read_data);                  // RET
-                  32'h6480_0?00: st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_dst, st.PC + 4); // POP
-                  32'h65C0_0000: st <= f_iret(st, w_mem_ready, w_mem_read_data);                  // IRET
+                  // ── Class 2 (LEN=10): ALU immediate — rd = rs1 OP ext(imm32),
+                  // extension per SGN. v1 in-place forms are rd==rs1 encodings.
+                  32'b10_0010_????_??_0000_0000_????_????_0000:
+                     case ({w_aluop, w_fbit})
+                        {4'd0,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_ADD, st.reg_dst, w_pc_next);  // ADDI / ADDV
+                        {4'd1,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_SUB, st.reg_dst, w_pc_next);  // MINUSV (+sext form)
+                        {4'd2,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_ADC, st.reg_dst, w_pc_next);  // ADC-imm (new)
+                        {4'd3,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_SBC, st.reg_dst, w_pc_next);  // SBC-imm (new)
+                        {4'd4,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_AND, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV
+                        {4'd5,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_OR,  st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV
+                        {4'd6,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_XOR, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV
+                        {4'd14, 1'b0}: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_dst, 1'b0, w_pc_next);      // LEAPC (SGN dc: 32-bit add)
+                        {4'd15, 1'b0}: st <= f_wb(st, w_imm_ext, st.reg_dst, 1'b0, w_pc_next);                    // MOV: SETR (SGN=1) / zext-MOV (SGN=0)
+                        default: `OPC_TRAP
+                     endcase
 
-                  // Class 8 — branch family (cond jumps/calls, abs+rel). perf_br + not-taken
-                  // pre-settle driven from the arm (module-scope); JMPR folds into f_ctrl.
-                  // COND at [22:19], INV at [18], LINK [25], REL [24], RIND [23].
-                  32'h6080_000?: st <= f_ctrl(st, OPCODE_REQUEST, r_reg_port_b[31:0]); // JMPR (target=rs2)
-                  32'hA000_0000: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // JMP
-                  32'hA008_0000: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZ
-                  32'hA00C_0000: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZ
-                  32'hA048_0000: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPE
-                  32'hA04C_0000: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNE
-                  32'hA010_0000: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPC
-                  32'hA014_0000: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNC
-                  32'hA018_0000: begin st <= f_cond_jump(st, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.overflow; if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPO
-                  32'hA01C_0000: begin st <= f_cond_jump(st, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.overflow; if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNO
-                  32'hA020_0000: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPS
-                  32'hA024_0000: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNS
-                  32'hA028_0000: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLT
-                  32'hA030_0000: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLE
-                  32'hA034_0000: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGT
-                  32'hA02C_0000: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGE
-                  32'hA038_0000: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULT
-                  32'hA040_0000: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULE
-                  32'hA044_0000: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGT
-                  32'hA03C_0000: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGE
-                  32'hA100_0000: st <= f_cond_jump(st, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // JMPREL
-                  32'hA108_0000: begin st <= f_cond_jump(st, st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.zero; if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPZREL
-                  32'hA10C_0000: begin st <= f_cond_jump(st, !st.flags.zero, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.zero; if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNZREL
-                  32'hA148_0000: begin st <= f_cond_jump(st, st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.equal; if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPEREL
-                  32'hA14C_0000: begin st <= f_cond_jump(st, !st.flags.equal, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.equal; if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNEREL
-                  32'hA110_0000: begin st <= f_cond_jump(st, st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.carry; if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPCREL
-                  32'hA114_0000: begin st <= f_cond_jump(st, !st.flags.carry, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.carry; if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNCREL
-                  32'hA120_0000: begin st <= f_cond_jump(st, st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.sign; if (!(st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPSREL
-                  32'hA124_0000: begin st <= f_cond_jump(st, !st.flags.sign, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.sign; if (!(!st.flags.sign) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPNSREL
-                  32'hA128_0000: begin st <= f_cond_jump(st, st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.less; if (!(st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLTREL
-                  32'hA130_0000: begin st <= f_cond_jump(st, (st.flags.less | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.less | st.flags.equal); if (!((st.flags.less | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPLEREL
-                  32'hA134_0000: begin st <= f_cond_jump(st, (!st.flags.less & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.less & !st.flags.equal); if (!((!st.flags.less & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGTREL
-                  32'hA12C_0000: begin st <= f_cond_jump(st, !st.flags.less, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.less; if (!(!st.flags.less) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPGEREL
-                  32'hA138_0000: begin st <= f_cond_jump(st, st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= st.flags.ult; if (!(st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULTREL
-                  32'hA140_0000: begin st <= f_cond_jump(st, (st.flags.ult | st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (st.flags.ult | st.flags.equal); if (!((st.flags.ult | st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPULEREL
-                  32'hA144_0000: begin st <= f_cond_jump(st, (!st.flags.ult & !st.flags.equal), w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= (!st.flags.ult & !st.flags.equal); if (!((!st.flags.ult & !st.flags.equal)) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGTREL
-                  32'hA13C_0000: begin st <= f_cond_jump(st, !st.flags.ult, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); r_perf_br_valid <= 1'b1; r_perf_br_taken <= !st.flags.ult; if (!(!st.flags.ult) && w_ps_ok) r_ir_presettled <= 1'b1; end // JMPUGEREL
-                  32'hA200_0000: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); // CALL
-                  32'hA208_0000: begin st <= f_cond_call(st, w_mem_ready, st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLZ
-                  32'hA20C_0000: begin st <= f_cond_call(st, w_mem_ready, !st.flags.zero, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.zero) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNZ
-                  32'hA248_0000: begin st <= f_cond_call(st, w_mem_ready, st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLE
-                  32'hA24C_0000: begin st <= f_cond_call(st, w_mem_ready, !st.flags.equal, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.equal) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNE
-                  32'hA210_0000: begin st <= f_cond_call(st, w_mem_ready, st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLC
-                  32'hA214_0000: begin st <= f_cond_call(st, w_mem_ready, !st.flags.carry, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.carry) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNC
-                  32'hA218_0000: begin st <= f_cond_call(st, w_mem_ready, st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLO
-                  32'hA21C_0000: begin st <= f_cond_call(st, w_mem_ready, !st.flags.overflow, w_var1[31:0], 1'b0, w_ps_ok, w_ps_r1, w_ps_r2); if (!(!st.flags.overflow) && w_ps_ok) r_ir_presettled <= 1'b1; end // CALLNO
-                  32'hA300_0000: st <= f_cond_call(st, w_mem_ready, 1'b1, w_var1[31:0], 1'b1, w_ps_ok, w_ps_r1, w_ps_r2); // CALLREL
+                  // ── Class 2 (LEN=11): MOV imm64 — SETR64, hi32 self-fetched at PC+8.
+                  32'b11_0010_1111_00_0000_0000_????_0000_0000:
+                     st <= f_setr64(st, w_mem_ready, w_mem_read_data, w_var1, st.reg_dst, w_pc_next);  // SETR64
 
-                  // The two bespoke multi-cycle opcodes (class 9 / class 6).
-                  32'hE440_0000: st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]); // PUSHV64 (self-fetch hi32)
-                  32'h5A00_0??0: st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_a[31:0], st.reg_dst); // MEMGET32
+                  // ── Class 3: compare. B=0 flag-setting CMP (E/L/U); B=1
+                  // boolean rd=0/1 via (PRED, INV) -> f_cmp_op.
+                  32'b01_0011_????_?0_0000_0000_????_????_????:
+                     if (w_cbool) begin
+                        if (w_cpred <= 3'd4) st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, f_cmp_op(w_cpred, w_cinv), w_pc_next);  // CMPccR
+                        else `OPC_TRAP
+                     end else if (w_cpred == 3'd0 && !w_cinv && w_opcode[11:8] == 4'h0)
+                        st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, w_pc_next);  // CMPRR (flags only)
+                     else `OPC_TRAP
+                  32'b10_0011_????_??_0000_0000_????_????_0000:
+                     if (w_cbool) begin
+                        if (w_cpred <= 3'd4) st <= f_cmpr(st, r_reg_port_a, w_imm_ext, f_cmp_op(w_cpred, w_cinv), w_pc_next);  // CMPcc-imm (new)
+                        else `OPC_TRAP
+                     end else if (w_cpred == 3'd0 && !w_cinv && w_opcode[11:8] == 4'h0)
+                        st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_CMP, st.reg_dst, w_pc_next);  // CMPRV
+                     else `OPC_TRAP
 
-                  // Class C — LCD SPI-DC writes; f_lcd = st part, arm drives the o_*LCD* ports.
-                  32'h7000_00?0: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDR
-                  32'h7100_00?0: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 4); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
-                  32'hB000_0000: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
-                  32'hB100_0000: begin st <= f_lcd(st, i_TX_LCD_Ready, st.PC + 8); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0];      o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
-                  32'hB200_0000: begin st <= f_ctrl(st, OPCODE_REQUEST, st.PC + 8); o_LCD_reset_n <= w_var1[0]; end // LCDRST
-                  default: begin  // invalid opcode -> crash-dump (was t_opcode_select's default)
-                     st.SM         <= HCF_1;
-                     st.error_code <= ERR_INV_OPCODE;
-                  end
+                  // ── Class 5 (LEN=01): unary — rd = OP(rs1); F -> Z where the
+                  // datapath parameterizes it (set_zero), canonical elsewhere.
+                  32'b01_0101_????_??_?_000_0000_????_????_0000:
+                     if (w_aluop != 4'd4 && w_aluop != 4'd5 && w_unsz != 2'd0) `OPC_TRAP
+                     else case (w_aluop)
+                        4'd0:  st <= f_wb(st, r_reg_port_a,             st.reg_dst, w_unf, w_pc_next);  // COPY
+                        4'd1:  st <= f_wb(st, ~r_reg_port_a + 64'd1,    st.reg_dst, w_unf, w_pc_next);  // NEG
+                        4'd2:  st <= f_wb(st, ~r_reg_port_a,            st.reg_dst, w_unf, w_pc_next);  // NOT
+                        4'd3:  if (w_unf) st <= f_abs(st, r_reg_port_a, st.reg_dst, w_pc_next); else `OPC_TRAP  // ABS (Z+V)
+                        4'd4:  if (w_unsz == 2'd3) `OPC_TRAP
+                               else if (w_unf) st <= f_wb_ns(st, w_sext_val, st.reg_dst, w_pc_next);    // SEXTB/H (+W new) — Z+S
+                               else st <= f_wb(st, w_sext_val, st.reg_dst, 1'b0, w_pc_next);            // SEXTW (flag-neutral)
+                        4'd5:  if (w_unsz == 2'd3) `OPC_TRAP
+                               else st <= f_wb(st, w_zext_val, st.reg_dst, w_unf, w_pc_next);           // ZEXTB/H/W
+                        4'd6:  st <= f_wb(st, {r_reg_port_a[7:0], r_reg_port_a[15:8], r_reg_port_a[23:16], r_reg_port_a[31:24], r_reg_port_a[39:32], r_reg_port_a[47:40], r_reg_port_a[55:48], r_reg_port_a[63:56]}, st.reg_dst, w_unf, w_pc_next);  // BSWAP
+                        4'd7:  st <= f_wb(st, bit_reverse(r_reg_port_a),                   st.reg_dst, w_unf, w_pc_next);  // BITREV
+                        4'd8:  st <= f_wb(st, {57'b0, popcount(r_reg_port_a)},             st.reg_dst, w_unf, w_pc_next);  // POPCNT
+                        4'd9:  st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_a)},  st.reg_dst, w_unf, w_pc_next);  // CLZ
+                        4'd10: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_a)}, st.reg_dst, w_unf, w_pc_next);  // CTZ
+                        4'd12: st <= f_wb(st, {st.flags.zero, st.flags.equal, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_dst, w_unf, w_pc_next);  // SETFR/GETF (v1 semantics)
+                        4'd14: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_ADD, st.reg_dst, w_pc_next); else `OPC_TRAP  // INC
+                        4'd15: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_SUB, st.reg_dst, w_pc_next); else `OPC_TRAP  // DEC
+                        default: `OPC_TRAP
+                     endcase
+                  // ── Class 4 (LEN=01): shift / rotate / bit. Count/position =
+                  // SRC ? N[20:15] : rs2[5:0] (one mux); F -> Z via set_zero.
+                  // ROL/ROR with SRC=1, N=1, F=1 keep the v1 rotate-by-1
+                  // carry-out semantics (f_rot1); RCL/RCR exist only in that
+                  // shape. SRC=0 requires N=0.
+                  32'b01_0100_????_?_??????_?_00_????_????_????:
+                     if (!w_shsrc && w_shn != 6'd0) `OPC_TRAP
+                     else case (w_aluop)
+                        4'd0: begin st <= f_ps(f_wb(st, r_reg_port_a << w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SHL (SHLR/SHLV/SHLR1)
+                        4'd1: begin st <= f_ps(f_wb(st, r_reg_port_a >> w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SHR
+                        4'd2: begin st <= f_ps(f_wb(st, $signed(r_reg_port_a) >>> w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SAR
+                        4'd3: if (w_shsrc && w_shn == 6'd1 && w_shf)
+                                 st <= f_rot1(st, {r_reg_port_a[62:0], r_reg_port_a[63]}, r_reg_port_a[63], st.reg_dst, w_pc_next);  // ROLR1 / ROLV #1 (Z+C)
+                              else
+                                 st <= f_wb(st, (r_reg_port_a << w_shcnt) | (r_reg_port_a >> (64 - w_shcnt)), st.reg_dst, w_shf, w_pc_next);  // ROLR / ROLV #N
+                        4'd4: if (w_shsrc && w_shn == 6'd1 && w_shf)
+                                 st <= f_rot1(st, {r_reg_port_a[0], r_reg_port_a[63:1]}, r_reg_port_a[0], st.reg_dst, w_pc_next);    // RORR1 / RORV #1 (Z+C)
+                              else
+                                 st <= f_wb(st, (r_reg_port_a >> w_shcnt) | (r_reg_port_a << (64 - w_shcnt)), st.reg_dst, w_shf, w_pc_next);  // RORR / RORV #N
+                        4'd5: if (w_shsrc && w_shn == 6'd1 && w_shf)
+                                 st <= f_rot1(st, {r_reg_port_a[62:0], st.flags.carry}, r_reg_port_a[63], st.reg_dst, w_pc_next);    // ROLCR (RCL #1)
+                              else `OPC_TRAP
+                        4'd6: if (w_shsrc && w_shn == 6'd1 && w_shf)
+                                 st <= f_rot1(st, {st.flags.carry, r_reg_port_a[63:1]}, r_reg_port_a[0], st.reg_dst, w_pc_next);     // RORCR (RCR #1)
+                              else `OPC_TRAP
+                        4'd8:  st <= f_wb(st, r_reg_port_a |  (64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BSET (RR + #N)
+                        4'd9:  st <= f_wb(st, r_reg_port_a & ~(64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BCLR
+                        4'd10: st <= f_wb(st, r_reg_port_a ^  (64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BTGL
+                        4'd11: if (w_shsrc) begin
+                                  if (w_opcode[11:8] == 4'h0 && !w_shf) st <= f_btst(st, r_reg_port_a, w_shn, w_pc_next);  // BTST #N (flag-only, v1)
+                                  else `OPC_TRAP
+                               end else
+                                  st <= f_wb(st, {63'b0, r_reg_port_a[r_reg_port_b[5:0]]}, st.reg_dst, w_shf, w_pc_next);  // BTSTRR (rd = bit)
+                        default: `OPC_TRAP
+                     endcase
+                  // ── Class 6: loads — rd = ext(mem[EA]); EA from the MODE mux
+                  // (w_eaddr); SIZE/SGN/A feed f_ld_idx directly. MODE 00/11 are
+                  // 1-word (LEN=01), 01/10 are 2-word (LEN=10). The 32-bit
+                  // register-indirect form keeps the unaligned-tolerant
+                  // f_memget32 path (v1 MEMGET32); A applies to 64-bit only.
+                  32'b01_0110_??_?_??_?_0000_0000_????_????_????:
+                     if (w_mmode == 2'b01 || w_mmode == 2'b10) `OPC_TRAP
+                     else if (w_mmode == 2'b00 && w_opcode[3:0] != 4'h0) `OPC_TRAP
+                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
+                     else if (w_msz == 2'b10 && w_mmode == 2'b00) begin
+                        if (w_msgn) `OPC_TRAP
+                        else st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_a[31:0], st.reg_dst);  // MEMGET32
+                     end else
+                        st <= f_ld_idx(st, w_mem_ready, w_eaddr, w_mem_read_data, mem_sz_e'(w_msz), w_msgn, w_malign, st.reg_dst, w_pc_next);  // MEMGET8/16/64, MEMREADRR, LDIDX64R + new sgn/size forms
+                  32'b10_0110_??_?_??_?_0000_0000_????_????_????:
+                     if (w_mmode == 2'b00 || w_mmode == 2'b11) `OPC_TRAP
+                     else if (w_mmode == 2'b10 && w_opcode[7:0] != 8'h00) `OPC_TRAP
+                     else if (w_mmode == 2'b01 && w_opcode[3:0] != 4'h0) `OPC_TRAP
+                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
+                     else st <= f_ld_idx(st, w_mem_ready, w_eaddr, w_mem_read_data, mem_sz_e'(w_msz), w_msgn, w_malign, st.reg_dst, w_pc_next);  // LDIDX8/16/32/64(_S/A), MEMREADR + new forms
+
+                  // ── Class 7: stores — mem[EA] = reg[rd] (read port C). SGN is
+                  // reserved-0 for stores; f_st_idx does all lane/byte-enable math.
+                  32'b01_0111_??_?_??_?_0000_0000_????_????_????:
+                     if (w_msgn) `OPC_TRAP
+                     else if (w_mmode == 2'b01 || w_mmode == 2'b10) `OPC_TRAP
+                     else if (w_mmode == 2'b00 && w_opcode[3:0] != 4'h0) `OPC_TRAP
+                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
+                     else st <= f_st_idx(st, w_mem_ready, w_eaddr, r_reg_port_c, mem_sz_e'(w_msz), w_malign, w_pc_next);  // MEMSET8/16/32/64(RR), STIDX64R + new size forms
+                  32'b10_0111_??_?_??_?_0000_0000_????_????_????:
+                     if (w_msgn) `OPC_TRAP
+                     else if (w_mmode == 2'b00 || w_mmode == 2'b11) `OPC_TRAP
+                     else if (w_mmode == 2'b10 && w_opcode[7:0] != 8'h00) `OPC_TRAP
+                     else if (w_mmode == 2'b01 && w_opcode[3:0] != 4'h0) `OPC_TRAP
+                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
+                     else st <= f_st_idx(st, w_mem_ready, w_eaddr, r_reg_port_c, mem_sz_e'(w_msz), w_malign, w_pc_next);  // STIDX8/16/32/64(_A), MEMSETR + new forms
+
+                  // ── Class 9: stack / SP ──
+                  32'b01_1001_????_00_0000_0000_????_????_0000:
+                     case (w_aluop)
+                        4'd0: if (w_opcode[11:8] != 4'h0) `OPC_TRAP else st <= f_push(st, r_reg_port_a, w_pc_next, w_mem_ready);              // PUSH rs1
+                        4'd2: if (w_opcode[7:4]  != 4'h0) `OPC_TRAP else st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_dst, w_pc_next); // POP rd
+                        4'd3: if (w_opcode[7:4]  != 4'h0) `OPC_TRAP else st <= f_wb  (st, {32'b0, st.SP}, st.reg_dst, 1'b0, w_pc_next);       // GETSP rd
+                        4'd4: if (w_opcode[11:8] != 4'h0) `OPC_TRAP else st <= f_sp_set(st, r_reg_port_a[31:0], w_pc_next);                   // SETSP rs1
+                        4'd6: if (w_opcode[11:4] != 8'h00) `OPC_TRAP else st <= f_ret (st, w_mem_ready, w_mem_read_data);                     // RET
+                        4'd7: if (w_opcode[11:4] != 8'h00) `OPC_TRAP else st <= f_iret(st, w_mem_ready, w_mem_read_data);                     // IRET
+                        default: `OPC_TRAP
+                     endcase
+                  32'b10_1001_????_00_0000_0000_0000_0000_0000:
+                     case (w_aluop)
+                        4'd1: st <= f_push(st, {32'b0, w_var1}, w_pc_next, w_mem_ready);       // PUSHV (zext imm32)
+                        4'd5: st <= f_sp_set(st, st.SP + $signed(w_var1), w_pc_next);          // ADDSP (sext imm32)
+                        default: `OPC_TRAP
+                     endcase
+                  32'b11_1001_0001_00_0000_0000_0000_0000_0000:
+                     st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]);          // PUSHV64 (self-fetch hi32)
+
+                  // ── Class A: mul / div — SGN/H are field reads into the
+                  // pipeline seeds (MULHV/MULUV/DIVUV/MODUV now exist for free).
+                  32'b01_1010_????_00_0000_0000_????_????_????:
+                     case (w_mdop)
+                        2'd0: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, w_mdhigh, !w_mdsgn, 1'b0);                    // MUL(H)(U)R
+                        2'd1: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, w_mdsgn, 1'b0, 1'b0, st.reg_dst); // DIV(U)R
+                        2'd2: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, w_mdsgn, 1'b1, 1'b0, st.reg_dst); // MOD(U)R
+                        default: `OPC_TRAP
+                     endcase
+                  32'b10_1010_????_00_0000_0000_????_????_0000:
+                     case (w_mdop)
+                        2'd0: st <= f_mul_setup(st, r_reg_port_a, w_imm_ext_md, st.reg_dst, w_mdhigh, !w_mdsgn, 1'b1);                    // MULV + new imm forms
+                        2'd1: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, w_imm_ext_md, w_mdsgn, 1'b0, 1'b1, st.reg_dst); // DIVV
+                        2'd2: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, w_imm_ext_md, w_mdsgn, 1'b1, 1'b1, st.reg_dst); // MODV
+                        default: `OPC_TRAP
+                     endcase
+
+                  // ── Class 4 (LEN=10): BEXTR / BDEP — start[4:0] / len[12:8]
+                  // packed in imm32.
+                  32'b10_0100_11??_0_000000_0_00_????_????_????:
+                     case (w_aluop)
+                        4'd12: if (w_opcode[3:0] != 4'h0) `OPC_TRAP
+                               else st <= f_bextr(st, r_reg_port_a, w_var1, st.reg_dst, w_pc_next);                // BEXTR
+                        4'd13: st <= f_bdep (st, r_reg_port_a, r_reg_port_b, w_var1, st.reg_dst, w_pc_next);       // BDEP (base=rs1, src=rs2)
+                        default: `OPC_TRAP
+                     endcase
+
+                  // ── Class B: system ──
+                  32'b01_1011_0000_??????_0000_0000_????_0000:
+                     case (w_opcode[21:16])
+                        6'd0: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, OPCODE_REQUEST, w_pc_next); // NOP
+                        6'd1: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, HALTED_BREAK,   st.PC);     // HALT
+                        6'd2: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, WAITING,        w_pc_next); // WAIT
+                        6'd3: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, OPCODE_REQUEST, 32'h4);     // RESET
+                        6'd4: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_trap(st);                            // TRAP
+                        6'd5: st <= f_delay(st, r_reg_port_a[31:0], w_pc_next);                                      // DELAYR (rs1)
+                        default: `OPC_TRAP
+                     endcase
+                  32'b10_1011_0000_000101_0000_0000_0000_0000:
+                     st <= f_delay(st, w_var1, w_pc_next);                                                           // DELAYV
+
+                  // ── Class 8: branch / call — COND+INV drive one flag mux
+                  // (f_cond_eval), LINK selects jump vs call, REL/RIND are field
+                  // reads. Conditional REL calls and conditional indirect forms
+                  // now exist for free. perf_br strobes on conditional jumps
+                  // only; not-taken pre-settles the sequential successor.
+                  32'b10_1000_?_?_0_????_?_00_0000_0000_0000_0000:                                     // imm target (abs / REL)
+                     if (!w_bcvt[1]) `OPC_TRAP
+                     else if (w_blink) begin
+                        st <= f_cond_call(st, w_mem_ready, w_bcvt[0], w_var1, w_brel, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);  // CALL / CALLcc / CALLREL
+                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
+                     end else begin
+                        st <= f_cond_jump(st, w_bcvt[0], w_var1, w_brel, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);               // JMP / JMPcc (REL)
+                        if (w_bcond != 4'd0) begin r_perf_br_valid <= 1'b1; r_perf_br_taken <= w_bcvt[0]; end
+                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
+                     end
+                  32'b01_1000_?_0_1_????_?_00_0000_0000_0000_????:                                     // register target (RIND, target = rs2)
+                     if (!w_bcvt[1]) `OPC_TRAP
+                     else if (w_blink) begin
+                        st <= f_cond_call(st, w_mem_ready, w_bcvt[0], r_reg_port_b[31:0], 1'b0, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);  // CALLR (+cond, new)
+                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
+                     end else begin
+                        st <= f_cond_jump(st, w_bcvt[0], r_reg_port_b[31:0], 1'b0, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);               // JMPR (+cond, new)
+                        if (w_bcond != 4'd0) begin r_perf_br_valid <= 1'b1; r_perf_br_taken <= w_bcvt[0]; end
+                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
+                     end
+
+                  // ── Class C: LCD SPI-DC — OP selects CMD/DATA/RESET, LEN
+                  // selects register vs immediate byte source. f_lcd = st part,
+                  // arm drives the o_*LCD* ports.
+                  32'b01_1100_??_0000_0000_0000_0000_????_0000:
+                     case (w_opcode[25:24])
+                        2'd0: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDR
+                        2'd1: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
+                        default: `OPC_TRAP
+                     endcase
+                  32'b10_1100_??_0000_0000_0000_0000_0000_0000:
+                     case (w_opcode[25:24])
+                        2'd0: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
+                        2'd1: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
+                        2'd2: begin st <= f_ctrl(st, OPCODE_REQUEST, w_pc_next); o_LCD_reset_n <= w_var1[0]; end // LCDRST
+                        default: `OPC_TRAP
+                     endcase
+
+                  // Illegal / reserved: LEN=00 (any pre-v2 word, zeroed DDR2),
+                  // classes 0x0/0xD/0xE/0xF, and every unassigned (CLASS, LEN)
+                  // shape falls through to here.
+                  default: `OPC_TRAP
                endcase
             end  // case OPCODE_EXECUTE
 
@@ -2982,47 +3062,33 @@ end
    function [2:0] f_perf_class;
       input [31:0] op;
       begin
-         casez (op)
-            // Unconditional direct jumps (class 8, LINK=0, COND=0) — must
-            // precede the wildcard conditional-branch arms below.
-            32'hA000_0000, 32'hA100_0000:
-               f_perf_class = PC_JUMP;
-            // Conditional branches: class 8 imm-target, LINK=0, COND != 0
-            // (the COND=0 encodings were consumed by the PC_JUMP arms above).
-            32'hA0??_0000, 32'hA1??_0000:
-               f_perf_class = PC_BRANCH;
-            // Direct + conditional calls (class 8, LINK=1)
-            32'hA2??_0000, 32'hA300_0000:
-               f_perf_class = PC_CALL;
-            // Indirect / stack-target control transfers
-            32'h6580_0000,                                   // RET
-            32'h6080_000?,                                   // JMPR
-            32'h65C0_0000,                                   // IRET
-            32'h6280_000?:                                   // CALLR
-               f_perf_class = PC_INDIRECT;
-            // Loads: class 6 (top byte 0x58-0x5B LEN=01 / 0x98-0x9B LEN=10), + POP
-            32'h58??_????, 32'h59??_????, 32'h5A??_????, 32'h5B??_????,
-            32'h98??_????, 32'h99??_????, 32'h9A??_????, 32'h9B??_????,
-            32'h6480_0?00:                                   // POP
-               f_perf_class = PC_LOAD;
-            // Stores: class 7 (0x5C-0x5F / 0x9C-0x9F), + PUSH / PUSHV / PUSHV64
-            32'h5C??_????, 32'h5D??_????, 32'h5E??_????, 32'h5F??_????,
-            32'h9C??_????, 32'h9D??_????, 32'h9E??_????, 32'h9F??_????,
-            32'h6400_00?0, 32'hA440_0000, 32'hE440_0000:     // PUSH / PUSHV / PUSHV64
-               f_perf_class = PC_STORE;
-            // ALU: classes 1 (reg-reg), 2 (imm, incl. SETR64 at LEN=11),
-            // 3 (compare), 4 (shift/bit), 5 (unary) — mul/div (class A),
-            // system (class B) and I/O (class C) stay PC_OTHER.
-            32'h44??_????, 32'h45??_????, 32'h46??_????, 32'h47??_????, // class 1
-            32'h88??_????, 32'h89??_????, 32'h8A??_????, 32'h8B??_????, // class 2
-            32'hCB??_????,                                              // class 2 LEN=11 (SETR64)
-            32'h4C??_????, 32'h4D??_????, 32'h4E??_????, 32'h4F??_????, // class 3 reg
-            32'h8C??_????, 32'h8D??_????, 32'h8E??_????, 32'h8F??_????, // class 3 imm
-            32'h50??_????, 32'h51??_????, 32'h52??_????, 32'h53??_????, // class 4 reg
-            32'h90??_????, 32'h91??_????, 32'h92??_????, 32'h93??_????, // class 4 imm (BEXTR/BDEP)
-            32'h54??_????, 32'h55??_????, 32'h56??_????, 32'h57??_????: // class 5
+         // ISA v2: the CLASS field IS the bucket; only class 8/9 need
+         // sub-classification (jump vs branch vs call vs indirect; PUSH/POP
+         // vs SP ops). Applies to every legal encoding by construction.
+         case (op[29:26])
+            4'h1, 4'h2, 4'h3, 4'h4, 4'h5:                   // ALU / compare / shift / unary
                f_perf_class = PC_ALU;
-            default:
+            4'h6: f_perf_class = PC_LOAD;
+            4'h7: f_perf_class = PC_STORE;
+            4'h8: begin                                     // branch family
+               if (op[23])                                  // RIND: JMPR / CALLR
+                  f_perf_class = PC_INDIRECT;
+               else if (op[25])                             // LINK: CALL / CALLcc / CALLREL
+                  f_perf_class = PC_CALL;
+               else if (op[22:19] == 4'd0)                  // COND=always: JMP / JMPREL
+                  f_perf_class = PC_JUMP;
+               else
+                  f_perf_class = PC_BRANCH;
+            end
+            4'h9: begin                                     // stack: PUSH*/POP move data
+               case (op[25:22])
+                  4'd0, 4'd1: f_perf_class = PC_STORE;      // PUSH / PUSHI
+                  4'd2:       f_perf_class = PC_LOAD;       // POP
+                  4'd6, 4'd7: f_perf_class = PC_INDIRECT;   // RET / IRET
+                  default:    f_perf_class = PC_OTHER;      // GETSP / SETSP / ADDSP
+               endcase
+            end
+            default:                                        // mul/div, system, I/O, illegal
                f_perf_class = PC_OTHER;
          endcase
       end

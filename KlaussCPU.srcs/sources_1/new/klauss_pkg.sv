@@ -336,7 +336,8 @@ package klauss_pkg;
       CMP_MIN, CMP_MAX, CMP_MINU, CMP_MAXU
    } cmp_op_e;
 
-   function automatic cpu_state_t f_cmpr(cpu_state_t s, logic [63:0] a, logic [63:0] b, cmp_op_e op);
+   function automatic cpu_state_t f_cmpr(cpu_state_t s, logic [63:0] a, logic [63:0] b, cmp_op_e op,
+                                         logic [31:0] pc_next);
       cpu_state_t         n;
       logic signed [63:0] sa, sb;
       logic [63:0]        val;
@@ -364,7 +365,7 @@ package klauss_pkg;
       n.wb.rd      = s.reg_dst;
       n.SM         = OPCODE_REQUEST;
       n.wb.pending = 1'b1;
-      n.PC         = s.PC + 4;
+      n.PC         = pc_next;
       return n;
    endfunction
 
@@ -605,6 +606,7 @@ package klauss_pkg;
       logic [63:0] val;
       logic [7:0]  b8;
       logic [15:0] h16;
+      logic [31:0] w32;
       n = s;
       n.rx_fifo_read = 1'b0;
       if (s.extra_clock == 0) begin
@@ -620,10 +622,11 @@ package klauss_pkg;
          n.mem_read_DV = 1'b0;
          b8  = rdata[(eaddr[2:0] * 8)  +: 8];
          h16 = rdata[(eaddr[2:1] * 16) +: 16];
+         w32 = eaddr[2] ? rdata[63:32] : rdata[31:0];
          case (sz)
             MSZ_8:   val = is_signed ? {{56{b8[7]}},   b8}  : {56'b0, b8};
             MSZ_16:  val = is_signed ? {{48{h16[15]}}, h16} : {48'b0, h16};
-            MSZ_32:  val = eaddr[2] ? {32'b0, rdata[63:32]} : {32'b0, rdata[31:0]};
+            MSZ_32:  val = is_signed ? {{32{w32[31]}}, w32} : {32'b0, w32};
             default: val = rdata; // MSZ_64
          endcase
          n.wb.value = val;
@@ -892,26 +895,34 @@ package klauss_pkg;
    // (jumps only) and r_ir_presettled are driven by the ARM's own NBAs (they are
    // module-scope 1-cycle strobes, so they stay out of st).
    // ------------------------------------------------------------------------
-   function automatic cpu_state_t f_cond_jump(cpu_state_t s, logic cond, logic [31:0] i_value,
-         logic is_rel, logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2);
+   // f_cond_jump / f_cond_call — ISA v2 field-driven forms. `target` is the
+   // resolved target value (imm32 or rs2 register for RIND); `pc_fall` is the
+   // fall-through PC (w_pc_next — PC+4 for 1-word register forms, PC+8 for
+   // 2-word immediate forms), which is also the pushed return address for
+   // calls. The not-taken path pre-settles reg_1/2/dst for the successor.
+   function automatic cpu_state_t f_cond_jump(cpu_state_t s, logic cond, logic [31:0] target,
+         logic is_rel, logic [31:0] pc_fall,
+         logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2, logic [3:0] ps_rd);
       cpu_state_t n;
       n = s;
       n.rx_fifo_read = 1'b0;
       n.SM = OPCODE_REQUEST;
       if (cond) begin
-         n.PC = is_rel ? (s.PC + i_value) : i_value;
+         n.PC = is_rel ? (s.PC + target) : target;
       end else begin
-         n.PC = s.PC + 8;
+         n.PC = pc_fall;
          if (ps_ok) begin
-            n.reg_1 = ps_r1;
-            n.reg_2 = ps_r2;
+            n.reg_1   = ps_r1;
+            n.reg_2   = ps_r2;
+            n.reg_dst = ps_rd;
          end
       end
       return n;
    endfunction
 
    function automatic cpu_state_t f_cond_call(cpu_state_t s, logic mem_ready, logic cond,
-         logic [31:0] i_value, logic is_rel, logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2);
+         logic [31:0] target, logic is_rel, logic [31:0] pc_fall,
+         logic ps_ok, logic [3:0] ps_r1, logic [3:0] ps_r2, logic [3:0] ps_rd);
       cpu_state_t n;
       n = s;
       n.rx_fifo_read = 1'b0;
@@ -919,40 +930,90 @@ package klauss_pkg;
          if (s.extra_clock == 0) begin
             n.SP             = s.SP - 8;
             n.mem_addr       = s.SP - 32'd8;
-            n.mem_write_data = {32'b0, s.PC + 32'd8};   // return after 2-word instruction
+            n.mem_write_data = {32'b0, pc_fall};   // return address = fall-through PC
             n.mem_byte_en    = 8'hFF;
             n.mem_write_DV   = 1'b1;
             n.extra_clock    = 1'b1;
          end else if (mem_ready) begin
             n.mem_write_DV = 1'b0;
             n.SM           = OPCODE_REQUEST;
-            n.PC           = is_rel ? (s.PC + i_value) : i_value;
+            n.PC           = is_rel ? (s.PC + target) : target;
          end
       end else begin
          n.SM = OPCODE_REQUEST;
-         n.PC = s.PC + 8;
+         n.PC = pc_fall;
          if (ps_ok) begin
-            n.reg_1 = ps_r1;
-            n.reg_2 = ps_r2;
+            n.reg_1   = ps_r1;
+            n.reg_2   = ps_r2;
+            n.reg_dst = ps_rd;
          end
       end
       return n;
    endfunction
 
    // f_ps — apply the fall-through pre-settle to a COMPUTED next-state:
-   // pre-load reg_1/2 for the sequential successor (its opcode's register fields,
-   // read from the IFB at r_FPC via w_ps_r1/w_ps_r2) so the fast-path dispatch can
-   // skip the FETCH2 bubble after a single-cycle op. Pure function composition —
-   // wrap a 1-cycle op's result: st <= f_ps(f_wb(...), w_ps_ok, w_ps_r1, w_ps_r2);
-   // the arm arms r_ir_presettled when w_ps_ok. Mirrors f_cond_jump's inline
-   // not-taken pre-settle; one whole-struct NBA, so no partial-override clobber.
+   // pre-load reg_1/2/dst for the sequential successor (its opcode's register
+   // fields, read from the IFB at r_FPC via w_ps_r1/w_ps_r2/w_ps_rd) so the
+   // fast-path dispatch can skip the FETCH2 bubble after a single-cycle op.
+   // reg_dst is pre-settled too so read port C (v2 store data, rd field) is
+   // valid in EXECUTE — this is what lets stores use the fast path. Pure
+   // function composition — wrap a 1-cycle op's result:
+   //   st <= f_ps(f_wb(...), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);
+   // the arm arms r_ir_presettled when ps_ok. One whole-struct NBA, so no
+   // partial-override clobber.
    function automatic cpu_state_t f_ps(cpu_state_t n, logic ps_ok,
-                                       logic [3:0] ps_r1, logic [3:0] ps_r2);
+                                       logic [3:0] ps_r1, logic [3:0] ps_r2, logic [3:0] ps_rd);
       if (ps_ok) begin
-         n.reg_1 = ps_r1;
-         n.reg_2 = ps_r2;
+         n.reg_1   = ps_r1;
+         n.reg_2   = ps_r2;
+         n.reg_dst = ps_rd;
       end
       return n;
+   endfunction
+
+   // ------------------------------------------------------------------------
+   // ISA v2 field-decode helpers (pure).
+   // ------------------------------------------------------------------------
+
+   // f_cmp_op — class-3 boolean compare: map (PRED, INV) onto cmp_op_e.
+   // PRED: 0=EQ 1=LT 2=LE 3=ULT 4=ULE; INV gives NE/GE/GT/UGE/UGT.
+   function automatic cmp_op_e f_cmp_op(logic [2:0] pred, logic inv);
+      case ({pred, inv})
+         {3'd0, 1'b0}: f_cmp_op = CMP_EQ;
+         {3'd0, 1'b1}: f_cmp_op = CMP_NE;
+         {3'd1, 1'b0}: f_cmp_op = CMP_LT;
+         {3'd1, 1'b1}: f_cmp_op = CMP_GE;
+         {3'd2, 1'b0}: f_cmp_op = CMP_LE;
+         {3'd2, 1'b1}: f_cmp_op = CMP_GT;
+         {3'd3, 1'b0}: f_cmp_op = CMP_ULT;
+         {3'd3, 1'b1}: f_cmp_op = CMP_UGE;
+         {3'd4, 1'b0}: f_cmp_op = CMP_ULE;
+         {3'd4, 1'b1}: f_cmp_op = CMP_UGT;
+         default:      f_cmp_op = CMP_EQ;   // PRED 5-7 rejected by the caller
+      endcase
+   endfunction
+
+   // f_cond_eval — class-8 branch condition: one 10:1 flag mux + INV.
+   // Returns {valid, taken}. COND: 0=always 1=Z 2=C 3=V 4=S 5=LT 6=LE 7=ULT
+   // 8=ULE 9=E; 10-15 invalid (trap). INV on COND=0 (never-taken) is reserved.
+   function automatic logic [1:0] f_cond_eval(flags_t f, logic [3:0] cond, logic inv);
+      logic t, v;
+      v = 1'b1;
+      case (cond)
+         4'd0: t = 1'b1;
+         4'd1: t = f.zero;
+         4'd2: t = f.carry;
+         4'd3: t = f.overflow;
+         4'd4: t = f.sign;
+         4'd5: t = f.less;
+         4'd6: t = f.less | f.equal;
+         4'd7: t = f.ult;
+         4'd8: t = f.ult | f.equal;
+         4'd9: t = f.equal;
+         default: begin t = 1'b0; v = 1'b0; end
+      endcase
+      if (cond == 4'd0 && inv) v = 1'b0;
+      return {v, inv ? ~t : t};
    endfunction
 
    // ------------------------------------------------------------------------

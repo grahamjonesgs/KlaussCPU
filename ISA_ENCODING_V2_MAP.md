@@ -347,7 +347,38 @@ CALLR 0x0000_407x. Rel O/NO variants remain unassigned, as in v1.)
 9. **Retired v1 opcodes** (already MMIO, not re-encoded): LED/7-seg/RGB
    (0x3000/0x306x/0x307x), TXMEM/TXSTRMEM (0x5002/0x5003), UART ops.
 
-## 5. Machine-readable table
+## 5. Field-driven decode — newly legal encodings
+
+Since the decode-simplification build (dispatch = one arm per CLASS×LEN,
+attributes parameterize the shared next-state functions), these previously
+trapping combinations are **architecturally legal** and available to LLVM.
+Everything not listed here and not in §3 still traps.
+
+- **ALU-imm (class 2)**: ADC/SBC with imm32; both SGN values on every OP
+  (e.g. sign-extended SUB-imm, zero-extended MOV). LEA/MOV ignore rs1 rather
+  than trapping on it.
+- **Compare (class 3)**: boolean compare-immediate (B=1, LEN=10, rd=0/1);
+  both SGN values on both forms.
+- **Shift/bit (class 4)**: the F bit is honored (Z-update is per-instruction
+  selectable) for SHL/SHR/SAR/ROL/ROR/BSET/BCLR/BTGL/BTSTRR, with any
+  embedded N. ROL/ROR with SRC=1, N=1, F=1 keep the rotate-by-1 Z+C
+  semantics; RCL/RCR still exist only in that shape.
+- **Unary (class 5)**: F honored where the datapath parameterizes it
+  (COPY/NEG/NOT/ZEXT/BSWAP/BITREV/POPCNT/CLZ/CTZ/GETF); SEXT with F=1 now
+  exists at all three sizes (Z+S). ABS/INC/DEC still require F=1.
+- **Loads (class 6)**: the full SIZE × SGN × MODE × A space (A: 64-bit only;
+  SIZE=32 MODE=00 remains the unaligned-tolerant MEMGET32 with SGN=A=0):
+  LDIDX8_S/16_S/32_S, MEMGET8_S/16_S/32_S(via mode 01)/64, sub-word reg+reg
+  (mode 11) and absolute (mode 10) forms — all 1 word in modes 00/11.
+- **Stores (class 7)**: full SIZE × MODE space (SGN reserved-0): sub-word
+  reg+reg and absolute forms.
+- **Mul/div (class A)**: MULHV/MULUV/MULHUV, DIVUV/MODUV — imm forms extend
+  per the SGN bit.
+- **Branches (class 8)**: conditional PC-relative calls (LINK=1, REL=1,
+  any COND) and conditional register-indirect jumps/calls (RIND=1, any
+  COND, including E). COND values 10-15 and INV-of-always trap.
+
+## 6. Machine-readable table
 
 ```csv
 symbol,template,words,class,regs,imm,flags,notes
