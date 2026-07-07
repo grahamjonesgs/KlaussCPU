@@ -160,18 +160,47 @@ bst 11/11, test_64bit 36/36), no crash.
   one `r_tgt_lineaddr` tag) → one compare, 3-way mux → **WNS +0.098** (meets; −0.033 vs
   C1's +0.131). Accepted as the shipping cost; re-check WNS if later changes tighten it.
 
-### Key cross-cutting finding — §D2 is the linchpin (CONFIRMED zero-cost 2026-07-06)
-The cache/DDR level-DV handshake (`mem_read_write.sv` PRE_WAIT/COOL_DOWN "phantom ready"
-guard) is the root cause B1 crashed on. **§D2 closes it at zero CPI cost (measured)** —
-so it is the enabler: (a) makes **B1** safe, (b) lets **C1** dispatch earlier without the
-race, (c) de-risks **C4/D1/D3**. Recommended order: **§D2 → re-land B1 + C1 → then C4**;
-land **§C2** (with its timing fix) independently — it's orthogonal (front-end fetch).
+### §D2 + §B1 tested together — B1 STILL CRASHES; D2 is necessary but NOT sufficient (2026-07-06)
+Re-implemented D2 (robust WAIT-accept framing) + B1 (all 7 load-completion sites —
+f_mem_load / f_ld_idx / f_ld_idxreg / f_pop / f_memget32×3 — defer the writeback via
+`wb.pending → OPCODE_REQUEST`, dropping the dedicated WRITEBACK cycle). Built clean
+(**WNS +0.193**, best of all — removing the WRITEBACK routing simplified the FSM decode).
+**But perf_baseline CRASHED (`ERR_INV_OPCODE`)** — B1's exact signature: a load (LDIDX64A)
+then the next fetch latches stale `read_data` as its opcode (crash dump: fetched word
+decodes to a different opcode than memory holds; V1H=0xFFFFFFB8 garbage).
+
+**Precise diagnosis — two different problems:**
+- **§D2 fixes the MEM-side re-latch** (the cache FSM won't re-accept a lingering
+  same-address DV). Confirmed working (D2-alone is neutral + crash-free).
+- **B1's crash is CPU-SIDE phantom-ready**, which D2 doesn't touch: the CPU, waiting in
+  `OPCODE_FETCH` for its fetch's ready, catches the **load's** late/registered ready
+  (bus_splitter registers `cpu.ready` → it arrives a cycle late) and latches whatever is
+  on `read_data`. The WRITEBACK cycle B1 removes wasn't just preventing the re-latch — it
+  **separated the load's ready-consumption from the fetch**, so the two readies could not
+  be confused. D2 does not restore that separation.
+
+**What B1 actually needs:** a CPU-side ready-ordering guard — the CPU must not consume a
+`ready` belonging to the previous transaction (a request/ready tag or accepted-handshake
+gate on `OPCODE_FETCH`'s ready-consume), OR the mem side must clear `ready` the instant it
+accepts a new request. That's a real handshake redesign, not a small edit. **Reasoning
+about the exact cycle timing has misfired twice (the D2 "mystery", now this) — do it in
+iverilog sim (golden-model self-trace) against real waveforms, not on 30-min silicon
+builds.** D2+B1 is stashed & reproducible; D2 alone remains a valid neutral enabler.
+STATUS: **memory-path thread PARKED** — C1+C2 banked as the shipping wins.
+
+### Key cross-cutting finding — the handshake is TWO problems, not one (revised 2026-07-06)
+The cache/DDR level-DV handshake has a mem-side re-latch (D2 fixes it, zero cost) AND a
+CPU-side ready-matching hazard (B1 exposes it, unfixed). §D2 is necessary but not
+sufficient for §B1. §C1 did NOT need either (it's clean without D2 — the "C1 needs D2"
+theory was the stale-baseline artifact). So the once-central "D2 linchpin unblocks
+B1/C1/C4" plan is **downgraded**: C1/C2 shipped standalone; B1 (and by extension any
+aggressive load-path overlap: C4/D1/D3) is gated on the CPU-side ready-ordering fix above.
 ~~**§B6** (LED-path Fmax reclaim).~~ *(2026-07-06: §B6 OBSOLETE — WNS is the MMIO-read
 mux at +0.182, walled by the SHA-256 core at +0.230. No cheap Fmax. See §B6 correction.)*
 
-Timing reference (post-route WNS, all met at 100 MHz): master **+0.077** ns · B1/B5
-**+0.113** · C1 **+0.131** · refined-C1 **+0.059** · D2 **+0.182** · **C2 +0.011 (needs
-fix)**. WNS varies ±0.12 ns run-to-run at the same RTL, so treat these as ± that.
+Timing reference (post-route WNS, all met at 100 MHz): master **+0.077** ns · C1 **+0.131**
+(landed) · C2-on-C1 **+0.098** (landed) · D2 **+0.182** · **D2+B1 +0.193** (crashes, not
+landed). WNS varies ±0.12 ns run-to-run at the same RTL, so treat these as ± that.
 
 ---
 
