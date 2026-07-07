@@ -1889,13 +1889,16 @@ rams_sp_nc rams_sp_nc1 (
                   r_ir_valid       <= 1'b0;   // discard the speculative fall-through
                   r_ir_presettled  <= 1'b0;   // (IRQ redirect; precise interrupts preserved)
                   // stay in OPCODE_REQUEST until push completes
-               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC) begin
+               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC
+                            && r_ir_opcode[29:26] != 4'h7) begin
                   // Fast-path dispatch: the prefetched IR was pre-settled into
-                  // st.reg_1/2/dst during the previous instruction's execute tail,
-                  // so all three reg-file read ports (incl. port C, the v2 store
-                  // data source) are already valid — skip the OPCODE_FETCH2
+                  // st.reg_1/2 during the previous instruction's execute tail, so the
+                  // reg-file read ports are already valid — skip the OPCODE_FETCH2
                   // settle bubble and go straight to EXECUTE (saves 1 cyc/instr).
                   // Ordered AFTER w_irq_ready so a pending interrupt always wins.
+                  // Class-7 stores are excluded: their data comes from read port C
+                  // (rd field), which is only guaranteed settled via the FETCH2
+                  // path, not the reg_1/2-only pre-settle (see f_ps note).
                   r_opcode_mem      <= r_ir_opcode;
                   st.reg_dst         <= r_ir_reg_dst;
                   r_var1_mem        <= r_ir_var1;

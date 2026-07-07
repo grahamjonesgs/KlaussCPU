@@ -914,7 +914,9 @@ package klauss_pkg;
          if (ps_ok) begin
             n.reg_1   = ps_r1;
             n.reg_2   = ps_r2;
-            n.reg_dst = ps_rd;
+            // reg_dst deliberately NOT pre-settled here — see f_ps note. Stores
+            // are excluded from the fast path (port C settles in FETCH2), so the
+            // successor's reg_dst comes from the fetch path, matching phase-1.
          end
       end
       return n;
@@ -945,7 +947,7 @@ package klauss_pkg;
          if (ps_ok) begin
             n.reg_1   = ps_r1;
             n.reg_2   = ps_r2;
-            n.reg_dst = ps_rd;
+            // reg_dst deliberately NOT pre-settled (see f_ps note).
          end
       end
       return n;
@@ -966,7 +968,13 @@ package klauss_pkg;
       if (ps_ok) begin
          n.reg_1   = ps_r1;
          n.reg_2   = ps_r2;
-         n.reg_dst = ps_rd;
+         // reg_dst is NOT pre-settled: port C (v2 store data) would then latch
+         // reg[w_ps_rd] from the possibly-shifted IFB while a fast-pathed store
+         // writes using reg_dst=r_ir_reg_dst, and the two can diverge. Instead,
+         // stores stay off the fast path (see the r_ir_opcode[29:26]!=7 guard),
+         // so reg_dst always comes from the settled fetch path — matching the
+         // proven phase-1 pipeline. ps_rd is retained in the signature for a
+         // future coordinated fix that pre-settles rd from the IR latch.
       end
       return n;
    endfunction
