@@ -1,0 +1,78 @@
+13:08:49.660 I Detected ELF file: 28.4 KiB, ELF base 0x00000020, ELF entry 0x00000020, board entry 0x00000020 
+13:08:49.661 I elf2serial: /media/psf/src/klausscpu-runtime/baremetal/perf_baseline.elf → /media/psf/src/klausscpu-runtime/baremetal/perf_baseline.kbt (entry 0x00000020, heap_start 0x000071E8) 
+Sending to board: 92% (52.5 KiB / 57.0 KiB)       Sending to board: 100% (57.0 KiB / 57.0 KiB)      
+13:08:50.598 I Wrote to serial port 
+Completed with 0 errors and 0 warnings in 0.947 seconds
+13:08:50.598 W Failed to enable raw terminal mode: "No such device or address (os error 6)" 
+Monitoring serial port (Ctrl+C to stop)...
+Load Complete OK
+=== KlaussCPU perf baseline ===
+L1: ways=2 sets=2048 line=16B total=65536B
+working set: 256 KiB
+
+
+--- alu ---
+time=330ms cycles=33000761 instr=8000022 CPI=4.125
+FASTPATH=6000005  (instrs that skipped FETCH2)
+mix:  ALU=25.00% LD=0.00% ST=0.00% BR=0.00% JMP=0.00% CALL=0.00% IND=0.00% OTH=0.00%
+      (mix sum=2000049 instr=8000022 MISMATCH)
+branch: n=0 taken=1 rate=184467440737095516.15%
+cyc:  fetch=66.66% exec=33.33% mul=0.00% div=0.00% int=0.00% idle=0.00%
+cache: acc=3000096 rdH=3000023 rdM=51 wrH=17 wrM=5 wb=61 miss=0.00% stall=2588 avgpen=46.21c
+CSV,alu,330,33000761,8000022,4125,0,0
+
+--- mem_stream ---
+time=166ms cycles=16563804 instr=1966142 CPI=8.424
+FASTPATH=1179665  (instrs that skipped FETCH2)
+mix:  ALU=26.66% LD=6.66% ST=6.66% BR=0.00% JMP=0.00% CALL=0.00% IND=0.00% OTH=0.00%
+      (mix sum=786509 instr=1966142 MISMATCH)
+branch: n=3 taken=131073 rate=4369100.00%
+cyc:  fetch=41.95% exec=58.04% mul=0.00% div=0.00% int=0.00% idle=0.00%
+cache: acc=1441897 rdH=1179643 rdM=131160 wrH=131080 wrM=14 wb=69109 miss=9.09% stall=4637591 avgpen=35.35c
+CSV,mem_stream,166,16563804,1966142,8424,909,436910000
+
+--- ptr_chase ---
+time=177ms cycles=17700804 instr=2600021 CPI=6.807
+FASTPATH=1000002  (instrs that skipped FETCH2)
+mix:  ALU=53.84% LD=0.00% ST=0.00% BR=7.69% JMP=0.00% CALL=0.00% IND=0.00% OTH=0.00%
+      (mix sum=1600051 instr=2600021 MISMATCH)
+branch: n=200000 taken=1 rate=0.00%
+cyc:  fetch=46.32% exec=53.67% mul=0.00% div=0.00% int=0.00% idle=0.00%
+cache: acc=1200095 rdH=1027740 rdM=172333 wrH=7 wrM=15 wb=4081 miss=14.36% stall=5102342 avgpen=29.60c
+CSV,ptr_chase,177,17700804,2600021,6807,1436,0
+
+--- branchy ---
+time=605ms cycles=60530630 instr=14687112 CPI=4.121
+FASTPATH=8311850  (instrs that skipped FETCH2)
+mix:  ALU=43.40% LD=0.00% ST=0.00% BR=0.00% JMP=0.00% CALL=0.00% IND=0.00% OTH=0.00%
+      (mix sum=6375294 instr=14687112 MISMATCH)
+branch: n=0 taken=844077 rate=184467440737095516.15%
+cyc:  fetch=71.34% exec=28.65% mul=0.00% div=0.00% int=0.00% idle=0.00%
+cache: acc=5531261 rdH=5531223 rdM=17 wrH=21 wrM=0 wb=0 miss=0.00% stall=494 avgpen=29.05c
+CSV,branchy,605,60530630,14687112,4121,0,0
+
+--- calls_fib ---
+time=1085ms cycles=108504961 instr=16969566 CPI=6.394
+FASTPATH=3599601  (instrs that skipped FETCH2)
+mix:  ALU=42.42% LD=9.09% ST=12.12% BR=0.00% JMP=3.03% CALL=0.00% IND=3.03% OTH=9.09%
+      (mix sum=13369997 instr=16969566 MISMATCH)
+branch: n=0 taken=514228 rate=184467440737095516.15%
+cyc:  fetch=60.18% exec=39.81% mul=0.00% div=0.00% int=0.00% idle=0.00%
+cache: acc=13884269 rdH=11313088 rdM=15 wrH=2571093 wrM=73 wb=0 miss=0.00% stall=2563 avgpen=29.12c
+CSV,calls_fib,1085,108504961,16969566,6394,0,0
+
+--- muldiv ---
+time=36ms cycles=3558546 instr=750019 CPI=4.744
+FASTPATH=500002  (instrs that skipped FETCH2)
+mix:  ALU=13.33% LD=0.00% ST=0.00% BR=6.66% JMP=0.00% CALL=0.00% IND=0.00% OTH=13.33%
+      (mix sum=250049 instr=750019 MISMATCH)
+branch: n=50000 taken=1 rate=0.00%
+cyc:  fetch=61.83% exec=25.29% mul=7.02% div=5.85% int=0.00% idle=0.00%
+cache: acc=300092 rdH=300063 rdM=8 wrH=21 wrM=0 wb=0 miss=0.00% stall=232 avgpen=29.00c
+mul: ops=50000 avglat=5.00c
+div: ops=100000 avglat=2.08c
+CSV,muldiv,36,3558546,750019,4744,0,0
+
+=== done (sink=5295195395655698285) ===
+
+CPU halted.

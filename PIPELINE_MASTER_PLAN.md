@@ -36,10 +36,14 @@ contradicted by an on-silicon experiment already in the record.
 
 **What is actually left, in priority order:**
 
-1. **Flag-model cleanup (§5)** — *the near-term, user-prioritized item.* Retire
-   the redundant `E/L/U` compare-flag producer bits; make `CMP` a non-writing
-   `SUB`. Low timing risk, unblocks LLVM wins now, de-risks the future pipeline's
-   flag hazard path. **Recommended next.**
+1. **Flag-model cleanup (§5)** — ✅ **RTL DONE & BOARD-VERIFIED** (branch
+   `feat/core-pipeline`, commit `fbb77d7`; WNS +0.203; all regressions PASS +
+   UART bit-identical + `perf_baseline` no-HCF + CPI unchanged; unit test
+   `tb_flags` 256192/0). Retired the `E/L/U` producer bits; `CMP` is now a
+   non-writing `SUB` over one 4-bit `Z/S/C/V` register; conditions derived
+   (borrow convention: `ULT=C`). Encoding-stable ⇒ current ELFs run identically.
+   **Toolchain side (backend/A3a/ADC-SBC/emulator/boot-ROM) is the user's, spec'd
+   in `FLAG_UNIFICATION_CHANGES.md`.**
 2. **Memory penalty-reduction (§4)** — the measured highest-value CPI lever on
    memory-bound kernels: MIG BL16 / critical-word-first / next-line prefetch.
    *Not* a bigger cache. Independent of the flag work.
