@@ -105,9 +105,14 @@ module ddr2_control (
    localparam READ = 4'd4;
    localparam READ_DONE = 4'd5;
    localparam WRITE_B1 = 4'd6;   // push the second 64-bit write beat (2:1 UI)
+   localparam READ_CMD2 = 4'd7;  // BL16 spike: issue the 2nd pipelined BL8 read command
    logic [3:0] state = IDLE;
 
    logic rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
+   // BL16 SPIKE: 4-beat counter for a pipelined dual-BL8 (256-bit) read. Measures
+   // whether a 2nd back-to-back row-hit read pipelines cheaply (~+8c to ready) or
+   // serialises (~+54c) — the go/no-go for real 32-byte cache lines.
+   logic [1:0] rd_cnt = 2'd0;
 
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
@@ -172,6 +177,7 @@ module ddr2_control (
          app_wdf_wren <= 0;
          app_wdf_end <= 0;
          rd_beat <= 1'b0;
+         rd_cnt <= 2'd0;
       end else begin
          case (state)
             // IDLE: stay here until BOTH DVs are deasserted before returning to
@@ -244,33 +250,46 @@ module ddr2_control (
             end
 
 
+            // BL16 SPIKE — pipelined dual-BL8 read. Issue command 1 (base), then
+            // command 2 (base + 16 B) back-to-back into the MIG command FIFO, then
+            // consume 4 × 64-bit beats. The cache uses only the first 128 b
+            // (beats 0/1); beats 2/3 (burst 2) are DISCARDED. Purpose: does the 2nd
+            // row-hit read pipeline (small delta to o_mem_ready) or serialise
+            // (~54c)? That is the go/no-go for real 32-byte lines.
             READ: begin
                if (app_rdy) begin
-                  app_en <= 1;
-                  app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
-                  app_cmd <= CMD_READ;
-                  rd_beat <= 1'b0;
-                  state <= READ_DONE;
+                  app_en   <= 1;
+                  app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr (burst 1 = base)
+                  app_cmd  <= CMD_READ;
+                  rd_cnt   <= 2'd0;
+                  state    <= READ_CMD2;
                end
             end
 
-            // 2:1 read: the BL8 burst returns as TWO 64-bit app_rd_data beats.
-            // First valid = line[63:0], second = line[127:64] — reassembled so
-            // o_mem_read_data is byte-identical to the old single-128-bit-beat path.
+            READ_CMD2: begin                    // command 1 accepted → present command 2
+               if (app_rdy & app_en) begin
+                  app_addr <= i_mem_addr[27:1] + 27'd8; // burst 2 = base + 16 B (8 halfwords)
+                  // app_en stays high so command 2 is presented next cycle
+                  state    <= READ_DONE;
+               end
+            end
+
+            // 2:1 read: each BL8 burst returns as TWO 64-bit app_rd_data beats.
+            // beat0/1 = burst1 = line[63:0]/[127:64]; beat2/3 = burst2 (discarded).
             READ_DONE: begin
                if (app_rdy & app_en) begin
-                  app_en <= 0;
+                  app_en <= 0;                   // command 2 accepted
                end
 
                if (app_rd_data_valid) begin
-                  if (rd_beat == 1'b0) begin
-                     o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]
-                     rd_beat <= 1'b1;
-                  end else begin
-                     o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
-                     o_mem_ready <= 1'b1;
-                     state <= IDLE;
-                  end
+                  case (rd_cnt)
+                     2'd0: o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]
+                     2'd1: o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
+                     2'd2: ;                                         // beat2 = burst2 low (discard)
+                     2'd3: begin o_mem_ready <= 1'b1; state <= IDLE; end // beat3 = burst2 high → done
+                     default: ;
+                  endcase
+                  rd_cnt <= rd_cnt + 2'd1;
                end
             end
 
