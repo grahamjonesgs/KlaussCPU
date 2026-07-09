@@ -526,9 +526,9 @@ module KlaussCPU (
    logic r_boot_flash;
    
    //=========================================================================
-   // Additional flags for expanded comparisons
+   // Flags: unified Z/S/C/V register (flags_t). The old separate equal/less/ult
+   // compare flags are retired — EQ/LT/ULT are derived in f_cond_eval (klauss_pkg).
    //=========================================================================
-   // (st.flags.sign / st.flags.less / st.flags.ult are now st.flags.sign/.less/.ult.)
 
    
    //=============================================================================
@@ -1233,8 +1233,6 @@ rams_sp_nc rams_sp_nc1 (
    integer i;
    initial begin
       st.flags.sign <= 0;
-      st.flags.less <= 0;
-      st.flags.ult <= 0;
       st.div.busy <= 0;
       st.div.op <= DIV_OP_NONE;
       st.div.counter <= 0;
@@ -1352,7 +1350,6 @@ rams_sp_nc rams_sp_nc1 (
       o_LCD_reset_n = 1'b0;
       st.PC = 32'h0;
       st.flags.zero = 0;
-      st.flags.equal = 0;
       st.flags.carry = 0;
       st.flags.overflow = 0;
       st.error_code = 8'h0;
@@ -1390,9 +1387,6 @@ rams_sp_nc rams_sp_nc1 (
       st.alu_pipe_value    = 64'b0;
       st.alu_pipe_carry    = 1'b0;
       st.alu_pipe_overflow = 1'b0;
-      st.alu_pipe_equal    = 1'b0;
-      st.alu_pipe_less     = 1'b0;
-      st.alu_pipe_ult      = 1'b0;
       st.alu_pipe_mode     = 1'b0;
       st.rx_fifo_read  = 0;
       r_break_active  = 0;
@@ -1764,7 +1758,6 @@ rams_sp_nc rams_sp_nc1 (
                   r_debug_flag <= 1'b0;
                   r_debug_step_flag <= 1'b0;
                   r_debug_step_run <= 1'b0;
-                  st.flags.equal <= 1'b0;
                   st.error_code <= 8'h0;
                   r_hcf_message_sent <= 1'b0;
                   r_interrupt_table[0] <= 32'h0;  // clear all 4 handler vectors;
@@ -1870,10 +1863,16 @@ rams_sp_nc rams_sp_nc1 (
                   // Zero flag pushed as it will be AFTER any deferred writeback
                   // committing this same cycle (st.wb.pending block above), so the
                   // saved interrupt context stays precise.
+                  // 7-bit ISA flag word kept for frame compatibility; E/L/U are
+                  // DERIVED from the Z/S/C/V register (E=Z, L=S^V, U=C). IRET
+                  // restores only Z/S/C/V (the derived bits regenerate).
                   st.mem_write_data <= {21'b0, st.int_mask,
-                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),
-                                       st.flags.equal, st.flags.carry,
-                                       st.flags.overflow, st.flags.sign, st.flags.less, st.flags.ult,
+                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),  // [38] Z
+                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),  // [37] E = Z
+                                       st.flags.carry,                                     // [36] C
+                                       st.flags.overflow, st.flags.sign,                   // [35] V, [34] S
+                                       (st.flags.sign ^ st.flags.overflow),                // [33] L = S^V
+                                       st.flags.carry,                                     // [32] U = C
                                        st.PC};
                   st.mem_byte_en    <= 8'hFF;
                   st.mem_write_DV   <= 1'b1;
@@ -2211,7 +2210,7 @@ rams_sp_nc rams_sp_nc1 (
                         4'd8:  st <= f_wb(st, {57'b0, popcount(r_reg_port_a)},             st.reg_dst, w_unf, w_pc_next);  // POPCNT
                         4'd9:  st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_a)},  st.reg_dst, w_unf, w_pc_next);  // CLZ
                         4'd10: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_a)}, st.reg_dst, w_unf, w_pc_next);  // CTZ
-                        4'd12: st <= f_wb(st, {st.flags.zero, st.flags.equal, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_dst, w_unf, w_pc_next);  // SETFR/GETF (v1 semantics)
+                        4'd12: st <= f_wb(st, {st.flags.zero, st.flags.zero, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_dst, w_unf, w_pc_next);  // GETF: {Z, E=Z, C, V} (E derived)
                         4'd14: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_ADD, st.reg_dst, w_pc_next); else `OPC_TRAP  // INC
                         4'd15: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_SUB, st.reg_dst, w_pc_next); else `OPC_TRAP  // DEC
                         default: `OPC_TRAP
@@ -2940,12 +2939,12 @@ end
                   st.flags.overflow   <= st.alu_pipe_overflow;
                   st.flags.sign       <= st.alu_pipe_value[63];
                   st.SM              <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
-               end else begin                           // CMP
-                  st.flags.equal <= st.alu_pipe_equal;
-                  st.flags.less  <= st.alu_pipe_less;
-                  st.flags.ult   <= st.alu_pipe_ult;
-                  st.flags.sign  <= st.alu_pipe_value[63];
-                  st.SM         <= OPCODE_REQUEST;
+               end else begin                           // CMP: commit SUB flags, no rd write
+                  st.flags.zero     <= (st.alu_pipe_value == 64'b0);
+                  st.flags.carry    <= st.alu_pipe_carry;
+                  st.flags.overflow <= st.alu_pipe_overflow;
+                  st.flags.sign     <= st.alu_pipe_value[63];
+                  st.SM             <= OPCODE_REQUEST;
                end
                // Execute-tail handoff: the ALU already consumed its operands and
                // st.PC is the successor, so pre-load st.reg_1/2 from the prefetched

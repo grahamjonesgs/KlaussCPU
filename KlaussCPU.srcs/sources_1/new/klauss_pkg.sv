@@ -84,12 +84,13 @@ package klauss_pkg;
    // (Z E C V / S L U) for readability.
    typedef struct packed {
       logic zero;       // Z: last result == 0
-      logic equal;      // E: last compare equal
-      logic carry;      // C: carry / borrow out
+      logic carry;      // C: carry / borrow out — x86 BORROW convention: SUB/CMP set C iff a<b (unsigned)
       logic overflow;   // V: signed overflow
       logic sign;       // S: sign of last result (bit 63)
-      logic less;       // L: signed less-than comparison
-      logic ult;        // U: unsigned less-than comparison
+      // E/L/U retired (flag-unification): the equal/less/ult conditions are now
+      // DERIVED from Z/S/C/V — EQ=Z, signed LT=S^V, unsigned ULT=C (borrow) —
+      // in f_cond_eval and on the ISA-visible flag word (IRQ save / GETF). Never
+      // stored, so CMP and arithmetic share one 4-bit flags register.
    } flags_t;
 
    // --- Deferred-writeback bundle (r_wb) -----------------------------------
@@ -225,9 +226,6 @@ package klauss_pkg;
       logic [63:0] alu_pipe_value;
       logic        alu_pipe_carry;
       logic        alu_pipe_overflow;
-      logic        alu_pipe_equal;
-      logic        alu_pipe_less;
-      logic        alu_pipe_ult;
       logic        alu_pipe_mode;
       logic [31:0] mem_addr;
       logic        mem_read_DV;
@@ -293,13 +291,16 @@ package klauss_pkg;
             n.SM         = OPCODE_REQUEST;
          end
          ALU_CMP: begin
-            // compare: set equal/less/ult flags via ALU_FINISH, no register write
-            n.alu_pipe_value = a - b;
-            n.alu_pipe_equal = (a == b)                  ? 1'b1 : 1'b0;
-            n.alu_pipe_less  = ($signed(a) < $signed(b)) ? 1'b1 : 1'b0;
-            n.alu_pipe_ult   = (a < b)                   ? 1'b1 : 1'b0;
-            n.alu_pipe_mode  = 1'b1;   // CMP
-            n.SM             = ALU_FINISH;
+            // compare = SUB without register writeback: set Z/S/C/V (committed in
+            // ALU_FINISH). C = sum[64] is the x86 borrow (1 iff a<b unsigned); V is
+            // the signed-subtract overflow. EQ/LT/ULT are derived from Z/S/C/V in
+            // f_cond_eval — no separate equal/less/ult storage.
+            sum = {1'b0, a} - {1'b0, b};
+            n.alu_pipe_value    = sum[63:0];
+            n.alu_pipe_carry    = sum[64];
+            n.alu_pipe_overflow = (a[63] != b[63]) && (sum[63] != a[63]) ? 1'b1 : 1'b0;
+            n.alu_pipe_mode     = 1'b1;   // CMP: commit flags, no rd write
+            n.SM                = ALU_FINISH;
          end
          default: begin
             // ADD / SUB / ADC / SBC : alu_pipe + carry/overflow flags via ALU_FINISH
@@ -872,13 +873,10 @@ package klauss_pkg;
          n.extra_clock = 1'b1;
       end else if (mem_ready) begin
          n.PC              = rdata[31:0];
-         n.flags.zero      = rdata[38];
-         n.flags.equal     = rdata[37];
-         n.flags.carry     = rdata[36];
-         n.flags.overflow  = rdata[35];
+         n.flags.zero      = rdata[38];  // [37]=E, [33]=L, [32]=U were derived on
+         n.flags.carry     = rdata[36];  // save (E=Z, L=S^V, U=C); not restored —
+         n.flags.overflow  = rdata[35];  // they regenerate from Z/S/C/V.
          n.flags.sign      = rdata[34];
-         n.flags.less      = rdata[33];
-         n.flags.ult       = rdata[32];
          n.int_mask        = rdata[42:39];
          n.SP              = s.SP + 8;
          n.mem_read_DV     = 1'b0;
@@ -1001,23 +999,26 @@ package klauss_pkg;
       endcase
    endfunction
 
-   // f_cond_eval — class-8 branch condition: one 10:1 flag mux + INV.
-   // Returns {valid, taken}. COND: 0=always 1=Z 2=C 3=V 4=S 5=LT 6=LE 7=ULT
-   // 8=ULE 9=E; 10-15 invalid (trap). INV on COND=0 (never-taken) is reserved.
+   // f_cond_eval — class-8 branch condition: one flag mux + INV, over the unified
+   // Z/S/C/V register. Returns {valid, taken}. COND: 0=always 1=Z 2=C 3=V 4=S
+   // 5=LT 6=LE 7=ULT 8=ULE 9=E; 10-15 invalid (trap). INV on COND=0 reserved.
+   // Relations are DERIVED (no E/L/U storage): EQ=Z, signed LT=S^V, LE=Z|(S^V);
+   // unsigned uses the x86 borrow — ULT=C (a<b), ULE=C|Z; E aliases Z. These are
+   // bit-identical to the retired equal/less/ult bits for any operand pair.
    function automatic logic [1:0] f_cond_eval(flags_t f, logic [3:0] cond, logic inv);
       logic t, v;
       v = 1'b1;
       case (cond)
-         4'd0: t = 1'b1;
-         4'd1: t = f.zero;
-         4'd2: t = f.carry;
-         4'd3: t = f.overflow;
-         4'd4: t = f.sign;
-         4'd5: t = f.less;
-         4'd6: t = f.less | f.equal;
-         4'd7: t = f.ult;
-         4'd8: t = f.ult | f.equal;
-         4'd9: t = f.equal;
+         4'd0: t = 1'b1;                             // always
+         4'd1: t = f.zero;                           // Z   (EQ after CMP)
+         4'd2: t = f.carry;                          // C   (raw carry / borrow)
+         4'd3: t = f.overflow;                       // V
+         4'd4: t = f.sign;                           // S
+         4'd5: t = f.sign ^ f.overflow;              // LT  signed   (S^V)
+         4'd6: t = f.zero | (f.sign ^ f.overflow);   // LE  signed   (Z | S^V)
+         4'd7: t = f.carry;                          // ULT unsigned (borrow: a<b)
+         4'd8: t = f.carry | f.zero;                 // ULE unsigned (C | Z)
+         4'd9: t = f.zero;                           // E == Z (alias of EQ)
          default: begin t = 1'b0; v = 1'b0; end
       endcase
       if (cond == 4'd0 && inv) v = 1'b0;

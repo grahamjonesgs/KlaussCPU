@@ -212,11 +212,13 @@ well-scoped, low-timing-risk ISA change that (a) unblocks concrete LLVM wins
 
 1. **`CMP` becomes `SUB`-without-writeback.** `CMPRR/CMPRV` drive the *same*
    `Z/S/C/V` as `SUB`. Retire the `E/L/U` producer bits. `flags_t` shrinks 7 → 4.
-2. **Derive relations in `f_cond_eval`** the standard ARM/MIPS way:
-   `EQ=Z`, `NE=¬Z`, signed `LT = S⊕V`, `GE = ¬(S⊕V)`, `LE = Z∨(S⊕V)`,
-   `GT = ¬Z∧¬(S⊕V)`, unsigned `ULT = ¬C`, `UGE = C`, `ULE = ¬C∨Z`, `UGT = C∧¬Z`.
-   (Confirm the carry-borrow polarity of the existing subtractor so `ULT=¬C` vs
-   `=C` is correct — this is the single most bug-prone line; pin it with a test.)
+2. **Derive relations in `f_cond_eval`**: `EQ=Z`, `NE=¬Z`, signed `LT = S⊕V`,
+   `GE = ¬(S⊕V)`, `LE = Z∨(S⊕V)`, `GT = ¬Z∧¬(S⊕V)`.
+   **CARRY POLARITY — VERIFIED against the RTL (klauss_pkg.sv:305-316):** this CPU
+   uses the **x86 BORROW convention**, not ARM. `SUB` computes
+   `{1'b0,a}-{1'b0,b}` so `carry = sum[64] = 1` exactly when `a < b` (unsigned).
+   Therefore **`ULT = C`, `UGE = ¬C`, `ULE = C∨Z`, `UGT = ¬C∧¬Z`** (NOT the ARM
+   `ULT=¬C`). This matches today's `alu_pipe_ult = (a<b)` bit. Pin it with a test.
 3. **`JMPE/JMPNE` alias `JMPZ/JMPNZ`** — one encoding per condition.
 4. **Deterministic writers:** every flag-writer writes the **full `Z/S/C/V` set
    or none**. Fix `SETFR` partial-nibble and the rotate carry non-uniformity.

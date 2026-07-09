@@ -332,7 +332,7 @@ function [7:0] f_dump_byte;
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "E";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = st.flags.equal    ? "1" : "0";
+                    5'd10: f_dump_byte = st.flags.zero     ? "1" : "0";  // E = Z (derived)
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "C";
                     5'd13: f_dump_byte = "=";
@@ -360,11 +360,11 @@ function [7:0] f_dump_byte;
                     5'd7:  f_dump_byte = " ";
                     5'd8:  f_dump_byte = "L";
                     5'd9:  f_dump_byte = "=";
-                    5'd10: f_dump_byte = st.flags.less ? "1" : "0";
+                    5'd10: f_dump_byte = (st.flags.sign ^ st.flags.overflow) ? "1" : "0";  // L = S^V (derived)
                     5'd11: f_dump_byte = " ";
                     5'd12: f_dump_byte = "U";
                     5'd13: f_dump_byte = "=";
-                    5'd14: f_dump_byte = st.flags.ult  ? "1" : "0";
+                    5'd14: f_dump_byte = st.flags.carry ? "1" : "0";  // U = C (derived)
                     5'd15: f_dump_byte = 8'h0D;
                     5'd16: f_dump_byte = 8'h0A;
                     default: f_dump_byte = 8'h00;
