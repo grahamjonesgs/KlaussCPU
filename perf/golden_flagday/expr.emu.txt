@@ -1,0 +1,43 @@
+13:57:39.263 I Emulating ELF /media/psf/src/klausscpu-runtime/baremetal/expr.elf: 24.4 KiB, ELF base 0x00000020, board entry 0x00000020 
+Completed with 0 errors and 0 warnings in 0.010 seconds
+--- Emulator finished: 112563 instructions, stop = Halt ---
+--- Captured UART output ---
+=== Expression Evaluator ===
+[0] = 0  PASS
+[42] = 42  PASS
+[1+2] = 3  PASS
+[10-3] = 7  PASS
+[4*5] = 20  PASS
+[20/4] = 5  PASS
+[17%5] = 2  PASS
+[1+2*3] = 7  PASS
+[2*3+1] = 7  PASS
+[10-2*3] = 4  PASS
+[100/10/2] = 5  PASS
+[100/(10/2)] = 20  PASS
+[(1+2)*3] = 9  PASS
+[-5+3] = -2  PASS
+[-(5+3)] = -8  PASS
+[--5] = 5  PASS
+[---5] = -5  PASS
+[3*-4] = -12  PASS
+[-(-(-(7)))] = -7  PASS
+[  1  +  2  ] = 3  PASS
+[	10	*	10	] = 100  PASS
+[(((((((1+2)*3)+4)*5)+6)*7)+8)] = 505  PASS
+[1+(2+(3+(4+(5+(6+(7+(8+9)))))))] = 45  PASS
+[1000000*1000000] = 1000000000000  PASS
+[123456*789012] = 97408265472  PASS
+[2+3*4-5*6+7] = -9  PASS
+[100-50+25-12+6-3] = 66  PASS
+[2*3*4+5*6*7+8*9] = 306  PASS
+[]  PASS (rejected as expected)
+[1+]  PASS (rejected as expected)
+[(1+2]  PASS (rejected as expected)
+[1+2)]  PASS (rejected as expected)
+[1/0]  PASS (rejected as expected)
+[1++]  PASS (rejected as expected)
+[foo]  PASS (rejected as expected)
+
+Results: 35 pass, 0 fail
+--- end UART ---

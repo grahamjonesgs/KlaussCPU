@@ -1,0 +1,17 @@
+# KlaussCPU performance baseline — POST FLAG-DAY (flag RTL + new-LLVM ELFs + new boot ROM)
+# RTL:   feat/core-pipeline (flag unification, commit 1832787), WNS +0.203, board /dev/ttyUSB1
+# ELFs:  /media/psf/src/klausscpu-runtime/baremetal/*.elf recompiled 2026-07-09 by the
+#        flag-aware LLVM. Boot ROM = regenerated netboot.mem.
+# Tool:  klausscc @ /home/graham/Documents/src/klausscc/target/release (v2+flags, Jul 9)
+# Captured 2026-07-09. NEW ELF SET — compare deltas below, not against baseline_board.csv
+# directly on memory-sensitive kernels (stale-ELF trap). Cycles/wall-clock is the honest metric.
+kernel,cycles,instr,CPI,prev_CPI,prev_cycles,note
+alu,33000715,8000022,4.125,4.125,33000762,flat
+mem_stream,15720248,1835070,8.566,8.424,16563804,-5.1% cycles / -6.7% instr (codegen win; CPI up = removed instrs were cheap)
+ptr_chase,17693701,2600021,6.805,6.807,17700804,flat
+branchy,59030633,14687112,4.019,4.121,60530630,-2.5% cycles (flag/branch codegen)
+calls_fib,104905349,16969566,6.181,6.394,108504961,-3.3% cycles (flag/branch codegen)
+muldiv,3558586,750019,4.744,4.744,3558546,flat
+# dhrystone: 0.160 DMIPS/MHz, 28128 Dhrystones/s, self-check PASS (flat)
+# Functional: hello/queens(11)/bst(11)/expr(35)/crypto(17)/test_64bit(36) all PASS,
+#   board UART byte-identical to pre-flag-day golden. Board == updated emulator (self-checks agree).

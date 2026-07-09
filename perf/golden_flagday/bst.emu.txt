@@ -1,0 +1,20 @@
+13:57:39.242 I Emulating ELF /media/psf/src/klausscpu-runtime/baremetal/bst.elf: 26.6 KiB, ELF base 0x00000020, board entry 0x00000020 
+Completed with 0 errors and 0 warnings in 0.025 seconds
+--- Emulator finished: 85191 instructions, stop = Halt ---
+--- Captured UART output ---
+=== Binary Search Tree ===
+T1  count==30:    PASS
+T2  find all:     PASS
+T3  miss unknown: PASS
+T4  in-order:     PASS
+    min=-20  max=100  height=9
+T5a count==26:    PASS
+T5b survivors:    PASS
+T5c removed:      PASS
+T6  re-walk sort: PASS
+T7  delete absent:PASS
+T8  freeâempty:   PASS
+T9  realloc cycle:PASS
+
+Results: 11 pass, 0 fail
+--- end UART ---

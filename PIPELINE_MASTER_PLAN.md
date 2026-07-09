@@ -36,14 +36,17 @@ contradicted by an on-silicon experiment already in the record.
 
 **What is actually left, in priority order:**
 
-1. **Flag-model cleanup (§5)** — ✅ **RTL DONE & BOARD-VERIFIED** (branch
-   `feat/core-pipeline`, commit `fbb77d7`; WNS +0.203; all regressions PASS +
-   UART bit-identical + `perf_baseline` no-HCF + CPI unchanged; unit test
-   `tb_flags` 256192/0). Retired the `E/L/U` producer bits; `CMP` is now a
-   non-writing `SUB` over one 4-bit `Z/S/C/V` register; conditions derived
-   (borrow convention: `ULT=C`). Encoding-stable ⇒ current ELFs run identically.
-   **Toolchain side (backend/A3a/ADC-SBC/emulator/boot-ROM) is the user's, spec'd
-   in `FLAG_UNIFICATION_CHANGES.md`.**
+1. **Flag-model cleanup (§5)** — ✅ **COMPLETE & FULL-STACK BOARD-VERIFIED.**
+   RTL (commit `fbb77d7`, WNS +0.203) + toolchain (LLVM/emulator/assembler, user)
+   + regenerated boot ROM (`netboot.mem`, `1832787`) + recompiled ELFs all
+   validated together on silicon: every regression PASS, board UART byte-identical
+   to the pre-flag-day golden, board == updated emulator, `tb_flags` 256192/0.
+   Retired `E/L/U` → one 4-bit `Z/S/C/V` register; `CMP`≡`SUB` flags; conditions
+   derived (borrow convention `ULT=C`). **Measured perf win** from the new flag
+   codegen: branchy −2.5% cyc, calls_fib −3.3% cyc, mem_stream −5% cyc/−6.7% instr
+   (`perf/baseline_flagday.csv`). Deferred **Phase 1b** (retire the now-dead E/L/U
+   ISA-word positions + `JMPE`/COND-9 alias; shrink IRQ frame 7→4-bit) — a small
+   post-recompile flag-day cleanup, ~zero perf/area, not gating anything.
 2. **Memory penalty-reduction (§4)** — the measured highest-value CPI lever on
    memory-bound kernels: MIG BL16 / critical-word-first / next-line prefetch.
    *Not* a bigger cache. Independent of the flag work.

@@ -1,0 +1,13 @@
+13:57:39.325 I Emulating ELF /media/psf/src/klausscpu-runtime/baremetal/hello.elf: 20.7 KiB, ELF base 0x00000020, board entry 0x00000020 
+Completed with 0 errors and 0 warnings in 0.004 seconds
+--- Emulator finished: 49878 instructions, stop = Halt ---
+--- Captured UART output ---
+Hello, KlaussCPU! 1
+Hello, KlaussCPU! 2
+[test] 11 22 33 44 55 66
+[ctrl3] 11 22 33
+[u8-6 ] 11 22 33 44 55 66
+[i=aa] 11 22 33 aa 55 66
+[i=bb] 11 22 33 bb 55 66
+[i=cc] 11 22 33 cc 55 66
+--- end UART ---

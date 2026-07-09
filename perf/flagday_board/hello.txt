@@ -1,0 +1,18 @@
+14:25:02.882 I Detected ELF file: 20.7 KiB, ELF base 0x00000020, ELF entry 0x00000020, board entry 0x00000020 
+14:25:02.883 I elf2serial: /media/psf/src/klausscpu-runtime/baremetal/hello.elf → /media/psf/src/klausscpu-runtime/baremetal/hello.kbt (entry 0x00000020, heap_start 0x000052E0) 
+Sending to board: 89% (37.0 KiB / 41.5 KiB)       Sending to board: 100% (41.5 KiB / 41.5 KiB)      
+14:25:03.770 I Wrote to serial port 
+Completed with 0 errors and 0 warnings in 0.891 seconds
+14:25:03.770 W Failed to enable raw terminal mode: "No such device or address (os error 6)" 
+Monitoring serial port (Ctrl+C to stop)...
+Load Complete OK
+Hello, KlaussCPU! 1
+Hello, KlaussCPU! 2
+[test] 11 22 33 44 55 66
+[ctrl3] 11 22 33
+[u8-6 ] 11 22 33 44 55 66
+[i=aa] 11 22 33 aa 55 66
+[i=bb] 11 22 33 bb 55 66
+[i=cc] 11 22 33 cc 55 66
+
+CPU halted.
