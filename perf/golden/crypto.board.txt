@@ -1,0 +1,30 @@
+12:22:34.039 I Detected ELF file: 29.3 KiB, ELF base 0x00000020, ELF entry 0x00000020, board entry 0x00000020 
+12:22:34.040 I elf2serial: /media/psf/src/klausscpu-runtime/baremetal/crypto.elf → /media/psf/src/klausscpu-runtime/baremetal/crypto.kbt (entry 0x00000020, heap_start 0x00007568) 
+Sending to board: 92% (54.2 KiB / 58.7 KiB)       Sending to board: 100% (58.7 KiB / 58.7 KiB)      
+12:22:34.976 I Wrote to serial port 
+Completed with 0 errors and 0 warnings in 0.969 seconds
+12:22:34.976 W Failed to enable raw terminal mode: "No such device or address (os error 6)" 
+Monitoring serial port (Ctrl+C to stop)...
+Load Complete OK
+=== Crypto / Hash ===
+CRC32 empty:      PASS
+CRC32 'a':        PASS
+CRC32 'abc':      PASS
+CRC32 '12...9':   PASS
+CRC32 'fox...':   PASS
+SHA256 empty:     PASS
+SHA256 'abc':     PASS
+SHA256 'a':       PASS
+SHA256 56-byte:   PASS
+B64 enc empty:    PASS
+B64 enc 'f':      PASS
+B64 enc 'fo':     PASS
+B64 enc 'foo':    PASS
+B64 enc 'foob':   PASS
+B64 enc 'foobar': PASS
+B64 dec 'foobar': PASS
+B64 bin round:    PASS
+
+Results: 17 pass, 0 fail
+
+CPU halted.

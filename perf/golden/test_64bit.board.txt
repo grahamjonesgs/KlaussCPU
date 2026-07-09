@@ -1,0 +1,51 @@
+12:22:35.069 I Detected ELF file: 27.7 KiB, ELF base 0x00000020, ELF entry 0x00000020, board entry 0x00000020 
+12:22:35.070 I elf2serial: /media/psf/src/klausscpu-runtime/baremetal/test_64bit.elf → /media/psf/src/klausscpu-runtime/baremetal/test_64bit.kbt (entry 0x00000020, heap_start 0x00006F08) 
+Sending to board: 92% (51.2 KiB / 55.5 KiB)       Sending to board: 100% (55.5 KiB / 55.5 KiB)      
+12:22:36.009 I Wrote to serial port 
+Completed with 0 errors and 0 warnings in 1.008 seconds
+12:22:36.009 W Failed to enable raw terminal mode: "No such device or address (os error 6)" 
+Monitoring serial port (Ctrl+C to stop)...
+Load Complete OK
+=== KlaussCPU Test Suite ===
+sizeof(int)=4  sizeof(long long)=8
+
+T1  shift>31:     PASS
+T2  mul64:        PASS
+T3  add64 no ovf: PASS
+T3b int wrap:     PASS
+T4a ~0==-1:       PASS
+T4b ~~0==0:       PASS
+T4c ~5A low32:    PASS
+T4d ~5A >>32==-1: PASS
+T5a -1>>63==-1:   PASS
+T5b -1>>1==-1:    PASS
+T5c -256>>4==-16: PASS
+T6a >>63==1:      PASS
+T6b >>1 positive: PASS
+T7a 2^40>0:       PASS
+T7b 2^40>0x7F..:  PASS
+T7c -1<2^40:      PASS
+T7d -1<0:         PASS
+T7e MaxU>2^40:    PASS
+T8  factorial:    PASS
+T9  fibonacci:    PASS
+T10a sum5(1..5):  PASS
+T10b sum5(10..50):PASS
+T10c sum6(10..60):PASS
+T10d sum6_mixed:  PASS
+T11 char[]:       PASS
+T12 strings:      PASS
+T13 memset/cpy:   PASS
+T14a int global:  PASS
+T14b ll  global:  PASS
+T15 ptr arith:    PASS
+T16a heap alloc:  PASS
+T16b calloc:      PASS
+T16c-0 keep[0]:   PASS
+T16c-1 new[1]:    PASS
+T16c-2 new[2]:    PASS
+T16d coalesce:    PASS
+
+Results: 36 pass, 0 fail
+
+CPU halted.

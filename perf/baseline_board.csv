@@ -1,0 +1,15 @@
+# KlaussCPU performance baseline
+# RTL:   master a19a853 (ISA v2 phase-2), flashed to QSPI 2026-07-08, board on /dev/ttyUSB1
+# ELFs:  /media/psf/src/klausscpu-runtime/baremetal/*.elf built 2026-07-07 (ISA v2)
+# Tool:  klausscc 0.1.2 @ /home/graham/Documents/src/klausscc/target/release (v2, Jul 9)
+#        NOTE: /home/graham/klausscc-linux-target/release/klausscc is STALE v1 — do not use.
+# Captured: 2026-07-09. Reproduces perf_isav2.log (2026-07-08) exactly -> board == master.
+# CPI = cycles / instr. fastpath% = fetch|execute-overlap fast-path fires / instr.
+kernel,time_ms,cycles,instr,CPI,cache_miss_pct,fastpath_pct
+alu,330,33000762,8000022,4.125,0.00,75.0
+mem_stream,166,16563866,1966142,8.424,9.09,60.0
+ptr_chase,177,17700988,2600021,6.808,14.36,38.5
+branchy,605,60530629,14687112,4.121,0.00,56.6
+calls_fib,1085,108504997,16969566,6.394,0.00,21.2
+muldiv,36,3558553,750019,4.744,0.00,66.7
+# dhrystone: 608.009 instr/Dhry, 28128 Dhrystones/s, 16.009 DMIPS, 0.160 DMIPS/MHz, self-check PASS

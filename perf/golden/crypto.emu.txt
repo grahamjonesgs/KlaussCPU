@@ -1,0 +1,25 @@
+12:29:51.224 I Emulating ELF /media/psf/src/klausscpu-runtime/baremetal/crypto.elf: 29.3 KiB, ELF base 0x00000020, board entry 0x00000020 
+Completed with 0 errors and 0 warnings in 0.006 seconds
+--- Emulator finished: 107725 instructions, stop = Halt ---
+--- Captured UART output ---
+=== Crypto / Hash ===
+CRC32 empty:      PASS
+CRC32 'a':        PASS
+CRC32 'abc':      PASS
+CRC32 '12...9':   PASS
+CRC32 'fox...':   PASS
+SHA256 empty:     PASS
+SHA256 'abc':     PASS
+SHA256 'a':       PASS
+SHA256 56-byte:   PASS
+B64 enc empty:    PASS
+B64 enc 'f':      PASS
+B64 enc 'fo':     PASS
+B64 enc 'foo':    PASS
+B64 enc 'foob':   PASS
+B64 enc 'foobar': PASS
+B64 dec 'foobar': PASS
+B64 bin round:    PASS
+
+Results: 17 pass, 0 fail
+--- end UART ---
