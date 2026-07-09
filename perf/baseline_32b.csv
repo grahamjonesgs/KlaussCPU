@@ -1,0 +1,17 @@
+# KlaussCPU performance — 32 B cache lines + pipelined dual-BL8 fill (BL16)
+# RTL:   feat/cache-32b (commit e63c2d7 + verification), WNS +0.190, BRAM 68.89% (neutral)
+# ELFs:  flag-day recompiled set (same as baseline_flagday.csv) — apples-to-apples.
+# Board /dev/ttyUSB1, klausscc @ /home/graham/Documents/src/klausscc/target/release. 2026-07-09.
+# VERIFIED: all self-checks PASS (test_64bit 36/36, crypto 17/17, expr 35/35, queens 11/11,
+#   bst 11/11), board UART bit-identical to flag-day golden (test_64bit + queens), dhrystone PASS.
+kernel,cycles,instr,CPI,prev_CPI,miss_pct,prev_miss_pct,avgpen,delta
+alu,33000475,8000022,4.125,4.125,0.00,0.00,50.9,flat
+mem_stream,13605486,1835070,7.414,8.566,5.00,10.00,39.6,-13.4% cycles (misses HALVED, avgpen +4.5c pipelined)
+ptr_chase,17754762,2600021,6.828,6.805,13.31,14.34,32.3,+0.3% FLAT (old serial-32B was +38%)
+branchy,59030412,14687112,4.019,4.019,0.00,0.00,31.0,flat
+calls_fib,104904454,16969566,6.181,6.181,0.00,0.00,31.3,flat
+muldiv,3558444,750019,4.744,4.744,0.00,0.00,31.8,flat
+# dhrystone: 0.160 DMIPS/MHz, 28160 Dhrystones/s (was 28128), self-check PASS.
+# Key result: pipelined dual-burst fill makes 32 B lines a WIN where the 2026-06 serial
+# version was a LOSS. Miss rate halves on spatial-locality kernels at ~constant per-miss
+# penalty (2nd row-hit burst ~free); no-spatial-locality (ptr_chase) stays flat, not +38%.

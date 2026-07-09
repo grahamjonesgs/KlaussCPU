@@ -146,13 +146,24 @@ behind the timing spike.
 The handoff's Phases 0/1 are **done**; Phase 2 "bigger direct-mapped I-cache" is
 **the wrong lever** per reframe #1. What survives, in value order:
 
-### 4.1 MIG BL16 reconfiguration *(highest-value, structural)*
-Reconfigure the MIG UI from BL8 (128 b/burst) to BL16 (256 b/burst). Then a 32 B
-line fills in **one** burst — no per-miss penalty doubling — and the previously
-rejected 32 B-line win likely flips positive. This is the root-cause fix for the
-penalty-bound wall. **Risk:** MIG re-gen + whole-CPU re-validate; verify the UI
-data width / clock (the core is already synchronous to `ui_clk` post the 2:1
-rework). **Exit:** ptr_chase/mem_stream CPI ↓, timing closes, UART bit-identical.
+### 4.1 32 B cache lines + pipelined dual-BL8 fill ("BL16") — ✅ DONE & BOARD-VERIFIED
+*(branch `feat/cache-32b`, commit `e63c2d7` + verification; WNS +0.190, BRAM 68.89% neutral)*
+
+**Reframed during implementation:** DDR2 can't do a literal BL16 (BL8=128 b is the
+JEDEC max), and the 2026-06 `cache-32b` "penalty doubles" result was a *pre-sync-
+clock artifact* (mandatory per-beat CDC settle) — the current `ddr2_control` is
+fully synchronous. So the real lever is **32 B lines with a pipelined dual-BL8
+fill**: `ddr2_control` issues both read commands (base, base+16 B) back-to-back
+into the MIG FIFO; the 2nd row-hit read pipelines ~free. A cheap `ddr2_control`-
+only **spike** (`68b5278`) confirmed this on silicon (+2.6 c/miss, not +54 c).
+
+**Result:** mem_stream **−13.4 % cycles** (CPI 8.57→7.41, misses halved at ~constant
+penalty); ptr_chase **flat** (+0.3 %, vs the old serial version's +38 % regression);
+compute kernels + dhrystone flat; all self-checks PASS + UART bit-identical.
+See `perf/baseline_32b.csv`. The system is still penalty-bound — but 32 B now buys
+the miss-rate cut *without* the penalty hit. **Simpler than the historical serial
+attempt:** the pipelined bursts are atomic in `ddr2_control`, so the cache miss
+FSM needed no per-beat states and no new arbiter entries.
 
 ### 4.2 Critical-word-first *(medium, no MIG change)*
 On a miss, return the requested word to the front end **before** the rest of the

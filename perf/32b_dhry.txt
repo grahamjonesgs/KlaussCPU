@@ -1,0 +1,43 @@
+15:43:40.812 I Detected ELF file: 28.3 KiB, ELF base 0x00000020, ELF entry 0x00000020, board entry 0x00000020 
+15:43:40.813 I elf2serial: /media/psf/src/klausscpu-runtime/baremetal/dhrystone.elf → /media/psf/src/klausscpu-runtime/baremetal/dhrystone.kbt (entry 0x00000020, heap_start 0x00007158) 
+Sending to board: 92% (52.2 KiB / 56.7 KiB)       Sending to board: 100% (56.7 KiB / 56.7 KiB)      
+15:43:41.745 I Wrote to serial port 
+Completed with 0 errors and 0 warnings in 0.945 seconds
+15:43:41.745 W Failed to enable raw terminal mode: "No such device or address (os error 6)" 
+Monitoring serial port (Ctrl+C to stop)...
+Load Complete OK
+Dhrystone Benchmark, Version 2.1 (Language: C) — KlaussCPU
+Timing via hardware cycle counter (REG_PERF_CYCLES @ 100 MHz).
+Calibrated: 100000 runs (~3551 cycles/run in warm-up)
+Running 100000 Dhrystone iterations ...
+Verification (expected Dhrystone 2.1 end state):
+  Int_Glob           5            ok
+  Bool_Glob          1            ok
+  Ch_1_Glob          65           ok
+  Ch_2_Glob          66           ok
+  Arr_1_Glob[8]      7            ok
+  Arr_2_Glob[8][7]   100010       ok
+  Ptr_Glob.Discr     0            ok
+  Ptr_Glob.Int_Comp  17           ok
+  Next.Int_Comp      18           ok
+  Int_1_Loc          5            ok
+  Int_2_Loc          13           ok
+  Int_3_Loc          7            ok
+  Enum_Loc           1            ok
+  Str_1_Loc          DHRYSTONE PROGRAM, 1'ST STRING ok
+  Str_2_Loc          DHRYSTONE PROGRAM, 2'ND STRING ok
+
+=== Results ===========================================
+Runs                 : 100000
+Cycles               : 355105740
+Instructions         : 60800979
+Microseconds/Dhry    : 35.510
+Cycles/Dhrystone     : 3551.057
+Instr/Dhrystone      : 608.009
+Dhrystones/second    : 28160
+DMIPS (VAX MIPS)     : 16.027
+DMIPS/MHz            : 0.160
+Self-check           : PASS
+=======================================================
+
+CPU halted.
