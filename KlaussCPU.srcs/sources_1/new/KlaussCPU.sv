@@ -1986,13 +1986,15 @@ rams_sp_nc rams_sp_nc1 (
                   // Refill the instruction buffer from the returned line so the
                   // following sequential fetches hit it. The cache exposes the
                   // requested doubleword (w_mem_read_data) and, when valid, the
-                  // line companion (w_mem_read_data_next, addr bit 3 toggled).
+                  // NEXT SEQUENTIAL doubleword (w_mem_read_data_next, addr+8). With
+                  // 32 B lines next_valid holds at offsets 0/1/2, so the next dw is
+                  // addr[31:3]+1 — NOT the old 16 B "flip bit 3" companion.
                   r_ifb_dw[0]     <= w_mem_read_data;
                   r_ifb_dwaddr[0] <= st.mem_addr[31:3];
                   r_ifb_dwval[0]  <= 1'b1;
                   if (w_mem_next_valid) begin
                      r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= {st.mem_addr[31:4], ~st.mem_addr[3]};
+                     r_ifb_dwaddr[1] <= st.mem_addr[31:3] + 29'd1;
                      r_ifb_dwval[1]  <= 1'b1;
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;
@@ -2005,16 +2007,17 @@ rams_sp_nc rams_sp_nc1 (
                   // back (loop heads normally get the full 128-bit line); either
                   // way consume r_cap_to_tgt so a later fetch never fills it.
                   if (r_cap_to_tgt) begin
-                     if (w_mem_next_valid) begin
-                        if (st.mem_addr[3] == 1'b0) begin
-                           r_tgt_line[63:0]   <= w_mem_read_data;
-                           r_tgt_line[127:64] <= w_mem_read_data_next;
-                        end else begin
-                           r_tgt_line[63:0]   <= w_mem_read_data_next;
-                           r_tgt_line[127:64] <= w_mem_read_data;
-                        end
-                        r_tgt_lineaddr <= st.mem_addr[31:4];
-                        r_tgt_val      <= 1'b1;
+                     // The loop-head slot is a 16 B (2-dw) buffer. With 32 B cache
+                     // lines the cache's "next" dw is the SEQUENTIAL addr+8, which
+                     // forms an aligned 16 B line with the requested dw only when
+                     // mem_addr[3]==0 (requested=even/low dw, next=odd/high dw of the
+                     // SAME 16 B line). For mem_addr[3]==1 the two dwords straddle
+                     // two 16 B lines, so skip — the slot only caches aligned heads.
+                     if (w_mem_next_valid && st.mem_addr[3] == 1'b0) begin
+                        r_tgt_line[63:0]   <= w_mem_read_data;
+                        r_tgt_line[127:64] <= w_mem_read_data_next;
+                        r_tgt_lineaddr     <= st.mem_addr[31:4];
+                        r_tgt_val          <= 1'b1;
                      end
                      r_cap_to_tgt <= 1'b0;
                   end
@@ -2080,7 +2083,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_ifb_dwval[0]  <= 1'b1;
                   if (w_mem_next_valid) begin
                      r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= {st.mem_addr[31:4], ~st.mem_addr[3]};
+                     r_ifb_dwaddr[1] <= st.mem_addr[31:3] + 29'd1;   // next SEQUENTIAL dw (32 B line)
                      r_ifb_dwval[1]  <= 1'b1;
                   end else begin
                      r_ifb_dwval[1]  <= 1'b0;

@@ -44,9 +44,10 @@ module ddr2_control (
     input i_mem_write_DV,
     input i_mem_read_DV,
     input [31:0] i_mem_addr,
-    input [127:0] i_mem_write_data,
+    input i_mem_wide,                    // 1 = 32 B line (two pipelined BL8 bursts); 0 = 128 b (blitter)
+    input [255:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
-    output logic [127:0] o_mem_read_data,
+    output logic [255:0] o_mem_read_data,
     output logic o_mem_ready,
     output o_calib_done,          // MIG init_calib_complete (DDR2 ready)
     output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (CPU runs synchronous to it)
@@ -109,10 +110,11 @@ module ddr2_control (
    logic [3:0] state = IDLE;
 
    logic rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
-   // BL16 SPIKE: 4-beat counter for a pipelined dual-BL8 (256-bit) read. Measures
-   // whether a 2nd back-to-back row-hit read pipelines cheaply (~+8c to ready) or
-   // serialises (~+54c) — the go/no-go for real 32-byte cache lines.
-   logic [1:0] rd_cnt = 2'd0;
+   // 32 B lines: a pipelined dual-BL8 read returns 4 beats reassembled into the
+   // 256-bit line; the blitter (narrow) uses a single BL8. rd_cnt counts the beats.
+   logic [1:0] rd_cnt   = 2'd0;
+   logic       r_wide   = 1'b0;    // latched i_mem_wide for the current transaction
+   logic       wr_burst = 1'b0;    // wide writeback: 0 = burst_lo (base), 1 = burst_hi (base+16)
 
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
@@ -178,6 +180,8 @@ module ddr2_control (
          app_wdf_end <= 0;
          rd_beat <= 1'b0;
          rd_cnt <= 2'd0;
+         r_wide <= 1'b0;
+         wr_burst <= 1'b0;
       end else begin
          case (state)
             // IDLE: stay here until BOTH DVs are deasserted before returning to
@@ -206,13 +210,18 @@ module ddr2_control (
                end
             end
 
-            // 2:1 write: issue the command once + push TWO 64-bit wdf beats.
-            WRITE: begin                          // command + beat0 (line[63:0])
+            // 2:1 write, per BL8 burst: one command + TWO 64-bit wdf beats.
+            // A 32 B writeback (i_mem_wide) is TWO serial BL8 bursts (writeback is
+            // off the CPU critical path, so serial is fine). wr_burst selects
+            // burst_lo(base)=line[255:128] then burst_hi(base+16)=line[127:0], with
+            // the same per-burst beat order as the read (beat0→[63:0], beat1→[127:64]).
+            WRITE: begin                          // command + beat0
                if (app_rdy & app_wdf_rdy) begin
                   app_en       <= 1;
                   app_cmd      <= CMD_WRITE;
-                  app_addr     <= i_mem_addr[27:1]; // byte addr → MIG halfword addr
-                  app_wdf_data <= i_mem_write_data[63:0];
+                  app_addr     <= wr_burst ? (i_mem_addr[27:1] + 27'd8) : i_mem_addr[27:1];
+                  app_wdf_data <= (i_mem_wide & ~wr_burst) ? i_mem_write_data[191:128]  // wide burst_lo: dw1
+                                                           : i_mem_write_data[63:0];    // narrow / wide burst_hi: dw3
                   app_wdf_mask <= i_app_wdf_mask[7:0];
                   app_wdf_wren <= 1;
                   app_wdf_end  <= 1'b0;              // beat0 is not the last beat
@@ -220,12 +229,13 @@ module ddr2_control (
                end
             end
 
-            WRITE_B1: begin                       // clear cmd; push beat1 (line[127:64])
+            WRITE_B1: begin                       // clear cmd; push beat1
                if (app_rdy & app_en) begin
                   app_en <= 0;
                end
                if (app_wdf_rdy & app_wdf_wren) begin   // beat0 accepted → present beat1
-                  app_wdf_data <= i_mem_write_data[127:64];
+                  app_wdf_data <= (i_mem_wide & ~wr_burst) ? i_mem_write_data[255:192]  // wide burst_lo: dw0
+                                                           : i_mem_write_data[127:64];  // narrow / wide burst_hi: dw2
                   app_wdf_mask <= i_app_wdf_mask[15:8];
                   app_wdf_end  <= 1'b1;                 // beat1 is the last beat
                   // app_wdf_wren stays high for beat1
@@ -244,25 +254,30 @@ module ddr2_control (
                end
 
                if (~app_en & ~app_wdf_wren) begin
-                  o_mem_ready <= 1'b1;
-                  state <= IDLE;
+                  if (i_mem_wide & ~wr_burst) begin
+                     wr_burst    <= 1'b1;          // wide: now write burst_hi (base + 16 B)
+                     state       <= WRITE;
+                  end else begin
+                     wr_burst    <= 1'b0;
+                     o_mem_ready <= 1'b1;
+                     state <= IDLE;
+                  end
                end
             end
 
 
-            // BL16 SPIKE — pipelined dual-BL8 read. Issue command 1 (base), then
-            // command 2 (base + 16 B) back-to-back into the MIG command FIFO, then
-            // consume 4 × 64-bit beats. The cache uses only the first 128 b
-            // (beats 0/1); beats 2/3 (burst 2) are DISCARDED. Purpose: does the 2nd
-            // row-hit read pipeline (small delta to o_mem_ready) or serialise
-            // (~54c)? That is the go/no-go for real 32-byte lines.
+            // 32 B read (i_mem_wide) = two pipelined BL8 bursts; blitter = one BL8.
+            // Wide: command 1 (base) + command 2 (base+16 B) go back-to-back into the
+            // MIG FIFO; 4 beats reassemble the 256-bit line (see READ_DONE map). The
+            // 2nd row-hit read pipelines ~free (measured ~+2.6c/miss on silicon).
             READ: begin
                if (app_rdy) begin
                   app_en   <= 1;
                   app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr (burst 1 = base)
                   app_cmd  <= CMD_READ;
                   rd_cnt   <= 2'd0;
-                  state    <= READ_CMD2;
+                  r_wide   <= i_mem_wide;
+                  state    <= i_mem_wide ? READ_CMD2 : READ_DONE;  // narrow (blitter) = 1 burst
                end
             end
 
@@ -282,13 +297,23 @@ module ddr2_control (
                end
 
                if (app_rd_data_valid) begin
-                  case (rd_cnt)
-                     2'd0: o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]
-                     2'd1: o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
-                     2'd2: ;                                         // beat2 = burst2 low (discard)
-                     2'd3: begin o_mem_ready <= 1'b1; state <= IDLE; end // beat3 = burst2 high → done
-                     default: ;
-                  endcase
+                  if (r_wide) begin
+                     case (rd_cnt)
+                        2'd0: o_mem_read_data[191:128] <= app_rd_data;  // burst_lo beat0 = dw1
+                        2'd1: o_mem_read_data[255:192] <= app_rd_data;  // burst_lo beat1 = dw0
+                        2'd2: o_mem_read_data[63:0]    <= app_rd_data;  // burst_hi beat0 = dw3
+                        2'd3: begin o_mem_read_data[127:64] <= app_rd_data; o_mem_ready <= 1'b1; state <= IDLE; end // dw2
+                        default: ;
+                     endcase
+                  end else begin
+                     if (rd_cnt == 2'd0) begin
+                        o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]
+                     end else begin
+                        o_mem_read_data[127:64] <= app_rd_data;   // beat1 = line[127:64]
+                        o_mem_ready <= 1'b1;
+                        state <= IDLE;
+                     end
+                  end
                   rd_cnt <= rd_cnt + 2'd1;
                end
             end

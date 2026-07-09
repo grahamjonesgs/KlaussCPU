@@ -108,11 +108,11 @@ module mem_read_write (
     output            o_mnt_busy
 );
 
-    parameter  CACHE_SIZE = 2_048;              // number of sets — 2 ways × 2048 sets = 4096 total lines = 64 KB
-    localparam INDEX_BITS = $clog2(CACHE_SIZE); // 11
-    // 32-bit byte address, bottom 4 bits = byte offset within 16-byte line
-    // addr[31:4] is the line address; tag = upper bits, index = lower INDEX_BITS
-    localparam TAG_BITS   = 28 - INDEX_BITS;    // 17 (addr[31:4] = 28 bits, lower INDEX_BITS used for index)
+    parameter  CACHE_SIZE = 1_024;              // number of sets — 2 ways × 1024 sets = 2048 total lines × 32 B = 64 KB
+    localparam INDEX_BITS = $clog2(CACHE_SIZE); // 10
+    // 32 B (256-bit) lines: bottom 5 bits = byte offset within the line.
+    // addr[31:5] is the line address (27 bits); tag = upper bits, index = lower INDEX_BITS.
+    localparam TAG_BITS   = 27 - INDEX_BITS;    // 17 (addr[31:5] = 27 bits, lower INDEX_BITS used for index)
 
     // -------------------------------------------------------------------------
     // DDR2 interface
@@ -134,8 +134,8 @@ module mem_read_write (
     logic          o_ddr_mem_write_DV = 1'b0;
     logic          o_ddr_mem_read_DV  = 1'b0;
     logic  [ 31:0] o_ddr_mem_addr;
-    logic  [127:0] o_ddr_mem_write_data;
-    wire [127:0] i_ddr_mem_read_data;
+    logic  [255:0] o_ddr_mem_write_data;   // 32 B line (cache path); blitter uses low 128 b
+    wire   [255:0] i_ddr_mem_read_data;    // 32 B line (cache path); blitter uses low 128 b
     wire         i_ddr_mem_ready;
     wire [ 15:0] w_app_wdf_mask;
     logic  [ 15:0] r_app_wdf_mask;
@@ -156,10 +156,13 @@ module mem_read_write (
     wire         mig_write_DV   = r_grant_blit ? i_dma_write_DV   : o_ddr_mem_write_DV;
     wire         mig_read_DV    = r_grant_blit ? i_dma_read_DV    : o_ddr_mem_read_DV;
     wire [ 31:0] mig_addr       = r_grant_blit ? i_dma_addr       : o_ddr_mem_addr;
-    wire [127:0] mig_write_data = r_grant_blit ? i_dma_write_data : o_ddr_mem_write_data;
+    wire [255:0] mig_write_data = r_grant_blit ? {128'b0, i_dma_write_data} : o_ddr_mem_write_data;
     wire [ 15:0] mig_wdf_mask   = r_grant_blit ? i_dma_wdf_mask   : w_app_wdf_mask;
+    // Cache fills a full 32 B line (two pipelined BL8 bursts); the blitter does a
+    // single 128 b burst. `mig_wide` tells ddr2_control which.
+    wire         mig_wide       = ~r_grant_blit;
 
-    assign o_dma_read_data = i_ddr_mem_read_data;   // shared; blitter latches on o_dma_ready
+    assign o_dma_read_data = i_ddr_mem_read_data[127:0]; // blitter uses low 128 b; latches on o_dma_ready
     assign o_dma_grant     = r_grant_blit;
 
     // -------------------------------------------------------------------------
@@ -205,16 +208,15 @@ module mem_read_write (
     //
     // DDR2 MIG address is in 16-bit half-word units (BL8 = 128-bit burst).
     // byte_addr → DDR half-word addr = byte_addr >> 1
-    // Burst-aligned (3 DDR addr bits = 16 bytes = 8×2B): clear bottom 3 DDR bits
-    //   → clear bottom 4 byte bits: {byte_addr[31:4], 4'b0000}
-    // Doubleword offset within 128-bit cache line: byte_addr[3]  (2 doublewords per line)
-    //   0 = upper doubleword [127:64], 1 = lower doubleword [63:0]
-    // Cache index: addr[4+INDEX_BITS-1:4], Tag: addr[31:4+INDEX_BITS]
+    // 32 B line base = clear bottom 5 byte bits: {byte_addr[31:5], 5'b0}.
+    // Doubleword offset within 256-bit line: byte_addr[4:3] (1-of-4 dwords).
+    //   00=dw0 [255:192], 01=dw1 [191:128], 10=dw2 [127:64], 11=dw3 [63:0]
+    // Cache index: addr[5+INDEX_BITS-1:5], Tag: addr[31:5+INDEX_BITS]
     // -------------------------------------------------------------------------
-    wire [31:0]           w_computed_ddr_addr = {cpu.addr[31:4], 4'b0000};
-    wire [INDEX_BITS-1:0] w_cache_index       = cpu.addr[4+INDEX_BITS-1:4];
-    wire [TAG_BITS-1:0]   w_cache_tag         = cpu.addr[31:4+INDEX_BITS];
-    wire                  w_byte_offset       = cpu.addr[3];    // doubleword within cache line
+    wire [31:0]           w_computed_ddr_addr = {cpu.addr[31:5], 5'b00000};   // 32 B-aligned line base
+    wire [INDEX_BITS-1:0] w_cache_index       = cpu.addr[5+INDEX_BITS-1:5];
+    wire [TAG_BITS-1:0]   w_cache_tag         = cpu.addr[31:5+INDEX_BITS];
+    wire [1:0]            w_dw_offset         = cpu.addr[4:3];   // 1-of-4 doubleword within the 256-bit line
 
     // -------------------------------------------------------------------------
     // Cache arrays — ALL in BRAM (dirty bits in distributed RAM — narrow 1-bit
@@ -231,12 +233,12 @@ module mem_read_write (
     (* ram_style = "block" *)
     logic [TAG_BITS:0] cache_val_addr_way1 [CACHE_SIZE-1:0];
 
-    // 128-bit cache line data
+    // 256-bit (32 B) cache line data
     (* ram_style = "block" *)
-    logic [127:0] cache_val_data_way0 [CACHE_SIZE-1:0];
+    logic [255:0] cache_val_data_way0 [CACHE_SIZE-1:0];
 
     (* ram_style = "block" *)
-    logic [127:0] cache_val_data_way1 [CACHE_SIZE-1:0];
+    logic [255:0] cache_val_data_way1 [CACHE_SIZE-1:0];
 
     // Dirty bits — 1-bit wide, distributed RAM. Written via dedicated always
     // blocks below (separate from the FSM) so Vivado can infer DRAM cleanly.
@@ -259,13 +261,13 @@ module mem_read_write (
     logic                  r_dirty_way0;
     logic                  r_dirty_way1;
     logic                  r_lru;
-    logic [127:0]          r_data_way0;
-    logic [127:0]          r_data_way1;
+    logic [255:0]          r_data_way0;
+    logic [255:0]          r_data_way1;
 
     // Latched request (stable while CPU waits, but latching makes CDC clear)
     logic [INDEX_BITS-1:0] r_cache_index;
     logic [TAG_BITS-1:0]   r_cache_tag;
-    logic                  r_byte_offset;   // which doubleword in 128-bit cache line (0=upper, 1=lower)
+    logic [1:0]            r_dw_offset;     // 1-of-4 doubleword within the 256-bit line (00=dw0 … 11=dw3)
     logic [7:0]            r_byte_en;       // byte enables (8'hFF = full doubleword write)
     logic [63:0]           r_write_data;
     logic                  r_is_write;
@@ -290,7 +292,7 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     // Miss-path pipeline registers
     // -------------------------------------------------------------------------
-    logic [127:0] r_evict_data_hold;     // dirty line being written back to DDR
+    logic [255:0] r_evict_data_hold;     // dirty 32 B line being written back to DDR
     logic [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
     logic [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
     logic         r_evict_way;          // which way to replace (miss paths)
@@ -430,7 +432,7 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     always_ff @(posedge i_Clk) begin : fsm
 
-        logic [127:0] merged; // procedural variable for cache line merge
+        logic [255:0] merged; // procedural variable for cache line merge
 
         case (state)
 
@@ -496,7 +498,7 @@ module mem_read_write (
                     // Latch request
                     r_cache_index       <= w_cache_index;
                     r_cache_tag         <= w_cache_tag;
-                    r_byte_offset       <= w_byte_offset;
+                    r_dw_offset         <= w_dw_offset;
                     r_byte_en           <= cpu.byte_en;
                     r_write_data        <= cpu.write_data;
                     r_is_write          <= cpu.write_DV;
@@ -524,14 +526,18 @@ module mem_read_write (
                         // write the BRAM now.  Dirty bit set via the
                         // combinatorial dirty0/1_wen wires (w_write_hit_now).
                         begin : write_hit_merge
-                            logic [127:0] hitline;
+                            logic [255:0] hitline;
                             logic [63:0]  old_dw;
                             logic [63:0]  new_dw;
                             hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
-                            // Extract old doubleword at the target offset
-                            // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
-                            old_dw = r_byte_offset ? hitline[63:0]
-                                                   : hitline[127:64];
+                            // Extract old doubleword at r_dw_offset
+                            // (00=dw0 [255:192], 01=dw1 [191:128], 10=dw2 [127:64], 11=dw3 [63:0])
+                            case (r_dw_offset)
+                                2'b00:   old_dw = hitline[255:192];
+                                2'b01:   old_dw = hitline[191:128];
+                                2'b10:   old_dw = hitline[127:64];
+                                default: old_dw = hitline[63:0];
+                            endcase
                             // Apply byte enables: r_byte_en[0]=LSByte bits[7:0], r_byte_en[7]=MSByte bits[63:56]
                             new_dw[63:56] = r_byte_en[7] ? r_write_data[63:56] : old_dw[63:56];
                             new_dw[55:48] = r_byte_en[6] ? r_write_data[55:48] : old_dw[55:48];
@@ -541,11 +547,14 @@ module mem_read_write (
                             new_dw[23:16] = r_byte_en[2] ? r_write_data[23:16] : old_dw[23:16];
                             new_dw[15:8]  = r_byte_en[1] ? r_write_data[15:8]  : old_dw[15:8];
                             new_dw[7:0]   = r_byte_en[0] ? r_write_data[7:0]   : old_dw[7:0];
-                            // Merge new doubleword into cache line
-                            if (r_byte_offset)
-                                merged = {hitline[127:64], new_dw};
-                            else
-                                merged = {new_dw, hitline[63:0]};
+                            // Merge the new doubleword back into its slot; other dwords unchanged.
+                            merged = hitline;
+                            case (r_dw_offset)
+                                2'b00:   merged[255:192] = new_dw;
+                                2'b01:   merged[191:128] = new_dw;
+                                2'b10:   merged[127:64]  = new_dw;
+                                default: merged[63:0]    = new_dw;
+                            endcase
                         end
 
                         // Separate write-enable per way — one write per array per cycle, BRAM-friendly.
@@ -561,7 +570,7 @@ module mem_read_write (
                     end else begin
                         // Write miss
                         r_evict_way        <= r_evict_way_sel;
-                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 4'b0000};
+                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
                         r_fetch_ddr_addr   <= r_computed_ddr_addr;
                         r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
                         if (r_evict_dirty) begin
@@ -581,17 +590,18 @@ module mem_read_write (
                         // the "next" doubleword is only valid at offset 0
                         // (companion is the lower dw of the same line).
                         begin : read_hit_present
-                            logic [127:0] hitline;
+                            logic [255:0] hitline;
                             hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
-                            if (r_byte_offset == 1'b0) begin
-                                cpu.read_data      <= hitline[127:64];
-                                cpu.read_data_next <= hitline[63:0];
-                                cpu.next_valid     <= 1'b1;
-                            end else begin
-                                cpu.read_data      <= hitline[63:0];
-                                cpu.read_data_next <= 64'h0;
-                                cpu.next_valid     <= 1'b0;
-                            end
+                            // Present the requested doubleword at r_dw_offset, plus the
+                            // NEXT sequential doubleword within the 32 B line (offset+1)
+                            // for the IFB lookahead. next_valid whenever offset != dw3.
+                            case (r_dw_offset)
+                                2'b00: begin cpu.read_data <= hitline[255:192]; cpu.read_data_next <= hitline[191:128]; end
+                                2'b01: begin cpu.read_data <= hitline[191:128]; cpu.read_data_next <= hitline[127:64];  end
+                                2'b10: begin cpu.read_data <= hitline[127:64];  cpu.read_data_next <= hitline[63:0];    end
+                                default: begin cpu.read_data <= hitline[63:0];  cpu.read_data_next <= 64'h0;            end
+                            endcase
+                            cpu.next_valid <= (r_dw_offset != 2'b11);
                         end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
@@ -601,7 +611,7 @@ module mem_read_write (
                     end else begin
                         // Read miss
                         r_evict_way        <= r_evict_way_sel;
-                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 4'b0000};
+                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
                         r_fetch_ddr_addr   <= r_computed_ddr_addr;
                         r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
                         if (r_evict_dirty) begin
@@ -668,9 +678,13 @@ module mem_read_write (
                     begin : write_fetch_merge
                         logic [63:0] old_dw;
                         logic [63:0] new_dw;
-                        // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
-                        old_dw = r_byte_offset ? i_ddr_mem_read_data[63:0]
-                                               : i_ddr_mem_read_data[127:64];
+                        // fetched 256 b line: dw0[255:192] dw1[191:128] dw2[127:64] dw3[63:0]
+                        case (r_dw_offset)
+                            2'b00:   old_dw = i_ddr_mem_read_data[255:192];
+                            2'b01:   old_dw = i_ddr_mem_read_data[191:128];
+                            2'b10:   old_dw = i_ddr_mem_read_data[127:64];
+                            default: old_dw = i_ddr_mem_read_data[63:0];
+                        endcase
                         new_dw[63:56] = r_byte_en[7] ? r_write_data[63:56] : old_dw[63:56];
                         new_dw[55:48] = r_byte_en[6] ? r_write_data[55:48] : old_dw[55:48];
                         new_dw[47:40] = r_byte_en[5] ? r_write_data[47:40] : old_dw[47:40];
@@ -679,10 +693,13 @@ module mem_read_write (
                         new_dw[23:16] = r_byte_en[2] ? r_write_data[23:16] : old_dw[23:16];
                         new_dw[15:8]  = r_byte_en[1] ? r_write_data[15:8]  : old_dw[15:8];
                         new_dw[7:0]   = r_byte_en[0] ? r_write_data[7:0]   : old_dw[7:0];
-                        if (r_byte_offset)
-                            merged = {i_ddr_mem_read_data[127:64], new_dw};
-                        else
-                            merged = {new_dw, i_ddr_mem_read_data[63:0]};
+                        merged = i_ddr_mem_read_data;
+                        case (r_dw_offset)
+                            2'b00:   merged[255:192] = new_dw;
+                            2'b01:   merged[191:128] = new_dw;
+                            2'b10:   merged[127:64]  = new_dw;
+                            default: merged[63:0]    = new_dw;
+                        endcase
                     end
 
                     // Install merged line in cache as DIRTY (write-back policy on miss).
@@ -756,16 +773,14 @@ module mem_read_write (
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;
 
-                    // r_byte_offset 0 = upper [127:64], 1 = lower [63:0]
-                    if (r_byte_offset == 1'b0) begin
-                        cpu.read_data      <= i_ddr_mem_read_data[127:64];
-                        cpu.read_data_next <= i_ddr_mem_read_data[63:0];
-                        cpu.next_valid     <= 1'b1;
-                    end else begin
-                        cpu.read_data      <= i_ddr_mem_read_data[63:0];
-                        cpu.read_data_next <= 64'h0;
-                        cpu.next_valid     <= 1'b0;
-                    end
+                    // Present requested dw + next sequential dw (IFB lookahead).
+                    case (r_dw_offset)
+                        2'b00: begin cpu.read_data <= i_ddr_mem_read_data[255:192]; cpu.read_data_next <= i_ddr_mem_read_data[191:128]; end
+                        2'b01: begin cpu.read_data <= i_ddr_mem_read_data[191:128]; cpu.read_data_next <= i_ddr_mem_read_data[127:64];  end
+                        2'b10: begin cpu.read_data <= i_ddr_mem_read_data[127:64];  cpu.read_data_next <= i_ddr_mem_read_data[63:0];    end
+                        default: begin cpu.read_data <= i_ddr_mem_read_data[63:0];  cpu.read_data_next <= 64'h0;                        end
+                    endcase
+                    cpu.next_valid <= (r_dw_offset != 2'b11);
 
                     cpu.ready <= 1;
                     state       <= PRE_WAIT;
@@ -998,6 +1013,7 @@ module mem_read_write (
         .i_mem_write_DV   (mig_write_DV),
         .i_mem_read_DV    (mig_read_DV),
         .i_mem_addr       (mig_addr),
+        .i_mem_wide       (mig_wide),        // 1 = cache 32 B (2 pipelined bursts); 0 = blitter 128 b
         .i_mem_write_data (mig_write_data),
         .i_app_wdf_mask   (mig_wdf_mask),
         .o_mem_read_data  (i_ddr_mem_read_data),
