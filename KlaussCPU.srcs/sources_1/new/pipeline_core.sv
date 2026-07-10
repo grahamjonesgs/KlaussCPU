@@ -477,6 +477,7 @@ module pipeline_core
    dec_t        mem_d;
    logic [63:0] mem_result;         // non-mem result (or store raw data)
    flags_t      mem_fval, mem_fmask;
+   logic        mem_zval;           // Z = (value==0), evaluated at WB (set_zero)
    logic [31:0] mem_eaddr;          // RAW effective address (lane math)
    logic [31:0] mem_iaddr;          // ISSUE address (aligned, drives the port)
    logic [63:0] mem_wdata;          // lane-replicated store data
@@ -492,6 +493,7 @@ module pipeline_core
    logic        wb_wreg;
    logic [63:0] wb_value;
    flags_t      wb_fval, wb_fmask;
+   logic        wb_zval;
    logic [31:0] wb_sp_new;
    logic        wb_sp_we;
    logic [3:0]  wb_mask_new;
@@ -631,7 +633,6 @@ module pipeline_core
                   else        sum = {1'b0, ex_a} + {1'b0, ex_alu_b} + {64'b0, cin};
                   exo_result        = sum[63:0];
                   exo_fval.carry    = sum[64];
-                  exo_fval.zero     = (sum[63:0] == 64'b0);
                   exo_fval.sign     = sum[63];
                   exo_fval.overflow = is_sub ? ((ex_a[63] != ex_alu_b[63]) && (sum[63] != ex_a[63]))
                                              : ((ex_a[63] == ex_alu_b[63]) && (sum[63] != ex_a[63]));
@@ -669,7 +670,6 @@ module pipeline_core
                4'd10: exo_result = ex_a ^  (64'b1 << ex_shcnt);
                default: exo_result = {63'b0, ex_a[ex_b[5:0]]};   // BTSTRR
             endcase
-            exo_fval.zero = (exo_result == 64'b0);
          end
          U_ROT1: begin
             case (ex_d.sub)
@@ -678,7 +678,6 @@ module pipeline_core
                4'd5: begin exo_result = {ex_a[62:0], flags.carry};  exo_fval.carry = ex_a[63]; end
                default: begin exo_result = {flags.carry, ex_a[63:1]}; exo_fval.carry = ex_a[0]; end
             endcase
-            exo_fval.zero = (exo_result == 64'b0);
          end
          U_BTSTN: exo_fval.zero = ~ex_a[ex_d.shn];
          U_UNARY: begin
@@ -704,7 +703,6 @@ module pipeline_core
                4'd10: exo_result = {57'b0, f_ctz64(ex_a)};
                default: exo_result = {flags.zero, flags.zero, flags.carry, flags.overflow, 60'b0}; // GETF
             endcase
-            exo_fval.zero = (exo_result == 64'b0);
             if (ex_d.sub == 4'd4) exo_fval.sign = exo_result[63];
          end
          U_LEA:   exo_result = {32'b0, ex_pc + ex_var1};
@@ -715,7 +713,6 @@ module pipeline_core
             bx_mask  = (32'hFFFFFFFF >> (32 - bx_len));
             bx_res   = (ex_a >> bx_start) & bx_mask;
             exo_result = {32'b0, bx_res};
-            exo_fval.zero = (exo_result == 64'b0);
          end
          U_BDEP: begin
             bx_start = ex_var1[4:0];  bx_len = ex_var1[12:8];
@@ -777,7 +774,6 @@ module pipeline_core
          end
          U_MUL: begin
             exo_result    = ex_d.mdhigh ? mul_pipe2[127:64] : mul_pipe2[63:0];
-            exo_fval.zero = (exo_result == 64'd0);
             exo_fval.sign = exo_result[63];
             if (ex_d.mdhigh)      exo_fval.overflow = 1'b0;
             else if (ex_d.mduns)  exo_fval.overflow = (mul_pipe2[127:64] != 64'd0);
@@ -793,7 +789,6 @@ module pipeline_core
                q_raw  = ex_div_mod ? dv.remainder : dv.quotient;
                q_neg  = dv.is_signed && (ex_div_mod ? dv.sign_r : dv.sign_q);
                exo_result        = q_neg ? (~q_raw + 64'd1) : q_raw;
-               exo_fval.zero     = (q_raw == 64'd0);
                exo_fval.overflow = 1'b0;
             end
          end
@@ -968,8 +963,16 @@ module pipeline_core
          ret_valid <= 1'b0;  ret_wr <= 1'b0;
          if (wb_valid) begin
             if (wb_wreg)    rf[wb_rd] <= wb_value;
-            if (wb_fmask != '0)
+            if (wb_fmask != '0) begin
                flags <= (flags & ~wb_fmask) | (wb_fval & wb_fmask);
+               // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
+               // runs here from the REGISTERED wb_value, not in EX behind the
+               // shifter/adder (the WNS -0.351 path). Every Z-writer's zero is
+               // (value==0) except BTSTN (~bit) and IRET (frame restore),
+               // which keep wb_fval.zero. DIV negation preserves zero.
+               if (wb_fmask.zero && wb_zval)
+                  flags.zero <= (wb_value == 64'b0);
+            end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
             if (wb_park) begin
@@ -1109,6 +1112,7 @@ module pipeline_core
             wb_wreg    <= mem_d.wreg;
             wb_value   <= mem_is_read ? mem_ldval : mem_result;
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
+            wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             wb_fmask   <= mem_fmask;
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
@@ -1135,6 +1139,7 @@ module pipeline_core
                mem_result <= (ex_d.uop == U_STORE || ex_d.uop == U_PUSH ||
                               ex_d.uop == U_CALL) ? exo_raw : exo_result;
                mem_fval   <= exo_fval; mem_fmask <= ex_valid ? exo_fmask : '0;
+               mem_zval   <= (ex_d.uop != U_BTSTN);   // Z from (value==0) at WB
                mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
