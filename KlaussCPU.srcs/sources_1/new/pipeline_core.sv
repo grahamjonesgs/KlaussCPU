@@ -46,6 +46,7 @@ module pipeline_core
    output logic         lcd_dc,
    output logic         lcd_dv,
    output logic         lcd_rst_n,
+   output logic         lcd_rst_wr,   // pulse: LCDRST executed (lcd_rst_n valid)
    input  logic         lcd_ready,
    // interrupts (external gating: irq_ready already masked by int_mask_o,
    // exactly like w_irq_ready / w_irq_sel / r_interrupt_table at top level)
@@ -66,6 +67,8 @@ module pipeline_core
    output logic [31:0]  ret_wr_addr, // as driven on d_addr
    output logic [7:0]   ret_wr_be,
    output logic [63:0]  ret_wr_raw,  // RAW store value (pre lane-replication)
+   // port fully idle (no transaction in flight) — gates external bus handoff
+   output logic         bus_idle,
    // park (drained stop)
    output logic         parked,
    output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT
@@ -807,6 +810,8 @@ module pipeline_core
    logic       if_xc;
    logic [28:0] if_req_dw;
    logic        if_rebase;
+   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc
+                     && !m_read_DV && !m_write_DV;
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
@@ -1014,7 +1019,11 @@ module pipeline_core
             end else dly_cnt <= dly_cnt + 45'd1;
          end
 
-         if (ex_valid && ex_d.uop == U_LCDRST) lcd_rst_n <= ex_var1[0];
+         lcd_rst_wr <= 1'b0;
+         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy) begin
+            lcd_rst_n  <= ex_var1[0];
+            lcd_rst_wr <= 1'b1;
+         end
 
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin

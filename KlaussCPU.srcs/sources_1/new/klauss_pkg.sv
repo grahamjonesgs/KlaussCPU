@@ -18,7 +18,7 @@ package klauss_pkg;
    // from the original localparams, so the synthesized hardware is unchanged.
    typedef enum logic [33:0] {
       OPCODE_REQUEST = 34'h1, OPCODE_FETCH = 34'h2, OPCODE_FETCH2 = 34'h4,
-      VAR1_FETCH = 34'h8, VAR1_FETCH2 = 34'h10, WAITING = 34'h20,  // WAITING: interruptible core-suspend (WAIT opcode); uses the state bit above VAR1_FETCH2
+      VAR1_FETCH = 34'h8, PIPE_RUN = 34'h10, WAITING = 34'h20,  // PIPE_RUN: the 5-stage pipeline_core owns execution (reuses the retired VAR1_FETCH2 bit); WAITING: interruptible core-suspend (WAIT opcode)
       START_WAIT = 34'h40, UART_DELAY = 34'h80, OPCODE_EXECUTE = 34'h100,
       HCF_1 = 34'h200, HCF_2 = 34'h400, HCF_3 = 34'h800, HCF_4 = 34'h1_000,
       NO_PROGRAM = 34'h2_000, LOAD_START = 34'h4_000, LOADING_BYTE = 34'h8_000,

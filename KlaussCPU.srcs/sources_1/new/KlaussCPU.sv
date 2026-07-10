@@ -244,8 +244,12 @@ module KlaussCPU (
    // A source fires only when it has a non-zero vector AND its mask bit is set.
    // w_irq_sel picks the source to dispatch; timer (0) has priority over blitter
    // (1). Sources 2..3 remain free for future devices — OR them in here.
-   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && st.int_mask[0];
-   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && st.int_mask[1];
+   // M5d: the pipeline core owns int_mask; the FSM's st.int_mask is retired
+   // from the gating (kept in st only as a dormant field).
+   wire [3:0] pip_int_mask;
+   wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
+   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
+   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
    wire w_irq_ready = w_irq_src0 || w_irq_src1;
    wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : 2'd1;
 
@@ -652,15 +656,102 @@ module KlaussCPU (
    // assigns bridge those wires to the interface (request out, response back).
    membus_if cpu_mem();
    membus_if dram_mem();
-   assign cpu_mem.write_DV      = st.mem_write_DV;
-   assign cpu_mem.read_DV       = st.mem_read_DV;
-   assign cpu_mem.addr          = st.mem_addr;
-   assign cpu_mem.write_data    = st.mem_write_data;
-   assign cpu_mem.byte_en       = st.mem_byte_en;
+   // ------------------------------------------------------------------------
+   // M5d: in PIPE_RUN the 5-stage pipeline_core owns the memory port; in every
+   // other state (boot copy / loader / HCF stack reads) the FSM's st.mem_*
+   // drive it as before. The handoff points guarantee the loser's port is
+   // idle: the pipeline parks only after draining (pip_bus_idle), and the FSM
+   // is idle in PIPE_RUN.
+   // ------------------------------------------------------------------------
+   wire        w_pipe_owns = (st.SM == PIPE_RUN);
+   wire [31:0] pip_m_addr;
+   wire        pip_m_read_DV, pip_m_write_DV;
+   wire [63:0] pip_m_wdata;
+   wire [7:0]  pip_m_be;
+   assign cpu_mem.write_DV      = w_pipe_owns ? pip_m_write_DV : st.mem_write_DV;
+   assign cpu_mem.read_DV       = w_pipe_owns ? pip_m_read_DV  : st.mem_read_DV;
+   assign cpu_mem.addr          = w_pipe_owns ? pip_m_addr     : st.mem_addr;
+   assign cpu_mem.write_data    = w_pipe_owns ? pip_m_wdata    : st.mem_write_data;
+   assign cpu_mem.byte_en       = w_pipe_owns ? pip_m_be       : st.mem_byte_en;
    assign w_mem_read_data       = cpu_mem.read_data;
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
    assign w_mem_ready           = cpu_mem.ready;
+
+   // Pipeline core — the execution engine (owns rf / flags / SP / PC /
+   // int_mask; single retire at WB; see pipeline_core.sv + PIPELINE_IMPL.md).
+   // Held in reset through the boot/loader states (a fresh program starts from
+   // architectural zero, like the emulator); NOT reset in HCF/HALTED so the
+   // crash dump can snapshot its state.
+   wire w_pip_hold_rst = (st.SM == NO_PROGRAM) || (st.SM == LOADING_BYTE) ||
+                         (st.SM == LOAD_COMPLETE) || (st.SM == START_WAIT) ||
+                         (st.SM == UART_DELAY);
+   logic        r_pip_start;
+   logic [31:0] r_pip_start_pc;
+   wire         pip_ret_valid, pip_ret_wr;
+   wire [31:0]  pip_ret_pc, pip_ret_op, pip_ret_wr_addr;
+   wire [7:0]   pip_ret_wr_be;
+   wire [63:0]  pip_ret_wr_raw;
+   wire         pip_parked;
+   wire [2:0]   pip_park_kind;
+   wire [31:0]  pip_park_pc, pip_park_op;
+   wire [63:0]  pip_dbg_r [0:15];
+   wire [31:0]  pip_dbg_sp;
+   flags_t      pip_dbg_flags;
+   wire         pip_irq_ack;
+   wire [1:0]   pip_irq_ack_sel;
+   wire [7:0]   pip_lcd_byte;
+   wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
+   wire         pip_bus_idle;   // gates the park -> FSM bus handoff
+   // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
+   // "MMIO store wins" ordering is preserved inside pipeline_core.
+   wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
+                                                && (w_mmio_addr[15:0]  == 16'h0000);
+
+   pipeline_core pipeline_core_i (
+      .clk        (i_Clk),
+      .rst        (w_reset_H || w_pip_hold_rst),
+      .start      (r_pip_start),
+      .start_pc   (r_pip_start_pc),
+      .m_addr     (pip_m_addr),
+      .m_read_DV  (pip_m_read_DV),
+      .m_write_DV (pip_m_write_DV),
+      .m_wdata    (pip_m_wdata),
+      .m_be       (pip_m_be),
+      .m_rdata    (w_mem_read_data),
+      .m_rdata_next (w_mem_read_data_next),
+      .m_next_valid (w_mem_next_valid),
+      .m_ready    (w_mem_ready && w_pipe_owns),
+      .irq_ready  (w_irq_ready),
+      .irq_sel    (w_irq_sel),
+      .irq_vector (r_interrupt_table[w_irq_sel]),
+      .irq_ack    (pip_irq_ack),
+      .irq_ack_sel(pip_irq_ack_sel),
+      .int_mask_o (pip_int_mask),
+      .mask_wr    (w_pip_mask_wr),
+      .mask_wdata (w_mmio_write_data[3:0]),
+      .lcd_byte   (pip_lcd_byte),
+      .lcd_dc     (pip_lcd_dc),
+      .lcd_dv     (pip_lcd_dv),
+      .lcd_rst_n  (pip_lcd_rst_n),
+      .lcd_rst_wr (pip_lcd_rst_wr),
+      .lcd_ready  (i_TX_LCD_Ready),
+      .bus_idle   (pip_bus_idle),
+      .ret_valid  (pip_ret_valid),
+      .ret_pc     (pip_ret_pc),
+      .ret_op     (pip_ret_op),
+      .ret_wr     (pip_ret_wr),
+      .ret_wr_addr(pip_ret_wr_addr),
+      .ret_wr_be  (pip_ret_wr_be),
+      .ret_wr_raw (pip_ret_wr_raw),
+      .parked     (pip_parked),
+      .park_kind  (pip_park_kind),
+      .park_pc    (pip_park_pc),
+      .park_op    (pip_park_op),
+      .dbg_r      (pip_dbg_r),
+      .dbg_sp     (pip_dbg_sp),
+      .dbg_flags  (pip_dbg_flags)
+   );
 
    (* KEEP_HIERARCHY = "yes" *)
    bus_splitter bus_splitter_i (
@@ -816,7 +907,7 @@ module KlaussCPU (
    wire [127:0] w_blit_dma_read_data;
    wire         w_blit_dma_ready;
    wire         w_blit_dma_grant;
-   wire         w_blit_irq;          // DONE interrupt — wired to the CPU interrupt controller (source 1)
+   // (w_blit_irq declared near the IRQ source gating at the top of the module)
 
    mmio_if blit_bus();
    assign blit_bus.write_DV   = w_blit_write_DV;
@@ -919,7 +1010,7 @@ module KlaussCPU (
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h00F: begin  // Interrupt controller / timer
             case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {60'b0, st.int_mask};
+               16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
                16'h0008: r_mmio_read_data_comb = {62'b0, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
@@ -1394,6 +1485,8 @@ rams_sp_nc rams_sp_nc1 (
       r_var1_prefetched = 0;
       r_ir_valid = 1'b0;
       r_ir_presettled = 1'b0;
+      r_pip_start = 1'b0;
+      r_pip_start_pc = 32'h20;
       r_FPC = 32'h0;
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
@@ -1800,7 +1893,10 @@ rams_sp_nc rams_sp_nc1 (
             START_WAIT: begin
                r_msg_send_DV <= 1'b0;
                if (r_start_wait_counter == 0) begin
-                  st.SM <= OPCODE_REQUEST;
+                  // M5d: execution belongs to the pipeline core.
+                  r_pip_start    <= 1'b1;
+                  r_pip_start_pc <= st.PC;
+                  st.SM <= PIPE_RUN;
                   st.seven_seg_value1 <= 32'h22_22_22_22;
                   st.seven_seg_value2 <= 32'h22_22_22_22;
                end else begin
@@ -1814,9 +1910,52 @@ rams_sp_nc rams_sp_nc1 (
             UART_DELAY: begin
                r_msg_send_DV <= 1'b0;
                if (!w_sending_msg) begin
-                  st.SM <= OPCODE_REQUEST;
+                  r_pip_start    <= 1'b1;
+                  r_pip_start_pc <= st.PC;
+                  st.SM <= PIPE_RUN;
                end
+            end
 
+            // ─────────────────────────────────────────────────────────────
+            // PIPE_RUN — the 5-stage pipeline_core owns execution and the
+            // memory port. This arm only mirrors retire bookkeeping (crash
+            // trace ring, instruction count), consumes IRQ dispatch acks,
+            // relays the LCD side-port, and handles the drained park
+            // (HALT / TRAP / illegal) by snapshotting the pipeline's
+            // architectural state into the FSM's copies so the existing
+            // HALTED_BREAK / HCF crash-dump machinery works unchanged.
+            // ─────────────────────────────────────────────────────────────
+            PIPE_RUN: begin
+               r_pip_start   <= 1'b0;
+               r_msg_send_DV <= 1'b0;   // MMIO UART TX (after-case) re-arms it
+               if (pip_ret_valid) begin
+                  r_trace_buf[r_trace_idx] <= {pip_ret_pc, pip_ret_op};
+                  r_trace_idx              <= r_trace_idx + 4'd1;
+                  if (r_trace_idx == 4'd15) r_trace_full <= 1'b1;
+                  r_instr_count <= r_instr_count + 32'd1;
+               end
+               if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
+                  r_timer_interrupt <= 1'b0;   // dispatch consumed the timer
+               if (pip_lcd_dv) begin
+                  o_TX_LCD_Byte <= pip_lcd_byte;
+                  o_LCD_DC      <= pip_lcd_dc;
+                  o_TX_LCD_DV   <= 1'b1;
+               end else begin
+                  o_TX_LCD_DV   <= 1'b0;
+               end
+               if (pip_lcd_rst_wr) o_LCD_reset_n <= pip_lcd_rst_n;
+               if (pip_parked && pip_bus_idle) begin
+                  for (i = 0; i < 16; i = i + 1) r_register[i] <= pip_dbg_r[i];
+                  st.PC    <= pip_park_pc;
+                  st.SP    <= pip_dbg_sp;
+                  st.flags <= pip_dbg_flags;
+                  case (pip_park_kind)
+                     3'd0: st.SM <= HALTED_BREAK;                                  // HALT
+                     3'd1: begin st.SM <= HCF_1; st.error_code <= ERR_TRAP; end    // TRAP
+                     3'd2: begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
+                     default: ;   // WAIT parks wake inside the pipeline
+                  endcase
+               end
             end
 
             OPCODE_REQUEST: begin
@@ -3126,7 +3265,8 @@ end
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;
-         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired) r_perf_instr <= r_perf_instr + 64'd1;
+         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired || pip_ret_valid)
+            r_perf_instr <= r_perf_instr + 64'd1;   // M5d: pipeline retires count here
          if (r_fastpath_fired) r_perf_fastpath <= r_perf_fastpath + 64'd1;  // fast-path-dispatch fire count (MMIO 0xA8)
 
          // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
@@ -3148,6 +3288,10 @@ end
             r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
          else if (st.SM == HALTED || st.SM == HALTED_BREAK || st.SM == WAITING)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
+         else if (st.SM == PIPE_RUN)
+            // M5d bring-up: all pipeline cycles land in the exec bucket; the
+            // per-hazard stall counters arrive with M6 (STALL_* plan).
+            r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
 
          // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
          // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
@@ -3168,6 +3312,19 @@ end
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
 
          // Tier 2 — instruction mix: one class per committed instruction.
+         // M5d: pipeline retires classify by the retired opcode.
+         if (pip_ret_valid) begin
+            case (f_perf_class(pip_ret_op))
+               PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
+               PC_LOAD:     r_perf_cnt_load     <= r_perf_cnt_load     + 64'd1;
+               PC_STORE:    r_perf_cnt_store    <= r_perf_cnt_store    + 64'd1;
+               PC_BRANCH:   r_perf_cnt_branch   <= r_perf_cnt_branch   + 64'd1;
+               PC_JUMP:     r_perf_cnt_jump     <= r_perf_cnt_jump     + 64'd1;
+               PC_CALL:     r_perf_cnt_call     <= r_perf_cnt_call     + 64'd1;
+               PC_INDIRECT: r_perf_cnt_indirect <= r_perf_cnt_indirect + 64'd1;
+               default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
+            endcase
+         end
          if (st.SM == OPCODE_FETCH2) begin
             case (f_perf_class(w_opcode))
                PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
