@@ -30,8 +30,24 @@
 > CPU_RESETN), and the stale-MMIO-ready back-to-back hazard → **ready-edge
 > arming** in all port engines. Timing: first impl WNS −0.124 (DSP CE cone) →
 > mul chain moved to its own free-running block (silicon structure).
-> **Next: M5e** — rebuild (arming fix), prog.tcl, run_m5e_board.sh regression
-> + perf_baseline CPI. Discipline: interlock-first, verify before committing.
+> **M5e DONE — M5 COMPLETE, BOARD-VERIFIED (2026-07-10).** Timing closed at
+> WNS +0.002 after 3 RTL iterations (DSP-CE cone → free-running mul block;
+> EX ==0 reduction → deferred Z at WB; ALU b-operand mux → resolved at
+> dispatch — all three are the FSM's own structural patterns; margin is thin,
+> firm with floorplan/phys_opt at M6). On silicon (volatile JTAG, master
+> still on QSPI): **hello/bst/expr/test_64bit/queens/crypto/dhrystone all
+> UART BYTE-IDENTICAL** to the emulator golden (`perf/m5a/run_m5e_board.sh`,
+> 7/7), and **test_rtos PASS** (251 timer ticks, 300 context switches —
+> precise IRQ/IRET under a preemptive RTOS on hardware). CPI (interlock-only,
+> `perf/baseline_m5_pipeline.csv`, NEW ELF set — directional vs the 2-stage
+> FSM): alu 4.75 (was 4.44), branchy 4.74 (~flat), calls_fib 6.18 (−1.5%),
+> ptr_chase 6.58 (−3%), mem_stream 7.75 (−8%), muldiv 4.48 (−9%). The
+> interlock-only pipeline already matches the fast-path-optimized FSM;
+> **M6 (EX→EX 2-input forwarding, P3-verified +0.080) is the CPI lever** —
+> every ALU RAW currently pays 3 bubbles. Also M6: per-hazard STALL_*
+> counters, Tier-2 branch-taken wire-up, firm the timing margin. Then M7
+> split I/D port, M8 LLVM sched model. NOT yet on QSPI; debug single-step is
+> FSM-era (documented gap); Zephyr bring-up on the pipeline still to do.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
 > superseded by `tb_pipeline_isa.sv` + the golden-trace harness.

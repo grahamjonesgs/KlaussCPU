@@ -17,11 +17,14 @@ for P in $PROGS; do
     awk '/--- Captured UART output ---/{f=1;next} /--- end UART ---/{f=0} f' "$P.emu.out" > "$P.uart.golden"
   fi
   iconv -f UTF-8 -t LATIN1 "$P.uart.golden" > "board/$P.gold.raw" 2>/dev/null || cp "$P.uart.golden" "board/$P.gold.raw"
-  # run on the board (monitor exits on the halt break; belt-and-braces timeout)
+  # run on the board (monitor exits on the halt break; belt-and-braces
+  # timeout). klausscc's monitor writes the received UART stream to STDERR.
   timeout 600 $K --input "$E/$P.elf" --serial /dev/ttyUSB1 --monitor \
-      > "board/$P.board.raw" 2> "board/$P.board.err"
-  # program bytes = everything after the loader's "Load Complete OK" banner
-  perl -0777 -ne 'if (/Load Complete OK\r?\n(.*)$/s) { print $1 }' "board/$P.board.raw" > "board/$P.board.prog"
+      > /dev/null 2> "board/$P.board.raw"
+  # program bytes = between the loader's "Load Complete OK" banner and the
+  # monitor's "CPU halted." status line
+  perl -0777 -ne 'if (/Load Complete OK[\r\n]+(.*?)\r?\n?CPU halted\./s) { print $1 }' \
+      "board/$P.board.raw" > "board/$P.board.prog"
   GB=$(wc -c < "board/$P.gold.raw")
   head -c "$GB" "board/$P.board.prog" > "board/$P.board.cut"
   if cmp -s "board/$P.board.cut" "board/$P.gold.raw"; then
