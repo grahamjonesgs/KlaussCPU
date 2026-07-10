@@ -47,6 +47,17 @@ module pipeline_core
    output logic         lcd_dv,
    output logic         lcd_rst_n,
    input  logic         lcd_ready,
+   // interrupts (external gating: irq_ready already masked by int_mask_o,
+   // exactly like w_irq_ready / w_irq_sel / r_interrupt_table at top level)
+   input  logic         irq_ready,
+   input  logic [1:0]   irq_sel,
+   input  logic [31:0]  irq_vector,
+   output logic         irq_ack,       // 1-cycle: source irq_ack_sel dispatched
+   output logic [1:0]   irq_ack_sel,
+   output logic [3:0]   int_mask_o,
+   // int_mask MMIO write-back (the SoC MMIO handler owns 0xF00F_0000)
+   input  logic         mask_wr,
+   input  logic [3:0]   mask_wdata,
    // retire / trace (registered at the WB commit edge; sample at negedge)
    output logic         ret_valid,
    output logic [31:0]  ret_pc,
@@ -116,6 +127,16 @@ module pipeline_core
    genvar gi;
    generate for (gi = 0; gi < 16; gi++) assign dbg_r[gi] = rf[gi]; endgenerate
    assign dbg_sp = sp; assign dbg_flags = flags;
+   assign int_mask_o = int_mask;
+
+   // IRQ entry sequencer (the OPCODE_REQUEST frame-push, pipelined form):
+   // taken at a dispatch boundary INSTEAD of a fetch; the pipe drains, the
+   // frame {mask, 7-bit flag word, resume PC} is pushed via the port, the
+   // source is auto-masked, PC redirects to the vector.
+   logic       irq_active;
+   logic       irq_xc;
+   logic [1:0] irq_sel_q;
+   logic [31:0] irq_vec_q;
 
    // ------------------------------------------- IF: 2-dword window (IFB model)
    logic [63:0] ifb_dw [0:1];
@@ -867,12 +888,51 @@ module pipeline_core
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; ifb_val <= 2'b00;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
+         irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
       end else begin
          if (start) begin
             pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00;
+         end
+
+         irq_ack <= 1'b0;
+
+         // WAIT wake: a parked WAIT resumes on a pending IRQ; the next dispatch
+         // boundary takes the interrupt (resume PC = WAIT+4, as the FSM's
+         // WAITING -> OPCODE_REQUEST path does).
+         if (parked && park_kind == 3'd3 && irq_ready) begin
+            parked     <= 1'b0;
+            fetch_halt <= 1'b0;
+         end
+
+         // ---------------- IRQ entry sequencer ----------------
+         if (irq_active) begin
+            if (!irq_xc) begin
+               // wait for full drain + a free port, then push the frame
+               if (!id_valid && !ex_valid && !mem_valid && !wb_valid
+                   && mem_xc == 2'd0 && !if_xc) begin
+                  m_addr     <= sp - 32'd8;
+                  m_wdata    <= {21'b0, int_mask,
+                                 flags.zero, flags.zero, flags.carry,
+                                 flags.overflow, flags.sign,
+                                 (flags.sign ^ flags.overflow), flags.carry,
+                                 pc};
+                  m_be       <= 8'hFF;
+                  m_write_DV <= 1'b1;
+                  irq_xc     <= 1'b1;
+               end
+            end else if (m_ready) begin
+               m_write_DV          <= 1'b0;
+               sp                  <= sp - 32'd8;
+               int_mask[irq_sel_q] <= 1'b0;   // masked while handler runs; IRET restores
+               pc                  <= irq_vec_q;
+               irq_ack             <= 1'b1;
+               irq_ack_sel         <= irq_sel_q;
+               irq_xc              <= 1'b0;
+               irq_active          <= 1'b0;
+            end
          end
 
          // ---------------- WB: the single retire point ----------------
@@ -998,7 +1058,7 @@ module pipeline_core
                m_read_DV <= 1'b0;
                if_xc     <= 1'b0;
             end
-         end else if (running && !fetch_halt && !parked && !fetch_ok
+         end else if (running && !fetch_halt && !parked && !irq_active && !fetch_ok
                       && !mem_port_op && mem_xc == 2'd0) begin
             m_addr    <= {miss_dw, 3'b000};
             m_read_DV <= 1'b1;
@@ -1072,7 +1132,14 @@ module pipeline_core
                   if (id_valid && !fetch_halt && dec.serialize) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
-                  end else if (running && !fetch_halt && fetch_ok) begin
+                  end else if (running && !fetch_halt && !irq_active && irq_ready) begin
+                     // take the IRQ at this boundary instead of fetching; the
+                     // instruction in ID (older) dispatched above and drains.
+                     irq_active <= 1'b1;
+                     irq_sel_q  <= irq_sel;
+                     irq_vec_q  <= irq_vector;
+                     id_valid   <= 1'b0;
+                  end else if (running && !fetch_halt && !irq_active && fetch_ok) begin
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      id_pc    <= pc;
@@ -1083,6 +1150,38 @@ module pipeline_core
                end
             end
          end
+
+         // ---------------- SMC squash (store into in-flight code) ----------
+         // Runs LAST in the block: overrides this edge's dispatch/redirect
+         // writes (the same ordering rule as the SoC MMIO-store-wins handler).
+         // A completing DRAM store invalidates matching IFB slots and squashes
+         // any YOUNGER in-flight instruction (IF window / ID / EX) whose word
+         // span overlaps the stored dword; refetch from the oldest squashed.
+         // Safe because side effects only exist from MEM onward.
+         if (mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF) begin : smc
+            logic [28:0] st_dw;
+            logic [31:0] id_last, ex_last;
+            logic hit_id, hit_ex;
+            st_dw   = mem_iaddr[31:3];
+            id_last = id_pc + {26'b0, dec.len, 2'b00} - 32'd1;
+            ex_last = ex_pc + {26'b0, ex_d.len, 2'b00} - 32'd1;
+            hit_id  = id_valid && (id_pc[31:3] == st_dw || id_last[31:3] == st_dw);
+            hit_ex  = ex_valid && (ex_pc[31:3] == st_dw || ex_last[31:3] == st_dw);
+            if (ifb_val[0] && ifb_base == st_dw)          ifb_val[0] <= 1'b0;
+            if (ifb_val[1] && ifb_base + 29'd1 == st_dw)  ifb_val[1] <= 1'b0;
+            if (hit_ex || hit_id) begin
+               ex_valid <= 1'b0;
+               id_valid <= 1'b0;
+               dly_on   <= 1'b0;
+               ifb_val  <= 2'b00;
+               pc       <= hit_ex ? ex_pc : id_pc;
+               if (hit_ex && ex_d.serialize) fetch_halt <= 1'b0; // re-dispatch re-arms it
+            end
+         end
+
+         // int_mask MMIO write-back (SoC handler owns 0xF00F_0000) — last, so
+         // a memory-mapped store wins over a same-edge IRET restore.
+         if (mask_wr) int_mask <= mask_wdata;
       end
    end
 

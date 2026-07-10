@@ -10,8 +10,15 @@
 > field is excluded (emulator doesn't model silicon mul/div flag writes — the
 > pipeline implements the FSM's Z/S/V / Z/V semantics), and the emulator's
 > UART golden is Latin-1→UTF-8 expanded (undone with iconv before compare).
-> **Next: M5b** (shared mem port + ready handshake + latency sweep), then M5c
-> (IRQ/IRET/WAIT/SMC/HCF), M5d (SoC integration), M5e (board). Discipline:
+> **M5b done**: one shared membus-shape port (= cpu_mem signal set), ready
+> handshake, IFB-style 2-dword fetch window, MEM-priority arbitration —
+> trace-identical across latency 1/9/random. **M5c done**: precise IRQ entry
+> (drain at dispatch boundary, frame push, auto-mask), IRET, WAIT wake, SMC
+> squash-and-refetch — WAIT+SMC directed tests PASS; bst under a 997-cycle
+> IRQ storm (829 dispatches) and test_64bit under 463-cycle storm + random
+> latency (3989 dispatches) both retire program-only traces IDENTICAL to the
+> no-IRQ goldens (runner `perf/m5a/run_m5c.sh`).
+> **Next: M5d** (SoC integration), M5e (board). Discipline:
 > interlock-first (no forwarding before M6), **verify before committing**.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —

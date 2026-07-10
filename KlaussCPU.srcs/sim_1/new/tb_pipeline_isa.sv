@@ -23,6 +23,14 @@ module tb_pipeline_isa;
    logic [7:0]   m_be;
    logic         m_next_valid, m_ready;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n;
+   logic         irq_ready;
+   logic [1:0]   irq_sel = 2'd0;
+   logic [31:0]  irq_vector = 32'h0010_0000;
+   logic         irq_ack;
+   logic [1:0]   irq_ack_sel;
+   logic [3:0]   int_mask_o;
+   logic         mask_wr = 0;
+   logic [3:0]   mask_wdata;
    logic         ret_valid, ret_wr;
    logic [31:0]  ret_pc, ret_op, ret_wr_addr;
    logic [7:0]   ret_wr_be;
@@ -75,6 +83,7 @@ module tb_pipeline_isa;
 
    always @(posedge clk) begin
       m_ready <= 1'b0;
+      mask_wr <= 1'b0;   // apply_write (below, same block) pulses it
       if (rst) begin
          in_flight <= 1'b0;
       end else if (!in_flight && !m_ready && (m_read_DV || m_write_DV)) begin
@@ -109,6 +118,11 @@ module tb_pipeline_isa;
             $fwrite(uart_f, "%c", wd[7:0]);
             uart_n++;
          end
+         if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) begin
+            // INT_MASK write: mirror the SoC MMIO handler into the core
+            mask_wr    <= 1'b1;
+            mask_wdata <= wd[3:0];
+         end
       end else begin
          cur = rd_dw(a);
          for (int i = 0; i < 8; i++) nxt[i*8 +: 8] = be[i] ? wd[i*8 +: 8] : cur[i*8 +: 8];
@@ -116,6 +130,46 @@ module tb_pipeline_isa;
          else if (a >= HI_BASE && a < 32'h0800_0000) mem_hi[(a - HI_BASE) >> 3] <= nxt;
          else $display("TB: WARN write outside model at %08x", a);
       end
+   endtask
+
+   // ---------------- IRQ / timer model + handler ---------------------------
+   // Mirrors the top level: source 0 = timer (level pending, cleared on
+   // dispatch ack), gated by the core's int_mask. Handler at 0x100000
+   // increments the counter at 0x180000 and IRETs (callee-saved).
+   int          irq_period = 0;     // +IRQ_PERIOD=N (0 = off)
+   longint      irq_fire_at = 0;    // one-shot fire cycle (wait test)
+   longint      cyc = 0;
+   int          irq_acks = 0;
+   logic        timer_pending = 0;
+   int          timer_cnt = 0;
+   string       test_mode = "";
+
+   assign irq_ready = timer_pending && int_mask_o[0];
+
+   always @(posedge clk) begin
+      if (!rst) begin
+         cyc <= cyc + 1;
+         if (irq_period != 0) begin
+            timer_cnt <= timer_cnt + 1;
+            if (timer_cnt >= irq_period) begin
+               timer_pending <= 1'b1;
+               timer_cnt     <= 0;
+            end
+         end
+         if (irq_fire_at != 0 && cyc == irq_fire_at) timer_pending <= 1'b1;
+         if (irq_ack && irq_ack_sel == 2'd0) begin
+            timer_pending <= 1'b0;
+            irq_acks      <= irq_acks + 1;
+         end
+      end
+   end
+
+   task automatic install_handler();
+      mem_lo['h20000] = {32'h64000020, 32'h64000010}; // PUSH r1 / PUSH r2
+      mem_lo['h20001] = {32'h00180000, 32'h8BD00100}; // SETR r1, 0x180000
+      mem_lo['h20002] = {32'h57880220, 32'h5B000210}; // MEMREADRR r2,[r1] / INCR r2
+      mem_lo['h20003] = {32'h64800200, 32'h5F000210}; // MEMSET64RR [r1],r2 / POP r2
+      mem_lo['h20004] = {32'h65C00000, 32'h64800100}; // POP r1 / IRET
    endtask
 
    // ---------------- trace: emulator line format ---------------------------
@@ -164,14 +218,28 @@ module tb_pipeline_isa;
             3'd0: $display("TB_M5A: stop = Halt after %0d instructions", icount);
             3'd1: $display("TB_M5A: stop = Trap at pc=%08x", park_pc);
             3'd2: $display("TB_M5A: stop = InvalidOpcode(%08x) at pc=%08x", park_op, park_pc);
-            default: $display("TB_M5A: stop = Wait at pc=%08x", park_pc);
+            default: ;   // WAIT park: not terminal — an IRQ wakes it (M5c)
          endcase
-         done();
+         if (park_kind != 3'd3) done();
       end
    end
 
    task automatic done();
       $display("TB_M5A: %0d instructions retired, %0d UART bytes", icount, uart_n);
+      if (irq_period != 0 || irq_fire_at != 0)
+         $display("TB_M5A: %0d interrupts dispatched", irq_acks);
+      if (test_mode == "wait") begin
+         if (mem_lo['h30000] === 64'h77 && irq_acks == 1)
+            $display("TB_M5C WAIT: PASS (handler ran, resumed, marker stored)");
+         else
+            $display("TB_M5C WAIT: FAIL (mem=%016x acks=%0d)", mem_lo['h30000], irq_acks);
+      end
+      if (test_mode == "smc") begin
+         if (dbg_r[2] === 64'hBEEF)
+            $display("TB_M5C SMC: PASS (squash + refetch read the new word)");
+         else
+            $display("TB_M5C SMC: FAIL (r2=%016x, expected beef)", dbg_r[2]);
+      end
       $fclose(trace_f);  $fclose(uart_f);
       $finish;
    endtask
@@ -201,17 +269,54 @@ module tb_pipeline_isa;
       void'($value$plusargs("ENTRY=%h", start_pc));
       void'($value$plusargs("LAT=%d", lat_fix));    // fixed DRAM latency (cycles)
       void'($value$plusargs("RAND=%d", lat_rand));  // + $urandom%RAND extra
+      void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
+      void'($value$plusargs("TEST=%s", test_mode));
       for (int i = 0; i < LO_DW; i++) mem_lo[i] = 64'h0;
       for (int i = 0; i < HI_DW; i++) mem_hi[i] = 64'h0;
-      $readmemh(image_f, mem_lo);
+      case (test_mode)
+         "wait": begin
+            // SETR r1,0x180000; SETR r3,1; SETR r4,0xF00F0000;
+            // MEMSET64RR [r4],r3 (unmask timer); WAIT; SETR r2,0x77;
+            // MEMSET64RR [r1],r2; HALT
+            mem_lo[4] = {32'h00180000, 32'h8BD00100};
+            mem_lo[5] = {32'h00000001, 32'h8BD00300};
+            mem_lo[6] = {32'hF00F0000, 32'h8BD00400};
+            mem_lo[7] = {32'h6C020000, 32'h5F000340};
+            mem_lo[8] = {32'h00000077, 32'h8BD00200};
+            mem_lo[9] = {32'h6C010000, 32'h5F000210};
+            install_handler();
+            irq_fire_at = 1500;    // well after the WAIT parks
+            image_f = "(built-in wait test)";
+         end
+         "smc": begin
+            // SETR r1,0xBEEF; SETR r3,0x3C; MEMSET32 [r3],r1 (hits the imm
+            // word of the SETR r2 already in flight); NOP; SETR r2,0xDEAD;
+            // HALT — with the squash, r2 must read back 0xBEEF.
+            mem_lo[4] = {32'h0000BEEF, 32'h8BD00100};
+            mem_lo[5] = {32'h0000003C, 32'h8BD00300};
+            mem_lo[6] = {32'h6C000000, 32'h5E000130};
+            mem_lo[7] = {32'h0000DEAD, 32'h8BD00200};
+            mem_lo[8] = {32'h00000000, 32'h6C010000};
+            image_f = "(built-in smc test)";
+         end
+         default: begin
+            $readmemh(image_f, mem_lo);
+            if (irq_period != 0) install_handler();
+         end
+      endcase
       trace_f = $fopen(trace_fn, "w");
       uart_f  = $fopen(uart_fn, "w");
       if (trace_f == 0 || uart_f == 0) begin
          $display("TB_M5A: cannot open output files"); $finish;
       end
-      $display("TB_M5A: image=%s entry=%08x maxi=%0d", image_f, start_pc, maxi);
+      $display("TB_M5A: image=%s entry=%08x maxi=%0d irq_period=%0d",
+               image_f, start_pc, maxi, irq_period);
       rst = 1;  repeat (4) @(posedge clk);
       rst = 0;  @(posedge clk);
       start = 1; @(posedge clk); start = 0;
+      if (irq_period != 0 && test_mode == "") begin
+         @(negedge clk);
+         dut.int_mask = 4'h1;   // storm mode: pre-enable the timer source
+      end
    end
 endmodule
