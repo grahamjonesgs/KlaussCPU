@@ -18,8 +18,20 @@
 > IRQ storm (829 dispatches) and test_64bit under 463-cycle storm + random
 > latency (3989 dispatches) both retire program-only traces IDENTICAL to the
 > no-IRQ goldens (runner `perf/m5a/run_m5c.sh`).
-> **Next: M5d** (SoC integration), M5e (board). Discipline:
-> interlock-first (no forwarding before M6), **verify before committing**.
+> **M5d done (sim)**: pipeline_core instantiated in KlaussCPU as the PIPE_RUN
+> engine (FSM keeps boot/loader/HCF/HALTED; park = drain + snapshot into the
+> FSM's arch copies; cpu_mem muxed; IRQ/int_mask/LCD/perf re-wired — see the
+> M5d commits). Full-SoC tb (tb_soc + run_m5d_soc.sh, behavioral DDR +
+> stubs): hello boots through the REAL boot-ROM→DDR→loader→PIPE_RUN chain,
+> runs to HALTED, UART **byte-identical**; trace identical up to the first
+> UART-TX busy poll (emulator transmits instantly — extra poll retires are
+> legitimate, the board behaves the same). Two integration bugs found IN SIM,
+> both fixed+committed: xsim-only X from the un-reset RX FIFO (tb now pulses
+> CPU_RESETN), and the stale-MMIO-ready back-to-back hazard → **ready-edge
+> arming** in all port engines. Timing: first impl WNS −0.124 (DSP CE cone) →
+> mul chain moved to its own free-running block (silicon structure).
+> **Next: M5e** — rebuild (arming fix), prog.tcl, run_m5e_board.sh regression
+> + perf_baseline CPI. Discipline: interlock-first, verify before committing.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
 > superseded by `tb_pipeline_isa.sv` + the golden-trace harness.
