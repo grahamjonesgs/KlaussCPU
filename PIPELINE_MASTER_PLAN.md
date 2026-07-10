@@ -291,11 +291,21 @@ forwarding on the read-port input. The CORE handoff's "CPI ~11 → ~1" framing a
 "do the I-cache first, a pipelined EX behind serial fetch just relocates the
 stall" are both stale: fetch is already decoupled, and CPI is already ~4.4–8.8.
 
-**The binding constraint is timing, not CPI** (reframe #2). Per `PIPELINE_PLAN.md`
-the deep pipeline is **gated by a throwaway timing spike (P3):** insert only a
-3-input forward mux on `r_reg_port_a/b`, run P&R, measure WNS on the carry chain.
-GREEN (≥0.4 ns) → full forwarding; AMBER → simple/logic-only; **RED → stop and
-ship what exists.** Do not build the 5-stage datapath before this spike.
+**The binding constraint is timing, not CPI** (reframe #2). The **P3 forward-mux
+timing spike is DONE** (throwaway builds, 2026-07-09):
+- **Full 3-input forward mux** (reg/EX/MEM) on the ALU operand path: **FAILS,
+  WNS −0.209 ns.** Congestion-bound (80 % route delay), in the ALU cluster — NOT
+  the carry chain (which absorbed the mux fine). The ALU is 5909 LUTs of dense
+  compute; there is no adjacent area to trim (uart_rx's 3028 is a mis-attribution;
+  the crash dump is already pre-fetch-optimized to ~150 LUTs).
+- **2-input forward mux** (reg/EX only, MEM→EX via load-use interlock): **CLOSES,
+  WNS +0.080 ns.**
+
+**Verdict = AMBER → the pipeline is a GO, scoped to EX-only (2-input) forwarding +
+a 1-cycle load-use interlock.** Full 3-way combinational forwarding needs
+ALU-cluster floorplanning (pblock) or a datapath restructure — not required for a
+first pipeline. The +0.080 margin is thin (near the ±0.12 P&R noise), so firm it
+with a floorplan/`phys_opt` pass when building for real.
 
 Keeping the CORE handoff's stage mapping (it's sound), corrected for what's built:
 
