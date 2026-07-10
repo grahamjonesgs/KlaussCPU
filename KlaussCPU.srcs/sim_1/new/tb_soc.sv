@@ -168,8 +168,16 @@ module tb_soc;
    wire [12:0] ddr2_addr;
    wire [2:0]  ddr2_ba;
 
+   // Power-on reset: silicon initializes registers from the bitstream; xsim
+   // starts them X, so pulse the reset like a real button press.
+   logic cpu_resetn = 1'b0;
+   initial begin
+      repeat (40) @(posedge clk100);
+      cpu_resetn = 1'b1;
+   end
+
    KlaussCPU dut (
-      .CPU_RESETN (1'b1),
+      .CPU_RESETN (cpu_resetn),
       .i_Clk_board(clk100),
       .i_uart_rx  (1'b1),
       .i_load_H   (1'b0),
@@ -261,7 +269,9 @@ module tb_soc;
       end
       if (icount == last_i) begin
          idle_n++;
-         if (idle_n > 200000) begin
+         // generous: a legitimate HCF crash dump emits ~1k UART bytes with no
+         // retires; only a genuinely stuck pipe survives this long
+         if (idle_n > 600000) begin
             $display("TB_SOC: DEADLOCK sm=%0d pc=%08x i=%0d", dut.st.SM, dut.pipeline_core_i.pc, icount);
             $fclose(uart_f); $fclose(trace_f);
             $finish;

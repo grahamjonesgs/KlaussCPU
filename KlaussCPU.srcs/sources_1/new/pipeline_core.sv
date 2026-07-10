@@ -823,6 +823,15 @@ module pipeline_core
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc
                      && !m_read_DV && !m_write_DV;
 
+   // Ready-EDGE arming: the real cache HOLDS ready high until its 2-FF sync
+   // sees DV drop (then COOL_DOWN). A back-to-back request issued while the
+   // previous transaction's ready is still high would otherwise "complete"
+   // instantly with stale data. Every issue clears the arm (unless ready is
+   // already low); the arm sets once ready has been observed low; completions
+   // require ready AND armed. One flag suffices — one transaction in flight.
+   logic rdy_armed;
+   wire  w_mrdy = m_ready && rdy_armed;
+
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
@@ -834,8 +843,8 @@ module pipeline_core
    // dword is in the same line, else a second read (f_memget32 exactly).
    wire ld32_span    = mem_is_ld32 && (mem_eaddr[2:0] > 3'd4);
    wire ld32_need2   = ld32_span && !m_next_valid;
-   wire mem_done_now = (mem_xc == 2'd1 && m_ready && !ld32_need2) ||
-                       (mem_xc == 2'd3 && m_ready);
+   wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !ld32_need2) ||
+                       (mem_xc == 2'd3 && w_mrdy);
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
@@ -904,6 +913,7 @@ module pipeline_core
          mem_xc <= '0; if_xc <= 1'b0; ifb_val <= 2'b00;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
+         rdy_armed <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
       end else begin
          if (start) begin
@@ -913,6 +923,9 @@ module pipeline_core
          end
 
          irq_ack <= 1'b0;
+
+         // ready-edge arming (issues below re-clear it; NBA last-write wins)
+         if (!m_ready) rdy_armed <= 1'b1;
 
          // WAIT wake: a parked WAIT resumes on a pending IRQ; the next dispatch
          // boundary takes the interrupt (resume PC = WAIT+4, as the FSM's
@@ -936,9 +949,10 @@ module pipeline_core
                                  pc};
                   m_be       <= 8'hFF;
                   m_write_DV <= 1'b1;
+                  rdy_armed  <= !m_ready;
                   irq_xc     <= 1'b1;
                end
-            end else if (m_ready) begin
+            end else if (w_mrdy) begin
                m_write_DV          <= 1'b0;
                sp                  <= sp - 32'd8;
                int_mask[irq_sel_q] <= 1'b0;   // masked while handler runs; IRET restores
@@ -1041,20 +1055,22 @@ module pipeline_core
                   m_be       <= mem_be;
                   m_read_DV  <= mem_port_rd;
                   m_write_DV <= mem_port_wr;
+                  rdy_armed  <= !m_ready;
                   mem_xc     <= 2'd1;
                end
-               2'd1: if (m_ready) begin
+               2'd1: if (w_mrdy) begin
                   if (ld32_need2) begin        // cross-line MEMGET32: 2nd read
-                     mem_dw0 <= m_rdata;
-                     m_addr  <= {mem_eaddr[31:3], 3'b000} + 32'd8;
-                     mem_xc  <= 2'd2;          // settle cycle (f_memget32 shape)
+                     mem_dw0   <= m_rdata;
+                     m_addr    <= {mem_eaddr[31:3], 3'b000} + 32'd8;
+                     rdy_armed <= 1'b0;        // new request (DV held, addr changed)
+                     mem_xc    <= 2'd2;        // settle cycle (f_memget32 shape)
                   end else begin
                      m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
                      mem_xc    <= 2'd0;
                   end
                end
                2'd2: mem_xc <= 2'd3;
-               default: if (m_ready) begin     // 2'd3
+               default: if (w_mrdy) begin     // 2'd3
                   m_read_DV <= 1'b0;
                   mem_xc    <= 2'd0;
                end
@@ -1063,7 +1079,7 @@ module pipeline_core
 
          // ---------------- IF fill engine (2-dword IFB window) ----------------
          if (if_xc) begin
-            if (m_ready) begin
+            if (w_mrdy) begin
                if (if_rebase) begin
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
@@ -1078,6 +1094,7 @@ module pipeline_core
                       && !mem_port_op && mem_xc == 2'd0) begin
             m_addr    <= {miss_dw, 3'b000};
             m_read_DV <= 1'b1;
+            rdy_armed <= !m_ready;
             if_req_dw <= miss_dw;
             if_rebase <= !in0;
             if_xc     <= 1'b1;
