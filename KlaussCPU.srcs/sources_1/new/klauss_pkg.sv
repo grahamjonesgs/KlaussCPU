@@ -258,6 +258,67 @@ package klauss_pkg;
    } cpu_state_t;
 
    // ========================================================================
+   // Pipeline stage-latch bundles (Phase B — feat/pipeline). See PIPELINE_IMPL.md.
+   // The whole-struct cpu_state_t above stays the reference model on master; the
+   // pipeline decomposes it into these per-stage bundles, each with its own valid
+   // bit and always_ff. Architectural state (r_register/flags/SP/int_mask/caches)
+   // stays central and is committed only at WB (the single retire point). These
+   // are first-cut widths and will firm up as each stage's logic lands (M1..M5).
+   // ========================================================================
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [95:0] words;      // up to 3 x 32-bit instruction words (opcode + imm64)
+      logic [1:0]  len;        // word count from LEN[31:30] (1/2/3)
+      logic        fault;      // fetch-side fault (illegal / bus)
+   } if_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [31:0] opcode;
+      logic [3:0]  cls;        // CLASS[29:26] (note: `class` is reserved)
+      logic [3:0]  rd;
+      logic [3:0]  rs1;
+      logic [3:0]  rs2;
+      logic [63:0] imm;        // sign/zero-extended immediate
+      logic [1:0]  len;
+      logic        is_branch;
+      logic        is_mem;
+      logic        is_store;
+      logic        is_mul;
+      logic        is_div;
+      logic        writes_reg;
+      logic        writes_flags;
+   } id_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [3:0]  rd;
+      logic [63:0] result;
+      flags_t      flags_out;
+      logic        writes_reg;
+      logic        writes_flags;
+      logic        is_mem;
+      logic        is_store;
+      logic [31:0] mem_addr;
+      logic [63:0] store_data;
+      logic        taken;      // branch taken (resolved in EX)
+      logic [31:0] target;     // redirect target
+   } ex_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [3:0]  rd;
+      logic [63:0] value;
+      flags_t      flags_out;
+      logic        writes_reg;
+      logic        writes_flags;
+   } mem_t;
+
+   // ========================================================================
    // f_alu — unified next-state ALU. ONE function for the whole
    // ALU op-class (RRR + reg-immediate + compares), selected by `op`. The caller
    // passes the two operands (extending the immediate sign/zero as the opcode
