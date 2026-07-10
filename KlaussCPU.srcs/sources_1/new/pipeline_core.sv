@@ -596,8 +596,10 @@ module pipeline_core
    logic [31:0] exo_iaddr;         // port ISSUE address (aligned per f_ld_idx)
 
    wire [63:0] ex_imm    = ex_d.sgn ? {{32{ex_var1[31]}}, ex_var1} : {32'b0, ex_var1};
-   wire [63:0] ex_alu_b  = (ex_op[29:26] == 4'h5) ? 64'd1              // INC/DEC
-                         : (ex_d.len == 2'b01)    ? ex_b : ex_imm;
+   // The ALU/compare b-operand is fully resolved at DISPATCH into ex_b
+   // (reg / sign-or-zero-extended imm32 / constant 1 for INC-DEC): the 64-bit
+   // adder and comparators read pure registers — no decode mux in front of
+   // the carry chain (the WNS -0.332 ex_op -> mem_result path).
    wire [5:0]  ex_shcnt  = ex_d.shsrc ? ex_d.shn : ex_b[5:0];
    wire [1:0]  ex_bcvt_t = f_cond_eval(flags, ex_d.bcond, ex_d.binv);
 
@@ -625,37 +627,37 @@ module pipeline_core
             is_sub = (ex_d.sub == 4'd1) || (ex_d.sub == 4'd3) || (ex_d.sub == 4'd7);
             cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags.carry : 1'b0;
             case (ex_d.sub)
-               4'd4: exo_result = ex_a & ex_alu_b;
-               4'd5: exo_result = ex_a | ex_alu_b;
-               4'd6: exo_result = ex_a ^ ex_alu_b;
+               4'd4: exo_result = ex_a & ex_b;
+               4'd5: exo_result = ex_a | ex_b;
+               4'd6: exo_result = ex_a ^ ex_b;
                default: begin
-                  if (is_sub) sum = {1'b0, ex_a} - {1'b0, ex_alu_b} - {64'b0, cin};
-                  else        sum = {1'b0, ex_a} + {1'b0, ex_alu_b} + {64'b0, cin};
+                  if (is_sub) sum = {1'b0, ex_a} - {1'b0, ex_b} - {64'b0, cin};
+                  else        sum = {1'b0, ex_a} + {1'b0, ex_b} + {64'b0, cin};
                   exo_result        = sum[63:0];
                   exo_fval.carry    = sum[64];
                   exo_fval.sign     = sum[63];
-                  exo_fval.overflow = is_sub ? ((ex_a[63] != ex_alu_b[63]) && (sum[63] != ex_a[63]))
-                                             : ((ex_a[63] == ex_alu_b[63]) && (sum[63] != ex_a[63]));
+                  exo_fval.overflow = is_sub ? ((ex_a[63] != ex_b[63]) && (sum[63] != ex_a[63]))
+                                             : ((ex_a[63] == ex_b[63]) && (sum[63] != ex_a[63]));
                end
             endcase
          end
          U_BOOL: begin
-            sa = ex_a; sb = ex_alu_b;
+            sa = ex_a; sb = ex_b;
             case (cmp_op_e'(ex_d.sub))
-               CMP_EQ:   exo_result = (ex_a == ex_alu_b) ? 64'b1 : 64'b0;
-               CMP_NE:   exo_result = (ex_a != ex_alu_b) ? 64'b1 : 64'b0;
+               CMP_EQ:   exo_result = (ex_a == ex_b) ? 64'b1 : 64'b0;
+               CMP_NE:   exo_result = (ex_a != ex_b) ? 64'b1 : 64'b0;
                CMP_LT:   exo_result = (sa < sb)   ? 64'b1 : 64'b0;
                CMP_LE:   exo_result = (sa <= sb)  ? 64'b1 : 64'b0;
                CMP_GT:   exo_result = (sa > sb)   ? 64'b1 : 64'b0;
                CMP_GE:   exo_result = (sa >= sb)  ? 64'b1 : 64'b0;
-               CMP_ULT:  exo_result = (ex_a < ex_alu_b)  ? 64'b1 : 64'b0;
-               CMP_ULE:  exo_result = (ex_a <= ex_alu_b) ? 64'b1 : 64'b0;
-               CMP_UGT:  exo_result = (ex_a > ex_alu_b)  ? 64'b1 : 64'b0;
-               CMP_UGE:  exo_result = (ex_a >= ex_alu_b) ? 64'b1 : 64'b0;
-               CMP_MIN:  exo_result = (sa < sb) ? ex_a : ex_alu_b;
-               CMP_MAX:  exo_result = (sa > sb) ? ex_a : ex_alu_b;
-               CMP_MINU: exo_result = (ex_a < ex_alu_b) ? ex_a : ex_alu_b;
-               default:  exo_result = (ex_a > ex_alu_b) ? ex_a : ex_alu_b; // MAXU
+               CMP_ULT:  exo_result = (ex_a < ex_b)  ? 64'b1 : 64'b0;
+               CMP_ULE:  exo_result = (ex_a <= ex_b) ? 64'b1 : 64'b0;
+               CMP_UGT:  exo_result = (ex_a > ex_b)  ? 64'b1 : 64'b0;
+               CMP_UGE:  exo_result = (ex_a >= ex_b) ? 64'b1 : 64'b0;
+               CMP_MIN:  exo_result = (sa < sb) ? ex_a : ex_b;
+               CMP_MAX:  exo_result = (sa > sb) ? ex_a : ex_b;
+               CMP_MINU: exo_result = (ex_a < ex_b) ? ex_a : ex_b;
+               default:  exo_result = (ex_a > ex_b) ? ex_a : ex_b; // MAXU
             endcase
          end
          U_SHIFT: begin
@@ -1160,8 +1162,11 @@ module pipeline_core
                   ex_d       <= dec;
                   ex_a       <= rf[dec.rs1];
                   ex_c       <= rf[dec.rd];
-                  // rs2 / imm operand mux for reg-vs-imm op forms (mul/div)
-                  ex_b       <= (dec.len != 2'b01 &&
+                  // The b-operand fully resolves HERE (reg / extended imm32 /
+                  // constant 1 for INC-DEC) so EX's adder and comparators read
+                  // pure registers — no decode mux before the carry chain.
+                  ex_b       <= (dec.uop == U_ALU && id_op[29:26] == 4'h5) ? 64'd1
+                              : (dec.len != 2'b01 &&
                                  (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                   dec.uop == U_BOOL || dec.uop == U_ALU))
                                 ? (dec.sgn ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
