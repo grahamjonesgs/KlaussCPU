@@ -1,114 +1,149 @@
 //===========================================================================
 // pipeline_core — Phase B in-order pipeline (feat/pipeline). See PIPELINE_IMPL.md.
 //
-// MILESTONE M1: IF / ID / EX / WB for Class-1 ALU reg-reg ops, INTERLOCK-ONLY
-// (no forwarding — a RAW dependency stalls ID until the producer leaves WB).
-// Shared instruction port (imem_addr/imem_data) backed by the testbench. This is
-// the correctness skeleton; loads/branches/mul-div/exceptions land in M2..M5, and
-// forwarding (EX->EX 2-input) in M6.
+// M1: IF/ID/EX/WB Class-1 ALU, interlock-only.
+// M2: + MEM stage (IF/ID/EX/MEM/WB) with 64-bit indexed loads/stores and the
+//     load-use interlock. Still interlock-only (no forwarding): a RAW dependency
+//     stalls ID until the producer leaves WB; because a load's result isn't
+//     committed until its (now one-later) WB, load-use is covered by the same
+//     scoreboard. Forwarding (EX->EX 2-input) arrives in M6.
 //
-// Instruction subset (ISA v2 Class 1, LEN=01, 1 word):
-//   op[29:26]=1 (class), op[25:22]=aluop (0=ADD 1=SUB 2=ADC 3=SBC 4=AND 5=OR
-//   6=XOR), op[21]=F, rd=op[11:8], rs1=op[7:4], rs2=op[3:0].
-// Sentinel: op == 32'h0 is treated as a bubble/NOP (no writes, no stall source).
+// Instruction subset (ISA v2, LEN=01, 1 word):
+//   Class 1 ALU rd = rs1 OP rs2 (aluop=op[25:22], F=op[21]).
+//   Class 6 load  rd = mem[rs1 + rs2]  (M2 EA model = rs1+rs2).
+//   Class 7 store mem[rs1 + rs2] = rd  (store data from rd; rd is a SOURCE here).
+//   rd=op[11:8], rs1=op[7:4], rs2=op[3:0]. op==0 is a NOP/bubble.
 //===========================================================================
 module pipeline_core
    import klauss_pkg::*;
 (
    input  logic        clk,
    input  logic        rst,
-   output logic [31:0] imem_addr,   // byte address of the instruction to fetch
-   input  logic [31:0] imem_data,   // instruction word at imem_addr (comb from tb)
-   output logic [63:0] dbg_r [0:15] // register-file view for the testbench
+   output logic [31:0] imem_addr,
+   input  logic [31:0] imem_data,
+   // data memory (64-bit, word addressed by dmem_addr[.:3]; backed by the tb)
+   output logic [31:0] dmem_addr,
+   output logic [63:0] dmem_wdata,
+   output logic        dmem_we,
+   input  logic [63:0] dmem_rdata,
+   output logic [63:0] dbg_r [0:15]
 );
 
-   // ---- Architectural state (central; RF/flags written at WB only) ----
    logic [63:0] rf [0:15];
    flags_t      flags;
    logic [31:0] pc;
 
-   // ---- Stage registers ----
-   // IF is implicit (pc + imem). ID holds the fetched word; EX holds operands;
-   // WB holds the result to commit.
    logic        id_valid;
    logic [31:0] id_op;
 
-   logic        ex_valid;
-   logic [63:0] ex_a, ex_b;
-   logic [3:0]  ex_aluop;
-   logic [3:0]  ex_rd;
+   // EX bundle
+   logic        ex_valid, ex_is_load, ex_is_store, ex_wreg, ex_wflags;
+   logic [3:0]  ex_aluop, ex_rd;
+   logic [63:0] ex_a, ex_b, ex_stdata;
    logic        ex_cin;
-   logic        ex_wreg, ex_wflags;
 
-   logic        wb_valid;
+   // MEM bundle
+   logic        mem_valid, mem_is_load, mem_is_store, mem_wreg, mem_wflags;
+   logic [3:0]  mem_rd;
+   logic [63:0] mem_alu, mem_addr_r, mem_stdata;
+   flags_t      mem_flags;
+
+   // WB bundle
+   logic        wb_valid, wb_wreg, wb_wflags;
    logic [3:0]  wb_rd;
    logic [63:0] wb_value;
    flags_t      wb_flags;
-   logic        wb_wreg, wb_wflags;
 
-   // ---- ID decode (combinational on id_op) ----
+   // ---- ID decode ----
    wire [3:0] d_class = id_op[29:26];
    wire [3:0] d_aluop = id_op[25:22];
    wire [3:0] d_rd    = id_op[11:8];
    wire [3:0] d_rs1   = id_op[7:4];
    wire [3:0] d_rs2   = id_op[3:0];
-   wire       d_is_alu  = id_valid && (id_op != 32'h0) && (d_class == 4'd1);
-   wire       d_wreg    = d_is_alu;                       // every M1 ALU op writes rd
-   wire       d_wflags  = d_is_alu && (d_aluop <= 4'd3);  // ADD/SUB/ADC/SBC set flags
+   wire       d_is_alu   = id_valid && (id_op != 32'h0) && (d_class == 4'd1);
+   wire       d_is_load  = id_valid && (d_class == 4'd6);
+   wire       d_is_store = id_valid && (d_class == 4'd7);
+   wire       d_valid_op = d_is_alu || d_is_load || d_is_store;
+   wire       d_wreg     = d_is_alu || d_is_load;
+   wire       d_wflags   = d_is_alu && (d_aluop <= 4'd3);
 
-   // ---- Interlock (no forwarding): stall ID while a source reg is still being
-   // written by an instruction in EX or WB (RF not yet updated). ----
-   wire raw_hit_ex = ex_valid && ex_wreg && ((ex_rd == d_rs1) || (ex_rd == d_rs2));
-   wire raw_hit_wb = wb_valid && wb_wreg && ((wb_rd == d_rs1) || (wb_rd == d_rs2));
-   wire raw_stall  = d_is_alu && (raw_hit_ex || raw_hit_wb);
+   // ---- Interlock (no forwarding): a source reg is busy while it is the pending
+   // destination of an instruction in EX / MEM / WB. Stores read rd as data, so
+   // rd is a source for stores. ----
+   // Inlined (not a function reading module signals — that breaks continuous-
+   // assign sensitivity). A source reg is busy if it is a pending destination in
+   // EX/MEM/WB. Stores read rd as data, so rd is a source for stores.
+   wire b_ex  = ex_valid  && ex_wreg;
+   wire b_mem = mem_valid && mem_wreg;
+   wire b_wb  = wb_valid  && wb_wreg;
+   wire hit1 = (b_ex && ex_rd == d_rs1) || (b_mem && mem_rd == d_rs1) || (b_wb && wb_rd == d_rs1);
+   wire hit2 = (b_ex && ex_rd == d_rs2) || (b_mem && mem_rd == d_rs2) || (b_wb && wb_rd == d_rs2);
+   wire hitd = (b_ex && ex_rd == d_rd ) || (b_mem && mem_rd == d_rd ) || (b_wb && wb_rd == d_rd );
+   wire raw_stall = d_valid_op && (hit1 || hit2 || (d_is_store && hitd));
 
    assign imem_addr = pc;
    genvar gi;
    generate for (gi = 0; gi < 16; gi++) assign dbg_r[gi] = rf[gi]; endgenerate
 
-   // ---- EX combinational compute ----
-   alu_res_t ex_res;
+   // EX combinational
+   alu_res_t    ex_res;
    assign ex_res = f_alu_ex(ex_a, ex_b, ex_aluop, ex_cin);
+   wire [63:0]  ex_eaddr = ex_a + ex_b;   // M2 effective-address model
 
-   integer i;
+   // MEM: drive the data port
+   assign dmem_addr  = mem_addr_r[31:0];
+   assign dmem_wdata = mem_stdata;
+   assign dmem_we    = mem_valid && mem_is_store;
+   wire [63:0] mem_value = mem_is_load ? dmem_rdata : mem_alu;
+
    always_ff @(posedge clk) begin
       if (rst) begin
-         pc       <= 32'h0;
-         id_valid <= 1'b0;
-         ex_valid <= 1'b0;
-         wb_valid <= 1'b0;
-         flags    <= '0;
-         // rf intentionally not reset — the testbench seeds it.
+         pc <= 0; id_valid <= 0; ex_valid <= 0; mem_valid <= 0; wb_valid <= 0;
+         flags <= '0;
       end else begin
-         // -- WB: commit to architectural state --
+         // WB commit
          if (wb_valid && wb_wreg)   rf[wb_rd] <= wb_value;
          if (wb_valid && wb_wflags) flags     <= wb_flags;
 
-         // -- EX -> WB (always advances; EX bubble propagates as wb_valid=0) --
-         wb_valid  <= ex_valid;
-         wb_rd     <= ex_rd;
-         wb_value  <= ex_res.result;
-         wb_flags  <= ex_res.flags;
-         wb_wreg   <= ex_wreg;
-         wb_wflags <= ex_wflags;
+         // MEM -> WB
+         wb_valid  <= mem_valid;
+         wb_rd     <= mem_rd;
+         wb_value  <= mem_value;
+         wb_flags  <= mem_flags;
+         wb_wreg   <= mem_wreg;
+         wb_wflags <= mem_wflags;
 
-         // -- ID -> EX and IF -> ID (frozen on a stall) --
+         // EX -> MEM
+         mem_valid   <= ex_valid;
+         mem_is_load <= ex_is_load;
+         mem_is_store<= ex_is_store;
+         mem_rd      <= ex_rd;
+         mem_alu     <= ex_res.result;
+         mem_addr_r  <= ex_eaddr;
+         mem_stdata  <= ex_stdata;
+         mem_flags   <= ex_res.flags;
+         mem_wreg    <= ex_wreg;
+         mem_wflags  <= ex_wflags;
+
+         // ID -> EX / IF -> ID (frozen on stall)
          if (raw_stall) begin
-            ex_valid <= 1'b0;   // insert a bubble into EX
-            // hold ID (id_valid/id_op) and pc — refetch/re-decode next cycle
+            ex_valid <= 1'b0;    // bubble
          end else begin
-            ex_valid  <= d_is_alu;
-            ex_a      <= rf[d_rs1];
-            ex_b      <= rf[d_rs2];
-            ex_aluop  <= d_aluop;
-            ex_rd     <= d_rd;
-            ex_cin    <= flags.carry;
-            ex_wreg   <= d_wreg;
-            ex_wflags <= d_wflags;
+            ex_valid    <= d_valid_op;
+            ex_is_load  <= d_is_load;
+            ex_is_store <= d_is_store;
+            ex_a        <= rf[d_rs1];
+            ex_b        <= rf[d_rs2];
+            ex_stdata   <= rf[d_rd];     // store data (also harmless for others)
+            ex_aluop    <= d_aluop;
+            ex_rd       <= d_rd;
+            ex_cin      <= flags.carry;
+            ex_wreg     <= d_wreg;
+            ex_wflags   <= d_wflags;
 
-            id_valid  <= 1'b1;
-            id_op     <= imem_data;
-            pc        <= pc + 32'd4;
+            id_valid <= 1'b1;
+            id_op    <= imem_data;
+            pc       <= pc + 32'd4;
          end
       end
    end
