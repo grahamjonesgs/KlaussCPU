@@ -1,5 +1,16 @@
 # KlaussCPU — Pipeline Implementation (Phase B, interlock-first)
 
+> **RESUME (session handoff).** Branch `feat/pipeline`. Done + xsim-verified:
+> **M0** stage types, **M1** ALU pipeline, **M2** MEM/loads/stores, **M3**
+> branches — all in `pipeline_core.sv` + `tb_pipeline.sv` (§6 milestone table).
+> **Next: M4** (mul/div busy interlock), then **M5** (integrate into the real
+> `KlaussCPU` — the big one). Discipline: interlock-first (no forwarding before
+> M5), and **xsim-verify every step before committing**. Verify loop:
+> `xvlog -sv klauss_pkg.sv pipeline_core.sv tb_pipeline.sv && xelab tb_pipeline
+> -s t && xsim t -runall` (Vivado on PATH via `/opt/Xilinx/2025.2/Vivado/bin`).
+> `master` = flags + 32 B (board-verified, on QSPI) — untouched.
+
+
 **Branch:** `feat/pipeline`. **Oracle:** `master` FSM (@81cc547) + `klausscc
 --emulate` — every milestone must be UART-bit-identical to it.
 **Approach:** clean rewrite on this branch; the whole-struct FSM stays on `master`
