@@ -318,6 +318,36 @@ package klauss_pkg;
       logic        writes_flags;
    } mem_t;
 
+   // Pure combinational EX-stage ALU (mirrors f_alu's arithmetic; no FSM
+   // sequencing). aluop = opcode[25:22] (0=ADD 1=SUB 2=ADC 3=SBC 4=AND 5=OR
+   // 6=XOR); cin = carry-in for ADC/SBC. Used by the pipeline EX stage.
+   typedef struct packed { flags_t flags; logic [63:0] result; } alu_res_t;
+
+   function automatic alu_res_t f_alu_ex(logic [63:0] a, logic [63:0] b,
+                                         logic [3:0] aluop, logic cin);
+      alu_res_t    r;
+      logic [64:0] sum;
+      logic        is_sub;
+      r      = '0;
+      is_sub = (aluop == 4'd1) || (aluop == 4'd3);   // SUB / SBC
+      case (aluop)
+         4'd4: begin r.result = a & b; r.flags.zero = ((a & b) == 64'b0); end   // AND
+         4'd5: begin r.result = a | b; r.flags.zero = ((a | b) == 64'b0); end   // OR
+         4'd6: begin r.result = a ^ b; r.flags.zero = ((a ^ b) == 64'b0); end   // XOR
+         default: begin                                                          // ADD/SUB/ADC/SBC
+            if (is_sub) sum = {1'b0, a} - {1'b0, b} - {64'b0, (aluop == 4'd3) ? cin : 1'b0};
+            else        sum = {1'b0, a} + {1'b0, b} + {64'b0, (aluop == 4'd2) ? cin : 1'b0};
+            r.result         = sum[63:0];
+            r.flags.carry    = sum[64];
+            r.flags.zero     = (sum[63:0] == 64'b0);
+            r.flags.sign     = sum[63];
+            r.flags.overflow = is_sub ? ((a[63] != b[63]) && (sum[63] != a[63]))
+                                      : ((a[63] == b[63]) && (sum[63] != a[63]));
+         end
+      endcase
+      return r;
+   endfunction
+
    // ========================================================================
    // f_alu — unified next-state ALU. ONE function for the whole
    // ALU op-class (RRR + reg-immediate + compares), selected by `op`. The caller
