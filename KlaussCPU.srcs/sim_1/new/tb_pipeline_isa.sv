@@ -17,12 +17,11 @@
 module tb_pipeline_isa;
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
-   logic [31:0]  if_addr;
-   logic [127:0] if_data;
-   logic         d_read, d_write;
-   logic [31:0]  d_addr;
-   logic [63:0]  d_wdata, d_rdata;
-   logic [7:0]   d_be;
+   logic [31:0]  m_addr;
+   logic         m_read_DV, m_write_DV;
+   logic [63:0]  m_wdata, m_rdata, m_rdata_next;
+   logic [7:0]   m_be;
+   logic         m_next_valid, m_ready;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n;
    logic         ret_valid, ret_wr;
    logic [31:0]  ret_pc, ret_op, ret_wr_addr;
@@ -60,14 +59,42 @@ module tb_pipeline_isa;
       else rd_dw = 64'h0;
    endfunction
 
-   // Sample the memory model at negedge: addresses settle right after the
-   // posedge (stage latches), reads must be valid by the next posedge, and a
-   // continuous assign through rd_dw() would NOT re-evaluate on memory-content
-   // changes (the array reads are hidden inside the function) — a load from a
-   // just-stored address would read stale data.
-   always @(negedge clk) begin
-      if_data <= {rd_dw({if_addr[31:3], 3'b000} + 32'd8), rd_dw(if_addr)};
-      d_rdata <= rd_dw(d_addr);
+   // ---------------- membus model: latency + ready handshake ---------------
+   // Mirrors the cache/bus_splitter behavior the FSM sees: registered request
+   // (DV held until ready), ready pulses 1 cycle with the data, MMIO reads
+   // take 2 cycles / writes 1, DRAM takes +LAT (fixed or randomized), and the
+   // read lookahead returns the next dword within the same 32 B line.
+   int lat_fix = 3;
+   int lat_rand = 0;
+   logic        in_flight = 0;
+   logic [31:0] q_addr;
+   logic        q_wr;
+   logic [63:0] q_wdata;
+   logic [7:0]  q_be;
+   int          lat_cnt;
+
+   always @(posedge clk) begin
+      m_ready <= 1'b0;
+      if (rst) begin
+         in_flight <= 1'b0;
+      end else if (!in_flight && !m_ready && (m_read_DV || m_write_DV)) begin
+         in_flight <= 1'b1;
+         q_addr <= m_addr;  q_wr <= m_write_DV;  q_wdata <= m_wdata;  q_be <= m_be;
+         if (m_addr[31:28] == 4'hF) lat_cnt <= m_read_DV ? 2 : 1;
+         else lat_cnt <= lat_fix + (lat_rand ? ($urandom % lat_rand) : 0);
+      end else if (in_flight) begin
+         if (lat_cnt > 1) lat_cnt <= lat_cnt - 1;
+         else begin
+            if (q_wr) apply_write(q_addr, q_wdata, q_be);
+            else begin
+               m_rdata      <= rd_dw(q_addr);
+               m_rdata_next <= rd_dw({q_addr[31:3], 3'b000} + 32'd8);
+               m_next_valid <= (q_addr[31:28] != 4'hF) && (q_addr[4:3] != 2'b11);
+            end
+            m_ready   <= 1'b1;
+            in_flight <= 1'b0;
+         end
+      end
    end
 
    integer uart_f, trace_f;
@@ -90,8 +117,6 @@ module tb_pipeline_isa;
          else $display("TB: WARN write outside model at %08x", a);
       end
    endtask
-
-   always @(posedge clk) if (d_write && !rst) apply_write(d_addr, d_wdata, d_be);
 
    // ---------------- trace: emulator line format ---------------------------
    function automatic string fbit(input logic b);
@@ -174,6 +199,8 @@ module tb_pipeline_isa;
       if (!$value$plusargs("UARTF=%s", uart_fn))  uart_fn = "rtl.uart";
       void'($value$plusargs("MAXI=%d", maxi));
       void'($value$plusargs("ENTRY=%h", start_pc));
+      void'($value$plusargs("LAT=%d", lat_fix));    // fixed DRAM latency (cycles)
+      void'($value$plusargs("RAND=%d", lat_rand));  // + $urandom%RAND extra
       for (int i = 0; i < LO_DW; i++) mem_lo[i] = 64'h0;
       for (int i = 0; i < HI_DW; i++) mem_hi[i] = 64'h0;
       $readmemh(image_f, mem_lo);

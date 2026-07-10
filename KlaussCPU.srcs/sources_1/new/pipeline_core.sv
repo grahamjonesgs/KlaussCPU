@@ -16,10 +16,12 @@
 // and the retire interface presents the emulator-format trace record
 // (klausscc --emulate --trace) for the tb to print and diff.
 //
-// Memory model (M5a ideal, replaced in M5b):
-//   - if_*: combinational 128-bit window {dw[a+8], dw[a]} at the fetch PC's
-//     dword — any 1/2/3-word instruction spans at most 2 dwords.
-//   - d_*: combinational-read / posedge-write dword port with byte enables.
+// Memory (M5b): ONE shared membus-style port — the exact cpu_mem signal set
+// (KlaussCPU.sv:655-663) so M5d wires it straight to bus_splitter. Registered
+// DV/addr, ready handshake (the FSM extra_clock pattern), read lookahead
+// (rdata_next/next_valid within a 32 B line). IF and MEM contend: MEM has
+// absolute priority (PIPELINE_IMPL.md §5); IF fills a 2-dword IFB-style
+// window (any 1/2/3-word instruction spans at most 2 dwords).
 //===========================================================================
 module pipeline_core
    import klauss_pkg::*;
@@ -29,16 +31,16 @@ module pipeline_core
    // run control
    input  logic         start,       // pulse: begin fetching at start_pc
    input  logic [31:0]  start_pc,
-   // instruction window (combinational)
-   output logic [31:0]  if_addr,     // dword-aligned
-   input  logic [127:0] if_data,     // {dw[if_addr+8], dw[if_addr]}
-   // data port (combinational read, posedge write)
-   output logic         d_read,
-   output logic         d_write,
-   output logic [31:0]  d_addr,
-   output logic [63:0]  d_wdata,
-   output logic [7:0]   d_be,
-   input  logic [63:0]  d_rdata,
+   // shared memory port (membus_if master shape)
+   output logic [31:0]  m_addr,
+   output logic         m_read_DV,
+   output logic         m_write_DV,
+   output logic [63:0]  m_wdata,
+   output logic [7:0]   m_be,
+   input  logic [63:0]  m_rdata,
+   input  logic [63:0]  m_rdata_next,   // next sequential dword, same line
+   input  logic         m_next_valid,
+   input  logic         m_ready,
    // LCD side port
    output logic [7:0]   lcd_byte,
    output logic         lcd_dc,
@@ -115,11 +117,26 @@ module pipeline_core
    generate for (gi = 0; gi < 16; gi++) assign dbg_r[gi] = rf[gi]; endgenerate
    assign dbg_sp = sp; assign dbg_flags = flags;
 
-   // ----------------------------------------------------------- IF: window
-   assign if_addr = {pc[31:3], 3'b000};
-   wire [31:0] w_op   = pc[2] ? if_data[63:32]  : if_data[31:0];
-   wire [31:0] w_var1 = pc[2] ? if_data[95:64]  : if_data[63:32];
-   wire [31:0] w_var2 = pc[2] ? if_data[127:96] : if_data[95:64];
+   // ------------------------------------------- IF: 2-dword window (IFB model)
+   logic [63:0] ifb_dw [0:1];
+   logic [28:0] ifb_base;          // dword address of slot 0
+   logic [1:0]  ifb_val;
+
+   wire [28:0] pc_dw = pc[31:3];
+   wire        in0   = ifb_val[0] && (pc_dw == ifb_base);
+   wire        in1   = ifb_val[1] && (pc_dw == ifb_base + 29'd1);
+   wire [127:0] w_win = in0 ? {ifb_dw[1], ifb_dw[0]} : {64'h0, ifb_dw[1]};
+   wire [31:0] w_op   = pc[2] ? w_win[63:32]  : w_win[31:0];
+   wire [31:0] w_var1 = pc[2] ? w_win[95:64]  : w_win[63:32];
+   wire [31:0] w_var2 = pc[2] ? w_win[127:96] : w_win[95:64];
+   // does the instruction spill into the next dword?
+   wire        w_span = pc[2] ? (w_op[31:30] != 2'b01) : (w_op[31:30] == 2'b11);
+   // the second dword is only sourced when the op sits in slot 0
+   wire        fetch_ok = (in0 && (!w_span || ifb_val[1])) || (in1 && !w_span);
+   // dword to request: slot-1 top-up when the op sits in slot 0 and spills;
+   // otherwise rebase the window at the op's own dword (next_valid refills
+   // slot 1 for free within a line).
+   wire [28:0] miss_dw  = in0 ? pc_dw + 29'd1 : pc_dw;
 
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
@@ -436,13 +453,13 @@ module pipeline_core
    dec_t        mem_d;
    logic [63:0] mem_result;         // non-mem result (or store raw data)
    flags_t      mem_fval, mem_fmask;
-   logic [31:0] mem_eaddr;          // RAW effective address
+   logic [31:0] mem_eaddr;          // RAW effective address (lane math)
+   logic [31:0] mem_iaddr;          // ISSUE address (aligned, drives the port)
    logic [63:0] mem_wdata;          // lane-replicated store data
    logic [7:0]  mem_be;
    logic [31:0] mem_sp_new;
    logic        mem_sp_we;
-   logic [1:0]  mem_ph;             // MEMGET32 phase
-   logic [63:0] mem_dw0;            // MEMGET32 stash
+   logic [63:0] mem_dw0;            // MEMGET32 cross-line stash
 
    // --------------------------------------------------------- WB stage latch
    logic        wb_valid;
@@ -540,6 +557,7 @@ module pipeline_core
    logic [63:0] exo_raw;           // raw store value (trace)
    logic [31:0] exo_sp_new;
    logic        exo_sp_we;
+   logic [31:0] exo_iaddr;         // port ISSUE address (aligned per f_ld_idx)
 
    wire [63:0] ex_imm    = ex_d.sgn ? {{32{ex_var1[31]}}, ex_var1} : {32'b0, ex_var1};
    wire [63:0] ex_alu_b  = (ex_op[29:26] == 4'h5) ? 64'd1              // INC/DEC
@@ -748,43 +766,43 @@ module pipeline_core
          U_RESET: begin exo_taken = 1'b1; exo_target = 32'h4; end
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
+      // port issue address (loads align per f_ld_idx; stores already aligned)
+      exo_iaddr = exo_eaddr;
+      if (ex_d.uop == U_LOAD) case (ex_d.msz)
+         2'd1:    exo_iaddr = {exo_eaddr[31:1], 1'b0};
+         2'd2:    exo_iaddr = {exo_eaddr[31:2], 2'b00};
+         2'd3:    exo_iaddr = ex_d.malign ? {exo_eaddr[31:3], 3'b000} : exo_eaddr;
+         default: exo_iaddr = exo_eaddr;
+      endcase
    end
 
    // mul/div operand B mux happens at dispatch: ex_b holds rs2 (len1) or
    // the sign/zero-extended imm32 (len2) — see the dispatch below.
 
-   // ---------------------------------------------------------- MEM stage comb
-   // Drives the data port; extracts/extends load data.
-   wire mem_is_ld32   = mem_valid && (mem_d.uop == U_LOAD32);
-   wire mem_ld32_span = mem_is_ld32 && (mem_eaddr[2:0] > 3'd4);
-   wire mem_busy      = mem_ld32_span && (mem_ph == 2'd0);
+   // ------------------------------------------------ MEM / IF port engines
+   // mem_xc: 0=idle 1=wait-ready 2=settle(2nd MEMGET32 read, mirrors
+   // f_memget32's dead cycle) 3=wait-ready-2. if_xc: fill in flight.
+   logic [1:0] mem_xc;
+   logic       if_xc;
+   logic [28:0] if_req_dw;
+   logic        if_rebase;
 
-   wire mem_is_read  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
+   wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
+   wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_is_ld32);
-   wire mem_is_write = mem_valid && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
+   wire mem_port_wr  = mem_valid && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
                                      (mem_d.uop == U_CALL && mem_sp_we));
-
-   always_comb begin
-      d_read  = mem_is_read;
-      d_write = mem_is_write;
-      d_wdata = mem_wdata;
-      d_be    = mem_be;
-      // address: loads issue the aligned address like f_ld_idx; the raw eaddr
-      // rides mem_eaddr for the lane math.
-      d_addr  = mem_eaddr;
-      if (mem_valid) case (mem_d.uop)
-         U_LOAD: case (mem_d.msz)
-            2'd1:    d_addr = {mem_eaddr[31:1], 1'b0};
-            2'd2:    d_addr = {mem_eaddr[31:2], 2'b00};
-            2'd3:    d_addr = mem_d.malign ? {mem_eaddr[31:3], 3'b000} : mem_eaddr;
-            default: d_addr = mem_eaddr;
-         endcase
-         U_LOAD32: d_addr = (mem_ph == 2'd0) ? mem_eaddr
-                                             : ({mem_eaddr[31:3], 3'b000} + 32'd8);
-         default: ;
-      endcase
-   end
+   wire mem_port_op  = mem_port_rd || mem_port_wr;
+   // MEMGET32 spanning a dword: served by the read lookahead when the next
+   // dword is in the same line, else a second read (f_memget32 exactly).
+   wire ld32_span    = mem_is_ld32 && (mem_eaddr[2:0] > 3'd4);
+   wire ld32_need2   = ld32_span && !m_next_valid;
+   wire mem_done_now = (mem_xc == 2'd1 && m_ready && !ld32_need2) ||
+                       (mem_xc == 2'd3 && m_ready);
+   wire mem_busy     = mem_port_op && !mem_done_now;
+   wire mem_is_read  = mem_port_rd;
+   wire mem_is_write = mem_port_wr;
 
    // load-value extraction (f_ld_idx / f_memget32 lane math)
    logic [63:0] mem_ldval;
@@ -792,28 +810,32 @@ module pipeline_core
       logic [7:0]  b8;
       logic [15:0] h16;
       logic [31:0] w32;
-      b8  = d_rdata[(mem_eaddr[2:0] * 8)  +: 8];
-      h16 = d_rdata[(mem_eaddr[2:1] * 16) +: 16];
-      w32 = mem_eaddr[2] ? d_rdata[63:32] : d_rdata[31:0];
-      mem_ldval = d_rdata;
+      b8  = m_rdata[(mem_eaddr[2:0] * 8)  +: 8];
+      h16 = m_rdata[(mem_eaddr[2:1] * 16) +: 16];
+      w32 = mem_eaddr[2] ? m_rdata[63:32] : m_rdata[31:0];
+      mem_ldval = m_rdata;
       if (mem_is_ld32) begin
          case (mem_eaddr[2:0])
-            3'd0: mem_ldval = {32'b0, d_rdata[31:0]};
-            3'd1: mem_ldval = {32'b0, d_rdata[39:8]};
-            3'd2: mem_ldval = {32'b0, d_rdata[47:16]};
-            3'd3: mem_ldval = {32'b0, d_rdata[55:24]};
-            3'd4: mem_ldval = {32'b0, d_rdata[63:32]};
-            // spanning offsets combine stash (dw0) + this read (dw1) in phase 1
-            3'd5: mem_ldval = {32'b0, d_rdata[7:0],  mem_dw0[63:40]};
-            3'd6: mem_ldval = {32'b0, d_rdata[15:0], mem_dw0[63:48]};
-            default: mem_ldval = {32'b0, d_rdata[23:0], mem_dw0[63:56]};
+            3'd0: mem_ldval = {32'b0, m_rdata[31:0]};
+            3'd1: mem_ldval = {32'b0, m_rdata[39:8]};
+            3'd2: mem_ldval = {32'b0, m_rdata[47:16]};
+            3'd3: mem_ldval = {32'b0, m_rdata[55:24]};
+            3'd4: mem_ldval = {32'b0, m_rdata[63:32]};
+            // spanning: phase-1 lookahead (rdata_next) or phase-3 second read
+            // combined with the stashed dw0
+            3'd5: mem_ldval = (mem_xc == 2'd3) ? {32'b0, m_rdata[7:0],  mem_dw0[63:40]}
+                                               : {32'b0, m_rdata_next[7:0],  m_rdata[63:40]};
+            3'd6: mem_ldval = (mem_xc == 2'd3) ? {32'b0, m_rdata[15:0], mem_dw0[63:48]}
+                                               : {32'b0, m_rdata_next[15:0], m_rdata[63:48]};
+            default: mem_ldval = (mem_xc == 2'd3) ? {32'b0, m_rdata[23:0], mem_dw0[63:56]}
+                                                  : {32'b0, m_rdata_next[23:0], m_rdata[63:56]};
          endcase
       end else if (mem_valid && mem_d.uop == U_LOAD) begin
          case (mem_d.msz)
             2'd0: mem_ldval = mem_d.sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
             2'd1: mem_ldval = mem_d.sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
             2'd2: mem_ldval = mem_d.sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-            default: mem_ldval = d_rdata;
+            default: mem_ldval = m_rdata;
          endcase
       end
    end
@@ -822,10 +844,10 @@ module pipeline_core
    flags_t iret_fval;
    always_comb begin
       iret_fval          = '0;
-      iret_fval.zero     = d_rdata[38];
-      iret_fval.carry    = d_rdata[36];
-      iret_fval.overflow = d_rdata[35];
-      iret_fval.sign     = d_rdata[34];
+      iret_fval.zero     = m_rdata[38];
+      iret_fval.carry    = m_rdata[36];
+      iret_fval.overflow = m_rdata[35];
+      iret_fval.sign     = m_rdata[34];
    end
 
    // LCD port
@@ -841,13 +863,16 @@ module pipeline_core
          flags <= '0; sp <= 32'h0800_0000; int_mask <= 4'h0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
-         mem_ph <= '0; parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
+         parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
+         mem_xc <= '0; if_xc <= 1'b0; ifb_val <= 2'b00;
+         m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
       end else begin
          if (start) begin
             pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
+            ifb_val <= 2'b00;
          end
 
          // ---------------- WB: the single retire point ----------------
@@ -931,11 +956,59 @@ module pipeline_core
 
          if (ex_valid && ex_d.uop == U_LCDRST) lcd_rst_n <= ex_var1[0];
 
+         // ---------------- MEM port engine (extra_clock pattern) ----------------
+         if (mem_port_op) begin
+            case (mem_xc)
+               2'd0: if (!if_xc) begin        // wait for the port (IF may hold it)
+                  m_addr     <= mem_iaddr;
+                  m_wdata    <= mem_wdata;
+                  m_be       <= mem_be;
+                  m_read_DV  <= mem_port_rd;
+                  m_write_DV <= mem_port_wr;
+                  mem_xc     <= 2'd1;
+               end
+               2'd1: if (m_ready) begin
+                  if (ld32_need2) begin        // cross-line MEMGET32: 2nd read
+                     mem_dw0 <= m_rdata;
+                     m_addr  <= {mem_eaddr[31:3], 3'b000} + 32'd8;
+                     mem_xc  <= 2'd2;          // settle cycle (f_memget32 shape)
+                  end else begin
+                     m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
+                     mem_xc    <= 2'd0;
+                  end
+               end
+               2'd2: mem_xc <= 2'd3;
+               default: if (m_ready) begin     // 2'd3
+                  m_read_DV <= 1'b0;
+                  mem_xc    <= 2'd0;
+               end
+            endcase
+         end
+
+         // ---------------- IF fill engine (2-dword IFB window) ----------------
+         if (if_xc) begin
+            if (m_ready) begin
+               if (if_rebase) begin
+                  ifb_base  <= if_req_dw;
+                  ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
+                  ifb_dw[1] <= m_rdata_next;  ifb_val[1] <= m_next_valid;
+               end else begin
+                  ifb_dw[1] <= m_rdata;       ifb_val[1] <= 1'b1;
+               end
+               m_read_DV <= 1'b0;
+               if_xc     <= 1'b0;
+            end
+         end else if (running && !fetch_halt && !parked && !fetch_ok
+                      && !mem_port_op && mem_xc == 2'd0) begin
+            m_addr    <= {miss_dw, 3'b000};
+            m_read_DV <= 1'b1;
+            if_req_dw <= miss_dw;
+            if_rebase <= !in0;
+            if_xc     <= 1'b1;
+         end
+
          // ---------------- MEM -> WB ----------------
          if (mem_busy) begin
-            // MEMGET32 cross-dword: stash dw0 this cycle, second read next.
-            mem_dw0  <= d_rdata;
-            mem_ph   <= 2'd1;
             wb_valid <= 1'b0;
          end else begin
             wb_valid   <= mem_valid;
@@ -946,17 +1019,16 @@ module pipeline_core
             wb_fmask   <= mem_fmask;
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
-            wb_mask_new<= d_rdata[42:39];
+            wb_mask_new<= m_rdata[42:39];
             wb_park    <= mem_valid && (mem_d.uop == U_HALT || mem_d.uop == U_TRAP ||
                                         mem_d.uop == U_WAIT || mem_d.uop == U_ILL);
             wb_park_kind <= (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
                           : (mem_d.uop == U_ILL)  ? 3'd2 : 3'd3;
             wb_wr      <= mem_is_write;
-            wb_wr_addr <= d_addr;   wb_wr_be <= d_be;   wb_wr_raw <= mem_result;
-            mem_ph     <= 2'd0;
+            wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= mem_result;
             // RET / IRET redirect + fetch resume at MEM completion
             if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET)) begin
-               pc <= d_rdata[31:0];
+               pc <= m_rdata[31:0];
                fetch_halt <= 1'b0;
             end
 
@@ -970,7 +1042,7 @@ module pipeline_core
                mem_result <= (ex_d.uop == U_STORE || ex_d.uop == U_PUSH ||
                               ex_d.uop == U_CALL) ? exo_raw : exo_result;
                mem_fval   <= exo_fval; mem_fmask <= ex_valid ? exo_fmask : '0;
-               mem_eaddr  <= exo_eaddr;
+               mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
 
@@ -1000,13 +1072,13 @@ module pipeline_core
                   if (id_valid && !fetch_halt && dec.serialize) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
-                  end else if (running && !fetch_halt) begin
+                  end else if (running && !fetch_halt && fetch_ok) begin
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      id_pc    <= pc;
                      pc       <= pc + {26'b0, w_op[31:30], 2'b00};  // LEN field
                   end else begin
-                     id_valid <= 1'b0;
+                     id_valid <= 1'b0;    // IF window miss: bubble, engine fills
                   end
                end
             end
