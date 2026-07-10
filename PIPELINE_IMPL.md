@@ -2,9 +2,13 @@
 
 > **RESUME (session handoff).** Branch `feat/pipeline`. Done + xsim-verified:
 > **M0** stage types, **M1** ALU pipeline, **M2** MEM/loads/stores, **M3**
-> branches — all in `pipeline_core.sv` + `tb_pipeline.sv` (§6 milestone table).
-> **Next: M4** (mul/div busy interlock), then **M5** (integrate into the real
-> `KlaussCPU` — the big one). Discipline: interlock-first (no forwarding before
+> branches, **M4** mul/div busy interlock — all in `pipeline_core.sv` +
+> `tb_pipeline.sv` (§6 milestone table). M4 models the silicon units: mul =
+> free-running DSP48 chain (4 EX cycles), div = CLZ-prep + 1-bit/cycle restoring
+> loop + 1-cycle by-zero path (`f_div_setup` semantics); mul/div write partial
+> flags, so ID holds them on `flag_busy` like branches (see core header).
+> **Next: M5** (integrate into the real `KlaussCPU` — the big one).
+> Discipline: interlock-first (no forwarding before
 > M5), and **xsim-verify every step before committing**. Verify loop:
 > `xvlog -sv klauss_pkg.sv pipeline_core.sv tb_pipeline.sv && xelab tb_pipeline
 > -s t && xsim t -runall` (Vivado on PATH via `/opt/Xilinx/2025.2/Vivado/bin`).
