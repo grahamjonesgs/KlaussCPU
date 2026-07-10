@@ -522,10 +522,20 @@ module pipeline_core
         ((dec.sp_rd || dec.sp_wr) && sp_busy) );
 
    // ------------------------------------------------------------- EX units
-   // multiply (silicon DSP48 chain model, M4)
+   // multiply — the silicon free-running DSP48 chain, in its OWN always block
+   // exactly like KlaussCPU.sv:558: no reset and no enables, so the operand
+   // regs absorb into DSP AREG/BREG with CE tied high. (Inside the main
+   // clocked block Vivado absorbed ex_a into AREG1 and put the whole dispatch
+   // enable cone on the DSP CE pin — the M5d WNS -0.124 path.)
    logic [64:0]  mul_a_q, mul_b_q;
    logic [127:0] mul_pipe1, mul_pipe2;
    logic [1:0]   mul_cnt;
+   always_ff @(posedge clk) begin
+      mul_a_q   <= {(ex_d.mduns ? 1'b0 : ex_a[63]), ex_a};
+      mul_b_q   <= {(ex_d.mduns ? 1'b0 : ex_b[63]), ex_b};
+      mul_pipe1 <= $signed(mul_a_q) * $signed(mul_b_q);
+      mul_pipe2 <= mul_pipe1;
+   end
    // divide (silicon restoring divider, M4)
    typedef enum logic [1:0] { MD_IDLE, MD_PREP, MD_STEP } md_phase_t;
    md_phase_t  div_ph;
@@ -963,10 +973,7 @@ module pipeline_core
          end
 
          // ---------------- EX free-running units ----------------
-         mul_a_q   <= {(ex_d.mduns ? 1'b0 : ex_a[63]), ex_a};
-         mul_b_q   <= {(ex_d.mduns ? 1'b0 : ex_b[63]), ex_b};
-         mul_pipe1 <= $signed(mul_a_q) * $signed(mul_b_q);
-         mul_pipe2 <= mul_pipe1;
+         // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
             MD_IDLE: if (ex_is_div && ex_b != 64'd0) begin
