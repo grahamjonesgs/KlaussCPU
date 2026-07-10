@@ -1,18 +1,21 @@
 # KlaussCPU — Pipeline Implementation (Phase B, interlock-first)
 
 > **RESUME (session handoff).** Branch `feat/pipeline`. Done + xsim-verified:
-> **M0** stage types, **M1** ALU pipeline, **M2** MEM/loads/stores, **M3**
-> branches, **M4** mul/div busy interlock — all in `pipeline_core.sv` +
-> `tb_pipeline.sv` (§6 milestone table). M4 models the silicon units: mul =
-> free-running DSP48 chain (4 EX cycles), div = CLZ-prep + 1-bit/cycle restoring
-> loop + 1-cycle by-zero path (`f_div_setup` semantics); mul/div write partial
-> flags, so ID holds them on `flag_busy` like branches (see core header).
-> **Next: M5** (integrate into the real `KlaussCPU` — the big one).
-> Discipline: interlock-first (no forwarding before
-> M5), and **xsim-verify every step before committing**. Verify loop:
-> `xvlog -sv klauss_pkg.sv pipeline_core.sv tb_pipeline.sv && xelab tb_pipeline
-> -s t && xsim t -runall` (Vivado on PATH via `/opt/Xilinx/2025.2/Vivado/bin`).
+> **M0-M4** (stage types, ALU, MEM, branches, mul/div interlock), and **M5a** —
+> `pipeline_core.sv` now implements the FULL ISA v2 (classes 1-C) and runs real
+> compiled ELFs: hello/bst/expr/test_64bit (to Halt) + queens (2M-instr cap)
+> are **trace-identical line-for-line** to `klausscc --emulate --trace` and
+> UART-byte-identical (§8 harness; runner `perf/m5a/run_m5a.sh <prog> [maxi]`).
+> Two known, DELIBERATE oracle deltas (documented in run_m5a.sh): the f= trace
+> field is excluded (emulator doesn't model silicon mul/div flag writes — the
+> pipeline implements the FSM's Z/S/V / Z/V semantics), and the emulator's
+> UART golden is Latin-1→UTF-8 expanded (undone with iconv before compare).
+> **Next: M5b** (shared mem port + ready handshake + latency sweep), then M5c
+> (IRQ/IRET/WAIT/SMC/HCF), M5d (SoC integration), M5e (board). Discipline:
+> interlock-first (no forwarding before M6), **verify before committing**.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
+> `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
+> superseded by `tb_pipeline_isa.sv` + the golden-trace harness.
 
 
 **Branch:** `feat/pipeline`. **Oracle:** `master` FSM (@81cc547) + `klausscc

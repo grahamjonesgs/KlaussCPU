@@ -1,0 +1,13 @@
+*.trace
+*.emu.out
+*.mem
+*.uart.golden
+*.log
+out/
+xsim.dir/
+*.jou
+*.pb
+*.wdb
+xvlog.log
+xelab.log
+webtalk*
