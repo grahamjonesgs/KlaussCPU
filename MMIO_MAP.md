@@ -278,6 +278,15 @@ run, read.
 | 0x0090 | `PERF_CNT_CALL`         | R  | 64    | Direct + conditional calls (`CALL`/`CALLREL`/`CALLcc`). |
 | 0x0098 | `PERF_CNT_INDIRECT`     | R  | 64    | Register/stack-target transfers (`JMPR`, `RET`, `IRET`, `CALLR`). Future BTB / target-prediction budget. |
 | 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div (also in `*_OPS`), system, I/O, `NOP`, etc. |
+| 0x00A8 | `PERF_FASTPATH`         | R  | 64    | (FSM-era) fast-path dispatches; 0 under the pipeline. |
+| 0x00B0 | `PERF_STALL_DATA`       | R  | 48    | Pipeline: GPR RAW stall cycles (producer in MEM/WB, or unforwardable in EX). |
+| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where a memory-read producer blocks from EX (load-use). |
+| 0x00C0 | `PERF_STALL_FLAGS`      | R  | 48    | Pipeline: flag-reader stall cycles (producer in MEM/WB; EX forwards). |
+| 0x00C8 | `PERF_STALL_SP`         | R  | 48    | Pipeline: SP-serialization stall cycles (class-9/CALL behind an SP writer). |
+| 0x00D0 | `PERF_STALL_MULDIV`     | R  | 48    | Pipeline: EX-busy cycles (mul/div/DELAY/LCD occupying EX). |
+| 0x00D8 | `PERF_BRANCH_FLUSH`     | R  | 48    | Pipeline: taken-redirect EVENTS (each costs ~2 fetch bubbles). |
+| 0x00E0 | `PERF_IF_MISS`          | R  | 48    | Pipeline: fetch-window miss cycles (IF engine filling; nothing to dispatch). |
+| 0x00E8 | `PERF_MEM_WAIT`         | R  | 48    | Pipeline: MEM-port wait cycles (loads/stores/stack in flight; front frozen). |
 
 **Mix invariant.** Each retired instruction is classified into exactly one of
 the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or
