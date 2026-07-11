@@ -59,8 +59,26 @@
 > mem_result (producer in MEM, non-load) / wb_value (producer in WB, loads
 > included) / rf; producer-in-EX = exactly ONE bubble; load-use = just the
 > load's latency; flags mirror via the WB registers (flags_eff, deferred-Z =
-> register-sourced wb_value==0 NOR). CMP→JMPcc 1 bubble (was 3). Build in
-> flight; then board A/B vs perf/baseline_m5_pipeline.csv.
+> register-sourced wb_value==0 NOR). CMP→JMPcc 1 bubble (was 3).
+>
+> **M6 DONE — BOARD-VERIFIED (2026-07-10).** Timing: v2 closed the CPU core;
+> impl_1 strategy set to Performance_Explore (route congestion in the EX
+> cluster — logic depth was fine at 10 levels; the strategy stays on the
+> project). Final WNS −0.016 on 2 endpoints, BOTH in the SHA-256 round
+> datapath (crypto_sha/u_sha — the die's documented pre-existing hot path,
+> NOT the pipeline; regression doesn't exercise HW SHA). **A QSPI/production
+> build needs a seed/directive respin or the SHA relaxation first.**
+> On silicon: 7/7 regression UART byte-identical + test_rtos PASS.
+> **CPI (perf/baseline_m6_pipeline.csv) vs M5 / vs final FSM (32B, same
+> ELFs):** alu 4.125 (−13% / ±0 — TIES the FSM exactly), branchy 4.402
+> (−7% / +9.5% — taken-flush cost, the M7 predictor/back-edge territory),
+> calls_fib 5.909 (−4% / −4%), ptr_chase 5.926 (−10% / −13%), mem_stream
+> 7.463 (−4% / +0.7%), muldiv 4.010 (−10% / −15%); dhrystone 0.154 DMIPS/MHz
+> (FSM 0.160). taken_bp counter live again (branchy 56.27% = FSM-exact).
+> Net vs the ISA-v2 start: mem_stream −17%, muldiv −15%, ptr_chase −13%,
+> calls_fib −8%, alu flat, branchy +7%. NEXT: M7 split I/D port (removes
+> IF/MEM contention), branch handling (predict/back-edge layout) for
+> branchy, M8 LLVM sched model; QSPI after the SHA-path respin.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
 > superseded by `tb_pipeline_isa.sv` + the golden-trace harness.
