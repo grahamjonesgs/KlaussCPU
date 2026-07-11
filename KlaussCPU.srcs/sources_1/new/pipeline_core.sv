@@ -69,6 +69,13 @@ module pipeline_core
    output logic [63:0]  ret_wr_raw,  // RAW store value (pre lane-replication)
    // port fully idle (no transaction in flight) — gates external bus handoff
    output logic         bus_idle,
+   // per-cycle hazard-attribution strobes (accumulated by the SoC perf block):
+   // [0] GPR RAW stall  [1] load-use subset  [2] flag stall  [3] SP stall
+   // [4] mul/div/EX-busy [5] taken-branch flush (event)  [6] IF window miss
+   // [7] MEM port wait
+   output logic [7:0]   perf_stall,
+   output logic         perf_br,        // conditional branch resolved (event)
+   output logic         perf_br_taken,
    // park (drained stop)
    output logic         parked,
    output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT
@@ -539,6 +546,17 @@ module pipeline_core
         (dec.fread && flag_busy) ||
         ((dec.sp_rd || dec.sp_wr) && sp_busy) );
 
+   // hazard-attribution strobes (events/cycles for the SoC perf counters)
+   wire lu1 = b_ex && !ex_fwdable;   // a memory-read producer blocks from EX
+   assign perf_stall[0] = id_valid && ((dec.use_rs1 && hit1) || (dec.use_rs2 && hit2)
+                                       || (dec.use_rdd && hitd));
+   assign perf_stall[1] = id_valid && lu1 &&
+                          ((dec.use_rs1 && ex_d.rd == dec.rs1) ||
+                           (dec.use_rs2 && ex_d.rd == dec.rs2) ||
+                           (dec.use_rdd && ex_d.rd == dec.rd));
+   assign perf_stall[2] = id_valid && dec.fread && flag_busy;
+   assign perf_stall[3] = id_valid && (dec.sp_rd || dec.sp_wr) && sp_busy;
+
    // ------------------------------------------------------------- EX units
    // multiply — the silicon free-running DSP48 chain, in its OWN always block
    // exactly like KlaussCPU.sv:558: no reset and no enables, so the operand
@@ -574,6 +592,7 @@ module pipeline_core
    wire ex_is_lcd  = ex_valid && (ex_d.uop == U_LCD);
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready);
+   assign perf_stall[4] = ex_busy;
 
    wire [63:0] w_div_abs_a   = (ex_d.sgn && ex_a[63]) ? (~ex_a + 64'd1) : ex_a;
    wire [63:0] w_div_abs_b   = (ex_d.sgn && ex_b[63]) ? (~ex_b + 64'd1) : ex_b;
@@ -876,6 +895,15 @@ module pipeline_core
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
+
+   // branch / flush / fetch / port attribution (events and wait cycles)
+   assign perf_stall[5] = ex_valid && !ex_busy && !mem_busy && exo_taken
+                          && (ex_d.uop == U_JMP || ex_d.uop == U_CALL);
+   assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
+   assign perf_stall[7] = mem_busy;
+   assign perf_br       = ex_valid && !ex_busy && !mem_busy
+                          && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
+   assign perf_br_taken = exo_taken;
 
    // load-value extraction (f_ld_idx / f_memget32 lane math)
    logic [63:0] mem_ldval;

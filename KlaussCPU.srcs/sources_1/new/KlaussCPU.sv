@@ -372,6 +372,16 @@ module KlaussCPU (
    // the rate. (This slot replaced a passive predecode-mismatch validator, now
    // covered by the consume guard and the functional regression.)
    logic [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
+   // M6: pipeline per-hazard attribution (MMIO 0xB0-0xE8; strobes from
+   // pipeline_core.perf_stall — see its port comment for the bit map)
+   logic [47:0] r_perf_stall_data;     // 0xB0 GPR RAW stall cycles
+   logic [47:0] r_perf_stall_loaduse;  // 0xB8 load-use subset
+   logic [47:0] r_perf_stall_flags;    // 0xC0 flag-reader stall cycles
+   logic [47:0] r_perf_stall_sp;       // 0xC8 SP-serialization stall cycles
+   logic [47:0] r_perf_stall_muldiv;   // 0xD0 EX-busy cycles (mul/div/delay/lcd)
+   logic [47:0] r_perf_branch_flush;   // 0xD8 taken-redirect events
+   logic [47:0] r_perf_if_miss;        // 0xE0 fetch-window miss cycles
+   logic [47:0] r_perf_mem_wait;       // 0xE8 MEM port wait cycles
    logic        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
    logic        r_int_push_wait_d;        // edge-detect for interrupt dispatch
    // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
@@ -703,6 +713,8 @@ module KlaussCPU (
    wire [7:0]   pip_lcd_byte;
    wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
+   wire [7:0]   pip_perf_stall;
+   wire         pip_perf_br, pip_perf_br_taken;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
    // "MMIO store wins" ordering is preserved inside pipeline_core.
    wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
@@ -737,6 +749,9 @@ module KlaussCPU (
       .lcd_rst_wr (pip_lcd_rst_wr),
       .lcd_ready  (i_TX_LCD_Ready),
       .bus_idle   (pip_bus_idle),
+      .perf_stall (pip_perf_stall),
+      .perf_br    (pip_perf_br),
+      .perf_br_taken (pip_perf_br_taken),
       .ret_valid  (pip_ret_valid),
       .ret_pc     (pip_ret_pc),
       .ret_op     (pip_ret_op),
@@ -1046,6 +1061,15 @@ module KlaussCPU (
                16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
                16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
                16'h00A8: r_mmio_read_data_comb = r_perf_fastpath;  // fast-path-dispatch fire count (this slot was the retired predecode validator)
+               // M6 pipeline hazard attribution (cycles unless noted)
+               16'h00B0: r_mmio_read_data_comb = {16'b0, r_perf_stall_data};
+               16'h00B8: r_mmio_read_data_comb = {16'b0, r_perf_stall_loaduse};
+               16'h00C0: r_mmio_read_data_comb = {16'b0, r_perf_stall_flags};
+               16'h00C8: r_mmio_read_data_comb = {16'b0, r_perf_stall_sp};
+               16'h00D0: r_mmio_read_data_comb = {16'b0, r_perf_stall_muldiv};
+               16'h00D8: r_mmio_read_data_comb = {16'b0, r_perf_branch_flush}; // events
+               16'h00E0: r_mmio_read_data_comb = {16'b0, r_perf_if_miss};
+               16'h00E8: r_mmio_read_data_comb = {16'b0, r_perf_mem_wait};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -3261,7 +3285,22 @@ end
          r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
          r_perf_cnt_other        <= 64'd0;
          r_perf_fastpath           <= 64'd0;
+         r_perf_stall_data <= 48'd0;  r_perf_stall_loaduse <= 48'd0;
+         r_perf_stall_flags <= 48'd0; r_perf_stall_sp <= 48'd0;
+         r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
+         r_perf_if_miss <= 48'd0;     r_perf_mem_wait <= 48'd0;
       end else begin
+         // M6 pipeline hazard attribution
+         if (pip_perf_stall[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
+         if (pip_perf_stall[1]) r_perf_stall_loaduse <= r_perf_stall_loaduse + 48'd1;
+         if (pip_perf_stall[2]) r_perf_stall_flags   <= r_perf_stall_flags   + 48'd1;
+         if (pip_perf_stall[3]) r_perf_stall_sp      <= r_perf_stall_sp      + 48'd1;
+         if (pip_perf_stall[4]) r_perf_stall_muldiv  <= r_perf_stall_muldiv  + 48'd1;
+         if (pip_perf_stall[5]) r_perf_branch_flush  <= r_perf_branch_flush  + 48'd1;
+         if (pip_perf_stall[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
+         if (pip_perf_stall[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
+         if (pip_perf_br && pip_perf_br_taken)
+            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;

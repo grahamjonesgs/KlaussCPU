@@ -83,7 +83,7 @@ if [ "$MAXI" != 0 ]; then head -n "$MAXI" "out/$PROG.soc.gold.n" > "out/$PROG.so
 if cmp -s "out/$PROG.soc.gold.n" "out/$PROG.soc.rtl.n"; then
   echo "SOC TRACE: IDENTICAL ($(wc -l < "out/$PROG.soc.rtl.n") lines)"
 else
-  PFX=$(cmp "out/$PROG.soc.gold.n" "out/$PROG.soc.rtl.n" 2>/dev/null | sed -E 's/.* line ([0-9]+).*/\1/')
+  PFX=$( (cmp "out/$PROG.soc.gold.n" "out/$PROG.soc.rtl.n" 2>/dev/null || true) | sed -E 's/.* line ([0-9]+).*/\1/')
   echo "SOC TRACE: identical prefix = $((${PFX:-1}-1)) lines (divergence at the first"
   echo "           timing-dependent MMIO poll is expected; RTL $(wc -l < "out/$PROG.soc.rtl.n") vs golden $(wc -l < "out/$PROG.soc.gold.n") lines)"
 fi
