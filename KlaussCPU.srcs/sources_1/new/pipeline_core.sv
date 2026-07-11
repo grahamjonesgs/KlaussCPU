@@ -470,6 +470,12 @@ module pipeline_core
    logic [31:0] ex_pc, ex_op, ex_var1, ex_var2, ex_pc_next;
    dec_t        ex_d;
    logic [63:0] ex_a, ex_b, ex_c;   // rs1 / rs2 / rd-data values
+   // M6: GPR forwarding happens at the ID->EX register INPUT (the proven P41
+   // shape): a producer completing EX forwards its combinational exo_result
+   // straight into the consumer's operand latch on the dispatch edge — no
+   // muxes inside EX, no use-site changes. Flags forward differently (M6b):
+   // ex_fwd_f marks a consumer whose flags live in the mem_* registers.
+   logic        ex_fwd_f;
 
    // --------------------------------------------------------- MEM stage latch
    logic        mem_valid;
@@ -511,11 +517,21 @@ module pipeline_core
    wire b_ex  = ex_valid  && ex_d.wreg;
    wire b_mem = mem_valid && mem_d.wreg;
    wire b_wb  = wb_valid  && wb_wreg;
-   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (b_mem && mem_d.rd == dec.rs1) || (b_wb && wb_rd == dec.rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (b_mem && mem_d.rd == dec.rs2) || (b_wb && wb_rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (b_mem && mem_d.rd == dec.rd)  || (b_wb && wb_rd == dec.rd);
-   wire flag_busy = (ex_valid && ex_d.fmask != '0) || (mem_valid && mem_fmask != '0)
-                 || (wb_valid && wb_fmask != '0);
+   // M6: a producer COMPLETING EX this edge forwards instead of stalling —
+   // its result enters mem_result exactly when the consumer enters EX.
+   // Memory reads (their value only exists at MEM) are excluded: loads keep
+   // the full interlock (MEM->EX is deliberately NOT forwarded — P3 showed
+   // the 3-input mux fails timing; 2-input closes at +0.080).
+   wire ex_fwdable   = b_ex && !(ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 ||
+                                 ex_d.uop == U_POP);
+   // Flag producers forward the same way (their fval/fmask/zval/result enter
+   // the mem_* registers on the same edge). IRET is a serializer, so a reader
+   // can never dispatch behind it — its MEM-sourced flags never forward.
+   wire ex_f_fwdable = ex_valid && (ex_d.fmask != '0);
+   wire hit1 = (b_ex && ex_d.rd == dec.rs1 && !ex_fwdable) || (b_mem && mem_d.rd == dec.rs1) || (b_wb && wb_rd == dec.rs1);
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2 && !ex_fwdable) || (b_mem && mem_d.rd == dec.rs2) || (b_wb && wb_rd == dec.rs2);
+   wire hitd = (b_ex && ex_d.rd == dec.rd  && !ex_fwdable) || (b_mem && mem_d.rd == dec.rd)  || (b_wb && wb_rd == dec.rd);
+   wire flag_busy = (mem_valid && mem_fmask != '0) || (wb_valid && wb_fmask != '0);
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
    wire raw_stall = id_valid && (
@@ -601,7 +617,22 @@ module pipeline_core
    // adder and comparators read pure registers — no decode mux in front of
    // the carry chain (the WNS -0.332 ex_op -> mem_result path).
    wire [5:0]  ex_shcnt  = ex_d.shsrc ? ex_d.shn : ex_b[5:0];
-   wire [1:0]  ex_bcvt_t = f_cond_eval(flags, ex_d.bcond, ex_d.binv);
+   // M6b: effective flags for EX readers. A flag producer that completed EX on
+   // the consumer's dispatch edge lives in the mem_* registers: merge its
+   // masked fields over the committed flags. Its Z is (mem_result == 0) when
+   // deferred (mem_zval) — a register-sourced NOR, not the EX-output path.
+   flags_t flags_eff;
+   always_comb begin
+      flags_eff = flags;
+      if (ex_fwd_f) begin
+         if (mem_fmask.zero)     flags_eff.zero     = mem_zval ? (mem_result == 64'b0)
+                                                               : mem_fval.zero;
+         if (mem_fmask.carry)    flags_eff.carry    = mem_fval.carry;
+         if (mem_fmask.overflow) flags_eff.overflow = mem_fval.overflow;
+         if (mem_fmask.sign)     flags_eff.sign     = mem_fval.sign;
+      end
+   end
+   wire [1:0]  ex_bcvt_t = f_cond_eval(flags_eff, ex_d.bcond, ex_d.binv);
 
    always_comb begin : ex_logic
       logic [64:0]        sum;
@@ -625,7 +656,7 @@ module pipeline_core
       case (ex_d.uop)
          U_ALU: begin
             is_sub = (ex_d.sub == 4'd1) || (ex_d.sub == 4'd3) || (ex_d.sub == 4'd7);
-            cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags.carry : 1'b0;
+            cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags_eff.carry : 1'b0;
             case (ex_d.sub)
                4'd4: exo_result = ex_a & ex_b;
                4'd5: exo_result = ex_a | ex_b;
@@ -677,8 +708,8 @@ module pipeline_core
             case (ex_d.sub)
                4'd3: begin exo_result = {ex_a[62:0], ex_a[63]};     exo_fval.carry = ex_a[63]; end
                4'd4: begin exo_result = {ex_a[0], ex_a[63:1]};      exo_fval.carry = ex_a[0];  end
-               4'd5: begin exo_result = {ex_a[62:0], flags.carry};  exo_fval.carry = ex_a[63]; end
-               default: begin exo_result = {flags.carry, ex_a[63:1]}; exo_fval.carry = ex_a[0]; end
+               4'd5: begin exo_result = {ex_a[62:0], flags_eff.carry};  exo_fval.carry = ex_a[63]; end
+               default: begin exo_result = {flags_eff.carry, ex_a[63:1]}; exo_fval.carry = ex_a[0]; end
             endcase
          end
          U_BTSTN: exo_fval.zero = ~ex_a[ex_d.shn];
@@ -703,7 +734,7 @@ module pipeline_core
                4'd8:  exo_result = {57'b0, f_popcnt64(ex_a)};
                4'd9:  exo_result = {57'b0, f_clz64(ex_a)};
                4'd10: exo_result = {57'b0, f_ctz64(ex_a)};
-               default: exo_result = {flags.zero, flags.zero, flags.carry, flags.overflow, 60'b0}; // GETF
+               default: exo_result = {flags_eff.zero, flags_eff.zero, flags_eff.carry, flags_eff.overflow, 60'b0}; // GETF
             endcase
             if (ex_d.sub == 4'd4) exo_fval.sign = exo_result[63];
          end
@@ -910,7 +941,7 @@ module pipeline_core
          mem_xc <= '0; if_xc <= 1'b0; ifb_val <= 2'b00;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
-         rdy_armed <= 1'b0;
+         rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
       end else begin
          if (start) begin
@@ -1160,17 +1191,21 @@ module pipeline_core
                   ex_var1    <= id_var1; ex_var2 <= id_var2;
                   ex_pc_next <= id_pc_next;
                   ex_d       <= dec;
-                  ex_a       <= rf[dec.rs1];
-                  ex_c       <= rf[dec.rd];
+                  ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
+                  // M6 EX->EX forward at the register input: the producer
+                  // completing EX this edge supplies exo_result directly.
+                  ex_a       <= (ex_fwdable && ex_d.rd == dec.rs1) ? exo_result : rf[dec.rs1];
+                  ex_c       <= (ex_fwdable && ex_d.rd == dec.rd)  ? exo_result : rf[dec.rd];
                   // The b-operand fully resolves HERE (reg / extended imm32 /
-                  // constant 1 for INC-DEC) so EX's adder and comparators read
-                  // pure registers — no decode mux before the carry chain.
+                  // constant 1 for INC-DEC / forwarded producer result) so
+                  // EX's adder and comparators read pure registers.
                   ex_b       <= (dec.uop == U_ALU && id_op[29:26] == 4'h5) ? 64'd1
                               : (dec.len != 2'b01 &&
                                  (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                   dec.uop == U_BOOL || dec.uop == U_ALU))
                                 ? (dec.sgn ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                                : rf[dec.rs2];
+                              : (ex_fwdable && ex_d.rd == dec.rs2) ? exo_result
+                              : rf[dec.rs2];
                   mul_cnt    <= 2'd0;
                   if (id_valid && !fetch_halt && dec.serialize) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
