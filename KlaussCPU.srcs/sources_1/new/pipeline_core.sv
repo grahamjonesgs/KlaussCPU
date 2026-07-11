@@ -524,21 +524,25 @@ module pipeline_core
    wire b_ex  = ex_valid  && ex_d.wreg;
    wire b_mem = mem_valid && mem_d.wreg;
    wire b_wb  = wb_valid  && wb_wreg;
-   // M6: a producer COMPLETING EX this edge forwards instead of stalling —
-   // its result enters mem_result exactly when the consumer enters EX.
-   // Memory reads (their value only exists at MEM) are excluded: loads keep
-   // the full interlock (MEM->EX is deliberately NOT forwarded — P3 showed
-   // the 3-input mux fails timing; 2-input closes at +0.080).
-   wire ex_fwdable   = b_ex && !(ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 ||
-                                 ex_d.uop == U_POP);
-   // Flag producers forward the same way (their fval/fmask/zval/result enter
-   // the mem_* registers on the same edge). IRET is a serializer, so a reader
-   // can never dispatch behind it — its MEM-sourced flags never forward.
-   wire ex_f_fwdable = ex_valid && (ex_d.fmask != '0);
-   wire hit1 = (b_ex && ex_d.rd == dec.rs1 && !ex_fwdable) || (b_mem && mem_d.rd == dec.rs1) || (b_wb && wb_rd == dec.rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2 && !ex_fwdable) || (b_mem && mem_d.rd == dec.rs2) || (b_wb && wb_rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == dec.rd  && !ex_fwdable) || (b_mem && mem_d.rd == dec.rd)  || (b_wb && wb_rd == dec.rd);
-   wire flag_busy = (mem_valid && mem_fmask != '0) || (wb_valid && wb_fmask != '0);
+   // M6 v2 — REGISTER-SOURCED forwarding (the shape P3 actually verified: the
+   // FSM forwards from the wb.value REGISTER, never from an ALU output; the
+   // zero-bubble exo_result->operand-register feedback was WNS -0.750):
+   //  - producer in MEM at dispatch -> forward mem_result (non-memory-read)
+   //  - producer in WB  at dispatch -> forward wb_value (loads INCLUDED: the
+   //    loaded value is in wb_value; rf only updates on this same edge)
+   //  - producer in EX  at dispatch -> ONE bubble (next cycle it forwards)
+   // Every forward mux sits at an ID->EX register D-input, fed by registers.
+   wire mem_loadlk  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LOAD32 ||
+                                    mem_d.uop == U_POP);
+   wire mem_fwd_ok  = b_mem && !mem_loadlk;
+   // Flag producers: in EX at dispatch -> 1 bubble; in MEM at dispatch -> the
+   // consumer's EX cycle reads them from the WB registers (flags_eff below);
+   // in WB at dispatch -> they commit on this edge, committed flags are right.
+   wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
+   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1);
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2);
+   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd);
+   wire flag_busy = (ex_valid && ex_d.fmask != '0);
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
    wire raw_stall = id_valid && (
@@ -547,13 +551,12 @@ module pipeline_core
         ((dec.sp_rd || dec.sp_wr) && sp_busy) );
 
    // hazard-attribution strobes (events/cycles for the SoC perf counters)
-   wire lu1 = b_ex && !ex_fwdable;   // a memory-read producer blocks from EX
    assign perf_stall[0] = id_valid && ((dec.use_rs1 && hit1) || (dec.use_rs2 && hit2)
                                        || (dec.use_rdd && hitd));
-   assign perf_stall[1] = id_valid && lu1 &&
-                          ((dec.use_rs1 && ex_d.rd == dec.rs1) ||
-                           (dec.use_rs2 && ex_d.rd == dec.rs2) ||
-                           (dec.use_rdd && ex_d.rd == dec.rd));
+   assign perf_stall[1] = id_valid && mem_loadlk && mem_d.wreg &&
+                          ((dec.use_rs1 && mem_d.rd == dec.rs1) ||
+                           (dec.use_rs2 && mem_d.rd == dec.rs2) ||
+                           (dec.use_rdd && mem_d.rd == dec.rd));
    assign perf_stall[2] = id_valid && dec.fread && flag_busy;
    assign perf_stall[3] = id_valid && (dec.sp_rd || dec.sp_wr) && sp_busy;
 
@@ -636,19 +639,20 @@ module pipeline_core
    // adder and comparators read pure registers — no decode mux in front of
    // the carry chain (the WNS -0.332 ex_op -> mem_result path).
    wire [5:0]  ex_shcnt  = ex_d.shsrc ? ex_d.shn : ex_b[5:0];
-   // M6b: effective flags for EX readers. A flag producer that completed EX on
-   // the consumer's dispatch edge lives in the mem_* registers: merge its
-   // masked fields over the committed flags. Its Z is (mem_result == 0) when
-   // deferred (mem_zval) — a register-sourced NOR, not the EX-output path.
+   // M6b: effective flags for EX readers. A flag producer that was in MEM at
+   // the consumer's dispatch sits in the WB registers during the consumer's
+   // EX cycle (it commits at the end of that cycle): merge its masked fields
+   // over the still-uncommitted flags register. Deferred-Z producers
+   // contribute (wb_value == 0) — a register-sourced NOR.
    flags_t flags_eff;
    always_comb begin
       flags_eff = flags;
       if (ex_fwd_f) begin
-         if (mem_fmask.zero)     flags_eff.zero     = mem_zval ? (mem_result == 64'b0)
-                                                               : mem_fval.zero;
-         if (mem_fmask.carry)    flags_eff.carry    = mem_fval.carry;
-         if (mem_fmask.overflow) flags_eff.overflow = mem_fval.overflow;
-         if (mem_fmask.sign)     flags_eff.sign     = mem_fval.sign;
+         if (wb_fmask.zero)     flags_eff.zero     = wb_zval ? (wb_value == 64'b0)
+                                                             : wb_fval.zero;
+         if (wb_fmask.carry)    flags_eff.carry    = wb_fval.carry;
+         if (wb_fmask.overflow) flags_eff.overflow = wb_fval.overflow;
+         if (wb_fmask.sign)     flags_eff.sign     = wb_fval.sign;
       end
    end
    wire [1:0]  ex_bcvt_t = f_cond_eval(flags_eff, ex_d.bcond, ex_d.binv);
@@ -1220,19 +1224,24 @@ module pipeline_core
                   ex_pc_next <= id_pc_next;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
-                  // M6 EX->EX forward at the register input: the producer
-                  // completing EX this edge supplies exo_result directly.
-                  ex_a       <= (ex_fwdable && ex_d.rd == dec.rs1) ? exo_result : rf[dec.rs1];
-                  ex_c       <= (ex_fwdable && ex_d.rd == dec.rd)  ? exo_result : rf[dec.rd];
+                  // M6 register-sourced forwarding at the operand-register
+                  // inputs: youngest writer wins (MEM over WB over rf).
+                  ex_a       <= (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result
+                              : (b_wb       && wb_rd    == dec.rs1) ? wb_value
+                              : rf[dec.rs1];
+                  ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result
+                              : (b_wb       && wb_rd    == dec.rd)  ? wb_value
+                              : rf[dec.rd];
                   // The b-operand fully resolves HERE (reg / extended imm32 /
-                  // constant 1 for INC-DEC / forwarded producer result) so
-                  // EX's adder and comparators read pure registers.
+                  // constant 1 for INC-DEC / forwarded result) so EX's adder
+                  // and comparators read pure registers.
                   ex_b       <= (dec.uop == U_ALU && id_op[29:26] == 4'h5) ? 64'd1
                               : (dec.len != 2'b01 &&
                                  (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                   dec.uop == U_BOOL || dec.uop == U_ALU))
                                 ? (dec.sgn ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                              : (ex_fwdable && ex_d.rd == dec.rs2) ? exo_result
+                              : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result
+                              : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                               : rf[dec.rs2];
                   mul_cnt    <= 2'd0;
                   if (id_valid && !fetch_halt && dec.serialize) begin
