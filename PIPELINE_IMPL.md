@@ -48,6 +48,19 @@
 > counters, Tier-2 branch-taken wire-up, firm the timing margin. Then M7
 > split I/D port, M8 LLVM sched model. NOT yet on QSPI; debug single-step is
 > FSM-era (documented gap); Zephyr bring-up on the pipeline still to do.
+>
+> **M6 IN FLIGHT (same day).** M6a+b+c implemented + full regression green +
+> committed: forwarding + per-hazard counters (MMIO 0xF00D_00B0-E8, in
+> MMIO_MAP.md). TIMING LESSON: the zero-bubble version (producer exo_result →
+> consumer operand registers) failed WNS −0.750/242 endpoints — the 12-level
+> shifter/result-mux tree + operand-register fanout can't close at 100 MHz.
+> **M6 v2 = register-sourced forwarding** (what P3 actually measured — the
+> FSM forwards from the wb.value REGISTER): operand-register D-inputs muxed
+> mem_result (producer in MEM, non-load) / wb_value (producer in WB, loads
+> included) / rf; producer-in-EX = exactly ONE bubble; load-use = just the
+> load's latency; flags mirror via the WB registers (flags_eff, deferred-Z =
+> register-sourced wb_value==0 NOR). CMP→JMPcc 1 bubble (was 3). Build in
+> flight; then board A/B vs perf/baseline_m5_pipeline.csv.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
 > superseded by `tb_pipeline_isa.sv` + the golden-trace harness.
