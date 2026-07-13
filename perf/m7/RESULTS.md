@@ -110,6 +110,36 @@ the compiler schedules intervening instructions between a dependent load and its
 hiding the latency, whereas hand-asm has tight load→use. So `perf_haz` is the vehicle
 for the definitive per-kernel impact numbers; run it on the M7 bitstream for the A/B.
 
+## M7a board result — real-workload A/B (`perf_haz`, M6 → M7a bitstream)
+
+M7a = in-core fill-through I-cache (pipeline_core; `PIPELINE_IMPL.md` §9), board-verified
+2026-07-13: `run_m5e_board` 7/7 UART byte-identical + `test_rtos` PASS. `haz_real_m7a.csv`
+vs `haz_real_m6.csv`:
+
+| kernel | CPI M6→M7a | ΔCPI | IF_MISS% M6→M7a | exposed next hazard (M7a) |
+|---|--:|--:|--:|---|
+| alu        | 3.94 → **2.38** | **−40%** | 63.5 → 39.5 | DATA 21.1% |
+| mem_stream | 7.32 → **5.17** | **−29%** | 53.7 → 37.4 | MEM_WAIT 43.3% |
+| ptr_chase  | 5.87 → **4.57** | **−22%** | 39.3 → 20.2 | DATA 61.2% |
+| branchy    | 4.25 → **2.37** | **−44%** | 72.5 → 52.2 | DATA 18.6% |
+| calls_fib  | 6.24 → **4.00** | **−36%** | 58.3 → 36.4 | MEM_WAIT 30.3% |
+| muldiv     | 4.21 → **2.68** | **−36%** | 71.3 → 44.8 | DATA 17.6% |
+
+**IF_MISS collapses on every kernel** and CPI drops 22–44% — the measured M7 thesis,
+confirmed on silicon. And the design worked exactly as intended: **removing the fetch
+bottleneck exposes the next one.** On the compute kernels that is now **DATA (GPR RAW)
+stalls** (alu 21%, branchy 19%, muldiv 18%) — the LLVM sched-model (M8) target; on the
+memory kernels it is **MEM_WAIT** (mem_stream 43%, calls_fib 30%) — the true-split-port /
+critical-word-first / D-cache territory. `ptr_chase` flips from fetch-bound to
+dependent-load-bound (DATA 61% — its serial pointer chase, now that fetch is cheap).
+Note the M6-vs-M7 shift the probe foreshadowed: ptr_chase LOADUSE was ~0% on M6 (hidden
+behind fetch) and is exposed on M7 — the tight-load-use `.kla` probe predicted this.
+
+Timing: build OK, WNS −0.050 ns on the FSM→perf-counter-reset fanout + the pre-existing
+mul-DSP CE cone (M6 shipped −0.016 there) — **not** the I-cache datapath, which closes;
+7/7 board pass confirms no functional impact. A QSPI/production build still wants the
+seed/directive respin (unchanged from M6).
+
 ## Reproduce
 ```
 # board (needs the M6 pipeline bitstream programmed, e.g. ~/.klausscpu_scratch/prog.tcl)

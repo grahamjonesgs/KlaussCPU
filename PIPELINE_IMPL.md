@@ -86,13 +86,24 @@
 > cycles in 5/6 kernels — and large even with zero memory traffic** (alu 93%
 > straight-line, MEM_WAIT=0, still 60% IF_MISS; branchy 73%). ⇒ M7 = **1-cycle-hit
 > I-cache with its own fetch port** (kills IF_MISS everywhere; the big lever) **+
-> split I/D port** (memory kernels' IF_MISS 33–54% and MEM_WAIT 37–54% currently
-> serialize on the one shared port). Design + sub-milestones (M7a cache+port,
-> M7b fence.i/SMC coherence, M7c re-measure) in §9. Probe cross-checks the real
-> baseline (branchy CPI 4.41 ≈ 4.402). Board holds the M6 bitstream (volatile JTAG,
-> prog.tcl) as of this measurement. NEXT: implement M7a. Later: branch handling
-> (predict/back-edge) for the BRFLUSH residual, M8 LLVM sched model; QSPI after the
-> SHA-path respin.
+> split I/D port**. Design + sub-milestones in §9. Also added `perf_haz.elf`
+> (runtime `baremetal/programs/perf_haz.c`): perf_baseline + hazard counters on the
+> REAL kernels — the codegen-faithful A/B vehicle (`perf/m7/haz_real_*.csv`).
+>
+> **M7a DONE — BOARD-VERIFIED (2026-07-13).** In-core fill-through I-cache
+> (direct-mapped 512×16 B, transparent IFB-fill accelerator; hits skip the shared
+> port, misses fill+install; store-snoop for SMC). User-approved fill-through-shared-
+> cache (least logic on an already-tight design). Golden-trace all-pass
+> (m5a/m5c-SMC+IRQ/m5d_soc); **board 7/7 UART byte-identical + test_rtos PASS**.
+> **Real-workload CPI −22–44%** (perf_haz M6→M7a), IF_MISS collapses on every kernel.
+> Timing WNS −0.050 on the perf-counter-reset fanout + pre-existing mul-DSP cone
+> (NOT the I-cache — it closes); board pass confirms no functional hit. **Removing
+> fetch exposed the next bottleneck: DATA (GPR RAW) on compute kernels (18–61%) → the
+> M8 sched-model target; MEM_WAIT on memory kernels → true-split-port / D-cache.**
+> NEXT: M7b (MMIO fence.i invalidate + tag-checked snoop for loaders-under-pipeline;
+> the current index-snoop is already SMC-correct for the regression), then M8 (LLVM
+> sched-model — the DATA-hazard lever, now quantified) + branch predict for the
+> BRFLUSH residual; QSPI after the SHA/counter respin.
 > `master` = flags + 32 B (board-verified, on QSPI) — untouched.
 > `tb_pipeline.sv` (toy-ISA M1-M4 tb) was retired with the M5a rewrite —
 > superseded by `tb_pipeline_isa.sv` + the golden-trace harness.
@@ -302,15 +313,18 @@ window), and the install must be deterministic (even fill = full line, odd =
 low-dword+retag; no old-state read that a redirect could mis-point).
 
 **Sub-milestones (each: golden-trace `run_m5a`+`run_m5c`+`run_m5d_soc`, then board):**
-- **M7a — SIM-VERIFIED (2026-07-13), board pending.** In-core fill-through I-cache.
-  Golden-trace bit-identical: `run_m5a` hello/bst/expr/test_64bit/queens(2M),
-  `run_m5c` (WAIT + **SMC squash+refetch** + IRQ storms bst/test_64bit),
-  `run_m5d_soc` hello. `haz_probe` in sim — **IF_MISS falls on every kernel** and
-  CPI drops: alu 3.35→2.09 (IF_MISS 61→38%), branchy 4.42→2.61 (74→53%),
-  mem_stream 5.25→3.76 (55→38%), ptr_chase 4.50→3.01 (56→34%), calls_fib
-  7.70→5.27 (54→34%), muldiv 7.54→6.32 (34→18%). Residual IF_MISS = the 2-cycle
-  lookup + taken-branch refill (predictor territory). NEXT: synth WNS (M6 already
-  at −0.016 on the SHA path — watch fetch-path timing), then board re-measure.
+- **M7a — BOARD-VERIFIED (2026-07-13).** In-core fill-through I-cache. Sim: golden-
+  trace bit-identical (`run_m5a` hello/bst/expr/test_64bit/queens-2M, `run_m5c` WAIT
+  + **SMC squash+refetch** + IRQ storms, `run_m5d_soc` hello). Silicon: `run_m5e_board`
+  **7/7 UART byte-identical** + `test_rtos` PASS. **Real-workload A/B (`perf_haz`,
+  `perf/m7/RESULTS.md`): CPI −22–44%** (alu 3.94→2.38, branchy 4.25→2.37, mem_stream
+  7.32→5.17, ptr_chase 5.87→4.57, calls_fib 6.24→4.00, muldiv 4.21→2.68); IF_MISS
+  collapses on every kernel. Timing: BUILD OK, WNS −0.050 on the FSM→perf-counter-
+  reset fanout + the pre-existing mul-DSP CE cone (M6 was −0.016 there) — NOT the
+  I-cache datapath (it closes); 7/7 board pass confirms no functional impact.
+  **Removing fetch exposed the next bottleneck** — DATA (GPR RAW) on compute kernels
+  (→ M8 sched-model), MEM_WAIT on memory kernels (→ true-split-port / D-cache).
+  QSPI still wants the seed/directive respin (unchanged from M6).
 - **M7b** — `fence.i` invalidate-all + I-cache store-snoop; SMC/loader coherence.
   Exit: SMC directed test + full regression bit-identical.
 - **M7c** — re-measure CPI (`baseline_m7_pipeline.csv`) + re-run the hazard probe;
