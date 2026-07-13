@@ -169,6 +169,50 @@ module pipeline_core
    // slot 1 for free within a line).
    wire [28:0] miss_dw  = in0 ? pc_dw + 29'd1 : pc_dw;
 
+   // ======================= M7a: fetch I-cache (fill-through) ==================
+   // Direct-mapped, IC_LINES x 16 B (2 dwords), per-line tag + PER-DWORD valid.
+   // Transparent accelerator on the IFB fill path: a hit returns the SAME
+   // (rdata, rdata_next, next_valid) triple the shared-port line-read gives for a
+   // given miss_dw, so the fill-engine capture logic is unchanged — a hit just
+   // skips the shared m_* port (the measured IF_MISS + IF/MEM-contention win;
+   // perf/m7/RESULTS.md). Coherence: invalidate-all on rst/start; per-store
+   // index-invalidate snoop (conservative — clears the indexed line without a tag
+   // read; SMC-correct, M7b refines to tag-checked). Miss path is unchanged (fetch
+   // at miss_dw, install what returns; per-dword valid tolerates partial fills).
+   //   dword addr = pc[31:3] (29b); line = dword[28:1]; dword-in-line = dword[0]=addr[3]
+   localparam int IC_LINES = 512;
+   localparam int IC_IDXW  = 9;                 // $clog2(IC_LINES)
+   (* ram_style = "block" *) logic [127:0] ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
+   (* ram_style = "block" *) logic [18:0]  ic_tag  [0:IC_LINES-1];
+   logic ic_vhi [0:IC_LINES-1];                 // addr3=0 dword present
+   logic ic_vlo [0:IC_LINES-1];                 // addr3=1 dword present
+
+   wire [IC_IDXW-1:0] ic_look_idx = miss_dw[IC_IDXW:1];
+   wire [18:0]        ic_look_tag = miss_dw[28:IC_IDXW+1];
+   // registered read of the line for the current miss_dw (1-cycle BRAM latency)
+   logic [IC_IDXW-1:0] ic_rd_idx;
+   logic [127:0]       ic_rd_data;
+   logic [18:0]        ic_rd_tag;
+   logic               ic_rd_vhi, ic_rd_vlo;
+   always_ff @(posedge clk) begin
+      ic_rd_idx  <= ic_look_idx;
+      ic_rd_data <= ic_data[ic_look_idx];
+      ic_rd_tag  <= ic_tag [ic_look_idx];
+      ic_rd_vhi  <= ic_vhi [ic_look_idx];
+      ic_rd_vlo  <= ic_vlo [ic_look_idx];
+   end
+   // hit once the registered read has caught up to the (stable, stalled) miss_dw
+   wire ic_rd_current = (ic_rd_idx == ic_look_idx);
+   wire ic_tag_match  = ic_rd_current && (ic_rd_tag == ic_look_tag);
+   wire ic_dw_valid   = miss_dw[0] ? ic_rd_vlo : ic_rd_vhi;
+   wire ic_hit        = ic_tag_match && ic_dw_valid;
+   // triple mirroring the m_* line-read for this miss_dw (see mem_read_write:
+   // addr3=0 -> line[127:64], addr3=1 -> line[63:0]; next = the low dword)
+   wire [63:0] ifr_rdata      = miss_dw[0] ? ic_rd_data[63:0] : ic_rd_data[127:64];
+   wire [63:0] ifr_rdata_next = ic_rd_data[63:0];
+   wire        ifr_next_valid = !miss_dw[0] && ic_rd_vlo;
+   logic       if_look;                         // in I-cache lookup phase (no port)
+
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
    logic [31:0] id_pc, id_op, id_var1, id_var2;
@@ -970,16 +1014,19 @@ module pipeline_core
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
-         mem_xc <= '0; if_xc <= 1'b0; ifb_val <= 2'b00;
+         mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
+         for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else begin
          if (start) begin
             pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-            ifb_val <= 2'b00;
+            ifb_val <= 2'b00; if_look <= 1'b0;
+            // invalidate-all: a fresh program image may reuse code addresses
+            for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
          end
 
          irq_ack <= 1'b0;
@@ -1125,6 +1172,13 @@ module pipeline_core
                   m_write_DV <= mem_port_wr;
                   rdy_armed  <= !m_ready;
                   mem_xc     <= 2'd1;
+                  // M7a store-snoop: invalidate the I-cache line this store maps to
+                  // (index-only, no tag read — conservative; SMC coherence, backed
+                  // by the M5c squash-and-refetch). M7b: tag-checked.
+                  if (mem_port_wr) begin
+                     ic_vhi[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
+                     ic_vlo[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
+                  end
                end
                2'd1: if (w_mrdy) begin
                   if (ld32_need2) begin        // cross-line MEMGET32: 2nd read
@@ -1145,7 +1199,12 @@ module pipeline_core
             endcase
          end
 
-         // ---------------- IF fill engine (2-dword IFB window) ----------------
+         // ------------- IF fill engine: I-cache lookup -> hit | miss-fill -------
+         // Three phases: (idle) on a fetch-window miss, start an I-cache LOOKUP
+         // (no port); on the lookup result, either serve the IFB from the cache
+         // (hit, 1 cyc, no port — the win) or issue the m_* miss-fill; on fill
+         // completion, capture into the IFB AND install the line. The IFB capture
+         // is byte-identical between the hit and miss paths (ifr_* mirrors m_*).
          if (if_xc) begin
             if (w_mrdy) begin
                if (if_rebase) begin
@@ -1157,15 +1216,62 @@ module pipeline_core
                end
                m_read_DV <= 1'b0;
                if_xc     <= 1'b0;
+               // --- install the fetched dword(s): if_req_dw[0]=addr3 (0->hi dword,
+               //     + lo when m_next_valid; 1->lo dword). Per-dword valid tolerates
+               //     the partial (odd-address) fill.
+               begin : ic_install
+                  // Deterministic install (no old-state read → robust to a
+                  // redirect during the fill). An even fetch returns BOTH dwords
+                  // (m_next_valid always set for addr3=0) → full-line install; an
+                  // odd fetch returns only the low dword → write it, retag, clear
+                  // hi. (An odd fill only occurs on an empty/other-tag line — a
+                  // cached line's odd dword would have hit — so no cached data is
+                  // lost.)  {m_rdata, m_rdata_next} = {addr3=0 dword, addr3=1 dword}.
+                  logic [IC_IDXW-1:0] wi;
+                  logic [18:0]        wt;
+                  wi = if_req_dw[IC_IDXW:1];
+                  wt = if_req_dw[28:IC_IDXW+1];
+                  ic_tag[wi] <= wt;
+                  if (if_req_dw[0] == 1'b0) begin        // even fill: full line
+                     ic_data[wi] <= {m_rdata, m_rdata_next};
+                     ic_vhi[wi]  <= 1'b1;
+                     ic_vlo[wi]  <= m_next_valid;
+                  end else begin                         // odd fill: low dword only
+                     ic_data[wi][63:0] <= m_rdata;
+                     ic_vhi[wi]  <= 1'b0;
+                     ic_vlo[wi]  <= 1'b1;
+                  end
+               end
             end
-         end else if (running && !fetch_halt && !parked && !irq_active && !fetch_ok
-                      && !mem_port_op && mem_xc == 2'd0) begin
-            m_addr    <= {miss_dw, 3'b000};
-            m_read_DV <= 1'b1;
-            rdy_armed <= !m_ready;
-            if_req_dw <= miss_dw;
-            if_rebase <= !in0;
-            if_xc     <= 1'b1;
+         end else if (if_look) begin
+            if (ic_rd_current) begin           // registered read now valid for miss_dw
+               if (ic_hit) begin               // serve from the I-cache (no port)
+                  // Use CURRENT in0/miss_dw (not latched): a branch redirect can
+                  // change miss_dw mid-lookup, and ic_rd_current ties ic_rd_data to
+                  // the current request — so base and data stay self-consistent
+                  // (a stale mix would corrupt the window; the m_* path is immune
+                  // because it captures old base + old data together).
+                  if (!in0) begin
+                     ifb_base  <= miss_dw;
+                     ifb_dw[0] <= ifr_rdata;       ifb_val[0] <= 1'b1;
+                     ifb_dw[1] <= ifr_rdata_next;  ifb_val[1] <= ifr_next_valid;
+                  end else begin
+                     ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
+                  end
+                  if_look <= 1'b0;
+               end else if (!mem_port_op && mem_xc == 2'd0) begin
+                  m_addr    <= {miss_dw, 3'b000};   // miss: issue the shared-port fill
+                  m_read_DV <= 1'b1;
+                  rdy_armed <= !m_ready;
+                  if_req_dw <= miss_dw;             // old base+data captured together
+                  if_rebase <= !in0;
+                  if_xc     <= 1'b1;
+                  if_look   <= 1'b0;
+               end
+               // else: port busy — hold in if_look (re-evaluates in0/miss_dw each cycle)
+            end
+         end else if (running && !fetch_halt && !parked && !irq_active && !fetch_ok) begin
+            if_look   <= 1'b1;                 // begin lookup (no port access)
          end
 
          // ---------------- MEM -> WB ----------------

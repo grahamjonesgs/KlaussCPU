@@ -289,10 +289,28 @@ Cross-check: probe branchy CPI 4.41 ≈ `baseline_m6_pipeline.csv` 4.402.
   deposit code as data then jump. This is the M5c SMC squash's cache-side partner;
   regression must stay UART-bit-identical (SMC directed test + queens self-mod paths).
 
+**Chosen realization (fill-through-shared-cache, user-approved).** The I-cache
+lives INSIDE `pipeline_core`'s fetch path as a transparent accelerator on the IFB
+fill: direct-mapped, 512×16 B lines, per-line tag + per-dword valid, BRAM data/tag
++ FF valid. A fetch-window miss does a 1-cycle-latency I-cache LOOKUP (no port);
+a hit refills the IFB from BRAM and skips the shared `m_*` port entirely (the win);
+a miss issues the same `m_*` line-read as before and installs the line. Coherence:
+invalidate-all on rst/`start`; per-store index-invalidate snoop (SMC). Key
+correctness lessons: the hit path must use the CURRENT `in0`/`miss_dw` (a branch
+redirect changes `miss_dw` mid-lookup — a latched base + fresh data corrupts the
+window), and the install must be deterministic (even fill = full line, odd =
+low-dword+retag; no old-state read that a redirect could mis-point).
+
 **Sub-milestones (each: golden-trace `run_m5a`+`run_m5c`+`run_m5d_soc`, then board):**
-- **M7a** — I-cache module + own fetch port + arbiter entry; hit/miss counters
-  (`ICACHE_HIT/MISS` MMIO). Exit: regressions bit-identical; IF_MISS drops on
-  alu/branchy; re-run `haz_probe` on board — IF_MISS % must fall.
+- **M7a — SIM-VERIFIED (2026-07-13), board pending.** In-core fill-through I-cache.
+  Golden-trace bit-identical: `run_m5a` hello/bst/expr/test_64bit/queens(2M),
+  `run_m5c` (WAIT + **SMC squash+refetch** + IRQ storms bst/test_64bit),
+  `run_m5d_soc` hello. `haz_probe` in sim — **IF_MISS falls on every kernel** and
+  CPI drops: alu 3.35→2.09 (IF_MISS 61→38%), branchy 4.42→2.61 (74→53%),
+  mem_stream 5.25→3.76 (55→38%), ptr_chase 4.50→3.01 (56→34%), calls_fib
+  7.70→5.27 (54→34%), muldiv 7.54→6.32 (34→18%). Residual IF_MISS = the 2-cycle
+  lookup + taken-branch refill (predictor territory). NEXT: synth WNS (M6 already
+  at −0.016 on the SHA path — watch fetch-path timing), then board re-measure.
 - **M7b** — `fence.i` invalidate-all + I-cache store-snoop; SMC/loader coherence.
   Exit: SMC directed test + full regression bit-identical.
 - **M7c** — re-measure CPI (`baseline_m7_pipeline.csv`) + re-run the hazard probe;
