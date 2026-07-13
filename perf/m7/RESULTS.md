@@ -83,6 +83,33 @@ each kernel's signature is right (muldiv is the only MULDIV-stalling kernel; cal
 the only SP-stalling one; IF_MISS < cycles). Magnitudes are the model's fixed 8-cycle
 DDR with in-cache working sets — **not** silicon; the board table above is the real one.
 
+## Real-workload hazard attribution (`perf_haz`) — codegen-faithful cross-check
+
+The `.kla` probe reproduces each kernel's *algorithmic* hazard signature but not the
+compiler's codegen. `perf_haz.elf` (runtime repo: `baremetal/programs/perf_haz.c`, a
+copy of `perf_baseline.c` that also snapshots `0xF00D_00B0..E8` per kernel) runs the
+**real compiled kernels with the real 256 KiB working set**. It is its OWN ELF — not
+an edit to the pinned `perf_baseline.elf` (which must stay pinned for the CPI A/B).
+
+**M6 board baseline** (`haz_real_m6.csv`, % of cycles):
+
+| kernel | CPI | DATA | LOADUSE | SP | MULDIV | BRFLUSH | **IF_MISS** | **MEM_WAIT** |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| alu        | 3.94 | 12.7 | 0.0  | 0    | 0    | 1.6 | **63.5** | 0.0 |
+| mem_stream | 7.32 | 19.2 | 17.3 | 0    | 0    | 1.9 | **53.7** | **39.5** |
+| ptr_chase  | 5.87 |  7.9 | 0.0  | 0    | 0    | 1.3 | **39.3** | **41.0** |
+| branchy    | 4.26 | 10.4 | 0.0  | 0    | 0    | 1.4 | **72.5** | 0.0 |
+| calls_fib  | 6.24 |  2.4 | 0.0  | 10.2 | 0    | 1.9 | **58.3** | **31.6** |
+| muldiv     | 4.21 |  9.6 | 0.0  | 0    | 11.3 | 1.6 | **71.3** | 0.0 |
+
+**Fidelity vs the micro-kernel probe:** IF_MISS matches well (real vs probe: alu
+63.5/60, branchy 72.5/73, mem_stream 53.7/44, muldiv 71.3/60) — so the probe was a
+sound proxy for the *design* decision (IF_MISS dominant, 39–73% on real code). But
+**LOADUSE diverges**: ptr_chase real **0.0%** vs probe 56%, mem_stream 17.3% vs 33% —
+the compiler schedules intervening instructions between a dependent load and its use,
+hiding the latency, whereas hand-asm has tight load→use. So `perf_haz` is the vehicle
+for the definitive per-kernel impact numbers; run it on the M7 bitstream for the A/B.
+
 ## Reproduce
 ```
 # board (needs the M6 pipeline bitstream programmed, e.g. ~/.klausscpu_scratch/prog.tcl)
