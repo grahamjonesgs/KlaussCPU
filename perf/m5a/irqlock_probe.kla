@@ -1,0 +1,36 @@
+// irqlock_probe — minimal repro of the MMIO ready-edge deadlock (LVGL hang).
+// A store to MMIO issued 1 cycle behind a completing MMIO load (consecutive
+// load;store, no data dep so no stall separates them — the shape of Zephyr's
+// irq_lock(): read int_mask; write int_mask) sees the read's stale-high ready
+// tail at issue, so rdy_armed never sets, and the old combinational write ack
+// then holds ready high forever -> permanent bus wedge.
+// PASS = prints "OK" and halts. WEDGE = silence (tb_soc deadlock watchdog).
+
+_start
+SETR B 0xF00F0000      // INT_MASK
+SETR D 0
+MEMREADRR C B          // MMIO load  (completes at T)
+MEMSET32 D B           // MMIO store (enters MEM at T+1 -> k=1) — writes 0, benign
+
+SETR A 79              // 'O'
+CALL putc:
+SETR A 75              // 'K'
+CALL putc:
+HALT
+
+// putc: send A's low byte (destroys B,C)
+putc:
+SETR B 0xF0010010      // UART STATUS
+putc_wait:
+MEMREADRR C B
+ANDV C 1
+CMPRV C 0
+JMPNE putc_wait:
+SETR B 0xF0010000      // UART TX_DATA
+MEMSET8 A B
+RET
+
+// pad so the sim boot-ROM's dword-granular copy can drop the tail harmlessly
+HALT
+HALT
+HALT

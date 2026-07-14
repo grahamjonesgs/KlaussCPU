@@ -1,0 +1,190 @@
+// blitflush_probe — directed repro of the LVGL flush=blitter code-memory
+// corruption (HCF ERR=01 PC=0xD69A4 OPCM=0xA600A600, see
+// PIPELINE_M7B_ICACHE_SNOOP.md "NEW open item").
+//
+// Mirrors zephyr-ws vnc/blitter.h blit_copy_rect() register-for-register:
+//   CACHE_CTRL=FLUSH; DST/DSTRIDE/SRC/SSTRIDE/W/H; CTRL=START|COPY<<1;
+//   poll STATUS.BUSY; STATUS=DONE (W1C); CACHE_CTRL=INVALIDATE.
+// The CPU first "renders" a 0xA600 pixel pattern into SRC (dirtying unified-
+// cache lines exactly like LVGL's draw buffer), then runs the sequence.
+//
+// Suspected bug: the MAINT flush walk builds the writeback address with a
+// 16-byte-line-era 4'b0000 offset ({tag, index, 4'b0000}, 31 bits zero-
+// extended) while the cache has 32 B lines -> every dirty line is flushed to
+// HALF its true address (2 * 0xD69A0 = 0x1AD340 = LVGL draw buffer).
+//
+// Checks (printed as hex64, read BEFORE the INVAL so the probe itself
+// survives the bug long enough to report):
+//   V = [0x00100000] = SRC/2 victim. never touched by CPU -> read is a miss,
+//       served from DDR.       fix: 0000000000000000   bug: A600A600A600A600
+//   D = [0x00300000] = blit dst. CPU never wrote it -> read from DDR.
+//       fix: A600A600A600A600  bug: 0000000000000000 (blitter copied the
+//       never-flushed DDR zeros under SRC)
+// then CACHE_CTRL=INVALIDATE (completing the Zephyr sequence) and
+//   S = [0x00200000] = SRC re-read from DDR after the drop.
+//       fix: A600A600A600A600  bug: zeros/garbage, or no output at all —
+//       post-INVAL code re-fetch from mis-flushed DDR kills the program,
+//       which is exactly the LVGL crash shape.
+// PASS line prints only if V/D/S all match the fixed expectation.
+
+_start
+// ---- render 2 cache lines (64 B = 32 px) of 0xA600 pixels into SRC ----
+SETR B 0x00200000
+SETR64 C 0xA600A600A600A600
+SETR H 8
+fill:
+MEMSET64 C B
+ADDV B 8
+MINUSV H 1
+JMPNZ fill:
+
+// ---- blit_start_copy(dst=0x300000, 64, src=0x200000, 64, w=32, h=1) ----
+SETR B 0xF0050000       // CACHE_CTRL
+SETR A 2
+MEMSET32 A B            // FLUSH (walk runs while we program the blitter)
+
+SETR B 0xF00E0010       // BLIT_DST_ADDR
+SETR64 A 0x00300000
+MEMSET64 A B
+SETR B 0xF00E0018       // BLIT_DST_STRIDE
+SETR64 A 64
+MEMSET64 A B
+SETR B 0xF00E0020       // BLIT_SRC_ADDR
+SETR64 A 0x00200000
+MEMSET64 A B
+SETR B 0xF00E0028       // BLIT_SRC_STRIDE
+SETR64 A 64
+MEMSET64 A B
+SETR B 0xF00E0030       // BLIT_WIDTH
+SETR64 A 32
+MEMSET64 A B
+SETR B 0xF00E0038       // BLIT_HEIGHT
+SETR64 A 1
+MEMSET64 A B
+SETR B 0xF00E0000       // BLIT_CTRL = START | (OP_COPY << 1)
+SETR64 A 3
+MEMSET64 A B
+
+// ---- poll BLIT_STATUS.BUSY (blitter waits out the flush walk at the arbiter)
+SETR B 0xF00E0008
+busy:
+MEMREADRR C B
+ANDV C 1
+CMPRV C 0
+JMPNE busy:
+
+SETR64 A 2              // STATUS = DONE (W1C)
+MEMSET64 A B
+
+// ---- report V and D before the INVAL ----
+SETR A 86               // 'V'
+CALL putc:
+SETR A 61               // '='
+CALL putc:
+SETR G 0x00100000
+MEMREADRR D G
+CALL print_hex64:
+COPY I D                // keep V for the verdict
+SETR A 32
+CALL putc:
+
+SETR A 68               // 'D'
+CALL putc:
+SETR A 61
+CALL putc:
+SETR G 0x00300000
+MEMREADRR D G
+CALL print_hex64:
+COPY J D                // keep D
+CALL crlf:
+
+// ---- blit_finish(): CACHE_CTRL = INVALIDATE ----
+SETR B 0xF0050000
+SETR A 4
+MEMSET32 A B
+
+// ---- report S after the drop ----
+SETR A 83               // 'S'
+CALL putc:
+SETR A 61
+CALL putc:
+SETR G 0x00200000
+MEMREADRR D G
+CALL print_hex64:
+COPY K D                // keep S
+CALL crlf:
+
+// ---- verdict ----
+SETR64 E 0xA600A600A600A600
+CMPRV I 0               // V must be untouched
+JMPNE fail:
+CMPRR J E               // D must be the pixels
+JMPNE fail:
+CMPRR K E               // S must still be the pixels
+JMPNE fail:
+SETR A 80               // "PASS"
+CALL putc:
+SETR A 65
+CALL putc:
+SETR A 83
+CALL putc:
+SETR A 83
+CALL putc:
+CALL crlf:
+HALT
+
+fail:
+SETR A 70               // "FAIL"
+CALL putc:
+SETR A 65
+CALL putc:
+SETR A 73
+CALL putc:
+SETR A 76
+CALL putc:
+CALL crlf:
+HALT
+
+// crlf (destroys A,B,C)
+crlf:
+SETR A 13
+CALL putc:
+SETR A 10
+CALL putc:
+RET
+
+// print_hex64: D printed as 16 hex digits (destroys A,C,E; D restored)
+print_hex64:
+SETR E 16
+ph_loop:
+ROLV D 4
+COPY A D
+ANDV A 0xF
+CMPRV A 10
+JMPULT ph_digit:
+ADDV A 55
+JMP ph_out:
+ph_digit:
+ADDV A 48
+ph_out:
+CALL putc:
+MINUSV E 1
+JMPNZ ph_loop:
+RET
+
+// putc: send A's low byte (destroys B,C)
+putc:
+SETR B 0xF0010010
+putc_wait:
+MEMREADRR C B
+ANDV C 1
+CMPRV C 0
+JMPNE putc_wait:
+SETR B 0xF0010000
+MEMSET8 A B
+RET
+
+// pad so the sim boot-ROM's dword-granular copy can drop the tail harmlessly
+HALT
+HALT
+HALT

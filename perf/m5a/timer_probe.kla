@@ -1,0 +1,56 @@
+// timer_probe — minimal repro of the LVGL TIMER_COUNT-poll wedge.
+// LVGL wedges at ~i=15,993,341 polling TIMER_COUNT (0xF00F0038) right when
+// the timer IRQ fires: the MMIO read never completes (MEM_WAIT pegged), so
+// the IRQ can never dispatch (needs !mem_busy) -> hard wedge.
+// This probe recreates exactly that: INT_VEC[0]=handler, short period,
+// unmask, then tight-poll TIMER_COUNT until the handler has counted 3 IRQs.
+// PASS = prints "SW" then halts. WEDGE = prints "S" then silence.
+
+_start
+SETR J 0               // J = IRQ count (handler increments)
+
+SETR D handler:        // INT_VEC[0] = handler address
+SETR B 0xF00F0010
+MEMSET32 D B
+
+SETR D 997             // TIMER_PERIOD: prime, so successive IRQs sweep every
+SETR B 0xF00F0030      // read-vs-fire alignment of the poll loop
+MEMSET32 D B
+
+SETR D 1               // int_mask bit0 = timer
+SETR B 0xF00F0000
+MEMSET32 D B
+
+SETR A 83              // 'S' — setup done, entering poll
+CALL putc:
+
+poll:
+SETR B 0xF00F0038      // TIMER_COUNT — the read that wedges under LVGL
+MEMREADRR C B
+CMPRV J 200
+JMPULT poll:
+
+SETR A 87              // 'W' — survived 200 timer IRQs while polling
+CALL putc:
+HALT
+
+handler:
+ADDV J 1
+IRET
+
+// putc: send A's low byte (destroys B,C)
+putc:
+SETR B 0xF0010010      // UART STATUS
+putc_wait:
+MEMREADRR C B
+ANDV C 1
+CMPRV C 0
+JMPNE putc_wait:
+SETR B 0xF0010000      // UART TX_DATA
+MEMSET8 A B
+RET
+
+// pad so the sim boot-ROM's dword-granular copy can drop the tail harmlessly
+HALT
+HALT
+HALT

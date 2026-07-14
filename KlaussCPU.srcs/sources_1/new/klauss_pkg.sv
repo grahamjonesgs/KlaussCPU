@@ -18,7 +18,7 @@ package klauss_pkg;
    // from the original localparams, so the synthesized hardware is unchanged.
    typedef enum logic [33:0] {
       OPCODE_REQUEST = 34'h1, OPCODE_FETCH = 34'h2, OPCODE_FETCH2 = 34'h4,
-      VAR1_FETCH = 34'h8, VAR1_FETCH2 = 34'h10, WAITING = 34'h20,  // WAITING: interruptible core-suspend (WAIT opcode); uses the state bit above VAR1_FETCH2
+      VAR1_FETCH = 34'h8, PIPE_RUN = 34'h10, WAITING = 34'h20,  // PIPE_RUN: the 5-stage pipeline_core owns execution (reuses the retired VAR1_FETCH2 bit); WAITING: interruptible core-suspend (WAIT opcode)
       START_WAIT = 34'h40, UART_DELAY = 34'h80, OPCODE_EXECUTE = 34'h100,
       HCF_1 = 34'h200, HCF_2 = 34'h400, HCF_3 = 34'h800, HCF_4 = 34'h1_000,
       NO_PROGRAM = 34'h2_000, LOAD_START = 34'h4_000, LOADING_BYTE = 34'h8_000,
@@ -256,6 +256,97 @@ package klauss_pkg;
       logic        timing_start;
       logic        rx_fifo_read;
    } cpu_state_t;
+
+   // ========================================================================
+   // Pipeline stage-latch bundles (Phase B — feat/pipeline). See PIPELINE_IMPL.md.
+   // The whole-struct cpu_state_t above stays the reference model on master; the
+   // pipeline decomposes it into these per-stage bundles, each with its own valid
+   // bit and always_ff. Architectural state (r_register/flags/SP/int_mask/caches)
+   // stays central and is committed only at WB (the single retire point). These
+   // are first-cut widths and will firm up as each stage's logic lands (M1..M5).
+   // ========================================================================
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [95:0] words;      // up to 3 x 32-bit instruction words (opcode + imm64)
+      logic [1:0]  len;        // word count from LEN[31:30] (1/2/3)
+      logic        fault;      // fetch-side fault (illegal / bus)
+   } if_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [31:0] opcode;
+      logic [3:0]  cls;        // CLASS[29:26] (note: `class` is reserved)
+      logic [3:0]  rd;
+      logic [3:0]  rs1;
+      logic [3:0]  rs2;
+      logic [63:0] imm;        // sign/zero-extended immediate
+      logic [1:0]  len;
+      logic        is_branch;
+      logic        is_mem;
+      logic        is_store;
+      logic        is_mul;
+      logic        is_div;
+      logic        writes_reg;
+      logic        writes_flags;
+   } id_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [3:0]  rd;
+      logic [63:0] result;
+      flags_t      flags_out;
+      logic        writes_reg;
+      logic        writes_flags;
+      logic        is_mem;
+      logic        is_store;
+      logic [31:0] mem_addr;
+      logic [63:0] store_data;
+      logic        taken;      // branch taken (resolved in EX)
+      logic [31:0] target;     // redirect target
+   } ex_t;
+
+   typedef struct packed {
+      logic        valid;
+      logic [31:0] pc;
+      logic [3:0]  rd;
+      logic [63:0] value;
+      flags_t      flags_out;
+      logic        writes_reg;
+      logic        writes_flags;
+   } mem_t;
+
+   // Pure combinational EX-stage ALU (mirrors f_alu's arithmetic; no FSM
+   // sequencing). aluop = opcode[25:22] (0=ADD 1=SUB 2=ADC 3=SBC 4=AND 5=OR
+   // 6=XOR); cin = carry-in for ADC/SBC. Used by the pipeline EX stage.
+   typedef struct packed { flags_t flags; logic [63:0] result; } alu_res_t;
+
+   function automatic alu_res_t f_alu_ex(logic [63:0] a, logic [63:0] b,
+                                         logic [3:0] aluop, logic cin);
+      alu_res_t    r;
+      logic [64:0] sum;
+      logic        is_sub;
+      r      = '0;
+      is_sub = (aluop == 4'd1) || (aluop == 4'd3);   // SUB / SBC
+      case (aluop)
+         4'd4: begin r.result = a & b; r.flags.zero = ((a & b) == 64'b0); end   // AND
+         4'd5: begin r.result = a | b; r.flags.zero = ((a | b) == 64'b0); end   // OR
+         4'd6: begin r.result = a ^ b; r.flags.zero = ((a ^ b) == 64'b0); end   // XOR
+         default: begin                                                          // ADD/SUB/ADC/SBC
+            if (is_sub) sum = {1'b0, a} - {1'b0, b} - {64'b0, (aluop == 4'd3) ? cin : 1'b0};
+            else        sum = {1'b0, a} + {1'b0, b} + {64'b0, (aluop == 4'd2) ? cin : 1'b0};
+            r.result         = sum[63:0];
+            r.flags.carry    = sum[64];
+            r.flags.zero     = (sum[63:0] == 64'b0);
+            r.flags.sign     = sum[63];
+            r.flags.overflow = is_sub ? ((a[63] != b[63]) && (sum[63] != a[63]))
+                                      : ((a[63] == b[63]) && (sum[63] != a[63]));
+         end
+      endcase
+      return r;
+   endfunction
 
    // ========================================================================
    // f_alu — unified next-state ALU. ONE function for the whole

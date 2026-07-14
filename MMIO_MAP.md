@@ -164,7 +164,7 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | Offset  | Reg                  | RW | Width | Description |
 |---------|----------------------|----|-------|-------------|
 | 0x0000  | `CACHE_CTRL`         | W  | 3     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). Reads as 0. |
-| 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_1008_0002` (2 ways, 2048 sets, 16 B/line, 64 KB total). |
+| 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_2004_0002` (2 ways, 1024 sets, 32 B/line, 64 KB total). |
 | 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
@@ -278,6 +278,18 @@ run, read.
 | 0x0090 | `PERF_CNT_CALL`         | R  | 64    | Direct + conditional calls (`CALL`/`CALLREL`/`CALLcc`). |
 | 0x0098 | `PERF_CNT_INDIRECT`     | R  | 64    | Register/stack-target transfers (`JMPR`, `RET`, `IRET`, `CALLR`). Future BTB / target-prediction budget. |
 | 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div (also in `*_OPS`), system, I/O, `NOP`, etc. |
+| 0x00A8 | `PERF_FASTPATH`         | R  | 64    | (FSM-era) fast-path dispatches; 0 under the pipeline. |
+| 0x00B0 | `PERF_STALL_DATA`       | R  | 48    | Pipeline: GPR RAW stall cycles (producer in MEM/WB, or unforwardable in EX). |
+| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where a memory-read producer blocks from EX (load-use). |
+| 0x00C0 | `PERF_STALL_FLAGS`      | R  | 48    | Pipeline: flag-reader stall cycles (producer in MEM/WB; EX forwards). |
+| 0x00C8 | `PERF_STALL_SP`         | R  | 48    | Pipeline: SP-serialization stall cycles (class-9/CALL behind an SP writer). |
+| 0x00D0 | `PERF_STALL_MULDIV`     | R  | 48    | Pipeline: EX-busy cycles (mul/div/DELAY/LCD occupying EX). |
+| 0x00D8 | `PERF_BRANCH_FLUSH`     | R  | 48    | Pipeline: taken-redirect EVENTS (each costs ~2 fetch bubbles). |
+| 0x00E0 | `PERF_IF_MISS`          | R  | 48    | Pipeline: fetch-window miss cycles (IF engine filling; nothing to dispatch). |
+| 0x00E8 | `PERF_MEM_WAIT`         | R  | 48    | Pipeline: MEM-port wait cycles (loads/stores/stack in flight; front frozen). |
+| **Bus-wedge flight recorder** | | | | |
+| 0x0100 | `WEDGE_SNAP0`           | R  | 64    | Latched ONCE when a CPU bus DV has been held 2^20 cycles (~10.5 ms — no legal transaction is that long): `[31:0]` stuck address, `[39:32]` reserved, `[40]` read_DV, `[41]` write_DV, `[42]` cpu ready, `[43]` mmio read strobe, `[44]` mmio read dv delayed, `[45]` mmio ready, `[46]` eth ready, `[47]` dram ready, `[48]` pipe owns bus, `[49]` timer pending, `[50]` irq_ready, `[51]` mem_busy, `[52]` if_miss, `[53]` pip_bus_idle, `[63]` snapshot valid. Survives program reloads (cleared by `PERF_CTRL[0]` only) — reload `perf/m5a/wedge_dump.kla` after a hang and decode with `perf/m5a/decode_wedge.py`. Diagnosed the Zephyr `irq_lock` MMIO ready-edge deadlock. |
+| 0x0108 | `WEDGE_SNAP1`           | R  | 64    | Companion context: `[31:0]` PERF_CYCLES at latch, `[35:32]` int_mask, `[36]` irq_src0 (timer), `[37]` irq_src1 (blitter), `[63:38]` timer counter [25:0]. |
 
 **Mix invariant.** Each retired instruction is classified into exactly one of
 the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or

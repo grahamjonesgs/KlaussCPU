@@ -244,8 +244,12 @@ module KlaussCPU (
    // A source fires only when it has a non-zero vector AND its mask bit is set.
    // w_irq_sel picks the source to dispatch; timer (0) has priority over blitter
    // (1). Sources 2..3 remain free for future devices — OR them in here.
-   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && st.int_mask[0];
-   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && st.int_mask[1];
+   // M5d: the pipeline core owns int_mask; the FSM's st.int_mask is retired
+   // from the gating (kept in st only as a dormant field).
+   wire [3:0] pip_int_mask;
+   wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
+   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
+   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
    wire w_irq_ready = w_irq_src0 || w_irq_src1;
    wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : 2'd1;
 
@@ -368,8 +372,35 @@ module KlaussCPU (
    // the rate. (This slot replaced a passive predecode-mismatch validator, now
    // covered by the consume guard and the functional regression.)
    logic [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
+   // M6: pipeline per-hazard attribution (MMIO 0xB0-0xE8; strobes from
+   // pipeline_core.perf_stall — see its port comment for the bit map)
+   logic [47:0] r_perf_stall_data;     // 0xB0 GPR RAW stall cycles
+   logic [47:0] r_perf_stall_loaduse;  // 0xB8 load-use subset
+   logic [47:0] r_perf_stall_flags;    // 0xC0 flag-reader stall cycles
+   logic [47:0] r_perf_stall_sp;       // 0xC8 SP-serialization stall cycles
+   logic [47:0] r_perf_stall_muldiv;   // 0xD0 EX-busy cycles (mul/div/delay/lcd)
+   logic [47:0] r_perf_branch_flush;   // 0xD8 taken-redirect events
+   logic [47:0] r_perf_if_miss;        // 0xE0 fetch-window miss cycles
+   logic [47:0] r_perf_mem_wait;       // 0xE8 MEM port wait cycles
    logic        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
    logic        r_int_push_wait_d;        // edge-detect for interrupt dispatch
+   // Bus-wedge flight recorder (0xF00D_0100/0108, RO; cleared by PERF_CTRL
+   // bit 0 like the counters, so a snapshot SURVIVES a program reload). If a
+   // CPU bus transaction holds its DV for 2^20 cycles (~10.5 ms — no legal
+   // transaction is remotely that long) the full handshake state is latched
+   // once: which DV, the address, every ready in the chain, splitter decode
+   // inputs, FSM state and IRQ context. Diagnose a hang by reloading with a
+   // dump program and reading two regs. snap0: [31:0] addr, [39:32] reserved,
+   // [40] read_DV, [41] write_DV, [42] cpu_mem.ready, [43] w_mmio_read_DV,
+   // [44] r_mmio_read_dv_d, [45] w_mmio_ready, [46] w_eth_ready,
+   // [47] dram_mem.ready, [48] w_pipe_owns, [49] r_timer_interrupt,
+   // [50] w_irq_ready, [51] mem_busy (pip_perf_stall[7]), [52] if_miss
+   // (pip_perf_stall[6]), [53] pip_bus_idle, [63] snapshot-valid.
+   // snap1: [31:0] r_perf_cycles at latch, [35:32] pip_int_mask,
+   // [36] w_irq_src0, [37] w_irq_src1, [63:38] r_timer_interrupt_counter[25:0].
+   logic [20:0] r_wedge_cnt;
+   logic        r_wedge_latched;
+   logic [63:0] r_wedge_snap0, r_wedge_snap1;
    // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
    // (conditional encodings only), consumed by the perf block below.
    logic        r_perf_br_valid;
@@ -385,18 +416,47 @@ module KlaussCPU (
 
    logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
    logic  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
-   logic         r_mmio_read_dv_d;       // delayed read strobe → ready pulse one cycle later
-   // UART MMIO (0xF001) RX pop-on-read: w_uart_rx_rd_sel is high for the whole read
-   // handshake; r_uart_rx_rd_d delays it by a cycle so w_uart_rx_pop is a single
-   // pulse (pop the FIFO exactly once, on the cycle the head byte is captured).
-   wire          w_uart_rx_rd_sel = w_mmio_read_DV & (w_mmio_addr[27:16] == 12'h001)
-                                                    & (w_mmio_addr[15:0]  == 16'h0008);
+   // The read decode's SELECT is also registered (r_mmio_addr_q): the raw
+   // w_mmio_addr arrives through the w_pipe_owns (st.SM) address mux, and
+   // st.SM -> addr-mux -> giant read decode -> r_mmio_read_data was the
+   // recurring WNS family (met at +0.02..0.03 on good seeds, -0.5 on bad).
+   // Decoding from an FF gives the whole mux a clean full cycle. MMIO reads
+   // are therefore 2-stage: DV at T, addr FF at T+1 (decode), data FF at T+2,
+   // ready (dv_d2) at T+2 — the bus_splitter FF delivers data+ready together
+   // at T+3. Costs +1 cycle per MMIO read (poll loops only).
+   logic  [31:0] r_mmio_addr_q;
+   logic         r_mmio_read_dv_d;       // read strobe delayed 1 (addr FF valid)
+   logic         r_mmio_read_dv_d2;      // read strobe delayed 2 → ready
+   // UART MMIO (0xF001) RX pop-on-read: sel is based on the REGISTERED
+   // addr/strobe so it tracks the decode stage; the pop pulse fires the cycle
+   // the (pre-pop) head byte is being decoded, and the FIFO advances the edge
+   // after — the data FF captures the old head. r_uart_rx_rd_d keeps it a
+   // single pulse per read handshake.
+   wire          w_uart_rx_rd_sel = r_mmio_read_dv_d & (r_mmio_addr_q[27:16] == 12'h001)
+                                                     & (r_mmio_addr_q[15:0]  == 16'h0008);
    logic         r_uart_rx_rd_d;
    wire          w_uart_rx_pop    = w_uart_rx_rd_sel & ~r_uart_rx_rd_d;
-   // MMIO writes complete in 1 cycle (write-side has no read-data path).
-   // MMIO reads now take 2 cycles: cycle 1 captures decode into the FF,
-   // cycle 2 asserts ready so the CPU FSM samples r_mmio_read_data.
-   wire        w_mmio_ready = w_mmio_write_DV | r_mmio_read_dv_d;
+   // WRITE acks use the same 2-cycle delayed-DV (edge-tracking) shape as the
+   // read ready. A combinational write ack (the original
+   // `w_mmio_write_DV | ...`) deadlocks the pipeline's ready-EDGE protocol:
+   // after an MMIO READ completes, its ready tail (read dv delay chain + the
+   // bus_splitter output FF) stays high for a few cycles; an MMIO STORE
+   // issued 1 cycle behind (consecutive load;store — e.g. Zephyr's irq_lock =
+   // read int_mask; write int_mask) sees stale-high ready at issue (rdy_armed
+   // stays 0), and its own comb ack then bridges the tail so ready NEVER
+   // falls -> the core never arms, the write never completes, the whole bus
+   // wedges (this was the LVGL boot hang; flight-recorder capture:
+   // write_DV=1 / ready=1 forever at 0xF00F_0000). With BOTH acks delayed 2
+   // cycles from their own DVs, any back-to-back MMIO pair (read;write,
+   // write;write, ...) presents at least one low-ready cycle between the
+   // outgoing tail and the incoming ack, so rdy_armed always re-arms:
+   // outgoing tail ends at completion+2, the next DV rises at completion+2
+   // (earliest, k=1) and its ack at completion+4 — ready is low at
+   // completion+3. Write side effects are level-based off the (multi-cycle)
+   // DV as before; the extra held cycle changes nothing.
+   logic       r_mmio_write_dv_d;      // write strobe delayed 1
+   logic       r_mmio_write_dv_d2;     // write strobe delayed 2 → ack
+   wire        w_mmio_ready = r_mmio_write_dv_d2 | r_mmio_read_dv_d2;
    wire w_mem_ready;
    logic [31:0] r_opcode_mem;
    logic [31:0] r_var1_mem;
@@ -652,15 +712,107 @@ module KlaussCPU (
    // assigns bridge those wires to the interface (request out, response back).
    membus_if cpu_mem();
    membus_if dram_mem();
-   assign cpu_mem.write_DV      = st.mem_write_DV;
-   assign cpu_mem.read_DV       = st.mem_read_DV;
-   assign cpu_mem.addr          = st.mem_addr;
-   assign cpu_mem.write_data    = st.mem_write_data;
-   assign cpu_mem.byte_en       = st.mem_byte_en;
+   // ------------------------------------------------------------------------
+   // M5d: in PIPE_RUN the 5-stage pipeline_core owns the memory port; in every
+   // other state (boot copy / loader / HCF stack reads) the FSM's st.mem_*
+   // drive it as before. The handoff points guarantee the loser's port is
+   // idle: the pipeline parks only after draining (pip_bus_idle), and the FSM
+   // is idle in PIPE_RUN.
+   // ------------------------------------------------------------------------
+   wire        w_pipe_owns = (st.SM == PIPE_RUN);
+   wire [31:0] pip_m_addr;
+   wire        pip_m_read_DV, pip_m_write_DV;
+   wire [63:0] pip_m_wdata;
+   wire [7:0]  pip_m_be;
+   assign cpu_mem.write_DV      = w_pipe_owns ? pip_m_write_DV : st.mem_write_DV;
+   assign cpu_mem.read_DV       = w_pipe_owns ? pip_m_read_DV  : st.mem_read_DV;
+   assign cpu_mem.addr          = w_pipe_owns ? pip_m_addr     : st.mem_addr;
+   assign cpu_mem.write_data    = w_pipe_owns ? pip_m_wdata    : st.mem_write_data;
+   assign cpu_mem.byte_en       = w_pipe_owns ? pip_m_be       : st.mem_byte_en;
    assign w_mem_read_data       = cpu_mem.read_data;
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
    assign w_mem_ready           = cpu_mem.ready;
+
+   // Pipeline core — the execution engine (owns rf / flags / SP / PC /
+   // int_mask; single retire at WB; see pipeline_core.sv + PIPELINE_IMPL.md).
+   // Held in reset through the boot/loader states (a fresh program starts from
+   // architectural zero, like the emulator); NOT reset in HCF/HALTED so the
+   // crash dump can snapshot its state.
+   wire w_pip_hold_rst = (st.SM == NO_PROGRAM) || (st.SM == LOADING_BYTE) ||
+                         (st.SM == LOAD_COMPLETE) || (st.SM == START_WAIT) ||
+                         (st.SM == UART_DELAY);
+   logic        r_pip_start;
+   logic [31:0] r_pip_start_pc;
+   wire         pip_ret_valid, pip_ret_wr;
+   wire [31:0]  pip_ret_pc, pip_ret_op, pip_ret_wr_addr;
+   wire [7:0]   pip_ret_wr_be;
+   wire [63:0]  pip_ret_wr_raw;
+   wire         pip_parked;
+   wire [2:0]   pip_park_kind;
+   wire [31:0]  pip_park_pc, pip_park_op;
+   wire [63:0]  pip_dbg_r [0:15];
+   wire [31:0]  pip_dbg_sp;
+   flags_t      pip_dbg_flags;
+   wire         pip_irq_ack;
+   wire [1:0]   pip_irq_ack_sel;
+   wire [7:0]   pip_lcd_byte;
+   wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
+   wire         pip_bus_idle;   // gates the park -> FSM bus handoff
+   wire [7:0]   pip_perf_stall;
+   wire         pip_perf_br, pip_perf_br_taken;
+   // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
+   // "MMIO store wins" ordering is preserved inside pipeline_core.
+   wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
+                                                && (w_mmio_addr[15:0]  == 16'h0000);
+
+   pipeline_core pipeline_core_i (
+      .clk        (i_Clk),
+      .rst        (w_reset_H || w_pip_hold_rst),
+      .start      (r_pip_start),
+      .start_pc   (r_pip_start_pc),
+      .m_addr     (pip_m_addr),
+      .m_read_DV  (pip_m_read_DV),
+      .m_write_DV (pip_m_write_DV),
+      .m_wdata    (pip_m_wdata),
+      .m_be       (pip_m_be),
+      .m_rdata    (w_mem_read_data),
+      .m_rdata_next (w_mem_read_data_next),
+      .m_next_valid (w_mem_next_valid),
+      .m_ready    (w_mem_ready && w_pipe_owns),
+      .irq_ready  (w_irq_ready),
+      .irq_sel    (w_irq_sel),
+      .irq_vector (r_interrupt_table[w_irq_sel]),
+      .irq_ack    (pip_irq_ack),
+      .irq_ack_sel(pip_irq_ack_sel),
+      .int_mask_o (pip_int_mask),
+      .mask_wr    (w_pip_mask_wr),
+      .mask_wdata (w_mmio_write_data[3:0]),
+      .lcd_byte   (pip_lcd_byte),
+      .lcd_dc     (pip_lcd_dc),
+      .lcd_dv     (pip_lcd_dv),
+      .lcd_rst_n  (pip_lcd_rst_n),
+      .lcd_rst_wr (pip_lcd_rst_wr),
+      .lcd_ready  (i_TX_LCD_Ready),
+      .bus_idle   (pip_bus_idle),
+      .perf_stall (pip_perf_stall),
+      .perf_br    (pip_perf_br),
+      .perf_br_taken (pip_perf_br_taken),
+      .ret_valid  (pip_ret_valid),
+      .ret_pc     (pip_ret_pc),
+      .ret_op     (pip_ret_op),
+      .ret_wr     (pip_ret_wr),
+      .ret_wr_addr(pip_ret_wr_addr),
+      .ret_wr_be  (pip_ret_wr_be),
+      .ret_wr_raw (pip_ret_wr_raw),
+      .parked     (pip_parked),
+      .park_kind  (pip_park_kind),
+      .park_pc    (pip_park_pc),
+      .park_op    (pip_park_op),
+      .dbg_r      (pip_dbg_r),
+      .dbg_sp     (pip_dbg_sp),
+      .dbg_flags  (pip_dbg_flags)
+   );
 
    (* KEEP_HIERARCHY = "yes" *)
    bus_splitter bus_splitter_i (
@@ -816,7 +968,7 @@ module KlaussCPU (
    wire [127:0] w_blit_dma_read_data;
    wire         w_blit_dma_ready;
    wire         w_blit_dma_grant;
-   wire         w_blit_irq;          // DONE interrupt — wired to the CPU interrupt controller (source 1)
+   // (w_blit_irq declared near the IRQ source gating at the top of the module)
 
    mmio_if blit_bus();
    assign blit_bus.write_DV   = w_blit_write_DV;
@@ -866,10 +1018,10 @@ module KlaussCPU (
 
    always_comb begin
       r_mmio_read_data_comb = 64'h0;
-      case (w_mmio_addr[27:16])
+      case (r_mmio_addr_q[27:16])
          12'h000: r_mmio_read_data_comb = w_sd_read_data;  // SD card
          12'h001: begin  // UART
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                16'h0008: r_mmio_read_data_comb = {56'b0, w_rx_fifo_byte};  // RX_DATA (peek; FIFO pops on read)
                // STATUS: bit0 = TX busy, bit1 = RX empty, bit2 = RX full
                16'h0010: r_mmio_read_data_comb = {61'b0, w_rx_fifo_full, w_rx_fifo_empty, w_sending_msg};
@@ -877,14 +1029,14 @@ module KlaussCPU (
             endcase
          end
          12'h002: begin  // RGB LEDs
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {52'b0, st.RGB_LED_1};
                16'h0008: r_mmio_read_data_comb = {52'b0, st.RGB_LED_2};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h003: begin  // 7-segment display (raw padded values)
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {32'b0, st.seven_seg_value2};
                16'h0008: r_mmio_read_data_comb = {32'b0, st.seven_seg_value1};
                16'h0010: r_mmio_read_data_comb = {st.seven_seg_value1, st.seven_seg_value2};
@@ -892,14 +1044,14 @@ module KlaussCPU (
             endcase
          end
          12'h004: begin  // LEDs (RW) and switches (RO)
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {48'b0, st.led};
                16'h0008: r_mmio_read_data_comb = {48'b0, i_switch};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
          12'h005: begin  // Cache controller — counters and config (RO)
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                // 0x0000 CACHE_CTRL is self-clearing — reads as 0
                16'h0000: r_mmio_read_data_comb = 64'h0;
                16'h0008: r_mmio_read_data_comb = w_cache_info;
@@ -918,8 +1070,8 @@ module KlaussCPU (
          12'h00C: r_mmio_read_data_comb = w_trng_read_data; // Crypto: TRNG
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h00F: begin  // Interrupt controller / timer
-            case (w_mmio_addr[15:0])
-               16'h0000: r_mmio_read_data_comb = {60'b0, st.int_mask};
+            case (r_mmio_addr_q[15:0])
+               16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
                16'h0008: r_mmio_read_data_comb = {62'b0, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
@@ -932,7 +1084,7 @@ module KlaussCPU (
             endcase
          end
          12'h00D: begin  // Performance counters (RO; PERF_CTRL self-clearing reads 0)
-            case (w_mmio_addr[15:0])
+            case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = 64'h0;            // PERF_CTRL
                16'h0008: r_mmio_read_data_comb = r_perf_cycles;
                16'h0010: r_mmio_read_data_comb = r_perf_instr;
@@ -955,6 +1107,18 @@ module KlaussCPU (
                16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
                16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
                16'h00A8: r_mmio_read_data_comb = r_perf_fastpath;  // fast-path-dispatch fire count (this slot was the retired predecode validator)
+               // M6 pipeline hazard attribution (cycles unless noted)
+               16'h00B0: r_mmio_read_data_comb = {16'b0, r_perf_stall_data};
+               16'h00B8: r_mmio_read_data_comb = {16'b0, r_perf_stall_loaduse};
+               16'h00C0: r_mmio_read_data_comb = {16'b0, r_perf_stall_flags};
+               16'h00C8: r_mmio_read_data_comb = {16'b0, r_perf_stall_sp};
+               16'h00D0: r_mmio_read_data_comb = {16'b0, r_perf_stall_muldiv};
+               16'h00D8: r_mmio_read_data_comb = {16'b0, r_perf_branch_flush}; // events
+               16'h00E0: r_mmio_read_data_comb = {16'b0, r_perf_if_miss};
+               16'h00E8: r_mmio_read_data_comb = {16'b0, r_perf_mem_wait};
+               // bus-wedge flight recorder (bit map at the r_wedge_* decl)
+               16'h0100: r_mmio_read_data_comb = r_wedge_snap0;
+               16'h0108: r_mmio_read_data_comb = r_wedge_snap1;
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -969,9 +1133,13 @@ module KlaussCPU (
    // 1-cycle-delayed ready pulse so the CPU samples r_mmio_read_data on the
    // cycle after the read strobe.
    always_ff @(posedge i_Clk) begin
-      r_mmio_read_data <= r_mmio_read_data_comb;
-      r_mmio_read_dv_d <= w_mmio_read_DV;
-      r_uart_rx_rd_d   <= w_uart_rx_rd_sel;
+      r_mmio_addr_q      <= w_mmio_addr;
+      r_mmio_read_data   <= r_mmio_read_data_comb;
+      r_mmio_read_dv_d   <= w_mmio_read_DV;
+      r_mmio_read_dv_d2  <= r_mmio_read_dv_d;
+      r_mmio_write_dv_d  <= w_mmio_write_DV;
+      r_mmio_write_dv_d2 <= r_mmio_write_dv_d;
+      r_uart_rx_rd_d     <= w_uart_rx_rd_sel;
    end
 
    // Declared here (ahead of its use in the .o_calib_done port below) so strict
@@ -1394,6 +1562,8 @@ rams_sp_nc rams_sp_nc1 (
       r_var1_prefetched = 0;
       r_ir_valid = 1'b0;
       r_ir_presettled = 1'b0;
+      r_pip_start = 1'b0;
+      r_pip_start_pc = 32'h20;
       r_FPC = 32'h0;
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
@@ -1800,7 +1970,10 @@ rams_sp_nc rams_sp_nc1 (
             START_WAIT: begin
                r_msg_send_DV <= 1'b0;
                if (r_start_wait_counter == 0) begin
-                  st.SM <= OPCODE_REQUEST;
+                  // M5d: execution belongs to the pipeline core.
+                  r_pip_start    <= 1'b1;
+                  r_pip_start_pc <= st.PC;
+                  st.SM <= PIPE_RUN;
                   st.seven_seg_value1 <= 32'h22_22_22_22;
                   st.seven_seg_value2 <= 32'h22_22_22_22;
                end else begin
@@ -1814,9 +1987,52 @@ rams_sp_nc rams_sp_nc1 (
             UART_DELAY: begin
                r_msg_send_DV <= 1'b0;
                if (!w_sending_msg) begin
-                  st.SM <= OPCODE_REQUEST;
+                  r_pip_start    <= 1'b1;
+                  r_pip_start_pc <= st.PC;
+                  st.SM <= PIPE_RUN;
                end
+            end
 
+            // ─────────────────────────────────────────────────────────────
+            // PIPE_RUN — the 5-stage pipeline_core owns execution and the
+            // memory port. This arm only mirrors retire bookkeeping (crash
+            // trace ring, instruction count), consumes IRQ dispatch acks,
+            // relays the LCD side-port, and handles the drained park
+            // (HALT / TRAP / illegal) by snapshotting the pipeline's
+            // architectural state into the FSM's copies so the existing
+            // HALTED_BREAK / HCF crash-dump machinery works unchanged.
+            // ─────────────────────────────────────────────────────────────
+            PIPE_RUN: begin
+               r_pip_start   <= 1'b0;
+               r_msg_send_DV <= 1'b0;   // MMIO UART TX (after-case) re-arms it
+               if (pip_ret_valid) begin
+                  r_trace_buf[r_trace_idx] <= {pip_ret_pc, pip_ret_op};
+                  r_trace_idx              <= r_trace_idx + 4'd1;
+                  if (r_trace_idx == 4'd15) r_trace_full <= 1'b1;
+                  r_instr_count <= r_instr_count + 32'd1;
+               end
+               if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
+                  r_timer_interrupt <= 1'b0;   // dispatch consumed the timer
+               if (pip_lcd_dv) begin
+                  o_TX_LCD_Byte <= pip_lcd_byte;
+                  o_LCD_DC      <= pip_lcd_dc;
+                  o_TX_LCD_DV   <= 1'b1;
+               end else begin
+                  o_TX_LCD_DV   <= 1'b0;
+               end
+               if (pip_lcd_rst_wr) o_LCD_reset_n <= pip_lcd_rst_n;
+               if (pip_parked && pip_bus_idle) begin
+                  for (i = 0; i < 16; i = i + 1) r_register[i] <= pip_dbg_r[i];
+                  st.PC    <= pip_park_pc;
+                  st.SP    <= pip_dbg_sp;
+                  st.flags <= pip_dbg_flags;
+                  case (pip_park_kind)
+                     3'd0: st.SM <= HALTED_BREAK;                                  // HALT
+                     3'd1: begin st.SM <= HCF_1; st.error_code <= ERR_TRAP; end    // TRAP
+                     3'd2: begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
+                     default: ;   // WAIT parks wake inside the pipeline
+                  endcase
+               end
             end
 
             OPCODE_REQUEST: begin
@@ -3122,11 +3338,27 @@ end
          r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
          r_perf_cnt_other        <= 64'd0;
          r_perf_fastpath           <= 64'd0;
+         r_perf_stall_data <= 48'd0;  r_perf_stall_loaduse <= 48'd0;
+         r_perf_stall_flags <= 48'd0; r_perf_stall_sp <= 48'd0;
+         r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
+         r_perf_if_miss <= 48'd0;     r_perf_mem_wait <= 48'd0;
       end else begin
+         // M6 pipeline hazard attribution
+         if (pip_perf_stall[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
+         if (pip_perf_stall[1]) r_perf_stall_loaduse <= r_perf_stall_loaduse + 48'd1;
+         if (pip_perf_stall[2]) r_perf_stall_flags   <= r_perf_stall_flags   + 48'd1;
+         if (pip_perf_stall[3]) r_perf_stall_sp      <= r_perf_stall_sp      + 48'd1;
+         if (pip_perf_stall[4]) r_perf_stall_muldiv  <= r_perf_stall_muldiv  + 48'd1;
+         if (pip_perf_stall[5]) r_perf_branch_flush  <= r_perf_branch_flush  + 48'd1;
+         if (pip_perf_stall[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
+         if (pip_perf_stall[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
+         if (pip_perf_br && pip_perf_br_taken)
+            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;
-         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired) r_perf_instr <= r_perf_instr + 64'd1;
+         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired || pip_ret_valid)
+            r_perf_instr <= r_perf_instr + 64'd1;   // M5d: pipeline retires count here
          if (r_fastpath_fired) r_perf_fastpath <= r_perf_fastpath + 64'd1;  // fast-path-dispatch fire count (MMIO 0xA8)
 
          // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
@@ -3148,6 +3380,10 @@ end
             r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
          else if (st.SM == HALTED || st.SM == HALTED_BREAK || st.SM == WAITING)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
+         else if (st.SM == PIPE_RUN)
+            // M5d bring-up: all pipeline cycles land in the exec bucket; the
+            // per-hazard stall counters arrive with M6 (STALL_* plan).
+            r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
 
          // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
          // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
@@ -3168,6 +3404,19 @@ end
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
 
          // Tier 2 — instruction mix: one class per committed instruction.
+         // M5d: pipeline retires classify by the retired opcode.
+         if (pip_ret_valid) begin
+            case (f_perf_class(pip_ret_op))
+               PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
+               PC_LOAD:     r_perf_cnt_load     <= r_perf_cnt_load     + 64'd1;
+               PC_STORE:    r_perf_cnt_store    <= r_perf_cnt_store    + 64'd1;
+               PC_BRANCH:   r_perf_cnt_branch   <= r_perf_cnt_branch   + 64'd1;
+               PC_JUMP:     r_perf_cnt_jump     <= r_perf_cnt_jump     + 64'd1;
+               PC_CALL:     r_perf_cnt_call     <= r_perf_cnt_call     + 64'd1;
+               PC_INDIRECT: r_perf_cnt_indirect <= r_perf_cnt_indirect + 64'd1;
+               default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
+            endcase
+         end
          if (st.SM == OPCODE_FETCH2) begin
             case (f_perf_class(w_opcode))
                PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
@@ -3184,6 +3433,60 @@ end
          // (the passive predecode-mismatch validator was retired — superseded by the
          // r_ir_pc==st.PC consume guard, the functional regression, and the
          // fast-path fire-rate counter which collapses on any predecode error.)
+      end
+   end
+
+   //=========================================================================
+   // Bus-wedge flight recorder (see the r_wedge_* declaration for the bit
+   // map). Pure observers off the bus/handshake FFs — no functional fan-out.
+   //=========================================================================
+   // The clear is REGISTERED before use: the raw w_perf_stat_clear cone
+   // (st.SM -> w_pipe_owns -> write_DV mux -> MMIO decode) missed timing as a
+   // direct reset fan-in to these 150-odd FFs (WNS -0.45). One cycle of clear
+   // latency is irrelevant here (clears and hangs are milliseconds apart).
+   logic r_wedge_clear;
+   always_ff @(posedge i_Clk) begin
+      r_wedge_clear <= w_reset_H || w_perf_stat_clear;
+      if (r_wedge_clear) begin
+         r_wedge_cnt     <= '0;
+         r_wedge_latched <= 1'b0;
+         r_wedge_snap0   <= 64'd0;
+         r_wedge_snap1   <= 64'd0;
+      end else begin
+         if (cpu_mem.read_DV || cpu_mem.write_DV)
+            r_wedge_cnt <= r_wedge_cnt + 21'd1;   // DV held: transaction in flight
+         else
+            r_wedge_cnt <= '0;                    // completed/idle: not stuck
+         if (!r_wedge_latched && r_wedge_cnt[20]) begin
+            r_wedge_latched <= 1'b1;
+            r_wedge_snap0 <= {1'b1, 9'b0,
+                              pip_bus_idle,             // [53]
+                              pip_perf_stall[6],        // [52] if_miss
+                              pip_perf_stall[7],        // [51] mem_busy
+                              w_irq_ready,              // [50]
+                              r_timer_interrupt,        // [49]
+                              w_pipe_owns,              // [48]
+                              dram_mem.ready,           // [47]
+                              w_eth_ready,              // [46]
+                              w_mmio_ready,             // [45]
+                              r_mmio_read_dv_d,         // [44]
+                              w_mmio_read_DV,           // [43]
+                              cpu_mem.ready,            // [42]
+                              cpu_mem.write_DV,         // [41]
+                              cpu_mem.read_DV,          // [40]
+                              // [39:32] reserved (was st.SM — sampling the
+                              // one-hot state vector forced a one-hot->binary
+                              // encoder that anchored st.SM replication and
+                              // cost WNS; w_pipe_owns [48] carries the only
+                              // state question that matters here)
+                              8'b0,
+                              cpu_mem.addr};            // [31:0]
+            r_wedge_snap1 <= {r_timer_interrupt_counter[25:0],  // [63:38]
+                              w_irq_src1,               // [37]
+                              w_irq_src0,               // [36]
+                              pip_int_mask,             // [35:32]
+                              r_perf_cycles[31:0]};     // [31:0]
+         end
       end
    end
 

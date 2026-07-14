@@ -810,9 +810,15 @@ module mem_read_write (
                     end
 
                     MS_W0: begin
-                        // r_tag_wayX[TAG_BITS] = valid bit.
+                        // r_tag_wayX[TAG_BITS] = valid bit. Line offset is 5 bits
+                        // (32 B lines) — same construction as r_evict_ddr_addr_r.
+                        // A 4-bit offset here (16 B-line era fossil) made the
+                        // 31-bit concat zero-extend and flushed every dirty line
+                        // to HALF its address — the LVGL flush=blitter code
+                        // corruption (0xA600A600 at PC 0xD69A4 = fb line
+                        // 0x1AD340 mis-flushed to 0xD69A0).
                         if (r_tag_way0[TAG_BITS] && r_dirty_way0) begin
-                            o_ddr_mem_addr       <= {r_tag_way0[TAG_BITS-1:0], r_cache_index, 4'b0000};
+                            o_ddr_mem_addr       <= {r_tag_way0[TAG_BITS-1:0], r_cache_index, 5'b00000};
                             o_ddr_mem_write_data <= r_data_way0;
                             r_app_wdf_mask       <= 16'h0000;   // write all 16 bytes
                             o_ddr_mem_write_DV   <= 1'b1;
@@ -837,7 +843,7 @@ module mem_read_write (
 
                     MS_W1: begin
                         if (r_tag_way1[TAG_BITS] && r_dirty_way1) begin
-                            o_ddr_mem_addr       <= {r_tag_way1[TAG_BITS-1:0], r_cache_index, 4'b0000};
+                            o_ddr_mem_addr       <= {r_tag_way1[TAG_BITS-1:0], r_cache_index, 5'b00000};
                             o_ddr_mem_write_data <= r_data_way1;
                             r_app_wdf_mask       <= 16'h0000;
                             o_ddr_mem_write_DV   <= 1'b1;
@@ -908,9 +914,9 @@ module mem_read_write (
     // Sized intermediates so each field of the concat has the correct width.
     // CACHE_SIZE is an unsized integer parameter, so naked use inside {} would
     // pad/widen unpredictably — bind to explicit-width localparams first.
-    localparam [31:0] LP_CACHE_TOTAL_BYTES = CACHE_SIZE * 2 * 16;  // ways × sets × line_bytes
+    localparam [31:0] LP_CACHE_TOTAL_BYTES = CACHE_SIZE * 2 * 32;  // ways × sets × line_bytes
     localparam [15:0] LP_CACHE_NUM_SETS    = CACHE_SIZE;
-    localparam [ 7:0] LP_CACHE_LINE_BYTES  = 8'd16;
+    localparam [ 7:0] LP_CACHE_LINE_BYTES  = 8'd32;
     localparam [ 7:0] LP_CACHE_NUM_WAYS    = 8'd2;
     localparam [63:0] LP_CACHE_INFO = {
         LP_CACHE_TOTAL_BYTES,   // [63:32]
