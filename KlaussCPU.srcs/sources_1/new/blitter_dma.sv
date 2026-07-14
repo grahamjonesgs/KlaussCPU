@@ -234,7 +234,9 @@ module blitter_dma (
         S_END,         // final flush dispatch
         S_FINISH,      // mark done
         S_BLEND,       // blend pipeline stage 1: latch operands (blend ops only)
-        S_BLEND2       // blend pipeline stage 2: register the 6 products (multiplies)
+        S_BLEND2,      // blend pipeline stage 2: register the 6 products (multiplies)
+        S_FILLW,       // FILL fast path: place a whole word's in-rect pixels in 1 cycle
+        S_COPYW        // aligned-COPY fast path: same, sourcing from r_rbuf
     } e_blit_state_t;
 
     // Read targets for the generic read sub-FSM (values 0..2 as before).
@@ -274,8 +276,21 @@ module blitter_dma (
 
     e_rdt_t       r_rd_target;    // which buffer the in-flight read fills
     logic [31:0]  r_rd_addr;
-    logic [3:0]   r_gap;          // CDC settle countdown
+    logic [3:0]   r_gap;          // post-write settle countdown (same-domain: 2)
     logic         r_flush_final;  // 1 = the in-flight flush is the final one
+
+    // ------------------------------------------------------------------------
+    // Burst tenure: the bus grant is HELD across DDR transactions instead of
+    // released per 128-bit word (the old acquire/transact/7-cycle-gap/release
+    // per word cost ~35 cycles/transaction, ~90% handshake). o_dma_done is
+    // pulsed — yielding the bus — only every CHUNK transactions (bounds the
+    // CPU's added stall to one chunk) and at blit end; o_dma_req stays high
+    // through a chunk release so the arbiter re-grants as soon as the cache
+    // is idle again. The arbiter side needs no change: it already holds the
+    // grant until i_dma_done and gates re-grant on !is_miss_path/!r_mnt_active.
+    // ------------------------------------------------------------------------
+    localparam CHUNK = 8;         // transactions per grant tenure
+    logic [3:0]   r_chunk;        // transactions completed this tenure
 
     // Op classification.
     wire w_is_blend = (r_op == OP_FILL_BLEND) ||
@@ -309,6 +324,12 @@ module blitter_dma (
     wire w_need_maskfill= w_use_mask && (!r_mbuf_valid || (w_mask_word != r_mbuf_addr));
     wire w_last_pixel   = (r_x == r_width - 16'd1);
 
+    // FILL word fast path (S_FILLW): in-rect pixels from the cursor to the end
+    // of the current destination word, placed in ONE cycle instead of ~2/pixel.
+    wire [15:0] w_rem_row = r_width - r_x;                    // >=1 whenever S_PIX evaluates
+    wire [3:0]  w_slots   = 4'd8 - {1'b0, w_dst_off};         // pixel slots to word end (1..8)
+    wire [15:0] w_fill_n  = ({12'd0, w_slots} < w_rem_row) ? {12'd0, w_slots} : w_rem_row;
+
     // BYTE-ORDER FIX: the cache (mem_read_write) maps CPU doubleword addr[3]=0 to
     // the UPPER 64 bits [127:64] of a 128-bit line, the opposite of the raw-line /
     // ddr2_control convention ([63:0]=beat0=bytes 0-7) that this blitter's DMA uses.
@@ -338,6 +359,7 @@ module blitter_dma (
             r_wbuf_dirty   <= 1'b0;
             r_rbuf_valid   <= 1'b0;
             r_mbuf_valid   <= 1'b0;
+            r_chunk        <= 4'd0;
         end else begin
             if (r_done_clear_pulse) r_done <= 1'b0;   // DONE is W1C
             if (r_busy) r_cycles <= r_cycles + 32'd1;  // blit cycle counter
@@ -360,6 +382,7 @@ module blitter_dma (
                         r_wbuf_dirty   <= 1'b0;
                         r_rbuf_valid   <= 1'b0;
                         r_mbuf_valid   <= 1'b0;
+                        r_chunk        <= 4'd0;
                         if (r_width == 16'h0 || r_height == 16'h0) begin
                             // Degenerate (empty) blit: no pixels, but still report
                             // a nonzero CYCLES so software polling the count never
@@ -410,9 +433,68 @@ module blitter_dma (
                         state       <= S_RD_REQ;
                     end else begin
                         // Blend ops take the S_BLEND pipeline stage first (latch
-                        // operands), then S_PLACE; opaque ops go straight to S_PLACE.
-                        state <= w_is_blend ? S_BLEND : S_PLACE;
+                        // operands), then S_PLACE. Opaque ops take a whole-word
+                        // fast path where the data allows it: FILL always
+                        // (constant COLOR), COPY when src and dst share the same
+                        // pixel offset within the 128-bit word (no skew — the
+                        // rbuf word maps 1:1 onto the wbuf word). Skewed COPY
+                        // keeps the proven per-pixel path.
+                        state <= w_is_blend        ? S_BLEND :
+                                 (r_op == OP_FILL) ? S_FILLW :
+                                 (r_op == OP_COPY && w_src_off == w_dst_off)
+                                                   ? S_COPYW : S_PLACE;
                     end
+                end
+
+                // ----------------------------------------------------------
+                // FILL fast path — the data is the constant COLOR, so every
+                // in-rect pixel of the current dst word is placed in ONE cycle
+                // (edge words handled by the byte mask, exactly as S_PLACE
+                // would have, just without the per-pixel stepping).
+                S_FILLW: begin
+                    for (int k = 0; k < 8; k++) begin
+                        if ((k[2:0] >= w_dst_off) &&
+                            ({13'd0, k[2:0]} - {13'd0, w_dst_off} < w_rem_row)) begin
+                            r_wbuf[k*16 +: 16]    <= r_color;
+                            r_wbuf_mask[k*2 +: 2] <= 2'b00;
+                        end
+                    end
+                    r_wbuf_dirty <= 1'b1;
+                    if (w_fill_n == w_rem_row) begin        // row completed
+                        r_x             <= 16'h0;
+                        r_row           <= r_row + 16'd1;
+                        r_dst_row_base  <= r_dst_row_base  + r_dst_stride;
+                        r_src_row_base  <= r_src_row_base  + r_src_stride;
+                        r_mask_row_base <= r_mask_row_base + r_mask_stride;
+                    end else begin
+                        r_x <= r_x + w_fill_n;
+                    end
+                    state <= S_PIX;
+                end
+
+                // ----------------------------------------------------------
+                // Aligned-COPY fast path — src and dst share the pixel offset
+                // within the word (S_PIX guard), so rbuf slot k maps straight
+                // onto wbuf slot k for every in-rect pixel of the current word.
+                S_COPYW: begin
+                    for (int k = 0; k < 8; k++) begin
+                        if ((k[2:0] >= w_dst_off) &&
+                            ({13'd0, k[2:0]} - {13'd0, w_dst_off} < w_rem_row)) begin
+                            r_wbuf[k*16 +: 16]    <= r_rbuf[k*16 +: 16];
+                            r_wbuf_mask[k*2 +: 2] <= 2'b00;
+                        end
+                    end
+                    r_wbuf_dirty <= 1'b1;
+                    if (w_fill_n == w_rem_row) begin        // row completed
+                        r_x             <= 16'h0;
+                        r_row           <= r_row + 16'd1;
+                        r_dst_row_base  <= r_dst_row_base  + r_dst_stride;
+                        r_src_row_base  <= r_src_row_base  + r_src_stride;
+                        r_mask_row_base <= r_mask_row_base + r_mask_stride;
+                    end else begin
+                        r_x <= r_x + w_fill_n;
+                    end
+                    state <= S_PIX;
                 end
 
                 // ----------------------------------------------------------
@@ -490,25 +572,39 @@ module blitter_dma (
                 S_WF_DRIVE: begin
                     if (i_dma_ready) begin
                         o_dma_write_DV <= 1'b0;
-                        r_gap          <= 4'd7;     // CDC settle
+                        // Same-domain settle (was 7 — an async-era vestige; the
+                        // cache's equivalent post-write gap is 2). Holds the
+                        // address stable while ddr2_control drains its write
+                        // and passes its DV-low IDLE gate.
+                        r_gap          <= 4'd2;
                         state          <= S_WF_GAP;
                     end
                 end
 
                 S_WF_GAP: begin
                     if (r_gap == 4'd0) begin
-                        o_dma_done <= 1'b1;        // release the bus
-                        state      <= S_WF_REL;
+                        state <= S_WF_REL;
                     end else begin
                         r_gap <= r_gap - 4'd1;
                     end
                 end
 
                 S_WF_REL: begin
-                    o_dma_req    <= 1'b0;
                     r_wbuf_open  <= 1'b0;          // accumulator retired
                     r_wbuf_dirty <= 1'b0;
-                    state        <= r_flush_final ? S_FINISH : S_PIX;
+                    if (r_flush_final) begin
+                        o_dma_done <= 1'b1;        // blit done: release for good
+                        o_dma_req  <= 1'b0;
+                        r_chunk    <= 4'd0;
+                        state      <= S_FINISH;
+                    end else if (r_chunk == 4'(CHUNK - 1)) begin
+                        o_dma_done <= 1'b1;        // chunk boundary: yield to the
+                        r_chunk    <= 4'd0;        // cache; req stays high so the
+                        state      <= S_PIX;       // arbiter re-grants when idle
+                    end else begin
+                        r_chunk    <= r_chunk + 4'd1;
+                        state      <= S_PIX;
+                    end
                 end
 
                 // ----------------------------------------------------------
@@ -545,15 +641,19 @@ module blitter_dma (
                                 r_wbuf_dirty <= 1'b0;
                             end
                         endcase
-                        o_dma_read_DV <= 1'b0;
-                        o_dma_done    <= 1'b1;    // reads are idempotent — no gap
+                        o_dma_read_DV <= 1'b0;    // reads are idempotent — no gap
                         state         <= S_RD_REL;
                     end
                 end
 
                 S_RD_REL: begin
-                    o_dma_req <= 1'b0;
-                    state     <= S_PIX;
+                    if (r_chunk == 4'(CHUNK - 1)) begin
+                        o_dma_done <= 1'b1;        // chunk boundary (req stays high)
+                        r_chunk    <= 4'd0;
+                    end else begin
+                        r_chunk    <= r_chunk + 4'd1;
+                    end
+                    state <= S_PIX;
                 end
 
                 // ----------------------------------------------------------
@@ -567,6 +667,13 @@ module blitter_dma (
                 end
 
                 S_FINISH: begin
+                    // Safety release: a blit can end on a read or a non-final
+                    // write (S_END with a clean accumulator) with the grant
+                    // still held mid-chunk. done while not granted is ignored
+                    // by the arbiter, so pulsing unconditionally is safe.
+                    o_dma_req     <= 1'b0;
+                    o_dma_done    <= 1'b1;
+                    r_chunk       <= 4'd0;
                     r_busy        <= 1'b0;
                     r_done        <= 1'b1;
                     r_cycles_last <= r_cycles;

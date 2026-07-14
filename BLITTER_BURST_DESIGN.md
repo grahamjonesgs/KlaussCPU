@@ -1,5 +1,33 @@
 # Blitter burst engine — design
 
+> **STATUS (2026-07-14, branch feat/blitter-burst):** stage 1 + word fast
+> paths IMPLEMENTED — held-grant chunked streaming (CHUNK=8 transactions per
+> grant tenure, req held through chunk releases), write settle gap 7→2, and
+> whole-word fast paths for FILL (S_FILLW) and same-offset COPY (S_COPYW).
+> ddr2_control is UNTOUCHED — measurement showed the ~35 cyc/transaction was
+> almost entirely the blitter's own acquire/gap/release handshake, not the
+> controller's IDLE drain (which passes in 1-2 cycles once DV drops promptly).
+> tb_blitter revived for the interface era (+ DMA half-swap-aware stub,
+> perf cases, same-offset edge test): 19/19 byte-exact.
+> Unit-tb (LAT=6 DDR model): FILL 4.75→2.13 cyc/px, COPY 6.38→3.50 cyc/px.
+>
+> **BOARD-VERIFIED** (WNS +0.042/WHS +0.024; m5e 7/7; wedge recorder zero;
+> blit_selftest full sweep PASS, 0 wrong pixels): FILL 640×480
+> 1,382,403→576,004 CYC (**2.40×**, 1.88 cyc/px); COPY real 640×480
+> 2,706,316→1,894,378 (**1.43×**, 6.17 cyc/px — now read-latency-bound);
+> COPY real under CPU DDR traffic 4,545,171→2,242,866 (**2.03×** — the held
+> grant also cuts arbitration thrash); skewed dst+2 1.15× (per-pixel path,
+> handshake savings only). LVGL benchmark: blit 27.1→23.7 ms/frame, copy
+> 28.2→~24.5 ms (the contended number — LVGL's threads run during the blit,
+> matching COPY real+ddr). All 6 scenes PASS to the VNC desktop.
+>
+> REMAINING (next increments, in expected-value order): src-read prefetch or
+> Opt-2 MIG-native back-to-back streaming in ddr2_control (COPY is now
+> demand-read-bound — each src word blocks the pixel engine ~20+ cycles),
+> skewed-COPY word path (barrel shift), decoupled write skid buffer. The
+> software async flush (LV_Z_FLUSH_THREAD + double VDB) hides the remaining
+> copy time behind render independently of all of these.
+
 **Problem:** the blitter does ~8.8 cyc/pixel (was 12.8 pre-DDR-rework). It is
 one-pixel-per-step, and the DDR sub-FSMs **acquire → single 128-bit transaction →
 release** per word — so a row of N pixels = ceil(N/8) reads/writes, each paying

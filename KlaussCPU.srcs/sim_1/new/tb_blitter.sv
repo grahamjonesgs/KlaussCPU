@@ -16,6 +16,10 @@ module clk_wiz_0 (input i_Clk, output clk_200, output clk_50, output locked, inp
 endmodule
 
 // --- mask-aware behavioral ddr2_control: 128-bit memory, fixed latency ---
+// Current (32 B-line era) port signature: i_mem_wide + 256-bit data buses.
+// Only the NARROW (blitter) path is exercised here — the CPU port is idle —
+// so the model keeps its original self-consistent 128-bit word memory
+// ([63:0] = beat0 = addressed bytes 0-7) and flags any wide access.
 module ddr2_control (
     inout [15:0] ddr2_dq, inout [1:0] ddr2_dqs_n, inout [1:0] ddr2_dqs_p,
     output [12:0] ddr2_addr, output [2:0] ddr2_ba,
@@ -24,15 +28,17 @@ module ddr2_control (
     output [0:0] ddr2_cs_n, output [1:0] ddr2_dm, output [0:0] ddr2_odt,
     input resetn, input sys_clk_i,
     input i_mem_write_DV, input i_mem_read_DV,
-    input [31:0] i_mem_addr, input [127:0] i_mem_write_data,
+    input [31:0] i_mem_addr,
+    input i_mem_wide,
+    input [255:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
-    output logic [127:0] o_mem_read_data, output logic o_mem_ready,
+    output logic [255:0] o_mem_read_data, output logic o_mem_ready,
     output o_calib_done,
     output o_ui_clk
 );
    assign o_calib_done = 1'b1;
-   assign o_ui_clk = sys_clk_i;   // P3: cache FSM runs on ui_clk; tb drives it from sys_clk_i
-   logic [127:0] mem [0:65535];      // addr[19:4] indexes the line
+   assign o_ui_clk = sys_clk_i;   // cache FSM runs on ui_clk; tb drives it from sys_clk_i
+   logic [127:0] mem [0:65535];      // addr[19:4] indexes the 16 B word
    integer i;
    initial begin
       o_mem_ready = 0; o_mem_read_data = 0;
@@ -47,13 +53,21 @@ module ddr2_control (
          o_mem_ready <= 0; cnt <= 0;
       end else if (!o_mem_ready) begin
          if (cnt == LAT) begin
+            if (i_mem_wide === 1'b1)
+               $display("TB_BLITTER: WARN unexpected WIDE access at %08x", i_mem_addr);
+            // The blitter swaps its two 64-bit halves at the DMA face so its
+            // byte order matches the CACHE's doubleword-in-line convention
+            // (see blitter_dma.sv "BYTE-ORDER FIX"). Model the same mapping
+            // here so `mem` stays in SOFTWARE byte order (byte b of the 16 B
+            // word at bit [b*8 +: 8]) for the tb reference model:
+            // DMA [63:0]/mask[7:0] <-> bytes 8-15, [127:64]/mask[15:8] <-> 0-7.
             if (i_mem_read_DV === 1'b1) begin
-               o_mem_read_data <= mem[idx];
+               o_mem_read_data <= {128'h0, mem[idx][63:0], mem[idx][127:64]};
             end else begin
                // masked write: app_wdf_mask[b]==1 means DO NOT write byte b
                for (b = 0; b < 16; b = b + 1)
-                  if (i_app_wdf_mask[b] === 1'b0)
-                     mem[idx][b*8 +: 8] <= i_mem_write_data[b*8 +: 8];
+                  if (i_app_wdf_mask[(b+8)%16] === 1'b0)
+                     mem[idx][b*8 +: 8] <= i_mem_write_data[((b+8)%16)*8 +: 8];
             end
             o_mem_ready <= 1; cnt <= 0;
          end else cnt <= cnt + 1;
@@ -81,12 +95,29 @@ module tb_blitter;
 
    logic rst_l = 1'b0;   // active-low reset for the blitter
 
+   // MMIO peripheral bus (interface era): tb regs drive the master face.
+   mmio_if blit_bus();
+   assign blit_bus.write_DV   = mmio_w;
+   assign blit_bus.read_DV    = mmio_r;
+   assign blit_bus.addr       = {16'b0, mmio_addr};
+   assign blit_bus.write_data = mmio_wdata;
+   assign blit_bus.byte_en    = 8'hFF;
+   assign mmio_rdata = blit_bus.read_data;
+   assign mmio_ready = blit_bus.ready;
+
+   // CPU memory bus: idle for these unit tests.
+   membus_if cpu_bus();
+   assign cpu_bus.write_DV   = 1'b0;
+   assign cpu_bus.read_DV    = 1'b0;
+   assign cpu_bus.addr       = 32'h0;
+   assign cpu_bus.write_data = 64'h0;
+   assign cpu_bus.byte_en    = 8'hFF;
+
+   wire blit_irq;
+
    blitter_dma dut_blit (
       .i_Clk(clk), .i_Rst_L(rst_l),
-      .i_mmio_write_DV(mmio_w), .i_mmio_read_DV(mmio_r),
-      .i_mmio_addr(mmio_addr), .i_mmio_write_data(mmio_wdata),
-      .i_mmio_byte_en(8'hFF),
-      .o_mmio_read_data(mmio_rdata), .o_mmio_ready(mmio_ready),
+      .mmio(blit_bus),
       .o_dma_req(dma_req), .o_dma_done(dma_done),
       .o_dma_write_DV(dma_w), .o_dma_read_DV(dma_r),
       .o_dma_addr(dma_addr), .o_dma_write_data(dma_wdata),
@@ -94,7 +125,6 @@ module tb_blitter;
       .i_dma_read_data(dma_rdata), .i_dma_ready(dma_ready), .i_dma_grant(dma_grant),
       .o_irq(blit_irq)
    );
-   wire blit_irq;
 
    mem_read_write dut_mem (
       .i_Clk_board(clk),
@@ -102,10 +132,7 @@ module tb_blitter;
       .ddr2_dq(), .ddr2_dqs_n(), .ddr2_dqs_p(),
       .ddr2_addr(), .ddr2_ba(), .ddr2_ras_n(), .ddr2_cas_n(), .ddr2_we_n(),
       .ddr2_ck_p(), .ddr2_ck_n(), .ddr2_cke(), .ddr2_cs_n(), .ddr2_dm(), .ddr2_odt(),
-      // CPU port idle for these unit tests.
-      .i_mem_write_DV(1'b0), .i_mem_read_DV(1'b0),
-      .i_mem_addr(32'h0), .i_mem_write_data(64'h0), .i_mem_byte_en(8'hFF),
-      .o_mem_read_data(), .o_mem_read_data_next(), .o_mem_next_valid(), .o_mem_ready(),
+      .cpu(cpu_bus),
       .i_stat_clear(1'b0),
       .o_cache_info(), .o_cnt_read_hits(), .o_cnt_read_misses(),
       .o_cnt_write_hits(), .o_cnt_write_misses(), .o_cnt_writebacks(),
@@ -114,7 +141,9 @@ module tb_blitter;
       .i_dma_req(dma_req), .i_dma_done(dma_done),
       .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
       .i_dma_addr(dma_addr), .i_dma_write_data(dma_wdata), .i_dma_wdf_mask(dma_mask),
-      .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant)
+      .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant),
+      // Cache maintenance idle for these unit tests.
+      .i_flush_go(1'b0), .i_inval_go(1'b0), .o_mnt_busy()
    );
 
    integer errors = 0;
@@ -474,6 +503,53 @@ module tb_blitter;
       if (blit_irq) begin errors = errors + 1; $display("FAIL: o_irq asserted with IRQ_EN=0"); end
       else $display("PASS irq-masked-when-disabled");
       mmio_write(16'h0008, 64'h2);
+
+      // ============ Test 10b: COPY, same NON-ZERO offset (fast path w/ edges) ===
+      // src and dst both at pixel offset 3 (byte 6) in their words — exercises
+      // S_COPYW's partial edge words — with differing strides and a width that
+      // ends mid-word (11 px: 5 in the first word, 8 middle... 11=5+6 tail).
+      for (y = 0; y < 5; y = y + 1)
+         for (x = 0; x < 11; x = x + 1)
+            poke_pixel(32'hD006 + y*48 + x*2, 16'h9100 + y*32 + x);
+      for (si = 0; si < 512; si = si + 1) poke_byte(32'hE000 + si, $random);
+      mmio_write(16'h0010, 64'h0000_E006);  // DST off 3
+      mmio_write(16'h0018, 64'd32);
+      mmio_write(16'h0020, 64'h0000_D006);  // SRC off 3
+      mmio_write(16'h0028, 64'd48);
+      mmio_write(16'h0030, 64'd11);
+      mmio_write(16'h0038, 64'd5);
+      snapshot_window(32'hE000, 512);
+      ref_copy(32'hE006, 32, 32'hD006, 48, 11, 5);
+      run_blit(3'd1);
+      check_window(32'hE000, 512, "copy-sameoff3-strided");
+
+      // ============ Test 11: performance FILL (128x16, aligned) ============
+      // Big enough for a stable cyc/px number; correctness still checked.
+      mmio_write(16'h0010, 64'h0004_0000); mmio_write(16'h0018, 64'd256);
+      mmio_write(16'h0030, 64'd128); mmio_write(16'h0038, 64'd16);
+      mmio_write(16'h0040, 64'h5A5A);
+      snapshot_window(32'h40000, 4096);
+      ref_fill(32'h40000, 256, 128, 16, 16'h5A5A);
+      run_blit(3'd0);
+      check_window(32'h40000, 4096, "perf-fill-128x16");
+      mmio_read(16'h0060, cyc);
+      $display("INFO perf-fill  128x16: CYCLES=%0d (%0d px -> cyc/px x1000 = %0d)",
+               cyc, 128*16, (cyc*1000)/(128*16));
+
+      // ============ Test 12: performance COPY (128x16, aligned) ============
+      for (y = 0; y < 16; y = y + 1)
+         for (x = 0; x < 128; x = x + 1)
+            poke_pixel(32'h50000 + y*256 + x*2, 16'hC000 + y*256 + x);
+      mmio_write(16'h0010, 64'h0006_0000); mmio_write(16'h0018, 64'd256);
+      mmio_write(16'h0020, 64'h0005_0000); mmio_write(16'h0028, 64'd256);
+      mmio_write(16'h0030, 64'd128); mmio_write(16'h0038, 64'd16);
+      snapshot_window(32'h60000, 4096);
+      ref_copy(32'h60000, 256, 32'h50000, 256, 128, 16);
+      run_blit(3'd1);
+      check_window(32'h60000, 4096, "perf-copy-128x16");
+      mmio_read(16'h0060, cyc);
+      $display("INFO perf-copy  128x16: CYCLES=%0d (%0d px -> cyc/px x1000 = %0d)",
+               cyc, 128*16, (cyc*1000)/(128*16));
 
       if (errors == 0) $display("PASS: all blitter checks passed");
       else             $display("FAILED: %0d errors", errors);
