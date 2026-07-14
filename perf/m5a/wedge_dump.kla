@@ -1,0 +1,53 @@
+// wedge_dump — print the bus-wedge flight recorder (0xF00D_0100/0108) as two
+// hex lines. Load AFTER a hang: the snapshot survives the reload (cleared only
+// by PERF_CTRL bit 0). Bit map lives at the r_wedge_* declaration in
+// KlaussCPU.sv: snap0 = {valid, ..., readys/DVs, st.SM, addr[31:0]},
+// snap1 = {timer_count[25:0], src1, src0, int_mask, cycles[31:0]}.
+
+_start
+SETR G 0xF00D0100
+MEMREADRR D G
+CALL print_hex64:
+SETR A 13
+CALL putc:
+SETR A 10
+CALL putc:
+SETR G 0xF00D0108
+MEMREADRR D G
+CALL print_hex64:
+SETR A 13
+CALL putc:
+SETR A 10
+CALL putc:
+HALT
+
+// print_hex64: D printed as 16 hex digits (destroys A,C,E; D restored)
+print_hex64:
+SETR E 16
+ph_loop:
+ROLV D 4
+COPY A D
+ANDV A 0xF
+CMPRV A 10
+JMPULT ph_digit:
+ADDV A 55
+JMP ph_out:
+ph_digit:
+ADDV A 48
+ph_out:
+CALL putc:
+MINUSV E 1
+JMPNZ ph_loop:
+RET
+
+// putc: send A's low byte (destroys B,C)
+putc:
+SETR B 0xF0010010
+putc_wait:
+MEMREADRR C B
+ANDV C 1
+CMPRV C 0
+JMPNE putc_wait:
+SETR B 0xF0010000
+MEMSET8 A B
+RET

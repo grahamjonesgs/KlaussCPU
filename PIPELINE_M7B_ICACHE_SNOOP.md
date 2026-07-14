@@ -119,9 +119,80 @@ w_irq_ready, r_timer_interrupt, w_pipe_owns, dram/eth/mmio readys,
 r_mmio_read_dv_d, w_mmio_read_DV, cpu ready/write_DV/read_DV, st.SM,
 addr[31:0]) and `0xF00D_0108` (snap1: timer_count[25:0], irq_src1/0,
 int_mask, cycles[31:0] at latch). Survives program reloads; cleared by
-PERF_CTRL bit 0. Read it after a hang with `perf/m5a/wedge_dump.kla`.
-Next step: run LVGL on the recorder build, dump, decode which ready in the
-chain is dead (mmio dv path vs splitter vs pipe_owns vs eth decode).
+PERF_CTRL bit 0. Read it after a hang with `perf/m5a/wedge_dump.kla`,
+decode with `perf/m5a/decode_wedge.py`.
+
+## WEDGE ROOT CAUSE (flight-recorder capture): MMIO comb write-ack deadlock
+The LVGL capture read: **stuck WRITE to 0xF00F_0000 (INT_MASK) with
+cpu.ready=1 and w_mmio_ready=1 held forever**, st.SM=PIPE_RUN, int_mask=0,
+timer pending, w_irq_ready=0. Not the TIMER_COUNT read at all — the wedge is
+Zephyr's `irq_lock()` = **`load int_mask; store int_mask` back-to-back**.
+
+Mechanism (ready-EDGE protocol deadlock):
+- MMIO READ ready = `r_mmio_read_dv_d` (delayed DV) + the bus_splitter output
+  FF ⇒ after a read completes, the CPU-visible ready stays stale-HIGH for
+  2 cycles.
+- MMIO WRITE ready was **combinational** (`w_mmio_write_DV | ...`).
+- The pipeline's `rdy_armed` protocol requires ready to be seen LOW after
+  issue before a completion counts. A store entering MEM **1 cycle** behind a
+  completing MMIO load (consecutive load;store with no data dep — no stall
+  separates them) issues into the stale-high tail (armed=0), and its own comb
+  ack then bridges the tail: ready NEVER falls ⇒ never arms ⇒ `w_mrdy` never
+  fires ⇒ DV held forever ⇒ w_mmio_ready held forever. Total bus wedge; the
+  pending IRQ can never dispatch (needs !mem_busy) and fetch starves.
+- k=2+ (any instruction between), read;read, write;write, write;read, and
+  DDR combos are all safe (their DV gaps or the cache's edge-tracking create
+  a ready falling edge). The eth bridge pulse-ack is safe (ack arrives after
+  ready has been low). Only the periph-MMIO comb write-ack can bridge.
+- Why nothing else ever hit it: hand-written .kla and the suites always have
+  ≥1 instruction between MMIO read and write (putc polls status, then SETRs,
+  then stores). Compiled C hits it naturally: irq_lock() is exactly the
+  load;store pair. The FSM core is immune (its state machine spaces ops).
+
+Fix: `r_mmio_write_dv_d` — the write ack is now delayed-DV (edge-tracking),
+identical in shape to the read ack. +1 cycle per MMIO write; DV was already
+held multiple cycles so side-effect consumers (UART TX etc., all level-based)
+see nothing new.
+
+Verification of the fix:
+- `perf/m5a/irqlock_probe.kla` (the k=1 load;store pair): tb_soc DEADLOCK
+  (sm=16, i=3) on the old RTL → **OK + clean halt** with the fix (sim AND
+  board).
+- `perf/m5a/timer_probe.kla` still passes; M5d SoC boot (bst) byte-identical.
+- Board: m5e regression 7/7 UART-identical; test_rtos healthy; **LVGL BOOTS**:
+  eth PHY ID reads 0x0007 (real value), Zephyr banner + LVGL benchmark header
+  print. Counters over the full run: IF_MISS 43.4 M cycles (the wedged run
+  read 30.7 B — collapsed ~700×), MEM_WAIT 15.0 M, 21.9 M instr retired.
+  Wedge recorder: all-zero (no bus wedge). M7b's success criteria are met.
+
+## Timing closure notes (this change set)
+The MMIO restage was forced by closure, not preference: the first fix build
+lost the giant `st.SM → w_pipe_owns → addr mux → MMIO read decode` cone
+(-0.45), so the read decode now selects from a registered address
+(`r_mmio_addr_q`) — MMIO reads are 2-stage and BOTH acks are 2-cycle
+delayed-DV (the deadlock analysis in the RTL comment covers the longer tail).
+Also: do NOT sample `st.SM` into debug regs — the FSM is tool-re-encoded
+(one-hot); a binary cast builds a wide encoder that anchors state replication
+(cost ~0.2 ns here; the recorder's [39:32] is now reserved). Final closure
+needed post-route phys_opt iterations on the routed checkpoint
+(AggressiveExplore / AlternateFlowWithRetiming alternating — WNS -0.131 →
++0.004, hold +0.025); flow scripts: `~/.klausscpu_scratch/build_physopt.tcl`
+(enables STEPS.POST_ROUTE_PHYS_OPT_DESIGN) + `physopt_iterate.tcl` (iterates
+directives on `KlaussCPU_postroute_physopt.dcp` and writes the bitstream when
+met).
+
+## NEW open item: blitter flush corrupts code memory (post-wedge crash)
+With the wedge fixed, LVGL boots and starts its render benchmark with
+**flush=blitter** (on hardware the app runtime-detects the blitter; every sim
+ran flush=memcpy — the blitter path was never exercised under the pipeline).
+~21.9 M instr in, HCF crash dump: ERR=01 at PC=0x000D69A4, OPC=00000000,
+OPCM/V1H=0xA600A600 — pixel-pattern data physically in DDR where code lives
+(the FSM dump re-reads memory). So the blitter flush is writing over code
+under the pipeline SoC: wild dest, src/dst mix-up, or blitter-vs-cache
+coherency on this path. Distinct from everything fixed here. Next session:
+reproduce in tb_soc (blitter_dma is compiled there) with a small blit that
+mirrors the LVGL flush rectangle; check the M7a-era note that DMA writers
+do not snoop the I-cache either (irrelevant to DDR corruption but same area).
 
 ## Remaining M7b-area follow-up (not this change)
 A `fence.i`-style MMIO invalidate-all for loaders-under-pipeline (LLEXT/netboot
