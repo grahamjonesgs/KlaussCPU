@@ -181,18 +181,64 @@ needed post-route phys_opt iterations on the routed checkpoint
 directives on `KlaussCPU_postroute_physopt.dcp` and writes the bitstream when
 met).
 
-## NEW open item: blitter flush corrupts code memory (post-wedge crash)
+## RESOLVED: blitter flush corrupted code memory (post-wedge crash)
 With the wedge fixed, LVGL boots and starts its render benchmark with
 **flush=blitter** (on hardware the app runtime-detects the blitter; every sim
 ran flush=memcpy — the blitter path was never exercised under the pipeline).
 ~21.9 M instr in, HCF crash dump: ERR=01 at PC=0x000D69A4, OPC=00000000,
 OPCM/V1H=0xA600A600 — pixel-pattern data physically in DDR where code lives
-(the FSM dump re-reads memory). So the blitter flush is writing over code
-under the pipeline SoC: wild dest, src/dst mix-up, or blitter-vs-cache
-coherency on this path. Distinct from everything fixed here. Next session:
-reproduce in tb_soc (blitter_dma is compiled there) with a small blit that
-mirrors the LVGL flush rectangle; check the M7a-era note that DMA writers
-do not snoop the I-cache either (irrelevant to DDR corruption but same area).
+(the FSM dump re-reads memory).
+
+**ROOT CAUSE — not the blitter at all.** The cache-maintenance walk (MAINT,
+`mem_read_write.sv` MS_W0/MS_W1) built its writeback address as
+`{tag, index, 4'b0000}` — a fossil from the 16 B-line cache (correct when
+written, commit 969191b "Pass 1 of Blitter working"). Commit e63c2d7 moved
+the cache to 32 B lines and updated every other address construction to a
+5-bit offset (`{r_evict_tag, r_cache_index, 5'b00000}`) but missed MAINT.
+The 17+10+4 = 31-bit concat zero-extends, so **every dirty line flushed by
+CACHE_CTRL FLUSH/INVALIDATE was written to HALF its true address**. The LVGL
+draw-buffer line at 0x1AD340 (0xA600 pixels) landed at 0xD69A0 — the crash PC
+0xD69A4 sits inside that 32 B window. The subsequent INVALIDATE then drops
+every cached line, so the CPU re-reads the torn DDR image (stale data + code
+splats) — total working-set corruption, first fetch of a corrupted line HCFs.
+CACHE_CTRL maintenance is used ONLY by the blitter coherency bracket
+(zephyr vnc/blitter.h: FLUSH before blit, INVALIDATE after), which is why the
+corruption tracked flush=blitter, and no sim or suite had ever walked MAINT
+on the 32 B-line cache.
+
+Hypothesis "MMIO write acks now 2-cycle delayed-DV → blitter double-fires"
+was audited and CLEARED: the blitter's 0xF00E handlers are level-tolerant
+(operand regs idempotent; CTRL.START guarded by !r_busy and consumed on the
+S_IDLE exit so a held DV's second r_start_pulse lands in S_PIX and is
+ignored; STATUS W1C and the flush pending-flag idempotent).
+
+**Fix**: MS_W0/MS_W1 writeback address offset 4'b0000 → 5'b00000 (identical
+shape to the eviction path). Also corrected the stale CACHE_INFO geometry
+(LP_CACHE_LINE_BYTES 16→32, LP_CACHE_TOTAL_BYTES ×16→×32; MMIO_MAP.md value
+updated to 64'h0001_0000_2004_0002).
+
+**Repro** (`perf/m5a/blitflush_probe.kla`, run in tb_soc via
+`perf/m7/kbt2mem.py` → netboot.mem): CPU renders 0xA600 pixels into SRC=0x200000
+(dirty lines), then mirrors blitter.h `blit_copy_rect()` register-for-register
+(FLUSH; DST/SRC/strides/W/H; CTRL=START|COPY; poll BUSY; W1C; INVALIDATE) and
+prints V=[SRC/2], D=[dst], S=[SRC re-read after INVAL].
+- Buggy RTL: `V=A600A600A600A600 D=0000000000000000` (mis-flush to SRC/2 =
+  the corruption mechanism; blit copied never-flushed DDR zeros), stack lines
+  sprayed to 0x03ffffxx (= stack/2 — tb_soc "DDR write outside model" WARNs),
+  and post-INVAL the probe loses its stack and loops forever — the exact
+  board crash shape.
+- Fixed RTL: `V=0 D=A600.. S=A600.. PASS`, clean HALT, zero WARNs.
+
+**BOARD-VERIFIED** (bitstream WNS +0.007 / WHS +0.022, default flow — no
+phys_opt iteration needed):
+- m5e regression 7/7 UART-identical; baremetal `blit_selftest` full sweep
+  PASS (FILL/COPY all geometries + dst+0..14 alignments + both flush-race
+  discriminators, 0 wrong pixels everywhere).
+- **LVGL runs the whole benchmark on flush=blitter**: all 6 scenes complete
+  (copy ≈ 28 ms/frame = blit 27.1 + cache maintenance ~0.9), then
+  "LVGL desktop ready on VNC :5900 (flush: blitter)" + VNC server up, 36+ s
+  — far past the old ~21.9 M-instr death in scene 1. No HCF dump; wedge
+  recorder all-zero.
 
 ## Remaining M7b-area follow-up (not this change)
 A `fence.i`-style MMIO invalidate-all for loaders-under-pipeline (LLEXT/netboot
