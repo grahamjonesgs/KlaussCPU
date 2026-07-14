@@ -1,0 +1,61 @@
+// perf_dump — print the 0xF00D perf/hazard counters as hex over UART.
+// The counters survive program loads (cleared only by PERF_CTRL bit 0), so
+// loading this right after a hung/finished run reads out that run's history.
+// Prints one 16-digit hex value per line, in this order:
+//   CYCLES INSTR STALL_DATA STALL_LOADUSE STALL_FLAGS STALL_SP STALL_MULDIV
+//   BRANCH_FLUSH IF_MISS MEM_WAIT
+// Registers: A=char/tmp  B=mmio addr  C=status tmp  D=value  E=digit count
+//            G=counter mmio pointer  H=counter count
+
+_start
+SETR G 0xF00D0008      // first counter: PERF_CYCLES
+SETR H 10              // number of counters to print
+
+dump_loop:
+MEMREADRR D G          // D = counter value
+CALL print_hex64:
+SETR A 13
+CALL putc:
+SETR A 10
+CALL putc:
+ADDV G 8               // next counter... but STALL_* start at 0xB0
+// after INSTR (0x10), jump the pointer to 0xB0
+SETR B 0xF00D0018
+CMPRR G B
+JMPNE dump_next:
+SETR G 0xF00D00B0
+dump_next:
+MINUSV H 1
+JMPNZ dump_loop:
+HALT
+
+// print_hex64: D printed as 16 hex digits (destroys A,C,E; D restored)
+print_hex64:
+SETR E 16
+ph_loop:
+ROLV D 4               // top nibble into the low bits
+COPY A D
+ANDV A 0xF
+CMPRV A 10
+JMPULT ph_digit:
+ADDV A 55              // 'A' + (n-10)
+JMP ph_out:
+ph_digit:
+ADDV A 48              // '0' + n
+ph_out:
+CALL putc:
+MINUSV E 1
+JMPNZ ph_loop:
+RET
+
+// putc: send A's low byte (destroys B,C)
+putc:
+SETR B 0xF0010010      // UART STATUS
+putc_wait:
+MEMREADRR C B
+ANDV C 1               // TX busy (bitwise ops set NO flags in this ISA)
+CMPRV C 0
+JMPNE putc_wait:
+SETR B 0xF0010000      // UART TX_DATA
+MEMSET8 A B
+RET

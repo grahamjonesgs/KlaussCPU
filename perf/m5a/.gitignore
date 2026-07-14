@@ -11,3 +11,15 @@ xsim.dir/
 xvlog.log
 xelab.log
 webtalk*
+
+board/
+*.code
+*.kbt
+eth_probe*.kla
+mmio_probe.kla
+unaligned_probe.kla
+eth_probe*.mem
+perf_dump.kla
+perf_clear.kla
+lvgl*.out
+lvgl.ops.uniq
