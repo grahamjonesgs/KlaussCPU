@@ -43,6 +43,10 @@
 //   0x50 MASK_ADDR   RW A8 mask top-left byte address (MASK_BLEND)
 //   0x58 MASK_STRIDE RW A8 mask row bytes
 //   0x60 CYCLES   R  cycle count of the last completed blit
+//   0x68 CHUNK    RW [3:0] DDR transactions per grant tenure (default 8;
+//                 writes of 0 store 1). Tune small (1-2) when the blit runs
+//                 concurrently with CPU work (async flush), large when the
+//                 CPU idle-polls (sync flush).
 //
 // OP: 0 FILL, 1 COPY, 2 FILL_BLEND, 3 COPY_BLEND, 4 MASK_BLEND.
 //
@@ -89,6 +93,7 @@ module blitter_dma (
     localparam OFF_MASK_ADDR   = 16'h0050;
     localparam OFF_MASK_STRIDE = 16'h0058;
     localparam OFF_CYCLES      = 16'h0060;
+    localparam OFF_CHUNK       = 16'h0068;  // RW [3:0]: DDR transactions per grant tenure
 
     // Operation codes
     localparam OP_FILL       = 3'd0;
@@ -134,6 +139,8 @@ module blitter_dma (
     logic [31:0] r_mask_stride;
     logic [ 2:0] r_op;
     logic        r_irq_en;
+    localparam CHUNK_DEFAULT = 4'd8;
+    logic [ 3:0] r_chunk_lim;   // DDR transactions per grant tenure (OFF_CHUNK, >=1)
 
     // -------------------------------------------------------------------------
     // Status / control handoff between the MMIO block and the engine FSM.
@@ -168,6 +175,7 @@ module blitter_dma (
             r_irq_en          <= 1'b0;
             r_start_pulse     <= 1'b0;
             r_done_clear_pulse<= 1'b0;
+            r_chunk_lim       <= CHUNK_DEFAULT;
         end else begin
             r_start_pulse      <= 1'b0;   // pulses are 1 cycle
             r_done_clear_pulse <= 1'b0;
@@ -191,6 +199,8 @@ module blitter_dma (
                     OFF_ALPHA:       r_alpha       <= mmio.write_data[7:0];
                     OFF_MASK_ADDR:   r_mask_addr   <= mmio.write_data[31:0];
                     OFF_MASK_STRIDE: r_mask_stride <= mmio.write_data[31:0];
+                    OFF_CHUNK:       r_chunk_lim   <= (mmio.write_data[3:0] == 4'd0)
+                                                     ? 4'd1 : mmio.write_data[3:0];
                     default: ;
                 endcase
             end
@@ -211,6 +221,7 @@ module blitter_dma (
             OFF_MASK_ADDR:   mmio.read_data = {32'b0, r_mask_addr};
             OFF_MASK_STRIDE: mmio.read_data = {32'b0, r_mask_stride};
             OFF_CYCLES:      mmio.read_data = {32'b0, r_cycles_last};
+            OFF_CHUNK:       mmio.read_data = {60'b0, r_chunk_lim};
             default:         mmio.read_data = 64'h0;
         endcase
     end
@@ -288,8 +299,13 @@ module blitter_dma (
     // through a chunk release so the arbiter re-grants as soon as the cache
     // is idle again. The arbiter side needs no change: it already holds the
     // grant until i_dma_done and gates re-grant on !is_miss_path/!r_mnt_active.
+    // The tenure length is SOFTWARE-TUNABLE (OFF_CHUNK, default 8): long
+    // tenures minimize blit time while the CPU idles (sync flush); short
+    // tenures minimize CPU miss latency while the blit runs hidden behind
+    // rendering (async flush) — there the blit should take leftover
+    // bandwidth, so CHUNK=1..2 is the right setting. r_chunk_lim (the tenure
+    // length) is declared with the operand registers above; OFF_CHUNK sets it.
     // ------------------------------------------------------------------------
-    localparam CHUNK = 8;         // transactions per grant tenure
     logic [3:0]   r_chunk;        // transactions completed this tenure
 
     // Op classification.
@@ -597,7 +613,7 @@ module blitter_dma (
                         o_dma_req  <= 1'b0;
                         r_chunk    <= 4'd0;
                         state      <= S_FINISH;
-                    end else if (r_chunk == 4'(CHUNK - 1)) begin
+                    end else if (r_chunk >= r_chunk_lim - 4'd1) begin
                         o_dma_done <= 1'b1;        // chunk boundary: yield to the
                         r_chunk    <= 4'd0;        // cache; req stays high so the
                         state      <= S_PIX;       // arbiter re-grants when idle
@@ -647,7 +663,7 @@ module blitter_dma (
                 end
 
                 S_RD_REL: begin
-                    if (r_chunk == 4'(CHUNK - 1)) begin
+                    if (r_chunk >= r_chunk_lim - 4'd1) begin
                         o_dma_done <= 1'b1;        // chunk boundary (req stays high)
                         r_chunk    <= 4'd0;
                     end else begin

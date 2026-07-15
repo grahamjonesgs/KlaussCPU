@@ -523,6 +523,28 @@ module tb_blitter;
       run_blit(3'd1);
       check_window(32'hE000, 512, "copy-sameoff3-strided");
 
+      // ============ Test 10c: CHUNK=1 tenure (per-transaction yield) ============
+      // Same copy as 10b but with the grant released after EVERY transaction —
+      // exercises the chunk-boundary re-arbitration path densely.
+      mmio_write(16'h0068, 64'd1);          // CHUNK = 1
+      begin logic [63:0] rb; mmio_read(16'h0068, rb);
+         if (rb[3:0] !== 4'd1) begin errors=errors+1; $display("FAIL: CHUNK readback %0d", rb[3:0]); end
+      end
+      for (y = 0; y < 5; y = y + 1)
+         for (x = 0; x < 11; x = x + 1)
+            poke_pixel(32'hD006 + y*48 + x*2, 16'h3300 + y*32 + x);
+      mmio_write(16'h0010, 64'h0000_E006);
+      mmio_write(16'h0018, 64'd32);
+      mmio_write(16'h0020, 64'h0000_D006);
+      mmio_write(16'h0028, 64'd48);
+      mmio_write(16'h0030, 64'd11);
+      mmio_write(16'h0038, 64'd5);
+      snapshot_window(32'hE000, 512);
+      ref_copy(32'hE006, 32, 32'hD006, 48, 11, 5);
+      run_blit(3'd1);
+      check_window(32'hE000, 512, "copy-chunk1");
+      mmio_write(16'h0068, 64'd8);          // restore default tenure
+
       // ============ Test 11: performance FILL (128x16, aligned) ============
       // Big enough for a stable cyc/px number; correctness still checked.
       mmio_write(16'h0010, 64'h0004_0000); mmio_write(16'h0018, 64'd256);

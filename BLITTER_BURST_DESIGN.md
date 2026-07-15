@@ -21,12 +21,28 @@
 > 28.2→~24.5 ms (the contended number — LVGL's threads run during the blit,
 > matching COPY real+ddr). All 6 scenes PASS to the VNC desktop.
 >
+> **ASYNC FLUSH + CHUNK TUNING (2026-07-15).** The zephyr async flush
+> (driver-level: vncd_write starts the blit and returns; fence retires it —
+> LVGL 8.3's full-size double-buffer mode only overlaps when display_write
+> returns early) collapsed the blocking copy to ~0.3 ms/frame but exposed
+> grant-tenure contention: with CHUNK=8 the CPU's cache misses wait out the
+> tenure during the (hidden) blit, inflating render by ≈ the blit time. The
+> tenure is now MMIO-tunable (`BLIT_CHUNK` 0xF00E_0068, default 8 = sync
+> optimum). Board sweep, async LVGL totals ms/frame (fill/gradient/shadow):
+> c8 113/70/524, c4 107/64/517, c2 102/58/512, **c1 101/57/510** — winner
+> CHUNK=1 (blit stretches 26.7→32.5 ms taking leftover bandwidth, stays
+> hidden; residual +9 ms vs solo render is raw DDR bandwidth sharing, not
+> tenure). The driver sets CHUNK=1 at init on the async path. Versus the
+> original sync per-word baseline: fill 120→101, gradient 77→57 (−26%),
+> rounded 165→147. blit_selftest at default 8: CYC identical to the
+> pre-register build; m5e 7/7; WNS +0.001.
+>
 > REMAINING (next increments, in expected-value order): src-read prefetch or
 > Opt-2 MIG-native back-to-back streaming in ddr2_control (COPY is now
 > demand-read-bound — each src word blocks the pixel engine ~20+ cycles),
 > skewed-COPY word path (barrel shift), decoupled write skid buffer. The
-> software async flush (LV_Z_FLUSH_THREAD + double VDB) hides the remaining
-> copy time behind render independently of all of these.
+> remaining ~+9 ms/frame async render inflation is DDR bandwidth, so Opt-2
+> (fewer controller cycles per word) also shrinks it.
 
 **Problem:** the blitter does ~8.8 cyc/pixel (was 12.8 pre-DDR-rework). It is
 one-pixel-per-step, and the DDR sub-FSMs **acquire → single 128-bit transaction →
