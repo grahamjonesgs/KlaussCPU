@@ -666,6 +666,7 @@ crossing on its register or interrupt interface.
 | 0x0050 | `BLIT_MASK_ADDR`  | RW | 32 | A8 (8 bpp) per-pixel alpha mask top-left address (MASK_BLEND). |
 | 0x0058 | `BLIT_MASK_STRIDE`| RW | 32 | Mask row stride in bytes. |
 | 0x0060 | `BLIT_CYCLES`     | R  | 32 | `i_Clk` cycle count of the last completed blit (profiling). |
+| 0x0068 | `BLIT_CHUNK`      | RW | 4  | DDR-grant tenure: transactions per bus grant before the blitter yields to the CPU (default 8; a write of 0 stores 1). Tune LARGE when the CPU idle-polls during the blit (sync flush — minimizes blit time), SMALL (1-2) when the blit runs concurrently with CPU work (async flush — minimizes CPU miss latency; the hidden blit takes leftover bandwidth). Survives program loads; resets to 8 on FPGA reconfigure. |
 
 All registers are 64-bit and software uses 64-bit accesses (the fields above
 occupy the low bits). `*_ADDR` are byte addresses into the ≤128 MB DDR space.

@@ -71,14 +71,17 @@ module mem_read_write (
     // The on-chip arbiter (below) grants the shared ddr2_control to either the
     // cache (master A, priority) or this port. Contract for the blitter:
     //   * Raise i_dma_req to ask for the bus (level; may stay high across ops).
-    //   * Wait for o_dma_grant, then drive ONE transaction:
+    //   * Wait for o_dma_grant, then drive one transaction at a time:
     //       - write: i_dma_write_DV + i_dma_addr/i_dma_write_data/i_dma_wdf_mask,
-    //                then hold address stable through the CDC settle (see the
-    //                WRITE_EVICT_DONE comment) before releasing.
+    //                then hold address stable through the settle gap (see the
+    //                WRITE_EVICT_DONE comment) before the next transaction.
     //       - read : i_dma_read_DV + i_dma_addr; latch o_dma_read_data when
     //                o_dma_ready pulses.
-    //   * Pulse i_dma_done for one cycle to release the bus (re-arbitration
-    //     point — keeps a long blit from starving the CPU).
+    //   * The grant may be HELD across multiple transactions (burst tenure).
+    //     Pulse i_dma_done to release the bus — the re-arbitration point. The
+    //     blitter yields every CHUNK (8) transactions and at blit end, which
+    //     bounds the CPU's added stall to one chunk; i_dma_req held high
+    //     through a chunk release re-queues it for the next idle window.
     // -------------------------------------------------------------------------
     input             i_dma_req,
     input             i_dma_done,
@@ -940,9 +943,11 @@ module mem_read_write (
     // Cache is the priority master; the blitter is handed the bus only while the
     // cache is NOT mid-transaction (is_miss_path low), so an in-flight cache
     // miss — including its CDC writeback gaps — is never interrupted. The
-    // blitter performs one 128-bit transaction per grant and pulses i_dma_done
-    // to release, so even a full-frame blit yields the bus back to the CPU
-    // between every transfer (bounded CPU stall, no starvation).
+    // blitter holds the grant for a CHUNK of transactions (8) and pulses
+    // i_dma_done at chunk boundaries and blit end, so even a full-frame blit
+    // yields the bus back to the CPU every few hundred cycles (bounded CPU
+    // stall, no starvation); a cache request that arrives mid-chunk parks in
+    // its miss state and is served at the next chunk boundary.
     //
     // The blitter is also held off while a cache-maintenance walk is active
     // (r_mnt_active): the walk's writebacks use the master-A path and must not

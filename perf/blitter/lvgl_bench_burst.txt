@@ -1,0 +1,46 @@
+# LVGL render benchmark — BURST STAGE 1 reference
+# bitstream: ac3254b (held-grant streaming + word fast paths), captured 2026-07-15 08:30
+# software: IDENTICAL zephyr ELF to preburst capture (sync flush, sleep-poll, single buffer)
+# blit_selftest same bitstream: FILL 640x480 CYC=576004, COPY real CYC=1894378, COPY real+ddr CYC=2242866
+LVGL bench fill     : total=116 render=92 copy=24 ms/frame (copy 24435 us = blit 23695 + cache 740)
+  rd hit: 94.33%
+  wr hit: 91.28%
+  stall%: 27.40%
+  CPI(rndr): 6.338  instr/fr=1448036
+  cyc split: fetch 0% exec 126% muldiv 0%
+  rm/fr=16817 wm/fr=42739 wb/fr=42079
+LVGL bench blend50  : total=298 render=273 copy=25 ms/frame (copy 25284 us = blit 23714 + cache 1570)
+  rd hit: 94.34%
+  wr hit: 97.69%
+  stall%: 11.43%
+  CPI(rndr): 4.253  instr/fr=6413586
+  cyc split: fetch 0% exec 109% muldiv 0%
+  rm/fr=52720 wm/fr=20414 wb/fr=50225
+LVGL bench rounded  : total=161 render=137 copy=24 ms/frame (copy 24181 us = blit 23696 + cache 485)
+  rd hit: 96.31%
+  wr hit: 93.19%
+  stall%: 17.56%
+  CPI(rndr): 5.237  instr/fr=2621670
+  cyc split: fetch 0% exec 117% muldiv 0%
+  rm/fr=23764 wm/fr=35214 wb/fr=36043
+LVGL bench shadow   : total=521 render=496 copy=25 ms/frame (copy 25202 us = blit 23704 + cache 1498)
+  rd hit: 97.79%
+  wr hit: 97.73%
+  stall%: 6.26%
+  CPI(rndr): 4.023  instr/fr=12335060
+  cyc split: fetch 0% exec 105% muldiv 0%
+  rm/fr=49875 wm/fr=28711 wb/fr=41725
+LVGL bench text     : total=429 render=405 copy=24 ms/frame (copy 24803 us = blit 23742 + cache 1061)
+  rd hit: 98.31%
+  wr hit: 97.72%
+  stall%: 5.84%
+  CPI(rndr): 4.295  instr/fr=9429374
+  cyc split: fetch 0% exec 106% muldiv 0%
+  rm/fr=39211 wm/fr=21493 wb/fr=27429
+LVGL bench gradient : total=74 render=49 copy=25 ms/frame (copy 25358 us = blit 23709 + cache 1649)
+  rd hit: 95.47%
+  wr hit: 89.07%
+  stall%: 37.41%
+  CPI(rndr): 7.374  instr/fr=669824
+  cyc split: fetch 0% exec 151% muldiv 0%
+  rm/fr=4444 wm/fr=36270 wb/fr=35288

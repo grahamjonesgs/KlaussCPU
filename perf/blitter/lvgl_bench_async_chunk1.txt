@@ -1,0 +1,11 @@
+# LVGL render benchmark — ASYNC FLUSH + CHUNK sweep (burst stage 1 + BLIT_CHUNK bitstream, WNS +0.001)
+# software: async driver (vncd_write start-and-return + fence), LV_Z_FLUSH_THREAD=y, LV_Z_DOUBLE_VDB=y, VDB=100
+# captured 2026-07-15; per-scene totals ms: c8 113/298/159/524/426/70, c4 107/292/154/517/421/64, c2 102/287/149/512/415/58, c1 101/285/147/510/414/57
+# winner CHUNK=1 (driver sets it at init); full c1 capture below
+LVGL bench fill     : total=101 render=101 copy=0 ms/frame (copy 281 us = blit 32945 + cache 0)
+LVGL bench blend50  : total=285 render=285 copy=0 ms/frame (copy 283 us = blit 32313 + cache 0)
+LVGL bench rounded  : total=147 render=147 copy=0 ms/frame (copy 262 us = blit 32501 + cache 0)
+LVGL bench shadow   : total=510 render=510 copy=0 ms/frame (copy 223 us = blit 32111 + cache 0)
+LVGL bench text     : total=414 render=414 copy=0 ms/frame (copy 210 us = blit 32227 + cache 0)
+LVGL bench gradient : total=57 render=57 copy=0 ms/frame (copy 297 us = blit 32788 + cache 0)
+=== benchmark done ===
