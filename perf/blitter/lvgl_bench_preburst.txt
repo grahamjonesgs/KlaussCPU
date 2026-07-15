@@ -1,0 +1,46 @@
+# LVGL render benchmark — PRE-BURST reference baseline
+# bitstream: 9b4a81f (cache-flush fix; per-word blitter), captured 2026-07-14 16:14
+# software: zephyr-ws build_lvgl/zephyr/zephyr.elf (sync flush, sleep-poll, LV_Z_VDB_SIZE=100 single buffer)
+# blit_selftest same bitstream: FILL 640x480 CYC=1382403, COPY real CYC=2706316, COPY real+ddr CYC=4545171
+LVGL bench fill     : total=120 render=92 copy=28 ms/frame (copy 28206 us = blit 27082 + cache 1124)
+  rd hit: 94.35%
+  wr hit: 91.29%
+  stall%: 27.28%
+  CPI(rndr): 6.325  instr/fr=1451240
+  cyc split: fetch 0% exec 130% muldiv 0%
+  rm/fr=16817 wm/fr=42740 wb/fr=42080
+LVGL bench blend50  : total=301 render=273 copy=28 ms/frame (copy 28019 us = blit 27093 + cache 926)
+  rd hit: 94.30%
+  wr hit: 97.69%
+  stall%: 11.39%
+  CPI(rndr): 4.254  instr/fr=6418418
+  cyc split: fetch 0% exec 110% muldiv 0%
+  rm/fr=53230 wm/fr=20414 wb/fr=50285
+LVGL bench rounded  : total=165 render=138 copy=27 ms/frame (copy 27995 us = blit 27132 + cache 863)
+  rd hit: 96.24%
+  wr hit: 93.20%
+  stall%: 17.60%
+  CPI(rndr): 5.234  instr/fr=2628993
+  cyc split: fetch 0% exec 120% muldiv 0%
+  rm/fr=24321 wm/fr=35262 wb/fr=36133
+LVGL bench shadow   : total=524 render=497 copy=27 ms/frame (copy 27858 us = blit 27099 + cache 759)
+  rd hit: 97.80%
+  wr hit: 97.73%
+  stall%: 6.22%
+  CPI(rndr): 4.022  instr/fr=12335088
+  cyc split: fetch 0% exec 105% muldiv 0%
+  rm/fr=49663 wm/fr=28722 wb/fr=41715
+LVGL bench text     : total=433 render=406 copy=27 ms/frame (copy 27903 us = blit 27083 + cache 820)
+  rd hit: 98.32%
+  wr hit: 97.73%
+  stall%: 5.72%
+  CPI(rndr): 4.295  instr/fr=9430733
+  cyc split: fetch 0% exec 106% muldiv 0%
+  rm/fr=39147 wm/fr=21484 wb/fr=27430
+LVGL bench gradient : total=77 render=50 copy=27 ms/frame (copy 27791 us = blit 27103 + cache 688)
+  rd hit: 95.55%
+  wr hit: 89.08%
+  stall%: 37.01%
+  CPI(rndr): 7.348  instr/fr=671026
+  cyc split: fetch 0% exec 156% muldiv 0%
+  rm/fr=4390 wm/fr=36264 wb/fr=35253
