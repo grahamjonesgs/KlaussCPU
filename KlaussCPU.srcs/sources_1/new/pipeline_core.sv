@@ -194,7 +194,32 @@ module pipeline_core
    // framebuffer/.bss writes thrashed the I-cache to ~51% IF_MISS / ~286 CPI).
    logic [18:0] ic_tagff [0:IC_LINES-1];
 
-   wire [IC_IDXW-1:0] ic_look_idx = miss_dw[IC_IDXW:1];
+   // ======================= M9: next-line buffer (NLB) ========================
+   // One prefetched 16 B line + a background I-cache lookup that runs while the
+   // pipe executes out of the IFB, so a sequential line cross is served from a
+   // register in 1 cycle instead of the 2-3 cycle if_look — at ANY alignment.
+   // Prefetch fills on I-cache HIT only (a miss never touches the shared port:
+   // no MEM contention, no pollution; cold lines take the demand path as
+   // before). See PIPELINE_M9_FETCH_PREFETCH.md.
+   logic [127:0] nlb_data;
+   logic [27:0]  nlb_line;            // line address = dword[28:1] = byte[31:4]
+   logic         nlb_vhi, nlb_vlo;    // per-dword valid (addr3=0 / addr3=1)
+   logic         pf_look;             // prefetch lookup owns the BRAM read port
+   logic [27:0]  pf_line;
+   logic         if_look;             // demand I-cache lookup phase (no port) —
+                                      // declared here for the pf_sel mux below
+   // The line after the one the window ends in ((ifb_base+2)>>1 for both
+   // parities of ifb_base — for an odd base this "next line" also completes
+   // the current straddle line's missing low dword).
+   wire  [27:0]  want_line    = ifb_base[28:1] + 28'd1;
+   wire          nlb_has_want = (nlb_vhi || nlb_vlo) && (nlb_line == want_line);
+
+   // Demand lookups own the BRAM read port whenever if_look is (or is about to
+   // go) active; the prefetch leg uses it only in the gaps. Same-index reads
+   // return the same row, so a mux switch can never serve stale data.
+   wire               pf_sel      = pf_look && !if_look;
+   wire [IC_IDXW-1:0] ic_look_idx = pf_sel ? pf_line[IC_IDXW-1:0]
+                                           : miss_dw[IC_IDXW:1];
    wire [18:0]        ic_look_tag = miss_dw[28:IC_IDXW+1];
    // registered read of the line for the current miss_dw (1-cycle BRAM latency)
    logic [IC_IDXW-1:0] ic_rd_idx;
@@ -218,7 +243,17 @@ module pipeline_core
    wire [63:0] ifr_rdata      = miss_dw[0] ? ic_rd_data[63:0] : ic_rd_data[127:64];
    wire [63:0] ifr_rdata_next = ic_rd_data[63:0];
    wire        ifr_next_valid = !miss_dw[0] && ic_rd_vlo;
-   logic       if_look;                         // in I-cache lookup phase (no port)
+   // (if_look is declared in the M9 NLB block above, ahead of the pf_sel mux)
+
+   // M9: prefetch-side decode of the registered read (meaningful under pf_sel)
+   wire pf_rd_current = pf_sel && (ic_rd_idx == pf_line[IC_IDXW-1:0]);
+   wire pf_tag_match  = pf_rd_current && (ic_rd_tag == pf_line[27:IC_IDXW]);
+   // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
+   wire        nlb_dw_ok      = (nlb_line == miss_dw[28:1]) &&
+                                (miss_dw[0] ? nlb_vlo : nlb_vhi);
+   wire [63:0] nlb_rdata      = miss_dw[0] ? nlb_data[63:0] : nlb_data[127:64];
+   wire [63:0] nlb_rdata_next = nlb_data[63:0];
+   wire        nlb_next_valid = !miss_dw[0] && nlb_vlo;
 
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
@@ -1022,6 +1057,7 @@ module pipeline_core
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00;
+         nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
@@ -1032,6 +1068,7 @@ module pipeline_core
             pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00; if_look <= 1'b0;
+            nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
             // invalidate-all: a fresh program image may reuse code addresses
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
          end
@@ -1191,6 +1228,16 @@ module pipeline_core
                      ic_vhi[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
                      ic_vlo[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
                   end
+                  // M9: issue-time NLB snoop + in-flight prefetch abort. Closes
+                  // the 1-cycle race where a prefetch captures a BRAM read that
+                  // predates this store's ic_v* clear (the mem_done_now
+                  // store-match below is the belt-and-braces line-granular kill).
+                  if (mem_port_wr && (nlb_vhi || nlb_vlo)
+                      && nlb_line == mem_iaddr[31:4]) begin
+                     nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
+                  end
+                  if (mem_port_wr && pf_look && pf_line == mem_iaddr[31:4])
+                     pf_look <= 1'b0;
                end
                2'd1: if (w_mrdy) begin
                   if (ld32_need2) begin        // cross-line MEMGET32: 2nd read
@@ -1294,7 +1341,45 @@ module pipeline_core
                // else: port busy — hold in if_look (re-evaluates in0/miss_dw each cycle)
             end
          end else if (running && !fetch_halt && !parked && !irq_active && !fetch_ok) begin
-            if_look   <= 1'b1;                 // begin lookup (no port access)
+            // M9: serve a sequential line cross from the NLB in ONE cycle (no
+            // BRAM, no port). Same current-in0/miss_dw discipline as the
+            // I-cache hit serve — base and data are registered together.
+            if (nlb_dw_ok) begin
+               if (!in0) begin
+                  ifb_base  <= miss_dw;
+                  ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
+                  ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+               end else begin
+                  ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+               end
+            end else begin
+               if_look   <= 1'b1;              // begin lookup (no port access)
+            end
+         end
+
+         // ---------------- M9: NLB prefetch engine (background) ----------------
+         // Runs the normal 1-cycle BRAM lookup at want_line through the shared
+         // read port whenever the demand side is idle; captures on hit, gives
+         // up silently on miss (demand path handles cold lines). A demand
+         // lookup starting mid-prefetch simply steals the mux (pf_sel drops);
+         // the prefetch retries when the port frees up.
+         if (pf_look) begin
+            if (if_look) begin
+               pf_look <= 1'b0;                // demand owns the port — retry later
+            end else if (pf_rd_current) begin
+               if (pf_tag_match && (ic_rd_vhi || ic_rd_vlo)) begin
+                  nlb_data <= ic_rd_data;
+                  nlb_line <= pf_line;
+                  nlb_vhi  <= ic_rd_vhi;
+                  nlb_vlo  <= ic_rd_vlo;
+               end
+               pf_look <= 1'b0;                // hit captured / miss abandoned
+            end
+         end else if (running && !fetch_halt && !parked && !irq_active
+                      && fetch_ok && ifb_val[0] && !nlb_has_want
+                      && !if_look && !if_xc) begin
+            pf_look <= 1'b1;
+            pf_line <= want_line;
          end
 
          // ---------------- MEM -> WB ----------------
@@ -1413,6 +1498,10 @@ module pipeline_core
             hit_ex  = ex_valid && (ex_pc[31:3] == st_dw || ex_last[31:3] == st_dw);
             if (ifb_val[0] && ifb_base == st_dw)          ifb_val[0] <= 1'b0;
             if (ifb_val[1] && ifb_base + 29'd1 == st_dw)  ifb_val[1] <= 1'b0;
+            // M9: the NLB is a code copy too — same store-match rule (line-granular)
+            if ((nlb_vhi || nlb_vlo) && nlb_line == st_dw[28:1]) begin
+               nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
+            end
             if (hit_ex || hit_id) begin
                ex_valid <= 1'b0;
                id_valid <= 1'b0;
