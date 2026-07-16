@@ -74,7 +74,7 @@ module mem_read_write (
     //   * Wait for o_dma_grant, then drive one transaction at a time:
     //       - write: i_dma_write_DV + i_dma_addr/i_dma_write_data/i_dma_wdf_mask,
     //                then hold address stable through the settle gap (see the
-    //                WRITE_EVICT_DONE comment) before the next transaction.
+    //                EVICT_SHADOW_WAIT comment) before the next transaction.
     //       - read : i_dma_read_DV + i_dma_addr; latch o_dma_read_data when
     //                o_dma_ready pulses.
     //   * The grant may be HELD across multiple transactions (burst tenure).
@@ -140,6 +140,13 @@ module mem_read_write (
     logic  [255:0] o_ddr_mem_write_data;   // 32 B line (cache path); blitter uses low 128 b
     wire   [255:0] i_ddr_mem_read_data;    // 32 B line (cache path); blitter uses low 128 b
     wire         i_ddr_mem_ready;
+    // M10a CWF early channel from ddr2_control (wide reads): the requested
+    // dword (+ companion for even offsets) arrives 3+ cycles before the full
+    // line — see the early-restart arms in READ_WAIT / WRITE_FETCH.
+    wire [ 63:0] w_ddr_rd_dw;
+    wire [ 63:0] w_ddr_rd_dw_next;
+    wire         w_ddr_dw_next_ok;
+    wire         w_ddr_dw_ready;
     wire [ 15:0] w_app_wdf_mask;
     logic  [ 15:0] r_app_wdf_mask;
 
@@ -201,6 +208,9 @@ module mem_read_write (
     // only on its own — neither can mistake the other's ready for its own.
     wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit;
     wire w_blit_ddr_ready  = i_ddr_mem_ready &  r_grant_blit;
+    // CWF early pulse is cache-only (the blitter's narrow reads never emit it,
+    // but gate on the grant anyway).
+    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit;
 
     assign o_dma_ready = w_blit_ddr_ready;
 
@@ -299,10 +309,20 @@ module mem_read_write (
     logic [31:0]  r_evict_ddr_addr_r;   // DDR address of the dirty eviction
     logic [31:0]  r_fetch_ddr_addr;     // DDR address for the refill fetch
     logic         r_evict_way;          // which way to replace (miss paths)
-    logic [3:0]   r_gap_count;          // gap between writeback and refill. Single
-                                       // domain, so it only needs to let
-                                       // ddr2_control go IDLE->WAIT (both DVs low)
-                                       // before the refill DV. (WRITE/READ_EVICT_GAP)
+    logic [3:0]   r_gap_count;          // DV-low settle gap between the refill and the
+                                       // shadow writeback. Single domain, so it only
+                                       // needs to let ddr2_control go IDLE->WAIT (both
+                                       // DVs low) before the write DV. (EVICT_SHADOW_GAP)
+    // M10a early restart bookkeeping. r_miss_served: the CPU has already been
+    // released for the current miss (early cpu.ready pulsed on the CWF dword)
+    // — suppresses the second present/ready at line-install time and stops the
+    // stall counter. r_do_evict: the victim line was dirty; its writeback runs
+    // AFTER the refill, in the shadow of the restarted CPU (fetch-first). The
+    // victim's data/address live in r_evict_data_hold / r_evict_ddr_addr_r,
+    // and the blitter arbiter is held off (is_miss_path) until it completes —
+    // nothing can observe DDR's stale copy of the victim line in the window.
+    logic         r_miss_served = 1'b0;
+    logic         r_do_evict    = 1'b0;
 
     // -------------------------------------------------------------------------
     // State machine — one-hot 16-bit
@@ -312,13 +332,13 @@ module mem_read_write (
     localparam CHECK                 = 16'd4;     // check registered BRAM results; hits complete here
     // 16'd8 (WRITE_HIT) and 16'd256 (READ_CACHE2) retired — both hit paths
     // now complete inside CHECK, saving one cycle per hit.
-    localparam WRITE_MISS_EVICT      = 16'd16;    // dirty write-miss: start writeback
-    localparam WRITE_EVICT_DONE      = 16'd32;    // wait for writeback, then fetch
-    localparam WRITE_EVICT_GAP       = 16'd64;    // CDC gap before read DV
+    // M10a fetch-first: 16'd64 (WRITE_EVICT_GAP), 16'd512/1024/2048
+    // (READ_EVICT/_DONE/_GAP) retired — dirty misses now fetch FIRST (the CPU
+    // restarts on the CWF dword) and write the victim back afterwards in the
+    // shadow (EVICT_SHADOW_*, reusing the 16'd16/32 encodings).
+    localparam EVICT_SHADOW_GAP      = 16'd16;    // DV-low settle before the shadow writeback
+    localparam EVICT_SHADOW_WAIT     = 16'd32;    // wait for the shadow writeback to complete
     localparam WRITE_FETCH           = 16'd128;   // wait for fetch, merge, store (write-back: line installed dirty)
-    localparam READ_EVICT            = 16'd512;   // dirty read-miss: start writeback
-    localparam READ_EVICT_DONE       = 16'd1024;  // wait for writeback, then fetch
-    localparam READ_EVICT_GAP        = 16'd2048;  // CDC gap before read DV
     localparam READ_WAIT             = 16'd4096;  // wait for DDR fetch
     localparam COOL_DOWN             = 16'd8192;  // dead cycle after PRE_WAIT — covers the
                                                   // 1-cycle return delay added by bus_splitter's
@@ -413,7 +433,8 @@ module mem_read_write (
     // WRITE_FETCH installs as DIRTY (write-back on miss): avoids DDR write-through
     // after a miss, which would race against MIG's internal write pipeline and
     // could clobber bytes committed by a prior buffered write to the same line.
-    // The dirty line will be written back to DDR by the normal WRITE_MISS_EVICT path.
+    // The dirty line will be written back to DDR when it is itself evicted
+    // (EVICT_SHADOW_* on that later miss) or by a maintenance flush.
     wire dirty0_din = w_write_hit_now || (state == WRITE_FETCH && w_cache_ddr_ready);
 
     wire dirty1_wen = (w_write_hit_now &&                       r_hit_way1) ||
@@ -506,6 +527,7 @@ module mem_read_write (
                     r_write_data        <= cpu.write_data;
                     r_is_write          <= cpu.write_DV;
                     r_computed_ddr_addr <= w_computed_ddr_addr;
+                    r_miss_served       <= 1'b0;   // M10a: new transaction, early restart not yet issued
                     state               <= CHECK;
                 end
             end
@@ -571,18 +593,17 @@ module mem_read_write (
                         state       <= PRE_WAIT;
 
                     end else begin
-                        // Write miss
+                        // Write miss — M10a fetch-first: issue the refill NOW
+                        // (dirty or not); a dirty victim's writeback runs in
+                        // the shadow after the CPU restarts (r_do_evict).
                         r_evict_way        <= r_evict_way_sel;
                         r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
                         r_fetch_ddr_addr   <= r_computed_ddr_addr;
                         r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
-                        if (r_evict_dirty) begin
-                            state <= WRITE_MISS_EVICT;
-                        end else begin
-                            o_ddr_mem_addr    <= r_computed_ddr_addr;
-                            o_ddr_mem_read_DV <= 1;
-                            state             <= WRITE_FETCH;
-                        end
+                        r_do_evict         <= r_evict_dirty;
+                        o_ddr_mem_addr     <= r_computed_ddr_addr;
+                        o_ddr_mem_read_DV  <= 1;
+                        state              <= WRITE_FETCH;
                     end
 
                 end else begin // read
@@ -612,69 +633,37 @@ module mem_read_write (
                         state       <= PRE_WAIT;
 
                     end else begin
-                        // Read miss
+                        // Read miss — M10a fetch-first (see the write-miss
+                        // comment above).
                         r_evict_way        <= r_evict_way_sel;
                         r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
                         r_fetch_ddr_addr   <= r_computed_ddr_addr;
                         r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
-                        if (r_evict_dirty) begin
-                            state <= READ_EVICT;
-                        end else begin
-                            o_ddr_mem_addr    <= r_computed_ddr_addr;
-                            o_ddr_mem_read_DV <= 1;
-                            state             <= READ_WAIT;
-                        end
+                        r_do_evict         <= r_evict_dirty;
+                        o_ddr_mem_addr     <= r_computed_ddr_addr;
+                        o_ddr_mem_read_DV  <= 1;
+                        state              <= READ_WAIT;
                     end
 
                 end
             end // CHECK
 
             // ------------------------------------------------------------------
-            // WRITE MISS — dirty eviction path
+            // WRITE MISS — refill in flight (fetch-first; any dirty victim
+            // writeback follows in EVICT_SHADOW_* after the CPU restarts)
             // ------------------------------------------------------------------
-            WRITE_MISS_EVICT: begin
-                o_ddr_mem_addr       <= r_evict_ddr_addr_r;
-                o_ddr_mem_write_data <= r_evict_data_hold;
-                r_app_wdf_mask       <= 16'b0000_0000_0000_0000; // all bytes valid
-                o_ddr_mem_write_DV   <= 1;
-                state                <= WRITE_EVICT_DONE;
-            end
-
-            WRITE_EVICT_DONE: begin
-                if (w_cache_ddr_ready) begin
-                    o_ddr_mem_write_DV <= 0;
-                    // CRITICAL: do NOT change o_ddr_mem_addr here. ddr2_control
-                    // samples cpu.write_DV directly (same ui_clk domain), but
-                    // its FSM only returns WRITE_DONE->IDLE->WAIT once BOTH DVs
-                    // read low (the IDLE gate there). For a cycle or two after we
-                    // drop write_DV it can still be draining its write, and if it
-                    // re-enters WAIT->WRITE while write_DV still reads high it
-                    // latches app_addr from the live cpu.addr. If we have already
-                    // changed addr to the refill target, that spurious write
-                    // commits the eviction line's data to the refill address —
-                    // corrupting DRAM.  Hold the eviction address through the
-                    // gap below so any spurious write is idempotent.
-                    r_gap_count        <= 4'd2;
-                    state              <= WRITE_EVICT_GAP;
-                end
-            end
-
-            WRITE_EVICT_GAP: begin
-                // Settle gap: hold the eviction address (and keep both DVs low)
-                // long enough for ddr2_control to drain its write and return to
-                // its DV=0-gated IDLE/WAIT.  Only after that is it safe to change
-                // addr to the refill target and raise read DV.  r_gap_count=2 (a
-                // few i_Clk cycles) covers it in the single ui_clk domain.
-                if (r_gap_count == 4'd0) begin
-                    o_ddr_mem_addr    <= r_fetch_ddr_addr;
-                    o_ddr_mem_read_DV <= 1;
-                    state             <= WRITE_FETCH;
-                end else begin
-                    r_gap_count <= r_gap_count - 4'd1;
-                end
-            end
-
             WRITE_FETCH: begin
+                cpu.ready <= 0;   // the early ready below is a 1-cycle pulse
+                if (w_cache_dw_ready && !r_miss_served) begin
+                    // M10a early restart: the requested dword has arrived, so
+                    // the merge is fully determined — the write is complete as
+                    // far as the CPU is concerned. Release it now; the line
+                    // merge + install (and any victim writeback) finish in the
+                    // shadow. The full-line merge below reads the same dword
+                    // out of i_ddr_mem_read_data, so nothing is stashed here.
+                    cpu.ready     <= 1;
+                    r_miss_served <= 1;
+                end
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_read_DV <= 0;
 
@@ -719,8 +708,14 @@ module mem_read_write (
 
                     // Line installed as DIRTY — will be written back to DDR on eviction.
                     // Dirty bit set via dirty0/1_din combinatorial wires above.
-                    cpu.ready <= 1;
-                    state       <= PRE_WAIT;
+                    if (!r_miss_served)
+                        cpu.ready <= 1;   // fallback: no early pulse fired this miss
+                    if (r_do_evict) begin
+                        r_gap_count <= 4'd2;
+                        state       <= EVICT_SHADOW_GAP;
+                    end else begin
+                        state       <= PRE_WAIT;
+                    end
                 end
             end
 
@@ -728,40 +723,25 @@ module mem_read_write (
             // inside CHECK (see the CHECK comment above).
 
             // ------------------------------------------------------------------
-            // READ MISS — dirty eviction path
-            // ------------------------------------------------------------------
-            READ_EVICT: begin
-                o_ddr_mem_addr       <= r_evict_ddr_addr_r;
-                o_ddr_mem_write_data <= r_evict_data_hold;
-                r_app_wdf_mask       <= 16'b0000_0000_0000_0000;
-                o_ddr_mem_write_DV   <= 1;
-                state                <= READ_EVICT_DONE;
-            end
-
-            READ_EVICT_DONE: begin
-                if (w_cache_ddr_ready) begin
-                    o_ddr_mem_write_DV <= 0;
-                    // Hold eviction address through the settle gap — see the long
-                    // comment in WRITE_EVICT_DONE for the race this prevents.
-                    r_gap_count        <= 4'd2;
-                    state              <= READ_EVICT_GAP;
-                end
-            end
-
-            READ_EVICT_GAP: begin
-                if (r_gap_count == 4'd0) begin
-                    o_ddr_mem_addr    <= r_fetch_ddr_addr;
-                    o_ddr_mem_read_DV <= 1;
-                    state             <= READ_WAIT;
-                end else begin
-                    r_gap_count <= r_gap_count - 4'd1;
-                end
-            end
-
-            // ------------------------------------------------------------------
-            // READ WAIT: DDR fetch complete — install line, return word
+            // READ WAIT: refill in flight. M10a early restart: the CPU gets the
+            // requested dword the beat it arrives (CWF: always beat 0/1); the
+            // full-line install — and any dirty victim writeback — complete in
+            // the shadow while the CPU is already running again.
             // ------------------------------------------------------------------
             READ_WAIT: begin
+                cpu.ready      <= 0;   // the early ready below is a 1-cycle pulse
+                cpu.next_valid <= 0;
+                if (w_cache_dw_ready && !r_miss_served) begin
+                    // Early restart: present the CWF dword (+ companion for
+                    // even offsets — exactly the cases the IFB lookahead and
+                    // the ld32 span fast path can use; odd offsets return
+                    // next_valid=0 and those consumers fall back correctly).
+                    cpu.read_data      <= w_ddr_rd_dw;
+                    cpu.read_data_next <= w_ddr_rd_dw_next;
+                    cpu.next_valid     <= w_ddr_dw_next_ok;
+                    cpu.ready          <= 1;
+                    r_miss_served      <= 1;
+                end
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_read_DV <= 0;
 
@@ -776,17 +756,62 @@ module mem_read_write (
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;
 
-                    // Present requested dw + next sequential dw (IFB lookahead).
-                    case (r_dw_offset)
-                        2'b00: begin cpu.read_data <= i_ddr_mem_read_data[255:192]; cpu.read_data_next <= i_ddr_mem_read_data[191:128]; end
-                        2'b01: begin cpu.read_data <= i_ddr_mem_read_data[191:128]; cpu.read_data_next <= i_ddr_mem_read_data[127:64];  end
-                        2'b10: begin cpu.read_data <= i_ddr_mem_read_data[127:64];  cpu.read_data_next <= i_ddr_mem_read_data[63:0];    end
-                        default: begin cpu.read_data <= i_ddr_mem_read_data[63:0];  cpu.read_data_next <= 64'h0;                        end
-                    endcase
-                    cpu.next_valid <= (r_dw_offset != 2'b11);
+                    if (!r_miss_served) begin
+                        // Fallback (no early pulse this miss): present requested
+                        // dw + next sequential dw (IFB lookahead) from the line.
+                        case (r_dw_offset)
+                            2'b00: begin cpu.read_data <= i_ddr_mem_read_data[255:192]; cpu.read_data_next <= i_ddr_mem_read_data[191:128]; end
+                            2'b01: begin cpu.read_data <= i_ddr_mem_read_data[191:128]; cpu.read_data_next <= i_ddr_mem_read_data[127:64];  end
+                            2'b10: begin cpu.read_data <= i_ddr_mem_read_data[127:64];  cpu.read_data_next <= i_ddr_mem_read_data[63:0];    end
+                            default: begin cpu.read_data <= i_ddr_mem_read_data[63:0];  cpu.read_data_next <= 64'h0;                        end
+                        endcase
+                        cpu.next_valid <= (r_dw_offset != 2'b11);
+                        cpu.ready      <= 1;
+                    end
 
-                    cpu.ready <= 1;
-                    state       <= PRE_WAIT;
+                    if (r_do_evict) begin
+                        r_gap_count <= 4'd2;
+                        state       <= EVICT_SHADOW_GAP;
+                    end else begin
+                        state       <= PRE_WAIT;
+                    end
+                end
+            end
+
+            // ------------------------------------------------------------------
+            // EVICT SHADOW: dirty victim writeback, AFTER the refill (fetch-
+            // first) and after the CPU has been released. The victim exists
+            // only in r_evict_data_hold/r_evict_ddr_addr_r here (its tags were
+            // overwritten at install) — is_miss_path keeps the blitter off the
+            // bus for the whole window, so DDR's stale copy is unobservable.
+            // ------------------------------------------------------------------
+            EVICT_SHADOW_GAP: begin
+                // Clear any fallback ready pulse (PRE_WAIT is bypassed on this
+                // path) and let ddr2_control pass its DV-low IDLE gate before
+                // the write DV rises — same settle discipline as the old
+                // WRITE_EVICT_GAP, direction reversed.
+                cpu.ready      <= 0;
+                cpu.next_valid <= 0;
+                if (r_gap_count == 4'd0) begin
+                    o_ddr_mem_addr       <= r_evict_ddr_addr_r;
+                    o_ddr_mem_write_data <= r_evict_data_hold;
+                    r_app_wdf_mask       <= 16'b0000_0000_0000_0000; // all bytes valid
+                    o_ddr_mem_write_DV   <= 1;
+                    state                <= EVICT_SHADOW_WAIT;
+                end else begin
+                    r_gap_count <= r_gap_count - 4'd1;
+                end
+            end
+
+            EVICT_SHADOW_WAIT: begin
+                if (w_cache_ddr_ready) begin
+                    o_ddr_mem_write_DV <= 0;
+                    // Hold the victim address while ddr2_control drains and
+                    // passes its DV gate — PRE_WAIT + COOL_DOWN give the settle
+                    // cycles before any new miss can change o_ddr_mem_addr
+                    // (WAIT → CHECK first). A spurious re-sampled write would
+                    // hit the victim address again: idempotent.
+                    state <= PRE_WAIT;
                 end
             end
 
@@ -929,14 +954,13 @@ module mem_read_write (
     };
     assign o_cache_info = LP_CACHE_INFO;
 
-    wire is_miss_path = (state == WRITE_MISS_EVICT) ||
-                        (state == WRITE_EVICT_DONE) ||
-                        (state == WRITE_EVICT_GAP)  ||
-                        (state == WRITE_FETCH)      ||
-                        (state == READ_EVICT)       ||
-                        (state == READ_EVICT_DONE)  ||
-                        (state == READ_EVICT_GAP)   ||
-                        (state == READ_WAIT);
+    // M10a: the shadow-writeback states are part of the miss path — the
+    // blitter arbiter must stay locked out until the victim line is safely in
+    // DDR (see the EVICT_SHADOW comment in the FSM).
+    wire is_miss_path = (state == WRITE_FETCH)      ||
+                        (state == READ_WAIT)        ||
+                        (state == EVICT_SHADOW_GAP) ||
+                        (state == EVICT_SHADOW_WAIT);
 
     // -------------------------------------------------------------------------
     // DMA grant arbitration (see the muxed mig_* wires and the DMA master port).
@@ -989,7 +1013,10 @@ module mem_read_write (
                 if ( r_is_write && !r_cache_hit)              o_cnt_write_misses <= o_cnt_write_misses + 64'd1;
                 if (!r_cache_hit && r_evict_dirty)            o_cnt_writebacks   <= o_cnt_writebacks   + 64'd1;
             end
-            if (is_miss_path)                                 o_cnt_stall_cycles <= o_cnt_stall_cycles + 64'd1;
+            // M10a: count only CPU-VISIBLE miss stall — once the early restart
+            // has released the CPU (r_miss_served), the remaining install /
+            // shadow-writeback cycles overlap execution and are not stall.
+            if (is_miss_path && !r_miss_served)               o_cnt_stall_cycles <= o_cnt_stall_cycles + 64'd1;
         end
     end
 
@@ -1025,10 +1052,15 @@ module mem_read_write (
         .i_mem_read_DV    (mig_read_DV),
         .i_mem_addr       (mig_addr),
         .i_mem_wide       (mig_wide),        // 1 = cache 32 B (2 pipelined bursts); 0 = blitter 128 b
+        .i_mem_dw_off     (r_dw_offset),     // CWF: requested dword (wide/cache reads only)
         .i_mem_write_data (mig_write_data),
         .i_app_wdf_mask   (mig_wdf_mask),
         .o_mem_read_data  (i_ddr_mem_read_data),
         .o_mem_ready      (i_ddr_mem_ready),
+        .o_mem_rd_dw      (w_ddr_rd_dw),
+        .o_mem_rd_dw_next (w_ddr_rd_dw_next),
+        .o_mem_dw_next_ok (w_ddr_dw_next_ok),
+        .o_mem_dw_ready   (w_ddr_dw_ready),
         .o_calib_done     (o_calib_done),
         .o_ui_clk         (w_ui_clk)
     );

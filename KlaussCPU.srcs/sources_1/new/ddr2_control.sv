@@ -45,10 +45,23 @@ module ddr2_control (
     input i_mem_read_DV,
     input [31:0] i_mem_addr,
     input i_mem_wide,                    // 1 = 32 B line (two pipelined BL8 bursts); 0 = 128 b (blitter)
+    input [1:0] i_mem_dw_off,            // M10a CWF: requested dword within the 32 B line (wide reads only)
     input [255:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
     output logic [255:0] o_mem_read_data,
     output logic o_mem_ready,
+    // M10a critical-word-first early channel (wide reads only). The burst
+    // holding the requested dword is issued FIRST, so the requested dword
+    // always arrives on beat 0 (odd dw_off) or beat 1 (even dw_off) — never
+    // on the final beat. o_mem_dw_ready pulses for one cycle when it has been
+    // captured, 3+ cycles before o_mem_ready; the full 32 B line in
+    // o_mem_read_data completes as usual. For even dw_off the companion
+    // (dw_off+1) dword rides beat 0 and is exposed on o_mem_rd_dw_next
+    // (o_mem_dw_next_ok qualifies it, stable through the transaction).
+    output logic [63:0] o_mem_rd_dw,
+    output logic [63:0] o_mem_rd_dw_next,
+    output       o_mem_dw_next_ok,
+    output logic o_mem_dw_ready,
     output o_calib_done,          // MIG init_calib_complete (DDR2 ready)
     output o_ui_clk               // MIG ui_clk (100 MHz at 2:1) — the CPU clock (CPU runs synchronous to it)
 
@@ -56,6 +69,8 @@ module ddr2_control (
 
 
    wire calib_done;
+   wire ui_clk;
+   wire ui_clk_sync_rst;
    assign o_calib_done = calib_done;
    assign o_ui_clk = ui_clk;      // expose the MIG UI clock to clock the whole CPU synchronously
 
@@ -83,9 +98,6 @@ module ddr2_control (
    wire app_sr_active;
    wire app_ref_ack;
    wire app_zq_ack;
-
-   wire ui_clk;
-   wire ui_clk_sync_rst;
 
    // -------------------------------------------------------------------------
    // The cache and ddr2_control are in the SAME ui_clk domain (the whole CPU
@@ -115,12 +127,22 @@ module ddr2_control (
    logic [1:0] rd_cnt   = 2'd0;
    logic       r_wide   = 1'b0;    // latched i_mem_wide for the current transaction
    logic       wr_burst = 1'b0;    // wide writeback: 0 = burst_lo (base), 1 = burst_hi (base+16)
+   // M10a CWF: latched request-dword offset and burst order for the current read.
+   // r_hi_first = 1 when burst_hi (base+16, dw2/dw3) is issued before burst_lo.
+   logic [1:0] r_dw_off  = 2'd0;
+   logic       r_hi_first = 1'b0;
+
+   // Companion qualifier: for an even-offset request the companion (dw_off+1)
+   // dword arrives on beat 0, before the requested dword on beat 1. Stable
+   // through the transaction — sampled by the cache on the o_mem_dw_ready pulse.
+   assign o_mem_dw_next_ok = r_wide & ~r_dw_off[0];
 
    parameter CMD_WRITE = 3'b000;
    parameter CMD_READ = 3'b001;
 
    initial begin
-      o_mem_ready <= 0;
+      o_mem_ready    <= 0;
+      o_mem_dw_ready <= 0;
    end
 
    mig_7series_0 mig_7series_0 (
@@ -182,7 +204,10 @@ module ddr2_control (
          rd_cnt <= 2'd0;
          r_wide <= 1'b0;
          wr_burst <= 1'b0;
+         r_hi_first <= 1'b0;
+         o_mem_dw_ready <= 1'b0;
       end else begin
+         o_mem_dw_ready <= 1'b0;   // 1-cycle pulse; the READ_DONE capture below overrides
          case (state)
             // IDLE: stay here until BOTH DVs are deasserted before returning to
             // WAIT. This is critical for transaction framing: the cache holds its
@@ -267,30 +292,44 @@ module ddr2_control (
 
 
             // 32 B read (i_mem_wide) = two pipelined BL8 bursts; blitter = one BL8.
-            // Wide: command 1 (base) + command 2 (base+16 B) go back-to-back into the
-            // MIG FIFO; 4 beats reassemble the 256-bit line (see READ_DONE map). The
-            // 2nd row-hit read pipelines ~free (measured ~+2.6c/miss on silicon).
+            // Wide: both commands go back-to-back into the MIG FIFO; 4 beats
+            // reassemble the 256-bit line (see READ_DONE map). The 2nd row-hit
+            // read pipelines ~free (measured ~+2.6c/miss on silicon).
+            // M10a CWF: the burst holding the REQUESTED dword is issued first
+            // (r_hi_first when the request is in dw2/dw3), so the requested
+            // dword always arrives on beat 0/1 and is exposed early on
+            // o_mem_rd_dw / o_mem_dw_ready while the tail beats finish the line.
             READ: begin
                if (app_rdy) begin
                   app_en   <= 1;
-                  app_addr <= i_mem_addr[27:1]; // byte addr → MIG halfword addr (burst 1 = base)
+                  app_addr <= (i_mem_wide && i_mem_dw_off[1])
+                              ? i_mem_addr[27:1] + 27'd8   // CWF: burst_hi (base+16 B) first
+                              : i_mem_addr[27:1];          // byte addr → MIG halfword addr
                   app_cmd  <= CMD_READ;
                   rd_cnt   <= 2'd0;
                   r_wide   <= i_mem_wide;
+                  r_dw_off <= i_mem_dw_off;
+                  r_hi_first <= i_mem_wide && i_mem_dw_off[1];
                   state    <= i_mem_wide ? READ_CMD2 : READ_DONE;  // narrow (blitter) = 1 burst
                end
             end
 
             READ_CMD2: begin                    // command 1 accepted → present command 2
                if (app_rdy & app_en) begin
-                  app_addr <= i_mem_addr[27:1] + 27'd8; // burst 2 = base + 16 B (8 halfwords)
+                  app_addr <= r_hi_first ? i_mem_addr[27:1]           // CWF: burst_lo second
+                                         : i_mem_addr[27:1] + 27'd8;  // burst 2 = base + 16 B
                   // app_en stays high so command 2 is presented next cycle
                   state    <= READ_DONE;
                end
             end
 
             // 2:1 read: each BL8 burst returns as TWO 64-bit app_rd_data beats.
-            // beat0/1 = burst1 = line[63:0]/[127:64]; beat2/3 = burst2 (discarded).
+            // Wide beat→dword map depends on burst order (line layout:
+            // dw0[255:192] dw1[191:128] dw2[127:64] dw3[63:0]):
+            //   lo-first: beat0=dw1, beat1=dw0, beat2=dw3, beat3=dw2
+            //   hi-first: beat0=dw3, beat1=dw2, beat2=dw1, beat3=dw0
+            // The requested dword is therefore always beat (r_dw_off[0] ? 0 : 1)
+            // and its companion (dw_off+1, even offsets) is always beat 0.
             READ_DONE: begin
                if (app_rdy & app_en) begin
                   app_en <= 0;                   // command 2 accepted
@@ -298,13 +337,28 @@ module ddr2_control (
 
                if (app_rd_data_valid) begin
                   if (r_wide) begin
-                     case (rd_cnt)
-                        2'd0: o_mem_read_data[191:128] <= app_rd_data;  // burst_lo beat0 = dw1
-                        2'd1: o_mem_read_data[255:192] <= app_rd_data;  // burst_lo beat1 = dw0
-                        2'd2: o_mem_read_data[63:0]    <= app_rd_data;  // burst_hi beat0 = dw3
-                        2'd3: begin o_mem_read_data[127:64] <= app_rd_data; o_mem_ready <= 1'b1; state <= IDLE; end // dw2
+                     case ({r_hi_first, rd_cnt})
+                        3'b0_00: o_mem_read_data[191:128] <= app_rd_data;  // burst_lo beat0 = dw1
+                        3'b0_01: o_mem_read_data[255:192] <= app_rd_data;  // burst_lo beat1 = dw0
+                        3'b0_10: o_mem_read_data[63:0]    <= app_rd_data;  // burst_hi beat0 = dw3
+                        3'b0_11: begin o_mem_read_data[127:64]  <= app_rd_data; o_mem_ready <= 1'b1; state <= IDLE; end // dw2
+                        3'b1_00: o_mem_read_data[63:0]    <= app_rd_data;  // burst_hi beat0 = dw3
+                        3'b1_01: o_mem_read_data[127:64]  <= app_rd_data;  // burst_hi beat1 = dw2
+                        3'b1_10: o_mem_read_data[191:128] <= app_rd_data;  // burst_lo beat0 = dw1
+                        3'b1_11: begin o_mem_read_data[255:192] <= app_rd_data; o_mem_ready <= 1'b1; state <= IDLE; end // dw0
                         default: ;
                      endcase
+                     // CWF early channel: capture the requested dword the beat
+                     // it arrives (beat 0 for odd offsets, beat 1 for even) and
+                     // pulse o_mem_dw_ready; the companion of an even-offset
+                     // request rides beat 0.
+                     if (rd_cnt == {1'b0, ~r_dw_off[0]}) begin
+                        o_mem_rd_dw    <= app_rd_data;
+                        o_mem_dw_ready <= 1'b1;
+                     end
+                     if (rd_cnt == 2'd0 && !r_dw_off[0]) begin
+                        o_mem_rd_dw_next <= app_rd_data;
+                     end
                   end else begin
                      if (rd_cnt == 2'd0) begin
                         o_mem_read_data[63:0]   <= app_rd_data;   // beat0 = line[63:0]

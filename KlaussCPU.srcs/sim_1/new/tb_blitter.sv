@@ -30,12 +30,24 @@ module ddr2_control (
     input i_mem_write_DV, input i_mem_read_DV,
     input [31:0] i_mem_addr,
     input i_mem_wide,
+    input [1:0] i_mem_dw_off,
     input [255:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
     output logic [255:0] o_mem_read_data, output logic o_mem_ready,
+    // M10a CWF early channel — inert in this stub (dw_ready never fires), so
+    // the cache exercises its fallback full-line path here; tb_cache/tb_soc
+    // carry the early-restart coverage.
+    output logic [63:0] o_mem_rd_dw,
+    output logic [63:0] o_mem_rd_dw_next,
+    output logic        o_mem_dw_next_ok,
+    output logic        o_mem_dw_ready,
     output o_calib_done,
     output o_ui_clk
 );
+   initial begin
+      o_mem_dw_ready   = 1'b0;
+      o_mem_dw_next_ok = 1'b0;
+   end
    assign o_calib_done = 1'b1;
    assign o_ui_clk = sys_clk_i;   // cache FSM runs on ui_clk; tb drives it from sys_clk_i
    logic [127:0] mem [0:65535];      // addr[19:4] indexes the 16 B word

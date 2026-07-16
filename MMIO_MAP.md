@@ -171,7 +171,7 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line. |
 | 0x0058  | `CNT_WRITE_MISSES`   | R  | 64    | Write accesses that missed and triggered a fetch-then-merge refill. |
 | 0x0060  | `CNT_WRITEBACKS`     | R  | 64    | Dirty-line evictions (the cache wrote a dirty line back to DDR before refilling its slot). Counts both write-miss and read-miss eviction paths. |
-| 0x0068  | `CNT_STALL_CYCLES`   | R  | 64    | `i_Clk` cycles the cache spent in the miss/refill chain (writeback, CDC gap, DDR fetch, install). Counts only beyond the single-cycle hit case, so this is the cycle cost of cache misses, not total memory-access latency. |
+| 0x0068  | `CNT_STALL_CYCLES`   | R  | 64    | `i_Clk` cycles the CPU was blocked on the cache miss/refill chain. M10a: counting stops at the critical-word-first early restart — the remaining line-install and shadow-writeback cycles overlap execution and are not counted. `STALL/(RD_MISS+WR_MISS)` is therefore the CPU-visible average miss penalty. |
 
 **Counters are 64-bit and free-running.** At `i_Clk = 100 MHz` even an event
 that fires every cycle takes ~5.8 × 10⁹ years to wrap, so software never has

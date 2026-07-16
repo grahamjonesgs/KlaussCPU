@@ -86,10 +86,18 @@ module ddr2_control (
     input i_mem_read_DV,
     input [31:0] i_mem_addr,
     input i_mem_wide,
+    input [1:0] i_mem_dw_off,
     input [255:0] i_mem_write_data,
     inout [15:0] i_app_wdf_mask,
     output logic [255:0] o_mem_read_data,
     output logic o_mem_ready,
+    // M10a CWF early channel — same contract as the real controller: on a wide
+    // read the requested dword pulses o_mem_dw_ready DW_LAT cycles before
+    // o_mem_ready; even offsets also carry the companion dword.
+    output logic [63:0] o_mem_rd_dw,
+    output logic [63:0] o_mem_rd_dw_next,
+    output logic        o_mem_dw_next_ok,
+    output logic        o_mem_dw_ready,
     output o_calib_done,
     output o_ui_clk
 );
@@ -131,9 +139,24 @@ module ddr2_control (
       else $display("TB_SOC: WARN DDR write outside model %08x", a);
    endtask
 
-   localparam LAT = 8;
+   function automatic logic [63:0] dw_of(input logic [255:0] l, input logic [1:0] off);
+      case (off)
+         2'b00:   dw_of = l[255:192];
+         2'b01:   dw_of = l[191:128];
+         2'b10:   dw_of = l[127:64];
+         default: dw_of = l[63:0];
+      endcase
+   endfunction
+
+   localparam LAT    = 8;
+   localparam DW_LAT = 4;   // CWF dword leads the full line by this many cycles
    logic [4:0] cnt = 0;
+   initial begin
+      o_mem_dw_ready   = 0;
+      o_mem_dw_next_ok = 0;
+   end
    always @(posedge sys_clk_i) begin
+      o_mem_dw_ready <= 1'b0;   // 1-cycle pulse
       if (i_mem_read_DV !== 1'b1 && i_mem_write_DV !== 1'b1) begin
          o_mem_ready <= 0;
          cnt <= 0;
@@ -143,7 +166,17 @@ module ddr2_control (
             else                        line_wr(i_mem_addr, i_mem_write_data, i_mem_wide);
             o_mem_ready <= 1;
             cnt <= 0;
-         end else cnt <= cnt + 1;
+         end else begin
+            // M10a CWF early channel (wide reads only): requested dword (and
+            // its beat-0 companion for even offsets) before the full line.
+            if (cnt == LAT - DW_LAT && i_mem_read_DV === 1'b1 && i_mem_wide) begin
+               o_mem_rd_dw      <= dw_of(line_rd(i_mem_addr), i_mem_dw_off);
+               o_mem_rd_dw_next <= dw_of(line_rd(i_mem_addr), i_mem_dw_off + 2'd1);
+               o_mem_dw_next_ok <= ~i_mem_dw_off[0];
+               o_mem_dw_ready   <= 1'b1;
+            end
+            cnt <= cnt + 1;
+         end
       end
    end
 endmodule

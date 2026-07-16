@@ -1,14 +1,25 @@
-// Testbench for mem_read_write after the CHECK-merge change (hits complete in
-// CHECK).  Drives the CPU-side interface exactly the way bus_splitter + the
-// CPU FSM do: ready/data come back through a 1-cycle register, and DV drops
-// one cycle after the registered ready — so DV is still high during the
-// cache's PRE_WAIT and COOL_DOWN states (the re-latch hazard COOL_DOWN
-// exists to absorb).  A behavioral ddr2_control model replaces the MIG.
+// tb_cache — unit bench for mem_read_write + the REAL ddr2_control (M10a).
 //
-// Checks: scoreboarded reads over directed + 4000 random ops confined to two
-// cache sets with four tags (forces clean and dirty evictions, writebacks,
-// refill merges), partial-byte writes, next-doubleword lookahead, and the
-// expected 2-cycle hit latency.
+// Unlike tb_soc/tb_blitter (which shadow ddr2_control with a one-shot-ready
+// behavioral model), this bench compiles the real controller on top of a
+// beat-level fake MIG UI (mig_7series_0 below): BL8 bursts return as two
+// back-to-back 64-bit beats after a fixed command latency, pipelined bursts
+// chain with a ~2-cycle gap. That gives true sim coverage of the M10a
+// critical-word-first machinery:
+//   * CWF command reorder (burst_hi first for dw2/dw3) + the r_hi_first
+//     beat->dword remap (checked by hit-reading whole lines after misses),
+//   * the early dword channel (o_mem_rd_dw/_next/_ok/dw_ready) and the
+//     cache's early-restart arms (checked via dut.r_miss_served),
+//   * fetch-first dirty misses with the victim writeback in the shadow
+//     (checked by eviction round-trips + a final flush + full DDR image
+//     compare against the scoreboard),
+//   * ready single-pulse discipline and the blitter-grant lockout across
+//     miss/shadow states (checked by always-on monitors).
+//
+// Drives the CPU side the way bus_splitter + the CPU FSM do: ready/data come
+// back through a 1-cycle register and DV drops one cycle after the registered
+// ready — so DV is still high during PRE_WAIT/COOL_DOWN (the re-latch hazard
+// those states absorb).
 `timescale 1ns/1ps
 
 // ---------------------------------------------------------------------------
@@ -21,77 +32,136 @@ module clk_wiz_0 (input i_Clk, output clk_200, output clk_50, output locked, inp
 endmodule
 
 // ---------------------------------------------------------------------------
-// Behavioral ddr2_control — 128-bit memory, fixed latency, ready held while
-// DV is high (matches the real handshake the cache's 2-FF sync expects).
+// Fake MIG 2:1 UI — beat-level model behind the REAL ddr2_control.
+//
+// Memory is 64-bit dwords keyed by app_addr>>2 (one BL8 burst = keys k, k+1;
+// beat0 = mem[k], beat1 = mem[k+1]). Reads return 2 back-to-back beats
+// RD_LAT cycles after command accept; a pipelined second burst's beats chain
+// ~2 cycles after the first burst's. Writes commit when a command and both
+// wdf beats have arrived (mask bit = 1 masks the byte, MIG semantics).
+//
+// The deterministic init pattern (init_dw, function of the KEY) must stay in
+// sync with tb_cache's copy — the TB scoreboard models this same image.
 // ---------------------------------------------------------------------------
-module ddr2_control (
-    inout [15:0] ddr2_dq,
-    inout [1:0] ddr2_dqs_n,
-    inout [1:0] ddr2_dqs_p,
+module mig_7series_0 (
+    inout  [15:0] ddr2_dq,
+    inout  [1:0]  ddr2_dqs_n,
+    inout  [1:0]  ddr2_dqs_p,
     output [12:0] ddr2_addr,
-    output [2:0] ddr2_ba,
-    output ddr2_ras_n,
-    output ddr2_cas_n,
-    output ddr2_we_n,
-    output [0:0] ddr2_ck_p,
-    output [0:0] ddr2_ck_n,
-    output [0:0] ddr2_cke,
-    output [0:0] ddr2_cs_n,
-    output [1:0] ddr2_dm,
-    output [0:0] ddr2_odt,
-    input resetn,
-    input sys_clk_i,
-    input i_mem_write_DV,
-    input i_mem_read_DV,
-    input [31:0] i_mem_addr,
-    input [127:0] i_mem_write_data,
-    inout [15:0] i_app_wdf_mask,
-    output logic [127:0] o_mem_read_data,
-    output logic o_mem_ready,
-    output o_calib_done
+    output [2:0]  ddr2_ba,
+    output        ddr2_ras_n,
+    output        ddr2_cas_n,
+    output        ddr2_we_n,
+    output [0:0]  ddr2_ck_p,
+    output [0:0]  ddr2_ck_n,
+    output [0:0]  ddr2_cke,
+    output [0:0]  ddr2_cs_n,
+    output [1:0]  ddr2_dm,
+    output [0:0]  ddr2_odt,
+    output        init_calib_complete,
+    input  [26:0] app_addr,
+    input  [2:0]  app_cmd,
+    input         app_en,
+    input  [63:0] app_wdf_data,
+    input         app_wdf_end,
+    input         app_wdf_wren,
+    output logic [63:0] app_rd_data,
+    output logic  app_rd_data_end,
+    output logic  app_rd_data_valid,
+    output        app_rdy,
+    output        app_wdf_rdy,
+    input         app_sr_req,
+    input         app_ref_req,
+    input         app_zq_req,
+    output        app_sr_active,
+    output        app_ref_ack,
+    output        app_zq_ack,
+    output        ui_clk,
+    output        ui_clk_sync_rst,
+    input  [7:0]  app_wdf_mask,
+    input         sys_clk_i,
+    input         sys_rst
 );
-   assign o_calib_done = 1'b1;
+   assign ddr2_addr = '0; assign ddr2_ba = '0;
+   assign ddr2_ras_n = 1; assign ddr2_cas_n = 1; assign ddr2_we_n = 1;
+   assign ddr2_ck_p = '0; assign ddr2_ck_n = '0; assign ddr2_cke = '0;
+   assign ddr2_cs_n = '0; assign ddr2_dm = '0; assign ddr2_odt = '0;
+   assign app_sr_active = 0; assign app_ref_ack = 0; assign app_zq_ack = 0;
 
-   // 64K lines = 1 MiB modeled; addr[19:4] indexes the line.
-   logic [127:0] mem [0:65535];
+   assign ui_clk = sys_clk_i;
+   // sys_rst is the POR resetn (active-low reset): low while POR counts.
+   logic [3:0] rstp = '1;
+   always @(posedge sys_clk_i) rstp <= {rstp[2:0], ~sys_rst};
+   assign ui_clk_sync_rst     = rstp[3] | ~sys_rst;
+   assign init_calib_complete = ~ui_clk_sync_rst;
+   assign app_rdy     = 1'b1;
+   assign app_wdf_rdy = 1'b1;
 
-   // init function shared with the TB scoreboard: dword at byte addr a
-   // (a[3]=0 -> upper half of line, a[3]=1 -> lower half)
-   function [63:0] init_dw;
-      input [31:0] a;
-      begin
-         init_dw = {16'hD00D, a[19:4], 16'hF00D, 13'b0, a[3], 2'b0};
-      end
+   // 8 MiB modeled: 1M 64-bit dwords, key = app_addr[21:2].
+   logic [63:0] mem [0:1048575];
+   function automatic logic [63:0] init_dw(input logic [19:0] k);
+      init_dw = {12'hD0D, k, 12'hF0F, ~k} ^ 64'h5A5A_5A5A_5A5A_5A5A;
    endfunction
-
-   integer i;
    initial begin
-      o_mem_ready = 0;
-      o_mem_read_data = 0;
-      for (i = 0; i < 65536; i = i + 1)
-         mem[i] = {init_dw({i[15:0], 4'b0000}), init_dw({i[15:0], 4'b1000})};
+      for (int i = 0; i < 1048576; i++) mem[i] = init_dw(20'(i));
    end
 
-   localparam LAT = 6;
-   logic [3:0] cnt = 0;
-   wire [15:0] idx = i_mem_addr[19:4];
+   localparam RD_LAT = 10;      // command accept -> burst beat0
+   int cyc = 0;
+   always @(posedge sys_clk_i) cyc <= cyc + 1;
+
+   // Command / write-data capture.
+   logic [26:0] rq_a [$];   int rq_t [$];
+   logic [26:0] wq_a [$];
+   logic [63:0] wq_d [$];   logic [7:0] wq_m [$];
 
    always @(posedge sys_clk_i) begin
-      if (i_mem_read_DV !== 1'b1 && i_mem_write_DV !== 1'b1) begin
-         o_mem_ready <= 0;
-         cnt <= 0;
-      end else if (!o_mem_ready) begin
-         if (cnt == LAT) begin
-            if (i_mem_read_DV === 1'b1)
-               o_mem_read_data <= mem[idx];
-            else
-               mem[idx] <= i_mem_write_data;   // cache always writes full lines (mask=0)
-            o_mem_ready <= 1;
-            cnt <= 0;
-         end else
-            cnt <= cnt + 1;
+      if (!ui_clk_sync_rst) begin
+         if (app_en && app_rdy && app_cmd == 3'b001) begin
+            rq_a.push_back(app_addr);  rq_t.push_back(cyc);
+         end
+         if (app_en && app_rdy && app_cmd == 3'b000)
+            wq_a.push_back(app_addr);
+         if (app_wdf_wren && app_wdf_rdy) begin
+            wq_d.push_back(app_wdf_data);  wq_m.push_back(app_wdf_mask);
+         end
+         // Commit a write burst once its command and both beats are in.
+         if (wq_a.size() > 0 && wq_d.size() >= 2) begin
+            automatic logic [26:0] wa;
+            automatic logic [63:0] d0, d1;
+            automatic logic [7:0]  m0, m1;
+            wa = wq_a.pop_front();
+            d0 = wq_d.pop_front();  m0 = wq_m.pop_front();
+            d1 = wq_d.pop_front();  m1 = wq_m.pop_front();
+            for (int b = 0; b < 8; b++) begin
+               if (!m0[b]) mem[20'(wa >> 2)    ][8*b +: 8] = d0[8*b +: 8];
+               if (!m1[b]) mem[20'(wa >> 2) + 1][8*b +: 8] = d1[8*b +: 8];
+            end
+         end
       end
-      // o_mem_ready stays high while DV is held (cache syncs it, then drops DV)
+   end
+
+   // Read return engine: 2 beats per burst; a queued second burst chains with
+   // a ~2-cycle gap (the pipelined dual-BL8 shape the real MIG shows).
+   initial begin
+      app_rd_data = '0; app_rd_data_valid = 0; app_rd_data_end = 0;
+      forever begin
+         @(posedge sys_clk_i);
+         if (!ui_clk_sync_rst && rq_a.size() > 0) begin
+            automatic logic [26:0] ra;
+            automatic int t0;
+            ra = rq_a[0];  t0 = rq_t[0];
+            while (cyc < t0 + RD_LAT) @(posedge sys_clk_i);
+            void'(rq_a.pop_front());  void'(rq_t.pop_front());
+            app_rd_data       <= mem[20'(ra >> 2)];
+            app_rd_data_valid <= 1;  app_rd_data_end <= 0;
+            @(posedge sys_clk_i);
+            app_rd_data       <= mem[20'(ra >> 2) + 1];
+            app_rd_data_end   <= 1;
+            @(posedge sys_clk_i);
+            app_rd_data_valid <= 0;  app_rd_data_end <= 0;
+         end
+      end
    end
 endmodule
 
@@ -103,138 +173,166 @@ module tb_cache;
    logic clk = 0;
    always #5 clk = ~clk;   // 100 MHz
 
-   logic         dv_w = 0, dv_r = 0;
-   logic  [31:0] addr;
-   logic  [63:0] wdata;
-   logic  [7:0]  be = 8'hFF;
-   wire [63:0] rdata, rdata_next;
-   wire        next_valid, ready;
-
-   mem_read_write dut (
-      .i_Clk(clk),
-      .ddr2_dq(), .ddr2_dqs_n(), .ddr2_dqs_p(),
-      .ddr2_addr(), .ddr2_ba(), .ddr2_ras_n(), .ddr2_cas_n(), .ddr2_we_n(),
-      .ddr2_ck_p(), .ddr2_ck_n(), .ddr2_cke(), .ddr2_cs_n(), .ddr2_dm(), .ddr2_odt(),
-      .i_mem_write_DV(dv_w),
-      .i_mem_read_DV(dv_r),
-      .i_mem_addr(addr),
-      .i_mem_write_data(wdata),
-      .i_mem_byte_en(be),
-      .o_mem_read_data(rdata),
-      .o_mem_read_data_next(rdata_next),
-      .o_mem_next_valid(next_valid),
-      .o_mem_ready(ready),
-      .i_stat_clear(1'b0),
-      .o_cache_info(), .o_cnt_read_hits(), .o_cnt_read_misses(),
-      .o_cnt_write_hits(), .o_cnt_write_misses(), .o_cnt_writebacks(),
-      .o_cnt_stall_cycles(),
-      .clk_50(), .o_calib_done(),
-      // DMA master port — driven by the arbiter test below; idle (req=0)
-      // during the cache regression so behaviour matches the pre-arbiter path.
-      .i_dma_req(dma_req), .i_dma_done(dma_done),
-      .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
-      .i_dma_addr(dma_addr), .i_dma_write_data(dma_wdata), .i_dma_wdf_mask(16'h0),
-      .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant),
-      // Cache-maintenance control (flush / invalidate).
-      .i_flush_go(flush_go), .i_inval_go(inval_go), .o_mnt_busy(mnt_busy)
-   );
+   membus_if mb();
 
    logic          dma_req = 0, dma_done = 0, dma_w = 0, dma_r = 0;
    logic  [31:0]  dma_addr = 0;
    logic  [127:0] dma_wdata = 0;
-   wire [127:0] dma_rdata;
-   wire         dma_ready, dma_grant;
+   wire  [127:0]  dma_rdata;
+   wire           dma_ready, dma_grant;
    logic          flush_go = 0, inval_go = 0;
-   wire         mnt_busy;
+   wire           mnt_busy;
+
+   mem_read_write dut (
+      .i_Clk_board(clk),
+      .ddr2_dq(), .ddr2_dqs_n(), .ddr2_dqs_p(),
+      .ddr2_addr(), .ddr2_ba(), .ddr2_ras_n(), .ddr2_cas_n(), .ddr2_we_n(),
+      .ddr2_ck_p(), .ddr2_ck_n(), .ddr2_cke(), .ddr2_cs_n(), .ddr2_dm(), .ddr2_odt(),
+      .cpu(mb),
+      .i_stat_clear(1'b0),
+      .o_cache_info(), .o_cnt_read_hits(), .o_cnt_read_misses(),
+      .o_cnt_write_hits(), .o_cnt_write_misses(), .o_cnt_writebacks(),
+      .o_cnt_stall_cycles(),
+      .clk_50(), .o_ui_clk(), .o_calib_done(),
+      .i_dma_req(dma_req), .i_dma_done(dma_done),
+      .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
+      .i_dma_addr(dma_addr), .i_dma_write_data(dma_wdata), .i_dma_wdf_mask(16'h0),
+      .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant),
+      .i_flush_go(flush_go), .i_inval_go(inval_go), .o_mnt_busy(mnt_busy)
+   );
 
    // splitter model: 1-cycle registered return path
    logic        ready_d = 0;
    logic [63:0] rdata_d, rdata_next_d;
    logic        next_valid_d;
    always @(posedge clk) begin
-      ready_d       <= ready;
-      rdata_d       <= rdata;
-      rdata_next_d  <= rdata_next;
-      next_valid_d  <= next_valid;
+      ready_d      <= mb.ready;
+      rdata_d      <= mb.read_data;
+      rdata_next_d <= mb.read_data_next;
+      next_valid_d <= mb.next_valid;
    end
 
-   // scoreboard: 64-bit dwords, addr[19:3] indexes
-   logic [63:0] sb [0:131071];
-   function [63:0] init_dw;
-      input [31:0] a;
-      begin
-         init_dw = {16'hD00D, a[19:4], 16'hF00D, 13'b0, a[3], 2'b0};
-      end
+   // -------------------------------------------------------------------------
+   // Scoreboard — models the DDR image as the fake MIG holds it, keyed by the
+   // MIG dword key. The cache's dword<->beat convention (board-verified):
+   // within each 16 B burst the CPU's two dwords land in SWAPPED beat order,
+   // so cpu byte addr a maps to key {a[22:5], a[4], ~a[3]}. The blitter's
+   // narrow port maps straight: 16 B-aligned a -> keys a[22:3], a[22:3]+1
+   // with d[63:0] in the first (this is the DMA-vs-cache half-swap contract).
+   // -------------------------------------------------------------------------
+   function automatic logic [19:0] k_cpu(input logic [31:0] a);
+      k_cpu = {a[22:5], a[4], ~a[3]};
    endfunction
-   integer i;
-   initial begin
-      for (i = 0; i < 131072; i = i + 1)
-         sb[i] = init_dw({i[16:0], 3'b000});
-   end
+   function automatic logic [63:0] init_dw(input logic [19:0] k);
+      init_dw = {12'hD0D, k, 12'hF0F, ~k} ^ 64'h5A5A_5A5A_5A5A_5A5A;
+   endfunction
+
+   logic [63:0] sb [logic [19:0]];       // sparse: only touched keys
+   function automatic logic [63:0] sb_rd_key(input logic [19:0] k);
+      sb_rd_key = sb.exists(k) ? sb[k] : init_dw(k);
+   endfunction
+   function automatic logic [63:0] sb_rd(input logic [31:0] a);
+      sb_rd = sb_rd_key(k_cpu(a));
+   endfunction
 
    integer errors = 0;
-   integer lat;
 
-   // CPU write: DV until registered ready, drop one cycle later (like the FSM)
-   task cpu_write;
-      input [31:0] a;
-      input [63:0] d;
-      input [7:0]  ben;
+   // -------------------------------------------------------------------------
+   // Always-on monitors
+   // -------------------------------------------------------------------------
+   // 1) cpu.ready is a 1-cycle pulse, exactly one per transaction (early
+   //    restart must never double-serve: no second pulse at install time).
+   logic ready_q = 0, dv_q = 0;
+   integer pulses_this_txn = 0;
+   always @(posedge clk) begin
+      if ((mb.write_DV || mb.read_DV) && !dv_q) pulses_this_txn = 0;
+      dv_q    <= (mb.write_DV || mb.read_DV);
+      if (mb.ready && ready_q) begin
+         errors++; $display("FAIL monitor: cpu.ready held >1 cycle (t=%0t)", $time);
+      end
+      if (mb.ready && !ready_q) begin
+         pulses_this_txn = pulses_this_txn + 1;
+         if (pulses_this_txn > 1) begin
+            errors++; $display("FAIL monitor: multiple ready pulses in one transaction (t=%0t)", $time);
+         end
+      end
+      ready_q <= mb.ready;
+   end
+
+   // 2) The blitter grant must never RISE while the cache is in a miss or
+   //    shadow-writeback state (or during a maintenance walk) — the victim
+   //    line's DDR copy is stale until the shadow write completes.
+   logic grant_q = 0, imp_q = 0, mnt_q = 0;
+   always @(posedge clk) begin
+      if (dma_grant && !grant_q && (imp_q || mnt_q)) begin
+         errors++; $display("FAIL monitor: DMA grant rose during miss/shadow/maintenance (t=%0t)", $time);
+      end
+      grant_q <= dma_grant;
+      imp_q   <= dut.is_miss_path;
+      mnt_q   <= dut.r_mnt_active;
+   end
+
+   // -------------------------------------------------------------------------
+   // CPU-side drivers (bus_splitter-faithful timing)
+   // -------------------------------------------------------------------------
+   task cpu_write(input [31:0] a, input [63:0] d, input [7:0] ben);
       integer k;
+      logic [63:0] cur;
       begin
          @(negedge clk);
-         addr = a; wdata = d; be = ben; dv_w = 1;
+         mb.addr = a; mb.write_data = d; mb.byte_en = ben; mb.write_DV = 1;
          @(negedge clk);
          while (!ready_d) @(negedge clk);
-         dv_w = 0; be = 8'hFF;
-         // scoreboard merge
+         mb.write_DV = 0; mb.byte_en = 8'hFF;
+         cur = sb_rd(a);
          for (k = 0; k < 8; k = k + 1)
-            if (ben[k]) sb[a[19:3]][8*k +: 8] = d[8*k +: 8];
+            if (ben[k]) cur[8*k +: 8] = d[8*k +: 8];
+         sb[k_cpu(a)] = cur;
       end
    endtask
 
-   // CPU read; returns latency in cycles from DV-high to cache ready.
-   // Polls at negedge so registered outputs are settled; captures data and
-   // the 1-cycle next-dw pulse atomically with ready.
+   // Read; returns data + latency (cycles from DV-high to registered ready).
+   // Captures the next-dw lookahead pulse atomically with ready and applies
+   // the universal invariant: next_valid=1 implies read_data_next matches the
+   // scoreboard's companion dword (and the offset cannot be dw3).
    logic        cap_nv;
    logic [63:0] cap_next;
-   task cpu_read;
-      input [31:0] a;
-      output [63:0] d;
-      output integer latency;
+   task cpu_read(input [31:0] a, output [63:0] d, output integer latency);
       begin
          @(negedge clk);
-         addr = a; dv_r = 1; latency = 0;
+         mb.addr = a; mb.read_DV = 1; latency = 0;
          @(negedge clk);
          while (!ready_d) begin latency = latency + 1; @(negedge clk); end
          d        = rdata_d;
          cap_nv   = next_valid_d;
          cap_next = rdata_next_d;
-         dv_r = 0;
-      end
-   endtask
-
-   task check_read;
-      input [31:0] a;
-      logic [63:0] d;
-      integer l;
-      begin
-         cpu_read(a, d, l);
-         if (d !== sb[a[19:3]]) begin
-            errors = errors + 1;
-            $display("FAIL read  %h: got %h want %h (t=%0t)", a, d, sb[a[19:3]], $time);
+         mb.read_DV = 0;
+         if (cap_nv) begin
+            if (a[4:3] == 2'b11) begin
+               errors++; $display("FAIL: next_valid at dw3 %h (t=%0t)", a, $time);
+            end else if (cap_next !== sb_rd(a + 8)) begin
+               errors++; $display("FAIL next-dw %h: got %h want %h (t=%0t)",
+                                  a, cap_next, sb_rd(a + 8), $time);
+            end
          end
       end
    endtask
 
-   // -------- DMA master (blitter) protocol drivers --------
-   // Mirror the contract documented on the mem_read_write DMA port: request the
-   // bus, wait for grant, run one transaction, hold address through a CDC settle
-   // after a write, then pulse done to release.
-   task dma_write;
-      input [31:0]  a;
-      input [127:0] d;
-      integer g;
+   task check_read(input [31:0] a);
+      logic [63:0] d;
+      integer l;
+      begin
+         cpu_read(a, d, l);
+         if (d !== sb_rd(a)) begin
+            errors++; $display("FAIL read  %h: got %h want %h (t=%0t)", a, d, sb_rd(a), $time);
+         end
+      end
+   endtask
+
+   // -------------------------------------------------------------------------
+   // DMA (blitter) drivers — same contract as the DMA port comment in the DUT.
+   // -------------------------------------------------------------------------
+   task dma_write(input [31:0] a, input [127:0] d);
       begin
          @(negedge clk); dma_req = 1;
          while (!dma_grant) @(negedge clk);
@@ -242,15 +340,15 @@ module tb_cache;
          @(negedge clk);
          while (!dma_ready) @(negedge clk);
          dma_w = 0;
-         repeat (8) @(negedge clk);     // hold addr through CDC settle (mask spurious re-accept)
+         repeat (8) @(negedge clk);     // hold addr through the settle gap
          dma_done = 1; @(negedge clk); dma_done = 0;
          dma_req = 0;
+         sb[{a[22:3]}]        = d[63:0];
+         sb[{a[22:3]} + 20'd1] = d[127:64];
       end
    endtask
 
-   task dma_read;
-      input  [31:0]  a;
-      output [127:0] d;
+   task dma_read(input [31:0] a, output [127:0] d);
       begin
          @(negedge clk); dma_req = 1;
          while (!dma_grant) @(negedge clk);
@@ -265,11 +363,13 @@ module tb_cache;
       end
    endtask
 
-   // -------- cache-maintenance drivers + DDR back-door (coherency tests) --------
+   // -------------------------------------------------------------------------
+   // Maintenance drivers + DDR back-door (into the fake MIG image)
+   // -------------------------------------------------------------------------
    task do_flush;
       begin
          @(negedge clk); flush_go = 1; @(negedge clk); flush_go = 0;
-         @(negedge clk);                 // let r_mnt_pending latch
+         @(negedge clk);
          while (mnt_busy) @(negedge clk);
          repeat (4) @(negedge clk);
       end
@@ -282,162 +382,224 @@ module tb_cache;
          repeat (4) @(negedge clk);
       end
    endtask
-   // Read/write the behavioral DDR directly (models DMA touching main memory).
-   function [63:0] ddr_dword(input [31:0] a);
-      logic [127:0] line;
-      begin
-         line = dut.ddr2_control.mem[a[19:4]];
-         ddr_dword = a[3] ? line[63:0] : line[127:64];
-      end
+   function automatic logic [63:0] ddr_dword(input logic [31:0] a);
+      ddr_dword = dut.ddr2_control.mig_7series_0.mem[k_cpu(a)];
    endfunction
-   task poke_ddr_dword(input [31:0] a, input [63:0] v);
+   task poke_ddr_dword(input logic [31:0] a, input logic [63:0] v);
       begin
-         if (a[3]) dut.ddr2_control.mem[a[19:4]][63:0]   = v;
-         else      dut.ddr2_control.mem[a[19:4]][127:64] = v;
+         dut.ddr2_control.mig_7series_0.mem[k_cpu(a)] = v;
+         sb[k_cpu(a)] = v;
       end
    endtask
 
-   logic [63:0] d;
-   logic [31:0] a, ra;
+   // Directed helper: read that MUST be a miss served by the early-restart
+   // path — checks data, the early flag, and miss next_valid semantics
+   // (companion present exactly on even dword offsets).
+   task check_miss_early(input [31:0] a);
+      logic [63:0] d;
+      integer l;
+      begin
+         cpu_read(a, d, l);
+         if (d !== sb_rd(a)) begin
+            errors++; $display("FAIL miss read %h: got %h want %h", a, d, sb_rd(a));
+         end
+         if (dut.r_miss_served !== 1'b1) begin
+            errors++; $display("FAIL: early restart did not fire on miss %h (fallback path used)", a);
+         end
+         if (cap_nv !== ~a[3]) begin
+            errors++; $display("FAIL miss nv %h: got %b want %b (CWF companion rule)", a, cap_nv, ~a[3]);
+         end
+         $display("  miss @off%0d: lat=%0d nv=%b", a[4:3], l, cap_nv);
+      end
+   endtask
+
+   // -------------------------------------------------------------------------
+   // Stimulus
+   // -------------------------------------------------------------------------
+   logic [63:0]  d;
+   logic [31:0]  a;
    logic [127:0] dline;
-   integer l, n, sel;
+   integer l, n, sel, lat;
+   logic [19:0] key;
 
    initial begin
-      be = 8'hFF;
-      // let POR counter (32 cycles) drain
+      mb.write_DV = 0; mb.read_DV = 0; mb.addr = '0;
+      mb.write_data = '0; mb.byte_en = 8'hFF;
+      // POR (32 board cycles) + fake-MIG reset pipe
       repeat (60) @(posedge clk);
 
-      // --- directed: write-miss merge, read-hit, companion dw ---
-      cpu_write(32'h0000_0100, 64'hAABB_CCDD_EE11_2233, 8'hFF);
-      check_read(32'h0000_0100);          // miss-installed line, now read hit
-      check_read(32'h0000_0108);          // companion dw, untouched DDR pattern
-
-      // next-dw lookahead: offset 0 read must present companion as "next"
-      cpu_read(32'h0000_0100, d, l);
-      if (!cap_nv || cap_next !== sb[32'h108 >> 3]) begin
-         errors = errors + 1;
-         $display("FAIL next-dw lookahead: nv=%b next=%h want %h", cap_nv, cap_next, sb[32'h108 >> 3]);
+      // ===== Phase A: CWF early restart on clean read misses, all offsets ===
+      // Distinct line per offset; after each miss, hit-read the WHOLE line —
+      // for off 2/3 the commands were issued hi-first, so this validates the
+      // r_hi_first beat->dword remap end to end.
+      $display("Phase A: CWF clean read misses");
+      for (n = 0; n < 4; n = n + 1) begin
+         a = 32'h0010_0000 + n[1:0] * 32'h20;
+         check_miss_early(a + n[1:0] * 8);
+         check_read(a + 0);  check_read(a + 8);
+         check_read(a + 16); check_read(a + 24);
+         // hit next-dw semantics: nv = (off != 3)
+         cpu_read(a + 8, d, l);
+         if (!cap_nv) begin errors++; $display("FAIL hit nv at off1 should be 1"); end
+         cpu_read(a + 24, d, l);
+         if (cap_nv)  begin errors++; $display("FAIL hit nv at off3 should be 0"); end
       end
-      // offset 1 read: next must be invalid
-      cpu_read(32'h0000_0108, d, l);
-      if (cap_nv) begin
-         errors = errors + 1;
-         $display("FAIL next-dw: nv should be 0 at offset 1");
+
+      // read-hit latency reference
+      cpu_read(32'h0010_0000, d, lat);
+      $display("read-hit latency (DV -> splitter ready): %0d cycles", lat);
+
+      // ===== Phase B: write-miss early ack + merge correctness ==============
+      $display("Phase B: write misses (early ack + merge)");
+      cpu_write(32'h0011_0000, 64'hAABB_CCDD_EE11_2233, 8'hFF);
+      if (dut.r_miss_served !== 1'b1) begin
+         errors++; $display("FAIL: early ack did not fire on write miss");
       end
+      check_read(32'h0011_0000);
+      check_read(32'h0011_0008);   // neighbours must carry the DDR pattern
+      check_read(32'h0011_0010);
+      check_read(32'h0011_0018);
+      // partial-byte write MISS at an odd offset (merge on the install path)
+      cpu_write(32'h0012_0008, 64'h5555_5555_5555_5555, 8'h3C);
+      check_read(32'h0012_0008);
+      check_read(32'h0012_0000);
+      // partial-byte write hits
+      cpu_write(32'h0011_0000, 64'h9999_9999_9999_9999, 8'h0F);
+      check_read(32'h0011_0000);
+      cpu_write(32'h0011_0008, 64'h7777_7777_7777_7777, 8'hC3);
+      check_read(32'h0011_0008);
 
-      // read-hit latency: WAIT + CHECK = ready 2 edges after DV sampled
-      cpu_read(32'h0000_0100, d, lat);
-      $display("read-hit latency (DV->splitter ready): %0d cycles", lat);
-
-      // --- partial-byte write hit ---
-      cpu_write(32'h0000_0100, 64'h5555_5555_5555_5555, 8'h0F);  // low 4 bytes only
-      check_read(32'h0000_0100);
-      cpu_write(32'h0000_0108, 64'h9999_9999_9999_9999, 8'hC3);  // scattered lanes
-      check_read(32'h0000_0108);
-
-      // --- conflict / eviction round trip (same set, 4 tags) ---
-      // index = addr[14:4]; keep index=0x10, vary addr[31:15]
+      // ===== Phase C: dirty evictions — shadow writeback round trips ========
+      // 4 tags in one set (index = addr[14:5]): each write evicts a dirty
+      // line whose writeback now runs in the shadow AFTER the refill; the
+      // read-backs prove the victims reached DDR intact.
+      $display("Phase C: dirty eviction round trips (shadow writeback)");
       cpu_write(32'h0000_0100, 64'h1111_0000_0000_0001, 8'hFF);
-      cpu_write(32'h0000_8100, 64'h2222_0000_0000_0002, 8'hFF);  // fills other way
-      cpu_write(32'h0001_0100, 64'h3333_0000_0000_0003, 8'hFF);  // evicts a dirty line
-      cpu_write(32'h0001_8100, 64'h4444_0000_0000_0004, 8'hFF);  // evicts the other
-      check_read(32'h0000_0100);   // must come back from DDR writeback
+      cpu_write(32'h0000_8100, 64'h2222_0000_0000_0002, 8'hFF);
+      cpu_write(32'h0001_0100, 64'h3333_0000_0000_0003, 8'hFF);
+      cpu_write(32'h0001_8100, 64'h4444_0000_0000_0004, 8'hFF);
+      check_read(32'h0000_0100);
       check_read(32'h0000_8100);
       check_read(32'h0001_0100);
       check_read(32'h0001_8100);
 
-      // --- randomized stress, two sets x four tags, random byte enables ---
+      // ===== Phase D: randomized stress, 2 sets x 4 tags x 4 dwords =========
+      $display("Phase D: 4000 random ops");
       for (n = 0; n < 4000; n = n + 1) begin
-         a = {12'b0, 2'b0, $random & 2'h3, 11'h010 + ($random & 1'b1), 4'b0};
-         a = a | (($random & 1) << 3);    // random dw within line
-         sel = $random & 3;
+         a = {15'b0, 2'($urandom), 10'h010, 5'b0}
+             | (32'($urandom & 1) << 5)          // 2 sets (index 0x10/0x11)
+             | (32'($urandom & 3) << 3);         // random dword in line
+         sel = $urandom & 3;
          if (sel == 0)
             check_read(a);
          else
-            cpu_write(a, {$random, $random}, ($random & 8'hFF) | 8'h01);
+            cpu_write(a, {$urandom, $urandom}, (8'($urandom) | 8'h01));
       end
-      // final sweep over the stressed region
-      for (n = 0; n < 16; n = n + 1) begin
-         a = {15'b0, n[3:2], 11'h010 + n[1], 4'b0} | (n[0] ? 32'h8 : 32'h0);
+      for (n = 0; n < 32; n = n + 1) begin
+         a = {15'b0, n[4:3], 10'h010, 5'b0} | (32'(n[2]) << 5) | (32'(n[1:0]) << 3);
          check_read(a);
       end
 
-      // ============================================================
-      // DMA arbiter test (Phase 1): the blitter port shares ddr2_control.
-      // ============================================================
-      // 1) DMA-write a full line to a fresh address (untouched by cache above).
-      dma_write(32'h0002_0000, {64'hCAFEBABE_DEADBEEF, 64'h0123_4567_89AB_CDEF});
+      // ===== Phase E: concurrent CPU + DMA traffic ==========================
+      // Blitter round-trips on a disjoint region while the CPU thrashes its
+      // two sets — exercises grant handoffs against miss/shadow states (the
+      // grant-rise monitor is armed the whole time).
+      $display("Phase E: concurrent CPU + DMA");
+      fork
+         begin
+            for (int m = 0; m < 300; m++) begin
+               automatic logic [31:0] ca;
+               ca = {15'b0, 2'($urandom), 10'h010, 5'b0}
+                    | (32'($urandom & 1) << 5) | (32'($urandom & 3) << 3);
+               if (($urandom & 3) == 0) check_read(ca);
+               else cpu_write(ca, {$urandom, $urandom}, (8'($urandom) | 8'h01));
+            end
+         end
+         begin
+            for (int m = 0; m < 20; m++) begin
+               automatic logic [31:0]  da;
+               automatic logic [127:0] dv, dr;
+               da = 32'h0040_0000 + 32'(m) * 16;
+               dv = {$urandom, $urandom, $urandom, $urandom};
+               dma_write(da, dv);
+               dma_read(da, dr);
+               if (dr !== dv) begin
+                  errors++; $display("FAIL dma round-trip %h: got %h want %h", da, dr, dv);
+               end
+            end
+         end
+      join
 
-      // 2) DMA-read it back — must round-trip through ddr2_control.
-      dma_read(32'h0002_0000, dline);
+      // ===== Phase F: DMA <-> cache coherency (directed, from the old TB) ===
+      $display("Phase F: DMA arbiter directed");
+      dma_write(32'h0042_0000, {64'hCAFEBABE_DEADBEEF, 64'h0123_4567_89AB_CDEF});
+      dma_read(32'h0042_0000, dline);
       if (dline !== {64'hCAFEBABE_DEADBEEF, 64'h0123_4567_89AB_CDEF}) begin
-         errors = errors + 1;
-         $display("FAIL dma read-back: got %h", dline);
+         errors++; $display("FAIL dma read-back: got %h", dline);
       end
+      // CPU (uncached line) must see the DMA data through a normal miss.
+      check_read(32'h0042_0000);
+      check_read(32'h0042_0008);
+      check_read(32'h0000_0100);   // and the cache still behaves afterwards
 
-      // 3) The CPU (cache, master A) must see the DMA-written data in main
-      //    memory: a CPU read of this (uncached) line misses and fetches it.
-      cpu_read(32'h0002_0000, d, l);
-      if (d !== 64'hCAFEBABE_DEADBEEF) begin
-         errors = errors + 1;
-         $display("FAIL cpu sees dma data (hi dw): got %h", d);
-      end
-      cpu_read(32'h0002_0008, d, l);
-      if (d !== 64'h0123_4567_89AB_CDEF) begin
-         errors = errors + 1;
-         $display("FAIL cpu sees dma data (lo dw): got %h", d);
-      end
-
-      // 4) Bus returns to the cache cleanly: a normal cached access still works.
-      check_read(32'h0000_0100);
-
-      // ============================================================
-      // Cache maintenance (Phase 4): flush / invalidate coherency.
-      // ============================================================
-      // --- FLUSH: a dirty line is written back to DDR, valid kept ---
-      cpu_write(32'h0004_0000, 64'hF1F1_0000_AAAA_5555, 8'hFF);  // dirty in cache
+      // ===== Phase G: maintenance flush / invalidate ========================
+      $display("Phase G: maintenance");
+      cpu_write(32'h0004_0000, 64'hF1F1_0000_AAAA_5555, 8'hFF);
       if (ddr_dword(32'h0004_0000) === 64'hF1F1_0000_AAAA_5555) begin
-         errors = errors + 1; $display("FAIL: dirty data reached DDR before flush");
+         errors++; $display("FAIL: dirty data reached DDR before flush");
       end
       do_flush;
       if (ddr_dword(32'h0004_0000) !== 64'hF1F1_0000_AAAA_5555) begin
-         errors = errors + 1;
-         $display("FAIL flush: DDR=%h want F1F10000AAAA5555", ddr_dword(32'h0004_0000));
+         errors++; $display("FAIL flush: DDR=%h want F1F10000AAAA5555", ddr_dword(32'h0004_0000));
       end else $display("PASS flush-wrote-back-dirty");
-      check_read(32'h0004_0000);   // still a hit after flush (valid kept) → V
+      check_read(32'h0004_0000);   // valid kept -> still a hit
 
-      // --- INVALIDATE sees fresh main-memory data on a CLEAN line ---
       cpu_read(32'h0005_0000, d, l);                 // cache a clean line
-      poke_ddr_dword(32'h0005_0000, 64'h1234_5678_9ABC_DEF0);  // "DMA" writes DDR
-      cpu_read(32'h0005_0000, d, l);                 // still stale (cache hit)
+      poke_ddr_dword(32'h0005_0000, 64'h1234_5678_9ABC_DEF0);
+      cpu_read(32'h0005_0000, d, l);                 // stale hit expected
       if (d === 64'h1234_5678_9ABC_DEF0) begin
-         errors = errors + 1; $display("FAIL: cache unexpectedly saw DDR without inval");
+         errors++; $display("FAIL: cache saw DDR without inval");
       end
       do_inval;
-      cpu_read(32'h0005_0000, d, l);                 // miss → refill → fresh
+      cpu_read(32'h0005_0000, d, l);
       if (d !== 64'h1234_5678_9ABC_DEF0) begin
-         errors = errors + 1; $display("FAIL inval: got %h want 123456789ABCDEF0", d);
+         errors++; $display("FAIL inval: got %h want 123456789ABCDEF0", d);
       end else $display("PASS inval-sees-fresh");
 
-      // --- INVALIDATE on a DIRTY line: write back THEN drop (no data loss) ---
-      cpu_write(32'h0006_0000, 64'hDEAD_BEEF_CAFE_F00D, 8'hFF); // dirty
-      do_inval;                                                  // flush + invalidate
+      cpu_write(32'h0006_0000, 64'hDEAD_BEEF_CAFE_F00D, 8'hFF);
+      do_inval;
       if (ddr_dword(32'h0006_0000) !== 64'hDEAD_BEEF_CAFE_F00D) begin
-         errors = errors + 1; $display("FAIL inval-dirty: DDR=%h", ddr_dword(32'h0006_0000));
+         errors++; $display("FAIL inval-dirty: DDR=%h", ddr_dword(32'h0006_0000));
       end
-      cpu_read(32'h0006_0000, d, l);                            // refill → original
+      cpu_read(32'h0006_0000, d, l);
       if (d !== 64'hDEAD_BEEF_CAFE_F00D) begin
-         errors = errors + 1; $display("FAIL inval-dirty readback: got %h", d);
+         errors++; $display("FAIL inval-dirty readback: got %h", d);
       end else $display("PASS inval-dirty-preserved");
 
-      if (errors == 0) $display("PASS: all cache + DMA-arbiter + maintenance checks passed");
-      else             $display("FAILED: %0d errors", errors);
+      // ===== Phase H: final image equality ==================================
+      // Flush everything, then the fake DDR must equal the scoreboard on every
+      // key ever touched — a lost or mis-addressed shadow writeback anywhere
+      // in the run fails here.
+      $display("Phase H: final flush + full DDR image compare");
+      do_flush;
+      if (sb.first(key)) begin
+         do begin
+            if (dut.ddr2_control.mig_7series_0.mem[key] !== sb[key]) begin
+               errors++;
+               $display("FAIL image key %h: DDR=%h sb=%h", key,
+                        dut.ddr2_control.mig_7series_0.mem[key], sb[key]);
+            end
+         end while (sb.next(key));
+      end
+
+      if (errors == 0) $display("TB_CACHE PASS: all CWF/early-restart/shadow/DMA/maintenance checks passed");
+      else             $display("TB_CACHE FAILED: %0d errors", errors);
       $finish;
    end
 
    initial begin
-      #4_000_000;
-      $display("TIMEOUT — cache hung (likely handshake regression)");
+      #40_000_000;
+      $display("TB_CACHE TIMEOUT — cache hung (handshake regression)");
       $finish;
    end
 endmodule
