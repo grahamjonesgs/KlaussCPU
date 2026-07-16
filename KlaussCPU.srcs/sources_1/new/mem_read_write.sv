@@ -325,9 +325,24 @@ module mem_read_write (
     logic         r_do_evict    = 1'b0;
 
     // -------------------------------------------------------------------------
+    // M10b served-DV guard — replaces the PRE_WAIT/COOL_DOWN dead states.
+    // After a ready pulse the CPU's DV stays high for ~2 more cycles (registered
+    // splitter + consume edge); WAIT must not re-latch that same request. The
+    // guard: r_dv_served is set at every ready-pulse edge (inline in the FSM,
+    // so it is visible on the very first WAIT cycle after a completion) and
+    // cleared the moment DV reads low — in ANY state, because the drop can
+    // happen while a miss/shadow is still in flight. The ld32 spanning-load
+    // path HOLDS DV and re-addresses atomically at its consume edge, so the
+    // guard also releases on an address change (r_served_addr mismatch).
+    // -------------------------------------------------------------------------
+    logic        r_dv_served   = 1'b0;
+    logic [31:0] r_served_addr = 32'b0;
+    wire w_dv_new = (cpu.write_DV || cpu.read_DV) &&
+                    !(r_dv_served && (cpu.addr == r_served_addr));
+
+    // -------------------------------------------------------------------------
     // State machine — one-hot 16-bit
     // -------------------------------------------------------------------------
-    localparam PRE_WAIT              = 16'd1;
     localparam WAIT                  = 16'd2;     // idle: wait for DV, issue BRAM reads
     localparam CHECK                 = 16'd4;     // check registered BRAM results; hits complete here
     // 16'd8 (WRITE_HIT) and 16'd256 (READ_CACHE2) retired — both hit paths
@@ -336,21 +351,20 @@ module mem_read_write (
     // (READ_EVICT/_DONE/_GAP) retired — dirty misses now fetch FIRST (the CPU
     // restarts on the CWF dword) and write the victim back afterwards in the
     // shadow (EVICT_SHADOW_*, reusing the 16'd16/32 encodings).
+    // M10b: 16'd1 (PRE_WAIT) and 16'd8192 (COOL_DOWN) retired — every
+    // completion returns straight to WAIT; the served-DV guard (r_dv_served /
+    // r_served_addr, declared above) absorbs the CPU's late DV drop that
+    // those two dead states existed to cover.
     localparam EVICT_SHADOW_GAP      = 16'd16;    // DV-low settle before the shadow writeback
     localparam EVICT_SHADOW_WAIT     = 16'd32;    // wait for the shadow writeback to complete
     localparam WRITE_FETCH           = 16'd128;   // wait for fetch, merge, store (write-back: line installed dirty)
     localparam READ_WAIT             = 16'd4096;  // wait for DDR fetch
-    localparam COOL_DOWN             = 16'd8192;  // dead cycle after PRE_WAIT — covers the
-                                                  // 1-cycle return delay added by bus_splitter's
-                                                  // registered output stage. Without it, WAIT
-                                                  // would re-enter while CPU's DV is still high
-                                                  // (CPU sees splitter.ready 1 cycle after cache
-                                                  // asserts it, and only drops DV at the next edge),
-                                                  // causing a spurious re-latch of the same request.
-                                                  // The phantom ready pulses produced by those
-                                                  // re-latches were observed to drive opcode
-                                                  // fetches off stale cpu.read_data — see
-                                                  // CRASH_DUMP.md ERR=01 trace at PC=0x78.
+    // (History: the retired COOL_DOWN covered the 1-cycle return delay of
+    // bus_splitter's registered output stage — WAIT re-entering while the
+    // CPU's DV was still high re-latched the same request, and the phantom
+    // ready pulses drove opcode fetches off stale cpu.read_data — see
+    // CRASH_DUMP.md ERR=01 trace at PC=0x78. The served-DV guard covers this
+    // by construction: same-address DV cannot re-latch until it drops.)
     localparam MAINT                 = 16'd16384; // cache flush/invalidate walk (sub-FSM below)
 
     logic [15:0] state = WAIT;
@@ -458,46 +472,30 @@ module mem_read_write (
 
         logic [255:0] merged; // procedural variable for cache line merge
 
+        // Served-DV guard clear — runs in every state (see the declaration
+        // comment). The case arms' set-assignments below override when a ready
+        // pulses this edge (DV is always high at a ready-set edge).
+        if (!(cpu.write_DV || cpu.read_DV))
+            r_dv_served <= 1'b0;
+
         case (state)
 
             // ------------------------------------------------------------------
-            // PRE_WAIT runs the cycle after a transaction completes (each
-            // completion path sets cpu.ready=1 and state<=PRE_WAIT).  The
-            // ready pulse must be visible to the CPU for exactly one cycle:
-            // longer than that and a CPU FSM that issues a back-to-back
-            // request (e.g. OPCODE_REQUEST → OPCODE_FETCH on the timer-
-            // interrupt push→fetch path) will see the *previous* transaction's
-            // stale ready in its new state and latch garbage from
-            // cpu.read_data.  Clearing ready here — not in WAIT — gives a
-            // clean low edge before the next request can be picked up.
+            // WAIT: idle state. When the CPU asserts a NEW DV (served-DV guard:
+            // a same-address DV that was already given its ready pulse is the
+            // tail of the previous transaction, not a request), issue all BRAM
+            // reads for tags, dirty bits, LRU, and both data ways
+            // simultaneously. All results are available next cycle in CHECK.
             //
-            // COOL_DOWN is inserted after PRE_WAIT so that WAIT re-entry is
-            // delayed one extra cycle.  Required because bus_splitter now
-            // registers cpu.ready: the CPU sees ready one cycle after this
-            // module asserts it, and so it drops r_mem_*_DV one cycle later
-            // than the legacy combinational-splitter path expected.  Without
-            // the dead cycle, WAIT runs while the CPU's DV is still high and
-            // re-latches the same request — see CRASH_DUMP.md notes.
-            PRE_WAIT: begin
-                cpu.ready      <= 0;
-                cpu.next_valid <= 0;
-                state            <= COOL_DOWN;
-            end
-
-            // ------------------------------------------------------------------
-            // COOL_DOWN: one-cycle dead state.  Does NOT inspect i_mem_*_DV, so
-            // any lingering CPU DV (still high while the CPU finishes observing
-            // the registered ready pulse from the splitter) is harmlessly
-            // ignored.  Always advances to WAIT.
-            // ------------------------------------------------------------------
-            COOL_DOWN: begin
-                state <= WAIT;
-            end
-
-            // ------------------------------------------------------------------
-            // WAIT: idle state. When the CPU asserts a DV, issue all BRAM reads
-            // for tags, dirty bits, LRU, and both data ways simultaneously.
-            // All results are available next cycle in CHECK.
+            // M10b write-ack-at-latch: a WRITE is acknowledged HERE, at the
+            // latch edge — one cycle before CHECK even knows hit/miss. The
+            // store is architecturally committed the moment it is latched
+            // (this FSM guarantees completion, subsequent accesses are ordered
+            // behind it in WAIT, MMIO never routes through the cache, and the
+            // I-cache store snoop runs at ISSUE time in pipeline_core). A
+            // write MISS therefore starts with r_miss_served already set: the
+            // CWF early-ack and install-time fallback in WRITE_FETCH are
+            // pre-suppressed and the whole miss runs in the shadow.
             // ------------------------------------------------------------------
             WAIT: begin
                 cpu.ready      <= 0;
@@ -510,7 +508,7 @@ module mem_read_write (
                     r_cache_index <= {INDEX_BITS{1'b0}};
                     r_mnt_sub     <= MS_READ;
                     state         <= MAINT;
-                end else if (cpu.write_DV || cpu.read_DV) begin
+                end else if (w_dv_new) begin
                     // Issue all BRAM reads in parallel (single read port: w_rd_index).
                     r_tag_way0          <= cache_val_addr_way0[w_rd_index];
                     r_tag_way1          <= cache_val_addr_way1[w_rd_index];
@@ -527,7 +525,12 @@ module mem_read_write (
                     r_write_data        <= cpu.write_data;
                     r_is_write          <= cpu.write_DV;
                     r_computed_ddr_addr <= w_computed_ddr_addr;
-                    r_miss_served       <= 1'b0;   // M10a: new transaction, early restart not yet issued
+                    r_miss_served       <= cpu.write_DV;  // writes: served right here
+                    if (cpu.write_DV) begin
+                        cpu.ready     <= 1;               // write-ack at latch
+                        r_dv_served   <= 1;
+                        r_served_addr <= cpu.addr;
+                    end
                     state               <= CHECK;
                 end
             end
@@ -544,6 +547,7 @@ module mem_read_write (
             // cycle on every cache hit. Miss paths are unchanged.
             // ------------------------------------------------------------------
             CHECK: begin
+                cpu.ready <= 0;   // clears the 1-cycle write-ack pulse from WAIT
                 if (r_is_write) begin
 
                     if (r_cache_hit) begin
@@ -589,8 +593,8 @@ module mem_read_write (
                             cache_val_data_way1[r_cache_index] <= merged;
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
-                        cpu.ready <= 1;
-                        state       <= PRE_WAIT;
+                        // Already acked at the WAIT latch (write-ack-at-latch).
+                        state       <= WAIT;
 
                     end else begin
                         // Write miss — M10a fetch-first: issue the refill NOW
@@ -629,8 +633,10 @@ module mem_read_write (
                         end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
-                        cpu.ready <= 1;
-                        state       <= PRE_WAIT;
+                        cpu.ready     <= 1;
+                        r_dv_served   <= 1;              // served-DV guard
+                        r_served_addr <= cpu.addr;       // (CPU holds addr until ready)
+                        state         <= WAIT;
 
                     end else begin
                         // Read miss — M10a fetch-first (see the write-miss
@@ -653,15 +659,14 @@ module mem_read_write (
             // writeback follows in EVICT_SHADOW_* after the CPU restarts)
             // ------------------------------------------------------------------
             WRITE_FETCH: begin
-                cpu.ready <= 0;   // the early ready below is a 1-cycle pulse
+                cpu.ready <= 0;
+                // M10b: writes are acked at the WAIT latch (r_miss_served
+                // arrives here already set), so this early arm and the
+                // fallback below are vestigial write-path safety nets.
                 if (w_cache_dw_ready && !r_miss_served) begin
-                    // M10a early restart: the requested dword has arrived, so
-                    // the merge is fully determined — the write is complete as
-                    // far as the CPU is concerned. Release it now; the line
-                    // merge + install (and any victim writeback) finish in the
-                    // shadow. The full-line merge below reads the same dword
-                    // out of i_ddr_mem_read_data, so nothing is stashed here.
                     cpu.ready     <= 1;
+                    r_dv_served   <= 1;
+                    r_served_addr <= cpu.addr;
                     r_miss_served <= 1;
                 end
                 if (w_cache_ddr_ready) begin
@@ -708,21 +713,16 @@ module mem_read_write (
 
                     // Line installed as DIRTY — will be written back to DDR on eviction.
                     // Dirty bit set via dirty0/1_din combinatorial wires above.
-                    if (!r_miss_served)
-                        cpu.ready <= 1;   // fallback: no early pulse fired this miss
+                    if (!r_miss_served) begin
+                        cpu.ready     <= 1;   // vestigial fallback (see above)
+                        r_dv_served   <= 1;
+                        r_served_addr <= cpu.addr;
+                    end
                     if (r_do_evict) begin
                         r_gap_count <= 4'd2;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
-                        // M10a skip: when the early restart already served the
-                        // CPU, its ready pulse was 3+ cycles ago and every DV
-                        // writer in pipeline_core drops (or atomically
-                        // re-addresses) DV at that edge — so the PRE_WAIT/
-                        // COOL_DOWN re-latch absorber is dead weight here. Go
-                        // straight to WAIT: a parked follow-up request is
-                        // served 2 cycles sooner. The fallback path (ready
-                        // pulsed THIS cycle) keeps the absorber.
-                        state       <= r_miss_served ? WAIT : PRE_WAIT;
+                        state       <= WAIT;   // served-DV guard absorbs the DV tail
                     end
                 end
             end
@@ -748,6 +748,8 @@ module mem_read_write (
                     cpu.read_data_next <= w_ddr_rd_dw_next;
                     cpu.next_valid     <= w_ddr_dw_next_ok;
                     cpu.ready          <= 1;
+                    r_dv_served        <= 1;
+                    r_served_addr      <= cpu.addr;
                     r_miss_served      <= 1;
                 end
                 if (w_cache_ddr_ready) begin
@@ -775,15 +777,15 @@ module mem_read_write (
                         endcase
                         cpu.next_valid <= (r_dw_offset != 2'b11);
                         cpu.ready      <= 1;
+                        r_dv_served    <= 1;
+                        r_served_addr  <= cpu.addr;
                     end
 
                     if (r_do_evict) begin
                         r_gap_count <= 4'd2;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
-                        // M10a skip — see the WRITE_FETCH comment: early-served
-                        // misses bypass the PRE_WAIT/COOL_DOWN absorber.
-                        state       <= r_miss_served ? WAIT : PRE_WAIT;
+                        state       <= WAIT;   // served-DV guard absorbs the DV tail
                     end
                 end
             end
@@ -796,10 +798,9 @@ module mem_read_write (
             // bus for the whole window, so DDR's stale copy is unobservable.
             // ------------------------------------------------------------------
             EVICT_SHADOW_GAP: begin
-                // Clear any fallback ready pulse (PRE_WAIT is bypassed on this
-                // path) and let ddr2_control pass its DV-low IDLE gate before
-                // the write DV rises — same settle discipline as the old
-                // WRITE_EVICT_GAP, direction reversed.
+                // Clear any fallback ready pulse and let ddr2_control pass its
+                // DV-low IDLE gate before the write DV rises — same settle
+                // discipline as the old WRITE_EVICT_GAP, direction reversed.
                 cpu.ready      <= 0;
                 cpu.next_valid <= 0;
                 if (r_gap_count == 4'd0) begin
@@ -817,12 +818,12 @@ module mem_read_write (
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_write_DV <= 0;
                     // Hold the victim address while ddr2_control drains and
-                    // passes its DV gate. Even on the skip path a new miss
-                    // cannot change o_ddr_mem_addr before WAIT → CHECK (2
-                    // cycles), by which point ddr2_control has re-entered its
-                    // DV-gated WAIT; a spurious re-sampled write would hit the
-                    // victim address again: idempotent.
-                    state <= r_miss_served ? WAIT : PRE_WAIT;
+                    // passes its DV gate. A new miss cannot change
+                    // o_ddr_mem_addr before WAIT → CHECK (2 cycles), by which
+                    // point ddr2_control has re-entered its DV-gated WAIT; a
+                    // spurious re-sampled write would hit the victim address
+                    // again: idempotent.
+                    state <= WAIT;
                 end
             end
 

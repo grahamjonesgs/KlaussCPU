@@ -242,11 +242,16 @@ module tb_cache;
    // -------------------------------------------------------------------------
    // 1) cpu.ready is a 1-cycle pulse, exactly one per transaction (early
    //    restart must never double-serve: no second pulse at install time).
+   // A transaction begins on a DV rise OR on an address change while DV is
+   // held (the ld32 spanning-load shape: DV held, atomically re-addressed).
    logic ready_q = 0, dv_q = 0;
+   logic [31:0] dv_addr_q = '0;
    integer pulses_this_txn = 0;
    always @(posedge clk) begin
-      if ((mb.write_DV || mb.read_DV) && !dv_q) pulses_this_txn = 0;
-      dv_q    <= (mb.write_DV || mb.read_DV);
+      if ((mb.write_DV || mb.read_DV) && (!dv_q || mb.addr !== dv_addr_q))
+         pulses_this_txn = 0;
+      dv_q      <= (mb.write_DV || mb.read_DV);
+      dv_addr_q <= mb.addr;
       if (mb.ready && ready_q) begin
          errors++; $display("FAIL monitor: cpu.ready held >1 cycle (t=%0t)", $time);
       end
@@ -326,6 +331,32 @@ module tb_cache;
          if (d !== sb_rd(a)) begin
             errors++; $display("FAIL read  %h: got %h want %h (t=%0t)", a, d, sb_rd(a), $time);
          end
+      end
+   endtask
+
+   // Held-DV atomic re-address (the pipeline's ld32_need2 shape): consume the
+   // first ready, then change the address WITHOUT dropping read_DV. The
+   // served-DV guard must release on the address change — a regression here
+   // deadlocks (caught by the timeout).
+   task cpu_read_held2(input [31:0] a1, input [31:0] a2);
+      logic [63:0] d;
+      begin
+         @(negedge clk);
+         mb.addr = a1; mb.read_DV = 1;
+         @(negedge clk);
+         while (!ready_d) @(negedge clk);
+         d = rdata_d;
+         if (d !== sb_rd(a1)) begin
+            errors++; $display("FAIL held-DV first %h: got %h want %h", a1, d, sb_rd(a1));
+         end
+         mb.addr = a2;         // DV stays high — atomic re-address
+         @(negedge clk);
+         while (!ready_d) @(negedge clk);
+         d = rdata_d;
+         if (d !== sb_rd(a2)) begin
+            errors++; $display("FAIL held-DV second %h: got %h want %h", a2, d, sb_rd(a2));
+         end
+         mb.read_DV = 0;
       end
    endtask
 
@@ -468,6 +499,22 @@ module tb_cache;
       check_read(32'h0011_0000);
       cpu_write(32'h0011_0008, 64'h7777_7777_7777_7777, 8'hC3);
       check_read(32'h0011_0008);
+
+      // ===== Phase B2 (M10b): write-ack-at-latch + served-DV guard ==========
+      $display("Phase B2: M10b ack/guard directed");
+      // held-DV atomic re-address: hit->hit (same line) and hit->MISS
+      // (dw3 -> next-line dw0, the real ld32 line-cross shape)
+      check_read(32'h0013_0000);                      // warm the line
+      cpu_read_held2(32'h0013_0000, 32'h0013_0008);   // hit -> hit
+      cpu_read_held2(32'h0013_0018, 32'h0013_0020);   // dw3 hit -> next-line MISS
+      $display("PASS held-DV re-address");
+      // store->load same address back-to-back (RAW through the early ack),
+      // including a store MISS immediately consumed by a load
+      cpu_write(32'h0014_0000, 64'h0123_4567_89AB_CDEF, 8'hFF);  // write MISS
+      check_read(32'h0014_0000);                                 // parked load
+      cpu_write(32'h0014_0000, 64'hFFFF_0000_FFFF_0000, 8'h55);  // partial hit
+      check_read(32'h0014_0000);
+      check_read(32'h0014_0008);                                 // neighbour intact
 
       // ===== Phase C: dirty evictions — shadow writeback round trips ========
       // 4 tags in one set (index = addr[14:5]): each write evicts a dirty
