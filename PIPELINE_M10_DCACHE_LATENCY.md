@@ -58,11 +58,24 @@ BLOCKING. Early restart releases the CPU, but the very next access (ptr_chase's
 dependent load, mem_stream's next store) parks in WAIT until the line install
 + shadow writeback finish — the per-miss win is only the CPU's compute overlap
 (~3c ptr_chase, ~5c mem_stream). The MIG command->first-beat latency (~20c)
-dominates the remaining 28c penalty and CWF cannot touch it. Remaining levers,
-in leverage order: hit-under-shadow (serve BRAM hits while the DDR side
-finishes install/writeback — the tag/data side is idle in the shadow states),
-skip PRE_WAIT/COOL_DOWN when early-served (2c/miss off the parked follow-up),
-D-side prefetch (helps mem_stream, defeated by ptr_chase's pointer chains).
+dominates the remaining 28c penalty and CWF cannot touch it.
+
+Stage 2 (same branch): skip PRE_WAIT/COOL_DOWN when early-served (the served
+DV dropped 3+ cycles before install; all three pipeline_core DV writers — mem
+engine, IF fill, IRQ push — drop or atomically re-address DV at the ready
+edge, so the re-latch absorber is dead weight on this path; fallback keeps
+it). BOARD-VERIFIED: mem_stream a further -0.7% (7.986M -> 7.931M cycles —
+its store stream genuinely parks on the busy cache); ptr_chase UNCHANGED —
+its dependent load only reaches the cache after the pointer-compute window,
+which was already hiding the two dead states. Lesson: FSM-earliness only pays
+where a request is actually parked. m5e 7/7; WNS +0.035 in-flow.
+
+FINAL M10a vs M9 (haz_real_m10a.csv): ptr_chase -3.8% CPI, mem_stream -4.7%,
+others unchanged. Remaining levers, in leverage order: hit-under-shadow
+(serve BRAM hits while the DDR side finishes install/writeback — the tag/data
+side is idle in the shadow states; also lets the NEXT miss's CHECK overlap
+the shadow), D-side prefetch (helps mem_stream streams, defeated by
+ptr_chase's pointer chains), MIG command-path latency (the ~20c floor).
 
 Verification: NEW unit gate perf/m5a/run_m10_cache.sh (tb_cache revived:
 REAL ddr2_control on a beat-level fake MIG — covers the CWF command

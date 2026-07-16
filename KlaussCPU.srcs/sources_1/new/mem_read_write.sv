@@ -714,7 +714,15 @@ module mem_read_write (
                         r_gap_count <= 4'd2;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
-                        state       <= PRE_WAIT;
+                        // M10a skip: when the early restart already served the
+                        // CPU, its ready pulse was 3+ cycles ago and every DV
+                        // writer in pipeline_core drops (or atomically
+                        // re-addresses) DV at that edge — so the PRE_WAIT/
+                        // COOL_DOWN re-latch absorber is dead weight here. Go
+                        // straight to WAIT: a parked follow-up request is
+                        // served 2 cycles sooner. The fallback path (ready
+                        // pulsed THIS cycle) keeps the absorber.
+                        state       <= r_miss_served ? WAIT : PRE_WAIT;
                     end
                 end
             end
@@ -773,7 +781,9 @@ module mem_read_write (
                         r_gap_count <= 4'd2;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
-                        state       <= PRE_WAIT;
+                        // M10a skip — see the WRITE_FETCH comment: early-served
+                        // misses bypass the PRE_WAIT/COOL_DOWN absorber.
+                        state       <= r_miss_served ? WAIT : PRE_WAIT;
                     end
                 end
             end
@@ -807,11 +817,12 @@ module mem_read_write (
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_write_DV <= 0;
                     // Hold the victim address while ddr2_control drains and
-                    // passes its DV gate — PRE_WAIT + COOL_DOWN give the settle
-                    // cycles before any new miss can change o_ddr_mem_addr
-                    // (WAIT → CHECK first). A spurious re-sampled write would
-                    // hit the victim address again: idempotent.
-                    state <= PRE_WAIT;
+                    // passes its DV gate. Even on the skip path a new miss
+                    // cannot change o_ddr_mem_addr before WAIT → CHECK (2
+                    // cycles), by which point ddr2_control has re-entered its
+                    // DV-gated WAIT; a spurious re-sampled write would hit the
+                    // victim address again: idempotent.
+                    state <= r_miss_served ? WAIT : PRE_WAIT;
                 end
             end
 
