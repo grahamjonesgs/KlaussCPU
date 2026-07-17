@@ -87,3 +87,39 @@ full SoC through early restart; tb_blitter's stub is inert on the early
 channel and covers the fallback path. Gates run: tb_cache PASS, M5a
 hello/bst/expr/test_64bit PASS, M5c storm PASS, M5d SoC bst PASS,
 tb_blitter PASS.
+
+# M10b (feat/m10-cwf, 2026-07-16/17) — SHIPS AS STAGE A
+
+Phase-0 insight from the M10a capture: calls_fib spends 20.6M cycles (33%)
+in memwait at a 0.00% miss rate — pure HIT-path cost, ~4 CPU-visible cycles
+per access. Two stages were built; stage A ships, stage B is parked.
+
+Stage A — write-ack-at-latch + served-DV guard (BOARD-VERIFIED, dacc9e8):
+WRITES are acknowledged at the WAIT latch edge, before hit/miss is known (a
+latched store is architecturally committed: completion guaranteed, later
+accesses order behind it in WAIT, MMIO bypasses the cache, the I-cache
+snoop runs at issue). Write misses run entirely in the shadow.
+PRE_WAIT/COOL_DOWN retired: every completion returns straight to WAIT; the
+served-DV guard (r_dv_served/r_served_addr — set at each ready pulse,
+cleared on DV-low in any state, released on address change for the ld32
+held-DV shape) absorbs the CPU's late DV drop those dead states covered.
+RESULT vs M10a-final: calls_fib 3.588 -> 3.441 CPI (-4.1%; memwait -2.57M
+= exactly 1c x its 2.57M stores), mem_stream -1.6%, others unchanged;
+m5e 7/7; WNS +0.056 in-flow.
+
+Stage B — address preview + fused WAIT/CHECK (branch feat/m10b-fused,
+daa0795): serves preview-matched read hits in ONE cache cycle (load-hit
+4 -> 3 CPU-visible) and starts misses a cycle early; fully sim-verified,
+PARKED after 5 builds at WNS -0.115 on four endpoints that are all OUTSIDE
+the new logic (the pre-existing SHA-round, ex_b->mem_result and id_op->pc
+zero-margin families, pushed over by global pressure). The branch's doc
+carries the full build-war post-mortem (RAM-inference single-write-net
+rule; tag arrays are LUTRAM since the 32B conversion — keep deep cones off
+their 288 replicated pins; registered preview; registered served-compare;
+fused write-hits dropped). Landing it needs EX-cluster/SHA RTL margin or a
+floorplan first — do not strategy-hunt.
+
+M10 FINAL (M10a + M10b-A) vs M9 baseline (perf/m7/haz_real_m10a.csv is the
+M10a capture; stage A numbers in its commit): ptr_chase -3.8%, mem_stream
+-6.2%, calls_fib -4.1%, alu/branchy/muldiv unchanged. CPU-visible avgpen:
+ptr_chase 31.6 -> 28.7c, mem_stream 39.0 -> 29.7c.
