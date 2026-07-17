@@ -255,6 +255,19 @@ module pipeline_core
    wire [63:0] nlb_rdata_next = nlb_data[63:0];
    wire        nlb_next_valid = !miss_dw[0] && nlb_vlo;
 
+   // M9+ 0-CYCLE serve: sliding window. Whenever pc is running from IFB slot 1
+   // (in1) and the NLB holds the dword after the window (ifb_base+2 — its line
+   // is want_line for BOTH base parities; its dword-in-line bit is ifb_base[0]),
+   // shift slot1->slot0 and refill slot1 from the NLB at the same edge. pc then
+   // never exits the window on a sequential path: the line cross that cost a
+   // 1-cycle rebase serve costs 0, and a slot-1 straddle that cost an if_look
+   // (~3c: odd-read rebase + top-up) costs at most 1. Register moves only —
+   // nothing new lands on the w_op/dispatch cone. (w_slide, which needs the
+   // MEM-stage store-completion signals, is declared after mem_done_now below.)
+   wire        slide_dw_ok = (nlb_line == want_line) &&
+                             (ifb_base[0] ? nlb_vlo : nlb_vhi);
+   wire [63:0] slide_data  = ifb_base[0] ? nlb_data[63:0] : nlb_data[127:64];
+
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
    logic [31:0] id_pc, id_op, id_var1, id_var2;
@@ -986,6 +999,17 @@ module pipeline_core
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
+   // M9+ slide enable (see slide_dw_ok above). Suppressed on a DRAM-store
+   // COMPLETION edge: the SMC squash (end of the clocked block) indexes IFB
+   // slots by the current base, and a same-edge slide would move the store's
+   // dword out from under its invalidate — the slide just retries next cycle.
+   // Issue-time store races need no gate: the issue-edge NLB kill + ic_v*
+   // clear stop any re-capture of the stored line, and a pre-store copy slid
+   // into the window is still at base/base+1 (or squashes via hit_id/hit_ex)
+   // when the completion snoop lands — the same window the 1-cycle serve has.
+   wire w_slide = in1 && slide_dw_ok &&
+                  !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF);
+
    // branch / flush / fetch / port attribution (events and wait cycles)
    assign perf_stall[5] = ex_valid && !ex_busy && !mem_busy && exo_taken
                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL);
@@ -1340,20 +1364,37 @@ module pipeline_core
                end
                // else: port busy — hold in if_look (re-evaluates in0/miss_dw each cycle)
             end
-         end else if (running && !fetch_halt && !parked && !irq_active && !fetch_ok) begin
-            // M9: serve a sequential line cross from the NLB in ONE cycle (no
-            // BRAM, no port). Same current-in0/miss_dw discipline as the
-            // I-cache hit serve — base and data are registered together.
-            if (nlb_dw_ok) begin
-               if (!in0) begin
-                  ifb_base  <= miss_dw;
-                  ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
-                  ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+         end else if (running && !fetch_halt && !parked && !irq_active) begin
+            if (!fetch_ok) begin
+               // M9: serve a sequential line cross from the NLB in ONE cycle (no
+               // BRAM, no port). Same current-in0/miss_dw discipline as the
+               // I-cache hit serve — base and data are registered together.
+               if (nlb_dw_ok) begin
+                  if (!in0) begin
+                     ifb_base  <= miss_dw;
+                     ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
+                     ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+                  end else begin
+                     ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+                  end
+               end else if (w_slide) begin
+                  // M9+: slot-1 straddle (in1 && w_span at an even base): the op
+                  // needs ifb_base+2, which nlb_dw_ok can't see (miss_dw is still
+                  // in the window's own line). Slide instead of if_look: 1 cycle,
+                  // no BRAM, no port.
+                  ifb_base  <= ifb_base + 29'd1;
+                  ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
+                  ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
                end else begin
-                  ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+                  if_look   <= 1'b1;              // begin lookup (no port access)
                end
-            end else begin
-               if_look   <= 1'b1;              // begin lookup (no port access)
+            end else if (w_slide) begin
+               // M9+ 0-cycle serve: pc is dispatching out of slot 1 — slide the
+               // window forward NOW, so the coming sequential line cross finds
+               // its dword already in the window and fetch never stalls.
+               ifb_base  <= ifb_base + 29'd1;
+               ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
+               ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
             end
          end
 

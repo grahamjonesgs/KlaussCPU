@@ -1,6 +1,7 @@
 # M9 — next-line fetch prefetch (NLB): alignment-immune sequential fetch
 
-**Status: spec + implementation in progress (feat/m9-fetch-prefetch).**
+**Status: M9 merged to master (6e476a0). M9b 0-cycle serve BOARD-VERIFIED on
+feat/m10-cwf — see §5.**
 
 ## 1. Why (measured, 2026-07-16)
 
@@ -57,3 +58,58 @@ branchy/ptr_chase regressions dissolve); M8's DATA wins become fully visible.
 3. Board: m5e 7/7 UART-identical; perf_haz A/B vs haz_real_m8align.csv
    (expect IFMISS to collapse toward brflush×~3; NO regression on any
    kernel); LVGL benchmark sanity.
+
+# 5. M9b — 0-cycle NLB serve: the sliding window (2026-07-17)
+
+The M9 promote was a 1-cycle register move at every sequential line cross,
+and a slot-1 straddle (op starting in the window's second dword and spilling
+into the next line) still took the full ~3c if_look path (odd-read rebase +
+NLB top-up). M9b removes both with a SLIDING window:
+
+- **Eager slide**: whenever pc is dispatching out of IFB slot 1 (`in1`) and
+  the NLB holds the dword after the window (`ifb_base+2` — its line is
+  `want_line` for BOTH base parities, its dword-in-line bit is `ifb_base[0]`),
+  shift slot1→slot0 and refill slot1 from the NLB at the same edge. pc then
+  never exits the window on a sequential path — the line cross costs 0
+  cycles, at any alignment, and the NLB is consumed dword-by-dword (two
+  slides per line; `want_line` advances after the second, retriggering the
+  prefetch engine with the same lead time the 1-cycle serve had).
+- **Straddle slide**: on `!fetch_ok && in1 && w_span` (where `nlb_dw_ok`
+  cannot see `ifb_base+2` because miss_dw is still in the window's own
+  line), slide instead of starting if_look: at most 1 cycle instead of ~3.
+- Register moves only — nothing new lands on the w_op/dispatch cone; the
+  slide-enable compares (in1, `nlb_line == want_line`, parity valid bit) are
+  register-sourced and gate only the IFB write enables.
+- **SMC discipline**: the slide is suppressed on a DRAM-store COMPLETION
+  edge (`mem_done_now && mem_is_write && !MMIO`) — the SMC squash indexes
+  IFB slots by the current base, and a same-edge slide would move the
+  store's dword out from under its invalidate; the slide retries next
+  cycle (frequency-irrelevant). Issue-time store races need no gate: the
+  issue-edge NLB kill + ic_v* clear stop any re-capture of the stored
+  line, and a pre-store copy already slid in is still at base/base+1 (or
+  squashes via hit_id/hit_ex) when the completion snoop lands — the same
+  window the 1-cycle serve always had. The 1-cycle serve remains for
+  redirects landing in the NLB line and partial-fill top-ups.
+
+BOARD-VERIFIED (haz_real_m9slide.csv vs haz_real_m10b.csv, perf_haz.elf,
+instr counts identical; WNS +0.012 in-flow; m5e 7/7 UART-identical):
+
+    kernel      CPI before -> after   dCPI      difmiss cycles
+    branchy     2.242 -> 2.047   -8.7%      -5.88M (40% of its pool)
+    muldiv      2.277 -> 2.011  -11.7%      -0.15M (25% of pool)
+    ptr_chase   4.462 -> 4.232   -5.2%      -1.20M
+    alu         2.000 -> 1.938   -3.1%      -1.50M (33% of pool)
+    mem_stream  3.968 -> 3.895   -1.8%      -0.79M
+    calls_fib   3.441 -> 3.382   -1.7%      -3.09M (19% of pool)
+
+Every delta is ifmiss (memwait/data/loaduse unchanged) — the pure designed
+effect, −12.6M cycles suite-wide (−5.9% total). Largest single-milestone
+win since M6. Residual ifmiss ≈ taken-branch redirect lookups (~3c each:
+branchy's 8.87M ≈ its 1.59M-flush × ~3c + cold fills) → the next fetch
+lever is a BTB/return-stack, not more sequential machinery.
+
+Sim gates: M5a golden traces bit-identical ×5 (hello/bst/expr/test_64bit/
+queens — queens' golden regenerated: its cached .mem/.trace pair had gone
+INCOHERENT, old-toolchain image vs new-toolchain trace; run_m5a.sh/
+run_m5d_soc.sh mem-out grep also fixed for the new klausscc's stderr
+logging), M5c IRQ+SMC storm, M5d SoC bst.

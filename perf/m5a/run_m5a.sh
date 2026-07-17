@@ -19,7 +19,7 @@ mkdir -p out
 
 # --- goldens (regenerate if missing) ---------------------------------------
 if [ ! -f "$PROG.mem" ]; then
-  $K --mem-out "$E/$PROG.elf" --mem-file "$PROG.mem" | grep mem-out
+  $K --mem-out "$E/$PROG.elf" --mem-file "$PROG.mem" 2>&1 | grep mem-out
 fi
 if [ "$MAXI" = 0 ]; then
   GTRACE=$PROG.trace

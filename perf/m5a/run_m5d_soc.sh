@@ -16,7 +16,7 @@ E=/media/psf/src/klausscpu-runtime/baremetal
 SRC=$(cd ../../KlaussCPU.srcs && pwd)
 export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
 mkdir -p out soc_run
-[ -f "$PROG.mem" ] || $K --mem-out "$E/$PROG.elf" --mem-file "$PROG.mem" | grep mem-out
+[ -f "$PROG.mem" ] || $K --mem-out "$E/$PROG.elf" --mem-file "$PROG.mem" 2>&1 | grep mem-out
 [ -f "$PROG.trace" ] || $K --input "$E/$PROG.elf" --emulate --trace "$PROG.trace" > "$PROG.emu.out" 2>&1
 [ -f "$PROG.uart.golden" ] || awk '/--- Captured UART output ---/{f=1;next} /--- end UART ---/{f=0} f' "$PROG.emu.out" > "$PROG.uart.golden"
 
