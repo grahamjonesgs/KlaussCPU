@@ -168,6 +168,17 @@ module pipeline_core
    // otherwise rebase the window at the op's own dword (next_valid refills
    // slot 1 for free within a line).
    wire [28:0] miss_dw  = in0 ? pc_dw + 29'd1 : pc_dw;
+   // Dispatch pc-advance, precomputed (timing keeper from the parked M11a
+   // war, PIPELINE_M11_REDIRECT.md): the +4/+8/+12 adders run in parallel
+   // with the window muxes and w_op's LEN bits only steer a narrow select —
+   // the serial (window mux -> 32b add) chain was the depth of the pc->pc
+   // zero-margin family. LEN==00 (illegal op) keeps the old pc+0 behavior.
+   wire [31:0] w_pc_p4  = pc + 32'd4;
+   wire [31:0] w_pc_p8  = pc + 32'd8;
+   wire [31:0] w_pc_p12 = pc + 32'd12;
+   wire [31:0] w_pc_adv = (w_op[31:30] == 2'b01) ? w_pc_p4
+                        : (w_op[31:30] == 2'b10) ? w_pc_p8
+                        : (w_op[31:30] == 2'b11) ? w_pc_p12 : pc;
 
    // ======================= M7a: fetch I-cache (fill-through) ==================
    // Direct-mapped, IC_LINES x 16 B (2 dwords), per-line tag + PER-DWORD valid.
@@ -238,6 +249,11 @@ module pipeline_core
    wire ic_tag_match  = ic_rd_current && (ic_rd_tag == ic_look_tag);
    wire ic_dw_valid   = miss_dw[0] ? ic_rd_vlo : ic_rd_vhi;
    wire ic_hit        = ic_tag_match && ic_dw_valid;
+   // (A registered dword-select shadow with a defer guard was tried here and
+   // REVERTED: the defer fires after every pc move, i.e. on EVERY taken
+   // branch's target serve — board-measured +0.5-1c per taken branch
+   // (haz_real_m9b_keepers.csv). Redirect-facing serves must never be
+   // defer-guarded; see PIPELINE_M11_REDIRECT.md.)
    // triple mirroring the m_* line-read for this miss_dw (see mem_read_write:
    // addr3=0 -> line[127:64], addr3=1 -> line[63:0]; next = the low dword)
    wire [63:0] ifr_rdata      = miss_dw[0] ? ic_rd_data[63:0] : ic_rd_data[127:64];
@@ -1513,7 +1529,7 @@ module pipeline_core
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      id_pc    <= pc;
-                     pc       <= pc + {26'b0, w_op[31:30], 2'b00};  // LEN field
+                     pc       <= w_pc_adv;   // precomputed pc+LEN (see IF section)
                   end else begin
                      id_valid <= 1'b0;    // IF window miss: bubble, engine fills
                   end
