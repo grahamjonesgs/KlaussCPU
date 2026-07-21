@@ -95,9 +95,21 @@ cycle-exact except the priced in-window-redirect cases.
 Recurrent marginal families with no throughput case for 100 MHz. CDC at
 their MMIO edges (LiteEth pattern). Deletes them from every future build.
 
-## Stage D — 2-cycle barrel shifter
+## Stage D — 2-cycle barrel shifter: BUILT, MEASURED, PARKED (2026-07-21)
 
-EX congestion relief: interlock like mul (1 extra cycle per shift),
-forwarding sees the result a cycle later, golden traces unchanged. Check
-shift density in hot chains first; sched-model retune (user's LLVM) if
-the A/B shows cost.
+Implemented as a mul-style EX-hold interlock (stage 1 = shift by
+shcnt[2:0] into free-running registers, stage 2 = shift by {shcnt[5:3],0}
++ combine; shifts/rotates compose across the split; BTSTRR staged on its
+own ex_b count). All gates trace-identical; build WNS +0.158 (vs +0.035
+without — the EX relief is real); m5e 7/7. BOARD PRICE (A/B vs the B+C
+build): **alu +9.6% CPI, branchy +5.0%, ptr_chase +1.8%** — the kernels
+run ~1.5M shifts each with consumers in-chain, and the EX-hold taxes
+EVERY shift +1c unconditionally. REVERTED (RTL = the doc's own rule,
+which said measure shift density first — the A/B did it emphatically).
+LANDING REQUIREMENTS: (a) pipeline stage 2 INTO the MEM stage with a
+load-use-style interlock so only shift->immediate-consumer pairs stall
+(the M8 scheduler already hoists those for loads) — note this touches
+the ex_b->mem_result timing family, budget for it; and/or (b) the LLVM
+sched-model retune (user's side) making 2-cycle shift latency visible to
+the scheduler; re-price on the board after either. The stage-1/stage-2
+decomposition in this doc's git history is correct and reusable.
