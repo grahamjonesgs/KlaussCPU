@@ -16,6 +16,21 @@ tracker (below) → C SHA→50MHz (+r_msg formatter) → D 2-cycle shifter →
 re-measure the default gap after each. PROCESS RULE (from the dw0-shadow
 lesson): every stage lands with a board CPI A/B, not just a WNS.
 
+## MILESTONE RESULT (2026-07-21, shipped = A+B+C at 069a7bc)
+
+Explore-flow margin: +0.035..+0.206 across draws WITHOUT post-route
+phys_opt (was ±0.05 WITH it) — tier-1 closes routinely, builds ~30 min,
+tier-2 rarely fires. Default-strategy re-measure: **−0.694, and the
+fetch family is GONE from the list — 29 of the 30 worst paths are ONE
+family: ex_d[uop] → EX cluster** (the P3-diagnosed congestion, now the
+sole blocker of 15-minute default builds; default-placer variance around
+congestion is large, hence −0.694 vs the mixed −0.522 before). The EX
+answers, in order: land Stage D via its into-MEM redesign (worth a
+measured +0.123 of Explore margin), the sched-model shift-latency retune
+(user's LLVM), an EX pblock, or accept Explore tier-1 as the floor.
+Board CPI vs pre-M12 master: calls_fib +0.9% (priced Stage B residual),
+all other kernels cycle-exact; crypto suite green on the SHA tick.
+
 ## Stage A — two-tier build flow (build_fast.tcl)
 
 Tier 1 = Performance_Explore route with post-route phys_opt DISABLED;
