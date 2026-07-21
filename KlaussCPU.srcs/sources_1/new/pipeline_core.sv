@@ -154,8 +154,21 @@ module pipeline_core
    logic [1:0]  ifb_val;
 
    wire [28:0] pc_dw = pc[31:3];
-   wire        in0   = ifb_val[0] && (pc_dw == ifb_base);
-   wire        in1   = ifb_val[1] && (pc_dw == ifb_base + 29'd1);
+   // M12 position-flag fetch tracker (PIPELINE_M12_TIMING.md): pc's window
+   // position is FLAGS maintained by shifts (dispatch), constants (serves)
+   // and zeroing (redirects — correct, it just forces the rebase path a
+   // redirect needs anyway), never live wide compares — the serial
+   // [in0 equality -> miss_dw +1 adder -> nlb equality] cone was the
+   // measured 16-level default-strategy wall. The base+K registers are
+   // maintained coherently at base-write sites (rare, off per-cycle paths).
+   // Real write sites set blocking EVENT FLAGS; one composer at the end of
+   // the clocked block folds them — no mirrored guards, no drift.
+   logic [2:0]  pos;               // pos[k] <=> (pc_dw == ifb_base + k)
+   logic [28:0] r_base_p1;         // ifb_base + 1
+   logic [28:0] r_base_p2;         // ifb_base + 2
+   logic [27:0] r_want_line;       // ifb_base[28:1] + 1
+   wire        in0   = ifb_val[0] && pos[0];
+   wire        in1   = ifb_val[1] && pos[1];
    wire [127:0] w_win = in0 ? {ifb_dw[1], ifb_dw[0]} : {64'h0, ifb_dw[1]};
    wire [31:0] w_op   = pc[2] ? w_win[63:32]  : w_win[31:0];
    wire [31:0] w_var1 = pc[2] ? w_win[95:64]  : w_win[63:32];
@@ -167,7 +180,7 @@ module pipeline_core
    // dword to request: slot-1 top-up when the op sits in slot 0 and spills;
    // otherwise rebase the window at the op's own dword (next_valid refills
    // slot 1 for free within a line).
-   wire [28:0] miss_dw  = in0 ? pc_dw + 29'd1 : pc_dw;
+   wire [28:0] miss_dw  = in0 ? r_base_p1 : pc_dw;   // mux of registers (M12)
    // Dispatch pc-advance, precomputed (timing keeper from the parked M11a
    // war, PIPELINE_M11_REDIRECT.md): the +4/+8/+12 adders run in parallel
    // with the window muxes and w_op's LEN bits only steer a narrow select —
@@ -221,8 +234,9 @@ module pipeline_core
                                       // declared here for the pf_sel mux below
    // The line after the one the window ends in ((ifb_base+2)>>1 for both
    // parities of ifb_base — for an odd base this "next line" also completes
-   // the current straddle line's missing low dword).
-   wire  [27:0]  want_line    = ifb_base[28:1] + 28'd1;
+   // the current straddle line's missing low dword). M12: registered
+   // (r_want_line, maintained with the base+K triple) — no live +1 adder.
+   wire  [27:0]  want_line    = r_want_line;
    wire          nlb_has_want = (nlb_vhi || nlb_vlo) && (nlb_line == want_line);
 
    // Demand lookups own the BRAM read port whenever if_look is (or is about to
@@ -1086,6 +1100,13 @@ module pipeline_core
    assign lcd_dc   = ex_d.lcd_is_data;
    assign lcd_dv   = ex_is_lcd && lcd_ready;
 
+   // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
+   // clocked block (pure combinational locals to synthesis — never FFs);
+   // r_ifq_p1 registers if_req_dw+1 at fill issue for the completion update.
+   logic       ev_disp, ev_slide, ev_rebase, ev_fill, ev_pcz;
+   logic [1:0] ev_adv;
+   logic [28:0] r_ifq_p1;
+
    // ================================================================== clocked
    always_ff @(posedge clk) begin
       if (rst) begin
@@ -1098,13 +1119,21 @@ module pipeline_core
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
+         pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else begin
+         // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
+         // real write sites below, folded by the pos_track composer at the
+         // end of this block. Same-process sampling — no mirrors, no drift.
+         ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
+         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0;
+
          if (start) begin
+            ev_pcz = 1'b1;
             pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00; if_look <= 1'b0;
@@ -1147,6 +1176,7 @@ module pipeline_core
                m_write_DV          <= 1'b0;
                sp                  <= sp - 32'd8;
                int_mask[irq_sel_q] <= 1'b0;   // masked while handler runs; IRET restores
+               ev_pcz              = 1'b1;
                pc                  <= irq_vec_q;
                irq_ack             <= 1'b1;
                irq_ack_sel         <= irq_sel_q;
@@ -1307,6 +1337,7 @@ module pipeline_core
          if (if_xc) begin
             if (w_mrdy) begin
                if (if_rebase) begin
+                  ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
                   ifb_dw[1] <= m_rdata_next;  ifb_val[1] <= m_next_valid;
@@ -1352,7 +1383,7 @@ module pipeline_core
                   // (a stale mix would corrupt the window; the m_* path is immune
                   // because it captures old base + old data together).
                   if (!in0) begin
-                     ifb_base  <= miss_dw;
+                     ifb_base  <= miss_dw;  ev_rebase = 1'b1;
                      ifb_dw[0] <= ifr_rdata;       ifb_val[0] <= 1'b1;
                      ifb_dw[1] <= ifr_rdata_next;  ifb_val[1] <= ifr_next_valid;
                   end else begin
@@ -1374,6 +1405,7 @@ module pipeline_core
                   m_read_DV <= 1'b1;
                   rdy_armed <= !m_ready;
                   if_req_dw <= miss_dw;             // old base+data captured together
+                  r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
                   if_rebase <= !in0;
                   if_xc     <= 1'b1;
                   if_look   <= 1'b0;
@@ -1387,7 +1419,7 @@ module pipeline_core
                // I-cache hit serve — base and data are registered together.
                if (nlb_dw_ok) begin
                   if (!in0) begin
-                     ifb_base  <= miss_dw;
+                     ifb_base  <= miss_dw;  ev_rebase = 1'b1;
                      ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
                      ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
                   end else begin
@@ -1398,7 +1430,7 @@ module pipeline_core
                   // needs ifb_base+2, which nlb_dw_ok can't see (miss_dw is still
                   // in the window's own line). Slide instead of if_look: 1 cycle,
                   // no BRAM, no port.
-                  ifb_base  <= ifb_base + 29'd1;
+                  ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
                   ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
                   ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
                end else begin
@@ -1408,7 +1440,7 @@ module pipeline_core
                // M9+ 0-cycle serve: pc is dispatching out of slot 1 — slide the
                // window forward NOW, so the coming sequential line cross finds
                // its dword already in the window and fetch never stalls.
-               ifb_base  <= ifb_base + 29'd1;
+               ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
                ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
                ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
             end
@@ -1461,6 +1493,7 @@ module pipeline_core
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= mem_result;
             // RET / IRET redirect + fetch resume at MEM completion
             if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET)) begin
+               ev_pcz = 1'b1;
                pc <= m_rdata[31:0];
                fetch_halt <= 1'b0;
             end
@@ -1482,6 +1515,7 @@ module pipeline_core
 
                // EX redirect: taken branch/call, RESET
                if (ex_valid && exo_taken) begin
+                  ev_pcz     = 1'b1;
                   pc         <= exo_target;
                   id_valid   <= 1'b0;
                   ex_valid   <= 1'b0;
@@ -1530,6 +1564,10 @@ module pipeline_core
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      id_pc    <= pc;
                      pc       <= w_pc_adv;   // precomputed pc+LEN (see IF section)
+                     ev_disp  = 1'b1;        // M12: dword advance for pos shift
+                     ev_adv   = (w_op[31:30] == 2'b00) ? 2'd0
+                              : pc[2] ? ((w_op[31:30] == 2'b11) ? 2'd2 : 2'd1)
+                                      : ((w_op[31:30] == 2'b01) ? 2'd0 : 2'd1);
                   end else begin
                      id_valid <= 1'b0;    // IF window miss: bubble, engine fills
                   end
@@ -1564,6 +1602,7 @@ module pipeline_core
                id_valid <= 1'b0;
                dly_on   <= 1'b0;
                ifb_val  <= 2'b00;
+               ev_pcz   = 1'b1;
                pc       <= hit_ex ? ex_pc : id_pc;
                if (hit_ex && ex_d.serialize) fetch_halt <= 1'b0; // re-dispatch re-arms it
             end
@@ -1572,7 +1611,71 @@ module pipeline_core
          // int_mask MMIO write-back (SoC handler owns 0xF00F_0000) — last, so
          // a memory-mapped store wins over a same-edge IRET restore.
          if (mask_wr) int_mask <= mask_wdata;
+
+         // ---------------- M12 pos-tracker composer (runs LAST) ----------------
+         // Folds this edge's events (blocking flags set by the real write
+         // sites above) into the position flags and the base+K triple. Fold
+         // order matters: dispatch shift, then slide shift-down (they
+         // co-occur on eager slides), then the exclusive strong writers;
+         // ev_pcz (redirect/RET/IRQ/squash/start) folds LAST and wins.
+         begin : pos_track
+            logic [2:0] p;
+            p = pos;
+            if (ev_disp)   p = p << ev_adv;
+            if (ev_slide)  p = {1'b0, p[2:1]};
+            if (ev_rebase) p = 3'b001;              // rebase base := pc's dword
+            if (ev_fill)   p = {1'b0,
+                                (pc_dw == r_ifq_p1),
+                                (pc_dw == if_req_dw)};
+            // (In-window redirect claims at the RET/exo edges were tried and
+            // REVERTED: board-measured ZERO effect on the calls_fib +514k —
+            // fib's call/return targets sit BEHIND the window base, which
+            // neither the flags nor the old live compares ever covered — and
+            // the claims added a compare cone plus an assertion-caught
+            // stale-base corner. The +1c/leaf-call residual is priced in
+            // PIPELINE_M12_TIMING.md.)
+            if (ev_pcz)    p = 3'b000;              // conservative: forces rebase
+            pos <= p;
+            // base+K triple: track this edge's base writer (sites are
+            // mutually exclusive; pcz does not move base)
+            if (ev_rebase) begin
+               r_base_p1   <= pc_dw + 29'd1;        // base' = miss_dw = pc_dw (!in0)
+               r_base_p2   <= pc_dw + 29'd2;
+               r_want_line <= pc_dw[28:1] + 28'd1;
+            end else if (ev_fill) begin
+               r_base_p1   <= r_ifq_p1;             // base' = if_req_dw
+               r_base_p2   <= r_ifq_p1 + 29'd1;
+               r_want_line <= if_req_dw[28:1] + 28'd1;
+            end else if (ev_slide) begin
+               r_base_p1   <= r_base_p2;            // base' = base + 1
+               r_base_p2   <= r_base_p2 + 29'd1;
+               r_want_line <= r_base_p1[28:1] + 28'd1;
+            end
+         end
       end
    end
+
+`ifndef SYNTHESIS
+   // M12 pos-tracker self-checks. Position flags are ONE-DIRECTIONAL by
+   // design (a set flag must be TRUE; a clear flag may be conservative —
+   // post-redirect zeros force the rebase path, which is correct). The
+   // base+K triple is a hard invariant whenever the window is armed.
+   always_ff @(posedge clk) if (!rst && running) begin
+      if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
+         else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
+      if (ifb_val[1] && pos[1]) assert (pc_dw == ifb_base + 29'd1)
+         else $fatal(1, "pos1 unsound: pc=%h base=%h", pc, ifb_base);
+      if ((ifb_val != 2'b00) && pos[2]) assert (pc_dw == ifb_base + 29'd2)
+         else $fatal(1, "pos2 unsound: pc=%h base=%h", pc, ifb_base);
+      if (ifb_val != 2'b00) begin
+         assert (r_base_p1 == ifb_base + 29'd1)
+            else $fatal(1, "base_p1 drift: base=%h p1=%h", ifb_base, r_base_p1);
+         assert (r_base_p2 == ifb_base + 29'd2)
+            else $fatal(1, "base_p2 drift: base=%h p2=%h", ifb_base, r_base_p2);
+         assert (r_want_line == ifb_base[28:1] + 28'd1)
+            else $fatal(1, "want_line drift: base=%h want=%h", ifb_base, r_want_line);
+      end
+   end
+`endif
 
 endmodule
