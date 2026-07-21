@@ -843,19 +843,9 @@ module pipeline_core
                default:  exo_result = (ex_a > ex_b) ? ex_a : ex_b; // MAXU
             endcase
          end
-         U_SHIFT: begin
-            case (ex_d.sub)
-               4'd0:  exo_result = ex_a << ex_shcnt;
-               4'd1:  exo_result = ex_a >> ex_shcnt;
-               4'd2:  exo_result = $signed(ex_a) >>> ex_shcnt;
-               4'd3:  exo_result = (ex_a << ex_shcnt) | (ex_a >> (64 - ex_shcnt));
-               4'd4:  exo_result = (ex_a >> ex_shcnt) | (ex_a << (64 - ex_shcnt));
-               4'd8:  exo_result = ex_a |  (64'b1 << ex_shcnt);
-               4'd9:  exo_result = ex_a & ~(64'b1 << ex_shcnt);
-               4'd10: exo_result = ex_a ^  (64'b1 << ex_shcnt);
-               default: exo_result = {63'b0, ex_a[ex_b[5:0]]};   // BTSTRR
-            endcase
-         end
+         U_SHIFT: exo_result = 64'b0;   // M12 Stage D: the result is produced
+                                        // in MEM (w_sh2 via mem_result_eff);
+                                        // the barrel left the EX cluster.
          U_ROT1: begin
             case (ex_d.sub)
                4'd3: begin exo_result = {ex_a[62:0], ex_a[63]};     exo_fval.carry = ex_a[63]; end
@@ -1048,6 +1038,58 @@ module pipeline_core
    assign perf_br       = ex_valid && !ex_busy && !mem_busy
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
    assign perf_br_taken = exo_taken;
+
+   // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
+   // The 64-bit barrel LEAVES the EX cluster (exo_result's U_SHIFT leg is a
+   // constant — the deepest cone and its fanout gone from the congested
+   // ex_d[uop]->EX family, the sole default-strategy blocker). Stage 1
+   // shifts by shcnt[2:0] into registers AT THE EX->MEM HANDOFF (gated, so
+   // a shift stalled in MEM can never be clobbered by the next); stage 2
+   // combines by the captured high bits DURING the MEM stage, purely
+   // register-sourced; consumers read mem_result_eff. CPI-FREE BY
+   // CONSTRUCTION: M6 forwarding already gives every producer-in-EX
+   // consumer a 1-bubble gap, and the combine completes inside it — no
+   // interlock, no sched-model change needed.
+   wire mem_is_sh     = mem_valid && (mem_d.uop == U_SHIFT);
+   wire ex_is_sh_hand = ex_valid && (ex_d.uop == U_SHIFT) && !ex_busy && !mem_busy;
+   logic [63:0] r_shl1, r_shr1, r_sar1, r_rol1, r_ror1, r_oh1, r_btr1, r_sha_op;
+   logic [2:0]  r_shhi, r_bthi;
+   logic [3:0]  r_shsub;
+   always_ff @(posedge clk) begin
+      if (ex_is_sh_hand) begin
+         r_shl1  <= ex_a << ex_shcnt[2:0];
+         r_shr1  <= ex_a >> ex_shcnt[2:0];
+         r_sar1  <= $signed(ex_a) >>> ex_shcnt[2:0];
+         r_rol1  <= (ex_a << ex_shcnt[2:0]) | (ex_a >> (7'd64 - {4'b0, ex_shcnt[2:0]}));
+         r_ror1  <= (ex_a >> ex_shcnt[2:0]) | (ex_a << (7'd64 - {4'b0, ex_shcnt[2:0]}));
+         r_oh1   <= 64'b1 << ex_shcnt[2:0];
+         r_btr1  <= (ex_a >> ex_b[2:0]) | (ex_a << (7'd64 - {4'b0, ex_b[2:0]}));
+         r_shhi  <= ex_shcnt[5:3];
+         r_bthi  <= ex_b[5:3];
+         r_shsub <= ex_d.sub;
+         r_sha_op<= ex_a;
+      end
+   end
+   logic [63:0] w_sh2;
+   always_comb begin : sh_stage2
+      logic [6:0]  hi8, bhi8;
+      logic [63:0] btr_full;
+      hi8  = {1'b0, r_shhi, 3'b000};
+      bhi8 = {1'b0, r_bthi, 3'b000};
+      btr_full = (r_btr1 >> bhi8) | (r_btr1 << (7'd64 - bhi8));
+      case (r_shsub)
+         4'd0:  w_sh2 = r_shl1 << hi8;
+         4'd1:  w_sh2 = r_shr1 >> hi8;
+         4'd2:  w_sh2 = $signed(r_sar1) >>> hi8;
+         4'd3:  w_sh2 = (r_rol1 << hi8) | (r_rol1 >> (7'd64 - hi8));
+         4'd4:  w_sh2 = (r_ror1 >> hi8) | (r_ror1 << (7'd64 - hi8));
+         4'd8:  w_sh2 = r_sha_op |  (r_oh1 << hi8);
+         4'd9:  w_sh2 = r_sha_op & ~(r_oh1 << hi8);
+         4'd10: w_sh2 = r_sha_op ^  (r_oh1 << hi8);
+         default: w_sh2 = {63'b0, btr_full[0]};   // BTSTRR
+      endcase
+   end
+   wire [63:0] mem_result_eff = mem_is_sh ? w_sh2 : mem_result;
 
    // load-value extraction (f_ld_idx / f_memget32 lane math)
    logic [63:0] mem_ldval;
@@ -1478,7 +1520,7 @@ module pipeline_core
             wb_valid   <= mem_valid;
             wb_pc      <= mem_pc;    wb_op <= mem_op;   wb_rd <= mem_d.rd;
             wb_wreg    <= mem_d.wreg;
-            wb_value   <= mem_is_read ? mem_ldval : mem_result;
+            wb_value   <= mem_is_read ? mem_ldval : mem_result_eff;
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             wb_fmask   <= mem_fmask;
@@ -1531,10 +1573,10 @@ module pipeline_core
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   // M6 register-sourced forwarding at the operand-register
                   // inputs: youngest writer wins (MEM over WB over rf).
-                  ex_a       <= (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result
+                  ex_a       <= (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rs1) ? wb_value
                               : rf[dec.rs1];
-                  ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result
+                  ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rd)  ? wb_value
                               : rf[dec.rd];
                   // The b-operand fully resolves HERE (reg / extended imm32 /
@@ -1545,7 +1587,7 @@ module pipeline_core
                                  (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                   dec.uop == U_BOOL || dec.uop == U_ALU))
                                 ? (dec.sgn ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                              : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result
+                              : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                               : rf[dec.rs2];
                   mul_cnt    <= 2'd0;
