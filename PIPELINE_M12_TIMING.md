@@ -110,7 +110,22 @@ cycle-exact except the priced in-window-redirect cases.
 Recurrent marginal families with no throughput case for 100 MHz. CDC at
 their MMIO edges (LiteEth pattern). Deletes them from every future build.
 
-## Stage D — 2-cycle barrel shifter: BUILT, MEASURED, PARKED (2026-07-21)
+## Stage D v2 — into-MEM shifter: SHIPPED (658f159) — CPI-FREE on silicon
+
+Supersedes the parked v1 below. The barrel leaves EX (exo_result U_SHIFT
+leg = constant): stage 1 captures at the EX->MEM handoff (gated against
+stall clobber), stage 2 combines register-sourced during MEM, consumers
+read mem_result_eff. CPI-free because M6's producer-in-EX bubble absorbs
+the extra stage — board A/B: ALL SIX kernels cycle-exact. WNS +0.082
+tier-1; m5e 7/7. No sched-model change needed (the LLVM latency retune
+is moot). **Default-gap: −0.694 → −0.414; the offender list rotated to
+id_op_reg → the ID decode/operand-resolution cone (all 30 worst paths)**
+— the next named family if 15-minute default builds are pursued further
+(note: the ex_b dispatch-resolution was a DELIBERATE M5 timing fix —
+unwinding it needs its own design pass); alternatives = EX/ID pblock or
+accept Explore tier-1 (~30 min, +0.08..+0.21) as the floor.
+
+## Stage D v1 — EX-hold 2-cycle shifter: BUILT, MEASURED, PARKED (2026-07-21)
 
 Implemented as a mul-style EX-hold interlock (stage 1 = shift by
 shcnt[2:0] into free-running registers, stage 2 = shift by {shcnt[5:3],0}
