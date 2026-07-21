@@ -34,6 +34,12 @@
 module sha256_core (
     input              i_clk,
     input              i_rst,
+    // M12: clock-enable — the ENTIRE FSM advances only on i_tick (every 2nd
+    // cycle). All intra-core FF->FF paths are therefore 2-cycle multicycle
+    // (constrained in the XDC); the wrapper HOLDS requests across ticks and
+    // owns the tick so this module stays uniformly slow. The SHA round adder
+    // chain was a recurrent zero-margin family at 100 MHz.
+    input              i_tick,
 
     input              i_init,
     input              i_start,
@@ -185,7 +191,7 @@ module sha256_core (
             a <= 32'h0; b <= 32'h0; c <= 32'h0; d <= 32'h0;
             e <= 32'h0; f <= 32'h0; g <= 32'h0; h <= 32'h0;
             for (i = 0; i < 16; i = i + 1) W[i] <= 32'h0;
-        end else begin
+        end else if (i_tick) begin
             case (r_state)
                 ST_IDLE: begin
                     o_busy <= 1'b0;

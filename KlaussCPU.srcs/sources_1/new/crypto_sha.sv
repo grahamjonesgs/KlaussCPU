@@ -188,14 +188,46 @@ module crypto_sha (
     logic [511:0] r_sha_block_pipe;
     always_ff @(posedge i_Clk) r_sha_block_pipe <= w_sha_block_pre;
 
+    // M12: the core advances only on r_tick (every 2nd cycle) so its round
+    // adder chain — a recurrent zero-margin family — gets a 2-cycle
+    // multicycle budget (XDC). The 1-cycle request PULSES from software/the
+    // HMAC FSM are converted to HOLDS so no request can fall between ticks:
+    //   start  — held until o_busy rises (its natural ack; START is not
+    //            idempotent, and busy-clear guarantees exactly-once even
+    //            when INIT is consumed in the same tick before it);
+    //   init / h_load — held through one consuming tick (idempotent, an
+    //            extra consumption is harmless).
+    logic r_tick;
+    logic r_start_hold, r_init_hold, r_hload_hold;
+    logic r_core_busy_q;
+    always_ff @(posedge i_Clk) begin
+        if (!i_Rst_L) begin
+            r_tick <= 1'b0;
+            r_start_hold <= 1'b0; r_init_hold <= 1'b0; r_hload_hold <= 1'b0;
+            r_core_busy_q <= 1'b0;
+        end else begin
+            r_tick        <= ~r_tick;
+            r_core_busy_q <= w_core_busy;
+            if (w_sha_start)                        r_start_hold <= 1'b1;
+            else if ((w_core_busy && !r_core_busy_q)   // consumed (busy rose)
+                     || (r_tick && w_core_busy))       // tick while busy: drop —
+                r_start_hold <= 1'b0;                  // legacy lost-while-busy
+            if (w_sha_init)         r_init_hold  <= 1'b1;
+            else if (r_tick)        r_init_hold  <= 1'b0;
+            if (r_h_load_pulse)     r_hload_hold <= 1'b1;
+            else if (r_tick)        r_hload_hold <= 1'b0;
+        end
+    end
+
     (* KEEP_HIERARCHY = "yes" *)
     sha256_core u_sha (
         .i_clk    (i_Clk),
         .i_rst    (~i_Rst_L),
-        .i_init   (w_sha_init),
-        .i_start  (w_sha_start),
+        .i_tick   (r_tick),
+        .i_init   (w_sha_init  | r_init_hold),
+        .i_start  (w_sha_start | r_start_hold),
         .i_block  (r_sha_block_pipe),
-        .i_h_load (r_h_load_pulse),
+        .i_h_load (r_h_load_pulse | r_hload_hold),
         .i_h_in   (w_sha_h_in),
         .o_busy   (w_core_busy),
         .o_done   (w_core_done),

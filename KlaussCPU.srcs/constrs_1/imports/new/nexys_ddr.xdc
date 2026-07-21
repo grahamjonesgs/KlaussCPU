@@ -428,3 +428,16 @@ set_false_path -to   [get_ports ETH_RSTN]
 
 # RXERR pin is on the connector but unused by LiteEth's RMII PHY.
 set_false_path -from [get_ports ETH_RXERR]
+
+# M12: the SHA-256 core advances only on the wrapper's r_tick clock-enable
+# (every 2nd cycle), so ALL intra-core FF->FF paths — including the round
+# adder chain that was a recurrent zero-margin family — have a 2-cycle
+# budget. The tick FF lives in the WRAPPER, so wrapper->core (enable, block,
+# holds) and core->wrapper (busy/done/digest reads) stay 1-cycle timed.
+# See PIPELINE_M12_TIMING.md Stage C.
+set_multicycle_path -setup 2 \
+    -from [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}] \
+    -to   [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}]
+set_multicycle_path -hold 1 \
+    -from [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}] \
+    -to   [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}]
