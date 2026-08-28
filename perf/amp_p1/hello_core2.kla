@@ -1,0 +1,43 @@
+// hello_core2 — AMP P1 gate program for core 2.
+// Emits "hello from core 2\n" to the core-2 log FIFO (console TX @ 0xF001_0000, UART-compatible)
+// and HALTs (park_kind observable through C2_CTRL on core 1's side).
+// Flat code, NO stack and NO calls: core 2's SP is not initialised in P1.
+_start
+SETR G 0xF0010000
+SETR A 104
+MEMSET8 A G
+SETR A 101
+MEMSET8 A G
+SETR A 108
+MEMSET8 A G
+SETR A 108
+MEMSET8 A G
+SETR A 111
+MEMSET8 A G
+SETR A 32
+MEMSET8 A G
+SETR A 102
+MEMSET8 A G
+SETR A 114
+MEMSET8 A G
+SETR A 111
+MEMSET8 A G
+SETR A 109
+MEMSET8 A G
+SETR A 32
+MEMSET8 A G
+SETR A 99
+MEMSET8 A G
+SETR A 111
+MEMSET8 A G
+SETR A 114
+MEMSET8 A G
+SETR A 101
+MEMSET8 A G
+SETR A 32
+MEMSET8 A G
+SETR A 50
+MEMSET8 A G
+SETR A 10
+MEMSET8 A G
+HALT

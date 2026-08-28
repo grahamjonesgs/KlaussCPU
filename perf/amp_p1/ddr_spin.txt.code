@@ -1,0 +1,11 @@
+0x00000000: 0000000000000034                  -- heap_start  (set by assembler)
+0x00000008: 0000000000000000                  -- heap_end    (reserved)
+0x00000010: 0000000000000000                  -- (reserved)
+0x00000018: 0000000000000000                  -- (reserved)
+                              -- // ddr_spin — GENERATED: infinite uncached DDR reads on core 2 (master-C
+                              -- // pressure for the core-1 CPI non-intrusion probe).  Runs from local RAM.
+                              -- _start
+0x00000020: 8BD00100 01000000 -- SETR B 0x01000000
+0x00000028:                   -- spin:
+0x00000028: 5B000210          -- MEMREADRR C B
+0x0000002C: A0000000 00000028 -- JMP spin:

@@ -1,0 +1,17 @@
+// eth_probe — AMP P3 sim gate program (runs from core-2 local RAM):
+// writes 0x5A5A to a LiteEth CSR (0xF006_0010), reads it back and stores the
+// value to DDR 0x0100_0200; reads the clock_ms mirror (0xF00F_0040) and
+// stores it to 0x0100_0208; HALTs.  With C2_ETH_OWNER=0 the readback must be
+// 0 (request never routed, no hang); with OWNER=1 it must be 0x5A5A.
+_start
+SETR B 0xF0060010
+SETR A 0x5A5A
+MEMSET32 A B
+MEMREADRR C B
+SETR D 0x01000200
+MEMSET64 C D
+SETR B 0xF00F0040
+MEMREADRR C B
+SETR D 0x01000208
+MEMSET64 C D
+HALT

@@ -1,0 +1,26 @@
+// ddr_sum — AMP P2a gate program: runs from core-2 LOCAL RAM, reads 8 dwords
+// from a DDR buffer at 0x0100_0000 through the uncached window, sums them,
+// stores the sum to DDR at 0x0100_0100 (window WRITE path), prints "sum\n"
+// to the console, HALTs.  Flat, no stack.
+_start
+SETR G 0xF0010000
+SETR B 0x01000000
+SETR E 8
+SETR D 0
+sum_loop:
+MEMREADRR C B
+ADDR D D C
+ADDV B 8
+MINUSV E 1
+JMPNZ sum_loop:
+SETR B 0x01000100
+MEMSET64 D B
+SETR A 115
+MEMSET8 A G
+SETR A 117
+MEMSET8 A G
+SETR A 109
+MEMSET8 A G
+SETR A 10
+MEMSET8 A G
+HALT

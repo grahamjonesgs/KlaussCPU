@@ -768,6 +768,7 @@ module KlaussCPU (
 
    pipeline_core pipeline_core_i (
       .clk        (i_Clk),
+      .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
       .start      (r_pip_start),
       .start_pc   (r_pip_start_pc),
@@ -997,6 +998,68 @@ module KlaussCPU (
    assign w_blit_ready     = blit_bus.ready;
 
    // -------------------------------------------------------------------------
+   // AMP core 2 — device id 0x010.  A second pipeline_core at effective
+   // 50 MHz (ce/2 + blanket multicycle, the M12 Stage-C pattern) with a 64 KB
+   // local BRAM and a log FIFO, controlled by core 1 through this window.
+   // P1 scope: no DDR access, no interrupts, no LiteEth.  See
+   // AMP_CORE2_PLAN.md and core2_subsys.sv for the register map.
+   // -------------------------------------------------------------------------
+   wire        w_c2_sel      = (w_mmio_addr[27:16] == 12'h010);
+   wire        w_c2_write_DV = w_mmio_write_DV & w_c2_sel;
+   wire        w_c2_read_DV  = w_mmio_read_DV  & w_c2_sel;
+   wire [63:0] w_c2_read_data;
+
+   // DDR master-C wires (to mem_read_write's arbiter, instantiated below).
+   wire         w_c2_ddr_req, w_c2_ddr_done;
+   wire         w_c2_ddr_write_DV, w_c2_ddr_read_DV;
+   wire [31:0]  w_c2_ddr_addr;
+   wire [127:0] w_c2_ddr_write_data;
+   wire [15:0]  w_c2_ddr_wdf_mask;
+   wire [127:0] w_c2_ddr_read_data;
+   wire         w_c2_ddr_ready, w_c2_ddr_grant;
+   // LiteEth OWNER mux wires (core-2 eth master + owner flag).
+   wire         w_c2_eth_owner;
+   wire         w_c2e_write_DV, w_c2e_read_DV;
+   wire [31:0]  w_c2e_addr;
+   wire [63:0]  w_c2e_write_data;
+   wire [7:0]   w_c2e_byte_en;
+   wire [63:0]  w_c2e_read_data;
+   wire         w_c2e_ready;
+
+   mmio_if c2_bus();
+   assign c2_bus.write_DV   = w_c2_write_DV;
+   assign c2_bus.read_DV    = w_c2_read_DV;
+   assign c2_bus.addr       = w_mmio_addr;
+   assign c2_bus.write_data = w_mmio_write_data;
+   assign c2_bus.byte_en    = w_mmio_byte_en;
+   (* KEEP_HIERARCHY = "yes" *)
+   core2_subsys core2_subsys_i (
+       .i_Clk(i_Clk),
+       .i_Rst_L(~w_reset_H),
+       .mmio(c2_bus),
+       .o_ddr_req(w_c2_ddr_req),
+       .o_ddr_done(w_c2_ddr_done),
+       .o_ddr_write_DV(w_c2_ddr_write_DV),
+       .o_ddr_read_DV(w_c2_ddr_read_DV),
+       .o_ddr_addr(w_c2_ddr_addr),
+       .o_ddr_write_data(w_c2_ddr_write_data),
+       .o_ddr_wdf_mask(w_c2_ddr_wdf_mask),
+       .i_ddr_read_data(w_c2_ddr_read_data),
+       .i_ddr_ready(w_c2_ddr_ready),
+       .i_ddr_grant(w_c2_ddr_grant),
+       .o_eth_owner(w_c2_eth_owner),
+       .o_eth_write_DV(w_c2e_write_DV),
+       .o_eth_read_DV(w_c2e_read_DV),
+       .o_eth_addr(w_c2e_addr),
+       .o_eth_write_data(w_c2e_write_data),
+       .o_eth_byte_en(w_c2e_byte_en),
+       .i_eth_read_data(w_c2e_read_data),
+       .i_eth_ready(w_c2e_ready),
+       .i_clock_ms(r_clock_ms)
+   );
+   assign w_c2_read_data = c2_bus.read_data;
+
+   // -------------------------------------------------------------------------
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
    // The result is registered into r_mmio_read_data (FF) below to break the
    // long combinational path from peripheral state regs through bus_splitter
@@ -1069,6 +1132,7 @@ module KlaussCPU (
          12'h00B: r_mmio_read_data_comb = w_sha_read_data;  // Crypto: SHA-256
          12'h00C: r_mmio_read_data_comb = w_trng_read_data; // Crypto: TRNG
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
+         12'h010: r_mmio_read_data_comb = w_c2_read_data;   // AMP core 2 mailbox
          12'h00F: begin  // Interrupt controller / timer
             case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
@@ -1196,6 +1260,18 @@ module KlaussCPU (
        .o_dma_ready(w_blit_dma_ready),
        .o_dma_grant(w_blit_dma_grant),
 
+       // DDR master C — AMP core 2's uncached window (lowest priority).
+       .i_c2_req(w_c2_ddr_req),
+       .i_c2_done(w_c2_ddr_done),
+       .i_c2_write_DV(w_c2_ddr_write_DV),
+       .i_c2_read_DV(w_c2_ddr_read_DV),
+       .i_c2_addr(w_c2_ddr_addr),
+       .i_c2_write_data(w_c2_ddr_write_data),
+       .i_c2_wdf_mask(w_c2_ddr_wdf_mask),
+       .o_c2_read_data(w_c2_ddr_read_data),
+       .o_c2_ready(w_c2_ddr_ready),
+       .o_c2_grant(w_c2_ddr_grant),
+
        // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
        .i_flush_go(w_cache_flush_go),
        .i_inval_go(w_cache_inval_go),
@@ -1238,11 +1314,23 @@ module KlaussCPU (
 
    // CPU MMIO side (from bus_splitter Eth port; full 32-bit addr)
    mmio_if eth_bus();
-   assign eth_bus.write_DV   = w_eth_write_DV;
-   assign eth_bus.read_DV    = w_eth_read_DV;
-   assign eth_bus.addr       = w_eth_addr;
-   assign eth_bus.write_data = w_eth_write_data;
-   assign eth_bus.byte_en    = w_eth_byte_en;
+   // AMP P3 — LiteEth OWNER mux.  Exactly one core drives the bridge:
+   // core 1 (bus_splitter eth port) by default / at reset so the boot-ROM
+   // netboot path is untouched; core 2 once software sets C2_ETH_OWNER.
+   // The non-owner never reaches the bridge: core 1 gets a 1-cycle ack of
+   // its own strobe (reads 0) so its bus never hangs; core 2's adapter
+   // self-completes on its side (core2_subsys.sv).
+   wire w_eth_own2 = w_c2_eth_owner;
+   assign eth_bus.write_DV   = w_eth_own2 ? w_c2e_write_DV   : w_eth_write_DV;
+   assign eth_bus.read_DV    = w_eth_own2 ? w_c2e_read_DV    : w_eth_read_DV;
+   assign eth_bus.addr       = w_eth_own2 ? w_c2e_addr       : w_eth_addr;
+   assign eth_bus.write_data = w_eth_own2 ? w_c2e_write_data : w_eth_write_data;
+   assign eth_bus.byte_en    = w_eth_own2 ? w_c2e_byte_en    : w_eth_byte_en;
+   logic r_eth_nown_dv_d;
+   always_ff @(posedge i_Clk) begin
+      r_eth_nown_dv_d <= (w_eth_write_DV | w_eth_read_DV) & w_eth_own2;
+   end
+   wire w_eth_nown_ack = (w_eth_write_DV | w_eth_read_DV) & w_eth_own2 & ~r_eth_nown_dv_d;
    eth_mmio_bridge eth_mmio_bridge_i (
        .i_clk             (i_Clk),
        .i_rst             (~CPU_RESETN),
@@ -1260,8 +1348,10 @@ module KlaussCPU (
        .i_wb_ack          (w_eth_wb_ack),
        .i_wb_err          (w_eth_wb_err)
    );
-   assign w_eth_read_data = eth_bus.read_data;
-   assign w_eth_ready     = eth_bus.ready;
+   assign w_eth_read_data = w_eth_own2 ? 64'h0          : eth_bus.read_data;
+   assign w_eth_ready     = w_eth_own2 ? w_eth_nown_ack : eth_bus.ready;
+   assign w_c2e_read_data = eth_bus.read_data;
+   assign w_c2e_ready     = w_eth_own2 ? eth_bus.ready  : 1'b0;
 
    liteeth_core liteeth_core_i (
        .sys_clock          (i_Clk),

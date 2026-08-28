@@ -1,0 +1,7 @@
+// ddr_spin — GENERATED: infinite uncached DDR reads on core 2 (master-C
+// pressure for the core-1 CPI non-intrusion probe).  Runs from local RAM.
+_start
+SETR B 0x01000000
+spin:
+MEMREADRR C B
+JMP spin:

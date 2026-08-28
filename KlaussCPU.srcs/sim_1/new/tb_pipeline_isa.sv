@@ -44,7 +44,7 @@ module tb_pipeline_isa;
    logic [31:0]  dbg_sp;
    klauss_pkg::flags_t dbg_flags;
 
-   pipeline_core dut (.*, .lcd_ready(1'b1));
+   pipeline_core dut (.*, .lcd_ready(1'b1), .ce(1'b1));
 
    always #5 clk = ~clk;
 

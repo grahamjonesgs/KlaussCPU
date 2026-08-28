@@ -441,3 +441,17 @@ set_multicycle_path -setup 2 \
 set_multicycle_path -hold 1 \
     -from [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}] \
     -to   [get_cells -hier -regexp {.*crypto_sha_i/u_sha/.*}]
+
+# AMP core 2 (core2_subsys_i/c2_core_i): the second pipeline_core advances
+# only on the wrapper's r_ce /2 toggle — every sequential block inside the
+# core is gated by ce (pipeline_core.sv), so ALL intra-core FF->FF paths have
+# a 2-cycle budget: the SHA Stage-C pattern at core scale (AMP_CORE2_PLAN.md
+# §3).  The r_ce FF, local RAM, log FIFO and the CE-paced bus FSM live in the
+# WRAPPER and stay 1-cycle timed, as do wrapper<->core boundary paths.
+set_multicycle_path -setup 2 \
+    -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
+    -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
+set_multicycle_path -hold 1 \
+    -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
+    -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
+

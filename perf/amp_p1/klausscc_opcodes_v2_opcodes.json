@@ -1,0 +1,1960 @@
+[
+  {
+    "comment": "",
+    "hex_code": "44200000",
+    "registers": 3,
+    "section": "",
+    "text_name": "ADDR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "44600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "SUBR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "44A00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "ADDC",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "44E00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "SUBC",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "45000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "ANDR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "45400000",
+    "registers": 3,
+    "section": "",
+    "text_name": "ORR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "45800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "XORR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "45C00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MINR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "46000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MAXR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "46400000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MINUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "46800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MAXUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4C000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "CMPRR",
+    "variables": 0,
+    "ops": [
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4C200000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPEQR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4C600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPNER",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4CA00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPLTR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4CE00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPGER",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4D200000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPLER",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4D600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPGTR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4DA00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPULTR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4DE00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPUGER",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4E200000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPULER",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "4E600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "CMPUGTR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50004000",
+    "registers": 3,
+    "section": "",
+    "text_name": "SHLR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50204000",
+    "registers": 2,
+    "section": "",
+    "text_name": "SHLV",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50208000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SHLR1",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50208000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SHLAR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50404000",
+    "registers": 3,
+    "section": "",
+    "text_name": "SHRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50604000",
+    "registers": 2,
+    "section": "",
+    "text_name": "SHRV",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50608000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SHRR1",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50804000",
+    "registers": 3,
+    "section": "",
+    "text_name": "SARR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50A04000",
+    "registers": 2,
+    "section": "",
+    "text_name": "SHRAV",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50A08000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SHRAR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50C04000",
+    "registers": 3,
+    "section": "",
+    "text_name": "ROLR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50E04000",
+    "registers": 2,
+    "section": "",
+    "text_name": "ROLV",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "50E0C000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ROLR1",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "51004000",
+    "registers": 3,
+    "section": "",
+    "text_name": "RORR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "51204000",
+    "registers": 2,
+    "section": "",
+    "text_name": "RORV",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5120C000",
+    "registers": 1,
+    "section": "",
+    "text_name": "RORR1",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5160C000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ROLCR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "51A0C000",
+    "registers": 1,
+    "section": "",
+    "text_name": "RORCR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "BSETRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "BSET",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52400000",
+    "registers": 3,
+    "section": "",
+    "text_name": "BCLRRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52600000",
+    "registers": 2,
+    "section": "",
+    "text_name": "BCLR",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "BTGLRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52A00000",
+    "registers": 2,
+    "section": "",
+    "text_name": "BTGL",
+    "variables": 0,
+    "ops": [
+      "RdRs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52C00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "BTSTRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "52E00000",
+    "registers": 2,
+    "section": "",
+    "text_name": "BTST",
+    "variables": 0,
+    "ops": [
+      "Rs1",
+      "Count"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "54000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "COPY",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "54480000",
+    "registers": 1,
+    "section": "",
+    "text_name": "NEGR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "54880000",
+    "registers": 1,
+    "section": "",
+    "text_name": "NOTR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "54C80000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ABSR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55080000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SEXTB",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55180000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SEXTH",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55200000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SEXTW",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55480000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ZEXTB",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55580000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ZEXTH",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55600000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ZEXTW",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "BSWAP",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "55C00000",
+    "registers": 1,
+    "section": "",
+    "text_name": "BITREV",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "56080000",
+    "registers": 1,
+    "section": "",
+    "text_name": "POPCNT",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "56400000",
+    "registers": 1,
+    "section": "",
+    "text_name": "CLZ",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "56800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "CTZ",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "57000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SETFR",
+    "variables": 0,
+    "ops": [
+      "Rd"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "57880000",
+    "registers": 1,
+    "section": "",
+    "text_name": "INCR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "57C80000",
+    "registers": 1,
+    "section": "",
+    "text_name": "DECR",
+    "variables": 0,
+    "ops": [
+      "RdRs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "58000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMGET8",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "59000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMGET16",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5A000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMGET32",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5B000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMREADRR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5B100000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMGET64",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5B600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "LDIDX64R",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5C000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMSET8",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5D000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMSET16",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5E000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMSET32",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5F000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMSET64RR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5F100000",
+    "registers": 2,
+    "section": "",
+    "text_name": "MEMSET64",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "5F600000",
+    "registers": 3,
+    "section": "",
+    "text_name": "STIDX64R",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "60800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "JMPR",
+    "variables": 0,
+    "ops": [
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "62800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "CALLR",
+    "variables": 0,
+    "ops": [
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "64000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "PUSH",
+    "variables": 0,
+    "ops": [
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "64800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "POP",
+    "variables": 0,
+    "ops": [
+      "Rd"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "64C00000",
+    "registers": 1,
+    "section": "",
+    "text_name": "GETSP",
+    "variables": 0,
+    "ops": [
+      "Rd"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "65000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SETSP",
+    "variables": 0,
+    "ops": [
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "65800000",
+    "registers": 0,
+    "section": "",
+    "text_name": "RET",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "65C00000",
+    "registers": 0,
+    "section": "",
+    "text_name": "IRET",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "68000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MULUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "68400000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MULHUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "68800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MULR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "68C00000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MULHR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "69000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "DIVUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "69800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "DIVR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "6A000000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MODUR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "6A800000",
+    "registers": 3,
+    "section": "",
+    "text_name": "MODR",
+    "variables": 0,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "6C000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "NOP",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "6C010000",
+    "registers": 0,
+    "section": "",
+    "text_name": "HALT",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "6C020000",
+    "registers": 0,
+    "section": "",
+    "text_name": "WAIT",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "6C030000",
+    "registers": 0,
+    "section": "",
+    "text_name": "RESET",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "6C040000",
+    "registers": 0,
+    "section": "",
+    "text_name": "TRAP",
+    "variables": 0,
+    "ops": []
+  },
+  {
+    "comment": "",
+    "hex_code": "6C050000",
+    "registers": 1,
+    "section": "",
+    "text_name": "DELAYR",
+    "variables": 0,
+    "ops": [
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "70000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "LCDCMDR",
+    "variables": 0,
+    "ops": [
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "71000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "LCDDATAR",
+    "variables": 0,
+    "ops": [
+      "Rs1"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "88200000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ADDV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "88300000",
+    "registers": 2,
+    "section": "",
+    "text_name": "ADDI",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "88600000",
+    "registers": 1,
+    "section": "",
+    "text_name": "MINUSV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "89000000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ANDV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "89400000",
+    "registers": 1,
+    "section": "",
+    "text_name": "ORV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "89800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "XORV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "8B800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "LEAPC",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "8BD00000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SETR",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "8C100000",
+    "registers": 1,
+    "section": "",
+    "text_name": "CMPRV",
+    "variables": 1,
+    "ops": [
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "93000000",
+    "registers": 2,
+    "section": "",
+    "text_name": "BEXTR",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "93400000",
+    "registers": 3,
+    "section": "",
+    "text_name": "BDEP",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Rs2",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "98200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX8",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "98A00000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX8_S",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "99200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX16",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "99A00000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX16_S",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9A200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX32",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9B200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX64",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9B300000",
+    "registers": 2,
+    "section": "",
+    "text_name": "LDIDX64A",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9B400000",
+    "registers": 1,
+    "section": "",
+    "text_name": "MEMREADR",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9C200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "STIDX8",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9D200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "STIDX16",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9E200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "STIDX32",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9F200000",
+    "registers": 2,
+    "section": "",
+    "text_name": "STIDX64",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9F300000",
+    "registers": 2,
+    "section": "",
+    "text_name": "STIDX64A",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Rs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "9F400000",
+    "registers": 1,
+    "section": "",
+    "text_name": "MEMSETR",
+    "variables": 1,
+    "ops": [
+      "Rd",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMP",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0080000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPZ",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A00C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPNZ",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0100000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPC",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0140000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPNC",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0180000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPO",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A01C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPNO",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0200000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPS",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0240000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPNS",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0280000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPLT",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A02C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPGE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0300000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPLE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0340000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPGT",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0380000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPULT",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A03C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPUGE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0400000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPULE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0440000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPUGT",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A0480000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A04C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "JMPNE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALL",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2080000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLZ",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A20C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLNZ",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2100000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLC",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2140000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLNC",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2180000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLO",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A21C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLNO",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A2480000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A24C0000",
+    "registers": 0,
+    "section": "",
+    "text_name": "CALLNE",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A4400000",
+    "registers": 0,
+    "section": "",
+    "text_name": "PUSHV",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A5400000",
+    "registers": 0,
+    "section": "",
+    "text_name": "ADDSP",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A8800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "MULV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "A9800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "DIVV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "AA800000",
+    "registers": 1,
+    "section": "",
+    "text_name": "MODV",
+    "variables": 1,
+    "ops": [
+      "RdRs1",
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "AC050000",
+    "registers": 0,
+    "section": "",
+    "text_name": "DELAYV",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "B0000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "LCDCMDV",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "B1000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "LCDDATAV",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "B2000000",
+    "registers": 0,
+    "section": "",
+    "text_name": "LCDRST",
+    "variables": 1,
+    "ops": [
+      "Imm"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "CBC00000",
+    "registers": 1,
+    "section": "",
+    "text_name": "SETR64",
+    "variables": 2,
+    "ops": [
+      "Rd",
+      "Imm64"
+    ]
+  },
+  {
+    "comment": "",
+    "hex_code": "E4400000",
+    "registers": 0,
+    "section": "",
+    "text_name": "PUSHV64",
+    "variables": 2,
+    "ops": [
+      "Imm64"
+    ]
+  }
+]

@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/home/graham/Documents/src/fpga/KlaussCPU/perf/amp_p1/vnc_probe.py", line 93, in <module>
+    main()
+  File "/home/graham/Documents/src/fpga/KlaussCPU/perf/amp_p1/vnc_probe.py", line 77, in main
+    s = socket.create_connection((host, 5900), timeout=30); s.settimeout(30)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/socket.py", line 852, in create_connection
+    raise exceptions[0]
+  File "/usr/lib/python3.12/socket.py", line 837, in create_connection
+    sock.connect(sa)
+TimeoutError: timed out

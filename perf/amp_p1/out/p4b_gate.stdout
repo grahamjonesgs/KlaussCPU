@@ -1,0 +1,23 @@
+FPGA programmed (clean slate)
+core 2 VNC at 192.168.68.59; letting doom reach steady state (title -> demo)...
+=== doom tick WITHOUT a client (baseline for this build) ===
+doom: drawfps=5 tick=169ms convert=23ms (draws=20/20 ticks in 3387ms)
+doom: drawfps=5 tick=171ms convert=23ms (draws=20/20 ticks in 3429ms)
+[doom-c2-hextile] 112 updates in 30.3s = 3.70 fps, avg 127959 B/update, 462 KB/s, rect encodings {0: 109, 5: 3}
+=== doom tick DURING hextile streaming ===
+doom: drawfps=5 tick=166ms convert=23ms (draws=20/20 ticks in 3335ms)
+doom: drawfps=6 tick=162ms convert=23ms (draws=20/20 ticks in 3254ms)
+doom: drawfps=6 tick=161ms convert=23ms (draws=20/20 ticks in 3228ms)
+[doom-c2-raw] 115 updates in 30.0s = 3.83 fps, avg 128016 B/update, 479 KB/s, rect encodings {0: 115}
+=== doom tick DURING raw streaming ===
+doom: drawfps=5 tick=170ms convert=23ms (draws=20/20 ticks in 3418ms)
+doom: drawfps=5 tick=178ms convert=23ms (draws=20/20 ticks in 3561ms)
+doom: drawfps=5 tick=184ms convert=23ms (draws=20/20 ticks in 3687ms)
+--- core-2 lines ---
+[core2] core2: prof rx=3970 (ms per 5 s)
+[core2] core2: alive 17 upd=223
+[core2] core2: boot=1 vnc=3
+[core2] core2: prof enc=798 tx=993
+[core2] core2: prof rx=3948 (ms per 5 s)
+[core2] core2 vnc: client disconnected
+AMP P4b BOARD: DONE

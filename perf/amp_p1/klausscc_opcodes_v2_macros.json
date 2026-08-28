@@ -1,0 +1,187 @@
+[
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "PUSH B",
+      "PUSH C",
+      "PUSH D",
+      "CALL %1",
+      "POP D",
+      "POP C",
+      "POP B",
+      "POP A"
+    ],
+    "name": "$CALLSAVE",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "SETR %1 0"
+    ],
+    "name": "$CLR",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "MEMREADRR %3 %2",
+      "MEMSET64RR %3 %1"
+    ],
+    "name": "$MEMCPYW",
+    "variables": 3
+  },
+  {
+    "comment": "",
+    "items": [
+      "CALL TX_NL:"
+    ],
+    "name": "$NEWLINE",
+    "variables": 0
+  },
+  {
+    "comment": "",
+    "items": [
+      "POP %2",
+      "POP %1"
+    ],
+    "name": "$POP2",
+    "variables": 2
+  },
+  {
+    "comment": "",
+    "items": [
+      "POP %3",
+      "POP %2",
+      "POP %1"
+    ],
+    "name": "$POP3",
+    "variables": 3
+  },
+  {
+    "comment": "",
+    "items": [
+      "POP %4",
+      "POP %3",
+      "POP %2",
+      "POP %1"
+    ],
+    "name": "$POP4",
+    "variables": 4
+  },
+  {
+    "comment": "",
+    "items": [
+      "POP D",
+      "POP C",
+      "POP B",
+      "POP A"
+    ],
+    "name": "$POPALL",
+    "variables": 0
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH %1",
+      "PUSH %2"
+    ],
+    "name": "$PUSH2",
+    "variables": 2
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH %1",
+      "PUSH %2",
+      "PUSH %3"
+    ],
+    "name": "$PUSH3",
+    "variables": 3
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH %1",
+      "PUSH %2",
+      "PUSH %3",
+      "PUSH %4"
+    ],
+    "name": "$PUSH4",
+    "variables": 4
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "PUSH B",
+      "PUSH C",
+      "PUSH D"
+    ],
+    "name": "$PUSHALL",
+    "variables": 0
+  },
+  {
+    "comment": "",
+    "items": [
+      "CMPRV %1 0"
+    ],
+    "name": "$TEST",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "COPY A %1",
+      "CALL TX_CHAR:",
+      "POP A"
+    ],
+    "name": "$TXCHAR",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "COPY A %1",
+      "MEMGET8 A A",
+      "CALL TX_CHAR:",
+      "POP A"
+    ],
+    "name": "$TXMEMCHAR",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "COPY A %1",
+      "CALL TX_HEX32:",
+      "POP A"
+    ],
+    "name": "$TXR",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "PUSH A",
+      "COPY A %1",
+      "CALL TX_STR:",
+      "POP A"
+    ],
+    "name": "$TXSTR",
+    "variables": 1
+  },
+  {
+    "comment": "",
+    "items": [
+      "DELAYV %1",
+      "DELAYV %2"
+    ],
+    "name": "$WAIT",
+    "variables": 2
+  }
+]

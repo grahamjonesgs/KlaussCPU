@@ -95,6 +95,24 @@ module mem_read_write (
     output            o_dma_grant,
 
     // -------------------------------------------------------------------------
+    // DDR master C — AMP core 2 (same contract as the blitter master B above:
+    // req level, grant, single 128 b burst DV/ready, done releases).  Lowest
+    // priority: cache first, blitter second, core 2 last.  Core 2 releases
+    // per-transaction, so core 1 never waits behind more than one 16 B burst
+    // (AMP_CORE2_PLAN.md §5 non-intrusion).
+    // -------------------------------------------------------------------------
+    input             i_c2_req,
+    input             i_c2_done,
+    input             i_c2_write_DV,
+    input             i_c2_read_DV,
+    input      [31:0] i_c2_addr,
+    input      [127:0] i_c2_write_data,
+    input      [15:0] i_c2_wdf_mask,
+    output     [127:0] o_c2_read_data,
+    output            o_c2_ready,
+    output            o_c2_grant,
+
+    // -------------------------------------------------------------------------
     // Cache-maintenance control (MMIO 0xF005). Full-cache operations that walk
     // every set/way. Pulses (1 cycle) trigger; o_mnt_busy is high while a walk
     // runs. The CPU's next cached access transparently stalls until the walk
@@ -161,19 +179,30 @@ module mem_read_write (
     // the blitter when the cache is idle, then back when the blitter pulses
     // i_dma_done — see the grant always-block near the FSM below.
     // -------------------------------------------------------------------------
-    logic          r_grant_blit = 1'b0;     // 0 = cache owns DDR, 1 = blitter owns
+    logic          r_grant_blit = 1'b0;     // blitter owns DDR (master B)
+    logic          r_grant_c2   = 1'b0;     // AMP core 2 owns DDR (master C)
+    // Mutually exclusive by construction (one grant block below); the cache
+    // (master A) owns the controller whenever both are low.
 
-    wire         mig_write_DV   = r_grant_blit ? i_dma_write_DV   : o_ddr_mem_write_DV;
-    wire         mig_read_DV    = r_grant_blit ? i_dma_read_DV    : o_ddr_mem_read_DV;
-    wire [ 31:0] mig_addr       = r_grant_blit ? i_dma_addr       : o_ddr_mem_addr;
-    wire [255:0] mig_write_data = r_grant_blit ? {128'b0, i_dma_write_data} : o_ddr_mem_write_data;
-    wire [ 15:0] mig_wdf_mask   = r_grant_blit ? i_dma_wdf_mask   : w_app_wdf_mask;
-    // Cache fills a full 32 B line (two pipelined BL8 bursts); the blitter does a
-    // single 128 b burst. `mig_wide` tells ddr2_control which.
-    wire         mig_wide       = ~r_grant_blit;
+    wire         mig_write_DV   = r_grant_blit ? i_dma_write_DV
+                                : r_grant_c2   ? i_c2_write_DV   : o_ddr_mem_write_DV;
+    wire         mig_read_DV    = r_grant_blit ? i_dma_read_DV
+                                : r_grant_c2   ? i_c2_read_DV    : o_ddr_mem_read_DV;
+    wire [ 31:0] mig_addr       = r_grant_blit ? i_dma_addr
+                                : r_grant_c2   ? i_c2_addr       : o_ddr_mem_addr;
+    wire [255:0] mig_write_data = r_grant_blit ? {128'b0, i_dma_write_data}
+                                : r_grant_c2   ? {128'b0, i_c2_write_data}
+                                               : o_ddr_mem_write_data;
+    wire [ 15:0] mig_wdf_mask   = r_grant_blit ? i_dma_wdf_mask
+                                : r_grant_c2   ? i_c2_wdf_mask   : w_app_wdf_mask;
+    // Cache fills a full 32 B line (two pipelined BL8 bursts); the blitter and
+    // core 2 do single 128 b bursts. `mig_wide` tells ddr2_control which.
+    wire         mig_wide       = ~(r_grant_blit | r_grant_c2);
 
     assign o_dma_read_data = i_ddr_mem_read_data[127:0]; // blitter uses low 128 b; latches on o_dma_ready
     assign o_dma_grant     = r_grant_blit;
+    assign o_c2_read_data  = i_ddr_mem_read_data[127:0];
+    assign o_c2_grant      = r_grant_c2;
 
     // -------------------------------------------------------------------------
     // Cache-maintenance request capture. A flush/invalidate pulse sets a sticky
@@ -204,15 +233,17 @@ module mem_read_write (
     // sampled directly.
     // -------------------------------------------------------------------------
     // ddr2_control's ready belongs to whichever master is currently granted.
-    // Gate it so the cache only acts on its own DDR completions and the blitter
-    // only on its own — neither can mistake the other's ready for its own.
-    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit;
+    // Gate it so each master only acts on its own DDR completions — none can
+    // mistake another's ready for its own.
+    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit & ~r_grant_c2;
     wire w_blit_ddr_ready  = i_ddr_mem_ready &  r_grant_blit;
-    // CWF early pulse is cache-only (the blitter's narrow reads never emit it,
-    // but gate on the grant anyway).
-    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit;
+    wire w_c2_ddr_ready    = i_ddr_mem_ready &  r_grant_c2;
+    // CWF early pulse is cache-only (the narrow reads never emit it, but gate
+    // on the grants anyway).
+    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit & ~r_grant_c2;
 
     assign o_dma_ready = w_blit_ddr_ready;
+    assign o_c2_ready  = w_c2_ddr_ready;
 
     // -------------------------------------------------------------------------
     // Address decode — combinational from cpu.addr (32-bit byte address).
@@ -990,13 +1021,23 @@ module mem_read_write (
     // be interrupted mid-CDC-gap. In the intended coherency sequence the blit
     // and the flush/invalidate never overlap anyway.
     // -------------------------------------------------------------------------
+    // Three masters, one bus: cache (A, priority — owns it whenever no grant
+    // is out), blitter (B), AMP core 2 (C, lowest).  B and C are granted only
+    // from the no-grant state, so they are mutually exclusive; each releases
+    // via its own done pulse.  Core 2 releases per-transaction, so a cache or
+    // blitter request never waits behind more than one 16 B burst.
     always_ff @(posedge i_Clk) begin
-        if (!r_grant_blit) begin
-            if (!is_miss_path && !r_mnt_active && i_dma_req)
-                r_grant_blit <= 1'b1;
-        end else begin
+        if (!r_grant_blit && !r_grant_c2) begin
+            if (!is_miss_path && !r_mnt_active) begin
+                if (i_dma_req)     r_grant_blit <= 1'b1;
+                else if (i_c2_req) r_grant_c2   <= 1'b1;
+            end
+        end else if (r_grant_blit) begin
             if (i_dma_done)
                 r_grant_blit <= 1'b0;
+        end else begin
+            if (i_c2_done)
+                r_grant_c2 <= 1'b0;
         end
     end
 

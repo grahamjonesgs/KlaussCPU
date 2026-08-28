@@ -1,0 +1,7 @@
+17:18:04.009 I Input file is core1_p1test.kla 
+17:18:04.013 I Emulating core1_p1test.kla: 1736 code bytes, entry 0x00000020 
+17:18:04.015 I Wrote 400 instruction trace lines to out/loader.trace 
+Completed with 0 errors and 0 warnings in 0.005 seconds
+--- Emulator finished: 400 instructions, stop = InstructionCap ---
+--- Captured UART output ---
+--- end UART ---

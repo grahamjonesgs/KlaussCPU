@@ -25,9 +25,21 @@
 //===========================================================================
 module pipeline_core
    import klauss_pkg::*;
+#(
+   // Architectural SP after reset.  Core 1 = top of DDR; the AMP core-2
+   // instance points it at the top of its local BRAM (AMP_CORE2_PLAN.md).
+   parameter logic [31:0] SP_RESET = 32'h0800_0000
+)
 (
    input  logic         clk,
    input  logic         rst,
+   // Clock enable: every sequential block advances only when ce=1.  Core 1
+   // ties it high (bit-identical to the pre-ce core); the AMP core-2 wrapper
+   // drives a /2 toggle so the whole core closes timing under a blanket
+   // 2-cycle multicycle constraint (AMP_CORE2_PLAN.md §3).  All latencies and
+   // handshakes are in CORE cycles (ce ticks), including the mul/shifter
+   // pipes — nothing free-runs past ce.
+   input  logic         ce,
    // run control
    input  logic         start,       // pulse: begin fetching at start_pc
    input  logic [31:0]  start_pc,
@@ -251,7 +263,7 @@ module pipeline_core
    logic [127:0]       ic_rd_data;
    logic [18:0]        ic_rd_tag;
    logic               ic_rd_vhi, ic_rd_vlo;
-   always_ff @(posedge clk) begin
+   always_ff @(posedge clk) if (ce) begin
       ic_rd_idx  <= ic_look_idx;
       ic_rd_data <= ic_data[ic_look_idx];
       ic_rd_tag  <= ic_tag [ic_look_idx];
@@ -690,15 +702,23 @@ module pipeline_core
    assign perf_stall[3] = id_valid && (dec.sp_rd || dec.sp_wr) && sp_busy;
 
    // ------------------------------------------------------------- EX units
-   // multiply — the silicon free-running DSP48 chain, in its OWN always block
-   // exactly like KlaussCPU.sv:558: no reset and no enables, so the operand
-   // regs absorb into DSP AREG/BREG with CE tied high. (Inside the main
-   // clocked block Vivado absorbed ex_a into AREG1 and put the whole dispatch
-   // enable cone on the DSP CE pin — the M5d WNS -0.124 path.)
+   // multiply — the silicon DSP48 chain, in its OWN always block exactly like
+   // KlaussCPU.sv:558: no reset and no data-dependent enables, so the operand
+   // regs absorb into DSP AREG/BREG.  The only enable is the plain ce net
+   // (constant 1 for core 1; the /2 toggle for core 2), which keeps mul
+   // latency in CORE cycles for the mul_cnt interlock.
+   // TIMING HISTORY (AMP builds, 2026-08): this ce-gated shape closes (P1/P2a
+   // met; P2b tier-1 -0.057 on id_op->DSP CEA1, tier-2 closed).  The
+   // enable-free variant was tried in P3 and was WORSE (-0.266): phys_opt's
+   // DSP register optimization then pulls ex_a into the DSP's 2nd A register,
+   // exposing the decode->operand-mux cone as a full-cycle path into the DSP
+   // (M5d's family).  Real fix = register the mul operands at DISPATCH (the
+   // M5 ALU b-operand pattern) or dont_touch on mul_a_q/mul_b_q — its own
+   // design pass (AMP_CORE2_PLAN.md §8).
    logic [64:0]  mul_a_q, mul_b_q;
    logic [127:0] mul_pipe1, mul_pipe2;
    logic [1:0]   mul_cnt;
-   always_ff @(posedge clk) begin
+   always_ff @(posedge clk) if (ce) begin
       mul_a_q   <= {(ex_d.mduns ? 1'b0 : ex_a[63]), ex_a};
       mul_b_q   <= {(ex_d.mduns ? 1'b0 : ex_b[63]), ex_b};
       mul_pipe1 <= $signed(mul_a_q) * $signed(mul_b_q);
@@ -1055,7 +1075,7 @@ module pipeline_core
    logic [63:0] r_shl1, r_shr1, r_sar1, r_rol1, r_ror1, r_oh1, r_btr1, r_sha_op;
    logic [2:0]  r_shhi, r_bthi;
    logic [3:0]  r_shsub;
-   always_ff @(posedge clk) begin
+   always_ff @(posedge clk) if (ce) begin
       if (ex_is_sh_hand) begin
          r_shl1  <= ex_a << ex_shcnt[2:0];
          r_shr1  <= ex_a >> ex_shcnt[2:0];
@@ -1154,7 +1174,7 @@ module pipeline_core
       if (rst) begin
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-         flags <= '0; sp <= 32'h0800_0000; int_mask <= 4'h0;
+         flags <= '0; sp <= SP_RESET; int_mask <= 4'h0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1167,7 +1187,7 @@ module pipeline_core
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
-      end else begin
+      end else if (ce) begin
          // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.

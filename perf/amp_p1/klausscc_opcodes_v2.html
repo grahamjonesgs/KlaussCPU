@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+#opcodes { font-family: Arial, Helvetica, sans-serif; border-collapse: collapse; width: 100%;}
+#opcodes td, #opcodes th { border: 1px solid #ddd; padding: 8px;}
+#opcodes tr:hover {background-color: #ddd;}
+#opcodes th { padding-top: 12px; padding-bottom: 12px; text-align: left; background-color: #04AA6D; color: white;}
+#macros { font-family: Arial, Helvetica, sans-serif; border-collapse: collapse; width: 100%;}
+#macros td, #macros th { border: 1px solid #ddd; padding: 8px;}
+#macros tr:hover {background-color: #ddd;}
+#macros th { padding-top: 12px; padding-bottom: 12px; text-align: left; background-color: #3004aa; color: white;}
+</style>
+</head>
+<body>
+<h1>Klauss ISA Instruction set and macros</h1>
+Created 24/08/2026 17:12<h2>Opcode Table</h2>
+
+<table id="opcodes">
+<tr>
+    <th>Name</th>
+    <th>Opcode</th>
+    <th>Variables</th>
+    <th>Registers</th>
+    <th>Description</th>
+</tr>
+<tr>
+    <td>ADDR</td>
+    <td>44200000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SUBR</td>
+    <td>44600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ADDC</td>
+    <td>44A00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SUBC</td>
+    <td>44E00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ANDR</td>
+    <td>45000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ORR</td>
+    <td>45400000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>XORR</td>
+    <td>45800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MINR</td>
+    <td>45C00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MAXR</td>
+    <td>46000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MINUR</td>
+    <td>46400000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MAXUR</td>
+    <td>46800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPRR</td>
+    <td>4C000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPEQR</td>
+    <td>4C200000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPNER</td>
+    <td>4C600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPLTR</td>
+    <td>4CA00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPGER</td>
+    <td>4CE00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPLER</td>
+    <td>4D200000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPGTR</td>
+    <td>4D600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPULTR</td>
+    <td>4DA00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPUGER</td>
+    <td>4DE00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPULER</td>
+    <td>4E200000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPUGTR</td>
+    <td>4E600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHLR</td>
+    <td>50004000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHLV</td>
+    <td>50204000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHLR1</td>
+    <td>50208000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHLAR</td>
+    <td>50208000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHRR</td>
+    <td>50404000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHRV</td>
+    <td>50604000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHRR1</td>
+    <td>50608000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SARR</td>
+    <td>50804000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHRAV</td>
+    <td>50A04000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SHRAR</td>
+    <td>50A08000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ROLR</td>
+    <td>50C04000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ROLV</td>
+    <td>50E04000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ROLR1</td>
+    <td>50E0C000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RORR</td>
+    <td>51004000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RORV</td>
+    <td>51204000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RORR1</td>
+    <td>5120C000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ROLCR</td>
+    <td>5160C000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RORCR</td>
+    <td>51A0C000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BSETRR</td>
+    <td>52000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BSET</td>
+    <td>52200000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BCLRRR</td>
+    <td>52400000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BCLR</td>
+    <td>52600000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BTGLRR</td>
+    <td>52800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BTGL</td>
+    <td>52A00000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BTSTRR</td>
+    <td>52C00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BTST</td>
+    <td>52E00000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>COPY</td>
+    <td>54000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>NEGR</td>
+    <td>54480000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>NOTR</td>
+    <td>54880000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ABSR</td>
+    <td>54C80000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SEXTB</td>
+    <td>55080000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SEXTH</td>
+    <td>55180000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SEXTW</td>
+    <td>55200000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ZEXTB</td>
+    <td>55480000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ZEXTH</td>
+    <td>55580000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ZEXTW</td>
+    <td>55600000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BSWAP</td>
+    <td>55800000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BITREV</td>
+    <td>55C00000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>POPCNT</td>
+    <td>56080000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CLZ</td>
+    <td>56400000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CTZ</td>
+    <td>56800000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SETFR</td>
+    <td>57000000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>INCR</td>
+    <td>57880000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DECR</td>
+    <td>57C80000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMGET8</td>
+    <td>58000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMGET16</td>
+    <td>59000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMGET32</td>
+    <td>5A000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMREADRR</td>
+    <td>5B000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMGET64</td>
+    <td>5B100000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX64R</td>
+    <td>5B600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSET8</td>
+    <td>5C000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSET16</td>
+    <td>5D000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSET32</td>
+    <td>5E000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSET64RR</td>
+    <td>5F000000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSET64</td>
+    <td>5F100000</td>
+    <td>0</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX64R</td>
+    <td>5F600000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPR</td>
+    <td>60800000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLR</td>
+    <td>62800000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>PUSH</td>
+    <td>64000000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>POP</td>
+    <td>64800000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>GETSP</td>
+    <td>64C00000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SETSP</td>
+    <td>65000000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RET</td>
+    <td>65800000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>IRET</td>
+    <td>65C00000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MULUR</td>
+    <td>68000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MULHUR</td>
+    <td>68400000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MULR</td>
+    <td>68800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MULHR</td>
+    <td>68C00000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DIVUR</td>
+    <td>69000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DIVR</td>
+    <td>69800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MODUR</td>
+    <td>6A000000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MODR</td>
+    <td>6A800000</td>
+    <td>0</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>NOP</td>
+    <td>6C000000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>HALT</td>
+    <td>6C010000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>WAIT</td>
+    <td>6C020000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>RESET</td>
+    <td>6C030000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>TRAP</td>
+    <td>6C040000</td>
+    <td>0</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DELAYR</td>
+    <td>6C050000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LCDCMDR</td>
+    <td>70000000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LCDDATAR</td>
+    <td>71000000</td>
+    <td>0</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ADDV</td>
+    <td>88200000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ADDI</td>
+    <td>88300000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MINUSV</td>
+    <td>88600000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ANDV</td>
+    <td>89000000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ORV</td>
+    <td>89400000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>XORV</td>
+    <td>89800000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LEAPC</td>
+    <td>8B800000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SETR</td>
+    <td>8BD00000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CMPRV</td>
+    <td>8C100000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BEXTR</td>
+    <td>93000000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>BDEP</td>
+    <td>93400000</td>
+    <td>1</td>
+    <td>3</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX8</td>
+    <td>98200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX8_S</td>
+    <td>98A00000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX16</td>
+    <td>99200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX16_S</td>
+    <td>99A00000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX32</td>
+    <td>9A200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX64</td>
+    <td>9B200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LDIDX64A</td>
+    <td>9B300000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMREADR</td>
+    <td>9B400000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX8</td>
+    <td>9C200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX16</td>
+    <td>9D200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX32</td>
+    <td>9E200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX64</td>
+    <td>9F200000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>STIDX64A</td>
+    <td>9F300000</td>
+    <td>1</td>
+    <td>2</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MEMSETR</td>
+    <td>9F400000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMP</td>
+    <td>A0000000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPZ</td>
+    <td>A0080000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPNZ</td>
+    <td>A00C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPC</td>
+    <td>A0100000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPNC</td>
+    <td>A0140000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPO</td>
+    <td>A0180000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPNO</td>
+    <td>A01C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPS</td>
+    <td>A0200000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPNS</td>
+    <td>A0240000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPLT</td>
+    <td>A0280000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPGE</td>
+    <td>A02C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPLE</td>
+    <td>A0300000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPGT</td>
+    <td>A0340000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPULT</td>
+    <td>A0380000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPUGE</td>
+    <td>A03C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPULE</td>
+    <td>A0400000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPUGT</td>
+    <td>A0440000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPE</td>
+    <td>A0480000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>JMPNE</td>
+    <td>A04C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALL</td>
+    <td>A2000000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLZ</td>
+    <td>A2080000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLNZ</td>
+    <td>A20C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLC</td>
+    <td>A2100000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLNC</td>
+    <td>A2140000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLO</td>
+    <td>A2180000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLNO</td>
+    <td>A21C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLE</td>
+    <td>A2480000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>CALLNE</td>
+    <td>A24C0000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>PUSHV</td>
+    <td>A4400000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>ADDSP</td>
+    <td>A5400000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MULV</td>
+    <td>A8800000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DIVV</td>
+    <td>A9800000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>MODV</td>
+    <td>AA800000</td>
+    <td>1</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>DELAYV</td>
+    <td>AC050000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LCDCMDV</td>
+    <td>B0000000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LCDDATAV</td>
+    <td>B1000000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>LCDRST</td>
+    <td>B2000000</td>
+    <td>1</td>
+    <td>0</td>
+    <td></td>
+</tr>
+<tr>
+    <td>SETR64</td>
+    <td>CBC00000</td>
+    <td>2</td>
+    <td>1</td>
+    <td></td>
+</tr>
+<tr>
+    <td>PUSHV64</td>
+    <td>E4400000</td>
+    <td>2</td>
+    <td>0</td>
+    <td></td>
+</tr>
+
+</table><h2>Macro Table</h2>
+<table id="macros">
+<tr>
+    <th>Name</th>
+    <th>Variables</th>
+    <th>Description</th>
+    <th>Details</th>
+</tr>
+<tr>
+    <td>$CALLSAVE</td>
+    <td>1</td>
+    <td></td>
+    <td>  PUSH A  PUSH B  PUSH C  PUSH D  CALL %1  POP D  POP C  POP B  POP A</td>
+</tr><tr>
+    <td>$CLR</td>
+    <td>1</td>
+    <td></td>
+    <td>  SETR %1 0</td>
+</tr><tr>
+    <td>$MEMCPYW</td>
+    <td>3</td>
+    <td></td>
+    <td>  MEMREADRR %3 %2  MEMSET64RR %3 %1</td>
+</tr><tr>
+    <td>$NEWLINE</td>
+    <td>0</td>
+    <td></td>
+    <td>  CALL TX_NL:</td>
+</tr><tr>
+    <td>$POP2</td>
+    <td>2</td>
+    <td></td>
+    <td>  POP %2  POP %1</td>
+</tr><tr>
+    <td>$POP3</td>
+    <td>3</td>
+    <td></td>
+    <td>  POP %3  POP %2  POP %1</td>
+</tr><tr>
+    <td>$POP4</td>
+    <td>4</td>
+    <td></td>
+    <td>  POP %4  POP %3  POP %2  POP %1</td>
+</tr><tr>
+    <td>$POPALL</td>
+    <td>0</td>
+    <td></td>
+    <td>  POP D  POP C  POP B  POP A</td>
+</tr><tr>
+    <td>$PUSH2</td>
+    <td>2</td>
+    <td></td>
+    <td>  PUSH %1  PUSH %2</td>
+</tr><tr>
+    <td>$PUSH3</td>
+    <td>3</td>
+    <td></td>
+    <td>  PUSH %1  PUSH %2  PUSH %3</td>
+</tr><tr>
+    <td>$PUSH4</td>
+    <td>4</td>
+    <td></td>
+    <td>  PUSH %1  PUSH %2  PUSH %3  PUSH %4</td>
+</tr><tr>
+    <td>$PUSHALL</td>
+    <td>0</td>
+    <td></td>
+    <td>  PUSH A  PUSH B  PUSH C  PUSH D</td>
+</tr><tr>
+    <td>$TEST</td>
+    <td>1</td>
+    <td></td>
+    <td>  CMPRV %1 0</td>
+</tr><tr>
+    <td>$TXCHAR</td>
+    <td>1</td>
+    <td></td>
+    <td>  PUSH A  COPY A %1  CALL TX_CHAR:  POP A</td>
+</tr><tr>
+    <td>$TXMEMCHAR</td>
+    <td>1</td>
+    <td></td>
+    <td>  PUSH A  COPY A %1  MEMGET8 A A  CALL TX_CHAR:  POP A</td>
+</tr><tr>
+    <td>$TXR</td>
+    <td>1</td>
+    <td></td>
+    <td>  PUSH A  COPY A %1  CALL TX_HEX32:  POP A</td>
+</tr><tr>
+    <td>$TXSTR</td>
+    <td>1</td>
+    <td></td>
+    <td>  PUSH A  COPY A %1  CALL TX_STR:  POP A</td>
+</tr><tr>
+    <td>$WAIT</td>
+    <td>2</td>
+    <td></td>
+    <td>  DELAYV %1  DELAYV %2</td>
+</tr></table>
+</body>
+</html>

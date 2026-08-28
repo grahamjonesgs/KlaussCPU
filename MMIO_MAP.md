@@ -29,9 +29,35 @@ cache controller.
 0xF00D_xxxx                 Performance counters (CPU pipeline / mix events)
 0xF00E_xxxx                 2D DMA blitter (RGB565 framebuffer accelerator)
 0xF00F_xxxx                 timers / IRQ controller
+0xF010_xxxx                 AMP core 2 mailbox (control / load window / log)
 ```
 
 Reserved ranges read as 0 and ignore writes (no bus error).
+
+### AMP core 2 mailbox — base `0xF010_0000`
+
+Control window for the second pipeline_core (effective 50 MHz, 64 KB local
+BRAM — P1 scope, no DDR/IRQ/LiteEth yet).  Full design: `AMP_CORE2_PLAN.md`;
+implementation: `core2_subsys.sv`.
+
+| Offset | Reg            | RW | Description |
+|--------|----------------|----|-------------|
+| 0x0000 | `C2_CTRL`      | RW | `[0]`=RUN (0 holds core-2 reset).  Read adds `[1]`=parked, `[4:2]`=park_kind (0=HALT 1=TRAP 2=ILLEGAL 3=WAIT), `[8]`=start pending. |
+| 0x0008 | `C2_START_PC`  | RW | Core-2 start PC (sampled on RUN 0→1; images enter at 0x20). |
+| 0x0010 | `C2_WIN_ADDR`  | RW | Load/readback window address (core-2 space).  Writing prefetches `ram[addr]` into `C2_WIN_DATA`. |
+| 0x0018 | `C2_WIN_DATA`  | RW | W: `ram[WIN_ADDR] <= data`, `WIN_ADDR += 8` (auto-increment load path).  R: the prefetched dword.  Only legal while RUN=0. |
+| 0x0020 | `C2_LOG`       | RW | R: `[8]`=valid, `[7:0]`=head byte (non-destructive).  W: pop one byte. |
+| 0x0028 | `C2_LOG_CNT`   | R  | Bytes in the log FIFO (512 deep). |
+| 0x0030 | `C2_PARK_PC`   | R  | Core-2 park PC (valid while parked). |
+| 0x0038 | `C2_ETH_OWNER` | RW | `[0]`=1: core 2 owns the LiteEth windows (`0xF006/7/8`).  Reset 0 = core 1, so boot-ROM netboot is untouched.  The non-owner's eth accesses read 0 / drop writes (no hang). |
+
+Core-2's own view: local RAM at `0x0` (and `0xE000_0000`), and a
+**UART-compatible console** at `0xF001_xxxx` (TX_DATA @0x0000 → log FIFO;
+STATUS @0x0010 with `[0]`=busy=FIFO-full) so unmodified baremetal console
+code runs on core 2.  P2: DDR is visible above its first 64 KB (uncached;
+the 1 MB text window at `0x07E0_0000` is read-cached, 8 KB).  P3: the
+LiteEth windows when it is the owner, and `0xF00F_0040` = a read-only
+mirror of core 1's `clock_ms` (lwIP `sys_now`).
 
 ## Access semantics
 
