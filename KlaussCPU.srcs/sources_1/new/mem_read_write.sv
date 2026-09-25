@@ -207,22 +207,36 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     // Cache-maintenance request capture. A flush/invalidate pulse sets a sticky
     // pending flag (+ mode); the main FSM consumes it from WAIT, raising
-    // r_mnt_active for the duration of the walk. New pulses while a walk is
-    // already active are ignored (the walk is idempotent anyway).
+    // r_mnt_active for the duration of the walk. A pulse that arrives while a
+    // walk is ALREADY RUNNING is captured too (it re-arms pending, so a fresh
+    // walk runs after this one): the running walk may have passed lines that
+    // were dirtied after it started, so dropping the new request would leave
+    // software believing data was flushed that never reached DDR.
     //   r_mnt_mode: 0 = FLUSH (write back dirty), 1 = INVALIDATE (flush + clear valid)
+    // The running walk uses its own r_mnt_walk_mode copy (latched at the
+    // WAIT->MAINT handoff), so a new pulse mid-walk can never retarget the
+    // walk already in progress.
     // -------------------------------------------------------------------------
-    logic r_mnt_pending = 1'b0;
-    logic r_mnt_mode    = 1'b0;
-    logic r_mnt_active  = 1'b0;     // set by the main FSM while a walk runs
+    logic r_mnt_pending   = 1'b0;
+    logic r_mnt_mode      = 1'b0;
+    logic r_mnt_active    = 1'b0;   // set by the main FSM while a walk runs
+    logic r_mnt_active_d  = 1'b0;   // for the consume edge below
+    logic r_mnt_walk_mode = 1'b0;   // mode of the RUNNING walk (owned by the FSM)
 
     assign o_mnt_busy = r_mnt_active | r_mnt_pending;
 
     always_ff @(posedge i_Clk) begin
-        if (r_mnt_active) begin
-            r_mnt_pending <= 1'b0;             // being serviced — clear request
-        end else if (i_flush_go || i_inval_go) begin
+        r_mnt_active_d <= r_mnt_active;
+        if (i_flush_go || i_inval_go) begin
             r_mnt_pending <= 1'b1;
-            r_mnt_mode    <= i_inval_go;       // INVALIDATE wins if both asserted
+            // INVALIDATE wins over FLUSH; a still-pending INVALIDATE is never
+            // downgraded by a later FLUSH pulse (the walk does the superset).
+            r_mnt_mode    <= i_inval_go | (r_mnt_pending & r_mnt_mode);
+        end else if (r_mnt_active && !r_mnt_active_d) begin
+            // The walk that just started (WAIT -> MAINT edge) owns this
+            // request; clear ONLY here so a pulse arriving mid-walk re-arms
+            // pending and schedules a fresh walk after the current one.
+            r_mnt_pending <= 1'b0;
         end
     end
 
@@ -535,10 +549,11 @@ module mem_read_write (
                     // Cache maintenance has priority over CPU requests: a pending
                     // flush/invalidate is consumed here, while the CPU stalls on
                     // its (un-served) request until the walk completes.
-                    r_mnt_active  <= 1'b1;
-                    r_cache_index <= {INDEX_BITS{1'b0}};
-                    r_mnt_sub     <= MS_READ;
-                    state         <= MAINT;
+                    r_mnt_active    <= 1'b1;
+                    r_mnt_walk_mode <= r_mnt_mode;   // freeze the mode for this walk
+                    r_cache_index   <= {INDEX_BITS{1'b0}};
+                    r_mnt_sub       <= MS_READ;
+                    state           <= MAINT;
                 end else if (w_dv_new) begin
                     // Issue all BRAM reads in parallel (single read port: w_rd_index).
                     r_tag_way0          <= cache_val_addr_way0[w_rd_index];
@@ -941,7 +956,7 @@ module mem_read_write (
                         // Dirty bits for both ways are cleared via the dirty0/1_wen
                         // wires (which include the MS_CLR term). For INVALIDATE,
                         // also clear the valid bit on both ways.
-                        if (r_mnt_mode) begin   // INVALIDATE
+                        if (r_mnt_walk_mode) begin   // INVALIDATE
                             cache_val_addr_way0[r_cache_index] <= {(TAG_BITS+1){1'b0}};
                             cache_val_addr_way1[r_cache_index] <= {(TAG_BITS+1){1'b0}};
                         end
@@ -1026,17 +1041,33 @@ module mem_read_write (
     // from the no-grant state, so they are mutually exclusive; each releases
     // via its own done pulse.  Core 2 releases per-transaction, so a cache or
     // blitter request never waits behind more than one 16 B burst.
+    // Orphaned-grant guard: both DMA masters hold their req HIGH for the whole
+    // tenure and only drop it in the same cycle they pulse done (blit end /
+    // core-2 transaction end).  A granted master showing req=0 with no done
+    // pulse can therefore only mean it was RESET mid-tenure (CPU_RESETN during
+    // a blit); without this guard the grant is held forever and every later
+    // cache miss hangs on the parked bus.  Drain a few quiet cycles first so
+    // any DDR transaction the dying master left in flight completes before
+    // the cache can see a stale ready.
+    logic [3:0] r_grant_orphan_cnt = 4'd0;
+    wire w_grant_orphaned = (r_grant_blit && !i_dma_req && !i_dma_done) ||
+                            (r_grant_c2   && !i_c2_req  && !i_c2_done);
+
     always_ff @(posedge i_Clk) begin
+        r_grant_orphan_cnt <= w_grant_orphaned ? r_grant_orphan_cnt + 4'd1 : 4'd0;
         if (!r_grant_blit && !r_grant_c2) begin
-            if (!is_miss_path && !r_mnt_active) begin
+            // o_mnt_busy (not just r_mnt_active): a REQUESTED flush/invalidate
+            // must win over a new DMA tenure even before its walk has started,
+            // or the walk's coherency point drifts behind a whole blit chunk.
+            if (!is_miss_path && !o_mnt_busy) begin
                 if (i_dma_req)     r_grant_blit <= 1'b1;
                 else if (i_c2_req) r_grant_c2   <= 1'b1;
             end
         end else if (r_grant_blit) begin
-            if (i_dma_done)
+            if (i_dma_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
                 r_grant_blit <= 1'b0;
         end else begin
-            if (i_c2_done)
+            if (i_c2_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
                 r_grant_c2 <= 1'b0;
         end
     end

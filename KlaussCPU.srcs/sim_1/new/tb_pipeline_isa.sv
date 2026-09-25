@@ -148,6 +148,20 @@ module tb_pipeline_isa;
 
    assign irq_ready = timer_pending && int_mask_o[0];
 
+   // Mask-race oracle (M5c maskrace): a dispatch ack is only legal if
+   // irq_ready was still high on the cycle the frame push completed.  If an
+   // older INT_MASK store (irq_lock) landed during the drain shadow and the
+   // core dispatched anyway, irq_ready is low here — that is the handler
+   // running inside the critical section.
+   int   maskrace_viol = 0;
+   logic r_irq_ready_d = 0;
+   always @(posedge clk) begin
+      if (!rst) begin
+         r_irq_ready_d <= irq_ready;
+         if (irq_ack && !r_irq_ready_d) maskrace_viol++;
+      end
+   end
+
    always @(posedge clk) begin
       if (!rst) begin
          cyc <= cyc + 1;
@@ -242,6 +256,17 @@ module tb_pipeline_isa;
          else
             $display("TB_M5C SMC: FAIL (r2=%016x, expected beef)", dbg_r[2]);
       end
+      if (test_mode == "maskrace") begin
+         if (maskrace_viol == 0 && irq_acks >= 8 && dbg_r[2] === 64'd512)
+            $display("TB_M5C MASKRACE: PASS (%0d irqs, 0 in-lock dispatches)",
+                     irq_acks);
+         else
+            $display("TB_M5C MASKRACE: FAIL (viol=%0d acks=%0d r2=%016x)",
+                     maskrace_viol, irq_acks, dbg_r[2]);
+      end
+      else if (maskrace_viol != 0)
+         $display("TB_M5A: WARNING %0d IRQ dispatches with irq_ready low",
+                  maskrace_viol);
       $fclose(trace_f);  $fclose(uart_f);
       $finish;
    endtask
@@ -289,6 +314,40 @@ module tb_pipeline_isa;
             install_handler();
             irq_fire_at = 1500;    // well after the WAIT parks
             image_f = "(built-in wait test)";
+         end
+         "maskrace": begin
+            // Zephyr irq_lock repro: 256 unrolled iterations of
+            //   MEMSET64RR [r4],r5   (INT_MASK=0, irq_lock)
+            //   INCR r2 ; INCR r2    (critical section work)
+            //   MEMSET64RR [r4],r3   (INT_MASK=1, irq_unlock)
+            //   12x INCR r6          (open unmasked window, like real code)
+            // under a timer storm.  The race: the IRQ is taken at a dispatch
+            // boundary while the NEXT lock store is already in flight; the
+            // drained store then clears the mask, and an unfixed core pushes
+            // the frame anyway — the handler runs inside the critical
+            // section (oracle above).  A fixed core abandons those entries
+            // and dispatches in the open window instead.  r2 must reach 512.
+            mem_lo[4]  = {32'h00180000, 32'h8BD00100};  // SETR r1,0x180000
+            mem_lo[5]  = {32'hF00F0000, 32'h8BD00400};  // SETR r4,INT_MASK
+            mem_lo[6]  = {32'h00000001, 32'h8BD00300};  // SETR r3,1 (unlock)
+            mem_lo[7]  = {32'h00000000, 32'h8BD00500};  // SETR r5,0 (lock)
+            mem_lo[8]  = {32'h00000000, 32'h8BD00200};  // SETR r2,0
+            mem_lo[9]  = {32'h00000000, 32'h8BD00600};  // SETR r6,0
+            mem_lo[10] = {32'h5F000340, 32'h6C000000};  // NOP ; first unmask
+            for (int k = 0; k < 256; k++) begin
+               mem_lo[11 + 8*k] = {32'h57880220, 32'h5F000540}; // lock ; INCR r2
+               mem_lo[12 + 8*k] = {32'h5F000340, 32'h57880220}; // INCR r2 ; unlock
+               for (int j = 0; j < 6; j++)                      // 12x INCR r6
+                  mem_lo[13 + 8*k + j] = {32'h57880660, 32'h57880660};
+            end
+            mem_lo[11 + 8*256] = {32'h00000000, 32'h6C010000};  // HALT
+            install_handler();
+            // Period must comfortably exceed the handler's ~60-cycle cost or
+            // the ISR re-enters at every IRET and the run degenerates into
+            // millions of handler retires. Prime vs the iteration length so
+            // the fire point sweeps every phase (incl. lock-in-flight).
+            if (irq_period == 0) irq_period = 97;
+            image_f = "(built-in maskrace test)";
          end
          "smc": begin
             // SETR r1,0xBEEF; SETR r3,0x3C; MEMSET32 [r3],r1 (hits the imm

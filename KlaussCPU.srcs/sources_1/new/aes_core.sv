@@ -47,6 +47,7 @@ module aes_core (
     input  wire         i_rst,
 
     input  wire         i_key_load,    // 1-cycle pulse: expand i_key into round keys
+    input  wire         i_key_zero,    // 1-cycle pulse: wipe ALL key-derived state
     input  wire         i_go_enc,      // 1-cycle pulse: encrypt i_data_in
     input  wire         i_go_dec,      // 1-cycle pulse: decrypt i_data_in
     input  wire [127:0] i_key,         // 128-bit key (consumed on i_key_load)
@@ -311,6 +312,21 @@ module aes_core (
             r_phase      <= PH_SUB;
             for (i = 0; i < 11; i = i + 1)
                 r_round_key[i] <= 128'h0;
+        end else if (i_key_zero) begin
+            // KEY_ZERO deep wipe: the expanded schedule and every key-derived
+            // datapath register go to 0, not just the wrapper's r_key copy.
+            // Unconditional (aborts any in-flight operation) — zeroization
+            // must not depend on the engine being idle.
+            for (i = 0; i < 11; i = i + 1)
+                r_round_key[i] <= 128'h0;
+            r_ks_word    <= 32'h0;
+            r_sel_key    <= 128'h0;
+            r_state_data <= 128'h0;
+            r_sub        <= 128'h0;
+            o_data_out   <= 128'h0;
+            r_state      <= ST_IDLE;
+            o_busy       <= 1'b0;
+            o_done       <= 1'b0;
         end else begin
             case (r_state)
                 ST_IDLE: begin

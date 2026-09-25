@@ -25,7 +25,7 @@ cache controller.
 0xF009_xxxx                 reserved
 0xF00A_xxxx                 Crypto — AES-128 (+ AES-GCM, planned)
 0xF00B_xxxx                 Crypto — SHA-256 (+ HMAC wrapper, planned)
-0xF00C_xxxx                 Crypto — TRNG (planned)
+0xF00C_xxxx                 Crypto — TRNG
 0xF00D_xxxx                 Performance counters (CPU pipeline / mix events)
 0xF00E_xxxx                 2D DMA blitter (RGB565 framebuffer accelerator)
 0xF00F_xxxx                 timers / IRQ controller
@@ -181,8 +181,8 @@ Legacy opcodes: `LEDR/LEDV` (set), `SWITCHR` (read switches) — see
 ### Cache controller — base `0xF005_0000`
 
 Performance counters and control for the L1 cache (2-way set-associative
-write-back, 64 KB total, 16-byte lines — see
-[mem_read_write.v](KlaussCPU.srcs/sources_1/new/mem_read_write.v)). The events
+write-back, 64 KB total, 32-byte lines — see
+[mem_read_write.sv](KlaussCPU.srcs/sources_1/new/mem_read_write.sv)). The events
 mirror the cache-related set of RISC-V Zihpm performance counters
 (`mhpmcounter` / `mhpmevent`); RISC-V leaves the actual counter exposure
 implementation-defined, so they live in MMIO here rather than as CSRs.
@@ -205,15 +205,25 @@ to manage rollover. Reset values: all zero. Counters are not affected by
 `CPU_RESETN` or program load — only by writing `CACHE_CTRL` bit 0.
 
 **Flush / invalidate (full-cache).** `CACHE_CTRL[1]` (FLUSH) and `[2]`
-(INVALIDATE) trigger an FSM in `mem_read_write.v` that walks every set/way
-(2048 × 2). FLUSH writes back each dirty line to DDR and marks it clean,
+(INVALIDATE) trigger an FSM in `mem_read_write.sv` that walks every set/way
+(1024 × 2). FLUSH writes back each dirty line to DDR and marks it clean,
 keeping it valid; INVALIDATE flushes dirty lines and then clears valid on
 every line. The walk takes on the order of a few thousand `i_Clk` cycles (more
-when many lines are dirty). It runs only when the cache is idle and has
-priority over CPU requests, so the CPU's next cached access transparently
-stalls until the walk completes — **a flush/invalidate behaves synchronously**
-from software's view (the store returns, and the following instruction fetch
-blocks until done). `CACHE_STATUS[0]` (MNT_BUSY) can also be polled.
+when many lines are dirty). The request is sticky: one issued while a walk is
+already running schedules a fresh walk after the current one (so lines
+dirtied mid-walk are still covered), and a pending request holds off new
+blitter/core-2 bus tenures until the walk has run.
+
+**"Synchronous" has a precise, narrower meaning here.** The CPU's next
+access **through the cache** (any DRAM load/store, and instruction fetch
+that misses the core's internal I-cache/fetch buffers) stalls until the
+walk completes. Accesses that do NOT go through the cache — MMIO
+loads/stores, and code fetches served entirely from the core's I-cache/IFB —
+do not wait. In practice: the store to `CACHE_CTRL` returns, and the walk is
+guaranteed complete before the next *cached* access lands, which is what the
+DMA-coherency sequences need; but code that must not start the next MMIO
+action (e.g. kicking the blitter) before the walk ends should poll
+`CACHE_STATUS[0]` (MNT_BUSY) — it covers both the pending and active phases.
 
 These exist for **DMA / blitter coherency**: the CPU accesses memory through
 this write-back cache, while the [2D DMA blitter](#2d-dma-blitter--base-0xf00e_0000)
@@ -224,6 +234,14 @@ hits DDR directly. The required sequence is:
 2. Program and start the blit; wait for `BLIT_STATUS.DONE`.
 3. **INVALIDATE** after the blit, so the CPU re-reads the blitter's output from
    DDR instead of stale cached copies of the destination.
+
+**Sub-line hazard (know this when laying out shared buffers):** dirty
+tracking is one bit per 32 B line and writeback is whole-line. A CPU store
+that dirties any byte of a line will eventually write back all 32 bytes —
+clobbering DMA/core-2 output that shares the line. Keep buffers the blitter
+or core 2 writes **32-byte aligned and padded**, so no line is ever shared
+between CPU-written and DMA-written data (this is the existing contract in
+AMP_CORE2_PLAN.md; per-dword dirty bits are the eventual hardware fix).
 
 ```c
 #include "mmio.h"
@@ -795,10 +813,10 @@ for putting bulk crypto in fabric. Implemented in
 
 | Offset | Reg          | RW | Width | Description |
 |--------|--------------|----|-------|-------------|
-| 0x000  | `AES_CTRL`   | W  | 8     | `[0]` GO (encrypt/decrypt one block; self-clearing). `[1]` ENC (1 = encrypt, 0 = decrypt; sampled with GO). `[2]` KEY_LOAD (expand key schedule; self-clearing). `[3]` KEY_ZERO (wipe key registers; self-clearing). |
+| 0x000  | `AES_CTRL`   | W  | 8     | `[0]` GO (encrypt/decrypt one block; self-clearing). `[1]` ENC (1 = encrypt, 0 = decrypt; sampled with GO). `[2]` KEY_LOAD (expand key schedule; self-clearing). `[3]` KEY_ZERO (full zeroization: staging key, the expanded round-key schedule inside the core, and the key-derived GCM state H/X/TAG; self-clearing). |
 | 0x008  | `AES_STATUS` | R  | 8     | `[0]` BUSY (operation in progress). `[1]` DONE (last operation completed; sticky until next GO/KEY_LOAD). |
-| 0x010  | `AES_KEY0`   | RW | 64    | Key bits [63:0]. |
-| 0x018  | `AES_KEY1`   | RW | 64    | Key bits [127:64]. |
+| 0x010  | `AES_KEY0`   | W  | 64    | Key bits [63:0]. Write-only — reads return 0 (keys are never readable over MMIO). |
+| 0x018  | `AES_KEY1`   | W  | 64    | Key bits [127:64]. Write-only — reads return 0. |
 | 0x040  | `AES_IN0`    | RW | 64    | Input block bits [63:0] (plaintext for encrypt, ciphertext for decrypt). |
 | 0x048  | `AES_IN1`    | RW | 64    | Input block bits [127:64]. |
 | 0x050  | `AES_OUT0`   | R  | 64    | Output block bits [63:0]. |
@@ -934,10 +952,10 @@ Per CRYPTO_PLAN.md §8.
 |--------|----------------|----|-------|-------------|
 | 0x080  | `HMAC_CTRL`    | W  | 8     | `[0]` KEY_LOAD  (recompute inner/outer midstates from `HMAC_KEY0..3`; ignored if already busy).  `[1]` START (single-cycle: H ← inner_state).  `[2]` FINAL (single-cycle: H ← outer_state).  `[3]` KEY_ZERO (wipe key + midstates).  All bits self-clearing. |
 | 0x088  | `HMAC_STATUS`  | R  | 8     | `[0]` BUSY (HMAC FSM running a midstate-computation pass).  `[1]` KEY_VALID (midstates have been computed and not been wiped). |
-| 0x090  | `HMAC_KEY0`    | RW | 64    | Key bits [63:0]. |
-| 0x098  | `HMAC_KEY1`    | RW | 64    | Key bits [127:64]. |
-| 0x0A0  | `HMAC_KEY2`    | RW | 64    | Key bits [191:128]. |
-| 0x0A8  | `HMAC_KEY3`    | RW | 64    | Key bits [255:192]. |
+| 0x090  | `HMAC_KEY0`    | W  | 64    | Key bits [63:0]. Write-only — reads return 0. |
+| 0x098  | `HMAC_KEY1`    | W  | 64    | Key bits [127:64]. Write-only — reads return 0. |
+| 0x0A0  | `HMAC_KEY2`    | W  | 64    | Key bits [191:128]. Write-only — reads return 0. |
+| 0x0A8  | `HMAC_KEY3`    | W  | 64    | Key bits [255:192]. Write-only — reads return 0. |
 
 **Timing.**  `KEY_LOAD` runs two SHA compressions back-to-back — ~135 cycles
 total.  `START` and `FINAL` are single-cycle H-load pulses; they never
@@ -981,7 +999,7 @@ debiasing and a NIST SP 800-90B repetition-count health monitor.  See
 |--------|----------------|----|-------|-------------|
 | 0x000  | `TRNG_CTRL`    | RW | 8     | `[0]` ENABLE (1 = sample ROs and produce output). `[1]` RESEED (self-clearing — drains FIFO, resets accumulator, restarts the RCT). |
 | 0x008  | `TRNG_STATUS`  | R  | 8     | `[0]` READY (≥1 conditioned 64-bit word in FIFO). `[1]` HEALTH_OK (Repetition-Count Test has not tripped). |
-| 0x010  | `TRNG_DATA`    | R  | 64    | 64-bit conditioned word.  **Reading this register consumes one FIFO entry** — side-effecting MMIO read.  Reads when READY = 0 return the last popped value (no new entropy). |
+| 0x010  | `TRNG_DATA`    | R  | 64    | 64-bit conditioned word.  **Reading this register consumes one FIFO entry** — side-effecting MMIO read.  Reads when READY = 0 return the current (stale) head slot — always check READY first. |
 
 **Pipeline.**  16 ring oscillators → metastability double-FF → XOR-fold to
 1 raw bit/cycle → Von Neumann debias (drops same-pair bits, emits the
@@ -995,10 +1013,12 @@ microseconds before reading `TRNG_DATA` — the FIFO fills as soon as the
 ROs settle (typically <1 µs).
 
 **Health monitor.**  `HEALTH_OK` drops to 0 if the raw-bit Repetition-Count
-Test trips (32 consecutive identical bits, false-positive ≈ 2⁻³¹ on a
-balanced source).  Once tripped, the fault is latched until `RESEED`;
-software MUST treat `!HEALTH_OK` as fatal for key material and refuse
-further use until a reseed succeeds.
+Test trips (64 consecutive identical bits, false-positive ≈ 2⁻⁶³ per window
+on a balanced source — the earlier cutoff of 32 false-tripped every ~21 s at
+the 10⁸ windows/s the source emits).  Once tripped, the fault is latched
+until `RESEED` **and the hardware stops queueing new output words** (READY
+drops once the FIFO drains); software MUST treat `!HEALTH_OK` as fatal for
+key material and refuse further use until a reseed succeeds.
 
 **Conditioning policy.**  Output is XOR-distilled (16 independent ROs)
 and Von-Neumann debiased — minimum-entropy per output bit is conservatively

@@ -701,7 +701,19 @@ module KlaussCPU (
 
    // Mux: break takes priority over normal TX; idle state is line-high
    assign o_uart_tx  = r_break_active ? 1'b0 : w_uart_tx_serial;
-   assign w_reset_H  = !CPU_RESETN;
+
+   // CPU_RESETN is a raw button pin: synchronize it into the ui_clk domain
+   // (2-FF) before it fans out to the design's thousands of synchronous-reset
+   // loads. The whole design is synchronous, so assertion through the
+   // synchronizer is fine; what must be clean is the RELEASE edge — raw, it
+   // can land inside different FFs' setup windows on different cycles and
+   // release parts of the SoC one cycle apart (the XDC's set_false_path was
+   // hiding exactly that hazard). The 2'b00 power-up value also yields a
+   // clean 2-cycle domain reset once the MIG's ui_clk starts (DDR calibration
+   // itself is separately gated by w_calib_done in the boot FSM).
+   (* ASYNC_REG = "TRUE" *) logic [1:0] r_rstn_sync = 2'b00;
+   always_ff @(posedge i_Clk) r_rstn_sync <= {r_rstn_sync[0], CPU_RESETN};
+   assign w_reset_H  = !r_rstn_sync[1];
 
    // KEEP_HIERARCHY prevents Vivado from flattening these modules' logic into
    // surrounding CPU slices. Without it the placer can scatter sd_spi/splitter
@@ -1333,7 +1345,7 @@ module KlaussCPU (
    wire w_eth_nown_ack = (w_eth_write_DV | w_eth_read_DV) & w_eth_own2 & ~r_eth_nown_dv_d;
    eth_mmio_bridge eth_mmio_bridge_i (
        .i_clk             (i_Clk),
-       .i_rst             (~CPU_RESETN),
+       .i_rst             (w_reset_H),      // synchronized (see r_rstn_sync)
        .mmio              (eth_bus),
        // LiteEth Wishbone master
        .o_wb_adr          (w_eth_wb_adr),
@@ -1355,7 +1367,7 @@ module KlaussCPU (
 
    liteeth_core liteeth_core_i (
        .sys_clock          (i_Clk),
-       .sys_reset          (~CPU_RESETN),
+       .sys_reset          (w_reset_H),     // synchronized (see r_rstn_sync)
        .interrupt          (w_eth_irq),
 
        // RMII connection to PHY pins
@@ -1719,10 +1731,17 @@ rams_sp_nc rams_sp_nc1 (
       // Break received: arm the flag so next byte is treated as a command
       else if (w_uart_break) begin
          r_break_received <= 1'b1;
+         // The pipeline's 1-cycle dispatch ack must be consumed even on a
+         // branch that skips the PIPE_RUN arm, or the timer source stays
+         // pending and the ISR re-enters straight after its IRET.
+         if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
+            r_timer_interrupt <= 1'b0;
       end
       // Command characters are only accepted after a break
       else if (w_uart_rx_DV & r_break_received) begin
          r_break_received <= 1'b0;  // consume the break — one command per break
+         if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
+            r_timer_interrupt <= 1'b0;   // same ack-consume as the break branch
          case (w_uart_rx_value)
             8'h53: begin // 'S' — load start
                st.SM <= LOADING_BYTE;
@@ -2116,6 +2135,10 @@ rams_sp_nc rams_sp_nc1 (
                   st.PC    <= pip_park_pc;
                   st.SP    <= pip_dbg_sp;
                   st.flags <= pip_dbg_flags;
+                  // The crash dump's OPC= line reads w_opcode = r_opcode_mem,
+                  // which only the (dormant) FSM fetch paths write — without
+                  // this copy a pipeline trap dumps a stale FSM-era opcode.
+                  r_opcode_mem <= pip_park_op;
                   case (pip_park_kind)
                      3'd0: st.SM <= HALTED_BREAK;                                  // HALT
                      3'd1: begin st.SM <= HCF_1; st.error_code <= ERR_TRAP; end    // TRAP

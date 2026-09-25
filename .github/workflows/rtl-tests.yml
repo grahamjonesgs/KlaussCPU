@@ -1,0 +1,92 @@
+# RTL trace-comparison CI
+# ----------------------
+# Runs the project's existing verification gates on every push / PR that
+# touches RTL, testbenches, or the runners:
+#
+#   1. xvlog -sv syntax gate over every source + testbench
+#   2. run_m5a.sh bst / test_64bit  — pipeline core vs klausscc emulator
+#      golden retire trace + UART byte stream (regenerates goldens on a
+#      fresh checkout; they are gitignored at 20-50 MB each)
+#   3. run_m5c.sh — directed WAIT / SMC / irq_lock mask-race tests + IRQ
+#      storms with program-trace identity
+#   4. run_m5d_soc.sh hello — full-SoC boot (boot ROM -> DDR copy -> loader
+#      -> PIPE_RUN) with UART identity against the emulator golden
+#
+# REQUIRES A SELF-HOSTED RUNNER with labels [self-hosted, vivado]:
+# GitHub-hosted runners have neither Vivado xsim nor the klausscc emulator
+# (expected at ~/Documents/src/klausscc/target/release/klausscc) nor the
+# compiled baremetal ELFs the goldens are generated from. Register the dev
+# VM as a runner: repo Settings -> Actions -> Runners -> New self-hosted
+# runner, then `./config.sh --labels vivado`.
+name: RTL tests
+
+on:
+  push:
+    paths:
+      - 'KlaussCPU.srcs/sources_1/new/**'
+      - 'KlaussCPU.srcs/sim_1/new/**'
+      - 'KlaussCPU.srcs/constrs_1/**'
+      - 'perf/m5a/run_*.sh'
+      - '.github/workflows/rtl-tests.yml'
+  pull_request:
+    paths:
+      - 'KlaussCPU.srcs/sources_1/new/**'
+      - 'KlaussCPU.srcs/sim_1/new/**'
+      - 'KlaussCPU.srcs/constrs_1/**'
+      - 'perf/m5a/run_*.sh'
+      - '.github/workflows/rtl-tests.yml'
+
+jobs:
+  sim-tests:
+    runs-on: [self-hosted, vivado]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false        # keep regenerated goldens between runs
+
+      - name: xvlog syntax gate
+        run: |
+          export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
+          cd KlaussCPU.srcs
+          rm -rf /tmp/ci_xvlog && mkdir -p /tmp/ci_xvlog && cd /tmp/ci_xvlog
+          xvlog -sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/klauss_pkg.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/membus_if.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/mmio_if.sv \
+            $(ls $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/*.sv | grep -v -e klauss_pkg -e membus_if -e mmio_if) \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sim_1/new/tb_pipeline_isa.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sim_1/new/tb_soc.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sim_1/new/tb_cache.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sim_1/new/tb_trng.sv \
+            -i $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new
+
+      - name: M5a golden traces (bst, test_64bit)
+        run: |
+          perf/m5a/run_m5a.sh bst
+          perf/m5a/run_m5a.sh test_64bit
+
+      - name: M5c directed IRQ / WAIT / SMC / mask-race + storms
+        run: perf/m5a/run_m5c.sh
+
+      - name: M10 cache unit gate (CWF / shadow / DMA / maintenance)
+        run: perf/m5a/run_m10_cache.sh
+
+      - name: TRNG FIFO pop-timing unit test
+        run: |
+          export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
+          rm -rf /tmp/ci_trng && mkdir -p /tmp/ci_trng && cd /tmp/ci_trng
+          xvlog -sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/mmio_if.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/ring_osc.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sources_1/new/trng.sv \
+            $GITHUB_WORKSPACE/KlaussCPU.srcs/sim_1/new/tb_trng.sv
+          xelab tb_trng -s ttrng --relax
+          xsim ttrng -runall | tee run.log
+          grep -q "TB_TRNG PASS" run.log
+
+      - name: M5d full-SoC boot (hello)
+        run: perf/m5a/run_m5d_soc.sh hello

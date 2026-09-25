@@ -1,8 +1,21 @@
 # CPU Architecture Reference — for C Compiler Implementation
 
+> **Currency note (2026-09).** Parts of this document predate two large
+> changes and are kept for the concepts, not the encodings:
+> 1. **ISA encoding v2** — the opcode numbering below is the v1 layout.
+>    [ISA_ENCODING_V2_MAP.md](ISA_ENCODING_V2_MAP.md) is the authoritative
+>    LLVM-facing opcode map.
+> 2. **The 5-stage pipeline** — execution is `pipeline_core.sv` (see
+>    [PIPELINE_IMPL.md](PIPELINE_IMPL.md)); the multicycle FSM described in
+>    the execution/interrupt sections survives only for boot, program load,
+>    and the crash dump. The `.vh` task files named in the change log at the
+>    bottom no longer exist (only `uart_tasks.vh` remains).
+> Sections known to be stale are marked inline. §6 (flags) reflects the
+> current hardware.
+
 ## 1. Overview
 
-Custom 64-bit RISC-style CPU implemented on a Xilinx 7-series FPGA, targeting 128 MiB of DDR2 SDRAM. The CPU has a 2-way set-associative write-back cache (64 KB, 128-bit lines). Memory is **little-endian**. The address space is 32 bits (byte-addressed); registers are 64 bits wide.
+Custom 64-bit RISC-style CPU implemented on a Xilinx 7-series FPGA, targeting 128 MiB of DDR2 SDRAM. The CPU has a 2-way set-associative write-back cache (64 KB, 32-byte lines). Memory is **little-endian**. The address space is 32 bits (byte-addressed); registers are 64 bits wide. Execution is a 5-stage in-order pipeline at 100 MHz, synchronous with the DDR2 controller (2:1 MIG ui_clk).
 
 ---
 
@@ -29,7 +42,7 @@ Custom 64-bit RISC-style CPU implemented on a Xilinx 7-series FPGA, targeting 12
   - Address 0x0007 → bits [63:56] (MSByte of first doubleword)
 - **Code and data share the same flat address space.** The assembler places the first instruction at `0x0020` (`HEAP_HEADER_WORDS * 8 = 4 * 8 = 32`). Addresses `0x0000–0x001F` (four 64-bit doublewords) are the heap header used by the runtime; the compiler/assembler must not emit code into this region.
 - **Stack** lives at the top of DDR2 and grows downward.
-- All memory accesses go through the cache. The DDR2 bus is 64-bit wide; the cache line is 128-bit (two 64-bit doublewords).
+- All memory accesses go through the cache. The cache line is 32 bytes (four 64-bit doublewords); fills run as two pipelined BL8 bursts with critical-word-first early restart.
 - **Instruction fetch buffer (IFB).** The fetch FSM keeps a one-line (two-doubleword) buffer of the last cache line read for opcodes. A fetch whose PC falls in the buffered line is served directly — skipping the ~5-cycle cache round-trip a hit otherwise costs — so straight-line/tight-loop fetch is much cheaper. It is filled on the OPCODE_FETCH miss path and checked in OPCODE_REQUEST. To preserve coherence (the unified cache is coherent today), a DRAM **store into a buffered line invalidates it**, so self-modifying code and the Zephyr LLEXT loader still observe freshly-written instructions. Branch redirects need no flush — a changed PC simply misses the buffer tag. The IFB is transparent to software; its effect shows up as a drop in `PERF_FETCH_CYCLES` and cache `CNT_READ_HITS` (see MMIO_MAP.md).
 
 ---
@@ -98,7 +111,11 @@ Immediate words are always inline (no literal pool). The instruction fetcher pre
 
 ## 6. Condition Flags
 
-Seven flags, set by various instructions:
+Four flags are **stored** in hardware — Z, S, C, V. The remaining three of
+the original seven (E, L, U) are **derived** from them whenever read
+(`E = Z`, `L = S ^ V`, `U = C`), so software still sees the full 7-bit flag
+word in `SETFR` results and interrupt frames. The architectural behavior of
+each condition is unchanged:
 
 | Flag | Name | Set by |
 |------|------|--------|
@@ -112,10 +129,11 @@ Seven flags, set by various instructions:
 
 **Important distinction:**
 - `zero_flag` is set by arithmetic operations (ADD, SUB, AND, etc.) when the **result** is zero.
-- `equal_flag` is set only by `CMPRR`/`CMPRV` (explicit compare instructions).
+- `equal_flag` is not stored: it is derived as `Z` (CMPRR/CMPRV set Z on equal operands).
+- `less_flag` / `ult_flag` are not stored: they are derived as `S ^ V` and `C` of the compare's subtraction.
 - Conditional jumps use flags from the most recent instruction that set them. `JMPZ` tests `zero_flag`; `JMPE` tests `equal_flag`. Use `CMPRR`/`CMPRV` before `JMPE`/`JMPLT`/`JMPULT` etc.; arithmetic instructions before `JMPZ`/`JMPNZ`.
 
-`SETFR` reads all flags into a register: `rd = {zero_flag, equal_flag, carry_flag, overflow_flag, 60'b0}`.
+`SETFR` reads all flags into a register (E/L/U regenerated from Z/S/C/V at read time).
 
 `IRET` restores PC, flags, and the per-source interrupt mask from the stack (interrupt return). See §13 for the full saved-context layout.
 

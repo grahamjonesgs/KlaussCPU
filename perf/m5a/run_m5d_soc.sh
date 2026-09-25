@@ -29,6 +29,7 @@ xvlog -sv \
   "$SRC/sources_1/new/membus_if.sv" \
   "$SRC/sources_1/new/mmio_if.sv" \
   "$SRC/sources_1/new/pipeline_core.sv" \
+  "$SRC/sources_1/new/core2_subsys.sv" \
   "$SRC/sources_1/new/bus_splitter.sv" \
   "$SRC/sources_1/new/mem_read_write.sv" \
   "$SRC/sources_1/new/boot_rom.sv" \

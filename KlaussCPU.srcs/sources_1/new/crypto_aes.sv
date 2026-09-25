@@ -88,6 +88,7 @@ module crypto_aes (
 
     // Pulses to aes_core — 1-cycle wide.
     logic r_key_load_pulse;
+    logic r_key_zero_pulse;
     logic r_go_enc_pulse;
     logic r_go_dec_pulse;
 
@@ -99,6 +100,7 @@ module crypto_aes (
         .i_clk      (i_Clk),
         .i_rst      (~i_Rst_L),
         .i_key_load (r_key_load_pulse),
+        .i_key_zero (r_key_zero_pulse),
         .i_go_enc   (r_go_enc_pulse),
         .i_go_dec   (r_go_dec_pulse),
         .i_key      (r_key),
@@ -205,6 +207,7 @@ module crypto_aes (
             r_key             <= 128'h0;
             r_data_in         <= 128'h0;
             r_key_load_pulse  <= 1'b0;
+            r_key_zero_pulse  <= 1'b0;
             r_go_enc_pulse    <= 1'b0;
             r_go_dec_pulse    <= 1'b0;
             r_done_latch      <= 1'b0;
@@ -215,6 +218,7 @@ module crypto_aes (
         end else begin
             // Default: deassert pulses each cycle (single-cycle wide).
             r_key_load_pulse  <= 1'b0;
+            r_key_zero_pulse  <= 1'b0;
             r_go_enc_pulse    <= 1'b0;
             r_go_dec_pulse    <= 1'b0;
             r_gcm_go_pulse    <= 1'b0;
@@ -228,10 +232,17 @@ module crypto_aes (
                 case (mmio.addr[15:0])
                     OFF_CTRL: begin
                         if (mmio.write_data[3]) begin
-                            // KEY_ZERO — wipe key (and round-key state inside core
-                            // is left stale; software should follow with KEY_LOAD
-                            // before reusing the engine).
-                            r_key <= 128'h0;
+                            // KEY_ZERO — full zeroization: the staging key, the
+                            // expanded round keys inside aes_core (via the
+                            // i_key_zero pulse), and the key-derived GCM state
+                            // (H = AES_K(0), plus running X and tag). KEY_LOAD
+                            // is still required before reusing the engine.
+                            r_key            <= 128'h0;
+                            r_key_zero_pulse <= 1'b1;
+                            r_gcm_H          <= 128'h0;
+                            r_gcm_X          <= 128'h0;
+                            // (r_gcm_tag wiped by the GCM FSM block, which
+                            // owns it — it watches r_key_zero_pulse.)
                         end
                         if (mmio.write_data[2]) begin
                             r_key_load_pulse <= 1'b1;
@@ -287,8 +298,8 @@ module crypto_aes (
             // captured but the tag was just reset so the new tag becomes
             // the captured value; software is expected to RESET only when
             // idle).
-            if (r_gcm_reset_pulse)
-                r_gcm_tag <= 128'h0;
+            if (r_gcm_reset_pulse || r_key_zero_pulse)
+                r_gcm_tag <= 128'h0;   // key-zero wipes the keyed tag too
 
             case (r_gcm_fsm)
                 GCM_IDLE: begin
@@ -325,8 +336,11 @@ module crypto_aes (
         mmio.read_data = 64'h0;
         case (mmio.addr[15:0])
             OFF_STATUS: mmio.read_data = {62'h0, r_done_latch, w_core_busy};
-            OFF_KEY0:   mmio.read_data = r_key[63:0];
-            OFF_KEY1:   mmio.read_data = r_key[127:64];
+            // Key registers are WRITE-ONLY: reading back key material over
+            // MMIO defeats zeroization (reads return 0; software never read
+            // these — verified across the runtime tree).
+            OFF_KEY0:   mmio.read_data = 64'h0;
+            OFF_KEY1:   mmio.read_data = 64'h0;
             OFF_IN0:    mmio.read_data = r_data_in[63:0];
             OFF_IN1:    mmio.read_data = r_data_in[127:64];
             OFF_OUT0:   mmio.read_data = w_data_out[63:0];

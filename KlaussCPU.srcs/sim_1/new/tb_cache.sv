@@ -623,6 +623,24 @@ module tb_cache;
          errors++; $display("FAIL inval-dirty readback: got %h", d);
       end else $display("PASS inval-dirty-preserved");
 
+      // Mid-walk re-arm: an INVALIDATE issued while a FLUSH walk is still
+      // running must not be dropped — a fresh walk must follow the current
+      // one. (Real shape: blit driver FLUSHes, the blit is short, and its
+      // post-blit INVALIDATE lands while the flush walk is still going.)
+      cpu_read(32'h0007_0000, d, l);                 // cache a clean line
+      poke_ddr_dword(32'h0007_0000, 64'hA5A5_0123_4567_89AB);
+      @(negedge clk); flush_go = 1; @(negedge clk); flush_go = 0;
+      wait (dut.r_mnt_active === 1'b1);              // FLUSH walk running
+      repeat (12) @(negedge clk);                    // well inside the walk
+      @(negedge clk); inval_go = 1; @(negedge clk); inval_go = 0;
+      @(negedge clk);
+      while (mnt_busy) @(negedge clk);               // both walks complete
+      repeat (4) @(negedge clk);
+      cpu_read(32'h0007_0000, d, l);
+      if (d !== 64'hA5A5_0123_4567_89AB) begin
+         errors++; $display("FAIL midwalk-inval: got %h (request dropped)", d);
+      end else $display("PASS midwalk-inval-rearmed");
+
       // ===== Phase H: final image equality ==================================
       // Flush everything, then the fake DDR must equal the scoreboard on every
       // key ever touched — a lost or mis-addressed shadow writeback anywhere

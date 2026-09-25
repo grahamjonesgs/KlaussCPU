@@ -117,33 +117,36 @@ module trng (
     //
     // Track the length of the current run of identical raw bits.  If the run
     // exceeds RCT_LIMIT, latch a fault that drops HEALTH_OK until RESEED.
-    // For a balanced source the probability of 32 consecutive identical bits
-    // is 2^-31 — that's the chosen false-positive bound.
+    // Sizing: the source emits 1e8 windows/s, so a 2^-31 per-window bound
+    // (limit 32) false-trips every ~21 s of enabled operation.  Limit 64
+    // (~2^-63 per window) makes a false trip astronomically unlikely over the
+    // device lifetime while still catching any genuinely stuck source, which
+    // produces runs of thousands within microseconds.
     // -------------------------------------------------------------------------
-    localparam [5:0] RCT_LIMIT = 6'd32;
+    localparam [6:0] RCT_LIMIT = 7'd64;
 
     logic       r_rct_value;
-    logic [5:0] r_rct_count;
+    logic [6:0] r_rct_count;
     logic       r_rct_fail;
 
     always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
             r_rct_value <= 1'b0;
-            r_rct_count <= 6'd1;
+            r_rct_count <= 7'd1;
             r_rct_fail  <= 1'b0;
         end else if (r_reseed_pulse) begin
             r_rct_value <= w_raw_bit;
-            r_rct_count <= 6'd1;
+            r_rct_count <= 7'd1;
             r_rct_fail  <= 1'b0;
         end else if (w_raw_valid) begin
             if (w_raw_bit == r_rct_value) begin
                 if (r_rct_count >= RCT_LIMIT)
                     r_rct_fail <= 1'b1;
                 else
-                    r_rct_count <= r_rct_count + 6'd1;
+                    r_rct_count <= r_rct_count + 7'd1;
             end else begin
                 r_rct_value <= w_raw_bit;
-                r_rct_count <= 6'd1;
+                r_rct_count <= 7'd1;
             end
         end
     end
@@ -232,18 +235,33 @@ module trng (
     // ready from bus_splitter).  A level-sensitive pop would consume two FIFO
     // entries per software read.
     // -------------------------------------------------------------------------
+    // A failed health check BLOCKS output: no new conditioned words enter the
+    // FIFO while r_rct_fail is latched (software sees READY drop once the
+    // queue drains, and HEALTH_OK=0 tells it why; RESEED clears the fault).
+    wire w_push = r_accum_full_pulse && ~r_rct_fail;
+
     logic [63:0] r_fifo [0:1];
     logic [1:0]  r_fifo_count;   // 0, 1, or 2
     logic        r_fifo_head;    // pop index
     logic        r_fifo_tail;    // push index
 
     logic  r_read_dv_prev;
+    logic  r_pop_pend;      // pop scheduled for the cycle AFTER the strobe edge
     always_ff @(posedge i_Clk) begin
-        if (~i_Rst_L) r_read_dv_prev <= 1'b0;
-        else          r_read_dv_prev <= mmio.read_DV;
+        if (~i_Rst_L) begin
+            r_read_dv_prev <= 1'b0;
+            r_pop_pend     <= 1'b0;
+        end else begin
+            r_read_dv_prev <= mmio.read_DV;
+            r_pop_pend     <= mmio.read_DV && ~r_read_dv_prev
+                              && (mmio.addr[15:0] == OFF_DATA);
+        end
     end
-    wire w_read_rising = mmio.read_DV && ~r_read_dv_prev;
-    wire w_pop = w_read_rising && (mmio.addr[15:0] == OFF_DATA) && (r_fifo_count != 2'd0);
+    // Pop one cycle after the strobe edge (the delayed-strobe pattern the
+    // UART RX pop already uses): the SoC's MMIO read stage samples read_data
+    // during that second cycle, so the head must still point at the entry
+    // being returned when the pop commits.
+    wire w_pop = r_pop_pend && (r_fifo_count != 2'd0);
 
     always_ff @(posedge i_Clk) begin
         if (~i_Rst_L) begin
@@ -257,7 +275,7 @@ module trng (
             r_fifo_head  <= 1'b0;
             r_fifo_tail  <= 1'b0;
         end else begin
-            case ({r_accum_full_pulse, w_pop})
+            case ({w_push, w_pop})
                 2'b10: begin    // push only
                     if (r_fifo_count != 2'd2) begin
                         r_fifo[r_fifo_tail] <= r_accum;

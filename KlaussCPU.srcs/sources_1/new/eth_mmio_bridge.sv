@@ -41,7 +41,7 @@ module eth_mmio_bridge (
     output     [ 2:0] o_wb_cti,
     input      [31:0] i_wb_dat_r,
     input             i_wb_ack,
-    input             i_wb_err           // unused for now; tie at top if needed
+    input             i_wb_err           // error termination — handled like ack
 );
 
     // ---- Wishbone single-transfer (B4 classic) ----
@@ -81,9 +81,20 @@ module eth_mmio_bridge (
 
     logic [2:0] state;
 
+    // A Wishbone slave may terminate a cycle with ERR instead of ACK, and an
+    // address nothing decodes may never terminate at all. Either way the CPU
+    // is spinning on mmio.ready — treat ERR as a completed cycle (reads
+    // return 32'hFFFF_FFFF) and back it with a watchdog so no access can
+    // wedge the whole SoC. 256 cycles is orders of magnitude beyond any real
+    // LiteEth CSR/buffer response.
+    logic [8:0] r_wb_tmo;
+    wire        w_wb_end  = i_wb_ack || i_wb_err || r_wb_tmo[8];
+    wire [31:0] w_wb_rdat = (i_wb_err || r_wb_tmo[8]) ? 32'hFFFF_FFFF : i_wb_dat_r;
+
     always_ff @(posedge i_clk) begin
         if (i_rst) begin
             state            <= S_IDLE;
+            r_wb_tmo         <= 9'd0;
             o_wb_adr         <= 30'b0;
             o_wb_dat_w       <= 32'b0;
             o_wb_sel         <= 4'b0;
@@ -104,6 +115,7 @@ module eth_mmio_bridge (
                     if (is_write || is_read) begin
                         if (low_active) begin
                             // Low-half cycle first (always, when low is active).
+                            r_wb_tmo   <= 9'd0;
                             o_wb_adr   <= eth_word_lo;
                             o_wb_dat_w <= mmio.write_data[31:0];
                             o_wb_sel   <= mmio.byte_en[3:0];
@@ -113,6 +125,7 @@ module eth_mmio_bridge (
                             state      <= S_LO;
                         end else if (high_active) begin
                             // Only high half active — skip straight to high cycle.
+                            r_wb_tmo   <= 9'd0;
                             o_wb_adr   <= eth_word_hi;
                             o_wb_dat_w <= mmio.write_data[63:32];
                             o_wb_sel   <= mmio.byte_en[7:4];
@@ -130,8 +143,9 @@ module eth_mmio_bridge (
 
                 // ----------------------------------------------------------------
                 S_LO: begin
-                    if (i_wb_ack) begin
-                        mmio.read_data[31:0] <= i_wb_dat_r;
+                    r_wb_tmo <= r_wb_tmo + 9'd1;
+                    if (w_wb_end) begin
+                        mmio.read_data[31:0] <= w_wb_rdat;
                         if (high_active) begin
                             // Drop STB for one cycle, hold CYC, then issue HI.
                             o_wb_stb <= 1'b0;
@@ -147,6 +161,7 @@ module eth_mmio_bridge (
                 // ----------------------------------------------------------------
                 S_LO_GAP: begin
                     // One-cycle STB-low gap.  Set up high-half params and re-assert.
+                    r_wb_tmo   <= 9'd0;
                     o_wb_adr   <= eth_word_hi;
                     o_wb_dat_w <= mmio.write_data[63:32];
                     o_wb_sel   <= mmio.byte_en[7:4];
@@ -157,8 +172,9 @@ module eth_mmio_bridge (
 
                 // ----------------------------------------------------------------
                 S_HI: begin
-                    if (i_wb_ack) begin
-                        mmio.read_data[63:32] <= i_wb_dat_r;
+                    r_wb_tmo <= r_wb_tmo + 9'd1;
+                    if (w_wb_end) begin
+                        mmio.read_data[63:32] <= w_wb_rdat;
                         o_wb_cyc <= 1'b0;
                         o_wb_stb <= 1'b0;
                         state    <= S_DONE;

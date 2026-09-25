@@ -24,6 +24,15 @@ xsim tpisa -runall -testplusarg "TEST=wait" -testplusarg "TRACE=out/wait.trace" 
   -testplusarg "UARTF=out/wait.uart" | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
 xsim tpisa -runall -testplusarg "TEST=smc" -testplusarg "TRACE=out/smc.trace" \
   -testplusarg "UARTF=out/smc.uart" | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
+# irq_lock mask-race (older INT_MASK store in the drain shadow): two phase
+# sweeps — prime storm periods, second with randomized DRAM latency.
+xsim tpisa -runall -testplusarg "TEST=maskrace" -testplusarg "TRACE=out/maskrace.trace" \
+  -testplusarg "UARTF=out/maskrace.uart" -testplusarg "IRQ_PERIOD=97" \
+  | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
+xsim tpisa -runall -testplusarg "TEST=maskrace" -testplusarg "TRACE=out/maskrace2.trace" \
+  -testplusarg "UARTF=out/maskrace2.uart" -testplusarg "IRQ_PERIOD=113" \
+  -testplusarg "LAT=1" -testplusarg "RAND=9" \
+  | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
 
 storm () {  # prog period extra_args golden_uart
   local P=$1 PER=$2; shift 2

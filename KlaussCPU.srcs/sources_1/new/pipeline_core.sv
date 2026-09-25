@@ -1223,16 +1223,31 @@ module pipeline_core
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
                    && mem_xc == 2'd0 && !if_xc) begin
-                  m_addr     <= sp - 32'd8;
-                  m_wdata    <= {21'b0, int_mask,
-                                 flags.zero, flags.zero, flags.carry,
-                                 flags.overflow, flags.sign,
-                                 (flags.sign ^ flags.overflow), flags.carry,
-                                 pc};
-                  m_be       <= 8'hFF;
-                  m_write_DV <= 1'b1;
-                  rdy_armed  <= !m_ready;
-                  irq_xc     <= 1'b1;
+                  // RE-CHECK at the drain boundary: an OLDER in-flight store
+                  // may have completed during the shadow and killed the cause
+                  // — an INT_MASK write (Zephyr irq_lock) or a level-IRQ ack
+                  // (blitter DONE W1C). Entering the handler then would run it
+                  // inside the critical section / dispatch a spurious IRQ.
+                  // All older stores have retired here (pipeline empty,
+                  // mem_xc==0), so irq_ready is now final for this boundary.
+                  if (!irq_ready) begin
+                     irq_active <= 1'b0;   // abandon: fetch resumes at pc
+                  end else begin
+                     // Re-latch source+vector too: the drained stores may have
+                     // retargeted the highest-priority pending source.
+                     irq_sel_q  <= irq_sel;
+                     irq_vec_q  <= irq_vector;
+                     m_addr     <= sp - 32'd8;
+                     m_wdata    <= {21'b0, int_mask,
+                                    flags.zero, flags.zero, flags.carry,
+                                    flags.overflow, flags.sign,
+                                    (flags.sign ^ flags.overflow), flags.carry,
+                                    pc};
+                     m_be       <= 8'hFF;
+                     m_write_DV <= 1'b1;
+                     rdy_armed  <= !m_ready;
+                     irq_xc     <= 1'b1;
+                  end
                end
             end else if (w_mrdy) begin
                m_write_DV          <= 1'b0;

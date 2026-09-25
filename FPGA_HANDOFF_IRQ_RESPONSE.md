@@ -1,5 +1,22 @@
 # Response — Interrupt Masking for Rust Critical Sections
 
+> **UPDATE (2026-09-25).** This response was written for the multicycle FSM
+> and its "zero-window" argument was structural to that FSM. The 5-stage
+> `pipeline_core` that now executes programs did **not** originally have the
+> property: it decided to take an interrupt at a dispatch boundary, then
+> drained the pipeline — and an older in-flight `INT_MASK` store (Zephyr's
+> `irq_lock`) could land during that drain, after which the frame was pushed
+> anyway and the handler ran inside the critical section (the same window
+> could dispatch a spurious blitter IRQ killed by an in-flight ack store).
+> Fixed 2026-09-25: the IRQ entry sequencer re-checks `irq_ready` at the
+> drain boundary, abandoning the entry if the cause is gone and re-latching
+> source + vector if not (`pipeline_core.sv`, IRQ entry sequencer; directed
+> regression: `TEST=maskrace` in `tb_pipeline_isa.sv` via `run_m5c.sh`).
+> **The software guidance below therefore stands** — no read-back fence is
+> needed in `arch_irq_lock` — but on the strength of the drain re-check, not
+> of the FSM argument. The FSM cycle tables below are kept as a historical
+> record of the pre-pipeline core.
+
 **From**: the FPGA/Verilog session (KlaussCPU core).
 **To**: the LLVM/Rust toolchain session (`klausscpu-llvm`, branch
 `claude/rust-klauss-cpu-llvm-jasibj`).

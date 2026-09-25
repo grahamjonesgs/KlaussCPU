@@ -430,10 +430,12 @@ module crypto_sha (
             OFF_DIGEST0 + 16'h18: mmio.read_data = digest_pack(2'd3);
             // HMAC registers
             OFF_HMAC_STATUS: mmio.read_data = { 62'h0, r_hmac_key_valid, w_hmac_busy };
-            OFF_HMAC_KEY0:   mmio.read_data = r_hmac_key[63:0];
-            OFF_HMAC_KEY1:   mmio.read_data = r_hmac_key[127:64];
-            OFF_HMAC_KEY2:   mmio.read_data = r_hmac_key[191:128];
-            OFF_HMAC_KEY3:   mmio.read_data = r_hmac_key[255:192];
+            // HMAC key registers are WRITE-ONLY (same zeroization rationale
+            // as the AES key regs — reads return 0).
+            OFF_HMAC_KEY0:   mmio.read_data = 64'h0;
+            OFF_HMAC_KEY1:   mmio.read_data = 64'h0;
+            OFF_HMAC_KEY2:   mmio.read_data = 64'h0;
+            OFF_HMAC_KEY3:   mmio.read_data = 64'h0;
             default:     mmio.read_data = 64'h0;
         endcase
     end
