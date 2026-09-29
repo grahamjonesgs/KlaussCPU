@@ -39,8 +39,14 @@ storm () {  # prog period extra_args golden_uart
   xsim tpisa -runall -testplusarg "IMAGE=$P.mem" -testplusarg "TRACE=out/$P.storm.trace" \
     -testplusarg "UARTF=out/$P.storm.uart" -testplusarg "IRQ_PERIOD=$PER" "$@" \
     | grep "TB_M5A: [0-9s]" >&2
-  awk '$0 !~ / pc=001000/' "out/$P.storm.trace" | sed -e 's/^i=[0-9]* //' -e 's/ f=[01]*//' > "out/$P.storm.nf"
-  sed -e 's/^i=[0-9]* //' -e 's/ f=[01]*//' "$P.trace" > "out/$P.gold.ni"
+  # Sub-word store annotations (wr=addr/BE/data, BE != ff) print the merged
+  # dword read back after the write, i.e. they include the NEIGHBOURING bytes.
+  # Under a storm the handler's frame pushes leave different junk in
+  # uninitialised stack bytes, so compare address+BE only for those (64-bit
+  # stores keep their data; every register/sp/pc is still compared).
+  SUBWR='/wr=[0-9a-f]\{8\}\/ff\//!s# \(wr=[0-9a-f]\{8\}/[0-9a-f]\{2\}\)/[0-9a-f]\{16\}# \1#'
+  awk '$0 !~ / pc=001000/' "out/$P.storm.trace" | sed -e 's/^i=[0-9]* //' -e 's/ f=[01]*//' -e "$SUBWR" > "out/$P.storm.nf"
+  sed -e 's/^i=[0-9]* //' -e 's/ f=[01]*//' -e "$SUBWR" "$P.trace" > "out/$P.gold.ni"
   if cmp -s "out/$P.storm.nf" "out/$P.gold.ni"; then
     echo "STORM $P: program trace identical under IRQ storm"
   else

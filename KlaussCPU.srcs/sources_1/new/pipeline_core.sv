@@ -105,6 +105,7 @@ module pipeline_core
       U_LEA, U_MOV, U_MOV64, U_BEXTR, U_BDEP,
       U_LOAD, U_LOAD32, U_STORE,
       U_PUSH, U_POP, U_GETSP, U_SETSP, U_ADDSP, U_RET, U_IRET,
+      U_ENTER, U_LEAVE,                 // ISA v3 C
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
       U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST
    } uop_e;
@@ -377,8 +378,10 @@ module pipeline_core
          end
          4'h3: begin // compare
             d.sgn = op[20];
-            if ((len == 2'b01 && op[20] == 1'b0 && op[19:12] == 8'h0) ||
-                (len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0) ||
+            // v3 D2: W [19] = 32-bit compare (reg form and 2-word form only;
+            // the short form's [19:12] is its immediate)
+            if ((len == 2'b01 && op[20] == 1'b0 && op[18:12] == 7'h0) ||
+                (len == 2'b10 && op[18:12] == 7'h0 && op[3:0] == 4'h0) ||
                 (len == 2'b01 && op[20] && !op[21] && op[3:0] == 4'h0)) begin // v3 A3 short CMP
                d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01) && !op[20];
                if (op[21]) begin        // B=1: boolean rd = 0/1
@@ -521,7 +524,18 @@ module pipeline_core
             end
          end
          4'h9: begin // stack / SP
-            if (op[21:20] == 2'b00 && op[19:12] == 8'h0) begin
+            // ISA v3 C: ENTER N (op 8, N = [21:0]) = push R15; R15 = SP;
+            // SP -= 8*N.  LEAVE (op 9) = SP = R15; pop R15.  Both name R15
+            // implicitly (the register fields are N / zero).
+            if (len == 2'b01 && aluop == 4'd8) begin
+               d.legal = 1'b1; d.uop = U_ENTER; d.wreg = 1'b1;
+               d.rd = 4'd15; d.rs1 = 4'd15; d.use_rs1 = 1'b1;
+               d.sp_rd = 1'b1; d.sp_wr = 1'b1; d.is_mem = 1'b1;
+            end else if (len == 2'b01 && aluop == 4'd9 && op[21:0] == 22'h0) begin
+               d.legal = 1'b1; d.uop = U_LEAVE; d.wreg = 1'b1;
+               d.rd = 4'd15; d.rs1 = 4'd15; d.use_rs1 = 1'b1;
+               d.sp_wr = 1'b1; d.is_mem = 1'b1;
+            end else if (op[21:20] == 2'b00 && op[19:12] == 8'h0) begin
                if (len == 2'b01 && op[3:0] == 4'h0) begin
                   case (aluop)
                      4'd0: if (op[11:8] == 4'h0) begin
@@ -665,14 +679,24 @@ module pipeline_core
          4'h3: return {op[20] && !op[21], s8};
          4'h6, 4'h7: return {op[22:21] == 2'b01, s8 << op[25:24]};
          4'h8: return {!op[23], {{12{op[17]}}, op[17:0], 2'b00}};
+         // C: ENTER's SP delta -(8 + 8N), so EX reuses the ADDSP adder
+         4'h9: return {op[25:22] == 4'd8, 32'd0 - ({7'b0, op[21:0], 3'b000} + 32'd8)};
          default: return {1'b0, 32'b0};
       endcase
    endfunction
    wire [32:0] w_short = f_short_imm(w_op);
+   function automatic logic [63:0] f_wsh(logic w, logic [63:0] v);
+      return w ? {v[31:0], 32'b0} : v;
+   endfunction
    // ex_b operand select, predecoded at the latch (M13): constant 1 (INC/DEC),
    // the extended immediate, or a register. Replaces a dec.len/dec.uop test
    // on the id_op->ex_b cone; asserted equal to the old decode below.
    logic id_b_one, id_b_imm, id_b_sext;
+   // ISA v3 D2: 32-bit compare (class 3 W [19], not the short form). Both
+   // operands are shifted left 32 at the dispatch mux: a 64-bit compare of
+   // {a[31:0],0} vs {b[31:0],0} yields exactly the 32-bit Z/S/C/V (and the
+   // 32-bit signed/unsigned order for the boolean forms) — EX is unchanged.
+   logic id_w;
    wire [31:0] id_pc_next = id_pc_nx;
 
    // --------------------------------------------------------- EX stage latch
@@ -737,7 +761,7 @@ module pipeline_core
    //  - producer in EX  at dispatch -> ONE bubble (next cycle it forwards)
    // Every forward mux sits at an ID->EX register D-input, fed by registers.
    wire mem_loadlk  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LOAD32 ||
-                                    mem_d.uop == U_POP);
+                                    mem_d.uop == U_POP || mem_d.uop == U_LEAVE);
    wire mem_fwd_ok  = b_mem && !mem_loadlk;
    // Flag producers: in EX at dispatch -> 1 bubble; in MEM at dispatch -> the
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
@@ -1013,6 +1037,16 @@ module pipeline_core
             exo_eaddr  = sp;
             exo_sp_new = sp + 32'd8;
          end
+         U_ENTER: begin                          // push R15; R15 = SP; SP -= 8N
+            exo_eaddr  = sp - 32'd8;
+            exo_wdata  = ex_a;  exo_raw = ex_a;  exo_be = 8'hFF;
+            exo_result = {32'b0, sp - 32'd8};    // new R15 (forwards from MEM)
+            exo_sp_new = sp + ex_var1;           // ex_var1 = -(8 + 8N)
+         end
+         U_LEAVE: begin                          // SP = R15; pop R15
+            exo_eaddr  = ex_a[31:0];
+            exo_sp_new = ex_a[31:0] + 32'd8;
+         end
          U_GETSP: exo_result = {32'b0, sp};
          U_SETSP: exo_sp_new = ex_a[31:0];
          U_ADDSP: exo_sp_new = sp + ex_var1;   // sext imm32 added to 32-bit SP
@@ -1089,8 +1123,9 @@ module pipeline_core
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
-                                     mem_is_ld32);
+                                     mem_d.uop == U_LEAVE || mem_is_ld32);
    wire mem_port_wr  = mem_valid && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
+                                     mem_d.uop == U_ENTER ||
                                      (mem_d.uop == U_CALL && mem_sp_we));
    wire mem_port_op  = mem_port_rd || mem_port_wr;
    // MEMGET32 spanning a dword: served by the read lookahead when the next
@@ -1251,7 +1286,7 @@ module pipeline_core
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
-         id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0;
+         id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -1645,7 +1680,7 @@ module pipeline_core
             wb_park_kind <= (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
                           : (mem_d.uop == U_ILL)  ? 3'd2 : 3'd3;
             wb_wr      <= mem_is_write;
-            wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= mem_result;
+            wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
             // RET / IRET redirect + fetch resume at MEM completion
             if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET)) begin
                ev_pcz = 1'b1;
@@ -1687,21 +1722,23 @@ module pipeline_core
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   // M6 register-sourced forwarding at the operand-register
                   // inputs: youngest writer wins (MEM over WB over rf).
-                  ex_a       <= (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
+                  ex_a       <= f_wsh(id_w,
+                                (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rs1) ? wb_value
-                              : rf[dec.rs1];
+                              : rf[dec.rs1]);
                   ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rd)  ? wb_value
                               : rf[dec.rd];
                   // The b-operand fully resolves HERE (reg / extended imm32 /
                   // constant 1 for INC-DEC / forwarded result) so EX's adder
                   // and comparators read pure registers.
-                  ex_b       <= id_b_one ? 64'd1
+                  ex_b       <= f_wsh(id_w,
+                                id_b_one ? 64'd1
                               : id_b_imm
                                 ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
                               : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rs2) ? wb_value
-                              : rf[dec.rs2];
+                              : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
                   if (id_valid && !fetch_halt && dec.serialize) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
@@ -1723,6 +1760,8 @@ module pipeline_core
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU);
                      id_b_sext <= w_dec.sgn;
+                     id_w      <= (w_op[29:26] == 4'h3) && w_op[19] &&
+                                  !(w_op[31:30] == 2'b01 && w_op[20]);
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
                      id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
