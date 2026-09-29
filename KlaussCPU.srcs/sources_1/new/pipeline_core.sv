@@ -106,6 +106,7 @@ module pipeline_core
       U_LOAD, U_LOAD32, U_STORE,
       U_PUSH, U_POP, U_GETSP, U_SETSP, U_ADDSP, U_RET, U_IRET,
       U_ENTER, U_LEAVE, U_LEAVERET,     // ISA v3 C
+      U_FBR,                            // ISA v3 B fused compare-and-branch
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
       U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST
    } uop_e;
@@ -625,6 +626,16 @@ module pipeline_core
                end
             end
          end
+         4'hD: begin // ISA v3 B: fused compare-and-branch (1 word, no flags)
+            // PRED [25:23] (as class 3), INV [22], IMM [21] (rhs = simm4
+            // [3:0]), simm13 word displacement [20:8]. The compare runs on
+            // the EX boolean path; a taken branch redirects from MEM.
+            if (len == 2'b01 && op[25:23] <= 3'd4) begin
+               d.legal = 1'b1; d.uop = U_FBR; d.sgn = 1'b1;
+               d.use_rs1 = 1'b1; d.use_rs2 = !op[21];
+               d.sub = 4'(f_cmp_op(op[25:23], op[22]));
+            end
+         end
          4'hC: begin // LCD
             if (op[23:12] == 12'h0 && op[3:0] == 4'h0) begin
                if (len == 2'b01 && op[25:24] <= 2'd1 && op[11:8] == 4'h0) begin
@@ -686,6 +697,8 @@ module pipeline_core
          4'h3: return {op[20] && !op[21], s8};
          4'h6, 4'h7: return {op[22:21] == 2'b01, s8 << op[25:24]};
          4'h8: return {!op[23], {{12{op[17]}}, op[17:0], 2'b00}};
+         // B: fused branch compare immediate simm4 (IMM form)
+         4'hD: return {op[21], {{28{op[3]}}, op[3:0]}};
          // C: ENTER's SP delta -(8 + 8N), so EX reuses the ADDSP adder
          4'h9: return {op[25:22] == 4'd8, 32'd0 - ({7'b0, op[21:0], 3'b000} + 32'd8)};
          default: return {1'b0, 32'b0};
@@ -940,7 +953,10 @@ module pipeline_core
                end
             endcase
          end
-         U_BOOL: begin
+         U_BOOL, U_FBR: begin
+            // U_FBR: the taken bit lands in mem_result[0]; its target
+            // (PC + 4*simm13, from ex_var2) rides in the EA register.
+            if (ex_d.uop == U_FBR) exo_eaddr = ex_pc + ex_var2;
             sa = ex_a; sb = ex_b;
             case (cmp_op_e'(ex_d.sub))
                CMP_EQ:   exo_result = (ex_a == ex_b) ? 64'b1 : 64'b0;
@@ -1129,6 +1145,8 @@ module pipeline_core
    wire  w_mrdy = m_ready && rdy_armed;
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
+   // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
+   wire fbr_taken    = mem_valid && mem_d.uop == U_FBR && mem_result[0];
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
@@ -1463,7 +1481,7 @@ module pipeline_core
          end
 
          lcd_rst_wr <= 1'b0;
-         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy) begin
+         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end
@@ -1772,11 +1790,16 @@ module pipeline_core
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      if (w_short[32]) id_var1 <= w_short[31:0];
+                     // B: the fused branch's displacement (4*simm13) rides in
+                     // id_var2 (a 1-word op has no second immediate word)
+                     if (w_op[31:30] == 2'b01 && w_op[29:26] == 4'hD)
+                        id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
-                                   (w_op[29:26] == 4'h3 && w_op[20])) &&
+                                   (w_op[29:26] == 4'h3 && w_op[20]) ||
+                                   (w_op[29:26] == 4'hD && w_op[21])) &&
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
-                                   w_dec.uop == U_BOOL || w_dec.uop == U_ALU);
+                                   w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
                      id_w      <= (w_op[29:26] == 4'h3) && w_op[19] &&
                                   !(w_op[31:30] == 2'b01 && w_op[20]);
@@ -1797,6 +1820,22 @@ module pipeline_core
                   end
                end
             end
+         end
+
+         // ---------------- ISA v3 B: taken fused branch (MEM redirect) ------
+         // Older than everything in EX/ID, so it overrides this edge's EX
+         // redirect and dispatch writes (NBA last-write wins): squash the
+         // two younger instructions and redirect. It never waits on the port
+         // (not a memory op), so it always leaves MEM this edge. An IRQ
+         // taken meanwhile drains first and then pushes this corrected pc.
+         if (fbr_taken) begin
+            ev_pcz     = 1'b1;
+            pc         <= mem_eaddr;
+            mem_valid  <= 1'b0;
+            ex_valid   <= 1'b0;
+            id_valid   <= 1'b0;
+            dly_on     <= 1'b0;
+            fetch_halt <= 1'b0;
          end
 
          // ---------------- SMC squash (store into in-flight code) ----------
@@ -1905,9 +1944,10 @@ module pipeline_core
       if (id_valid && dec.legal)
          assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
                  id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||
-                               (id_op[29:26] == 4'h3 && id_op[20])) &&
+                               (id_op[29:26] == 4'h3 && id_op[20]) ||
+                               (id_op[29:26] == 4'hD && id_op[21])) &&
                               (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
-                               dec.uop == U_BOOL || dec.uop == U_ALU)) &&
+                               dec.uop == U_BOOL || dec.uop == U_ALU || dec.uop == U_FBR)) &&
                  id_b_sext == dec.sgn)
             else $fatal(1, "id ex_b-select predecode drift: op=%h", id_op);
    end
