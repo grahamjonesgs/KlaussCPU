@@ -218,6 +218,12 @@ module pipeline_core
    // read; SMC-correct, M7b refines to tag-checked). Miss path is unchanged (fetch
    // at miss_dw, install what returns; per-dword valid tolerates partial fills).
    //   dword addr = pc[31:3] (29b); line = dword[28:1]; dword-in-line = dword[0]=addr[3]
+   // ISA v3 B (fused compare-and-branch) build switch. It adds a MEM-stage
+   // pc source; the M13 builds measured CPU pc-path margin +0.03 ns with it
+   // vs ~+0.2 ns without (WNS then set by SoC paths). 0 = class D traps and
+   // the redirect logic synthesizes away (compile with
+   // -mllvm -klausscpu-fuse-cmp-br=false).
+   localparam bit EN_FBR = 1'b1;
    localparam int IC_LINES = 512;
    localparam int IC_IDXW  = 9;                 // $clog2(IC_LINES)
    (* ram_style = "block" *) logic [127:0] ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
@@ -630,7 +636,7 @@ module pipeline_core
             // PRED [25:23] (as class 3), INV [22], IMM [21] (rhs = simm4
             // [3:0]), simm13 word displacement [20:8]. The compare runs on
             // the EX boolean path; a taken branch redirects from MEM.
-            if (len == 2'b01 && op[25:23] <= 3'd4) begin
+            if (EN_FBR && len == 2'b01 && op[25:23] <= 3'd4) begin
                d.legal = 1'b1; d.uop = U_FBR; d.sgn = 1'b1;
                d.use_rs1 = 1'b1; d.use_rs2 = !op[21];
                d.sub = 4'(f_cmp_op(op[25:23], op[22]));
@@ -1146,7 +1152,7 @@ module pipeline_core
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
-   wire fbr_taken    = mem_valid && mem_d.uop == U_FBR && mem_result[0];
+   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
