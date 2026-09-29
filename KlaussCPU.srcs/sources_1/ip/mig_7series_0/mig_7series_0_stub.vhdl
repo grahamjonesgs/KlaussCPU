@@ -2,10 +2,10 @@
 -- Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
 -- --------------------------------------------------------------------------------
 -- Tool Version: Vivado v.2025.2 (lin64) Build 6299465 Fri Nov 14 12:34:56 MST 2025
--- Date        : Mon Jun 22 12:10:11 2026
--- Host        : Ubunutu running 64-bit Ubuntu 24.04.4 LTS
+-- Date        : Mon Sep 28 21:44:13 2026
+-- Host        : Ubuntu running 64-bit Ubuntu 24.04.5 LTS
 -- Command     : write_vhdl -force -mode synth_stub
---               /home/graham/Documents/src/fpga/KlaussCPU/KlaussCPU.srcs/sources_1/ip/mig_7series_0/mig_7series_0_stub.vhdl
+--               /home/graham/Documents/src/KlaussCPU/KlaussCPU.srcs/sources_1/ip/mig_7series_0/mig_7series_0_stub.vhdl
 -- Design      : mig_7series_0
 -- Purpose     : Stub declaration of top-level module interface
 -- Device      : xc7a100tcsg324-1
