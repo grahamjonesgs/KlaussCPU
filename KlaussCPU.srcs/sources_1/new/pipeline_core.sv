@@ -229,6 +229,13 @@ module pipeline_core
    // CODE line's index and evicts it though the code is untouched — LVGL's
    // framebuffer/.bss writes thrashed the I-cache to ~51% IF_MISS / ~286 CPI).
    logic [18:0] ic_tagff [0:IC_LINES-1];
+   // M12 snoop split: the tag compare runs at store issue and is registered
+   // here; the ic_v* clear lands one cycle later (the one-cycle compare +
+   // clear was the tier-1 worst family: tagff LUTRAM read -> 19b compare ->
+   // 1024-FF index decode). The registered read below bypasses a pending
+   // clear so a lookup in the gap cycle cannot hit the stale line.
+   logic               snoop_q;
+   logic [IC_IDXW-1:0] snoop_idx_q;
 
    // ======================= M9: next-line buffer (NLB) ========================
    // One prefetched 16 B line + a background I-cache lookup that runs while the
@@ -263,12 +270,14 @@ module pipeline_core
    logic [127:0]       ic_rd_data;
    logic [18:0]        ic_rd_tag;
    logic               ic_rd_vhi, ic_rd_vlo;
+   // pending snoop clear (lands this edge) — read it as already invalid
+   wire snoop_kill = snoop_q && (snoop_idx_q == ic_look_idx);
    always_ff @(posedge clk) if (ce) begin
       ic_rd_idx  <= ic_look_idx;
       ic_rd_data <= ic_data[ic_look_idx];
       ic_rd_tag  <= ic_tag [ic_look_idx];
-      ic_rd_vhi  <= ic_vhi [ic_look_idx];
-      ic_rd_vlo  <= ic_vlo [ic_look_idx];
+      ic_rd_vhi  <= ic_vhi [ic_look_idx] && !snoop_kill;
+      ic_rd_vlo  <= ic_vlo [ic_look_idx] && !snoop_kill;
    end
    // hit once the registered read has caught up to the (stable, stalled) miss_dw
    wire ic_rd_current = (ic_rd_idx == ic_look_idx);
@@ -611,6 +620,14 @@ module pipeline_core
 
    dec_t dec;
    assign dec = f_decode(id_op);
+   // M12 hazard predecode: the operand-use flags the interlock needs are
+   // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
+   // through it the pc/dispatch hold) starts from registers instead of the
+   // full f_decode(id_op) cone (the id_op->pc family). Always equal to the
+   // matching dec.* fields — asserted at the end of the module.
+   dec_t w_dec;
+   assign w_dec = f_decode(w_op);
+   logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
    wire [31:0] id_pc_next = id_pc + {26'b0, dec.len, 2'b00};
 
    // --------------------------------------------------------- EX stage latch
@@ -680,6 +697,7 @@ module pipeline_core
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
    // in WB at dispatch -> they commit on this edge, committed flags are right.
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
+   // (register fields are raw id_op bits — dec.rs1/rs2/rd = op[7:4]/[3:0]/[11:8])
    wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1);
    wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2);
    wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd);
@@ -687,19 +705,19 @@ module pipeline_core
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
    wire raw_stall = id_valid && (
-        (dec.use_rs1 && hit1) || (dec.use_rs2 && hit2) || (dec.use_rdd && hitd) ||
-        (dec.fread && flag_busy) ||
-        ((dec.sp_rd || dec.sp_wr) && sp_busy) );
+        (id_use_rs1 && hit1) || (id_use_rs2 && hit2) || (id_use_rdd && hitd) ||
+        (id_fread && flag_busy) ||
+        (id_sp_rw && sp_busy) );
 
    // hazard-attribution strobes (events/cycles for the SoC perf counters)
-   assign perf_stall[0] = id_valid && ((dec.use_rs1 && hit1) || (dec.use_rs2 && hit2)
-                                       || (dec.use_rdd && hitd));
+   assign perf_stall[0] = id_valid && ((id_use_rs1 && hit1) || (id_use_rs2 && hit2)
+                                       || (id_use_rdd && hitd));
    assign perf_stall[1] = id_valid && mem_loadlk && mem_d.wreg &&
-                          ((dec.use_rs1 && mem_d.rd == dec.rs1) ||
-                           (dec.use_rs2 && mem_d.rd == dec.rs2) ||
-                           (dec.use_rdd && mem_d.rd == dec.rd));
-   assign perf_stall[2] = id_valid && dec.fread && flag_busy;
-   assign perf_stall[3] = id_valid && (dec.sp_rd || dec.sp_wr) && sp_busy;
+                          ((id_use_rs1 && mem_d.rd == dec.rs1) ||
+                           (id_use_rs2 && mem_d.rd == dec.rs2) ||
+                           (id_use_rdd && mem_d.rd == dec.rd));
+   assign perf_stall[2] = id_valid && id_fread && flag_busy;
+   assign perf_stall[3] = id_valid && id_sp_rw && sp_busy;
 
    // ------------------------------------------------------------- EX units
    // multiply — the silicon DSP48 chain, in its OWN always block exactly like
@@ -1184,7 +1202,9 @@ module pipeline_core
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
-         rdy_armed <= 1'b0; ex_fwd_f <= 1'b0;
+         rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
+         id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
+         id_fread <= 1'b0; id_sp_rw <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -1352,6 +1372,14 @@ module pipeline_core
             lcd_rst_wr <= 1'b1;
          end
 
+         // M12 snoop stage 2: the registered tag-match clears the line (the
+         // issue below re-arms snoop_q; NBA last-write wins).
+         snoop_q <= 1'b0;
+         if (snoop_q) begin
+            ic_vhi[snoop_idx_q] <= 1'b0;
+            ic_vlo[snoop_idx_q] <= 1'b0;
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
@@ -1370,11 +1398,14 @@ module pipeline_core
                   // store has a matching tag) and still backed by the M5c
                   // squash-and-refetch. mem_iaddr is byte-aligned: index [12:4],
                   // tag [31:13] (= the install's if_req_dw[28:IC_IDXW+1]).
-                  if (mem_port_wr &&
-                      ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4]) begin
-                     ic_vhi[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
-                     ic_vlo[mem_iaddr[IC_IDXW+3:4]] <= 1'b0;
-                  end
+                  // M12: compare here, clear next cycle (snoop_q, below the
+                  // case). No install can land in the gap: this issue needs
+                  // !if_xc and the store then holds the port (mem_port_op
+                  // blocks fill issue), and the store's data is not in memory
+                  // before mem_xc==1 completes anyway.
+                  snoop_q     <= mem_port_wr &&
+                                 ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4];
+                  snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
                   // M9: issue-time NLB snoop + in-flight prefetch abort. Closes
                   // the 1-cycle race where a prefetch captures a BRAM read that
                   // predates this store's ic_v* clear (the mem_done_now
@@ -1639,6 +1670,9 @@ module pipeline_core
                   end else if (running && !fetch_halt && !irq_active && fetch_ok) begin
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
+                     id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
+                     id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
+                     id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
                      id_pc    <= pc;
                      pc       <= w_pc_adv;   // precomputed pc+LEN (see IF section)
                      ev_disp  = 1'b1;        // M12: dword advance for pos shift
@@ -1752,6 +1786,12 @@ module pipeline_core
          assert (r_want_line == ifb_base[28:1] + 28'd1)
             else $fatal(1, "want_line drift: base=%h want=%h", ifb_base, r_want_line);
       end
+      // M12 hazard predecode must track the full decode of the latched op
+      if (id_valid)
+         assert (id_use_rs1 == dec.use_rs1 && id_use_rs2 == dec.use_rs2 &&
+                 id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
+                 id_sp_rw == (dec.sp_rd || dec.sp_wr))
+            else $fatal(1, "id hazard predecode drift: op=%h", id_op);
    end
 `endif
 
