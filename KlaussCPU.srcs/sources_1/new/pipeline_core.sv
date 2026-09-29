@@ -322,9 +322,16 @@ module pipeline_core
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
    logic [31:0] id_pc, id_op, id_var1, id_var2;
+   // M13: latch-time precomputes (off the id_op->decode cones). id_pc_nx =
+   // id_pc + 4*LEN (the fetch side's w_pc_adv); id_last_dw = dword of the
+   // op's LAST word (pc + 4*(LEN-1)) for the SMC squash.
+   logic [31:0] id_pc_nx;
+   logic [28:0] id_last_dw;
 
    // -------------------------------------------------------------- decoder
-   function automatic dec_t f_decode(logic [31:0] op);
+   // f_decode_raw: field/legality decode WITHOUT the final illegal-op clear
+   // (the M13 hazard predecode reads its use flags raw — see w_dec below).
+   function automatic dec_t f_decode_raw(logic [31:0] op);
       dec_t d;
       logic [1:0] len;   logic [3:0] cls, aluop;
       d = '0;
@@ -337,7 +344,8 @@ module pipeline_core
          4'h1, 4'h2: begin // ALU reg-reg (1w) / reg-imm (2w)
             d.sgn = op[20];
             if ((cls == 4'h1 && len == 2'b01 && op[20] == 1'b0 && op[19:12] == 8'h0) ||
-                (cls == 4'h2 && len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0)) begin
+                (cls == 4'h2 && len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0) ||
+                (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0)) begin  // v3 A5 short: imm8 [19:12]
                d.use_rs1 = 1'b1;  d.use_rs2 = (cls == 4'h1);
                case ({aluop, op[21]})
                   {4'd0,1'b1}, {4'd1,1'b1}, {4'd2,1'b1}, {4'd3,1'b1}: begin
@@ -370,8 +378,9 @@ module pipeline_core
          4'h3: begin // compare
             d.sgn = op[20];
             if ((len == 2'b01 && op[20] == 1'b0 && op[19:12] == 8'h0) ||
-                (len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0)) begin
-               d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01);
+                (len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0) ||
+                (len == 2'b01 && op[20] && !op[21] && op[3:0] == 4'h0)) begin // v3 A3 short CMP
+               d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01) && !op[20];
                if (op[21]) begin        // B=1: boolean rd = 0/1
                   if (op[25:23] <= 3'd4) begin
                      d.legal = 1'b1; d.uop = U_BOOL; d.wreg = 1'b1;
@@ -475,10 +484,10 @@ module pipeline_core
          end
          4'h6, 4'h7: begin // loads / stores
             d.msz = op[25:24]; d.sgn = op[23]; d.mmode = op[22:21]; d.malign = op[20];
-            if (op[19:12] == 8'h0
+            if ((op[19:12] == 8'h0 || (len == 2'b01 && op[22:21] == 2'b01)) // v3 A4 imm8
                 && !(cls == 4'h7 && op[23])                         // stores: SGN reserved
                 && !(op[20] && op[25:24] != 2'b11)                  // A only for 64-bit
-                && ((len == 2'b01 && (op[22:21] == 2'b00 || op[22:21] == 2'b11)) ||
+                && ((len == 2'b01 && (op[22:21] != 2'b10)) ||      // v3: +MODE=01 short
                     (len == 2'b10 && (op[22:21] == 2'b01 || op[22:21] == 2'b10)))
                 && !(op[22:21] == 2'b00 && op[3:0] != 4'h0)         // [rs1]: rs2 = 0
                 && !(op[22:21] == 2'b10 && op[7:0] != 8'h00)        // [imm]: rs1/rs2 = 0
@@ -501,7 +510,8 @@ module pipeline_core
             d.blink = op[25]; d.brel = op[24]; d.brind = op[23];
             d.bcond = op[22:19]; d.binv = op[18];
             if (((len == 2'b10 && !op[23] && op[17:16] == 2'b00 && op[15:0] == 16'h0) ||
-                 (len == 2'b01 && !op[24] && op[23] && op[17:16] == 2'b00 && op[15:4] == 12'h0))
+                 (len == 2'b01 && !op[24] && op[23] && op[17:16] == 2'b00 && op[15:4] == 12'h0) ||
+                 (len == 2'b01 && op[24] && !op[23]))               // v3 A1: disp18 [17:0]
                 && (op[22:19] <= 4'd9) && !(op[22:19] == 4'd0 && op[18])) begin
                d.legal   = 1'b1;
                d.uop     = op[25] ? U_CALL : U_JMP;
@@ -610,6 +620,12 @@ module pipeline_core
          end
          default: ;
       endcase
+      return d;
+   endfunction
+
+   function automatic dec_t f_decode(logic [31:0] op);
+      dec_t d;
+      d = f_decode_raw(op);
       if (!d.legal) begin
          d.uop = U_ILL; d.serialize = 1'b1;
          d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
@@ -623,16 +639,46 @@ module pipeline_core
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
-   // full f_decode(id_op) cone (the id_op->pc family). Always equal to the
-   // matching dec.* fields — asserted at the end of the module.
+   // full f_decode(id_op) cone (the id_op->pc family). Read from the RAW
+   // decode (M13): the flags skip the legality clear, so an illegal op may
+   // stall conservatively (it traps anyway) but the full legality cone stays
+   // off this path. Equal to dec.* for every legal op — asserted below.
    dec_t w_dec;
-   assign w_dec = f_decode(w_op);
+   assign w_dec = f_decode_raw(w_op);
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
-   wire [31:0] id_pc_next = id_pc + {26'b0, dec.len, 2'b00};
+
+   // ISA v3 short 1-word forms (ISA_V3_PROPOSAL.md §3): the immediate lives in
+   // word 0 and is formed HERE, at the IF->ID latch, into id_var1 — so every
+   // EX consumer (ex_b imm leg, EA, branch target, MOV) is unchanged.
+   //   A5 class 2  LEN=01          imm8 [19:12], SGN [20] picks sext/zext
+   //   A3 class 3  LEN=01 SGN=1 B=0 simm8 [19:12]
+   //   A4 class 6/7 LEN=01 MODE=01  simm8 [19:12] << SIZE [25:24]
+   //   A1 class 8  LEN=01 RIND=0    simm18 [17:0] << 2 (PC-relative)
+   function automatic logic [32:0] f_short_imm(logic [31:0] op);
+      logic [7:0] i8;
+      logic [31:0] s8;
+      i8 = op[19:12];
+      s8 = {{24{i8[7]}}, i8};
+      if (op[31:30] != 2'b01) return {1'b0, 32'b0};
+      case (op[29:26])
+         4'h2: return {1'b1, op[20] ? s8 : {24'b0, i8}};
+         4'h3: return {op[20] && !op[21], s8};
+         4'h6, 4'h7: return {op[22:21] == 2'b01, s8 << op[25:24]};
+         4'h8: return {!op[23], {{12{op[17]}}, op[17:0], 2'b00}};
+         default: return {1'b0, 32'b0};
+      endcase
+   endfunction
+   wire [32:0] w_short = f_short_imm(w_op);
+   // ex_b operand select, predecoded at the latch (M13): constant 1 (INC/DEC),
+   // the extended immediate, or a register. Replaces a dec.len/dec.uop test
+   // on the id_op->ex_b cone; asserted equal to the old decode below.
+   logic id_b_one, id_b_imm, id_b_sext;
+   wire [31:0] id_pc_next = id_pc_nx;
 
    // --------------------------------------------------------- EX stage latch
    logic        ex_valid;
    logic [31:0] ex_pc, ex_op, ex_var1, ex_var2, ex_pc_next;
+   logic [28:0] ex_last_dw;         // M13: id_last_dw carried (SMC squash)
    dec_t        ex_d;
    logic [63:0] ex_a, ex_b, ex_c;   // rs1 / rs2 / rd-data values
    // M6: GPR forwarding happens at the ID->EX register INPUT (the proven P41
@@ -1205,6 +1251,7 @@ module pipeline_core
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
+         id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -1635,6 +1682,7 @@ module pipeline_core
                   ex_pc      <= id_pc;   ex_op <= id_op;
                   ex_var1    <= id_var1; ex_var2 <= id_var2;
                   ex_pc_next <= id_pc_next;
+                  ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   // M6 register-sourced forwarding at the operand-register
@@ -1648,11 +1696,9 @@ module pipeline_core
                   // The b-operand fully resolves HERE (reg / extended imm32 /
                   // constant 1 for INC-DEC / forwarded result) so EX's adder
                   // and comparators read pure registers.
-                  ex_b       <= (dec.uop == U_ALU && id_op[29:26] == 4'h5) ? 64'd1
-                              : (dec.len != 2'b01 &&
-                                 (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
-                                  dec.uop == U_BOOL || dec.uop == U_ALU))
-                                ? (dec.sgn ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                  ex_b       <= id_b_one ? 64'd1
+                              : id_b_imm
+                                ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
                               : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
                               : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                               : rf[dec.rs2];
@@ -1670,10 +1716,20 @@ module pipeline_core
                   end else if (running && !fetch_halt && !irq_active && fetch_ok) begin
                      id_valid <= 1'b1;
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
+                     if (w_short[32]) id_var1 <= w_short[31:0];
+                     id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
+                     id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
+                                   (w_op[29:26] == 4'h3 && w_op[20])) &&
+                                  (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
+                                   w_dec.uop == U_BOOL || w_dec.uop == U_ALU);
+                     id_b_sext <= w_dec.sgn;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
                      id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
                      id_pc    <= pc;
+                     id_pc_nx <= w_pc_adv;
+                     id_last_dw <= (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
+                                 : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc[31:3];
                      pc       <= w_pc_adv;   // precomputed pc+LEN (see IF section)
                      ev_disp  = 1'b1;        // M12: dword advance for pos shift
                      ev_adv   = (w_op[31:30] == 2'b00) ? 2'd0
@@ -1695,13 +1751,10 @@ module pipeline_core
          // Safe because side effects only exist from MEM onward.
          if (mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF) begin : smc
             logic [28:0] st_dw;
-            logic [31:0] id_last, ex_last;
             logic hit_id, hit_ex;
             st_dw   = mem_iaddr[31:3];
-            id_last = id_pc + {26'b0, dec.len, 2'b00} - 32'd1;
-            ex_last = ex_pc + {26'b0, ex_d.len, 2'b00} - 32'd1;
-            hit_id  = id_valid && (id_pc[31:3] == st_dw || id_last[31:3] == st_dw);
-            hit_ex  = ex_valid && (ex_pc[31:3] == st_dw || ex_last[31:3] == st_dw);
+            hit_id  = id_valid && (id_pc[31:3] == st_dw || id_last_dw == st_dw);
+            hit_ex  = ex_valid && (ex_pc[31:3] == st_dw || ex_last_dw == st_dw);
             if (ifb_val[0] && ifb_base == st_dw)          ifb_val[0] <= 1'b0;
             if (ifb_val[1] && ifb_base + 29'd1 == st_dw)  ifb_val[1] <= 1'b0;
             // M9: the NLB is a code copy too — same store-match rule (line-granular)
@@ -1787,11 +1840,19 @@ module pipeline_core
             else $fatal(1, "want_line drift: base=%h want=%h", ifb_base, r_want_line);
       end
       // M12 hazard predecode must track the full decode of the latched op
-      if (id_valid)
+      if (id_valid && dec.legal)
          assert (id_use_rs1 == dec.use_rs1 && id_use_rs2 == dec.use_rs2 &&
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (id_valid && dec.legal)
+         assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
+                 id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||
+                               (id_op[29:26] == 4'h3 && id_op[20])) &&
+                              (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
+                               dec.uop == U_BOOL || dec.uop == U_ALU)) &&
+                 id_b_sext == dec.sgn)
+            else $fatal(1, "id ex_b-select predecode drift: op=%h", id_op);
    end
 `endif
 
