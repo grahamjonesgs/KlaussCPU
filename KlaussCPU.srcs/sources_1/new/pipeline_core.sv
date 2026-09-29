@@ -105,7 +105,7 @@ module pipeline_core
       U_LEA, U_MOV, U_MOV64, U_BEXTR, U_BDEP,
       U_LOAD, U_LOAD32, U_STORE,
       U_PUSH, U_POP, U_GETSP, U_SETSP, U_ADDSP, U_RET, U_IRET,
-      U_ENTER, U_LEAVE,                 // ISA v3 C
+      U_ENTER, U_LEAVE, U_LEAVERET,     // ISA v3 C
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
       U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST
    } uop_e;
@@ -535,6 +535,13 @@ module pipeline_core
                d.legal = 1'b1; d.uop = U_LEAVE; d.wreg = 1'b1;
                d.rd = 4'd15; d.rs1 = 4'd15; d.use_rs1 = 1'b1;
                d.sp_wr = 1'b1; d.is_mem = 1'b1;
+            end else if (len == 2'b01 && aluop == 4'd10 && op[21:0] == 22'h0) begin
+               // LEAVERET (op 10) = LEAVE; RET: R15 = [R15], PC = [R15+8],
+               // SP = R15 + 16. Two dwords: one read when [R15+8] is in the
+               // same 16 B line (m_rdata_next), else the MEMGET32 2nd read.
+               d.legal = 1'b1; d.uop = U_LEAVERET; d.wreg = 1'b1;
+               d.rd = 4'd15; d.rs1 = 4'd15; d.use_rs1 = 1'b1;
+               d.sp_wr = 1'b1; d.is_mem = 1'b1; d.serialize = 1'b1;
             end else if (op[21:20] == 2'b00 && op[19:12] == 8'h0) begin
                if (len == 2'b01 && op[3:0] == 4'h0) begin
                   case (aluop)
@@ -761,7 +768,8 @@ module pipeline_core
    //  - producer in EX  at dispatch -> ONE bubble (next cycle it forwards)
    // Every forward mux sits at an ID->EX register D-input, fed by registers.
    wire mem_loadlk  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LOAD32 ||
-                                    mem_d.uop == U_POP || mem_d.uop == U_LEAVE);
+                                    mem_d.uop == U_POP || mem_d.uop == U_LEAVE ||
+                                    mem_d.uop == U_LEAVERET);
    wire mem_fwd_ok  = b_mem && !mem_loadlk;
    // Flag producers: in EX at dispatch -> 1 bubble; in MEM at dispatch -> the
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
@@ -1043,9 +1051,9 @@ module pipeline_core
             exo_result = {32'b0, sp - 32'd8};    // new R15 (forwards from MEM)
             exo_sp_new = sp + ex_var1;           // ex_var1 = -(8 + 8N)
          end
-         U_LEAVE: begin                          // SP = R15; pop R15
+         U_LEAVE, U_LEAVERET: begin              // SP = R15; pop R15 (; pop PC)
             exo_eaddr  = ex_a[31:0];
-            exo_sp_new = ex_a[31:0] + 32'd8;
+            exo_sp_new = ex_a[31:0] + ((ex_d.uop == U_LEAVERET) ? 32'd16 : 32'd8);
          end
          U_GETSP: exo_result = {32'b0, sp};
          U_SETSP: exo_sp_new = ex_a[31:0];
@@ -1123,7 +1131,8 @@ module pipeline_core
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
-                                     mem_d.uop == U_LEAVE || mem_is_ld32);
+                                     mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
+                                     mem_is_ld32);
    wire mem_port_wr  = mem_valid && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
                                      mem_d.uop == U_ENTER ||
                                      (mem_d.uop == U_CALL && mem_sp_we));
@@ -1132,7 +1141,10 @@ module pipeline_core
    // dword is in the same line, else a second read (f_memget32 exactly).
    wire ld32_span    = mem_is_ld32 && (mem_eaddr[2:0] > 3'd4);
    wire ld32_need2   = ld32_span && !m_next_valid;
-   wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !ld32_need2) ||
+   // LEAVERET: [R15+8] not in the same line -> second read (same path)
+   wire lr_need2     = mem_valid && mem_d.uop == U_LEAVERET && !m_next_valid;
+   wire mem_need2    = ld32_need2 || lr_need2;
+   wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
                        (mem_xc == 2'd3 && w_mrdy);
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
@@ -1236,6 +1248,8 @@ module pipeline_core
             default: mem_ldval = (mem_xc == 2'd3) ? {32'b0, m_rdata[23:0], mem_dw0[63:56]}
                                                   : {32'b0, m_rdata_next[23:0], m_rdata[63:56]};
          endcase
+      end else if (mem_valid && mem_d.uop == U_LEAVERET) begin
+         mem_ldval = (mem_xc == 2'd3) ? mem_dw0 : m_rdata;   // saved R15
       end else if (mem_valid && mem_d.uop == U_LOAD) begin
          case (mem_d.msz)
             2'd0: mem_ldval = mem_d.sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
@@ -1500,7 +1514,7 @@ module pipeline_core
                      pf_look <= 1'b0;
                end
                2'd1: if (w_mrdy) begin
-                  if (ld32_need2) begin        // cross-line MEMGET32: 2nd read
+                  if (mem_need2) begin         // cross-line MEMGET32 / LEAVERET: 2nd read
                      mem_dw0   <= m_rdata;
                      m_addr    <= {mem_eaddr[31:3], 3'b000} + 32'd8;
                      rdy_armed <= 1'b0;        // new request (DV held, addr changed)
@@ -1682,9 +1696,13 @@ module pipeline_core
             wb_wr      <= mem_is_write;
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
             // RET / IRET redirect + fetch resume at MEM completion
-            if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET)) begin
+            if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET ||
+                              mem_d.uop == U_LEAVERET)) begin
                ev_pcz = 1'b1;
-               pc <= m_rdata[31:0];
+               // LEAVERET's return address is the SECOND dword: the line
+               // lookahead, or the 2nd read (mem_xc 3) with dw0 stashed.
+               pc <= (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
+                   : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
                fetch_halt <= 1'b0;
             end
 
