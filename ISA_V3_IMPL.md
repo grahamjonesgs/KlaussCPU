@@ -97,6 +97,57 @@ PC-relative label arithmetic the assembler doesn't do).
 - Board self-checks (bst, expr, test_64bit, queens, test_printf, test_fp,
   crypto, test_asm, test_switch) and perf_baseline/dhrystone.
 
-## Results
+## Results (2026-09-29, measured)
 
-(filled in below by the M13 report)
+### Board cycles — one CPU (v3, all features), only the binary changes
+
+perf_baseline kernels (cycles) and Dhrystone. Each column adds features to
+the compiler; every self-check (bst, expr, test_64bit, queens, test_printf,
+test_fp, crypto, test_asm, test_switch) passes in every column. v2 binaries
+run cycle-identical on the v3 core (e.g. calls_fib 55,024,161 either way).
+
+| kernel | v2 | +A (short forms) | +D2 | +ENTER/LEAVE | +LEAVERET | +B (fused) | total |
+|---|---|---|---|---|---|---|---|
+| alu | 12,000,401 | 12,000,348 | 12,000,390 | 12,000,354 | 12,000,277 | 12,000,274 | 0.0% |
+| mem_stream | 7,500,166 | 7,466,651 | 7,467,016 | 7,466,875 | 7,467,124 | 7,142,998 | −4.8% |
+| ptr_chase | 8,809,685 | 8,809,689 | 8,786,642 | 8,775,782 | 8,775,941 | 8,790,271 | −0.2% |
+| branchy | 22,188,400 | 20,781,911 | 19,781,911 | 19,781,906 | 19,781,901 | 19,188,306 | **−13.5%** |
+| calls_fib | 55,024,161 | 49,367,535 | 44,889,530 | 40,775,676 | 36,661,855 | 36,661,840 | **−33.4%** |
+| muldiv | 1,508,381 | 1,308,363 | 1,308,365 | 1,308,353 | 1,308,323 | 1,308,352 | **−13.3%** |
+| Dhrystones/s | 57,536 | 60,240 | 60,495 | 61,086 | 61,689 | 63,572 | **+10.5%** |
+
+(The "+B" column is on the EN_FBR=1 build; the others on the build without
+B — the non-B columns are cycle-identical on both.) Note: the SoC branch
+counter (`perf_br`) counts EX-stage JMPs only, so fused branches don't show
+in perf_baseline's branch-rate column.
+
+### Dynamic instructions / fetched words / code size (emulator, vs v2)
+
+| program | instructions | fetched words | .text |
+|---|---|---|---|
+| hello | −6.4% | −38.6% | −36.4% |
+| bst | −14.3% | −42.6% | −34.9% |
+| expr | −13.9% | −42.4% | −34.6% |
+| test_64bit | −19.1% | −43.9% | −33.4% |
+| queens | −16.1% | −38.5% | −35.7% |
+| crypto | −8.3% | −32.9% | −32.3% |
+| test_printf | −11.0% | −40.4% | −34.5% |
+| test_fp | −17.1% | −42.1% | −30.4% |
+
+Short forms alone (A) cut fetched words 28–35% — the proposal predicted 30%.
+
+### Timing (tier-1 Performance_Explore, no tier-2 needed in any build)
+
+| build | WNS | WHS | build time | limiting paths |
+|---|---|---|---|---|
+| master before M13 (snoop + hazard fixes) | +0.235 | +0.024 | 10m00s | CPU id_op→pc +0.236 |
+| + margin fixes + A1/A3/A4/A5 | +0.086 | +0.018 | 12m07s | SoC st_reg→cache BRAM; CPU ≥ +0.186 |
+| + D2 | +0.192 | +0.027 | 17m00s | — |
+| + ENTER/LEAVE/LEAVERET | +0.163 | +0.013 | 14m30s | SoC st_reg→cache/IFB; CPU-internal ≥ +0.248 |
+| + B (EN_FBR=1) | +0.033 | +0.019 | 12m21s | CPU id_op→pc, wb_value→pc (B's MEM pc source) |
+
+Without B the CPU is no longer the limiter (the old id_op→pc and ex_b
+families are gone from the ≤0.4 ns list). B costs ~0.2 ns of pc-path margin
+for its +3% Dhrystone / −3% branchy; `EN_FBR` drops it.
+
+FreeRTOS demo (preemption, 1 kHz tick, yields) PASSes on the B build.
