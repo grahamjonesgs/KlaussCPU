@@ -242,16 +242,22 @@ module KlaussCPU (
    //   source 1 = blitter DONE (w_blit_irq = blitter r_done & IRQ_EN; level —
    //              the ISR must ack by writing STATUS.DONE (W1C) before IRET)
    // A source fires only when it has a non-zero vector AND its mask bit is set.
-   // w_irq_sel picks the source to dispatch; timer (0) has priority over blitter
-   // (1). Sources 2..3 remain free for future devices — OR them in here.
+   //   source 2 = LiteEth RX/TX event (r_eth_irq = registered LiteEth
+   //              `interrupt` = OR of (EV_PENDING & EV_ENABLE); level — the ISR
+   //              must W1C RX_/TX_EV_PENDING before IRET). Only while core 1
+   //              owns the MAC (C2_ETH_OWNER clear).
+   // w_irq_sel picks the source to dispatch: timer (0) > blitter (1) > eth (2).
+   // Source 3 remains free — OR it in here.
    // M5d: the pipeline core owns int_mask; the FSM's st.int_mask is retired
    // from the gating (kept in st only as a dormant field).
    wire [3:0] pip_int_mask;
    wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
    wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
    wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
-   wire w_irq_ready = w_irq_src0 || w_irq_src1;
-   wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : 2'd1;
+   logic r_eth_irq;   // registered LiteEth interrupt (driven after the LiteEth instance)
+   wire w_irq_src2  = r_eth_irq         && (r_interrupt_table[2] != 32'h0) && pip_int_mask[2];
+   wire w_irq_ready = w_irq_src0 || w_irq_src1 || w_irq_src2;
+   wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : w_irq_src1 ? 2'd1 : 2'd2;
 
    // Free-running millisecond counter (since LOAD_COMPLETE). 64-bit so it
    // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
@@ -304,7 +310,7 @@ module KlaussCPU (
    wire [ 2:0] w_eth_wb_cti;
    wire        w_eth_wb_ack;
    wire        w_eth_wb_err;
-   wire        w_eth_irq;       // LiteEth combined RX/TX event (not yet wired to INT_PENDING)
+   wire        w_eth_irq;       // LiteEth combined RX/TX event -> interrupt source 2 (r_eth_irq)
 
    // Cache performance counters / control (driven by mem_read_write below;
    // exposed via MMIO 0xF005_xxxx — see MMIO_MAP.md "Cache controller").
@@ -1149,7 +1155,7 @@ module KlaussCPU (
          12'h00F: begin  // Interrupt controller / timer
             case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
-               16'h0008: r_mmio_read_data_comb = {62'b0, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter
+               16'h0008: r_mmio_read_data_comb = {61'b0, r_eth_irq, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter, [2]=eth
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
                16'h0020: r_mmio_read_data_comb = {32'b0, r_interrupt_table[2]};
@@ -1361,6 +1367,9 @@ module KlaussCPU (
        .i_wb_ack          (w_eth_wb_ack),
        .i_wb_err          (w_eth_wb_err)
    );
+   // Interrupt source 2: LiteEth's combined event, registered (same i_Clk
+   // domain) and masked off while core 2 owns the MAC.
+   always_ff @(posedge i_Clk) r_eth_irq <= w_eth_irq && !w_eth_own2;
    assign w_eth_read_data = w_eth_own2 ? 64'h0          : eth_bus.read_data;
    assign w_eth_ready     = w_eth_own2 ? w_eth_nown_ack : eth_bus.ready;
    assign w_c2e_read_data = eth_bus.read_data;

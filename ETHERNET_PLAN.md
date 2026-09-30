@@ -8,7 +8,7 @@ software" so we can layer lwIP on top.
 end-to-end — FPGA's ARP broadcasts are received cleanly by a host running
 tcpdump, FPGA RX correctly parses IPv4 / IPv6 / ARP / multicast frames with
 correct ethertypes and headers. Ready for software-side lwIP integration.
-Phase 6 (interrupt wiring) deferred — polling works.
+Phase 6 (interrupt wiring) DONE in M13 (2026-09): LiteEth `interrupt` is interrupt source 2 (see MMIO_MAP.md); the stacks still poll.
 
 ---
 

@@ -189,7 +189,7 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 
 | Offset  | Reg                  | RW | Width | Description |
 |---------|----------------------|----|-------|-------------|
-| 0x0000  | `CACHE_CTRL`         | W  | 3     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). Reads as 0. |
+| 0x0000  | `CACHE_CTRL`         | W  | 4     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). `[3]` ICACHE_INV — fence.i: the core drops its whole I-cache, prefetch buffer and fetch window and refetches everything after the store (see below). Reads as 0. |
 | 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_2004_0002` (2 ways, 1024 sets, 32 B/line, 64 KB total). |
 | 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
@@ -203,6 +203,17 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 that fires every cycle takes ~5.8 × 10⁹ years to wrap, so software never has
 to manage rollover. Reset values: all zero. Counters are not affected by
 `CPU_RESETN` or program load — only by writing `CACHE_CTRL` bit 0.
+
+**ICACHE_INV (`CACHE_CTRL[3]`, fence.i).** The core decodes its own
+completing store with bit 3 set: it invalidates every fetch-side code copy
+(I-cache, next-line prefetch buffer, fetch window) and squashes/refetches
+every younger in-flight instruction, so the instruction after the store
+already sees memory as written. CPU stores are snooped into the I-cache per
+line anyway; use the fence when code arrives from a **non-snooping writer**
+(blitter or LiteEth DMA, core 2) and as a loader's final step before jumping
+to new code. For DMA-written code, also make the data cache consistent first
+(FLUSH before the DMA reads, INVALIDATE after it writes). The data-cache bits
+can be set in the same write. `mmio.h`: `icache_invalidate()`.
 
 **Flush / invalidate (full-cache).** `CACHE_CTRL[1]` (FLUSH) and `[2]`
 (INVALIDATE) trigger an FSM in `mem_read_write.sv` that walks every set/way
@@ -537,13 +548,17 @@ one frame, subsequent frames increment `RX_ERRORS` and are dropped.
 #### Interrupts
 
 LiteEth aggregates RX-done and TX-done into one combined `interrupt`
-output (wired to `w_eth_irq` in [KlaussCPU.v](KlaussCPU.srcs/sources_1/new/KlaussCPU.v)).
-Wiring to a CPU interrupt vector is **Phase 6 of [ETHERNET_PLAN.md](ETHERNET_PLAN.md)**
-— currently the IRQ line is unconnected and software polls the
-`*_EV_PENDING` registers.
+output (`EV_PENDING & EV_ENABLE` of both paths), wired to **interrupt
+source 2** (`INT_PENDING[2]`, `INT_VEC2`; registered once, masked while core 2
+owns the MAC). It is a **level** source like the blitter: the ISR must W1C the
+`EV_PENDING` bit(s) before `IRET`, or it re-dispatches. The bundled network
+stacks (lwIP port, Zephyr driver) still poll and never unmask source 2; to
+use the interrupt, set `INT_VEC2`, set `EV_ENABLE` for the events wanted and
+OR `1 << 2` into `INT_MASK`. (`baremetal/programs/test_irq_ext.c` in the
+runtime is a working example.)
 
-Once wired, the ISR distinguishes RX vs TX by reading both `EV_PENDING`
-registers and W1C-clearing whichever fired:
+The ISR distinguishes RX vs TX by reading both `EV_PENDING` registers and
+W1C-clearing whichever fired:
 
 ```c
 void eth_isr(void) {
@@ -623,17 +638,18 @@ sleep_ms(120);                       /* allow auto-negotiation */
 
 Per-source interrupt controller and the source-0 timer. The CPU supports up
 to 4 interrupt sources; source 0 is wired to the periodic timer below,
-**source 1 is the 2D DMA blitter's DONE interrupt**, and sources 2–3 are
-reserved for future peripherals. The only interrupt-related opcode is `IRET`
+**source 1 is the 2D DMA blitter's DONE interrupt**, **source 2 is the
+Ethernet (LiteEth) RX/TX interrupt**, and source 3 is reserved. Dispatch
+priority when several are pending: timer > blitter > Ethernet. The only interrupt-related opcode is `IRET`
 (return from handler) — everything else is configured here.
 
 | Offset  | Reg            | RW | Width | Description |
 |---------|----------------|----|-------|-------------|
 | 0x0000  | `INT_MASK`     | RW | 4     | Per-source enable; bit N = source N. Only bits [3:0] are used; upper bits ignored on write, read as 0. |
-| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bits 2–3 reserved (read 0). |
+| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bit 2 = Ethernet (source 2, = LiteEth `interrupt`, i.e. any `EV_PENDING & EV_ENABLE`; 0 while core 2 owns the MAC); bit 3 reserved (reads 0). |
 | 0x0010  | `INT_VEC0`     | RW | 32    | Handler byte address for source 0 (timer). A vector of 0 disables the source even when its mask bit is set. |
 | 0x0018  | `INT_VEC1`     | RW | 32    | Handler for source 1 (2D DMA blitter DONE). A vector of 0 disables the source. |
-| 0x0020  | `INT_VEC2`     | RW | 32    | Handler for source 2 (reserved). |
+| 0x0020  | `INT_VEC2`     | RW | 32    | Handler for source 2 (Ethernet RX/TX). A vector of 0 disables the source. |
 | 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (reserved). |
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
 | 0x0038  | `TIMER_COUNT`  | R  | 32    | Live cycle counter — useful for profiling. |
