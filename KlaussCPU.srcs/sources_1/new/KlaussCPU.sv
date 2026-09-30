@@ -772,7 +772,7 @@ module KlaussCPU (
    wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
    wire [7:0]   pip_perf_stall;
-   wire         pip_perf_br, pip_perf_br_taken;
+   wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
    // "MMIO store wins" ordering is preserved inside pipeline_core.
    wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
@@ -811,6 +811,7 @@ module KlaussCPU (
       .perf_stall (pip_perf_stall),
       .perf_br    (pip_perf_br),
       .perf_br_taken (pip_perf_br_taken),
+      .perf_fbr_taken (pip_perf_fbr_taken),
       .ret_valid  (pip_ret_valid),
       .ret_pc     (pip_ret_pc),
       .ret_op     (pip_ret_op),
@@ -3414,11 +3415,12 @@ end
                else
                   f_perf_class = PC_BRANCH;
             end
+            4'hD: f_perf_class = PC_BRANCH;                 // v3 B fused compare-and-branch
             4'h9: begin                                     // stack: PUSH*/POP move data
                case (op[25:22])
-                  4'd0, 4'd1: f_perf_class = PC_STORE;      // PUSH / PUSHI
-                  4'd2:       f_perf_class = PC_LOAD;       // POP
-                  4'd6, 4'd7: f_perf_class = PC_INDIRECT;   // RET / IRET
+                  4'd0, 4'd1, 4'd8: f_perf_class = PC_STORE; // PUSH / PUSHI / ENTER (pushes R15)
+                  4'd2, 4'd9: f_perf_class = PC_LOAD;       // POP / LEAVE (pops R15)
+                  4'd6, 4'd7, 4'd10: f_perf_class = PC_INDIRECT; // RET / IRET / LEAVERET
                   default:    f_perf_class = PC_OTHER;      // GETSP / SETSP / ADDSP
                endcase
             end
@@ -3465,8 +3467,11 @@ end
          if (pip_perf_stall[5]) r_perf_branch_flush  <= r_perf_branch_flush  + 48'd1;
          if (pip_perf_stall[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
          if (pip_perf_stall[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
-         if (pip_perf_br && pip_perf_br_taken)
-            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
+         // EX-resolved conditional jumps + MEM-resolved fused branches (v3 B);
+         // both can land on the same cycle.
+         if ((pip_perf_br && pip_perf_br_taken) || pip_perf_fbr_taken)
+            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken
+                                     + ((pip_perf_br && pip_perf_br_taken && pip_perf_fbr_taken) ? 64'd2 : 64'd1);
          // Tier 0 — total cycles and retired instructions.
          // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;

@@ -88,6 +88,7 @@ module pipeline_core
    output logic [7:0]   perf_stall,
    output logic         perf_br,        // conditional branch resolved (event)
    output logic         perf_br_taken,
+   output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
    // park (drained stop)
    output logic         parked,
    output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT
@@ -1207,13 +1208,16 @@ module pipeline_core
                   !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF);
 
    // branch / flush / fetch / port attribution (events and wait cycles)
-   assign perf_stall[5] = ex_valid && !ex_busy && !mem_busy && exo_taken
-                          && (ex_d.uop == U_JMP || ex_d.uop == U_CALL);
+   // An EX op killed this edge by an older fused branch or a store squash
+   // never retires, so it is not counted.
+   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && exo_taken && !fbr_taken && !sq_ex
+                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
-   assign perf_br       = ex_valid && !ex_busy && !mem_busy
+   assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
    assign perf_br_taken = exo_taken;
+   assign perf_fbr_taken = fbr_taken;   // MEM ops always commit: counted as they redirect
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
    // The 64-bit barrel LEAVES the EX cluster (exo_result's U_SHIFT leg is a

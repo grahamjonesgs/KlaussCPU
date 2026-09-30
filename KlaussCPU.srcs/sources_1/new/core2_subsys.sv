@@ -155,6 +155,7 @@ module core2_subsys
       .perf_stall (),
       .perf_br    (),
       .perf_br_taken (),
+      .perf_fbr_taken (),
       .ret_valid  (),
       .ret_pc     (),
       .ret_op     (),
