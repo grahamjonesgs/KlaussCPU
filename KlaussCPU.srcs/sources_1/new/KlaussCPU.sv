@@ -467,126 +467,6 @@ module KlaussCPU (
    logic [31:0] r_opcode_mem;
    logic [31:0] r_var1_mem;
    logic [31:0] r_var2_mem;
-   logic r_var1_prefetched; // 1 when r_var1_mem was populated from the opcode cache line
-
-   // -------------------------------------------------------------------------
-   // 2-stage fetch|execute overlap. r_FPC is a prefetch pointer running ahead of
-   // st.PC; a single-entry instruction-register (IR) latch holds one decoded
-   // instruction. The latch is filled from the instruction buffer under a
-   // bus-idle execute tail (the prefetch, below) and consumed by the fast-path
-   // dispatch in OPCODE_REQUEST. The consume guard r_ir_pc == st.PC is the
-   // independent safety net: a mismatch degrades to a normal re-fetch, never a
-   // wrong instruction. The sequential length comes from f_predecode_len (proven
-   // exact on hardware — a wrong length fails the guard and collapses the
-   // fast-path rate). Execute stays serial; only the fetch front-end overlaps it.
-   // -------------------------------------------------------------------------
-   logic [31:0] r_FPC;              // next-sequential prefetch PC (advanced by f_predecode_len)
-   logic        r_ir_valid;         // IR latch holds a valid prefetched instruction
-   logic [31:0] r_ir_pc;            // PC of the latched instruction (must == st.PC to consume)
-   logic [31:0] r_ir_opcode;        // its 32-bit opcode
-   logic [3:0]  r_ir_reg_1;
-   logic [3:0]  r_ir_reg_2;
-   logic [3:0]  r_ir_reg_dst;
-   logic [31:0] r_ir_var1;          // prefetched var1 (PC+4) when available in the IFB
-   logic        r_ir_var1_prefetched;
-   logic        r_ir_presettled;    // the execute tail already loaded st.reg_1/2 from
-                                  // this latch, so the registered read ports settle
-                                  // during the tail and the fast-path dispatch can
-                                  // skip the FETCH2 settle bubble (saves 1 cyc/instr).
-
-   // -------------------------------------------------------------------------
-   // Instruction fetch buffer (IFB) — a one-line (two-doubleword) capture of
-   // the last cache line read for opcodes. Sequential fetches that land in the
-   // buffered line skip OPCODE_FETCH's ~5-cycle cache round-trip (a cache *hit*
-   // still costs ~5 cycles through the cache pipeline + bus_splitter register).
-   // Per-doubleword granularity so serving reuses the exact st.PC[2] half-select
-   // the cache path uses — no 128-bit repacking. Filled in OPCODE_FETCH on a
-   // miss; checked in OPCODE_REQUEST; invalidated when a store writes a buffered
-   // line (keeps self-modifying code / the Zephyr LLEXT loader coherent — the
-   // unified cache is coherent today and the IFB must not reintroduce a stale
-   // copy). Branch redirects need no flush: a changed PC simply misses the tag.
-   //
-   // NB: held at one line (S=2) deliberately. An S=4 (two-line) variant was
-   // measured and captured *zero* additional hits — every hot loop in the
-   // workload exceeds two lines, and a round-robin line buffer gets no
-   // cross-line reuse below whole-loop size (a cliff, not a gradient). The
-   // loops already sit in L1 at ~0% miss; the IFB's only job is intra-line
-   // sequential reuse, which one line fully delivers. Hiding the remaining
-   // per-line cache-access latency needs overlap (prefetch / pipeline), not
-   // more buffer capacity.
-   // -------------------------------------------------------------------------
-   logic [63:0] r_ifb_dw     [0:1];   // the two doublewords of one 16-byte line
-   logic [28:0] r_ifb_dwaddr [0:1];   // dw-aligned tag = addr[31:3] per slot
-   logic [ 1:0] r_ifb_dwval;          // per-slot valid
-
-   // Dedicated backward-branch-target slot ("loop-head cache"). A single
-   // sticky 16-byte-line buffer (ONE line tag), filled ONLY on a taken backward
-   // *conditional* branch target fetch (loop back-edges — keyed off
-   // r_perf_br_valid/taken so JMP/call/ret never thrash it). It is NOT evicted by
-   // the forward sequential fetches that fill r_ifb_* while the loop body runs, so
-   // the loop head — which the 2-slot IFB loses every iteration once the body spans
-   // a second line — hits here instead of paying the full 6-cycle target fetch.
-   // One line tag (vs two per-dw tags) keeps the added dispatch-mux depth to a
-   // single compare + 3:1 mux, so the var1 path stays off the timing edge. Same
-   // SMC-store invalidation as r_ifb_*.
-   logic [127:0] r_tgt_line;              // [63:0]=low dw, [127:64]=high dw of the line
-   logic [27:0]  r_tgt_lineaddr;          // line-aligned tag = addr[31:4]
-   logic         r_tgt_val;
-   logic [31:0]  r_branch_src_pc = 32'b0; // PC of the instr executing in OPCODE_EXECUTE
-   logic         r_cap_to_tgt    = 1'b0;  // in-flight OPCODE_FETCH is a bwd-branch target
-
-   wire [28:0] w_ifb_pc_dw  = st.PC[31:3];         // dw holding the opcode at PC
-   wire [28:0] w_ifb_pc1_dw = st.PC[31:3] + 1'b1;  // dw holding PC+4 (when PC[2]==1)
-   wire w_ifb_op_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc_dw);
-   wire w_ifb_op_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc_dw);
-   wire w_tgt_op_hit  = r_tgt_val && (r_tgt_lineaddr == w_ifb_pc_dw[28:1]);
-   wire [63:0] w_tgt_op_dw = w_ifb_pc_dw[0] ? r_tgt_line[127:64] : r_tgt_line[63:0];
-   wire w_ifb_op_hit  = w_ifb_op_hit0 | w_ifb_op_hit1 | w_tgt_op_hit;
-   wire [63:0] w_ifb_op_dw = w_ifb_op_hit0 ? r_ifb_dw[0] :
-                             w_ifb_op_hit1 ? r_ifb_dw[1] : w_tgt_op_dw;
-   wire w_ifb_v1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_pc1_dw);
-   wire w_ifb_v1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_pc1_dw);
-   wire w_tgt_v1_hit  = r_tgt_val && (r_tgt_lineaddr == w_ifb_pc1_dw[28:1]);
-   wire [63:0] w_tgt_v1_dw = w_ifb_pc1_dw[0] ? r_tgt_line[127:64] : r_tgt_line[63:0];
-   wire w_ifb_v1_hit  = w_ifb_v1_hit0 | w_ifb_v1_hit1 | w_tgt_v1_hit;
-   wire [63:0] w_ifb_v1_dw = w_ifb_v1_hit0 ? r_ifb_dw[0] :
-                             w_ifb_v1_hit1 ? r_ifb_dw[1] : w_tgt_v1_dw;
-
-   // Instruction-buffer lookup mirrored on the prefetch pointer r_FPC (the
-   // prefetch reads the buffered line at r_FPC; no cache request, never the bus).
-   wire [28:0] w_ifb_fpc_dw   = r_FPC[31:3];
-   wire [28:0] w_ifb_fpc1_dw  = r_FPC[31:3] + 1'b1;
-   wire w_ifb_fpc_hit0  = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc_dw);
-   wire w_ifb_fpc_hit1  = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc_dw);
-   wire w_ifb_fpc_hit   = w_ifb_fpc_hit0 | w_ifb_fpc_hit1;
-   wire [63:0] w_ifb_fpc_data = w_ifb_fpc_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
-   // Tier-4 branch not-taken pre-settle: reg_1/2 for the fall-through successor
-   // (mirrors the cond-jump/call tasks; only meaningful when !r_ir_valid & fpc hit).
-   wire        w_ps_ok = (!r_ir_valid && w_ifb_fpc_hit);
-   wire [3:0]  w_ps_r1 = r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
-   wire [3:0]  w_ps_r2 = r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
-   wire [3:0]  w_ps_rd = r_FPC[2] ? w_ifb_fpc_data[43:40] : w_ifb_fpc_data[11:8];
-   wire w_ifb_fpcv1_hit0 = r_ifb_dwval[0] && (r_ifb_dwaddr[0] == w_ifb_fpc1_dw);
-   wire w_ifb_fpcv1_hit1 = r_ifb_dwval[1] && (r_ifb_dwaddr[1] == w_ifb_fpc1_dw);
-   wire w_ifb_fpcv1_hit  = w_ifb_fpcv1_hit0 | w_ifb_fpcv1_hit1;
-   wire [63:0] w_ifb_fpcv1_data = w_ifb_fpcv1_hit0 ? r_ifb_dw[0] : r_ifb_dw[1];
-   // Taken backward conditional branch (loop back-edge). r_perf_br_valid/taken
-   // are asserted only by the JMPcc arms (not JMP/call/ret), and r_branch_src_pc
-   // holds the branch's own PC (registered in OPCODE_EXECUTE), so this is precise at
-   // the OPCODE_REQUEST cycle that follows the branch. Feeds only r_cap_to_tgt (a
-   // register), off the dispatch critical path.
-   wire w_bwd_target = r_perf_br_valid && r_perf_br_taken && (st.PC < r_branch_src_pc);
-   // Execute-tail states where the memory bus is idle and a one-entry IFB-hit
-   // prefetch may fill the IR latch without contending for the cache port.
-   wire w_exec_tail = (st.SM == OPCODE_EXECUTE) || (st.SM == ALU_FINISH)    ||
-                      (st.SM == MULTIPLY_SETUP) || (st.SM == MULTIPLY_BREG) ||
-                      (st.SM == MULTIPLY_CALC)  || (st.SM == MULTIPLY_PIPE) ||
-                      (st.SM == DIVIDE_PREP)    || (st.SM == DIVIDE_STEP);
-
-   // Debug
-   logic r_debug_flag;
-   logic r_debug_step_flag;
-   logic r_debug_step_run;
 
    wire w_reset_H;
    logic r_boot_flash;
@@ -597,40 +477,6 @@ module KlaussCPU (
    //=========================================================================
 
    
-   //=============================================================================
-  // PIPELINED MULTIPLY REGISTERS
-  //=============================================================================
-
-  // Pipeline stage registers (active during s_multiply state)
-  logic [127:0] r_mul_pipe1;        // Stage 1: multiply result (maps to DSP48 MREG)
-  logic [127:0] r_mul_pipe2;        // Stage 2: registered output (maps to DSP48 PREG)
-  wire [63:0] r_mul_result_lo;
-  wire [63:0] r_mul_result_hi;
-  assign r_mul_result_lo = r_mul_pipe2[63:0];
-  assign r_mul_result_hi = r_mul_pipe2[127:64];
-
-  // Dedicated multiply operand capture (breaks path from register file)
-
-  // Sign-extended (65-bit) operand latches. Doing the signed/unsigned mux
-  // *here* (before the DSP) keeps the LUT2 off the operand_q -> DSP-cascade
-  // path so Vivado can absorb operand_q into DSP48E1 AREG/BREG cleanly.
-  // For unsigned ops we zero-extend; for signed we sign-extend. A single
-  // 65x65 signed multiply then gives the correct lower-128-bit result for
-  // both cases.
-  logic [64:0] r_mul_operand_a_q;
-  logic [64:0] r_mul_operand_b_q;
-
-  // Free-running 3-stage multiply pipeline (Vivado: DSP48 AREG/BREG + MREG + PREG)
-  always_ff @(posedge i_Clk) begin
-     // Stage 1: sign-extend & latch operands (absorbed into DSP AREG/BREG)
-     r_mul_operand_a_q <= {(st.mul_is_unsigned ? 1'b0 : st.mul_operand_a[63]), st.mul_operand_a};
-     r_mul_operand_b_q <= {(st.mul_is_unsigned ? 1'b0 : st.mul_operand_b[63]), st.mul_operand_b};
-     // Stage 2: multiply (MREG) - lower 128 bits of 130-bit signed product
-     r_mul_pipe1 <= $signed(r_mul_operand_a_q) * $signed(r_mul_operand_b_q);
-     // Stage 3: register (PREG)
-     r_mul_pipe2 <= r_mul_pipe1;
-  end
-
   // Free-running millisecond clock since FPGA boot. Lives in its own always
   // block so it ticks every cycle, independent of the main FSM, UART
   // break/command handling, and reset logic. Initial values come from the
@@ -646,48 +492,11 @@ module KlaussCPU (
   end
 
 
-   //=========================================================================
-   // Hardware divide using iterative but optimized state machine
-   // For true single-cycle, you'd need a pipelined divider IP
-   //=========================================================================
-   // Multi-cycle divide pipeline state, grouped (all fields move together
-   // through the DIVIDE_PREP/DIVIDE_STEP FSM; accessed as st.div.<field>).
-   // cpu_state_t + all f_* next-state functions + their enums (alu_op_e/
-   // cmp_op_e/mem_sz_e) + div_state_t live in klauss_pkg.sv (imported above).
+   // SoC control state (loader / boot copy / PIPE_RUN glue / crash dump /
+   // peripheral registers). cpu_state_t lives in klauss_pkg.sv. Instruction
+   // execution belongs entirely to pipeline_core (the pre-pipeline multicycle
+   // CPU that shared this state machine was removed in M13).
    cpu_state_t st;
-
-   // Restoring-division step, factored so synthesis sees ONE 65-bit subtract
-   // instead of a separate 64-bit comparator + 64-bit subtractor in series.
-   // In restoring division the ">=" test and the subtract are the same
-   // operation: the borrow-out of {rem,bit} - divisor IS the comparison
-   // result (no borrow => result >= 0 => quotient bit 1, take the difference;
-   // borrow => quotient bit 0, keep the shifted remainder).  Driving the
-   // quotient-bit mux from w_div_borrow halves the logic on this path.
-   wire [63:0] w_div_shifted = {st.div.remainder[62:0], st.div.dividend[63]};
-   wire [64:0] w_div_trial   = {1'b0, w_div_shifted} - {1'b0, st.div.divisor};
-   wire        w_div_borrow  = w_div_trial[64];
-   
-   // Dedicated read ports - registered every cycle
-   logic [63:0] r_reg_port_a;
-   logic [63:0] r_reg_port_b;
-   logic [63:0] r_reg_port_c;
-
-   // Writeback pipeline registers
-
-    always_ff @(posedge i_Clk) begin
-       // RAW forward: the execute-tail pre-settle moves the port read into the
-       // deferred-writeback commit cycle, so forward a still-pending writeback
-       // whose dest matches the operand (the value r_register WILL hold next
-       // cycle). This mux is on the port INPUT (reg-file read), not the
-       // r_reg_port_b->carry-flag OUTPUT path, so the tight carry chain is
-       // untouched. On the slow (FETCH2) path st.wb.pending is already 0 when the
-       // port reads, so it is a no-op there.
-       r_reg_port_a <= (st.wb.pending && (st.wb.rd == st.reg_1)) ? st.wb.value : r_register[st.reg_1];
-       r_reg_port_b <= (st.wb.pending && (st.wb.rd == st.reg_2)) ? st.wb.value : r_register[st.reg_2];
-       // Port C reads the rd field's register — ISA v2 stores take their DATA
-       // from rd ([11:8]), which is otherwise write-only. Same forward rule.
-       r_reg_port_c <= (st.wb.pending && (st.wb.rd == st.reg_dst)) ? st.wb.value : r_register[st.reg_dst];
-   end
 
    // Track the last non-HCF FSM state so the crash dump can show what was
    // executing at the moment of the trap.  All five HCF states are excluded
@@ -866,7 +675,6 @@ module KlaussCPU (
    wire        w_sd_write_DV  = w_mmio_write_DV & w_sd_sel;
    wire        w_sd_read_DV   = w_mmio_read_DV  & w_sd_sel;
    wire [63:0] w_sd_read_data;
-   wire        w_sd_ready;
 
    mmio_if sd_bus();
    assign sd_bus.write_DV   = w_sd_write_DV;
@@ -889,7 +697,6 @@ module KlaussCPU (
        .o_sd_dat2(o_SD_DAT2)
    );
    assign w_sd_read_data = sd_bus.read_data;
-   assign w_sd_ready     = sd_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
@@ -898,7 +705,6 @@ module KlaussCPU (
    wire        w_aes_write_DV = w_mmio_write_DV & w_aes_sel;
    wire        w_aes_read_DV  = w_mmio_read_DV  & w_aes_sel;
    wire [63:0] w_aes_read_data;
-   wire        w_aes_ready;
 
    mmio_if aes_bus();
    assign aes_bus.write_DV   = w_aes_write_DV;
@@ -913,7 +719,6 @@ module KlaussCPU (
        .mmio(aes_bus)
    );
    assign w_aes_read_data = aes_bus.read_data;
-   assign w_aes_ready     = aes_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto SHA-256 — device id 0x00B. See CRYPTO_PLAN.md §6 and MMIO_MAP.md.
@@ -922,7 +727,6 @@ module KlaussCPU (
    wire        w_sha_write_DV = w_mmio_write_DV & w_sha_sel;
    wire        w_sha_read_DV  = w_mmio_read_DV  & w_sha_sel;
    wire [63:0] w_sha_read_data;
-   wire        w_sha_ready;
 
    mmio_if sha_bus();
    assign sha_bus.write_DV   = w_sha_write_DV;
@@ -937,7 +741,6 @@ module KlaussCPU (
        .mmio(sha_bus)
    );
    assign w_sha_read_data = sha_bus.read_data;
-   assign w_sha_ready     = sha_bus.ready;
 
    // -------------------------------------------------------------------------
    // Crypto TRNG — device id 0x00C. See CRYPTO_PLAN.md §7 and MMIO_MAP.md.
@@ -946,7 +749,6 @@ module KlaussCPU (
    wire        w_trng_write_DV = w_mmio_write_DV & w_trng_sel;
    wire        w_trng_read_DV  = w_mmio_read_DV  & w_trng_sel;
    wire [63:0] w_trng_read_data;
-   wire        w_trng_ready;
 
    // MMIO bus to the TRNG slave (pilot of the mmio_if interface refactor).
    // Broadcast request driven in; per-peripheral decoded strobes driven in;
@@ -964,7 +766,6 @@ module KlaussCPU (
        .mmio(trng_bus)
    );
    assign w_trng_read_data = trng_bus.read_data;
-   assign w_trng_ready     = trng_bus.ready;
 
    // -------------------------------------------------------------------------
    // 2D DMA blitter — device id 0x00E. MMIO slave for operands + START/STATUS;
@@ -975,7 +776,6 @@ module KlaussCPU (
    wire        w_blit_write_DV = w_mmio_write_DV & w_blit_sel;
    wire        w_blit_read_DV  = w_mmio_read_DV  & w_blit_sel;
    wire [63:0] w_blit_read_data;
-   wire        w_blit_ready;
 
    // DMA master wires to mem_read_write (instantiated above).
    wire         w_blit_dma_req;
@@ -1014,7 +814,6 @@ module KlaussCPU (
        .o_irq(w_blit_irq)
    );
    assign w_blit_read_data = blit_bus.read_data;
-   assign w_blit_ready     = blit_bus.ready;
 
    // -------------------------------------------------------------------------
    // AMP core 2 — device id 0x010.  A second pipeline_core at effective
@@ -1526,53 +1325,13 @@ rams_sp_nc rams_sp_nc1 (
    // ── ISA v2 field decode (see ISA_ENCODING_V2_MAP.md) ────────────────────
    // Every property the dispatch needs is a fixed-position field read; the
    // casez below enumerates only "which operation within a class".
-   wire [1:0]  w_len     = w_opcode[31:30];               // 01=1w 10=2w 11=3w, 00=illegal
-   wire [3:0]  w_class   = w_opcode[29:26];
-   wire [31:0] w_pc_next = st.PC + {26'b0, w_len, 2'b00}; // +4 / +8 / +12 from LEN
    // classes 1/2 (ALU) + shared minor-opcode field [25:22]
-   wire [3:0]  w_aluop   = w_opcode[25:22];
-   wire        w_fbit    = w_opcode[21];                  // F: set flags
-   wire        w_sgnbit  = w_opcode[20];                  // SGN: imm32 sign- vs zero-extend
-   wire [63:0] w_imm_ext = w_sgnbit ? {{32{w_var1[31]}}, w_var1} : {32'b0, w_var1};
    // class 3 (compare)
-   wire [2:0]  w_cpred   = w_opcode[25:23];
-   wire        w_cinv    = w_opcode[22];
-   wire        w_cbool   = w_opcode[21];
    // class 4 (shift/rotate/bit)
-   wire        w_shsrc   = w_opcode[21];                  // 1 = embedded count N
-   wire [5:0]  w_shn     = w_opcode[20:15];
-   wire        w_shf     = w_opcode[14];                  // F: set Z
-   wire [5:0]  w_shcnt   = w_shsrc ? w_shn : r_reg_port_b[5:0];
    // class 5 (unary)
-   wire [1:0]  w_unsz    = w_opcode[21:20];               // SEXT/ZEXT size
-   wire        w_unf     = w_opcode[19];                  // F: set Z
-   wire [63:0] w_sext_val = (w_unsz == 2'd0) ? {{56{r_reg_port_a[7]}},  r_reg_port_a[7:0]}  :
-                            (w_unsz == 2'd1) ? {{48{r_reg_port_a[15]}}, r_reg_port_a[15:0]} :
-                                               {{32{r_reg_port_a[31]}}, r_reg_port_a[31:0]};
-   wire [63:0] w_zext_val = (w_unsz == 2'd0) ? {56'b0, r_reg_port_a[7:0]}  :
-                            (w_unsz == 2'd1) ? {48'b0, r_reg_port_a[15:0]} :
-                                               {32'b0, r_reg_port_a[31:0]};
    // classes 6/7 (load/store)
-   wire [1:0]  w_msz     = w_opcode[25:24];               // 00=8 01=16 10=32 11=64
-   wire        w_msgn    = w_opcode[23];
-   wire [1:0]  w_mmode   = w_opcode[22:21];               // 00=[rs1] 01=rs1+imm 10=[imm] 11=rs1+rs2
-   wire        w_malign  = w_opcode[20];
-   wire [31:0] w_eaddr   = (w_mmode == 2'b00) ? r_reg_port_a[31:0] :
-                           (w_mmode == 2'b01) ? r_reg_port_a[31:0] + w_var1 :
-                           (w_mmode == 2'b10) ? w_var1 :
-                                                r_reg_port_a[31:0] + r_reg_port_b[31:0];
    // class 8 (branch)
-   wire        w_blink   = w_opcode[25];
-   wire        w_brel    = w_opcode[24];
-   wire        w_brind   = w_opcode[23];
-   wire [3:0]  w_bcond   = w_opcode[22:19];
-   wire        w_binv    = w_opcode[18];
-   wire [1:0]  w_bcvt    = f_cond_eval(st.flags, w_bcond, w_binv);  // {valid, taken}
    // class A (mul/div)
-   wire [1:0]  w_mdop    = w_opcode[25:24];               // 0=MUL 1=DIV 2=MOD
-   wire        w_mdsgn   = w_opcode[23];
-   wire        w_mdhigh  = w_opcode[22];
-   wire [63:0] w_imm_ext_md = w_mdsgn ? {{32{w_var1[31]}}, w_var1} : {32'b0, w_var1};
 
 // Reserved attribute combinations and non-zero reserved fields trap here, the
 // same ERR_INV_OPCODE path as the casez default — the encoding space stays
@@ -1658,9 +1417,6 @@ rams_sp_nc rams_sp_nc1 (
       st.mem_byte_en <= 8'hFF;
       r_msg = 256'b0;
       r_boot_flash = 0;
-      r_debug_flag = 0;
-      r_debug_step_flag = 0;
-      r_debug_step_run = 0;
       r_break_received = 0;
       st.wb.set_zero = 0;
       st.wb.pending        = 0;
@@ -1671,18 +1427,11 @@ rams_sp_nc rams_sp_nc1 (
       st.rx_fifo_read  = 0;
       r_break_active  = 0;
       r_break_counter = 0;
-      r_var1_prefetched = 0;
-      r_ir_valid = 1'b0;
-      r_ir_presettled = 1'b0;
       r_pip_start = 1'b0;
       r_pip_start_pc = 32'h20;
-      r_FPC = 32'h0;
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
       r_instr_count = 32'h0;
-      r_ifb_dwval = 2'b0;
-      r_tgt_val = 1'b0;
-      r_cap_to_tgt = 1'b0;
       r_perf_br_valid = 1'b0;
       r_perf_br_taken = 1'b0;
       r_int_push_wait_d = 1'b0;
@@ -1724,12 +1473,6 @@ rams_sp_nc rams_sp_nc1 (
          r_trace_idx <= 4'h0;
          r_trace_full <= 1'b0;
          r_instr_count <= 32'h0;
-         r_ifb_dwval <= 2'b0;
-         r_tgt_val <= 1'b0;
-         r_cap_to_tgt <= 1'b0;
-         r_ir_valid <= 1'b0;
-         r_ir_presettled <= 1'b0;
-         r_FPC <= 32'h0;
          r_hcf_dump_phase <= 7'd0;
          r_hcf_dump_sub <= 3'b000;
          r_hcf_dump_byte_pos <= 5'd0;
@@ -1766,11 +1509,6 @@ rams_sp_nc rams_sp_nc1 (
                st.mem_write_DV <= 1'b0;
                st.mem_read_DV <= 1'b0;
             end
-            8'h47: r_debug_flag      <= 1;  // 'G' — debug on
-            8'h67: r_debug_flag      <= 0;  // 'g' — debug off
-            8'h57: r_debug_step_flag <= 1;  // 'W' — step on
-            8'h77: r_debug_step_flag <= 0;  // 'w' — step off
-            8'h6E: r_debug_step_run  <= 1;  // 'n' — next step
             // Any other byte after break: silently ignored
          endcase
       end else begin
@@ -1778,56 +1516,6 @@ rams_sp_nc rams_sp_nc1 (
          st.rx_fifo_read <= 1'b0;
          r_perf_br_valid <= 1'b0;  // 1-cycle strobe; jump tasks re-assert it
          r_fastpath_fired <= 1'b0; // default; the fast-path dispatch below asserts it
-
-         // Prefetch under execute: during a bus-idle execute tail, fill the
-         // one-entry IR latch from the instruction buffer at r_FPC (this
-         // instruction's sequential successor, set at the dispatch below /
-         // OPCODE_FETCH2). Buffer-hit-only — no cache request — so it never
-         // contends for the memory port; the !r_mem_*_DV guards exclude load/store
-         // and store cycles. The execute-tail handoff then pre-loads st.reg_1/2 from
-         // this latch so the fast-path dispatch can skip the FETCH2 bubble.
-         if (w_exec_tail && !r_ir_valid && !st.mem_read_DV && !st.mem_write_DV
-             && w_ifb_fpc_hit) begin
-            r_ir_pc      <= r_FPC;
-            r_ir_opcode  <= r_FPC[2] ? w_ifb_fpc_data[63:32] : w_ifb_fpc_data[31:0];
-            r_ir_reg_1   <= r_FPC[2] ? w_ifb_fpc_data[39:36] : w_ifb_fpc_data[7:4];
-            r_ir_reg_2   <= r_FPC[2] ? w_ifb_fpc_data[35:32] : w_ifb_fpc_data[3:0];
-            r_ir_reg_dst <= r_FPC[2] ? w_ifb_fpc_data[43:40] : w_ifb_fpc_data[11:8];
-            if (r_FPC[2] == 1'b0) begin
-               r_ir_var1            <= w_ifb_fpc_data[63:32];  // var1 shares this dw
-               r_ir_var1_prefetched <= 1'b1;
-            end else if (w_ifb_fpcv1_hit) begin
-               r_ir_var1            <= w_ifb_fpcv1_data[31:0]; // var1 in the next dw
-               r_ir_var1_prefetched <= 1'b1;
-            end else begin
-               r_ir_var1_prefetched <= 1'b0;
-            end
-            r_ir_valid   <= 1'b1;
-         end
-
-         // Instruction-buffer coherence: a DRAM store into a buffered line
-         // drops it so the next fetch re-reads the modified bytes (self-
-         // modifying code / Zephyr LLEXT loader). MMIO stores (top nibble F)
-         // can't alias code, so they're excluded.
-         if (st.mem_write_DV && (st.mem_addr[31:28] != 4'hF)) begin
-            if (r_ifb_dwval[0] && (r_ifb_dwaddr[0] == st.mem_addr[31:3]))
-               r_ifb_dwval[0] <= 1'b0;
-            if (r_ifb_dwval[1] && (r_ifb_dwaddr[1] == st.mem_addr[31:3]))
-               r_ifb_dwval[1] <= 1'b0;
-            // Loop-head slot obeys the same SMC-store invalidation (a store
-            // into either dw of the cached line drops it).
-            if (r_tgt_val && (r_tgt_lineaddr == st.mem_addr[31:4]))
-               r_tgt_val <= 1'b0;
-            // Self-modifying-code poison: a store into the latched instruction's
-            // dword (or the next dword, where a spilled var1 lives) invalidates the
-            // prefetched IR so stale code is never consumed (same discipline as the
-            // instruction buffer above).
-            if (r_ir_valid && ((r_ir_pc[31:3] == st.mem_addr[31:3]) ||
-                               (r_ir_pc[31:3] + 1'b1 == st.mem_addr[31:3]))) begin
-               r_ir_valid      <= 1'b0;
-               r_ir_presettled <= 1'b0;
-            end
-         end
 
          if (r_timer_interrupt_counter > r_timer_period) begin
             r_timer_interrupt_counter <= 0;
@@ -2044,9 +1732,6 @@ rams_sp_nc rams_sp_nc1 (
                   o_TX_LCD_Byte <= 8'b0;
                   o_TX_LCD_Count <= 4'd1;
                   st.flags.carry <= 1'b0;
-                  r_debug_flag <= 1'b0;
-                  r_debug_step_flag <= 1'b0;
-                  r_debug_step_run <= 1'b0;
                   st.error_code <= 8'h0;
                   r_hcf_message_sent <= 1'b0;
                   r_interrupt_table[0] <= 32'h0;  // clear all 4 handler vectors;
@@ -2069,12 +1754,6 @@ rams_sp_nc rams_sp_nc1 (
                   st.int_mask <= 4'h0;            // all sources masked until program enables
                   r_timer_period <= 32'h000F_FFFF;  // default ~10.5 ms @ 100 MHz
                   r_instr_count <= 32'h0;        // reset committed-instruction counter for the new run
-                  r_ifb_dwval <= 2'b0;           // drop any buffered code from the previous program
-                  r_tgt_val <= 1'b0;              // drop the loop-head slot too
-                  r_cap_to_tgt <= 1'b0;
-                  r_FPC <= r_PC_requested;       // prefetch pointer starts at the entry point
-                  r_ir_valid <= 1'b0;            // no prefetched instruction yet
-                  r_ir_presettled <= 1'b0;
                   st.timing_start <= 0;
                   st.flags.zero <= 0;
                   t_tx_message(8'd1);  // Load OK message
@@ -2099,16 +1778,6 @@ rams_sp_nc rams_sp_nc1 (
                   r_start_wait_counter <= r_start_wait_counter - 1;
                   st.seven_seg_value1 <= 32'h21_21_21_21;
                   st.seven_seg_value2 <= 32'h21_21_21_21;
-               end
-            end
-
-            // Delay to enable load message to be sent before starting
-            UART_DELAY: begin
-               r_msg_send_DV <= 1'b0;
-               if (!w_sending_msg) begin
-                  r_pip_start    <= 1'b1;
-                  r_pip_start_pc <= st.PC;
-                  st.SM <= PIPE_RUN;
                end
             end
 
@@ -2157,588 +1826,6 @@ rams_sp_nc rams_sp_nc1 (
                   endcase
                end
             end
-
-            OPCODE_REQUEST: begin
-               r_msg_send_DV <= 1'b0;
-               st.extra_clock <= 2'b0;  // always reset — all instructions rely on this
-               st.mem_byte_en <= 8'hFF;  // default full-word; byte ops override this
-
-               // Execute-occupancy fusion: commit the previous
-               // instruction's register writeback here, in parallel with the
-               // fetch dispatch below. r_register and the dispatch's
-               // st.mem_addr/st.PC are disjoint resources, and the register read
-               // ports are sampled at OPCODE_FETCH2 (after this write), so the
-               // next instruction observes the result with no RAW hazard. This
-               // removes the dedicated WRITEBACK cycle (~ -1 cyc/instr on the
-               // writeback-producing op classes).
-               if (st.wb.pending) begin
-                  r_register[st.wb.rd] <= st.wb.value;
-                  if (st.wb.set_zero)
-                     st.flags.zero <= (st.wb.value == 64'b0);
-                  st.wb.set_zero <= 1'b0;
-                  st.wb.pending <= 1'b0;
-               end
-
-               if (r_int_push_wait) begin
-                  // Waiting for DDR2 to finish the timer-interrupt PC push
-                  if (w_mem_ready) begin
-                     st.mem_write_DV  <= 1'b0;
-                     r_int_push_wait <= 1'b0;
-                     st.mem_addr      <= st.PC;  // st.PC already set to interrupt target
-                     st.mem_read_DV   <= 1'b1;
-                     st.SM            <= OPCODE_FETCH;
-                     r_cap_to_tgt     <= 1'b0;   // an IRQ redirect is never a loop back-edge
-                  end
-               end else if (w_irq_ready) begin
-                  // Start pushing current PC + flags + mask onto DDR2 stack before jumping to handler.
-                  // Slot layout (64-bit doubleword):
-                  //   [63:43] = 0
-                  //   [42:39] = st.int_mask (per-source enables, restored by IRET)
-                  //   [38]    = zero,    [37] = equal,  [36] = carry,
-                  //   [35]    = overflow,[34] = sign,   [33] = less, [32] = ult
-                  //   [31:0]  = PC (resume address)
-                  st.SP             <= st.SP - 8;
-                  st.mem_addr       <= st.SP - 32'd8;
-                  // Zero flag pushed as it will be AFTER any deferred writeback
-                  // committing this same cycle (st.wb.pending block above), so the
-                  // saved interrupt context stays precise.
-                  // 7-bit ISA flag word kept for frame compatibility; E/L/U are
-                  // DERIVED from the Z/S/C/V register (E=Z, L=S^V, U=C). IRET
-                  // restores only Z/S/C/V (the derived bits regenerate).
-                  st.mem_write_data <= {21'b0, st.int_mask,
-                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),  // [38] Z
-                                       ((st.wb.pending && st.wb.set_zero) ? (st.wb.value == 64'b0) : st.flags.zero),  // [37] E = Z
-                                       st.flags.carry,                                     // [36] C
-                                       st.flags.overflow, st.flags.sign,                   // [35] V, [34] S
-                                       (st.flags.sign ^ st.flags.overflow),                // [33] L = S^V
-                                       st.flags.carry,                                     // [32] U = C
-                                       st.PC};
-                  st.mem_byte_en    <= 8'hFF;
-                  st.mem_write_DV   <= 1'b1;
-                  // Source-selected dispatch (timer=0 priority, blitter=1). The
-                  // pushed mask above is the pre-dispatch st.int_mask, so IRET
-                  // re-enables this source. Timer pending is hardware-cleared
-                  // here; the blitter is level/sticky and acked by the ISR
-                  // (write STATUS.DONE W1C) before IRET.
-                  if (w_irq_sel == 2'd0) r_timer_interrupt <= 1'b0;
-                  st.int_mask[w_irq_sel] <= 1'b0;  // mask this source while handler runs; IRET restores
-                  st.PC             <= r_interrupt_table[w_irq_sel];
-                  r_int_push_wait  <= 1'b1;
-                  r_ir_valid       <= 1'b0;   // discard the speculative fall-through
-                  r_ir_presettled  <= 1'b0;   // (IRQ redirect; precise interrupts preserved)
-                  // stay in OPCODE_REQUEST until push completes
-               end else if (r_ir_presettled && r_ir_valid && r_ir_pc == st.PC
-                            && r_ir_opcode[29:26] != 4'h7) begin
-                  // Fast-path dispatch: the prefetched IR was pre-settled into
-                  // st.reg_1/2 during the previous instruction's execute tail, so the
-                  // reg-file read ports are already valid — skip the OPCODE_FETCH2
-                  // settle bubble and go straight to EXECUTE (saves 1 cyc/instr).
-                  // Ordered AFTER w_irq_ready so a pending interrupt always wins.
-                  // Class-7 stores are excluded: their data comes from read port C
-                  // (rd field), which is only guaranteed settled via the FETCH2
-                  // path, not the reg_1/2-only pre-settle (see f_ps note).
-                  r_opcode_mem      <= r_ir_opcode;
-                  st.reg_dst         <= r_ir_reg_dst;
-                  r_var1_mem        <= r_ir_var1;
-                  r_var1_prefetched <= r_ir_var1_prefetched;
-                  // Crash trace + retire counter: FETCH2 (their usual home) is skipped
-                  // on this path, so the unique commit gate moves here.
-                  r_trace_buf[r_trace_idx] <= {st.PC, r_ir_opcode};
-                  r_trace_idx              <= r_trace_idx + 4'd1;
-                  if (r_trace_idx == 4'd15) r_trace_full <= 1'b1;
-                  r_instr_count <= r_instr_count + 32'd1;
-                  r_FPC <= st.PC + f_predecode_len(r_ir_opcode);  // next sequential prefetch
-                  r_fastpath_fired <= 1'b1;  // a retired instruction that skips FETCH2 (counts in r_perf_instr + r_perf_fastpath)
-                  r_ir_valid      <= 1'b0;
-                  r_ir_presettled <= 1'b0;
-                  if (r_ir_var1_prefetched) begin
-                     if (r_debug_flag && r_ir_opcode[29:26] != 4'hB)   // skip system-class (NOP/DELAY/...) in debug trace
-                        st.SM <= DEBUG_DATA;
-                     else
-                        st.SM <= OPCODE_EXECUTE;
-                  end else begin
-                     st.SM          <= VAR1_FETCH;   // var1 not buffered — fetch it (also settles)
-                     st.mem_addr    <= (st.PC + 4);
-                     st.mem_read_DV <= 1'b1;
-                  end
-               end else if (w_ifb_op_hit) begin
-                  // Instruction-buffer hit: serve the opcode now and skip the
-                  // OPCODE_FETCH cache round-trip. var1 (PC+4) is prefetched
-                  // from the buffer when available; otherwise OPCODE_FETCH2
-                  // falls through to VAR1_FETCH exactly as on a non-prefetch.
-                  r_opcode_mem <= st.PC[2] ? w_ifb_op_dw[63:32] : w_ifb_op_dw[31:0];
-                  // Latch register fields a cycle early — the opcode is available
-                  // combinationally on an IFB hit, so the registered reg-file
-                  // reads settle during OPCODE_FETCH2 and the VAR1_FETCH2 bubble
-                  // is no longer needed (fetch sequencing 3 cycles -> 2).
-                  st.reg_1   <= st.PC[2] ? w_ifb_op_dw[39:36] : w_ifb_op_dw[7:4];
-                  st.reg_2   <= st.PC[2] ? w_ifb_op_dw[35:32] : w_ifb_op_dw[3:0];
-                  st.reg_dst <= st.PC[2] ? w_ifb_op_dw[43:40] : w_ifb_op_dw[11:8];
-                  if (st.PC[2] == 1'b0) begin
-                     r_var1_mem        <= w_ifb_op_dw[63:32];  // var1 shares this dw
-                     r_var1_prefetched <= 1'b1;
-                  end else if (w_ifb_v1_hit) begin
-                     r_var1_mem        <= w_ifb_v1_dw[31:0];   // var1 in the next buffered dw
-                     r_var1_prefetched <= 1'b1;
-                  end else begin
-                     r_var1_prefetched <= 1'b0;
-                  end
-                  r_ir_valid      <= 1'b0;   // drop the prefetch (served from the buffer, not pre-settled)
-                  r_ir_presettled <= 1'b0;
-                  st.SM <= OPCODE_FETCH2;
-               end else begin
-                  r_ir_valid      <= 1'b0;   // drop any stale prefetch on a cache-miss fetch
-                  r_ir_presettled <= 1'b0;
-                  st.mem_addr    <= st.PC;
-                  st.mem_read_DV <= 1'b1;
-                  st.SM          <= OPCODE_FETCH;
-                  r_cap_to_tgt   <= w_bwd_target;  // capture this line into the loop-head slot iff it's a bwd-branch target
-               end
-            end
-
-            OPCODE_FETCH: begin
-               if (w_mem_ready) begin
-                  // PC[2] selects which 32-bit half of the 64-bit doubleword holds the opcode.
-                  // Little-endian layout:
-                  //   [31:0]  = bytes at the doubleword-aligned base address  (PC[2]==0)
-                  //   [63:32] = bytes at base+4                               (PC[2]==1)
-                  r_opcode_mem  <= st.PC[2] ? w_mem_read_data[63:32]
-                                           : w_mem_read_data[31:0];
-                  // Latch register fields here (a cycle earlier than the old
-                  // OPCODE_FETCH2) so the registered reg reads settle by the time
-                  // OPCODE_FETCH2 hands off to OPCODE_EXECUTE — no VAR1_FETCH2.
-                  st.reg_1   <= st.PC[2] ? w_mem_read_data[39:36] : w_mem_read_data[7:4];
-                  st.reg_2   <= st.PC[2] ? w_mem_read_data[35:32] : w_mem_read_data[3:0];
-                  st.reg_dst <= st.PC[2] ? w_mem_read_data[43:40] : w_mem_read_data[11:8];
-                  st.mem_read_DV <= 1'b0;
-                  if (st.PC[2] == 0) begin
-                     // var1 (at PC+4) is in the HIGH half of the same doubleword — always here.
-                     r_var1_mem        <= w_mem_read_data[63:32];
-                     r_var1_prefetched <= 1'b1;
-                  end else if (w_mem_next_valid) begin
-                     // var1 (at PC+4) is in the next doubleword's low half.
-                     r_var1_mem        <= w_mem_read_data_next[31:0];
-                     r_var1_prefetched <= 1'b1;
-                  end else begin
-                     r_var1_prefetched <= 1'b0;
-                  end
-                  // Refill the instruction buffer from the returned line so the
-                  // following sequential fetches hit it. The cache exposes the
-                  // requested doubleword (w_mem_read_data) and, when valid, the
-                  // NEXT SEQUENTIAL doubleword (w_mem_read_data_next, addr+8). With
-                  // 32 B lines next_valid holds at offsets 0/1/2, so the next dw is
-                  // addr[31:3]+1 — NOT the old 16 B "flip bit 3" companion.
-                  r_ifb_dw[0]     <= w_mem_read_data;
-                  r_ifb_dwaddr[0] <= st.mem_addr[31:3];
-                  r_ifb_dwval[0]  <= 1'b1;
-                  if (w_mem_next_valid) begin
-                     r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= st.mem_addr[31:3] + 29'd1;
-                     r_ifb_dwval[1]  <= 1'b1;
-                  end else begin
-                     r_ifb_dwval[1]  <= 1'b0;
-                  end
-                  // This fetch is a taken backward-branch target (loop head).
-                  // Mirror the whole line into the sticky loop-head slot so
-                  // subsequent iterations hit it after the body evicts the IFB
-                  // slots. Store in canonical order (low dw at [63:0]) so the hit
-                  // read indexes by PC[3]. Only cache when the companion dw came
-                  // back (loop heads normally get the full 128-bit line); either
-                  // way consume r_cap_to_tgt so a later fetch never fills it.
-                  if (r_cap_to_tgt) begin
-                     // The loop-head slot is a 16 B (2-dw) buffer. With 32 B cache
-                     // lines the cache's "next" dw is the SEQUENTIAL addr+8, which
-                     // forms an aligned 16 B line with the requested dw only when
-                     // mem_addr[3]==0 (requested=even/low dw, next=odd/high dw of the
-                     // SAME 16 B line). For mem_addr[3]==1 the two dwords straddle
-                     // two 16 B lines, so skip — the slot only caches aligned heads.
-                     if (w_mem_next_valid && st.mem_addr[3] == 1'b0) begin
-                        r_tgt_line[63:0]   <= w_mem_read_data;
-                        r_tgt_line[127:64] <= w_mem_read_data_next;
-                        r_tgt_lineaddr     <= st.mem_addr[31:4];
-                        r_tgt_val          <= 1'b1;
-                     end
-                     r_cap_to_tgt <= 1'b0;
-                  end
-                  st.SM <= OPCODE_FETCH2;
-               end  // if ready asserted, else will loop until ready
-            end
-
-            OPCODE_FETCH2: begin
-               // Capture {PC, opcode} into the crash-dump trace ring exactly once
-               // per dispatched fetch.  OPCODE_FETCH2 is the unique "instruction
-               // committed for execution" gate (it precedes every path into
-               // OPCODE_EXECUTE, including the debug-step and interrupt-handler
-               // paths), so this gives one entry per executed instruction.
-               r_trace_buf[r_trace_idx] <= {st.PC, w_opcode};
-               r_trace_idx              <= r_trace_idx + 4'd1;
-               if (r_trace_idx == 4'd15)
-                  r_trace_full <= 1'b1;
-               // Bump the committed-instruction counter once per fetch (this is
-               // the unique commit gate). 32-bit wrap is ~4.3e9 — irrelevant
-               // for crash diagnostics.
-               r_instr_count <= r_instr_count + 32'd1;
-               // Advance the prefetch pointer to this instruction's sequential
-               // successor (the fast path does this in OPCODE_REQUEST instead). The
-               // predecode is proven exact, so r_FPC tracks the fall-through; a
-               // control-flow redirect just makes the next dispatch recompute it.
-               r_FPC <= st.PC + f_predecode_len(w_opcode);
-               // Register fields (st.reg_1/2/dst) were latched a cycle earlier in
-               // OPCODE_REQUEST (IFB hit) or OPCODE_FETCH (miss), so r_reg_port_a/b
-               // are already settling — the old VAR1_FETCH2 bubble is gone.
-               if (r_var1_prefetched) begin
-                  // var1 already in r_var1_mem — go straight to execute.
-                  if (r_debug_flag && w_opcode[29:26] != 4'hB) begin   // skip system-class (NOP/DELAY/...) in debug trace
-                     st.SM <= DEBUG_DATA;
-                  end else begin
-                     st.SM <= OPCODE_EXECUTE;
-                  end
-               end else begin
-                  st.SM          <= VAR1_FETCH;
-                  st.mem_addr    <= (st.PC + 4);
-                  st.mem_read_DV <= 1'b1;
-               end
-            end
-
-            // VAR1_FETCH2 removed: register fields are now latched a cycle
-            // earlier (OPCODE_REQUEST / OPCODE_FETCH), so the registered reg
-            // reads no longer need a dedicated settle bubble before EXECUTE.
-
-            VAR1_FETCH: begin
-               if (w_mem_ready) begin
-                  r_var1_mem<=w_mem_read_data[31:0]; // lower 32 bits = instruction word at this address (little-endian, PC[2]==0)
-                  // Refill the instruction buffer from this returned line, same
-                  // as OPCODE_FETCH does.  VAR1_FETCH only runs when the
-                  // immediate at PC+4 fell outside the buffered/prefetched
-                  // doubleword (PC at the last word of a line), so the line
-                  // returned here is the NEXT code line — exactly what the
-                  // following fetch at PC+8 needs.  Without this refill that
-                  // fetch pays a second full cache round-trip for data the CPU
-                  // just had in its hands.  st.mem_addr still holds PC+4 (set in
-                  // OPCODE_FETCH2), so the tagging matches OPCODE_FETCH's
-                  // refill verbatim.
-                  r_ifb_dw[0]     <= w_mem_read_data;
-                  r_ifb_dwaddr[0] <= st.mem_addr[31:3];
-                  r_ifb_dwval[0]  <= 1'b1;
-                  if (w_mem_next_valid) begin
-                     r_ifb_dw[1]     <= w_mem_read_data_next;
-                     r_ifb_dwaddr[1] <= st.mem_addr[31:3] + 29'd1;   // next SEQUENTIAL dw (32 B line)
-                     r_ifb_dwval[1]  <= 1'b1;
-                  end else begin
-                     r_ifb_dwval[1]  <= 1'b0;
-                  end
-                  if (r_debug_flag && w_opcode[29:26] != 4'hB) begin  // Ignore system-class opcodes (NOP/DELAY/...)
-                     st.SM <= DEBUG_DATA;
-                  end else begin
-                     st.SM <= OPCODE_EXECUTE;
-                  end
-                  st.mem_read_DV <= 1'b0;
-
-               end  // if ready asserted, else will loop until ready
-            end
-
-
-            DEBUG_DATA: begin
-               t_debug_message;
-               st.SM <= DEBUG_DATA2;
-            end
-
-            DEBUG_DATA2: begin
-               r_msg_send_DV <= 1'b0;
-               st.SM <= DEBUG_DATA3;
-            end
-
-            DEBUG_DATA3: begin
-               if (!w_sending_msg) begin
-                  st.SM <= OPCODE_EXECUTE;
-                  if (r_debug_step_flag == 1'b1) begin
-                     st.SM <= DEBUG_WAIT;
-                  end else begin
-                     st.SM <= OPCODE_EXECUTE;
-                  end
-               end
-            end
-
-            DEBUG_WAIT: begin
-               if (r_debug_step_run == 1'b1) begin
-                  r_debug_step_run <= 1'b0;
-                  st.SM <= OPCODE_EXECUTE;
-               end
-            end
-
-            OPCODE_EXECUTE: begin
-               // Snapshot this instr's PC so the next OPCODE_REQUEST can tell a
-               // taken branch is *backward* (loop back-edge) for the loop-head
-               // cache. Module-scope reg — not clobbered by the arms' whole-struct `st <=`.
-               r_branch_src_pc <= st.PC;
-               casez (w_opcode[31:0])
-                  // ═══ ISA v2 field-driven dispatch ════════════════════════
-                  // One casez arm per (CLASS, LEN); the attribute fields select
-                  // the operation and parameterize the shared next-state
-                  // functions (see ISA_ENCODING_V2_MAP.md). Reserved fields are
-                  // matched as 0 in the patterns; reserved attribute
-                  // combinations `OPC_TRAP via the inner defaults.
-
-                  // ── Class 1 (LEN=01): ALU reg-reg — rd = rs1 OP rs2 ──
-                  32'b01_0001_????_?0_0000_0000_????_????_????:
-                     case ({w_aluop, w_fbit})
-                        {4'd0,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADD, st.reg_dst, w_pc_next);  // ADDR
-                        {4'd1,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SUB, st.reg_dst, w_pc_next);  // SUBR
-                        {4'd2,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_ADC, st.reg_dst, w_pc_next);  // ADDC
-                        {4'd3,  1'b1}: st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_SBC, st.reg_dst, w_pc_next);  // SUBC
-                        {4'd4,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_AND, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDR
-                        {4'd5,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_OR,  st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORR
-                        {4'd6,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, r_reg_port_b, ALU_XOR, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORR
-                        {4'd7,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MIN,  w_pc_next);  // MINR
-                        {4'd8,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAX,  w_pc_next);  // MAXR
-                        {4'd9,  1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MINU, w_pc_next);  // MINUR
-                        {4'd10, 1'b0}: st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, CMP_MAXU, w_pc_next);  // MAXUR
-                        default: `OPC_TRAP
-                     endcase
-
-                  // ── Class 2 (LEN=10): ALU immediate — rd = rs1 OP ext(imm32),
-                  // extension per SGN. v1 in-place forms are rd==rs1 encodings.
-                  32'b10_0010_????_??_0000_0000_????_????_0000:
-                     case ({w_aluop, w_fbit})
-                        {4'd0,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_ADD, st.reg_dst, w_pc_next);  // ADDI / ADDV
-                        {4'd1,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_SUB, st.reg_dst, w_pc_next);  // MINUSV (+sext form)
-                        {4'd2,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_ADC, st.reg_dst, w_pc_next);  // ADC-imm (new)
-                        {4'd3,  1'b1}: st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_SBC, st.reg_dst, w_pc_next);  // SBC-imm (new)
-                        {4'd4,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_AND, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ANDV
-                        {4'd5,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_OR,  st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // ORV
-                        {4'd6,  1'b0}: begin st <= f_ps(f_alu(st, r_reg_port_a, w_imm_ext, ALU_XOR, st.reg_dst, w_pc_next), w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok) r_ir_presettled <= 1'b1; end  // XORV
-                        {4'd14, 1'b0}: st <= f_wb(st, {32'b0, st.PC + w_var1}, st.reg_dst, 1'b0, w_pc_next);      // LEAPC (SGN dc: 32-bit add)
-                        {4'd15, 1'b0}: st <= f_wb(st, w_imm_ext, st.reg_dst, 1'b0, w_pc_next);                    // MOV: SETR (SGN=1) / zext-MOV (SGN=0)
-                        default: `OPC_TRAP
-                     endcase
-
-                  // ── Class 2 (LEN=11): MOV imm64 — SETR64, hi32 self-fetched at PC+8.
-                  32'b11_0010_1111_00_0000_0000_????_0000_0000:
-                     st <= f_setr64(st, w_mem_ready, w_mem_read_data, w_var1, st.reg_dst, w_pc_next);  // SETR64
-
-                  // ── Class 3: compare. B=0 flag-setting CMP (E/L/U); B=1
-                  // boolean rd=0/1 via (PRED, INV) -> f_cmp_op.
-                  32'b01_0011_????_?0_0000_0000_????_????_????:
-                     if (w_cbool) begin
-                        if (w_cpred <= 3'd4) st <= f_cmpr(st, r_reg_port_a, r_reg_port_b, f_cmp_op(w_cpred, w_cinv), w_pc_next);  // CMPccR
-                        else `OPC_TRAP
-                     end else if (w_cpred == 3'd0 && !w_cinv && w_opcode[11:8] == 4'h0)
-                        st <= f_alu(st, r_reg_port_a, r_reg_port_b, ALU_CMP, st.reg_dst, w_pc_next);  // CMPRR (flags only)
-                     else `OPC_TRAP
-                  32'b10_0011_????_??_0000_0000_????_????_0000:
-                     if (w_cbool) begin
-                        if (w_cpred <= 3'd4) st <= f_cmpr(st, r_reg_port_a, w_imm_ext, f_cmp_op(w_cpred, w_cinv), w_pc_next);  // CMPcc-imm (new)
-                        else `OPC_TRAP
-                     end else if (w_cpred == 3'd0 && !w_cinv && w_opcode[11:8] == 4'h0)
-                        st <= f_alu(st, r_reg_port_a, w_imm_ext, ALU_CMP, st.reg_dst, w_pc_next);  // CMPRV
-                     else `OPC_TRAP
-
-                  // ── Class 5 (LEN=01): unary — rd = OP(rs1); F -> Z where the
-                  // datapath parameterizes it (set_zero), canonical elsewhere.
-                  32'b01_0101_????_??_?_000_0000_????_????_0000:
-                     if (w_aluop != 4'd4 && w_aluop != 4'd5 && w_unsz != 2'd0) `OPC_TRAP
-                     else case (w_aluop)
-                        4'd0:  st <= f_wb(st, r_reg_port_a,             st.reg_dst, w_unf, w_pc_next);  // COPY
-                        4'd1:  st <= f_wb(st, ~r_reg_port_a + 64'd1,    st.reg_dst, w_unf, w_pc_next);  // NEG
-                        4'd2:  st <= f_wb(st, ~r_reg_port_a,            st.reg_dst, w_unf, w_pc_next);  // NOT
-                        4'd3:  if (w_unf) st <= f_abs(st, r_reg_port_a, st.reg_dst, w_pc_next); else `OPC_TRAP  // ABS (Z+V)
-                        4'd4:  if (w_unsz == 2'd3) `OPC_TRAP
-                               else if (w_unf) st <= f_wb_ns(st, w_sext_val, st.reg_dst, w_pc_next);    // SEXTB/H (+W new) — Z+S
-                               else st <= f_wb(st, w_sext_val, st.reg_dst, 1'b0, w_pc_next);            // SEXTW (flag-neutral)
-                        4'd5:  if (w_unsz == 2'd3) `OPC_TRAP
-                               else st <= f_wb(st, w_zext_val, st.reg_dst, w_unf, w_pc_next);           // ZEXTB/H/W
-                        4'd6:  st <= f_wb(st, {r_reg_port_a[7:0], r_reg_port_a[15:8], r_reg_port_a[23:16], r_reg_port_a[31:24], r_reg_port_a[39:32], r_reg_port_a[47:40], r_reg_port_a[55:48], r_reg_port_a[63:56]}, st.reg_dst, w_unf, w_pc_next);  // BSWAP
-                        4'd7:  st <= f_wb(st, bit_reverse(r_reg_port_a),                   st.reg_dst, w_unf, w_pc_next);  // BITREV
-                        4'd8:  st <= f_wb(st, {57'b0, popcount(r_reg_port_a)},             st.reg_dst, w_unf, w_pc_next);  // POPCNT
-                        4'd9:  st <= f_wb(st, {57'b0, count_leading_zeros(r_reg_port_a)},  st.reg_dst, w_unf, w_pc_next);  // CLZ
-                        4'd10: st <= f_wb(st, {57'b0, count_trailing_zeros(r_reg_port_a)}, st.reg_dst, w_unf, w_pc_next);  // CTZ
-                        4'd12: st <= f_wb(st, {st.flags.zero, st.flags.zero, st.flags.carry, st.flags.overflow, 60'b0}, st.reg_dst, w_unf, w_pc_next);  // GETF: {Z, E=Z, C, V} (E derived)
-                        4'd14: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_ADD, st.reg_dst, w_pc_next); else `OPC_TRAP  // INC
-                        4'd15: if (w_unf) st <= f_alu(st, r_reg_port_a, 64'd1, ALU_SUB, st.reg_dst, w_pc_next); else `OPC_TRAP  // DEC
-                        default: `OPC_TRAP
-                     endcase
-                  // ── Class 4 (LEN=01): shift / rotate / bit. Count/position =
-                  // SRC ? N[20:15] : rs2[5:0] (one mux); F -> Z via set_zero.
-                  // ROL/ROR with SRC=1, N=1, F=1 keep the v1 rotate-by-1
-                  // carry-out semantics (f_rot1); RCL/RCR exist only in that
-                  // shape. SRC=0 requires N=0.
-                  32'b01_0100_????_?_??????_?_00_????_????_????:
-                     if (!w_shsrc && w_shn != 6'd0) `OPC_TRAP
-                     else case (w_aluop)
-                        4'd0: begin st <= f_ps(f_wb(st, r_reg_port_a << w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SHL (SHLR/SHLV/SHLR1)
-                        4'd1: begin st <= f_ps(f_wb(st, r_reg_port_a >> w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SHR
-                        4'd2: begin st <= f_ps(f_wb(st, $signed(r_reg_port_a) >>> w_shcnt, st.reg_dst, w_shf, w_pc_next), w_ps_ok && w_shsrc && w_shf, w_ps_r1, w_ps_r2, w_ps_rd); if (w_ps_ok && w_shsrc && w_shf) r_ir_presettled <= 1'b1; end  // SAR
-                        4'd3: if (w_shsrc && w_shn == 6'd1 && w_shf)
-                                 st <= f_rot1(st, {r_reg_port_a[62:0], r_reg_port_a[63]}, r_reg_port_a[63], st.reg_dst, w_pc_next);  // ROLR1 / ROLV #1 (Z+C)
-                              else
-                                 st <= f_wb(st, (r_reg_port_a << w_shcnt) | (r_reg_port_a >> (64 - w_shcnt)), st.reg_dst, w_shf, w_pc_next);  // ROLR / ROLV #N
-                        4'd4: if (w_shsrc && w_shn == 6'd1 && w_shf)
-                                 st <= f_rot1(st, {r_reg_port_a[0], r_reg_port_a[63:1]}, r_reg_port_a[0], st.reg_dst, w_pc_next);    // RORR1 / RORV #1 (Z+C)
-                              else
-                                 st <= f_wb(st, (r_reg_port_a >> w_shcnt) | (r_reg_port_a << (64 - w_shcnt)), st.reg_dst, w_shf, w_pc_next);  // RORR / RORV #N
-                        4'd5: if (w_shsrc && w_shn == 6'd1 && w_shf)
-                                 st <= f_rot1(st, {r_reg_port_a[62:0], st.flags.carry}, r_reg_port_a[63], st.reg_dst, w_pc_next);    // ROLCR (RCL #1)
-                              else `OPC_TRAP
-                        4'd6: if (w_shsrc && w_shn == 6'd1 && w_shf)
-                                 st <= f_rot1(st, {st.flags.carry, r_reg_port_a[63:1]}, r_reg_port_a[0], st.reg_dst, w_pc_next);     // RORCR (RCR #1)
-                              else `OPC_TRAP
-                        4'd8:  st <= f_wb(st, r_reg_port_a |  (64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BSET (RR + #N)
-                        4'd9:  st <= f_wb(st, r_reg_port_a & ~(64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BCLR
-                        4'd10: st <= f_wb(st, r_reg_port_a ^  (64'b1 << w_shcnt), st.reg_dst, w_shf, w_pc_next);  // BTGL
-                        4'd11: if (w_shsrc) begin
-                                  if (w_opcode[11:8] == 4'h0 && !w_shf) st <= f_btst(st, r_reg_port_a, w_shn, w_pc_next);  // BTST #N (flag-only, v1)
-                                  else `OPC_TRAP
-                               end else
-                                  st <= f_wb(st, {63'b0, r_reg_port_a[r_reg_port_b[5:0]]}, st.reg_dst, w_shf, w_pc_next);  // BTSTRR (rd = bit)
-                        default: `OPC_TRAP
-                     endcase
-                  // ── Class 6: loads — rd = ext(mem[EA]); EA from the MODE mux
-                  // (w_eaddr); SIZE/SGN/A feed f_ld_idx directly. MODE 00/11 are
-                  // 1-word (LEN=01), 01/10 are 2-word (LEN=10). The 32-bit
-                  // register-indirect form keeps the unaligned-tolerant
-                  // f_memget32 path (v1 MEMGET32); A applies to 64-bit only.
-                  32'b01_0110_??_?_??_?_0000_0000_????_????_????:
-                     if (w_mmode == 2'b01 || w_mmode == 2'b10) `OPC_TRAP
-                     else if (w_mmode == 2'b00 && w_opcode[3:0] != 4'h0) `OPC_TRAP
-                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
-                     else if (w_msz == 2'b10 && w_mmode == 2'b00) begin
-                        if (w_msgn) `OPC_TRAP
-                        else st <= f_memget32(st, w_mem_ready, w_mem_read_data, w_mem_read_data_next, w_mem_next_valid, r_reg_port_a[31:0], st.reg_dst);  // MEMGET32
-                     end else
-                        st <= f_ld_idx(st, w_mem_ready, w_eaddr, w_mem_read_data, mem_sz_e'(w_msz), w_msgn, w_malign, st.reg_dst, w_pc_next);  // MEMGET8/16/64, MEMREADRR, LDIDX64R + new sgn/size forms
-                  32'b10_0110_??_?_??_?_0000_0000_????_????_????:
-                     if (w_mmode == 2'b00 || w_mmode == 2'b11) `OPC_TRAP
-                     else if (w_mmode == 2'b10 && w_opcode[7:0] != 8'h00) `OPC_TRAP
-                     else if (w_mmode == 2'b01 && w_opcode[3:0] != 4'h0) `OPC_TRAP
-                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
-                     else st <= f_ld_idx(st, w_mem_ready, w_eaddr, w_mem_read_data, mem_sz_e'(w_msz), w_msgn, w_malign, st.reg_dst, w_pc_next);  // LDIDX8/16/32/64(_S/A), MEMREADR + new forms
-
-                  // ── Class 7: stores — mem[EA] = reg[rd] (read port C). SGN is
-                  // reserved-0 for stores; f_st_idx does all lane/byte-enable math.
-                  32'b01_0111_??_?_??_?_0000_0000_????_????_????:
-                     if (w_msgn) `OPC_TRAP
-                     else if (w_mmode == 2'b01 || w_mmode == 2'b10) `OPC_TRAP
-                     else if (w_mmode == 2'b00 && w_opcode[3:0] != 4'h0) `OPC_TRAP
-                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
-                     else st <= f_st_idx(st, w_mem_ready, w_eaddr, r_reg_port_c, mem_sz_e'(w_msz), w_malign, w_pc_next);  // MEMSET8/16/32/64(RR), STIDX64R + new size forms
-                  32'b10_0111_??_?_??_?_0000_0000_????_????_????:
-                     if (w_msgn) `OPC_TRAP
-                     else if (w_mmode == 2'b00 || w_mmode == 2'b11) `OPC_TRAP
-                     else if (w_mmode == 2'b10 && w_opcode[7:0] != 8'h00) `OPC_TRAP
-                     else if (w_mmode == 2'b01 && w_opcode[3:0] != 4'h0) `OPC_TRAP
-                     else if (w_malign && w_msz != 2'b11) `OPC_TRAP
-                     else st <= f_st_idx(st, w_mem_ready, w_eaddr, r_reg_port_c, mem_sz_e'(w_msz), w_malign, w_pc_next);  // STIDX8/16/32/64(_A), MEMSETR + new forms
-
-                  // ── Class 9: stack / SP ──
-                  32'b01_1001_????_00_0000_0000_????_????_0000:
-                     case (w_aluop)
-                        4'd0: if (w_opcode[11:8] != 4'h0) `OPC_TRAP else st <= f_push(st, r_reg_port_a, w_pc_next, w_mem_ready);              // PUSH rs1
-                        4'd2: if (w_opcode[7:4]  != 4'h0) `OPC_TRAP else st <= f_pop (st, w_mem_ready, w_mem_read_data, st.reg_dst, w_pc_next); // POP rd
-                        4'd3: if (w_opcode[7:4]  != 4'h0) `OPC_TRAP else st <= f_wb  (st, {32'b0, st.SP}, st.reg_dst, 1'b0, w_pc_next);       // GETSP rd
-                        4'd4: if (w_opcode[11:8] != 4'h0) `OPC_TRAP else st <= f_sp_set(st, r_reg_port_a[31:0], w_pc_next);                   // SETSP rs1
-                        4'd6: if (w_opcode[11:4] != 8'h00) `OPC_TRAP else st <= f_ret (st, w_mem_ready, w_mem_read_data);                     // RET
-                        4'd7: if (w_opcode[11:4] != 8'h00) `OPC_TRAP else st <= f_iret(st, w_mem_ready, w_mem_read_data);                     // IRET
-                        default: `OPC_TRAP
-                     endcase
-                  32'b10_1001_????_00_0000_0000_0000_0000_0000:
-                     case (w_aluop)
-                        4'd1: st <= f_push(st, {32'b0, w_var1}, w_pc_next, w_mem_ready);       // PUSHV (zext imm32)
-                        4'd5: st <= f_sp_set(st, st.SP + $signed(w_var1), w_pc_next);          // ADDSP (sext imm32)
-                        default: `OPC_TRAP
-                     endcase
-                  32'b11_1001_0001_00_0000_0000_0000_0000_0000:
-                     st <= f_pushv64(st, w_mem_ready, w_mem_read_data, w_var1[31:0]);          // PUSHV64 (self-fetch hi32)
-
-                  // ── Class A: mul / div — SGN/H are field reads into the
-                  // pipeline seeds (MULHV/MULUV/DIVUV/MODUV now exist for free).
-                  32'b01_1010_????_00_0000_0000_????_????_????:
-                     case (w_mdop)
-                        2'd0: st <= f_mul_setup(st, r_reg_port_a, r_reg_port_b, st.reg_dst, w_mdhigh, !w_mdsgn, 1'b0);                    // MUL(H)(U)R
-                        2'd1: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, w_mdsgn, 1'b0, 1'b0, st.reg_dst); // DIV(U)R
-                        2'd2: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, r_reg_port_b, w_mdsgn, 1'b1, 1'b0, st.reg_dst); // MOD(U)R
-                        default: `OPC_TRAP
-                     endcase
-                  32'b10_1010_????_00_0000_0000_????_????_0000:
-                     case (w_mdop)
-                        2'd0: st <= f_mul_setup(st, r_reg_port_a, w_imm_ext_md, st.reg_dst, w_mdhigh, !w_mdsgn, 1'b1);                    // MULV + new imm forms
-                        2'd1: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, w_imm_ext_md, w_mdsgn, 1'b0, 1'b1, st.reg_dst); // DIVV
-                        2'd2: if (w_mdhigh) `OPC_TRAP else st <= f_div_setup(st, r_reg_port_a, w_imm_ext_md, w_mdsgn, 1'b1, 1'b1, st.reg_dst); // MODV
-                        default: `OPC_TRAP
-                     endcase
-
-                  // ── Class 4 (LEN=10): BEXTR / BDEP — start[4:0] / len[12:8]
-                  // packed in imm32.
-                  32'b10_0100_11??_0_000000_0_00_????_????_????:
-                     case (w_aluop)
-                        4'd12: if (w_opcode[3:0] != 4'h0) `OPC_TRAP
-                               else st <= f_bextr(st, r_reg_port_a, w_var1, st.reg_dst, w_pc_next);                // BEXTR
-                        4'd13: st <= f_bdep (st, r_reg_port_a, r_reg_port_b, w_var1, st.reg_dst, w_pc_next);       // BDEP (base=rs1, src=rs2)
-                        default: `OPC_TRAP
-                     endcase
-
-                  // ── Class B: system ──
-                  32'b01_1011_0000_??????_0000_0000_????_0000:
-                     case (w_opcode[21:16])
-                        6'd0: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, OPCODE_REQUEST, w_pc_next); // NOP
-                        6'd1: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, HALTED_BREAK,   st.PC);     // HALT
-                        6'd2: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, WAITING,        w_pc_next); // WAIT
-                        6'd3: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_ctrl(st, OPCODE_REQUEST, 32'h4);     // RESET
-                        6'd4: if (w_opcode[7:4] != 4'h0) `OPC_TRAP else st <= f_trap(st);                            // TRAP
-                        6'd5: st <= f_delay(st, r_reg_port_a[31:0], w_pc_next);                                      // DELAYR (rs1)
-                        default: `OPC_TRAP
-                     endcase
-                  32'b10_1011_0000_000101_0000_0000_0000_0000:
-                     st <= f_delay(st, w_var1, w_pc_next);                                                           // DELAYV
-
-                  // ── Class 8: branch / call — COND+INV drive one flag mux
-                  // (f_cond_eval), LINK selects jump vs call, REL/RIND are field
-                  // reads. Conditional REL calls and conditional indirect forms
-                  // now exist for free. perf_br strobes on conditional jumps
-                  // only; not-taken pre-settles the sequential successor.
-                  32'b10_1000_?_?_0_????_?_00_0000_0000_0000_0000:                                     // imm target (abs / REL)
-                     if (!w_bcvt[1]) `OPC_TRAP
-                     else if (w_blink) begin
-                        st <= f_cond_call(st, w_mem_ready, w_bcvt[0], w_var1, w_brel, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);  // CALL / CALLcc / CALLREL
-                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
-                     end else begin
-                        st <= f_cond_jump(st, w_bcvt[0], w_var1, w_brel, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);               // JMP / JMPcc (REL)
-                        if (w_bcond != 4'd0) begin r_perf_br_valid <= 1'b1; r_perf_br_taken <= w_bcvt[0]; end
-                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
-                     end
-                  32'b01_1000_?_0_1_????_?_00_0000_0000_0000_????:                                     // register target (RIND, target = rs2)
-                     if (!w_bcvt[1]) `OPC_TRAP
-                     else if (w_blink) begin
-                        st <= f_cond_call(st, w_mem_ready, w_bcvt[0], r_reg_port_b[31:0], 1'b0, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);  // CALLR (+cond, new)
-                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
-                     end else begin
-                        st <= f_cond_jump(st, w_bcvt[0], r_reg_port_b[31:0], 1'b0, w_pc_next, w_ps_ok, w_ps_r1, w_ps_r2, w_ps_rd);               // JMPR (+cond, new)
-                        if (w_bcond != 4'd0) begin r_perf_br_valid <= 1'b1; r_perf_br_taken <= w_bcvt[0]; end
-                        if (!w_bcvt[0] && w_ps_ok) r_ir_presettled <= 1'b1;
-                     end
-
-                  // ── Class C: LCD SPI-DC — OP selects CMD/DATA/RESET, LEN
-                  // selects register vs immediate byte source. f_lcd = st part,
-                  // arm drives the o_*LCD* ports.
-                  32'b01_1100_??_0000_0000_0000_0000_????_0000:
-                     case (w_opcode[25:24])
-                        2'd0: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDR
-                        2'd1: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= r_reg_port_a[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAR
-                        default: `OPC_TRAP
-                     endcase
-                  32'b10_1100_??_0000_0000_0000_0000_0000_0000:
-                     case (w_opcode[25:24])
-                        2'd0: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0]; o_LCD_DC <= 1'b0; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDCMDV
-                        2'd1: begin st <= f_lcd(st, i_TX_LCD_Ready, w_pc_next); if (i_TX_LCD_Ready) begin o_TX_LCD_Byte <= w_var1[7:0]; o_LCD_DC <= 1'b1; o_TX_LCD_DV <= 1'b1; end else o_TX_LCD_DV <= 1'b0; end // LCDDATAV
-                        2'd2: begin st <= f_ctrl(st, OPCODE_REQUEST, w_pc_next); o_LCD_reset_n <= w_var1[0]; end // LCDRST
-                        default: `OPC_TRAP
-                     endcase
-
-                  // Illegal / reserved: LEN=00 (any pre-v2 word, zeroed DDR2),
-                  // classes 0x0/0xD/0xE/0xF, and every unassigned (CLASS, LEN)
-                  // shape falls through to here.
-                  default: `OPC_TRAP
-               endcase
-            end  // case OPCODE_EXECUTE
 
             HCF_1: begin
                // First entry only: kick the crash-dump UART emitter.  HCF_4 loops
@@ -3082,68 +2169,6 @@ rams_sp_nc rams_sp_nc1 (
                end  // else if(st.timeout_counter>=DELAY_TIME)
 
             end
-            
-             MULTIPLY_SETUP: begin
-    // Operands now valid in st.mul_operand_a/b; this cycle they propagate
-    // into r_mul_operand_a_q/b_q (absorbed into DSP48E1 AREG/BREG).
-    st.SM <= MULTIPLY_BREG;
-end
-
-MULTIPLY_BREG: begin
-    // Wait for DSP input registers (AREG/BREG) - multiply now starting
-    st.SM <= MULTIPLY_CALC;
-end
-
-MULTIPLY_CALC: begin
-    // Wait for pipeline stage 2 (MREG) - multiply is computed
-    // by the free-running pipeline from r_mul_operand_a_q/b_q
-    st.SM <= MULTIPLY_PIPE;
-end
-
-MULTIPLY_PIPE: begin
-    // Wait for pipeline stage 3 (PREG) - result now in r_mul_result_hi/lo
-    st.SM <= MULTIPLY_WRITEBACK;
-end
-
-MULTIPLY_WRITEBACK: begin
-    // Stage result into writeback pipeline
-    if (st.mul_is_high)
-        st.wb.value <= r_mul_result_hi;
-    else
-        st.wb.value <= r_mul_result_lo;
-    st.wb.rd <= st.mul_dest_reg;
-
-    // Flags from registered values
-    if (st.mul_is_high) begin
-        st.flags.zero     <= (r_mul_result_hi == 64'b0);
-        st.flags.sign     <= r_mul_result_hi[63];
-        st.flags.overflow <= 1'b0;
-    end else begin
-        st.flags.zero     <= (r_mul_result_lo == 64'b0);
-        st.flags.sign     <= r_mul_result_lo[63];
-        if (st.mul_is_unsigned)
-            st.flags.overflow <= (r_mul_result_hi != 64'b0);
-        else
-            st.flags.overflow <= (r_mul_result_hi != {64{r_mul_result_lo[63]}});
-    end
-
-    // PC increment depends on instruction type
-    if (st.mul_is_immediate)
-        st.PC <= st.PC + 8;
-    else
-        st.PC <= st.PC + 4;
-
-    // Execute-tail handoff: pre-load st.reg_1/2 from the prefetched latch (the
-    // multiply used r_mul_operand_*_q, not st.reg_1/2) so the next dispatch skips
-    // FETCH2. st.PC becomes the successor this cycle; OPCODE_REQUEST's r_ir_pc==st.PC
-    // guard confirms the match next cycle.
-    if (r_ir_valid) begin
-        st.reg_1         <= r_ir_reg_1;
-        st.reg_2         <= r_ir_reg_2;
-        r_ir_presettled <= 1'b1;
-    end
-    st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
-end
 
             HALTED_BREAK: begin
                // Wait for any in-flight TX to finish, then hold line low for
@@ -3165,137 +2190,6 @@ end
 
             HALTED: begin
                // CPU halted - do nothing until reset
-            end
-
-            // Interruptible core-suspend (WAIT opcode). The core parks here
-            // issuing no instruction fetches and no bus/MMIO activity (only the
-            // free-running timer / clock_ms / perf counters keep ticking), until
-            // an unmasked, vectored interrupt becomes pending. The wake is
-            // LEVEL-sensitive on w_irq_ready and re-evaluated every cycle, so an
-            // interrupt arriving on or after the WAIT cycle is never lost (this
-            // is what makes the software idiom "enable-interrupts; WAIT" safe).
-            // t_wait already advanced st.PC to the instruction after WAIT, so the
-            // normal dispatch in OPCODE_REQUEST saves that PC and IRET resumes
-            // past the WAIT. If an interrupt is already pending when WAIT runs,
-            // this exits next cycle — it never sleeps with work pending.
-            // CPU_RESETN (handled above) and UART load/command paths force-exit
-            // like any other state.
-            WAITING: begin
-               if (w_irq_ready)
-                  st.SM <= OPCODE_REQUEST;
-            end
-
-            // DIVIDE_PREP — skip the leading-zero iterations of restoring
-            // division.  The div tasks land here (dividend already abs'd,
-            // divisor checked non-zero); pre-shifting the dividend by clz and
-            // starting the counter there is bit-identical to running those
-            // iterations: each would shift a 0 into the remainder, fail the
-            // trial subtract, and emit a 0 quotient bit.  Typical 32-bit
-            // operands now iterate ~32 times instead of a fixed 64; small loop
-            // counters take a handful.  DIVIDE_STEP's iteration datapath is
-            // untouched (its trial-subtract carry chain is a known critical
-            // path), and the CLZ + shifter here run register-to-register in
-            // their own cycle.
-            DIVIDE_PREP: begin : divide_prep
-               logic [6:0] prep_clz;
-               prep_clz = count_leading_zeros(st.div.dividend);
-               if (prep_clz[6]) begin
-                  // dividend == 0 (clz = 64): quotient 0, remainder 0 —
-                  // go straight to DIVIDE_STEP's finish branch.
-                  st.div.counter <= 7'd64;
-               end else begin
-                  st.div.dividend <= st.div.dividend << prep_clz[5:0];
-                  st.div.counter  <= {1'b0, prep_clz[5:0]};
-               end
-               st.SM <= DIVIDE_STEP;
-            end
-
-            DIVIDE_STEP: begin
-               // Shared division iteration - avoids re-evaluating opcode casez each cycle
-               if (st.div.counter < 7'd64) begin
-                  // Restoring division step — single subtract (w_div_trial),
-                  // borrow-out (w_div_borrow) selects quotient bit and remainder.
-                  if (!w_div_borrow) begin
-                     st.div.remainder <= w_div_trial[63:0];
-                     st.div.quotient  <= {st.div.quotient[62:0], 1'b1};
-                  end
-                  else begin
-                     st.div.remainder <= w_div_shifted;
-                     st.div.quotient  <= {st.div.quotient[62:0], 1'b0};
-                  end
-                  st.div.dividend <= {st.div.dividend[62:0], 1'b0};
-                  st.div.counter <= st.div.counter + 1;
-               end
-               else begin
-                  // Division complete - write result based on op type
-                  if (st.div.op == DIV_OP_DIV) begin
-                     if (st.div.is_signed && st.div.sign_q)
-                        st.wb.value <= ~st.div.quotient + 1;
-                     else
-                        st.wb.value <= st.div.quotient;
-                     st.flags.zero <= (st.div.quotient == 0) ? 1'b1 : 1'b0;
-                  end
-                  else begin  // DIV_OP_MOD
-                     if (st.div.is_signed && st.div.sign_r)
-                        st.wb.value <= ~st.div.remainder + 1;
-                     else
-                        st.wb.value <= st.div.remainder;
-                     st.flags.zero <= (st.div.remainder == 0) ? 1'b1 : 1'b0;
-                  end
-                  st.wb.rd <= st.div.dest_reg;
-                  st.flags.overflow <= 1'b0;
-                  st.div.op <= DIV_OP_NONE;
-                  st.PC <= st.PC + (st.div.pc_inc ? 8 : 4);
-                  // Execute-tail handoff: pre-load st.reg_1/2 from the prefetched
-                  // latch (the divide used r_div_* regs, not st.reg_1/2) so the next
-                  // dispatch skips FETCH2.
-                  if (r_ir_valid) begin
-                     st.reg_1         <= r_ir_reg_1;
-                     st.reg_2         <= r_ir_reg_2;
-                     r_ir_presettled <= 1'b1;
-                  end
-                  st.SM <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
-               end
-            end
-
-            WRITEBACK: begin
-               r_register[st.wb.rd] <= st.wb.value;
-               if (st.wb.set_zero)
-                  st.flags.zero <= (st.wb.value == 64'b0);
-               st.wb.set_zero <= 1'b0;
-               st.SM <= OPCODE_REQUEST;
-            end
-
-            //==================================================================
-            // ALU_FINISH — second pipeline stage for arithmetic / compare ops.
-            // Cycle 1 (the task in OPCODE_EXECUTE) registered the 64-bit
-            // subtract / compare result + flags into r_alu_pipe_*. This stage
-            // copies the intermediates to architectural state, then either
-            // proceeds to WRITEBACK (ARITH ops, write rd) or directly back to
-            // OPCODE_REQUEST (CMP ops, no rd). Mode bit selects.
-            //==================================================================
-            ALU_FINISH: begin
-               if (st.alu_pipe_mode == 1'b0) begin       // ARITH
-                  st.wb.value <= st.alu_pipe_value;
-                  st.flags.carry      <= st.alu_pipe_carry;
-                  st.flags.overflow   <= st.alu_pipe_overflow;
-                  st.flags.sign       <= st.alu_pipe_value[63];
-                  st.SM              <= OPCODE_REQUEST; st.wb.pending <= 1'b1;
-               end else begin                           // CMP: commit SUB flags, no rd write
-                  st.flags.zero     <= (st.alu_pipe_value == 64'b0);
-                  st.flags.carry    <= st.alu_pipe_carry;
-                  st.flags.overflow <= st.alu_pipe_overflow;
-                  st.flags.sign     <= st.alu_pipe_value[63];
-                  st.SM             <= OPCODE_REQUEST;
-               end
-               // Execute-tail handoff: the ALU already consumed its operands and
-               // st.PC is the successor, so pre-load st.reg_1/2 from the prefetched
-               // latch — the read ports settle now and the fast-path dispatch skips FETCH2.
-               if (r_ir_valid) begin
-                  st.reg_1         <= r_ir_reg_1;
-                  st.reg_2         <= r_ir_reg_2;
-                  r_ir_presettled <= 1'b1;
-               end
             end
 
             default: st.SM <= HCF_1;  // loop in error
