@@ -1153,6 +1153,7 @@ module pipeline_core
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
    wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
+
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
@@ -1173,6 +1174,26 @@ module pipeline_core
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
+
+   // ---- completing-store squashes (evaluated on the store's completion edge,
+   // the same edge the EX op would advance into MEM) ----
+   // SMC: a DRAM store overlapping the code of the younger op in EX or ID.
+   wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF;
+   wire [28:0] smc_dw     = mem_iaddr[31:3];
+   wire        smc_hit_id = smc_st && id_valid &&
+                            (id_pc[31:3] == smc_dw || id_last_dw == smc_dw);
+   wire        smc_hit_ex = smc_st && ex_valid &&
+                            (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw);
+   // ICACHE_INV (CACHE_CTRL 0xF005_0000 bit 3, a fence.i): the SoC ignores
+   // bit 3; the core decodes its own completing store. Invalidates every
+   // fetch-side code copy and refetches everything younger — for code written
+   // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
+   wire        icinv      = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
+                            mem_be[0] && mem_wdata[3];
+   // Squash the EX op (it must not enter MEM: it was fetched before the
+   // store) / anything younger than the store.
+   wire        sq_ex      = smc_hit_ex || (icinv && ex_valid);
+   wire        sq_any     = sq_ex || smc_hit_id || (icinv && id_valid);
 
    // M9+ slide enable (see slide_dw_ok above). Suppressed on a DRAM-store
    // COMPLETION edge: the SMC squash (end of the clocked block) indexes IFB
@@ -1487,7 +1508,7 @@ module pipeline_core
          end
 
          lcd_rst_wr <= 1'b0;
-         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken) begin
+         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !sq_ex) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end
@@ -1851,27 +1872,35 @@ module pipeline_core
          // any YOUNGER in-flight instruction (IF window / ID / EX) whose word
          // span overlaps the stored dword; refetch from the oldest squashed.
          // Safe because side effects only exist from MEM onward.
-         if (mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF) begin : smc
-            logic [28:0] st_dw;
-            logic hit_id, hit_ex;
-            st_dw   = mem_iaddr[31:3];
-            hit_id  = id_valid && (id_pc[31:3] == st_dw || id_last_dw == st_dw);
-            hit_ex  = ex_valid && (ex_pc[31:3] == st_dw || ex_last_dw == st_dw);
-            if (ifb_val[0] && ifb_base == st_dw)          ifb_val[0] <= 1'b0;
-            if (ifb_val[1] && ifb_base + 29'd1 == st_dw)  ifb_val[1] <= 1'b0;
+         if (smc_st) begin
+            if (ifb_val[0] && ifb_base == smc_dw)          ifb_val[0] <= 1'b0;
+            if (ifb_val[1] && ifb_base + 29'd1 == smc_dw)  ifb_val[1] <= 1'b0;
             // M9: the NLB is a code copy too — same store-match rule (line-granular)
-            if ((nlb_vhi || nlb_vlo) && nlb_line == st_dw[28:1]) begin
+            if ((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) begin
                nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
             end
-            if (hit_ex || hit_id) begin
-               ex_valid <= 1'b0;
-               id_valid <= 1'b0;
-               dly_on   <= 1'b0;
-               ifb_val  <= 2'b00;
-               ev_pcz   = 1'b1;
-               pc       <= hit_ex ? ex_pc : id_pc;
-               if (hit_ex && ex_d.serialize) fetch_halt <= 1'b0; // re-dispatch re-arms it
-            end
+         end
+         if (icinv) begin
+            for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
+            nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;
+            if_look <= 1'b0;  snoop_q <= 1'b0;
+            ifb_val <= 2'b00; ev_pcz = 1'b1;
+         end
+         if (sq_any) begin
+            // M13 fix: the EX op is fetched-before-the-store too, so it must
+            // not commit (it used to advance into MEM here and ALSO be
+            // refetched: stale execution, then a deadlock when the ID op
+            // dispatched this edge was a serializer that set fetch_halt).
+            if (sq_ex) mem_valid <= 1'b0;
+            ex_valid   <= 1'b0;
+            id_valid   <= 1'b0;
+            dly_on     <= 1'b0;
+            ifb_val    <= 2'b00;
+            ev_pcz     = 1'b1;
+            pc         <= sq_ex ? ex_pc : id_pc;
+            // Every in-flight serializer is younger than the store, so it is
+            // squashed here and re-arms fetch_halt when it re-dispatches.
+            fetch_halt <= 1'b0;
          end
 
          // int_mask MMIO write-back (SoC handler owns 0xF00F_0000) — last, so

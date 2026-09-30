@@ -24,6 +24,16 @@ xsim tpisa -runall -testplusarg "TEST=wait" -testplusarg "TRACE=out/wait.trace" 
   -testplusarg "UARTF=out/wait.uart" | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
 xsim tpisa -runall -testplusarg "TEST=smc" -testplusarg "TRACE=out/smc.trace" \
   -testplusarg "UARTF=out/smc.uart" | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
+# M13: store over the op in EX (was stale-execute + deadlock), and the
+# ICACHE_INV fence against non-snooped (DMA-style) code writes, with a
+# no-fence control that must see the stale code. Fixed and random latency.
+for T in smc_ex icinv icinv_nofence; do
+  for L in "LAT=0" "LAT=1"; do
+    xsim tpisa -runall -testplusarg "TEST=$T" -testplusarg "TRACE=out/$T.trace" \
+      -testplusarg "UARTF=out/$T.uart" -testplusarg "$L" -testplusarg "RAND=5" \
+      | grep "TB_M5C" | tee /dev/stderr | grep -q PASS || RES=1
+  done
+done
 # irq_lock mask-race (older INT_MASK store in the drain shadow): two phase
 # sweeps — prime storm periods, second with randomized DRAM latency.
 xsim tpisa -runall -testplusarg "TEST=maskrace" -testplusarg "TRACE=out/maskrace.trace" \

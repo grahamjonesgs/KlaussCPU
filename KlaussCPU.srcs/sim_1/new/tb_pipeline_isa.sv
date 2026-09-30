@@ -120,6 +120,9 @@ module tb_pipeline_isa;
             $fwrite(uart_f, "%c", wd[7:0]);
             uart_n++;
          end
+         // TB-only "DMA": rewrite code behind the core's back (no store snoop)
+         // — the icinv tests stage new code at 0x200 and copy it over 0x100.
+         if (a == 32'hF0FF_0000) mem_lo[32] <= mem_lo[64];
          if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) begin
             // INT_MASK write: mirror the SoC MMIO handler into the core
             mask_wr    <= 1'b1;
@@ -256,6 +259,24 @@ module tb_pipeline_isa;
          else
             $display("TB_M5C SMC: FAIL (r2=%016x, expected beef)", dbg_r[2]);
       end
+      if (test_mode == "smc_ex") begin
+         if (dbg_r[2] === 64'hBEEF && icount == 5)
+            $display("TB_M5C SMC_EX: PASS (store over the op in EX: squashed + refetched once)");
+         else
+            $display("TB_M5C SMC_EX: FAIL (r2=%016x, retired %0d, expected beef/5)", dbg_r[2], icount);
+      end
+      if (test_mode == "icinv") begin
+         if (dbg_r[2] === 64'd2)
+            $display("TB_M5C ICINV: PASS (DMA-written code visible after ICACHE_INV)");
+         else
+            $display("TB_M5C ICINV: FAIL (r2=%016x, expected 2)", dbg_r[2]);
+      end
+      if (test_mode == "icinv_nofence") begin
+         if (dbg_r[2] === 64'd1)
+            $display("TB_M5C ICINV_NOFENCE: PASS (stale cached code ran without the fence, as expected)");
+         else
+            $display("TB_M5C ICINV_NOFENCE: FAIL (r2=%016x, expected 1 = stale)", dbg_r[2]);
+      end
       if (test_mode == "maskrace") begin
          if (maskrace_viol == 0 && irq_acks >= 8 && dbg_r[2] === 64'd512)
             $display("TB_M5C MASKRACE: PASS (%0d irqs, 0 in-lock dispatches)",
@@ -359,6 +380,30 @@ module tb_pipeline_isa;
             mem_lo[7] = {32'h0000DEAD, 32'h8BD00200};
             mem_lo[8] = {32'h00000000, 32'h6C010000};
             image_f = "(built-in smc test)";
+         end
+         "smc_ex": begin
+            // SETR r1,0xBEEF; SETR r3,0x38; MEMSET32 [r3],r1 overwrites the
+            // imm word of the IMMEDIATELY following SETR r2 (in EX when the
+            // store completes); HALT. r2 must be 0xBEEF, SETR r2 retired once.
+            mem_lo[4] = {32'h0000BEEF, 32'h8BD00100};
+            mem_lo[5] = {32'h00000038, 32'h8BD00300};
+            mem_lo[6] = {32'h8BD00200, 32'h5E000130};
+            mem_lo[7] = {32'h6C010000, 32'h0000DEAD};
+            image_f = "(built-in smc_ex test)";
+         end
+         "icinv", "icinv_nofence": begin
+            // f at 0x100: SETR r2,1; RET. Staged f' at 0x200: SETR r2,2; RET.
+            // main: CALL f (caches it); TB-DMA f' over f (no snoop);
+            // ICACHE_INV (CACHE_CTRL=8; NOP for _nofence); CALL f; HALT.
+            mem_lo[32] = {32'h65800000, 32'h4BD01200};
+            mem_lo[64] = {32'h65800000, 32'h4BD02200};
+            mem_lo[4]  = {32'h8BD00400, 32'h63000038};   // CALL.S f ; SETR r4,..
+            mem_lo[5]  = {32'h5E000240, 32'hF0FF0000};   // 0xF0FF0000 ; MEMSET32 [r4],r2 (TB DMA)
+            mem_lo[6]  = {32'hF0050000, 32'h8BD00500};   // SETR r5,CACHE_CTRL
+            mem_lo[7]  = {(test_mode == "icinv") ? 32'h5E000650 : 32'h6C000000,
+                          32'h4BD08600};                 // SETR.S r6,8 ; MEMSET32 [r5],r6 | NOP
+            mem_lo[8]  = {32'h6C010000, 32'h63000030};   // CALL.S f ; HALT
+            image_f = "(built-in icinv test)";
          end
          default: begin
             $readmemh(image_f, mem_lo);
