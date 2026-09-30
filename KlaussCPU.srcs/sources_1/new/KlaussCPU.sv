@@ -181,7 +181,6 @@ module KlaussCPU (
    logic [31:0] o_ram_write_value;
    logic [31:0] o_ram_write_addr;
    logic [31:0] r_ram_next_write_addr;
-   logic [7:0] rx_count;
    logic [2:0] r_load_byte_counter;
    logic [15:0] r_checksum;
    logic [15:0] r_old_checksum;
@@ -1312,31 +1311,12 @@ rams_sp_nc rams_sp_nc1 (
    integer i;
    initial begin
       st.flags.sign <= 0;
-      st.div.busy <= 0;
-      st.div.op <= DIV_OP_NONE;
-      st.div.counter <= 0;
        for (i = 0; i < 16; i = i + 1)
        r_register[i] = 64'b0;
-      st.mul_is_immediate = 0;
    end
    
    assign w_opcode = r_opcode_mem;
 
-   // ── ISA v2 field decode (see ISA_ENCODING_V2_MAP.md) ────────────────────
-   // Every property the dispatch needs is a fixed-position field read; the
-   // casez below enumerates only "which operation within a class".
-   // classes 1/2 (ALU) + shared minor-opcode field [25:22]
-   // class 3 (compare)
-   // class 4 (shift/rotate/bit)
-   // class 5 (unary)
-   // classes 6/7 (load/store)
-   // class 8 (branch)
-   // class A (mul/div)
-
-// Reserved attribute combinations and non-zero reserved fields trap here, the
-// same ERR_INV_OPCODE path as the casez default — the encoding space stays
-// loudly reclaimable.
-`define OPC_TRAP begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
    assign w_var1   = r_var1_mem;
    assign w_var2   = r_var2_mem;
    
@@ -1396,7 +1376,6 @@ rams_sp_nc rams_sp_nc1 (
       st.seven_seg_value1 = 32'h20_10_00_07;
       st.seven_seg_value2 = 32'h21_21_21_21;
       st.led <= 16'h0;
-      rx_count = 8'b0;
       o_ram_write_addr = 32'h0;
       r_ram_next_write_addr = 32'h0;
       st.SP = 32'h800_0000;          // empty-descending stack, top of 128 MiB byte space
@@ -2335,9 +2314,8 @@ rams_sp_nc rams_sp_nc1 (
 
 
    //=========================================================================
-   // Performance-counter block (Tier 0/1/2). Its own always block: reads
-   // existing FSM state (st.SM, st.div.counter, r_int_push_wait), the decoded
-   // opcode (w_opcode) and the branch-outcome strobe set by the jump tasks.
+   // Performance-counter block (Tier 0/1/2). Its own always block: reads the
+   // pipeline's perf strobes (pip_perf_*), st.SM and r_int_push_wait.
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
    //=========================================================================
