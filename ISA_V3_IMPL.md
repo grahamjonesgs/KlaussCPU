@@ -1,7 +1,7 @@
 # ISA v3 — what was implemented (M13)
 
 Implements `klausscpu-llvm/llvm/lib/Target/KlaussCPU/ISA_V3_PROPOSAL.md` items
-A (all), B (resolved in MEM), C, D1 and D2 across the RTL, the `klausscc` emulator/assembler and the
+A (all), B (resolved in MEM), C, D1, D2 and D3 across the RTL, the `klausscc` emulator/assembler and the
 LLVM fork. Everything is backwards compatible: every v2 binary runs unchanged
 (board-measured cycle-identical on the v3 core). Branch `isa-v3` in all repos.
 
@@ -18,6 +18,7 @@ LLVM fork. Everything is backwards compatible: every v2 binary runs unchanged
 | C `ENTER N` | 9 | `LEN=01`, op 8 | N `[21:0]` (dwords) | push R15; R15 = SP; SP −= 8N |
 | C `LEAVE` | 9 | `LEN=01`, op 9, `[21:0]=0` | — | SP = R15; pop R15 |
 | C `LEAVERET` | 9 | `LEN=01`, op 10, `[21:0]=0` | — | LEAVE; RET (R15=[R15], PC=[R15+8], SP=R15+16) |
+| D3 W ALU ops | 1 / 2 (2-word) / A | W `[19]` on ADD/SUB, ADD-imm, low MUL | — | result = sext of its low 32 bits; applied in MEM (`mem_result_eff`) |
 | B fused compare-and-branch | **D** (was reserved) | `LEN=01`, PRED `[25:23]` ≤ 4 | INV `[22]`, IMM `[21]`, simm13 `[20:8]`, rs1 `[7:4]`, rs2/simm4 `[3:0]` | if (rs1 PRED rhs) ^ INV: PC += 4·disp; flags untouched |
 
 Short CMPRV always sign-extends (SGN=1 is its discriminator), so a compare
@@ -66,6 +67,9 @@ honoured by the RTL for AND/OR/XOR (proposal §3.2 needs no RTL change).
   32-bit extended and an extension instruction disappears (sext pair: any
   condition; zext pair: EQ/NE/unsigned only).
 - C: `ENTER`/`LEAVE`/`LEAVERET` from `KlaussCPUFrameLowering`.
+- D3: `(sext_inreg (add|sub|mul a,b), i32)` with a single-use inner op
+  selects `ADDW`/`SUBW`/`MULW` (`ADDIW` for a simm32 add), dropping the SEXTW
+  (`-klausscpu-w32-alu`).
 - B: post-RA pre-emit pass `KlaussCPUFuseCmpBr` fuses an adjacent
   CMPRR / CMPRV(#-8..7) + JMPcc (EQ/NE/Z/NZ, signed and unsigned LT/GE/LE/GT,
   C/NC) when the flags are dead afterwards and the function is < 16 KB at

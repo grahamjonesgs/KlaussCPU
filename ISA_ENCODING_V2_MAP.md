@@ -10,7 +10,7 @@ Every encoding not listed here traps with ERR_INV_OPCODE.
 
 > **ISA v3 (2026-09):** the v3 additions — short 1-word immediate/branch
 > forms, the fused compare-and-branch (class 0xD), ENTER/LEAVE/LEAVERET,
-> LDIDX32_S and the 32-bit W compare — all use combinations that trap in
+> LDIDX32_S, the 32-bit W compare and the W ALU ops — all use combinations that trap in
 > v2, so every v2 encoding below is unchanged. They are listed in **§7**;
 > design notes and measurements are in `ISA_V3_IMPL.md`.
 
@@ -628,7 +628,15 @@ PRED `[25:23]` 0=EQ 1=LT 2=LE 3=ULT 4=ULE (as class 3), INV `[22]`, IMM `[21]`
 (±16 KB). **Flags are not written.** Resolved in MEM (a taken one squashes
 the two younger instructions); `EN_FBR` in `pipeline_core.sv` builds it out.
 
-### 7.6 Machine-readable additions
+### 7.6 32-bit W ALU ops (D3)
+
+W `[19]` on class 1 ADD/SUB (`ADDW 0x44280000`, `SUBW 0x44680000`), the class 2
+**2-word** ADD (`ADDIW 0x88380000`; the short form's `[19:12]` is its
+immediate) and the class A low-half MUL (`MULW 0x68880000`): the result is the
+64-bit operation's low 32 bits **sign-extended**. Z follows the W result;
+S/C/V are those of the 64-bit operation.
+
+### 7.7 Machine-readable additions
 
 ```csv
 symbol,template,words,class,regs,imm,flags,notes
@@ -639,4 +647,8 @@ ENTER,0x66000000,1,9,,N[21:0],,push R15; R15=SP; SP-=8N (v3 C)
 LEAVE,0x66400000,1,9,,,,SP=R15; pop R15 (v3 C)
 LEAVERET,0x66800000,1,9,,,,LEAVE; RET (v3 C)
 FBR,0x74000000,1,13,"rs1,rs2|simm4",simm13,,fused compare-and-branch (v3 B)
+ADDW,0x44280000,1,1,"rd,rs1,rs2",,ZCV,sext32 result (v3 D3)
+SUBW,0x44680000,1,1,"rd,rs1,rs2",,ZCV,sext32 result (v3 D3)
+ADDIW,0x88380000,2,2,"rd,rs1",sext32,ZCV,sext32 result (v3 D3)
+MULW,0x68880000,1,10,"rd,rs1,rs2",,ZSV,low half sext32 (v3 D3)
 ```
