@@ -150,8 +150,8 @@ module KlaussCPU (
    logic r_hcf_message_sent;
    logic [31:0] r_start_wait_counter;
 
-   // Crash-dump trace ring buffer — captures {PC, opcode} of every dispatched
-   // fetch in OPCODE_FETCH2.  On HCF entry the most recent 16 entries (newest at
+   // Crash-dump trace ring buffer — captures {PC, opcode} of every instruction
+   // the pipeline retires (pip_ret_*, in PIPE_RUN).  On HCF entry the most recent 16 entries (newest at
    // r_trace_idx-1) are flushed over UART so a crash log shows the branch-history
    // leading up to the failing instruction, not just the failing instruction itself.
    logic [63:0] r_trace_buf [0:15];
@@ -190,14 +190,6 @@ module KlaussCPU (
 
    // Register control
    logic [63:0] r_register[15:0];
-
-   // -----------------------------------------------------------------------
-   // ALU pipeline registers — written by arithmetic / compare tasks during
-   // OPCODE_EXECUTE; consumed in ALU_FINISH (next cycle) to drive the
-   // architectural flags + st.wb.value. Adds +1 cycle to ADD/SUB/CMP
-   // ops in exchange for breaking the 64-bit subtractor → carry-flag path.
-   // st.alu_pipe_mode picks between ARITH (0) and CMP (1) finish behavior.
-   // -----------------------------------------------------------------------
 
    // Display value
    logic r_error_display_type;
@@ -566,8 +558,7 @@ module KlaussCPU (
    // architectural zero, like the emulator); NOT reset in HCF/HALTED so the
    // crash dump can snapshot its state.
    wire w_pip_hold_rst = (st.SM == NO_PROGRAM) || (st.SM == LOADING_BYTE) ||
-                         (st.SM == LOAD_COMPLETE) || (st.SM == START_WAIT) ||
-                         (st.SM == UART_DELAY);
+                         (st.SM == LOAD_COMPLETE) || (st.SM == START_WAIT);
    logic        r_pip_start;
    logic [31:0] r_pip_start_pc;
    wire         pip_ret_valid, pip_ret_wr;
@@ -1399,10 +1390,6 @@ rams_sp_nc rams_sp_nc1 (
       r_break_received = 0;
       st.wb.set_zero = 0;
       st.wb.pending        = 0;
-      st.alu_pipe_value    = 64'b0;
-      st.alu_pipe_carry    = 1'b0;
-      st.alu_pipe_overflow = 1'b0;
-      st.alu_pipe_mode     = 1'b0;
       st.rx_fifo_read  = 0;
       r_break_active  = 0;
       r_break_counter = 0;
