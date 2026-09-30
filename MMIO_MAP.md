@@ -293,9 +293,10 @@ the cache counters at `0xF005_xxxx`. The intent is to characterise where cycles
 go on the current multicycle FSM **before** committing to a pipeline — measure
 CPI, the fetch/execute/stall split, and the branch/instruction mix, then use
 those numbers to decide what pipelining actually buys. Driven by a dedicated
-always block in [KlaussCPU.v](KlaussCPU.srcs/sources_1/new/KlaussCPU.v) (search
-"Performance-counter block") that observes existing FSM state and the decoded
-opcode, so it adds no logic to the CPU's critical path.
+always block in [KlaussCPU.sv](KlaussCPU.srcs/sources_1/new/KlaussCPU.sv) (search
+"Performance-counter block") that observes the pipeline's retire / perf strobes
+and the SoC state, so it adds no logic to the CPU's critical path. The slots
+marked *retired* counted states of the multicycle CPU (removed) and read 0.
 
 All counters are **read as 64-bit, free-running** and **read-only**. Internally
 they are 48-bit (the upper 16 bits read as 0) to save fabric and ease timing
@@ -312,17 +313,17 @@ run, read.
 | 0x0000 | `PERF_CTRL`             | RW | 1     | `[0]` write-1-clear-all (self-clearing; reads 0). |
 | **Tier 0 — denominators** | | | | |
 | 0x0008 | `PERF_CYCLES`           | R  | 64    | Every `i_Clk` cycle. The CPI denominator. |
-| 0x0010 | `PERF_INSTR`            | R  | 64    | Retired (committed) instructions. Counts one per pass through the `OPCODE_FETCH2` commit gate. **CPI = CYCLES / INSTR.** |
+| 0x0010 | `PERF_INSTR`            | R  | 64    | Retired (committed) instructions: one per pipeline retire (`pip_ret_valid`). **CPI = CYCLES / INSTR.** |
 | **Tier 1 — cycle accounting** | | | | |
-| 0x0018 | `PERF_FETCH_CYCLES`     | R  | 64    | Cycles in instruction fetch/decode states (`OPCODE_REQUEST` (non-interrupt), `OPCODE_FETCH`, `OPCODE_FETCH2`, `VAR1_FETCH`, `VAR1_FETCH2`). The cycles a fetch/decode pipeline stage would overlap away. |
-| 0x0020 | `PERF_EXEC_CYCLES`      | R  | 64    | Cycles in `OPCODE_EXECUTE` / `ALU_FINISH` / `WRITEBACK`. Includes memory-access stalls for loads/stores (they spin in `OPCODE_EXECUTE` waiting on the bus); see the cache `CNT_STALL_CYCLES` for the DDR portion. |
-| 0x0028 | `PERF_MUL_CYCLES`       | R  | 64    | Cycles in the multiply pipeline states. |
-| 0x0030 | `PERF_DIV_CYCLES`       | R  | 64    | Cycles in `DIVIDE_STEP` (iterative divide; ~65 cycles/op). |
-| 0x0038 | `PERF_INT_CYCLES`       | R  | 64    | Cycles spent pushing interrupt context (`r_int_push_wait`). Context-entry tax. |
+| 0x0018 | `PERF_FETCH_CYCLES`     | R  | 64    | *Retired* — reads 0 (multicycle fetch states). Fetch stalls: `PERF_IF_MISS` (0xE0). |
+| 0x0020 | `PERF_EXEC_CYCLES`      | R  | 64    | Cycles in `PIPE_RUN` (the pipeline running a program). |
+| 0x0028 | `PERF_MUL_CYCLES`       | R  | 64    | *Retired* — reads 0 (multicycle multiply states). See `PERF_STALL_MULDIV` (0xD0). |
+| 0x0030 | `PERF_DIV_CYCLES`       | R  | 64    | *Retired* — reads 0 (multicycle divide states). See `PERF_STALL_MULDIV` (0xD0). |
+| 0x0038 | `PERF_INT_CYCLES`       | R  | 64    | *Retired* — reads 0 (FSM interrupt context-push wait). |
 | 0x0040 | `PERF_IDLE_CYCLES`      | R  | 64    | Cycles in `HALTED` / `HALTED_BREAK`. |
-| 0x0048 | `PERF_MUL_OPS`          | R  | 64    | Multiply instructions executed. Avg multiply latency = `MUL_CYCLES / MUL_OPS`. |
-| 0x0050 | `PERF_DIV_OPS`          | R  | 64    | Divide/mod instructions executed. Avg divide latency = `DIV_CYCLES / DIV_OPS`. |
-| 0x0058 | `PERF_INT_OPS`          | R  | 64    | Interrupt dispatches (rising edge of context-push). |
+| 0x0048 | `PERF_MUL_OPS`          | R  | 64    | *Retired* — reads 0. Multiplies are in `PERF_CNT_OTHER`. |
+| 0x0050 | `PERF_DIV_OPS`          | R  | 64    | *Retired* — reads 0. Divides are in `PERF_CNT_OTHER`. |
+| 0x0058 | `PERF_INT_OPS`          | R  | 64    | Interrupt dispatches (pipeline `irq_ack`, one per ISR entry). |
 | **Tier 2 — instruction mix + branch behaviour** | | | | |
 | 0x0060 | `PERF_CNT_ALU`          | R  | 64    | Arithmetic / logic / shift / rotate / compare / bit / move ops. |
 | 0x0068 | `PERF_CNT_LOAD`         | R  | 64    | Loads (all `MEMGET*`/`LDIDX*`/`MEMREAD*` + `POP`). |
@@ -332,8 +333,8 @@ run, read.
 | 0x0088 | `PERF_CNT_JUMP`         | R  | 64    | Unconditional direct jumps (`JMP`, `JMPREL`). |
 | 0x0090 | `PERF_CNT_CALL`         | R  | 64    | Direct + conditional calls (`CALL`/`CALLREL`/`CALLcc`). |
 | 0x0098 | `PERF_CNT_INDIRECT`     | R  | 64    | Register/stack-target transfers (`JMPR`, `RET`, `IRET`, `CALLR`). Future BTB / target-prediction budget. |
-| 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div (also in `*_OPS`), system, I/O, `NOP`, etc. |
-| 0x00A8 | `PERF_FASTPATH`         | R  | 64    | (FSM-era) fast-path dispatches; 0 under the pipeline. |
+| 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div, system, I/O, `NOP`, etc. |
+| 0x00A8 | `PERF_FASTPATH`         | R  | 64    | *Retired* — reads 0 (multicycle fast-path dispatches). |
 | 0x00B0 | `PERF_STALL_DATA`       | R  | 48    | Pipeline: GPR RAW stall cycles (producer in MEM/WB, or unforwardable in EX). |
 | 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where a memory-read producer blocks from EX (load-use). |
 | 0x00C0 | `PERF_STALL_FLAGS`      | R  | 48    | Pipeline: flag-reader stall cycles (producer in MEM/WB; EX forwards). |

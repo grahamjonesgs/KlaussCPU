@@ -91,10 +91,11 @@ localparams).
    encoding (3-word: opcode @ PC, lo32 @ PC+4, hi32 @ PC+8). Currently:
    `SETR64` (`0FE?`) and `PUSHV64` (`4060`). For other opcodes the field shows
    whatever happens to live at PC+8 — ignore it.
-5. **`SM`** is the FSM state (one-hot). Cross-reference against the `localparam`
-   block in [KlaussCPU.v](KlaussCPU.srcs/sources_1/new/KlaussCPU.v) (`OPCODE_REQUEST`,
-   `OPCODE_FETCH`, `OPCODE_EXECUTE`, `WRITEBACK`, `MULTIPLY_*`, `DIVIDE_STEP`,
-   etc.). Combined with `ERR=02` it pinpoints the unreachable state.
+5. **`SM`** is the SoC FSM state (one-hot) captured at HCF entry. Cross-reference
+   against the `e_sm_t` enum in [klauss_pkg.sv](KlaussCPU.srcs/sources_1/new/klauss_pkg.sv).
+   It is the state *before* HCF entry; since the multicycle CPU was removed it
+   is normally `PIPE_RUN` (`SM=000000010`).
+   Combined with `ERR=02` it pinpoints an unreachable state.
 6. **`IV0` vs `PC`** — for crashes inside (or just after) a timer interrupt, this
    tells you whether the dispatch went where software set it. `PC == IV0` means
    the jump landed correctly and the fault is in the ISR body; `PC != IV0` means
