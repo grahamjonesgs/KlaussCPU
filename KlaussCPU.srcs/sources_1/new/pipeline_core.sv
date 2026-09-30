@@ -692,6 +692,12 @@ module pipeline_core
    // off this path. Equal to dec.* for every legal op — asserted below.
    dec_t w_dec;
    assign w_dec = f_decode_raw(w_op);
+   // M13: the dispatch's serializer test also reads a latch-time bit
+   // (id_ser = full decode, so illegal ops still serialize) instead of
+   // f_decode(id_op) — it gated every ID-latch load (the id_op->id_* family).
+   dec_t w_decf;
+   assign w_decf = f_decode(w_op);
+   logic id_ser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
    // ISA v3 short 1-word forms (ISA_V3_PROPOSAL.md §3): the immediate lives in
@@ -1362,7 +1368,7 @@ module pipeline_core
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
-         id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0;
+         id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -1820,7 +1826,7 @@ module pipeline_core
                               : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                               : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
-                  if (id_valid && !fetch_halt && dec.serialize) begin
+                  if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active && irq_ready) begin
@@ -1845,6 +1851,7 @@ module pipeline_core
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
+                     id_ser    <= w_decf.serialize;
                      id_w      <= (w_op[29:26] == 4'h3) && w_op[19] &&
                                   !(w_op[31:30] == 2'b01 && w_op[20]);
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
@@ -2002,6 +2009,9 @@ module pipeline_core
                                dec.uop == U_BOOL || dec.uop == U_ALU || dec.uop == U_FBR)) &&
                  id_b_sext == dec.sgn)
             else $fatal(1, "id ex_b-select predecode drift: op=%h", id_op);
+      if (id_valid)
+         assert (id_ser == dec.serialize)
+            else $fatal(1, "id serialize predecode drift: op=%h", id_op);
    end
 `endif
 
