@@ -197,7 +197,6 @@ module KlaussCPU (
    // Stack control — stack now lives in DDR2 RAM, top of 128 MiB, growing down
    // SP = 32'h800_0000 means empty; PUSH: SP-=8, mem[SP]=val; POP: val=mem[SP], SP+=8
    // R15 is the frame pointer by convention (software convention only, no hardware enforcement)
-   logic        r_int_push_wait;  // set while waiting for DDR2 to complete interrupt PC-push
 
    // UART send message
    logic [255:0] r_msg;  // 32 bytes — longest message is 21 bytes (case 2 of t_tx_message)
@@ -225,10 +224,8 @@ module KlaussCPU (
    // when r_timer_interrupt_counter > r_timer_period.
    logic [31:0] r_timer_period;
 
-   // Interrupt-wake condition — an unmasked, vectored source is pending. This is
-   // the SAME expression OPCODE_REQUEST uses to dispatch, factored out so the
-   // WAITING (WAIT opcode) suspend exits on exactly the dispatch condition (no
-   // separate edge logic → no lost wakeups).
+   // Interrupt request to the pipeline — an unmasked, vectored source is
+   // pending (pipeline_core dispatches it, and wakes a WAIT, on w_irq_ready).
    //   source 0 = timer (r_timer_interrupt, hardware-cleared on dispatch)
    //   source 1 = blitter DONE (w_blit_irq = blitter r_done & IRQ_EN; level —
    //              the ISR must ack by writing STATUS.DONE (W1C) before IRET)
@@ -343,16 +340,12 @@ module KlaussCPU (
    // Tier 0 — denominators
    logic [47:0] r_perf_cycles;        // every i_Clk cycle
    logic [47:0] r_perf_instr;         // retired (committed) instructions
-   // Tier 1 — cycle accounting (buckets are disjoint; sum ≈ cycles in steady run)
-   logic [47:0] r_perf_fetch_cycles;  // instruction fetch / decode states
-   logic [47:0] r_perf_exec_cycles;   // execute / ALU-finish / writeback (incl. mem stalls)
-   logic [47:0] r_perf_mul_cycles;    // multiply pipeline states
-   logic [47:0] r_perf_div_cycles;    // iterative divide state
-   logic [47:0] r_perf_int_cycles;    // interrupt context-push wait
+   // Tier 1 — cycle accounting. FETCH/MUL/DIV/INT cycle buckets, MUL/DIV_OPS
+   // and FASTPATH counted multicycle-CPU states and read 0 since it was
+   // removed; pipeline stalls are attributed by the M6 STALL_* counters.
+   logic [47:0] r_perf_exec_cycles;   // PIPE_RUN cycles
    logic [47:0] r_perf_idle_cycles;   // HALTED / HALTED_BREAK
-   logic [47:0] r_perf_mul_ops;       // multiply instructions
-   logic [47:0] r_perf_div_ops;       // divide / mod instructions
-   logic [47:0] r_perf_int_ops;       // interrupt dispatches
+   logic [47:0] r_perf_int_ops;       // interrupt dispatches (pip_irq_ack)
    // Tier 2 — instruction mix + branch behaviour
    logic [47:0] r_perf_cnt_alu;
    logic [47:0] r_perf_cnt_load;
@@ -363,12 +356,6 @@ module KlaussCPU (
    logic [47:0] r_perf_cnt_call;          // direct + conditional calls
    logic [47:0] r_perf_cnt_indirect;      // JMPR / RET / IRET / CALLR (reg/stack target)
    logic [47:0] r_perf_cnt_other;         // mul/div/system/io/nop/etc.
-   // Fast-path-dispatch fire count (MMIO 0xA8): instructions that skipped the
-   // FETCH2 bubble. A healthy 15-53% rate is itself live proof f_predecode_len is
-   // exact — a wrong length fails the r_ir_pc==st.PC consume guard and collapses
-   // the rate. (This slot replaced a passive predecode-mismatch validator, now
-   // covered by the consume guard and the functional regression.)
-   logic [47:0] r_perf_fastpath;       // fast-path dispatches (skipped FETCH2)
    // M6: pipeline per-hazard attribution (MMIO 0xB0-0xE8; strobes from
    // pipeline_core.perf_stall — see its port comment for the bit map)
    logic [47:0] r_perf_stall_data;     // 0xB0 GPR RAW stall cycles
@@ -379,8 +366,6 @@ module KlaussCPU (
    logic [47:0] r_perf_branch_flush;   // 0xD8 taken-redirect events
    logic [47:0] r_perf_if_miss;        // 0xE0 fetch-window miss cycles
    logic [47:0] r_perf_mem_wait;       // 0xE8 MEM port wait cycles
-   logic        r_fastpath_fired;      // 1-cycle strobe asserted when the fast-path consumes
-   logic        r_int_push_wait_d;        // edge-detect for interrupt dispatch
    // Bus-wedge flight recorder (0xF00D_0100/0108, RO; cleared by PERF_CTRL
    // bit 0 like the counters, so a snapshot SURVIVES a program reload). If a
    // CPU bus transaction holds its DV for 2^20 cycles (~10.5 ms — no legal
@@ -398,10 +383,6 @@ module KlaussCPU (
    logic [20:0] r_wedge_cnt;
    logic        r_wedge_latched;
    logic [63:0] r_wedge_snap0, r_wedge_snap1;
-   // Branch-outcome strobe — set for 1 cycle by t_cond_jump / t_cond_jump_rel
-   // (conditional encodings only), consumed by the perf block below.
-   logic        r_perf_br_valid;
-   logic        r_perf_br_taken;
    // Instruction-class codes (return value of f_perf_class)
    localparam PC_OTHER=3'd0, PC_ALU=3'd1, PC_LOAD=3'd2, PC_STORE=3'd3,
               PC_BRANCH=3'd4, PC_JUMP=3'd5, PC_CALL=3'd6, PC_INDIRECT=3'd7;
@@ -960,14 +941,14 @@ module KlaussCPU (
                16'h0000: r_mmio_read_data_comb = 64'h0;            // PERF_CTRL
                16'h0008: r_mmio_read_data_comb = r_perf_cycles;
                16'h0010: r_mmio_read_data_comb = r_perf_instr;
-               16'h0018: r_mmio_read_data_comb = r_perf_fetch_cycles;
+               16'h0018: r_mmio_read_data_comb = 64'h0;            // FETCH_CYCLES (multicycle CPU; retired)
                16'h0020: r_mmio_read_data_comb = r_perf_exec_cycles;
-               16'h0028: r_mmio_read_data_comb = r_perf_mul_cycles;
-               16'h0030: r_mmio_read_data_comb = r_perf_div_cycles;
-               16'h0038: r_mmio_read_data_comb = r_perf_int_cycles;
+               16'h0028: r_mmio_read_data_comb = 64'h0;            // MUL_CYCLES (multicycle CPU; retired)
+               16'h0030: r_mmio_read_data_comb = 64'h0;            // DIV_CYCLES (multicycle CPU; retired)
+               16'h0038: r_mmio_read_data_comb = 64'h0;            // INT_CYCLES (multicycle CPU; retired)
                16'h0040: r_mmio_read_data_comb = r_perf_idle_cycles;
-               16'h0048: r_mmio_read_data_comb = r_perf_mul_ops;
-               16'h0050: r_mmio_read_data_comb = r_perf_div_ops;
+               16'h0048: r_mmio_read_data_comb = 64'h0;            // MUL_OPS (multicycle CPU; retired)
+               16'h0050: r_mmio_read_data_comb = 64'h0;            // DIV_OPS (multicycle CPU; retired)
                16'h0058: r_mmio_read_data_comb = r_perf_int_ops;
                16'h0060: r_mmio_read_data_comb = r_perf_cnt_alu;
                16'h0068: r_mmio_read_data_comb = r_perf_cnt_load;
@@ -978,7 +959,7 @@ module KlaussCPU (
                16'h0090: r_mmio_read_data_comb = r_perf_cnt_call;
                16'h0098: r_mmio_read_data_comb = r_perf_cnt_indirect;
                16'h00A0: r_mmio_read_data_comb = r_perf_cnt_other;
-               16'h00A8: r_mmio_read_data_comb = r_perf_fastpath;  // fast-path-dispatch fire count (this slot was the retired predecode validator)
+               16'h00A8: r_mmio_read_data_comb = 64'h0;            // FASTPATH (multicycle CPU; retired)
                // M6 pipeline hazard attribution (cycles unless noted)
                16'h00B0: r_mmio_read_data_comb = {16'b0, r_perf_stall_data};
                16'h00B8: r_mmio_read_data_comb = {16'b0, r_perf_stall_loaduse};
@@ -1370,7 +1351,6 @@ rams_sp_nc rams_sp_nc1 (
       o_ram_write_addr = 32'h0;
       r_ram_next_write_addr = 32'h0;
       st.SP = 32'h800_0000;          // empty-descending stack, top of 128 MiB byte space
-      r_int_push_wait = 1'b0;
       r_msg_send_DV <= 1'b0;
       r_hcf_message_sent <= 1'b0;
       st.RGB_LED_1 = 12'h000;
@@ -1398,22 +1378,14 @@ rams_sp_nc rams_sp_nc1 (
       r_trace_idx = 4'h0;
       r_trace_full = 1'b0;
       r_instr_count = 32'h0;
-      r_perf_br_valid = 1'b0;
-      r_perf_br_taken = 1'b0;
-      r_int_push_wait_d = 1'b0;
       r_perf_cycles = 64'd0;       r_perf_instr = 64'd0;
-      r_perf_fetch_cycles = 64'd0; r_perf_exec_cycles = 64'd0;
-      r_perf_mul_cycles = 64'd0;   r_perf_div_cycles = 64'd0;
-      r_perf_int_cycles = 64'd0;   r_perf_idle_cycles = 64'd0;
-      r_perf_mul_ops = 64'd0;      r_perf_div_ops = 64'd0;
+      r_perf_exec_cycles = 64'd0;  r_perf_idle_cycles = 64'd0;
       r_perf_int_ops = 64'd0;
       r_perf_cnt_alu = 64'd0;      r_perf_cnt_load = 64'd0;
       r_perf_cnt_store = 64'd0;    r_perf_cnt_branch = 64'd0;
       r_perf_cnt_branch_taken = 64'd0; r_perf_cnt_jump = 64'd0;
       r_perf_cnt_call = 64'd0;     r_perf_cnt_indirect = 64'd0;
       r_perf_cnt_other = 64'd0;
-      r_perf_fastpath = 64'd0;
-      r_fastpath_fired = 1'b0;
       r_hcf_dump_phase = 7'd0;
       r_hcf_dump_sub = 3'b000;
       r_hcf_dump_byte_pos = 5'd0;
@@ -1431,7 +1403,6 @@ rams_sp_nc rams_sp_nc1 (
          r_boot_active   <= 1'b1;   // arm the resident boot-ROM copy
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
-         r_int_push_wait <= 1'b0;
          st.wb.pending    <= 1'b0;
          r_break_received <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
@@ -1480,8 +1451,6 @@ rams_sp_nc rams_sp_nc1 (
       end else begin
          r_msg_send_DV  <= 1'b0;
          st.rx_fifo_read <= 1'b0;
-         r_perf_br_valid <= 1'b0;  // 1-cycle strobe; jump tasks re-assert it
-         r_fastpath_fired <= 1'b0; // default; the fast-path dispatch below asserts it
 
          if (r_timer_interrupt_counter > r_timer_period) begin
             r_timer_interrupt_counter <= 0;
@@ -1588,7 +1557,6 @@ rams_sp_nc rams_sp_nc1 (
                   st.mem_write_DV <= 1'b0;
                end
                st.SP <= 32'h800_0000;  // reset stack pointer during program load
-               r_int_push_wait <= 1'b0;
 
                st.seven_seg_value1 <= {
                   8'h24,
@@ -2302,25 +2270,20 @@ rams_sp_nc rams_sp_nc1 (
 
    //=========================================================================
    // Performance-counter block (Tier 0/1/2). Its own always block: reads the
-   // pipeline's perf strobes (pip_perf_*), st.SM and r_int_push_wait.
+   // pipeline's perf strobes (pip_perf_*, pip_ret_*, pip_irq_ack) and st.SM.
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
    //=========================================================================
    always_ff @(posedge i_Clk) begin
-      r_int_push_wait_d <= r_int_push_wait;
       if (w_reset_H || w_perf_stat_clear) begin
          r_perf_cycles           <= 64'd0;  r_perf_instr            <= 64'd0;
-         r_perf_fetch_cycles     <= 64'd0;  r_perf_exec_cycles      <= 64'd0;
-         r_perf_mul_cycles       <= 64'd0;  r_perf_div_cycles       <= 64'd0;
-         r_perf_int_cycles       <= 64'd0;  r_perf_idle_cycles      <= 64'd0;
-         r_perf_mul_ops          <= 64'd0;  r_perf_div_ops          <= 64'd0;
+         r_perf_exec_cycles      <= 64'd0;  r_perf_idle_cycles      <= 64'd0;
          r_perf_int_ops          <= 64'd0;
          r_perf_cnt_alu          <= 64'd0;  r_perf_cnt_load         <= 64'd0;
          r_perf_cnt_store        <= 64'd0;  r_perf_cnt_branch       <= 64'd0;
          r_perf_cnt_branch_taken <= 64'd0;  r_perf_cnt_jump         <= 64'd0;
          r_perf_cnt_call         <= 64'd0;  r_perf_cnt_indirect     <= 64'd0;
          r_perf_cnt_other        <= 64'd0;
-         r_perf_fastpath           <= 64'd0;
          r_perf_stall_data <= 48'd0;  r_perf_stall_loaduse <= 48'd0;
          r_perf_stall_flags <= 48'd0; r_perf_stall_sp <= 48'd0;
          r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
@@ -2341,53 +2304,17 @@ rams_sp_nc rams_sp_nc1 (
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken
                                      + ((pip_perf_br && pip_perf_br_taken && pip_perf_fbr_taken) ? 64'd2 : 64'd1);
          // Tier 0 — total cycles and retired instructions.
-         // OPCODE_FETCH2 is the unique 1-cycle commit gate (mirrors r_instr_count).
          r_perf_cycles <= r_perf_cycles + 64'd1;
-         if (st.SM == OPCODE_FETCH2 || r_fastpath_fired || pip_ret_valid)
-            r_perf_instr <= r_perf_instr + 64'd1;   // M5d: pipeline retires count here
-         if (r_fastpath_fired) r_perf_fastpath <= r_perf_fastpath + 64'd1;  // fast-path-dispatch fire count (MMIO 0xA8)
+         if (pip_ret_valid)
+            r_perf_instr <= r_perf_instr + 64'd1;
 
-         // Tier 1 — disjoint cycle buckets. The interrupt context-push happens
-         // inside OPCODE_REQUEST (r_int_push_wait==1), so it is split out first
-         // to keep the fetch bucket clean.
-         if (r_int_push_wait)
-            r_perf_int_cycles <= r_perf_int_cycles + 64'd1;
-         else if (st.SM == OPCODE_REQUEST || st.SM == OPCODE_FETCH  ||
-                  st.SM == OPCODE_FETCH2  || st.SM == VAR1_FETCH)
-            r_perf_fetch_cycles <= r_perf_fetch_cycles + 64'd1;
-         else if (st.SM == OPCODE_EXECUTE || st.SM == ALU_FINISH ||
-                  st.SM == WRITEBACK)
-            r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
-         else if (st.SM == MULTIPLY_SETUP || st.SM == MULTIPLY_BREG ||
-                  st.SM == MULTIPLY_CALC  || st.SM == MULTIPLY_PIPE ||
-                  st.SM == MULTIPLY_WRITEBACK)
-            r_perf_mul_cycles <= r_perf_mul_cycles + 64'd1;
-         else if (st.SM == DIVIDE_STEP || st.SM == DIVIDE_PREP)
-            r_perf_div_cycles <= r_perf_div_cycles + 64'd1;
-         else if (st.SM == HALTED || st.SM == HALTED_BREAK || st.SM == WAITING)
+         // Tier 1 — cycle buckets + interrupt dispatches.
+         if (st.SM == HALTED || st.SM == HALTED_BREAK)
             r_perf_idle_cycles <= r_perf_idle_cycles + 64'd1;
          else if (st.SM == PIPE_RUN)
-            // M5d bring-up: all pipeline cycles land in the exec bucket; the
-            // per-hazard stall counters arrive with M6 (STALL_* plan).
             r_perf_exec_cycles <= r_perf_exec_cycles + 64'd1;
-
-         // Tier 1 — event counts. MULTIPLY_SETUP is a 1-cycle entry state (one
-         // per multiply); DIVIDE_STEP with counter==0 is the first divide cycle.
-         if (st.SM == MULTIPLY_SETUP)
-            r_perf_mul_ops <= r_perf_mul_ops + 64'd1;
-         // DIVIDE_PREP is the unique 1-cycle entry state per divide (the old
-         // counter==0 test no longer fires once per op — prep starts the
-         // counter at clz, and a zero dividend skips the iterations entirely).
-         if (st.SM == DIVIDE_PREP)
-            r_perf_div_ops <= r_perf_div_ops + 64'd1;
-         if (r_int_push_wait && !r_int_push_wait_d)
+         if (pip_irq_ack)
             r_perf_int_ops <= r_perf_int_ops + 64'd1;
-
-         // Tier 2 — conditional-branch taken outcome (strobe from jump tasks).
-         // The matching BRANCH total is incremented from the classifier below,
-         // so taken ≤ branch always holds.
-         if (r_perf_br_valid && r_perf_br_taken)
-            r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken + 64'd1;
 
          // Tier 2 — instruction mix: one class per committed instruction.
          // M5d: pipeline retires classify by the retired opcode.
@@ -2403,22 +2330,7 @@ rams_sp_nc rams_sp_nc1 (
                default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
             endcase
          end
-         if (st.SM == OPCODE_FETCH2) begin
-            case (f_perf_class(w_opcode))
-               PC_ALU:      r_perf_cnt_alu      <= r_perf_cnt_alu      + 64'd1;
-               PC_LOAD:     r_perf_cnt_load     <= r_perf_cnt_load     + 64'd1;
-               PC_STORE:    r_perf_cnt_store    <= r_perf_cnt_store    + 64'd1;
-               PC_BRANCH:   r_perf_cnt_branch   <= r_perf_cnt_branch   + 64'd1;
-               PC_JUMP:     r_perf_cnt_jump     <= r_perf_cnt_jump     + 64'd1;
-               PC_CALL:     r_perf_cnt_call     <= r_perf_cnt_call     + 64'd1;
-               PC_INDIRECT: r_perf_cnt_indirect <= r_perf_cnt_indirect + 64'd1;
-               default:     r_perf_cnt_other    <= r_perf_cnt_other    + 64'd1;
-            endcase
-         end
 
-         // (the passive predecode-mismatch validator was retired — superseded by the
-         // r_ir_pc==st.PC consume guard, the functional regression, and the
-         // fast-path fire-rate counter which collapses on any predecode error.)
       end
    end
 
