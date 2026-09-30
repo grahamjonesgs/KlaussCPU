@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 PROG=${1:?usage: run_m5d_soc.sh <prog> [maxi]}
 MAXI=${2:-0}
 K=/home/graham/Documents/src/klausscc/target/release/klausscc
-E=/media/psf/src/klausscpu-runtime/baremetal
+E=${E:-/media/psf/src/klausscpu-runtime/baremetal}
 SRC=$(cd ../../KlaussCPU.srcs && pwd)
 export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
 mkdir -p out soc_run

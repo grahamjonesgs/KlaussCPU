@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 K=/home/graham/Documents/src/klausscc/target/release/klausscc
-E=/media/psf/src/klausscpu-runtime/baremetal
+E=${E:-/media/psf/src/klausscpu-runtime/baremetal}
 PROGS=${@:-"hello bst expr test_64bit queens crypto dhrystone"}
 mkdir -p out board
 PASS=0; FAIL=0
