@@ -8,6 +8,12 @@ the "no benefit taken" checkpoint build — one dispatch arm per instruction,
 same next-state functions, same flags, same cycle counts except where noted).
 Every encoding not listed here traps with ERR_INV_OPCODE.
 
+> **ISA v3 (2026-09):** the v3 additions — short 1-word immediate/branch
+> forms, the fused compare-and-branch (class 0xD), ENTER/LEAVE/LEAVERET,
+> LDIDX32_S and the 32-bit W compare — all use combinations that trap in
+> v2, so every v2 encoding below is unchanged. They are listed in **§7**;
+> design notes and measurements are in `ISA_V3_IMPL.md`.
+
 ## 1. Word-0 layout (all instructions)
 
 ```
@@ -44,7 +50,8 @@ class-4 embedded-count forms).
 | 0xA | mul / div |
 | 0xB | system |
 | 0xC | I/O (LCD) |
-| 0x0, 0xD, 0xE, 0xF | illegal / reserved (trap) |
+| 0xD | fused compare-and-branch (v3, §7.5) |
+| 0x0, 0xE, 0xF | illegal / reserved (trap) |
 
 ## 2. Per-class attribute bits
 
@@ -53,7 +60,8 @@ class-4 embedded-count forms).
   (class 2: sign- vs zero-extend imm32).
 - **Class 3 (compare)**: `[25:23]` PRED (0=EQ 1=LT 2=LE 3=ULT 4=ULE),
   `[22]` INV, `[21]` B (0=flag-setting CMP: writes E/L/U; 1=boolean rd=0/1),
-  `[20]` SGN (imm form).
+  `[20]` SGN (imm form). v3: `[19]` W (32-bit compare; reg form and 2-word
+  form only) — §7.3; `LEN=01 SGN=1 B=0` is the short CMPRV — §7.1.
 - **Class 4 (shift/bit)**: `[25:22]` OP (0=SHL 1=SHR 2=SAR 3=ROL 4=ROR 5=RCL
   6=RCR 8=BSET 9=BCLR 10=BTGL 11=BTST 12=BEXTR 13=BDEP), `[21]` SRC
   (0=count in rs2[5:0], 1=embedded), `[20:15]` N (embedded count/position),
@@ -64,11 +72,13 @@ class-4 embedded-count forms).
 - **Class 6/7 (load/store)**: `[25:24]` SIZE (00=8 01=16 10=32 11=64),
   `[23]` SGN (loads only), `[22:21]` MODE (00=[rs1] 01=rs1+imm32 10=[imm32]
   11=rs1+rs2), `[20]` A (64-bit: 1 = force 8-byte alignment of the address).
+  v3: `LEN=01 MODE=01` is the short scaled-offset form — §7.1.
 - **Class 8 (branch)**: `[25]` LINK (call), `[24]` REL (PC-relative),
   `[23]` RIND (target = rs2, LEN=01), `[22:19]` COND (0=always 1=Z 2=C 3=V
-  4=S 5=LT 6=LE 7=ULT 8=ULE 9=E), `[18]` INV.
+  4=S 5=LT 6=LE 7=ULT 8=ULE 9=E), `[18]` INV. v3: `LEN=01 RIND=0 REL=1` is
+  the short PC-relative branch/call (simm18 `[17:0]`) — §7.2.
 - **Class 9 (stack)**: `[25:22]` OP (0=PUSH 1=PUSHI 2=POP 3=GETSP 4=SETSP
-  5=ADDSP 6=RET 7=IRET).
+  5=ADDSP 6=RET 7=IRET; v3: 8=ENTER 9=LEAVE 10=LEAVERET — §7.4).
 - **Class A (mul/div)**: `[25:24]` OP (0=MUL 1=DIV 2=MOD), `[23]` SGN,
   `[22]` H (high half, MUL only).
 - **Class B (system)**: `[21:16]` OP (0=NOP 1=HALT 2=WAIT 3=RESET 4=TRAP
@@ -566,4 +576,67 @@ LCDDATAR,0x71000000,1,12,rs1,,,
 LCDCMDV,0xB0000000,2,12,,imm32,,
 LCDDATAV,0xB1000000,2,12,,imm32,,
 LCDRST,0xB2000000,2,12,,imm32,,
+```
+
+## 7. ISA v3 additions
+
+All previously trapped. The toolchain picks the short forms automatically
+(`KlaussCPUMCCompress`); every one has a 2-word equivalent above.
+
+### 7.1 Short 1-word immediates (LEN=01, imm8 in word0 `[19:12]`)
+
+Built from the 2-word template: `short = (template & 0x3FFFFFFF) | 0x40000000
+| imm8<<12 | regs`. Semantics are exactly the 2-word form's with the
+immediate below.
+
+| Form | Class | Condition | Immediate |
+|---|---|---|---|
+| ALU-imm / SETR / LEAPC | 2 | `LEN=01`, `rs2=0` | imm8; `SGN [20]` = sign- vs zero-extend |
+| CMPRV | 3 | `LEN=01`, `SGN=1`, `B=0`, `rd=rs2=0` | simm8 (always sign-extended) |
+| LDIDX* / STIDX* | 6/7 | `LEN=01`, `MODE=01`, `rs2=0` | simm8 **<< SIZE** (byte offset / access size) |
+
+Examples: `SETR.S A,-5` = `0x4BDFB000`, `CMPRV.S A,-3` = `0x4C1FD000`,
+`LDIDX64A.S C,[B+16]` = `0x5B302210`.
+
+### 7.2 Short PC-relative branch / call (class 8, LEN=01, RIND=0, REL=1)
+
+`word0 = 0x61000000 | COND<<19 | INV<<18 | LINK<<25 | simm18 [17:0]`;
+target = PC + 4·simm18 (±512 KB). CALL pushes PC+4. Emitted only for
+in-section targets; out of range / other sections use the 2-word REL form.
+
+### 7.3 32-bit compare — W `[19]` (class 3)
+
+`CMPRRW` (`0x4C080000`, 1 word), `CMPRVW` (`0x8C180000`, 2 words), and W on
+the boolean (B=1) forms: compare the low 32 bits of both operands (flags
+Z/S/C/V exactly as a 32-bit subtract; boolean result by 32-bit signed or
+unsigned order).
+
+### 7.4 Frame instructions (class 9, LEN=01)
+
+| Symbol | Template | Operands | Semantics |
+|---|---|---|---|
+| ENTER | `0x66000000` | N `[21:0]` (dwords) | push R15; R15 = SP; SP −= 8·N |
+| LEAVE | `0x66400000` | — | SP = R15; pop R15 |
+| LEAVERET | `0x66800000` | — | SP = R15; pop R15; pop PC (= LEAVE; RET) |
+
+### 7.5 Fused compare-and-branch (class 0xD, LEN=01)
+
+`word0 = 0x74000000 | PRED<<23 | INV<<22 | IMM<<21 | simm13<<8 | rs1<<4 | rs2/simm4`
+
+PRED `[25:23]` 0=EQ 1=LT 2=LE 3=ULT 4=ULE (as class 3), INV `[22]`, IMM `[21]`
+(rhs = simm4 `[3:0]` instead of rs2). If `(rs1 PRED rhs) ^ INV`: PC += 4·simm13
+(±16 KB). **Flags are not written.** Resolved in MEM (a taken one squashes
+the two younger instructions); `EN_FBR` in `pipeline_core.sv` builds it out.
+
+### 7.6 Machine-readable additions
+
+```csv
+symbol,template,words,class,regs,imm,flags,notes
+LDIDX32_S,0x9AA00000,2,6,"rd,rs1",sext32,,sign-extending 32-bit load (v3 D1)
+CMPRRW,0x4C080000,1,3,"rs1,rs2",,ZSCV,32-bit compare (v3 D2)
+CMPRVW,0x8C180000,2,3,rs1,sext32,ZSCV,32-bit compare (v3 D2)
+ENTER,0x66000000,1,9,,N[21:0],,push R15; R15=SP; SP-=8N (v3 C)
+LEAVE,0x66400000,1,9,,,,SP=R15; pop R15 (v3 C)
+LEAVERET,0x66800000,1,9,,,,LEAVE; RET (v3 C)
+FBR,0x74000000,1,13,"rs1,rs2|simm4",simm13,,fused compare-and-branch (v3 B)
 ```
