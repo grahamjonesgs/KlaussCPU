@@ -138,6 +138,7 @@ module pipeline_core
       logic       mdhigh, mduns;
       logic       lcd_is_data;
       logic [1:0] len;          // instruction words
+      logic       w32;          // ISA v3 D3: result = sext of its low 32 bits (in MEM)
    } dec_t;
 
    // ----------------------------------------------------- architectural state
@@ -352,8 +353,12 @@ module pipeline_core
       case (cls)
          4'h1, 4'h2: begin // ALU reg-reg (1w) / reg-imm (2w)
             d.sgn = op[20];
-            if ((cls == 4'h1 && len == 2'b01 && op[20] == 1'b0 && op[19:12] == 8'h0) ||
-                (cls == 4'h2 && len == 2'b10 && op[19:12] == 8'h0 && op[3:0] == 4'h0) ||
+            // v3 D3: W [19] on class 1 ADD/SUB and the class 2 (2-word) ADD
+            d.w32 = op[19] && len != 2'b01 || (cls == 4'h1 && op[19]);
+            if ((cls == 4'h1 && len == 2'b01 && op[20] == 1'b0 && op[18:12] == 7'h0 &&
+                 (!op[19] || aluop <= 4'd1)) ||
+                (cls == 4'h2 && len == 2'b10 && op[18:12] == 7'h0 && op[3:0] == 4'h0 &&
+                 (!op[19] || aluop == 4'd0)) ||
                 (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0)) begin  // v3 A5 short: imm8 [19:12]
                d.use_rs1 = 1'b1;  d.use_rs2 = (cls == 4'h1);
                case ({aluop, op[21]})
@@ -596,7 +601,10 @@ module pipeline_core
          end
          4'hA: begin // mul / div
             d.mduns = !op[23]; d.mdhigh = op[22]; d.sgn = op[23];
-            if (op[21:20] == 2'b00 && op[19:12] == 8'h0
+            // v3 D3: MULW = W [19] on the low-half MUL
+            d.w32 = op[19];
+            if (op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
+                (!op[19] || (op[25:24] == 2'd0 && !op[22]))
                 && ((len == 2'b01) || (len == 2'b10 && op[3:0] == 4'h0))) begin
                d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01);  d.wreg = 1'b1;
                case (op[25:24])
@@ -1269,7 +1277,12 @@ module pipeline_core
          default: w_sh2 = {63'b0, btr_full[0]};   // BTSTRR
       endcase
    end
-   wire [63:0] mem_result_eff = mem_is_sh ? w_sh2 : mem_result;
+   // v3 D3: a W op's result is its low 32 bits sign-extended — applied here,
+   // on the registered MEM value both forwarding and WB read (only the
+   // upper-half select changes; EX is untouched).
+   wire [63:0] mem_result_eff = mem_is_sh ? w_sh2
+                              : mem_d.w32 ? {{32{mem_result[31]}}, mem_result[31:0]}
+                              : mem_result;
 
    // load-value extraction (f_ld_idx / f_memget32 lane math)
    logic [63:0] mem_ldval;
