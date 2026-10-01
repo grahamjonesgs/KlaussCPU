@@ -28,9 +28,9 @@
  * the copy, which is why the copy+jump must run from the trampoline, not here.
  * Set NETBOOT_LAUNCH 0 to revert to Phase-0 receive+verify only.
  *
- * The trampoline words come from trampoline.kla (assembled with klausscc at
- * base 0x20); see that file for the source.  Running resident from boot SRAM is
- * Phase 2 (see NETBOOT_PLAN.md).
+ * The trampoline (nb_tramp) is assembled inline below by the compiler, so it
+ * tracks the ISA encoding.  Running resident from boot SRAM is Phase 2 (see
+ * NETBOOT_PLAN.md).
  *
  * Build: drop this in runtime/programs/ alongside lwip_demo.c — it reuses the
  * same includes (mmio.h, src/eth.h, lwip_port/ethernetif.h) and lwIP config.
@@ -79,7 +79,7 @@
 // regions disjoint:
 //   dst      0x0000_0000 .. +img      (<= 0x0100_0000)
 //   staging  0x0400_0000 .. +img      (<= 0x0500_0000)
-//   tramp    0x07FF_0000 .. +104 B
+//   tramp    0x07FF_0000 .. +~90 B
 //   stack    0x0800_0000 (grows down)
 #define MAX_IMG_BYTES    0x01000000u
 
@@ -124,54 +124,47 @@ static uint32_t image_checksum(uint32_t len) {
 
 // ── Relocation trampoline ─────────────────────────────────────────────────
 //
-// Machine code from trampoline.kla, assembled at base 0x20 (ASM_BASE).  Copies
-// the staged image (src 0x04000000, dst 0x0) one 64-bit word at a time, restores
-// SP, and jumps to the entry register.  Emitted to TRAMP_BASE at run time with
-// the two absolute jump targets relocated and the len/entry immediates patched.
-//
-//   idx 5  = copy length in bytes (multiple of 8)   ← patched
-//   idx 7  = entry PC                               ← patched
-//   idx 13 = JMPE target (DONE, base 0x80)          ← + (TRAMP_BASE-ASM_BASE)
-//   idx 23 = JMP  target (LOOP, base 0x48)          ← + (TRAMP_BASE-ASM_BASE)
+// nb_tramp(len, entry) copies the staged image (src STAGING_BASE, dst 0x0) one
+// 64-bit word at a time, invalidates the I-cache (CACHE_CTRL[3]), restores
+// SP=0x0800_0000 and jumps to the entry. It is assembled here by the compiler
+// (so it always matches the current ISA encoding) and is position-independent
+// (PC-relative branches only): launch_image() copies its bytes to TRAMP_BASE
+// and calls it there, because the copy overwrites netboot itself.
+// Args per the calling convention: r0 = len (bytes, multiple of 8), r1 = entry.
+__asm__(
+    "  .text\n  .p2align 3\n  .globl nb_tramp\n"
+    "nb_tramp:\n"
+    "  setr r2, 0x04000000\n"          // src = STAGING_BASE
+    "  setr r3, 0\n"                   // dst = 0x0
+    ".Lnb_loop:\n"
+    "  cmprv r0, 0\n"
+    "  jmperel .Lnb_done\n"
+    "  ldidx64 r4, r2, 0\n"
+    "  stidx64 r4, r3, 0\n"
+    "  addv r2, r2, 8\n"
+    "  addv r3, r3, 8\n"
+    "  minusv r0, r0, 8\n"
+    "  jmprel .Lnb_loop\n"
+    ".Lnb_done:\n"
+    "  setr r5, 0xF0050000\n"          // CACHE_CTRL
+    "  setr r6, 8\n"                   // ICACHE_INV
+    "  stidx32 r6, r5, 0\n"
+    "  setr r7, 0x08000000\n"          // SP as the HW loader leaves it
+    "  setsp r7\n"
+    "  jmpr r1\n"
+    "  .globl nb_tramp_end\n"
+    "nb_tramp_end:\n");
+extern const uint32_t nb_tramp[], nb_tramp_end[];
 
-#define ASM_BASE     0x20u
-#define TRAMP_WORDS  26
-
-static const uint32_t TRAMP_TEMPLATE[TRAMP_WORDS] = {
-    0x00000800u, 0x04000000u,   //  0,1  SETR A, 0x04000000   (src)
-    0x00000801u, 0x00000000u,   //  2,3  SETR B, 0x0          (dst)
-    0x00000802u, 0x00000000u,   //  4,5  SETR C, len          (PATCH idx 5)
-    0x00000803u, 0x00000000u,   //  6,7  SETR D, entry        (PATCH idx 7)
-    0x00000805u, 0x08000000u,   //  8,9  SETR F, 0x08000000   (stack top)
-    0x00000832u, 0x00000000u,   // 10,11 CMPRV C, 0           (LOOP)
-    0x00001003u, 0x00000080u,   // 12,13 JMPE DONE            (PATCH idx 13)
-    0x00007B40u,                // 14    MEMGET64 E, A
-    0x00007A41u,                // 15    MEMSET64 E, B
-    0x00000810u, 0x00000008u,   // 16,17 ADDV A, 8
-    0x00000811u, 0x00000008u,   // 18,19 ADDV B, 8
-    0x00000822u, 0x00000008u,   // 20,21 MINUSV C, 8
-    0x00001000u, 0x00000048u,   // 22,23 JMP LOOP             (PATCH idx 23)
-    0x00004045u,                // 24    SETSP F
-    0x00001023u,                // 25    JMPR D
-};
-
-// Emit the patched trampoline to TRAMP_BASE and jump to it. Never returns.
+// Copy the trampoline to TRAMP_BASE and jump to it. Never returns.
 static void launch_image(uint32_t entry_pc, uint32_t img_len) {
-    uint32_t reloc = TRAMP_BASE - ASM_BASE;
-    uint32_t tramp[TRAMP_WORDS];
-    for (int i = 0; i < TRAMP_WORDS; i++) tramp[i] = TRAMP_TEMPLATE[i];
-    tramp[5]   = (img_len + 7u) & ~7u;      // bytes to copy, rounded to 8
-    tramp[7]   = entry_pc;
-    tramp[13] += reloc;                     // JMPE DONE → run address
-    tramp[23] += reloc;                     // JMP  LOOP → run address
-
     volatile uint32_t *dst = (volatile uint32_t *)TRAMP_BASE;
-    for (int i = 0; i < TRAMP_WORDS; i++) dst[i] = tramp[i];
+    for (const uint32_t *w = nb_tramp; w < nb_tramp_end; w++) *dst++ = *w;
 
-    // Hand off. The unified cache is coherent and a store into a buffered code
-    // line invalidates it, so the just-written trampoline (and, after it copies,
-    // the program) is fetched correctly — same property the LLEXT loader uses.
-    ((void (*)(void))TRAMP_BASE)();
+    // Fence before running freshly written code (CPU stores are snooped, but
+    // this also covers any stale line at TRAMP_BASE).
+    icache_invalidate();
+    ((void (*)(uint32_t, uint32_t))TRAMP_BASE)((img_len + 7u) & ~7u, entry_pc);
 }
 
 // ── Netif status callback (IP assigned) ───────────────────────────────────

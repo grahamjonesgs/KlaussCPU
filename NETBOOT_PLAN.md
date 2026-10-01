@@ -82,15 +82,16 @@ independent of the RTL work.
 ### Phase 1 — Relocate + run (still UART-bootstrapped) ✅ IMPLEMENTED
 The downloaded program is linked to run at `0x20` (where netboot itself runs), so
 copying staging→`0x0` clobbers the copier mid-flight. Solved with a **trampoline**:
-- [tools/netboot/trampoline.kla](tools/netboot/trampoline.kla) — 26-word copy-down
-  routine (`MEMGET64`/`MEMSET64` loop, `SETSP 0x0800_0000`, `JMPR` entry), assembled
-  with `klausscc` at base `0x20` to get verified machine code.
-- `netboot.c` embeds those words as `TRAMP_TEMPLATE`, and on receive-complete
-  `launch_image()` emits them to **`0x07FF_0000`** (high DDR, clear of the staging
-  source, the `0x0` destination, and the stack), patching the len/entry immediates
-  and relocating the two absolute jump targets by `TRAMP_BASE − 0x20`. It then
-  calls into the trampoline, which copies the image to `0x0`, restores
-  `SP = 0x0800_0000` (matching the HW loader), and jumps to the entry — so the
+- `nb_tramp` in `netboot.c` — a position-independent copy-down routine (64-bit
+  load/store loop, `CACHE_CTRL` I-cache invalidate, `SETSP 0x0800_0000`, `JMPR`
+  entry) written as inline assembly, so the compiler always emits it in the
+  current ISA encoding. (Until 2026-10 this was `trampoline.kla` hand-assembled
+  into v1 words, which the v2/v3 CPU rejects as illegal opcodes.)
+- On receive-complete `launch_image()` copies the routine's bytes to
+  **`0x07FF_0000`** (high DDR, clear of the staging source, the `0x0`
+  destination, and the stack) and calls it with `(len, entry)` in `r0`/`r1`.
+  It copies the image to `0x0`, restores `SP = 0x0800_0000` (matching the HW
+  loader), and jumps to the entry — so the
   program runs exactly as if kbt-loaded. Image cap 16 MiB keeps the regions disjoint.
 - The jump is deferred to netboot's main loop (after a ~100 ms lwIP service window)
   so the TCP ACK/FIN flush before netboot overwrites itself. `NETBOOT_LAUNCH 0`
