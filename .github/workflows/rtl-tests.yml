@@ -15,9 +15,10 @@
 # REQUIRES A SELF-HOSTED RUNNER with labels [self-hosted, vivado]:
 # GitHub-hosted runners have neither Vivado xsim nor the klausscc emulator
 # (expected at ~/Documents/src/klausscc/target/release/klausscc) nor the
-# compiled baremetal ELFs the goldens are generated from. Register the dev
-# VM as a runner: repo Settings -> Actions -> Runners -> New self-hosted
-# runner, then `./config.sh --labels vivado`.
+# compiled baremetal ELFs the goldens are generated from (E, default
+# ~/Documents/src/klausscpu-runtime/baremetal). The runner is the Ubuntu dev VM
+# (service in ~/actions-runner): repo Settings -> Actions -> Runners -> New
+# self-hosted runner, then `./config.sh --labels vivado` and `sudo ./svc.sh install`.
 name: RTL tests
 
 on:
@@ -28,6 +29,7 @@ on:
       - 'KlaussCPU.srcs/constrs_1/**'
       - 'perf/m5a/run_*.sh'
       - '.github/workflows/rtl-tests.yml'
+  workflow_dispatch:     # manual run: Actions tab -> RTL tests -> Run workflow
   pull_request:
     paths:
       - 'KlaussCPU.srcs/sources_1/new/**'
