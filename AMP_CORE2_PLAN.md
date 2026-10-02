@@ -318,6 +318,39 @@ Core-2 address map (32-bit, same ISA view as core 1):
   the client disconnects**, so it's a per-frame core-1 cost of the AMP path
   (suspect the whole-cache FLUSH per post), not the network.  Unmeasured;
   next to profile.
+  **CORE-1 + END-TO-END PASS (2026-10-02, board, wired; runtime commits
+  65be541..a387b55): client 7.47 -> 21 fps (8-bit) / 16.4 fps (RGB565).**
+  The suspicion above was wrong — the FLUSH measured 5-100 us/frame.  The
+  "slowdown" was the title screen (93 ms) giving way to the 3D demos.  Per
+  frame, core 1 spent: R_RenderPlayerView 38.8 ms, game tics 4.7 ms, and
+  ~60 ms in two pixel passes: doomgeneric's I_FinishUpdate expanding the
+  8-bit buffer to XRGB8888 (struct copy + bpp branch per pixel) and
+  DG_DrawFrame packing that to RGB565.  Steps (doom draw fps, 60 s
+  incremental client): CMAP256 + 256-entry RGB565 LUT 7.5 -> 13.5; LUT 8
+  px per u64 13.5 -> 15.0; core-2 single-pass send (fb rows straight to
+  tcp_write, LWIP_CHECKSUM_ON_COPY with a fused 64-bit copy+sum) lifts
+  core 2's full-frame capacity 14.2 -> 17.6; minimal-libc word-wise
+  string functions 15.0 -> 16.9.  Engine at -O3: +2%, noise, not kept.
+  **8-bit colour-map VNC mode**: descriptor grew to 128 B (indexed source
+  + palette from core 1, want_rgb565 from core 2, read on core 1 by
+  evicting its clean line — 2-way LRU, 32 KB/way — instead of INVALIDATE);
+  core 1 skips RGB565 unless a true-colour client is connected (doom 21.7
+  fps); core 2 sends indices raw + SetColourMapEntries on palette change.
+  **Packet capture (pktmon) found three core-2 eth bugs** that had been
+  costing ~200 ms client-retransmit stalls all along: TX slot 0 rewritten
+  while still queued (waited TX_READY, needs TX_LEVEL == 0 — exposed once
+  the slot copy got fast), runts not padded (switch drops 54 B ACKs), and
+  the MAC's two RX slots overflowing on back-to-back client frames (RX
+  queue drained before each frame and on every TX, strictly in order —
+  TCP_QUEUE_OOSEQ=0 punished an earlier out-of-order version).  8-bit
+  sends use 1280 B tcp_writes so RX is drained often (3840 B lost ~1/5
+  of requests); RGB565 keeps 3840 B (1280 cost it 16.4 -> 13.4).
+  Final: 8-bit client 21.0-21.5 fps = doom's draw rate (vnc_viewer.py
+  defaults to it against core 2); RGB565 ~16.4 fps; Windows retransmits
+  ~0-6 per 20 s.  **Limits now:** doom render (38.8 ms R_RenderPlayerView)
+  for 8-bit; core 2 (~57 ms/frame at 128 KB) for RGB565.  Still no
+  keyboard path in the AMP build.  More LiteEth RX slots (needs LiteX to
+  regenerate the core) would remove the residual RX drops.
 - **P5 hextile + tuning**: encoder port, lwipopts/TCP window tuning,
   region-flush RTL if the MAINT walk shows up in the profile.  Target:
   the ~11 fps ceiling (render-limited).
