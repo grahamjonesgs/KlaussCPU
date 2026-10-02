@@ -270,6 +270,54 @@ Core-2 address map (32-bit, same ISA view as core 1):
   forwarding through the descriptor).  NEXT (P5): bytes/RTT — larger
   window / wired client test / cheaper encodings for doom content; then
   the region-flush + cacheable-fb hardware levers if encode ever limits.
+  **WIRED CLIENT RESULT (2026-10-02, board, Windows host on wired
+  Ethernet, ping 1-3 ms):** same P4b doom AMP build, probed with
+  `perf/amp_p1/vnc_probe.py --full` (native RGB565): **hextile 5.51 fps /
+  raw 5.57 fps @128 KB/update, ~690 KB/s** (vs 3.7-3.8 on the WiFi path —
+  +45%; the window × RTT ceiling is gone).  doom drawfps ~7.3 (tick
+  120-143 ms) while streaming, vs 10-11 (tick 93 ms) with no client.  Core
+  2 now looks CPU-bound, not net-bound: heartbeat prof rx ≈ 5000 ms per
+  5 s window (whole loop busy), enc ≈ 1100 / tx ≈ 870; 690 KB/s is ~5% of
+  the 100 Mb link.  So the chain is render 7.3/s > core-2 service 5.5/s,
+  bounded by core 2's lwIP/encode CPU at 50 MHz.  **Client pixel format
+  matters more than the link:** TigerVNC 1.16 negotiates 32 bpp ("fmt 32
+  bpp conv"), forcing core 2's per-pixel convert + 2× bytes — only **~2.0
+  fps** (upd delta ~10 per 5 s heartbeat, enc ~1850 ms/5 s), *worse* than
+  single-core Zephyr doom with the same client (2.6 fps: convert 80 ms +
+  send 210 ms @250 KB/update, tick 430 ms).  TigerVNC has no 16 bpp mode
+  (its low-colour levels are 8 bpp).  Next levers: a 32 bpp little-endian
+  fast path in vnc_c2.c — it already has per-channel LUTs, but every pixel
+  goes through the generic byte-at-a-time put_pixel_bytes() loop; a direct
+  u32 store should cut enc (unmeasured) — so common viewers aren't
+  penalised; then core-2 lwIP/encode cost if 5.5 fps is to approach render.
+  **CORE-2 SEND PATH FIX (2026-10-02, board, wired): core 2 is no longer the
+  limit — the client gets every frame doom draws, 7.47 fps (was 5.5).**
+  Exclusive-bucket profiler added (runtime core2/c2_prof.h: push/pop
+  buckets charged off the 1 ms clock mirror — unbiased totals, always sum
+  to wall time; the old enc/tx/rx counters nested inside each other).
+  Baseline A (probe --full raw, 5.45 fps, ~183 ms/frame): tx_copy 59.6 ms,
+  tcp_write 31.3, chksum 30.0, encode 27.1, rx_stack 21.6, fetch 12.0.
+  Causes: (1) TX frames start 2 bytes off a 4-byte boundary (lwIP aligns
+  the transport payload, 54 header bytes in front), so ethernetif.c's
+  4-aligned word path never engaged — one MMIO transaction per byte into
+  the slot SRAM; (2) picolibc memcpy ~10 cycles/byte (encode = one 128 KB
+  memcpy = 27 ms; tcp_write's COPY uses it too); (3) LWIP_CHKSUM_ALGORITHM 1
+  is byte-at-a-time.  Fixes (B): aligned 64-bit slot writes with a
+  shift-merged source (`ETH_TX_WIDE64`, core-2 build only — the bridge
+  splits each into two 32-bit WB cycles); lwIP MEMCPY → 64-bit shift-merge
+  copy; LWIP_CHKSUM → 64-bit-load checksum (no 16-bit loads, so the LDIDX16
+  quirk can't bite); fb rows fetched straight into the 8-aligned stage.
+  Copy + checksum are self-tested at boot against byte references (168 /
+  1344 cases, pass) and fall back on mismatch.  **Result B: --full 14.16
+  fps (~72 ms/frame: rx_stack 24.6, tcp_write 12.3, fetch 11.7, tx_copy
+  10.7, chksum 8.4); incremental 7.47 fps = doom's draw rate;
+  tools/vnc_viewer.py 7.37 fps.**  Checksum-on-copy was planned but not
+  done: core 2 now has ~45% headroom at doom's rate, so it can't add fps.
+  **New limit: doom render on core 1, ~7.5 fps (tick 121-145 ms) vs 10-11
+  (tick 93 ms) before core 2 first streams — and it stays ~7-8 fps after
+  the client disconnects**, so it's a per-frame core-1 cost of the AMP path
+  (suspect the whole-cache FLUSH per post), not the network.  Unmeasured;
+  next to profile.
 - **P5 hextile + tuning**: encoder port, lwipopts/TCP window tuning,
   region-flush RTL if the MAINT walk shows up in the profile.  Target:
   the ~11 fps ceiling (render-limited).
