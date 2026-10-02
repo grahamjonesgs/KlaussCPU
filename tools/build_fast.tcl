@@ -14,6 +14,8 @@
 #   vivado -mode batch -source tools/build_fast.tcl [-tclargs <options>]
 # Options:
 #   -jobs N       parallel runs for launch_runs (default 4; lower on 8 GB RAM)
+#   -threads N    general.maxThreads for synth/place/route (default 8;
+#                 Vivado's Windows default is 2)
 #   -resynth      force synth_1 to re-run even if it is up to date
 #   -tier2_only   skip tier 1; run tier 2 on the existing routed checkpoint
 #   -force_bit    write the bitstream even if timing is not met
@@ -29,12 +31,14 @@ set proj_dir [file normalize [file join [file dirname [info script]] ..]]
 set proj_xpr [file join $proj_dir KlaussCPU.xpr]
 
 set opt_jobs 4
+set opt_threads 8
 set opt_resynth 0
 set opt_tier2_only 0
 set opt_force_bit 0
 for {set i 0} {$i < [llength $argv]} {incr i} {
    switch -- [lindex $argv $i] {
       -jobs       { incr i; set opt_jobs [lindex $argv $i] }
+      -threads    { incr i; set opt_threads [lindex $argv $i] }
       -resynth    { set opt_resynth 1 }
       -tier2_only { set opt_tier2_only 1 }
       -force_bit  { set opt_force_bit 1 }
@@ -61,6 +65,7 @@ proc wns {} { return [get_property SLACK [get_timing_paths -max_paths 1 -nworst 
 proc whs {} { return [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]] }
 proc met {} { return [expr {[wns] >= 0.0 && [whs] >= 0.0}] }
 
+set_param general.maxThreads $opt_threads
 open_project $proj_xpr
 set top      [get_property top [current_fileset]]
 set impl_dir [get_property DIRECTORY [get_runs impl_1]]
