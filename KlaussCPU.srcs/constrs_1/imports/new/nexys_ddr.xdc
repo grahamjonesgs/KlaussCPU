@@ -458,10 +458,13 @@ set_multicycle_path -hold 1 \
 # a 2-cycle budget: the SHA Stage-C pattern at core scale (AMP_CORE2_PLAN.md
 # §3).  The r_ce FF, local RAM, log FIFO and the CE-paced bus FSM live in the
 # WRAPPER and stay 1-cycle timed, as do wrapper<->core boundary paths.
-set_multicycle_path -setup 2 \
-    -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
-    -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
-set_multicycle_path -hold 1 \
-    -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
-    -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
+# Since 2026-10 core 2 runs at the full 100 MHz (CE held high in
+# core2_subsys.sv), so its paths get the normal single-cycle budget and this
+# constraint is disabled.  Re-enable it together with a /2 r_ce for 50 MHz.
+# set_multicycle_path -setup 2 \
+#     -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
+#     -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
+# set_multicycle_path -hold 1 \
+#     -from [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}] \
+#     -to   [get_cells -hier -regexp {.*core2_subsys_i/c2_core_i/.*}]
 

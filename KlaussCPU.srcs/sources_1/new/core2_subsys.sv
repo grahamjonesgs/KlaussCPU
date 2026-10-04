@@ -1,16 +1,20 @@
 // ============================================================================
-// core2_subsys — AMP core 2: a second pipeline_core at effective 50 MHz.
+// core2_subsys — AMP core 2: a second pipeline_core (100 MHz since 2026-10;
+// originally an effective 50 MHz — see Clocking).
 //
 // P1 scope (AMP_CORE2_PLAN.md): the core + a 64 KB local BRAM (code+data for
 // now; P2 re-partitions when DDR arrives) + a log FIFO, controlled by core 1
 // through MMIO device 0x010.  No DDR access, no interrupts, no LiteEth yet.
 //
-// Clocking: everything core-2-side advances on r_ce (a /2 toggle), making the
-// subsystem a logically-50 MHz synchronous system on the 100 MHz clock — the
-// M12 Stage-C SHA pattern.  The XDC gives the pipeline_core instance a blanket
-// 2-cycle multicycle budget.  The local RAM and log FIFO run full-rate (their
-// inputs from the CE side are stable across each 2-cycle window; pushes are
-// qualified with r_ce so they fire exactly once per core cycle).
+// Clocking: everything core-2-side advances on r_ce.  Originally r_ce was a /2
+// toggle (a logically-50 MHz subsystem on the 100 MHz clock, the M12 Stage-C
+// SHA pattern, with a blanket 2-cycle multicycle budget on the core in the
+// XDC).  Since 2026-10 r_ce is held high after reset, so core 2 runs at the
+// full 100 MHz and is timed single-cycle (the multicycle constraint is gone):
+// build met at WNS +0.011 / WHS +0.020, board-verified (VNC full-frame 17.6 ->
+// 21.1 fps RGB565, 38 fps 8-bit).  The CE plumbing is kept so a /2 rate is a
+// one-line change back if timing ever needs it.  Pushes into the log FIFO are
+// still qualified with r_ce (fire once per core cycle either way).
 //
 // Rules honoured (plan §3): every core-2-facing handshake is level-held —
 // m2_ready is generated ON the CE grid (one core cycle), never a bare 100 MHz
@@ -88,10 +92,13 @@ module core2_subsys
    assign mmio.ready = 1'b1;   // top-level dv_d2 protocol provides pacing
 
    // ------------------------------------------------------------------ ce/2
+   // CE held high after reset: core 2 runs at the full 100 MHz (see the
+   // Clocking note above).  For the old 50 MHz rate, make this `~r_ce` and
+   // restore the multicycle-2 constraint over c2_core_i in nexys_ddr.xdc.
    logic r_ce;
    always_ff @(posedge i_Clk) begin
       if (!i_Rst_L) r_ce <= 1'b0;
-      else          r_ce <= ~r_ce;
+      else          r_ce <= 1'b1;
    end
 
    // -------------------------------------------------- mailbox control regs

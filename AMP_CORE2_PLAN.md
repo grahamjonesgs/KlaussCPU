@@ -351,6 +351,26 @@ Core-2 address map (32-bit, same ISA view as core 1):
   for 8-bit; core 2 (~57 ms/frame at 128 KB) for RGB565.  Still no
   keyboard path in the AMP build.  More LiteEth RX slots (needs LiteX to
   regenerate the core) would remove the residual RX drops.
+  **CORE 2 AT 100 MHz (2026-10-04, board):** r_ce held high, the core's
+  multicycle-2 XDC constraint removed (core2_subsys.sv / nexys_ddr.xdc).
+  build_fast tier 1 MET, WNS +0.011 / WHS +0.020 (master was +0.030),
+  25m00s.  Self-tests pass; VNC full-frame RGB565 17.6 -> 21.1 fps (~57 ->
+  ~47 ms/frame), 8-bit 38 fps.  Only ~20% (not 2x): core 2's big buckets
+  are DDR/IO-bound — tcp_write's uncached-DDR copy 14.3 ms, tx_wait 0.3 ->
+  1.6 ms (now waiting on the wire); boot benchmark DDR u64 loads 10 -> 7
+  ms vs BRAM 6 -> 3 ms.  Doom clients stay doom-limited (8-bit 21-28 fps,
+  RGB565 ~17 fps).  **Showcase: runtime apps/mandel** (Mandelbrot zoom,
+  8-bit, 64-bit fixed point; continuous zoom by nearest-neighbour scaling
+  between computed images): single-core build (core 1 also runs Zephyr
+  TCP/IP + VNC) 5.0 fps / 1.26 M iter/s vs two-core 23.7 fps / 2.76 M
+  iter/s (8-bit, no zoom scaling; 19.3 fps / 2.17 M iter/s with it) —
+  4.7x display, 2.2x compute.  Found on the way: C2_ETH_OWNER survives a
+  core-1 reload, so a single-core image after an AMP one had no network
+  (PHY ID 0x0000); the Zephyr eth driver now stops core 2 and reclaims the
+  MAC at init.  **Dhrystone 2.1 (core 1, 100 MHz):** -O1 36.2 DMIPS /
+  0.36 DMIPS/MHz, -O2 40.6 DMIPS / 0.41 DMIPS/MHz; CPI ~3.0-3.1, 452-518
+  instr/Dhrystone — absolute ~486DX2/DX4 class, per-clock well below an
+  ARM7 (~0.9): the stall rate, not the clock, is the core's headroom.
 - **P5 hextile + tuning**: encoder port, lwipopts/TCP window tuning,
   region-flush RTL if the MAINT walk shows up in the profile.  Target:
   the ~11 fps ceiling (render-limited).
