@@ -27,6 +27,18 @@ ip_upgrade.log
 *.wdf
 *.wpc
 
+# Vivado IP output products.  Vivado regenerates these per machine, and the
+# copies differ by OS (absolute paths, host/timestamp headers, CR CR LF line
+# endings on Windows), so tracking them churned on every Windows/Linux switch.
+# Track only the IP sources; tools/build_fast.tcl regenerates the rest.
+# MIG: the .xci plus the top-level MIG configuration files (the .xci's
+# XML_INPUT_FILE is one of mig_[abc].prj).
+/KlaussCPU.srcs/sources_1/ip/mig_7series_0/*
+!/KlaussCPU.srcs/sources_1/ip/mig_7series_0/mig_7series_0.xci
+!/KlaussCPU.srcs/sources_1/ip/mig_7series_0/mig_[abc].prj
+# Vivado runtime report written to the project root by every build.
+dfx_runtime.txt
+
 # Temporary/OS files
 .Xil/
 *.bak

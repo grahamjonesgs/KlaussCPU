@@ -80,6 +80,41 @@ if {!$opt_tier2_only} {
    set_property AUTO_INCREMENTAL_CHECKPOINT 0 $impl
    set_property INCREMENTAL_CHECKPOINT "" $impl
 
+   # IP output products are not tracked in git (they differ per OS — see
+   # .gitignore), so a fresh checkout has only the IP sources.  Generate
+   # whatever is missing or stale; a no-op when everything is up to date.
+   set t0 [clock seconds]
+   generate_target all [get_ips]
+   bf_log "IP output products checked/generated in [elapsed $t0]"
+
+   # An IP synthesised out-of-context (MIG) also needs the checkpoint + stub
+   # its own synth run writes next to the .xci.  After a pull deletes them the
+   # run can still look complete, and synth_1 then fails with "module not
+   # found" — so re-run that IP's synth run whenever its .dcp is missing.
+   # (Core-container IP, e.g. clk_wiz_0_1.xcix, keeps its products inside the
+   # .xcix; its .xci path isn't a file on disk, so it's skipped.)
+   foreach ip [get_ips] {
+      set xci [get_property IP_FILE $ip]
+      if {![file exists $xci]} continue
+      if {![get_property GENERATE_SYNTH_CHECKPOINT [get_files $xci]]} continue
+      if {[file exists "[file rootname $xci].dcp"]} continue
+      set run [get_runs -quiet ${ip}_synth_1]
+      if {$run eq ""} {
+         bf_log "IP $ip has no checkpoint and no ${ip}_synth_1 run"
+         exit 2
+      }
+      set t0 [clock seconds]
+      bf_log "IP $ip: checkpoint missing, re-running $run"
+      reset_run $run
+      launch_runs $run -jobs $opt_jobs
+      wait_on_run $run
+      if {![run_ok $run]} {
+         bf_log "$run FAILED: [get_property STATUS $run]"
+         exit 2
+      }
+      bf_log "$run done in [elapsed $t0]"
+   }
+
    set synth [get_runs synth_1]
    if {$opt_resynth || [get_property NEEDS_REFRESH $synth] || ![run_ok synth_1]} {
       set t0 [clock seconds]
