@@ -282,3 +282,10 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
   +0.078 / WHS +0.022**, 44,482 LUTs (70.2%), BRAM 102.5. On that bitstream:
   test_vga_scan 7/7, test_vga 6/6, blit_selftest 19 PASS / 0 FAIL.
 - 2026-10-09: Phase 3 (software) — see the Phase 3 section; runtime commit on vga-output.
+- 2026-10-09: Doom zero-copy VGA path: vga_out pool is now 3 buffers;
+  vga_out_indexed_buffer()/vga_out_present_indexed() let Doom render straight
+  into VGA memory (DG_ScreenBuffer re-pointed each frame; AMP builds keep the
+  copy). Gameplay fps over the same 27 demo windows: VGA-only 21.3 -> **24.7**
+  (repeatable; was 23.7 for AMP without VGA), hand-off 2 ms -> <1 ms,
+  0 underflows. AMP + VGA unchanged at 20.8. Next lever is Doom's render
+  itself (~39 ms R_RenderPlayerView).
