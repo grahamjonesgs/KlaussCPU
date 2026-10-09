@@ -154,6 +154,12 @@ module tb_blitter;
       .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
       .i_dma_addr(dma_addr), .i_dma_write_data(dma_wdata), .i_dma_wdf_mask(dma_mask),
       .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant),
+      // Core 2 and VGA scanout masters idle for these unit tests.
+      .i_c2_req(1'b0), .i_c2_done(1'b0), .i_c2_write_DV(1'b0), .i_c2_read_DV(1'b0),
+      .i_c2_addr(32'h0), .i_c2_write_data(128'h0), .i_c2_wdf_mask(16'h0),
+      .o_c2_read_data(), .o_c2_ready(), .o_c2_grant(),
+      .i_vga_req(1'b0), .i_vga_done(1'b0), .i_vga_read_DV(1'b0), .i_vga_addr(32'h0),
+      .o_vga_read_data(), .o_vga_ready(), .o_vga_grant(),
       // Cache maintenance idle for these unit tests.
       .i_flush_go(1'b0), .i_inval_go(1'b0), .o_mnt_busy()
    );

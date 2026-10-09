@@ -124,7 +124,20 @@ if {!$opt_tier2_only} {
    }
 
    set synth [get_runs synth_1]
-   if {$opt_resynth || [get_property NEEDS_REFRESH $synth] || ![run_ok synth_1]} {
+   # NEEDS_REFRESH misses sources edited outside Vivado (a batch session
+   # opens the project fresh), so also re-synthesise when any design source
+   # or constraint file is newer than the synth checkpoint.
+   set synth_dcp [file join [get_property DIRECTORY $synth] ${top}.dcp]
+   set stale_src ""
+   if {[file exists $synth_dcp]} {
+      set dcp_time [file mtime $synth_dcp]
+      foreach f [concat [get_files -quiet -of_objects [get_filesets sources_1]] \
+                        [get_files -quiet -of_objects [get_filesets constrs_1]]] {
+         if {[file exists $f] && [file mtime $f] > $dcp_time} { set stale_src $f; break }
+      }
+   }
+   if {$stale_src ne ""} { bf_log "synth_1 stale: $stale_src is newer than the checkpoint" }
+   if {$opt_resynth || $stale_src ne "" || [get_property NEEDS_REFRESH $synth] || ![run_ok synth_1]} {
       set t0 [clock seconds]
       bf_log "synth_1 (jobs=$opt_jobs)"
       reset_run synth_1

@@ -30,7 +30,7 @@ cache controller.
 0xF00E_xxxx                 2D DMA blitter (RGB565 framebuffer accelerator)
 0xF00F_xxxx                 timers / IRQ controller
 0xF010_xxxx                 AMP core 2 mailbox (control / load window / log)
-0xF011_xxxx                 VGA output (640x480@60, palette, vsync IRQ)
+0xF011_xxxx                 VGA output (640x480@60, DDR scanout, palette, vsync IRQ)
 ```
 
 Reserved ranges read as 0 and ignore writes (no bus error).
@@ -825,31 +825,49 @@ frame time becomes `max(render, copy)` rather than `render + copy`. Read
 ### VGA output — base `0xF011_0000`
 
 Drives the Nexys A7 VGA connector (12-bit resistor DAC) at 640×480 @ 59.5 Hz
-from the CPU clock: 25 MHz pixel clock enable, no separate clock. RTL:
-`vga_ctrl.sv` + `vga_timing.sv`; design and phases: `VGA_PLAN.md`. Phase 1
-(current) has CPU-free pixel sources only. Phase 2 adds DDR framebuffer
-scanout behind `SCANOUT_EN`; the `DOUBLE`/`BPP8`/`FB_BASE`/`STRIDE`/`VSTART`
-fields are stored for it already.
+from the CPU clock: 25 MHz pixel clock enable, no separate clock. It scans a
+framebuffer out of DDR as DDR master D: wide 32 B reads into a 2-line
+buffer, first priority among the DMA masters. RTL: `vga_ctrl.sv`,
+`vga_scanout.sv`, `vga_timing.sv`; design and history: `VGA_PLAN.md`.
 
 | Offset | Reg | RW | Description |
 |--------|-----|----|-------------|
-| 0x000 | `VGA_CTRL` | RW | `[0]` SCANOUT_EN (Phase 2), `[1]` DOUBLE (Phase 2), `[2]` BPP8 (Phase 2), `[3]` TEST_PATTERN (reset 1), `[4]` VSYNC_IRQ_EN, `[5]` PALETTE_VIEW. Source priority: test pattern > palette view > scanout > `VGA_BORDER`. |
-| 0x008 | `VGA_FB_BASE` | RW | Framebuffer address `[31:4]`; copied to `VGA_FB_ACTIVE` at the start of vblank (tear-free flip). Reads return the pending value. |
-| 0x010 | `VGA_STRIDE` | RW | Bytes per source line `[15:4]` (reset 640) |
-| 0x018 | `VGA_STATUS` | R/W | R: `[0]` IN_VBLANK, `[1]` VSYNC_PENDING, `[31:16]` frame count, `[41:32]` current raster line (0–524), `[63:48]` scanout underflow count. W: bit 1 clears VSYNC_PENDING, bit 2 clears the underflow count. |
-| 0x020 | `VGA_BORDER` | RW | `[11:0]` RGB444 shown wherever no image is |
-| 0x028 | `VGA_VSTART` | RW | `[9:0]` first display line of the image (Phase 2) |
+| 0x000 | `VGA_CTRL` | RW | `[0]` SCANOUT_EN, `[1]` DOUBLE (320 px → 640, each line twice), `[2]` BPP8 (palette indices; else RGB565), `[3]` TEST_PATTERN (reset 1), `[4]` VSYNC_IRQ_EN, `[5]` PALETTE_VIEW. Source priority: test pattern > palette view > scanout image > `VGA_BORDER`. |
+| 0x008 | `VGA_FB_BASE` | RW | Framebuffer address `[31:5]` (32 B aligned); copied to `VGA_FB_ACTIVE` at the start of vblank (tear-free flip). Reads return the pending value. |
+| 0x010 | `VGA_STRIDE` | RW | Bytes per source line `[15:5]` (a multiple of 32; reset 640) |
+| 0x018 | `VGA_STATUS` | R/W | R: `[0]` IN_VBLANK, `[1]` VSYNC_PENDING, `[31:16]` frame count, `[41:32]` current raster line (0–524), `[63:48]` underflow count (display lines whose DDR fetch was late; saturating). W: bit 1 clears VSYNC_PENDING, bit 2 clears the underflow count. |
+| 0x020 | `VGA_BORDER` | RW | `[11:0]` RGB444 shown outside the image (and on starved lines) |
+| 0x028 | `VGA_VSTART` | RW | `[9:0]` first display line of the image |
 | 0x030 | `VGA_FB_ACTIVE` | R | `FB_BASE` as latched at the last vblank |
+| 0x038 | `VGA_HEIGHT` | RW | `[9:0]` source lines (reset 240) |
 | 0x800–0xFF8 | `VGA_PALETTE[0..255]` | RW | `[11:0]` RGB444, 8 B per entry; not reset |
 
+- **Image geometry:** HEIGHT lines of 320 (DOUBLE) or 640 pixels, 1 (BPP8)
+  or 2 (RGB565) bytes each, STRIDE bytes apart, shown on display lines
+  VSTART .. VSTART + HEIGHT×(DOUBLE ? 2 : 1) − 1 (clipped at 479).
+  Examples: 320×240 RGB565 doubled = `CTRL=0x3, STRIDE=640, HEIGHT=240,
+  VSTART=0`; doom's 320×200, centred = `HEIGHT=200, VSTART=40`.
+- **Pixel format:** little-endian. RGB565 pixel *i* is the halfword at
+  `base + 2i`, and the display uses its top 4 bits per channel. BPP8 bytes
+  index `VGA_PALETTE`.
+- **When writes take effect:** SCANOUT_EN, DOUBLE, BPP8, STRIDE, HEIGHT,
+  VSTART and FB_BASE latch at the start of vblank (line 480), so anything
+  written during a frame applies from the next one. TEST_PATTERN,
+  PALETTE_VIEW, VSYNC_IRQ_EN, BORDER and the palette act immediately.
+- **Coherency:** scanout reads DDR directly. The CPU draws through the
+  write-back cache, so **flush (`CACHE_CTRL_FLUSH`) before flipping**.
+  Blitter output needs no flush.
+- **Bandwidth:** reads per source line are 10 (320×8 bpp), 20 (320×16 or
+  640×8) or 40 (640×16). The arbiter lets scanout in even between the sets
+  of a cache flush walk.
 - `PALETTE_VIEW` shows a 16×16 grid of 40×30 cells; cell (row, col) =
   `VGA_PALETTE[row*16 + col]`.
-- Vsync: `VSYNC_PENDING` sets at raster line 480 (start of vblank) every
-  frame. With `VSYNC_IRQ_EN` it drives interrupt source 3 (level); the ISR
-  writes `VGA_STATUS = 2` before `IRET`. Vblank lasts 45 lines ≈ 1.43 ms:
-  the window for page flips and palette changes.
-- C names: `REG_VGA_*`, `VGA_CTRL_*`, `VGA_STATUS_*`, `INT_SRC_VGA` in the
-  runtime's `mmio.h`; board test `baremetal/programs/test_vga.c`.
+- **Vsync:** `VSYNC_PENDING` sets at raster line 480 every frame. With
+  `VSYNC_IRQ_EN` it drives interrupt source 3 (level); the ISR writes
+  `VGA_STATUS = 2` before `IRET`. Vblank lasts 45 lines ≈ 1.43 ms.
+- **C names:** `REG_VGA_*`, `VGA_CTRL_*`, `VGA_STATUS_*` and `INT_SRC_VGA` in
+  the runtime's `mmio.h`. Board tests: `baremetal/programs/test_vga.c`
+  (registers / IRQ) and `test_vga_scan.c` (scanout).
 
 ### Crypto: AES-128 — base `0xF00A_0000`
 

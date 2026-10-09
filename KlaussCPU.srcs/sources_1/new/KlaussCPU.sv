@@ -815,11 +815,28 @@ module KlaussCPU (
    assign vga_bus.addr       = w_mmio_addr;
    assign vga_bus.write_data = w_mmio_write_data;
    assign vga_bus.byte_en    = w_mmio_byte_en;
+   // DDR master D (scanout) wires to mem_read_write (instantiated below).
+   wire         w_vga_dma_req;
+   wire         w_vga_dma_done;
+   wire         w_vga_dma_read_DV;
+   wire [31:0]  w_vga_dma_addr;
+   wire [255:0] w_vga_dma_read_data;
+   wire         w_vga_dma_ready;
+   wire         w_vga_dma_grant;
+
+   (* KEEP_HIERARCHY = "yes" *)
    vga_ctrl vga_ctrl_i (
        .i_Clk   (i_Clk),
        .i_Rst_L (~w_reset_H),
        .mmio    (vga_bus),
        .o_irq   (w_vga_irq),
+       .o_dma_req      (w_vga_dma_req),
+       .o_dma_done     (w_vga_dma_done),
+       .o_dma_read_DV  (w_vga_dma_read_DV),
+       .o_dma_addr     (w_vga_dma_addr),
+       .i_dma_read_data(w_vga_dma_read_data),
+       .i_dma_ready    (w_vga_dma_ready),
+       .i_dma_grant    (w_vga_dma_grant),
        .o_vga_r (VGA_R),
        .o_vga_g (VGA_G),
        .o_vga_b (VGA_B),
@@ -1103,6 +1120,15 @@ module KlaussCPU (
        .o_c2_read_data(w_c2_ddr_read_data),
        .o_c2_ready(w_c2_ddr_ready),
        .o_c2_grant(w_c2_ddr_grant),
+
+       // DDR master D — VGA scanout (read-only wide reads; first among DMA masters).
+       .i_vga_req(w_vga_dma_req),
+       .i_vga_done(w_vga_dma_done),
+       .i_vga_read_DV(w_vga_dma_read_DV),
+       .i_vga_addr(w_vga_dma_addr),
+       .o_vga_read_data(w_vga_dma_read_data),
+       .o_vga_ready(w_vga_dma_ready),
+       .o_vga_grant(w_vga_dma_grant),
 
        // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
        .i_flush_go(w_cache_flush_go),

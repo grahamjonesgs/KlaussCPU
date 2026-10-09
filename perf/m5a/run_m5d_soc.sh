@@ -51,6 +51,7 @@ xvlog -sv \
   "$SRC/sources_1/new/SPI_Master_With_Single_CS.sv" \
   "$SRC/sources_1/new/RGB_LED.sv" \
   "$SRC/sources_1/new/vga_timing.sv" \
+  "$SRC/sources_1/new/vga_scanout.sv" \
   "$SRC/sources_1/new/vga_ctrl.sv" \
   "$SRC/sources_1/new/uart_tx.sv" \
   "$SRC/sources_1/new/KlaussCPU.sv" \

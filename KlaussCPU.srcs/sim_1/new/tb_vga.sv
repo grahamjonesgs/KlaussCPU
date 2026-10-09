@@ -1,6 +1,6 @@
 //===========================================================================
-// tb_vga — VGA_PLAN.md Phase 0/1 gate: vga_ctrl's 640×480 @ 60 Hz pin timing,
-// pixel sources, registers, palette and vsync IRQ.
+// tb_vga — VGA_PLAN.md Phase 0/1/2 gate: vga_ctrl's 640×480 @ 60 Hz pin
+// timing, pixel sources, registers, palette, vsync IRQ and DDR scanout.
 //
 // Watches ONLY the five pin-level outputs (as the converter would), one sample
 // per pixel, and checks against VESA DMT 640×480:
@@ -16,7 +16,14 @@
 //   * content, per frame, by the mode the test sequence selected:
 //       frames 1-2  reset TEST_PATTERN: full-white top line, bars, ramps
 //       frame  3    border mode (CTRL=0, BORDER=0x123): every pixel 0x123
-//       frames 4+   PALETTE_VIEW: every pixel = palette[(y/30)*16 + x/40]
+//       frames 4-7  PALETTE_VIEW: every pixel = palette[(y/30)*16 + x/40]
+//       frames 8-11 SCANOUT from a DDR model (hash-of-address memory), every
+//                   pixel compared: 320x240 RGB565 doubled; 640x400 BPP8
+//                   letterboxed, stride 1024; 320x200 doubled under heavy
+//                   grant contention; 640x480 RGB565 with a DDR too slow to
+//                   keep up (underflow: each pixel must be border or correct,
+//                   never garbage, and UNDERFLOW must count)
+//       frame  12   SCANOUT_EN off again: border only
 //   * MMIO: reset values, STATUS fields, palette readback, vsync IRQ (fires at
 //     line 480, once per 420 000 px, W1C, gated by IRQ_EN), FB_BASE → FB_ACTIVE
 //     latched only at vblank
@@ -39,10 +46,81 @@ module tb_vga;
       bus.write_DV = 0; bus.read_DV = 0; bus.addr = 0; bus.write_data = 0;
    end
 
+   // DDR master D
+   logic         dma_req, dma_done, dma_rd;
+   logic [31:0]  dma_addr;
+   logic [255:0] dma_rdata = '0;
+   logic         dma_ready = 0, dma_grant = 0;
+
    vga_ctrl dut (
       .i_Clk(clk), .i_Rst_L(rst_l), .mmio(bus.slave), .o_irq(irq),
+      .o_dma_req(dma_req), .o_dma_done(dma_done), .o_dma_read_DV(dma_rd),
+      .o_dma_addr(dma_addr), .i_dma_read_data(dma_rdata), .i_dma_ready(dma_ready),
+      .i_dma_grant(dma_grant),
       .o_vga_r(r), .o_vga_g(g), .o_vga_b(b), .o_vga_hs(hs), .o_vga_vs(vs)
    );
+
+   int          mode = 0;         // 0 test pattern, 1 border, 2 palette view, 3 scanout
+   // scanout frame config (applied by the pixel monitor at the VS fall)
+   typedef struct { logic dbl, bpp8; int base, stride, height, vstart; logic allow_uf; } scfg_t;
+   scfg_t       cfg, cfg_next;
+   logic        cfg_pending = 0;
+   int          uf_lines = 0;     // lines that showed border inside the image
+
+   // ---------------- DDR model (mem_read_write master-D contract) ----------
+   // Memory = a hash of the byte address.  Grants come after a random delay
+   // (0..ddr_gdelay cycles: contention) and drop the cycle after done; each
+   // read returns its 32 B line in the cache-line layout after ddr_lat cycles.
+   function automatic logic [7:0] mem_byte(input logic [31:0] a);
+      return 8'((a * 7) ^ ((a >> 7) * 3) ^ ((a >> 13) * 5) ^ (a >> 21));
+   endfunction
+   function automatic logic [255:0] mem_line(input logic [31:0] a);
+      logic [255:0] l;
+      for (int k = 0; k < 4; k++)
+         for (int j = 0; j < 8; j++)
+            l[255 - 64*k - 56 + 8*j -: 8] = mem_byte(a + 32'(8*k + j));
+      return l;
+   endfunction
+
+   int ddr_lat = 20, ddr_gdelay = 0, ddr_reads = 0;
+   int dma_errors_shown = 0;
+   initial forever begin
+      @(posedge clk);
+      if (dma_req && !dma_grant) begin
+         repeat ($urandom_range(0, ddr_gdelay)) @(posedge clk);
+         dma_grant <= 1'b1;
+         // serve reads until done
+         forever begin
+            @(posedge clk);
+            if (dma_done) begin dma_grant <= 1'b0; break; end
+            if (dma_rd) begin
+               if (dma_addr[4:0] != 0 && dma_errors_shown++ < 3)
+                  fail($sformatf("misaligned scanout read %h", dma_addr));
+               // every read must lie inside the frame being scanned (the
+               // monitor's cfg switches at the VS fall, before any prefetch)
+               if (mode == 3 && (int'(dma_addr) < cfg.base ||
+                                 int'(dma_addr) >= cfg.base + cfg.height * cfg.stride) &&
+                   dma_errors_shown++ < 3)
+                  fail($sformatf("scanout read %h outside the frame [%h, %h)", dma_addr,
+                                 cfg.base, cfg.base + cfg.height * cfg.stride));
+               repeat (ddr_lat) @(posedge clk);
+               dma_rdata <= mem_line(dma_addr);
+               dma_ready <= 1'b1;
+               ddr_reads++;
+               @(posedge clk);
+               dma_ready <= 1'b0;
+               // the master must drop DV before the next read
+               @(posedge clk);
+               if (dma_rd && dma_errors_shown++ < 3)
+                  fail("read DV not dropped after ready");
+            end
+         end
+      end
+   end
+   // a read while not granted is a protocol error
+   always @(posedge clk)
+      if (dma_rd && !dma_grant && dma_errors_shown++ < 3)
+         fail("read DV without grant");
 
    // ---------------- MMIO helpers (device window 0xF011_xxxx) ----------------
    task automatic mmio_write(input logic [15:0] off, input logic [63:0] d);
@@ -91,12 +169,25 @@ module tb_vga;
    int          active_lines = 0;
    int          first_active_ln = -1;
    logic [11:0] line_buf [0:639];
-   int          mode = 0;         // 0 test pattern, 1 border, 2 palette view
 
    localparam logic [11:0] BORDER_COL = 12'h123;
    function automatic logic [11:0] pal_val(input int i);
       logic [7:0] b = i;
       return {b[7:4], b[3:0], 4'hA};               // never black (keeps the window check valid)
+   endfunction
+
+   // expected scanout pixel; in_img says whether (x, y) is inside the image
+   function automatic logic [11:0] exp_scan(input int x, input int y, output logic in_img);
+      int s, px, a;
+      logic [15:0] p565;
+      in_img = (y >= cfg.vstart) && (y - cfg.vstart < (cfg.height << cfg.dbl)) && (y < 480);
+      if (!in_img) return BORDER_COL;
+      s  = (y - cfg.vstart) >> cfg.dbl;
+      px = x >> cfg.dbl;
+      a  = cfg.base + s * cfg.stride + px * (cfg.bpp8 ? 1 : 2);
+      if (cfg.bpp8) return pal_val(mem_byte(a));
+      p565 = {mem_byte(a + 1), mem_byte(a)};
+      return {p565[15:12], p565[10:7], p565[4:1]};
    endfunction
 
    function automatic logic [11:0] expect_bar(input int x);
@@ -110,6 +201,21 @@ module tb_vga;
       if (lit_first < 0) return;                 // blank line
       active_lines++;
       if (first_active_ln < 0) first_active_ln = ln;
+      if (mode == 3) begin                       // image pixels may be black: bounds only
+         automatic logic in_img, uf = 0;
+         automatic logic [11:0] want;
+         if (lit_first < 144 || lit_last > 783)
+            fail($sformatf("y=%0d lit outside the active window (%0d..%0d)", y, lit_first, lit_last));
+         for (int x = 0; x < 640; x++) begin
+            want = exp_scan(x, y, in_img);
+            if (line_buf[x] == want) continue;
+            if (in_img && cfg.allow_uf && line_buf[x] == BORDER_COL) begin uf = 1; continue; end
+            fail($sformatf("scanout y=%0d x=%0d = %03h (want %03h)", y, x, line_buf[x], want));
+            break;
+         end
+         if (uf) uf_lines++;
+         return;
+      end
       if (lit_first != 144) fail($sformatf("y=%0d first lit px %0d (want 144)", y, lit_first));
       if (lit_last  != 783) fail($sformatf("y=%0d last lit px %0d (want 783)",  y, lit_last));
       if (mode == 1) begin
@@ -181,14 +287,15 @@ module tb_vga;
          if (frames >= 1) begin
             if (px_since_vs != 420000)
                fail($sformatf("VS period %0d px (want 420000)", px_since_vs));
-            if (active_lines != 480)
+            if (active_lines != 480 && mode != 3)
                fail($sformatf("%0d active lines (want 480)", active_lines));
-            if (first_active_ln != 34)
+            if (first_active_ln != 34 && mode != 3)
                fail($sformatf("first active line ends at HS #%0d after VS (want 34)", first_active_ln));
             $display("frame %0d: %0d active lines, first at HS #%0d after VS",
                      frames, active_lines, first_active_ln);
          end
          frames++;
+         if (cfg_pending) begin cfg = cfg_next; mode = 3; cfg_pending = 0; end
          px_since_vs = 0;
          ln = -1;                                  // the HS fall in this line becomes 0
          active_lines = 0;
@@ -214,6 +321,24 @@ module tb_vga;
       hs_q = hs;
       vs_q = vs;
    end
+
+   // wait until the raster is in the active picture (not vblank)
+   task automatic wait_active();
+      logic [63:0] d;
+      do mmio_read(16'h018, d); while (d[0] || d[41:32] < 10'd8);
+   endtask
+
+   // program a scanout frame (takes effect at the next frame) and tell the
+   // monitor to expect it from the next VS fall
+   task automatic set_scan(input scfg_t c, input logic [5:0] extra = 6'h0);
+      mmio_write(16'h008, 64'(c.base));
+      mmio_write(16'h010, 64'(c.stride));
+      mmio_write(16'h038, 64'(c.height));
+      mmio_write(16'h028, 64'(c.vstart));
+      mmio_write(16'h000, {58'b0, extra | {3'b000, c.bpp8, c.dbl, 1'b1}});
+      cfg_next = c;
+      cfg_pending = 1;
+   endtask
 
    initial begin
       logic [63:0] d;
@@ -274,7 +399,44 @@ module tb_vga;
       mmio_write(16'h018, 64'h2);
       $display("vsync IRQ period %0.3f ms", (t2 - t1) / 1.0e6);
 
-      wait (frames == 7);                          // palette frames 4-6 checked
+      // ---- frames 8-11: DDR scanout ----
+      // Settings latch at the start of vblank (line 480), so each frame's
+      // config is written in the preceding frame's ACTIVE period; the monitor
+      // switches its expectation at the next VS fall.
+      mmio_write(16'h018, 64'h4);                  // clear UNDERFLOW
+      wait (frames == 7);                          // palette view frame 7 still on
+      wait_active();
+      // PALETTE_VIEW (an immediate pixel source) stays on for the rest of
+      // frame 7; it is dropped in the vblank before frame 8 below.
+      set_scan('{dbl:1, bpp8:0, base:32'h00AB_C000, stride:640,  height:240, vstart:0,  allow_uf:0}, 6'h20);
+      wait (frames == 8);
+      mmio_write(16'h000, 64'h03);                 // SCANOUT_EN | DOUBLE, palette view off
+      wait_active();
+      set_scan('{dbl:0, bpp8:1, base:32'h0020_0000, stride:1024, height:400, vstart:40, allow_uf:0});
+      wait (frames == 9);
+      ddr_gdelay = 200;                            // contention: grant up to 2 us late
+      wait_active();
+      set_scan('{dbl:1, bpp8:0, base:32'h0030_0020, stride:640,  height:200, vstart:40, allow_uf:0});
+      wait (frames == 10);
+      wait_active();
+      set_scan('{dbl:0, bpp8:0, base:32'h0040_0000, stride:1280, height:480, vstart:0, allow_uf:1});
+      wait (frames == 11);
+      ddr_gdelay = 0;
+      expect_reg(16'h018, 64'h0, 64'hFFFF_0000_0000_0000);   // frames 8-10: no underflow
+      ddr_lat = 150;                               // 40 reads x ~150 cycles > one line
+      wait_active();
+      mmio_write(16'h000, 64'h00);                 // frame 12: scanout off -> border
+      wait (frames == 12);
+      mode = 1;
+      ddr_lat = 20;
+      mmio_read(16'h018, d);
+      $display("underflow: %0d display lines counted, %0d lines showed border in the image, %0d DDR reads",
+               d[63:48], uf_lines, ddr_reads);
+      if (d[63:48] == 0 || uf_lines == 0) fail("starved frame produced no underflow");
+      mmio_write(16'h018, 64'h4);
+      expect_reg(16'h018, 64'h0, 64'hFFFF_0000_0000_0000);   // W1C cleared it
+
+      wait (frames == 13);                         // border frame 12 checked
       repeat (10) @(posedge clk);
       if (errors == 0) $display("TB_VGA PASS");
       else             $display("TB_VGA FAIL (%0d errors)", errors);
@@ -282,7 +444,7 @@ module tb_vga;
    end
 
    initial begin
-      #150ms;
+      #280ms;
       $display("TB_VGA TIMEOUT (frames=%0d)", frames);
       $finish;
    end

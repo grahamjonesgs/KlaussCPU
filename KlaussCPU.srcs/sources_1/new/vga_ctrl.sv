@@ -4,34 +4,42 @@
 // MMIO device id 0x011, base 0xF011_0000.
 //
 // 640×480 @ 60 Hz from vga_timing (25 MHz pixel CE on the 100 MHz CPU clock).
-// Phase 1: register file, 256-entry palette, vsync IRQ and three CPU-free
-// pixel sources. Phase 2 adds the DDR scanout source (CTRL.SCANOUT_EN; the
-// DOUBLE/BPP8/FB_BASE/STRIDE/VSTART fields are already stored for it).
+// Register file, 256-entry palette, vsync IRQ, and DDR framebuffer scanout
+// (vga_scanout.sv — DDR master D; RGB565 or 8-bit palette, optional 2x
+// pixel/line doubling).
 //
 // Pixel source, highest priority first:
 //   CTRL.TEST_PATTERN  colour bars / ramps / border / bouncing square (Phase 0)
 //   CTRL.PALETTE_VIEW  16×16 grid of 40×30 cells, cell (row, col) shows
 //                      palette[row*16 + col] — checks the palette path
-//   otherwise          VGA_BORDER colour (Phase 2: the scanout image)
+//   CTRL.SCANOUT_EN    the DDR framebuffer, inside its image window
+//   otherwise          VGA_BORDER colour (also outside the image window, and
+//                      on a line whose fetch did not finish — an underflow)
 // Reset state is TEST_PATTERN, so a fresh bitstream shows a picture with no
 // software running.
 //
 // Register layout (offsets within the device window, 64-bit accesses):
-//   0x000 VGA_CTRL      RW [0] SCANOUT_EN (Phase 2)   [1] DOUBLE (Phase 2)
-//                          [2] BPP8 (Phase 2)         [3] TEST_PATTERN (reset 1)
-//                          [4] VSYNC_IRQ_EN           [5] PALETTE_VIEW
-//   0x008 VGA_FB_BASE   RW framebuffer byte address [31:4] (16 B aligned).
+//   0x000 VGA_CTRL      RW [0] SCANOUT_EN   [1] DOUBLE (320 → 640 px, 2x lines)
+//                          [2] BPP8 (palette indices; else RGB565)
+//                          [3] TEST_PATTERN (reset 1)
+//                          [4] VSYNC_IRQ_EN   [5] PALETTE_VIEW
+//   0x008 VGA_FB_BASE   RW framebuffer byte address [31:5] (32 B aligned).
 //                          Pending value; copied to FB_ACTIVE at the start of
 //                          vblank, so a write is a tear-free page flip.
-//   0x010 VGA_STRIDE    RW bytes per source line [15:4] (reset 640)
+//   0x010 VGA_STRIDE    RW bytes per source line [15:5] (32 B aligned; reset 640)
 //   0x018 VGA_STATUS    R  [0] IN_VBLANK  [1] VSYNC_PENDING  [31:16] FRAME
 //                          count  [41:32] current raster line  [63:48]
-//                          UNDERFLOW count (Phase 2; reads 0 until then)
+//                          UNDERFLOW count (starved display lines, saturating)
 //                       W  [1]=1 clears VSYNC_PENDING, [2]=1 clears UNDERFLOW
 //   0x020 VGA_BORDER    RW [11:0] colour {R,G,B} outside the source image
-//   0x028 VGA_VSTART    RW [9:0] first display line of the image (Phase 2)
+//   0x028 VGA_VSTART    RW [9:0] first display line of the image
 //   0x030 VGA_FB_ACTIVE R  the FB_BASE latched at the last vblank
+//   0x038 VGA_HEIGHT    RW [9:0] source lines (reset 240)
 //   0x800..0xFF8 VGA_PALETTE RW 256 entries, 8 B apart, [11:0] = {R,G,B}
+//
+// Mode fields (DOUBLE, BPP8, STRIDE, HEIGHT, VSTART, FB_ACTIVE) take effect
+// at the next frame (see vga_scanout.sv).  The CPU draws through the
+// write-back cache, so software must flush the framebuffer before flipping.
 //
 // Vsync IRQ: VSYNC_PENDING sets at the start of vblank (line 480) every frame;
 // o_irq = VSYNC_PENDING & VSYNC_IRQ_EN, a level the ISR must clear with a
@@ -40,8 +48,10 @@
 //
 // Pixel pipeline (all registered on the pixel CE, so every signal — RGB, HS,
 // VS — sees the same two-stage delay and stays aligned):
-//   stage 1  source select from (x, y): direct colour or palette index
-//   stage 2  palette lookup (LUTRAM) + blanking → IOB output FFs
+//   stage 1  source select from (x, y): direct colour, palette index, or the
+//            scanout line-buffer dword (read the cycle after x changes)
+//   stage 2  pixel extract + palette lookup (LUTRAM) / RGB565→444 + blanking
+//            → IOB output FFs
 //////////////////////////////////////////////////////////////////////////////////
 
 module vga_ctrl (
@@ -50,6 +60,15 @@ module vga_ctrl (
 
     mmio_if.slave      mmio,        // offsets use mmio.addr[15:0]
     output logic       o_irq,       // vsync, level (see header)
+
+    // DDR master D (scanout) — to mem_read_write
+    output logic        o_dma_req,
+    output logic        o_dma_done,
+    output logic        o_dma_read_DV,
+    output logic [31:0] o_dma_addr,
+    input       [255:0] i_dma_read_data,
+    input               i_dma_ready,
+    input               i_dma_grant,
 
     output logic [3:0] o_vga_r,
     output logic [3:0] o_vga_g,
@@ -65,6 +84,7 @@ module vga_ctrl (
     localparam logic [15:0] OFF_BORDER    = 16'h0020;
     localparam logic [15:0] OFF_VSTART    = 16'h0028;
     localparam logic [15:0] OFF_FB_ACTIVE = 16'h0030;
+    localparam logic [15:0] OFF_HEIGHT    = 16'h0038;
 
     localparam logic [5:0]  CTRL_RESET    = 6'b00_1000;   // TEST_PATTERN
 
@@ -97,15 +117,20 @@ module vga_ctrl (
     // Registers
     // -------------------------------------------------------------------------
     logic [5:0]  r_ctrl       = CTRL_RESET;
-    logic [31:4] r_fb_base    = '0;
-    logic [31:4] r_fb_active  = '0;
-    logic [15:4] r_stride     = 12'd40;        // 640 B = 320 px of RGB565
+    logic [31:5] r_fb_base    = '0;
+    logic [31:5] r_fb_active  = '0;
+    logic [15:5] r_stride     = 11'd20;        // 640 B = 320 px of RGB565
     logic [11:0] r_border     = 12'h000;
     logic [9:0]  r_vstart     = 10'd0;
+    logic [9:0]  r_height     = 10'd240;
     logic        r_vs_pending = 1'b0;
     logic [15:0] r_frame      = '0;
-    logic [15:0] r_underflow  = '0;            // Phase 2 bumps this
+    logic [15:0] r_underflow  = '0;
+    logic        w_underflow;                  // pulse from vga_scanout
 
+    wire w_scan_en      = r_ctrl[0];
+    wire w_double       = r_ctrl[1];
+    wire w_bpp8         = r_ctrl[2];
     wire w_test_pattern = r_ctrl[3];
     wire w_irq_en       = r_ctrl[4];
     wire w_palette_view = r_ctrl[5];
@@ -121,9 +146,10 @@ module vga_ctrl (
             r_ctrl       <= CTRL_RESET;
             r_fb_base    <= '0;
             r_fb_active  <= '0;
-            r_stride     <= 12'd40;
+            r_stride     <= 11'd20;
             r_border     <= 12'h000;
             r_vstart     <= 10'd0;
+            r_height     <= 10'd240;
             r_vs_pending <= 1'b0;
             r_frame      <= '0;
             r_underflow  <= '0;
@@ -133,19 +159,21 @@ module vga_ctrl (
                 r_vs_pending <= 1'b1;
                 r_frame      <= r_frame + 16'd1;
             end
+            if (w_underflow && r_underflow != 16'hFFFF) r_underflow <= r_underflow + 16'd1;
             // A W1C in the same cycle as a new vblank loses to the set, so a
             // frame boundary can never be dropped.
             if (mmio.write_DV) begin
                 case (mmio.addr[15:0])
                     OFF_CTRL:    r_ctrl    <= mmio.write_data[5:0];
-                    OFF_FB_BASE: r_fb_base <= mmio.write_data[31:4];
-                    OFF_STRIDE:  r_stride  <= mmio.write_data[15:4];
+                    OFF_FB_BASE: r_fb_base <= mmio.write_data[31:5];
+                    OFF_STRIDE:  r_stride  <= mmio.write_data[15:5];
                     OFF_STATUS: begin
                         if (mmio.write_data[1] && !w_vblank_start) r_vs_pending <= 1'b0;
                         if (mmio.write_data[2])                    r_underflow  <= '0;
                     end
                     OFF_BORDER:  r_border  <= mmio.write_data[11:0];
                     OFF_VSTART:  r_vstart  <= mmio.write_data[9:0];
+                    OFF_HEIGHT:  r_height  <= mmio.write_data[9:0];
                     default: ;
                 endcase
             end
@@ -176,16 +204,51 @@ module vga_ctrl (
         else
             case (mmio.addr[15:0])
                 OFF_CTRL:      mmio.read_data = {58'b0, r_ctrl};
-                OFF_FB_BASE:   mmio.read_data = {32'b0, r_fb_base, 4'b0};
-                OFF_STRIDE:    mmio.read_data = {48'b0, r_stride, 4'b0};
+                OFF_FB_BASE:   mmio.read_data = {32'b0, r_fb_base, 5'b0};
+                OFF_STRIDE:    mmio.read_data = {48'b0, r_stride, 5'b0};
                 OFF_STATUS:    mmio.read_data = {r_underflow, 6'b0, w_y, r_frame,
                                                  14'b0, r_vs_pending, w_in_vblank};
                 OFF_BORDER:    mmio.read_data = {52'b0, r_border};
                 OFF_VSTART:    mmio.read_data = {54'b0, r_vstart};
-                OFF_FB_ACTIVE: mmio.read_data = {32'b0, r_fb_active, 4'b0};
+                OFF_FB_ACTIVE: mmio.read_data = {32'b0, r_fb_active, 5'b0};
+                OFF_HEIGHT:    mmio.read_data = {54'b0, r_height};
                 default:       mmio.read_data = 64'h0;
             endcase
     end
+
+    // -------------------------------------------------------------------------
+    // DDR scanout (line fetch + line buffer)
+    // -------------------------------------------------------------------------
+    logic        w_use_img, w_img_bpp8;
+    logic [63:0] w_img_dword;
+    logic [2:0]  w_img_sub;
+
+    vga_scanout scanout (
+        .i_Clk          (i_Clk),
+        .i_Rst_L        (i_Rst_L),
+        .i_en           (w_scan_en),
+        .i_double       (w_double),
+        .i_bpp8         (w_bpp8),
+        .i_fb_base      ({r_fb_active, 5'b0}),
+        .i_stride       ({r_stride, 5'b0}),
+        .i_height       (r_height),
+        .i_vstart       (r_vstart),
+        .i_line_start   (w_line_start),
+        .i_x            (w_x),
+        .i_y            (w_y),
+        .o_use_img      (w_use_img),
+        .o_dword        (w_img_dword),
+        .o_sub          (w_img_sub),
+        .o_bpp8         (w_img_bpp8),
+        .o_underflow    (w_underflow),
+        .o_dma_req      (o_dma_req),
+        .o_dma_done     (o_dma_done),
+        .o_dma_read_DV  (o_dma_read_DV),
+        .o_dma_addr     (o_dma_addr),
+        .i_dma_read_data(i_dma_read_data),
+        .i_dma_ready    (i_dma_ready),
+        .i_dma_grant    (i_dma_grant)
+    );
 
     // -------------------------------------------------------------------------
     // Bouncing square: moves 2 px right/left and 1 px down/up per frame, at the
@@ -268,35 +331,60 @@ module vga_ctrl (
             w_pattern = {w_x40, w_x40, w_x40};
     end
 
+    localparam logic [1:0] K_DIRECT = 2'd0, K_PALVIEW = 2'd1, K_IMG = 2'd2;
+
+    logic [1:0]  r_s1_kind   = K_DIRECT;
     logic [11:0] r_s1_rgb    = '0;     // direct colour
-    logic [7:0]  r_s1_idx    = '0;     // palette index
-    logic        r_s1_use_pal = 1'b0;
+    logic [7:0]  r_s1_idx    = '0;     // palette-view index
+    logic [63:0] r_s1_dword  = '0;     // scanout line-buffer dword
+    logic [2:0]  r_s1_sub    = '0;
+    logic        r_s1_bpp8   = 1'b0;
     logic        r_s1_active = 1'b0;
     logic        r_s1_hs_n   = 1'b1, r_s1_vs_n = 1'b1;
 
     always_ff @(posedge i_Clk) begin
         if (!i_Rst_L) begin
-            r_s1_active  <= 1'b0;
-            r_s1_hs_n    <= 1'b1;
-            r_s1_vs_n    <= 1'b1;
-            r_s1_use_pal <= 1'b0;
+            r_s1_active <= 1'b0;
+            r_s1_hs_n   <= 1'b1;
+            r_s1_vs_n   <= 1'b1;
+            r_s1_kind   <= K_DIRECT;
         end else if (w_pix_ce) begin
-            r_s1_active  <= w_active;
-            r_s1_hs_n    <= w_hsync_n;
-            r_s1_vs_n    <= w_vsync_n;
-            r_s1_use_pal <= !w_test_pattern && w_palette_view;
-            r_s1_rgb     <= w_test_pattern ? w_pattern : r_border;
-            r_s1_idx     <= {w_y30, w_x40};
+            r_s1_active <= w_active;
+            r_s1_hs_n   <= w_hsync_n;
+            r_s1_vs_n   <= w_vsync_n;
+            r_s1_kind   <= w_test_pattern ? K_DIRECT
+                         : w_palette_view ? K_PALVIEW
+                         : w_use_img      ? K_IMG
+                         :                  K_DIRECT;
+            r_s1_rgb    <= w_test_pattern ? w_pattern : r_border;
+            r_s1_idx    <= {w_y30, w_x40};
+            r_s1_dword  <= w_img_dword;
+            r_s1_sub    <= w_img_sub;
+            r_s1_bpp8   <= w_img_bpp8;
         end
     end
 
     // -------------------------------------------------------------------------
-    // Stage 2: palette lookup + blanking → output FFs (IOB-packed).
+    // Stage 2: pixel extract, palette lookup / RGB565→444, blanking → output
+    // FFs (IOB-packed).  Pixels are little-endian in the dword: byte j at
+    // [8j+7:8j], RGB565 halfword i at [16i+15:16i].
     // Reset: black, syncs at their inactive (high) level.
     // -------------------------------------------------------------------------
-    wire [11:0] w_s2_rgb = !r_s1_active ? 12'h000                 // black in blanking
-                         : r_s1_use_pal ? r_palette[r_s1_idx]
-                         :                r_s1_rgb;
+    wire [7:0]  w_img_byte = r_s1_dword[{r_s1_sub, 3'b000} +: 8];
+    wire [15:0] w_img_565  = r_s1_dword[{r_s1_sub[2:1], 4'b0000} +: 16];
+    wire [11:0] w_img_444  = {w_img_565[15:12], w_img_565[10:7], w_img_565[4:1]};
+    wire [7:0]  w_pal_idx  = (r_s1_kind == K_PALVIEW) ? r_s1_idx : w_img_byte;
+    wire [11:0] w_pal_rgb  = r_palette[w_pal_idx];
+
+    logic [11:0] w_s2_rgb;
+    always_comb begin
+        if (!r_s1_active)                  w_s2_rgb = 12'h000;   // black in blanking
+        else case (r_s1_kind)
+            K_PALVIEW:                     w_s2_rgb = w_pal_rgb;
+            K_IMG:                         w_s2_rgb = r_s1_bpp8 ? w_pal_rgb : w_img_444;
+            default:                       w_s2_rgb = r_s1_rgb;
+        endcase
+    end
 
     (* IOB = "TRUE" *) logic [3:0] r_vga_r = 4'h0, r_vga_g = 4'h0, r_vga_b = 4'h0;
     (* IOB = "TRUE" *) logic       r_vga_hs = 1'b1, r_vga_vs = 1'b1;

@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 SRC=$(cd ../../KlaussCPU.srcs && pwd)
-export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
+export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin:/c/AMDDesignTools/2025.2/Vivado/bin
 mkdir -p out cache_run
 cd cache_run
 

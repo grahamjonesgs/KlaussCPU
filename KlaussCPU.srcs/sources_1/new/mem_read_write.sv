@@ -113,6 +113,25 @@ module mem_read_write (
     output            o_c2_grant,
 
     // -------------------------------------------------------------------------
+    // DDR master D — VGA scanout (vga_scanout.sv, VGA_PLAN.md Phase 2).
+    // READ-ONLY, and its reads are WIDE: one transaction = one 32 B line
+    // (the cache's two pipelined BL8 bursts, requested dword 0), returned on
+    // o_vga_read_data in the cache-line layout (dword at byte offset 8k in
+    // bits [255-64k -: 64]).  Same req/grant/DV/ready/done contract as B/C;
+    // priority among the DMA masters: VGA > blitter > core 2 (the display
+    // has a hard deadline).  Unlike B/C it may also be granted at the
+    // maintenance walk's between-sets point (MS_READ), so a long flush does
+    // not starve the display.  i_vga_addr[4:0] must be 0.
+    // -------------------------------------------------------------------------
+    input             i_vga_req,
+    input             i_vga_done,
+    input             i_vga_read_DV,
+    input      [31:0] i_vga_addr,
+    output     [255:0] o_vga_read_data,
+    output            o_vga_ready,
+    output            o_vga_grant,
+
+    // -------------------------------------------------------------------------
     // Cache-maintenance control (MMIO 0xF005). Full-cache operations that walk
     // every set/way. Pulses (1 cycle) trigger; o_mnt_busy is high while a walk
     // runs. The CPU's next cached access transparently stalls until the walk
@@ -181,28 +200,36 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     logic          r_grant_blit = 1'b0;     // blitter owns DDR (master B)
     logic          r_grant_c2   = 1'b0;     // AMP core 2 owns DDR (master C)
+    logic          r_grant_vga  = 1'b0;     // VGA scanout owns DDR (master D, read-only)
     // Mutually exclusive by construction (one grant block below); the cache
-    // (master A) owns the controller whenever both are low.
+    // (master A) owns the controller whenever all are low.
 
-    wire         mig_write_DV   = r_grant_blit ? i_dma_write_DV
+    wire         mig_write_DV   = r_grant_vga  ? 1'b0
+                                : r_grant_blit ? i_dma_write_DV
                                 : r_grant_c2   ? i_c2_write_DV   : o_ddr_mem_write_DV;
-    wire         mig_read_DV    = r_grant_blit ? i_dma_read_DV
+    wire         mig_read_DV    = r_grant_vga  ? i_vga_read_DV
+                                : r_grant_blit ? i_dma_read_DV
                                 : r_grant_c2   ? i_c2_read_DV    : o_ddr_mem_read_DV;
-    wire [ 31:0] mig_addr       = r_grant_blit ? i_dma_addr
+    wire [ 31:0] mig_addr       = r_grant_vga  ? i_vga_addr
+                                : r_grant_blit ? i_dma_addr
                                 : r_grant_c2   ? i_c2_addr       : o_ddr_mem_addr;
     wire [255:0] mig_write_data = r_grant_blit ? {128'b0, i_dma_write_data}
                                 : r_grant_c2   ? {128'b0, i_c2_write_data}
                                                : o_ddr_mem_write_data;
     wire [ 15:0] mig_wdf_mask   = r_grant_blit ? i_dma_wdf_mask
                                 : r_grant_c2   ? i_c2_wdf_mask   : w_app_wdf_mask;
-    // Cache fills a full 32 B line (two pipelined BL8 bursts); the blitter and
-    // core 2 do single 128 b bursts. `mig_wide` tells ddr2_control which.
+    // Cache and VGA fill a full 32 B line (two pipelined BL8 bursts); the
+    // blitter and core 2 do single 128 b bursts. `mig_wide` tells ddr2_control
+    // which.  VGA always asks for dword 0 (mig_dw_off, at the ddr2_control
+    // instance: in-order bursts, no CWF).
     wire         mig_wide       = ~(r_grant_blit | r_grant_c2);
 
     assign o_dma_read_data = i_ddr_mem_read_data[127:0]; // blitter uses low 128 b; latches on o_dma_ready
     assign o_dma_grant     = r_grant_blit;
     assign o_c2_read_data  = i_ddr_mem_read_data[127:0];
     assign o_c2_grant      = r_grant_c2;
+    assign o_vga_read_data = i_ddr_mem_read_data;
+    assign o_vga_grant     = r_grant_vga;
 
     // -------------------------------------------------------------------------
     // Cache-maintenance request capture. A flush/invalidate pulse sets a sticky
@@ -249,15 +276,17 @@ module mem_read_write (
     // ddr2_control's ready belongs to whichever master is currently granted.
     // Gate it so each master only acts on its own DDR completions — none can
     // mistake another's ready for its own.
-    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit & ~r_grant_c2;
+    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga;
     wire w_blit_ddr_ready  = i_ddr_mem_ready &  r_grant_blit;
     wire w_c2_ddr_ready    = i_ddr_mem_ready &  r_grant_c2;
-    // CWF early pulse is cache-only (the narrow reads never emit it, but gate
-    // on the grants anyway).
-    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit & ~r_grant_c2;
+    wire w_vga_ddr_ready   = i_ddr_mem_ready &  r_grant_vga;
+    // CWF early pulse is cache-only.  VGA's wide reads DO emit it (they are
+    // the cache's read shape), so the VGA term here is load-bearing.
+    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga;
 
     assign o_dma_ready = w_blit_ddr_ready;
     assign o_c2_ready  = w_c2_ddr_ready;
+    assign o_vga_ready = w_vga_ddr_ready;
 
     // -------------------------------------------------------------------------
     // Address decode — combinational from cpu.addr (32-bit byte address).
@@ -1049,20 +1078,38 @@ module mem_read_write (
     // cache miss hangs on the parked bus.  Drain a few quiet cycles first so
     // any DDR transaction the dying master left in flight completes before
     // the cache can see a stale ready.
+    //
+    // Master D (VGA scanout) is granted FIRST among the DMA masters, and its
+    // gate is looser: it is read-only (no coherency point to protect), so a
+    // pending/running maintenance walk does not block it — only a cache miss
+    // in flight, or a walk that is mid-writeback.  MS_READ is the walk's
+    // between-sets point: no write DV is up and the previous set's CDC gap has
+    // drained, so the walk can park there (its next writeback waits in
+    // MS_Wx_WAIT on the gated w_cache_ddr_ready) exactly like a cache miss
+    // parks behind a blitter chunk.  Without this a full-cache flush (up to
+    // ~1.2 ms with every line dirty) would underflow ~38 display lines.
     logic [3:0] r_grant_orphan_cnt = 4'd0;
     wire w_grant_orphaned = (r_grant_blit && !i_dma_req && !i_dma_done) ||
-                            (r_grant_c2   && !i_c2_req  && !i_c2_done);
+                            (r_grant_c2   && !i_c2_req  && !i_c2_done)  ||
+                            (r_grant_vga  && !i_vga_req && !i_vga_done);
+    wire w_no_grant = !r_grant_blit && !r_grant_c2 && !r_grant_vga;
+    wire w_vga_gate = !is_miss_path && (state != MAINT || r_mnt_sub == MS_READ);
 
     always_ff @(posedge i_Clk) begin
         r_grant_orphan_cnt <= w_grant_orphaned ? r_grant_orphan_cnt + 4'd1 : 4'd0;
-        if (!r_grant_blit && !r_grant_c2) begin
+        if (w_no_grant) begin
             // o_mnt_busy (not just r_mnt_active): a REQUESTED flush/invalidate
-            // must win over a new DMA tenure even before its walk has started,
-            // or the walk's coherency point drifts behind a whole blit chunk.
-            if (!is_miss_path && !o_mnt_busy) begin
+            // must win over a new blit/core-2 tenure even before its walk has
+            // started, or the walk's coherency point drifts behind a chunk.
+            if (i_vga_req && w_vga_gate)
+                r_grant_vga  <= 1'b1;
+            else if (!is_miss_path && !o_mnt_busy) begin
                 if (i_dma_req)     r_grant_blit <= 1'b1;
                 else if (i_c2_req) r_grant_c2   <= 1'b1;
             end
+        end else if (r_grant_vga) begin
+            if (i_vga_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+                r_grant_vga <= 1'b0;
         end else if (r_grant_blit) begin
             if (i_dma_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
                 r_grant_blit <= 1'b0;
@@ -1107,6 +1154,8 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     // Clock wizard and DDR2 controller
     // -------------------------------------------------------------------------
+    wire [1:0] mig_dw_off = r_grant_vga ? 2'b00 : r_dw_offset;   // VGA: dword 0, in-order
+
     clk_wiz_0 clk_wiz_0 (
         .i_Clk  (i_Clk_board),     // board oscillator (NOT i_Clk=ui_clk — that would be circular)
         .clk_200(sys_clk_i),
@@ -1136,7 +1185,7 @@ module mem_read_write (
         .i_mem_read_DV    (mig_read_DV),
         .i_mem_addr       (mig_addr),
         .i_mem_wide       (mig_wide),        // 1 = cache 32 B (2 pipelined bursts); 0 = blitter 128 b
-        .i_mem_dw_off     (r_dw_offset),     // CWF: requested dword (wide/cache reads only)
+        .i_mem_dw_off     (mig_dw_off),      // CWF: requested dword (wide reads; VGA = 0)
         .i_mem_write_data (mig_write_data),
         .i_app_wdf_mask   (mig_wdf_mask),
         .o_mem_read_data  (i_ddr_mem_read_data),

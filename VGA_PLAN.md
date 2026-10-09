@@ -1,6 +1,6 @@
 # VGA output plan
 
-**STATUS: Phases 0 and 1 DONE (board-verified). Phase 2 (DDR scanout) next.**
+**STATUS: Phases 0–2 DONE (board-verified, timing met). Phase 3 (software: vga.h, Zephyr VGA output, doom) in progress.**
 
 Drive the Nexys A7's on-board VGA connector (12-bit colour, a 4:4:4 resistor
 DAC plus HS/VS) from the SoC, displaying a framebuffer that lives in **DDR**.
@@ -124,26 +124,70 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
   latch), then shows border colours, the palette grid and 5 s of palette
   cycling driven by vsync.
 
-### Phase 2: scanout DMA master
-- `vga_scanout.sv`: on each source line, issue narrow 128-bit reads from
-  `fb_base + line × stride` into the idle half of a ping-pong line buffer
-  (one RAMB36: 2 × 640 B for doubled RGB565, 2 × 1280 B for native).
-- Fetch starts at the previous display line's `line_start`. Doubled mode
-  fetches once and displays twice.
-- Underflow: if the pixel side reaches a half that isn't full, output the
-  border colour for the rest of the line and bump the counter. It never
-  stalls and never shows garbage.
-- **Arbiter (`mem_read_write.sv`):** add master D using the existing
-  req/grant/done contract, priority **cache > VGA > blitter > core 2**. VGA
-  holds the grant for a whole line fetch (≤ 40 reads). It can wait at most
-  one blitter chunk (8 txns) or one core-2 txn for the bus. The
-  orphaned-grant guard covers D as well.
-- **Gate (sim):** `tb_vga` with a model DDR shows a correct image CRC;
-  `tb_cache` passes with a VGA master saturating; `tb_blitter`, `tb_core2`,
-  `tb_soc` and `run_m5a`/`run_m5c` are unchanged; and there are **0
-  underflows** while a full-screen blitter COPY and core-2 VNC traffic run.
-- **Gate (board):** timing met at 100 MHz; doom renders at 320×200 on VGA;
-  the underflow counter stays 0 over a 10-minute doom + VNC session.
+### Phase 2: scanout DMA master (as built)
+- **`vga_scanout.sv`** (inside `vga_ctrl`) is DDR master D. It uses **wide
+  reads**: one transaction is one 32 B line, the cache's two pipelined BL8
+  bursts, which halves the transaction count compared with narrow 16 B
+  reads. Lines go into a ping-pong line buffer (one RAMB36, 512×64, 2 KB per
+  half; source line *s* lives in half *s*[0]).
+- **Fetch schedule:** source line 0 is prefetched at display line
+  (VSTART−1) mod 525. At the first display line of source line *s*, *s*+1 is
+  fetched into the other half, so each fetch has one source line of time
+  (1 display line native, 2 doubled) and never writes the half on screen.
+  Reads per line: 10 (320×8 bpp), 20 (320×16 / 640×8), 40 (640×16). Tenures
+  are CHUNK = 4 reads. A fetch that is still running when the next one is
+  due is abandoned after its in-flight read, and the new line starts.
+- **Frame latching:** SCANOUT_EN, DOUBLE, BPP8, STRIDE, HEIGHT and VSTART
+  latch at the start of vblank (line 480), the same moment FB_BASE becomes
+  FB_ACTIVE. Anything written during a frame applies from the next one.
+  TEST_PATTERN and PALETTE_VIEW (debug views), BORDER, the palette and
+  VSYNC_IRQ_EN still act immediately. Sim found and fixed three bugs here:
+  a mid-frame VSTART write could re-fire the line-0 prefetch; a frame whose
+  VSTART moved down replayed the previous frame above its image; and with
+  latching at line VSTART−1, settings written in the active picture landed
+  a frame early.
+- **Underflow:** a display line whose half is not yet VALID shows the border
+  colour (or, if the fetch lands mid-line, border then correct pixels, never
+  garbage), and `VGA_STATUS[63:48]` counts it (saturating, W1C via bit 2).
+- **Pixel path:** stage 1 registers the line-buffer dword (the BRAM read
+  issued the cycle after x changes). Stage 2 extracts the byte or halfword
+  (little-endian), then either looks it up in the palette or expands
+  RGB565→444 (top 4 bits per channel).
+- **Arbiter (`mem_read_write.sv`):** new master D ports. The grant priority
+  among DMA masters is **VGA > blitter > core 2**; the cache stays the
+  default owner. VGA's gate is looser than the others: read-only, so a
+  pending or running maintenance walk does not block it, only a miss in
+  flight or a walk that is mid-writeback. It may be granted at the walk's
+  between-sets point (MS_READ), and the walk then parks in MS_Wx_WAIT.
+  Without this, a dirty full-cache flush (up to ~1.2 ms) would underflow
+  ~38 lines. `mig_wide` is 1 for VGA, `mig_dw_off` is 0, and the cache's
+  ready/CWF pulses are gated off while VGA holds the bus. The orphan guard
+  covers D.
+- **New register:** `VGA_HEIGHT` (0x038, source lines, reset 240). FB_BASE
+  and STRIDE are now 32 B aligned.
+- **Gate (sim), all PASS:**
+  - `tb_vga` runs 12 frames. Scanout frames are compared pixel by pixel
+    against a hash-of-address DDR model: 320×240 RGB565 doubled; 640×400
+    BPP8 letterboxed with stride 1024; 320×200 doubled with grants up to 2 µs
+    late; and a starved 640×480×16 frame (every line underflows, border or
+    correct only, counter counts and clears). Every read is checked to be
+    32 B aligned, granted, DV-dropped, and inside the frame.
+  - `tb_cache` (real `ddr2_control` + fake MIG) adds V1, the wide-read
+    layout, and V2: VGA streaming against CPU thrash, the blitter, and a
+    dirty flush walk, with 1153 VGA reads and 112 grants inside the walk.
+    The full DDR image compare still matches.
+  - `tb_blitter` is unchanged; the full SoC elaborates.
+  - Fault injection: arbiter (cache CWF gating, walk gate, miss gate) and
+    scanout (RGB565 byte order, line-read count, wrong half, extra fetch past
+    the image, underflow counter) faults are all caught. Two survivors are
+    benign: `mig_dw_off`, because `ddr2_control` assembles both burst orders
+    identically; and VALID set 3 cycles early.
+- **Gate (board):** `Klausscpu-runtime/baremetal/test_vga_scan.elf` covers
+  S1 320×240 doubled, S2 page flip + flush every frame, S3 under
+  blitter/memcpy/flush stress, S4 letterboxed 320×200, S5 640×480 8 bpp,
+  S6 640×480 RGB565 idle and under memcpy, and M, the memcpy throughput cost.
+- `tb_soc` on Windows: `xsim.bat` splits the `-testplusarg K=V` arguments at
+  `=`, so `run_m5d_soc.sh` only runs on the Linux VM.
 
 ### Phase 3: software
 - klausscc runtime `vga.h`: init, set mode, `vga_flip(base)` (write
@@ -197,3 +241,18 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
   **6/6 PASS**: readback, palette, 60 frames/s, raster line moves, 0 IRQs while
   disabled, 120 IRQs in 2 s, pending clear, FB_BASE latch.
   Visual check confirmed by the user: border colours, palette grid, smooth vsync palette cycling.
+- 2026-10-09: Phase 2 RTL (vga_scanout, master D, frame latching) +
+  tb_vga / tb_cache / tb_blitter PASS (see Phase 2 section). First quick
+  build silently reused a stale synth netlist (NEEDS_REFRESH misses
+  out-of-GUI edits) — build_fast.tcl now re-synthesises when any source is
+  newer than the synth checkpoint. Quick build: WNS -0.274 (all failing
+  paths in core 2 / boot FSM, none in VGA), 44,504 LUTs, BRAM 102.5 (+1 for
+  the line buffer). Board: `test_vga_scan.elf` **7/7 PASS, 0 underflows in
+  every mode**, incl. 640x480 RGB565 under memcpy and 180 page flips with a
+  full-cache flush per frame. memcpy 7 -> 6 -> 5 MB/s (off / 320x240x16 /
+  640x480x16). Photo of S1 confirmed by the user: bar order, gradient axes,
+  8x8 checkerboard, white frame; 16-level banding is the 12-bit DAC; the
+  monitor stretches 4:3 to 16:9.
+- 2026-10-09: Phase 2 full build (Performance_Explore): **MET tier 1, WNS
+  +0.078 / WHS +0.022**, 44,482 LUTs (70.2%), BRAM 102.5. On that bitstream:
+  test_vga_scan 7/7, test_vga 6/6, blit_selftest 19 PASS / 0 FAIL.

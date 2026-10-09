@@ -15,6 +15,7 @@ cd vga_run
 xvlog -sv \
   "$SRC/sources_1/new/mmio_if.sv" \
   "$SRC/sources_1/new/vga_timing.sv" \
+  "$SRC/sources_1/new/vga_scanout.sv" \
   "$SRC/sources_1/new/vga_ctrl.sv" \
   "$SRC/sim_1/new/tb_vga.sv" > xvlog.log 2>&1 \
   || { tail -30 xvlog.log; exit 1; }
