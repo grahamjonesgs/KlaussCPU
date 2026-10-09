@@ -61,6 +61,13 @@ module KlaussCPU (
     output     [ 1:0] ETH_TXD,
     output            ETH_REFCLK,          // 50 MHz to PHY (driven via ODDR from clk_50)
 
+    // VGA connector (12-bit resistor DAC; VGA_PLAN.md)
+    output     [ 3:0] VGA_R,
+    output     [ 3:0] VGA_G,
+    output     [ 3:0] VGA_B,
+    output            VGA_HS,
+    output            VGA_VS,
+
     // DDR2 Physical Interface Signals
     //Inouts
     inout [15:0] ddr2_dq,
@@ -1301,6 +1308,18 @@ rams_sp_nc rams_sp_nc1 (
        .LED2(st.RGB_LED_2),
        .o_LED_RGB_1(o_LED_RGB_1),
        .o_LED_RGB_2(o_LED_RGB_2)
+   );
+
+   // VGA output — Phase 0: free-running 640x480@60 test pattern on the ui_clk
+   // domain (25 MHz pixel CE); no MMIO yet (VGA_PLAN.md).
+   vga_ctrl vga_ctrl_i (
+       .i_Clk   (i_Clk),
+       .i_Rst_L (~w_reset_H),
+       .o_vga_r (VGA_R),
+       .o_vga_g (VGA_G),
+       .o_vga_b (VGA_B),
+       .o_vga_hs(VGA_HS),
+       .o_vga_vs(VGA_VS)
    );
 
 
