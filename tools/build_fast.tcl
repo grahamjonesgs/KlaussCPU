@@ -19,6 +19,11 @@
 #   -resynth      force synth_1 to re-run even if it is up to date
 #   -tier2_only   skip tier 1; run tier 2 on the existing routed checkpoint
 #   -force_bit    write the bitstream even if timing is not met
+#   -quick        TEST build: impl_1 with the default strategy (Vivado
+#                 Implementation Defaults, much faster than
+#                 Performance_Explore), no tier 2, bitstream always written
+#                 (implies -force_bit).  For board bring-up only — finish with
+#                 a normal run before committing results that depend on timing.
 #
 # Outputs (in KlaussCPU.runs/impl_1/):
 #   KlaussCPU.bit                         — only when met (or -force_bit)
@@ -35,6 +40,7 @@ set opt_threads 8
 set opt_resynth 0
 set opt_tier2_only 0
 set opt_force_bit 0
+set opt_quick 0
 for {set i 0} {$i < [llength $argv]} {incr i} {
    switch -- [lindex $argv $i] {
       -jobs       { incr i; set opt_jobs [lindex $argv $i] }
@@ -42,6 +48,7 @@ for {set i 0} {$i < [llength $argv]} {incr i} {
       -resynth    { set opt_resynth 1 }
       -tier2_only { set opt_tier2_only 1 }
       -force_bit  { set opt_force_bit 1 }
+      -quick      { set opt_quick 1; set opt_force_bit 1 }
       default     { puts "build_fast: unknown option [lindex $argv $i]"; exit 2 }
    }
 }
@@ -75,7 +82,8 @@ set routed   [file join $impl_dir ${top}_routed.dcp]
 if {!$opt_tier2_only} {
    # Pin the tier-1 configuration so a GUI tweak can't silently change it.
    set impl [get_runs impl_1]
-   set_property strategy Performance_Explore $impl
+   set_property strategy [expr {$opt_quick ? "Vivado Implementation Defaults"
+                                           : "Performance_Explore"}] $impl
    set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED false $impl
    set_property AUTO_INCREMENTAL_CHECKPOINT 0 $impl
    set_property INCREMENTAL_CHECKPOINT "" $impl
@@ -155,7 +163,7 @@ bf_log [format "tier 1: WNS %+.3f  WHS %+.3f" $tier1_wns $tier1_whs]
 
 # ---------------------------------------------------------------- tier 2
 set tier2_ran 0
-if {![met]} {
+if {![met] && !$opt_quick} {
    foreach d $TIER2_DIRECTIVES {
       set t0 [clock seconds]
       set before [wns]
@@ -178,6 +186,7 @@ if {$is_met || $opt_force_bit} {
 }
 
 set summary [format "tier 1 WNS %+.3f / WHS %+.3f" $tier1_wns $tier1_whs]
+if {$opt_quick} { set summary "QUICK build, $summary" }
 if {$tier2_ran} {
    append summary [format ", tier 2 WNS %+.3f / WHS %+.3f" $final_wns $final_whs]
 }
@@ -185,7 +194,7 @@ if {$is_met} {
    bf_log "MET ($summary). Bitstream: [file join $impl_dir ${top}.bit]. Total [elapsed $t_start]"
    exit 0
 } elseif {$opt_force_bit} {
-   bf_log "NOT MET ($summary). Bitstream written anyway (-force_bit). Total [elapsed $t_start]"
+   bf_log "NOT MET ($summary). Bitstream written anyway ([expr {$opt_quick ? "-quick" : "-force_bit"}]). Total [elapsed $t_start]"
    exit 1
 } else {
    bf_log "NOT MET ($summary). No bitstream written. Total [elapsed $t_start]"

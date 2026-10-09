@@ -1,7 +1,6 @@
 # VGA output plan
 
-**STATUS: Phase 0 DONE: test pattern verified on the board through the Gizzu
-VGA→HDMI converter. Phase 1 (MMIO + palette + vsync IRQ) next.**
+**STATUS: Phases 0 and 1 DONE (board-verified). Phase 2 (DDR scanout) next.**
 
 Drive the Nexys A7's on-board VGA connector (12-bit colour, a 4:4:4 resistor
 DAC plus HS/VS) from the SoC, displaying a framebuffer that lives in **DDR**.
@@ -95,21 +94,35 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
 
 ### Phase 1: MMIO block + palette
 - `0xF011_0000` register file in `vga_ctrl.sv`, decoded in the `KlaussCPU.sv`
-  MMIO read/write hubs.
+  MMIO read hub (the device owns its writes through `mmio_if`). As built:
 
 | Offset | Reg | RW | Description |
 |--------|-----|----|-------------|
-| 0x00 | `VGA_CTRL` | RW | `[0]` enable scanout (0 = test pattern / border colour), `[1]` double (320×240 → 640×480), `[2]` bpp (0 = RGB565, 1 = 8-bit indexed), `[3]` test pattern, `[4]` vsync IRQ enable |
-| 0x08 | `VGA_FB_BASE` | RW | Framebuffer byte address (16 B aligned). **Latched at the start of vblank**, so a write is a tear-free page flip. Readback = the pending value. |
-| 0x10 | `VGA_STRIDE` | RW | Bytes per source line (16 B aligned) |
-| 0x18 | `VGA_STATUS` | R/W1C | `[0]` in vblank, `[1]` vsync IRQ pending (W1C), `[31:16]` frame counter; `[63:48]` underflow count (W1C clears it) |
-| 0x20 | `VGA_BORDER` | RW | 12-bit colour outside the source image (letterboxing) |
-| 0x28 | `VGA_VSTART` | RW | First display line of the image (centres 320×200 as 640×400: 40) |
-| 0x400–0x7FF | `VGA_PALETTE` | W | 256 × 12-bit entries (LUTRAM), 8 B per entry |
+| 0x000 | `VGA_CTRL` | RW | `[0]` SCANOUT_EN (Phase 2), `[1]` DOUBLE (Phase 2), `[2]` BPP8 (Phase 2), `[3]` TEST_PATTERN (**reset 1**), `[4]` VSYNC_IRQ_EN, `[5]` PALETTE_VIEW. Source priority: test pattern > palette view > (scanout) > border colour. |
+| 0x008 | `VGA_FB_BASE` | RW | Framebuffer byte address `[31:4]`. **Copied to FB_ACTIVE at the start of vblank**, so a write is a tear-free page flip. Reads return the pending value. |
+| 0x010 | `VGA_STRIDE` | RW | Bytes per source line `[15:4]` (reset 640) |
+| 0x018 | `VGA_STATUS` | R / W | R: `[0]` IN_VBLANK, `[1]` VSYNC_PENDING, `[31:16]` frame count, `[41:32]` current raster line, `[63:48]` underflow count. W: `[1]`=1 clears VSYNC_PENDING, `[2]`=1 clears the underflow count. |
+| 0x020 | `VGA_BORDER` | RW | `[11:0]` RGB444 outside the source image (letterboxing) |
+| 0x028 | `VGA_VSTART` | RW | `[9:0]` first display line of the image (Phase 2; 40 centres 640×400) |
+| 0x030 | `VGA_FB_ACTIVE` | R | The FB_BASE latched at the last vblank (lets software see a flip land) |
+| 0x800–0xFF8 | `VGA_PALETTE` | RW | 256 entries × 8 B, `[11:0]` RGB444 (LUTRAM; not reset) |
 
-- Vsync IRQ → `w_irq_src3` (extend `w_irq_ready` / `w_irq_sel` to 2 bits).
-- **Gate:** the test pattern and border colour can be switched from software;
-  the IRQ fires at 59.5 Hz (count over 10 s).
+- PALETTE_VIEW draws a 16×16 grid of 40×30 cells, cell (row, col) =
+  `palette[row*16 + col]`. It tests the palette on the board before scanout
+  exists, using the same lookup as Phase 2's 8-bit mode.
+- The pixel path is two stages on the pixel CE (source select → palette
+  lookup → IOB FFs), with HS/VS delayed by the same amount.
+- Vsync IRQ → `w_irq_src3`, `INT_PENDING[3]`; `w_irq_sel` priority timer >
+  blitter > eth > vga.
+- **Gate (sim):** `run_vga.sh` covers 7 frames: pattern → border → palette
+  view; register reset values and readback, all 256 palette entries, the IRQ
+  (line 480, a 16.8 ms period, W1C, IRQ_EN gating) and the FB latch. Four
+  deliberate faults (palette index swap, an immediate FB latch, an ungated
+  IRQ, an HS glitch) are all caught.
+- **Gate (board):** `Klausscpu-runtime/baremetal/test_vga.elf` checks T1–T5
+  (readback, palette, a 59–60 frame/s count, 118–120 IRQs in 2 s, the FB
+  latch), then shows border colours, the palette grid and 5 s of palette
+  cycling driven by vsync.
 
 ### Phase 2: scanout DMA master
 - `vga_scanout.sv`: on each source line, issue narrow 128-bit reads from
@@ -175,3 +188,12 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
   **Board gate PASSED** through the Gizzu: locks at 640×480, all four border
   edges visible, bar order correct, 16 even steps in every ramp, square
   moving smoothly.
+- 2026-10-09: Phase 1 RTL: register file, palette (LUTRAM, 2-port), palette
+  view, vsync IRQ on source 3; tb_vga extended (PASS, 7 frames) and
+  mutation-checked; SoC elaborates. `test_vga.c` + `mmio.h` VGA block added in
+  Klausscpu-runtime. Bitstream build started.
+  Bitstream (full Performance_Explore, `-resynth`): **MET tier 1, WNS +0.192 /
+  WHS +0.015** (26 min); 44,223 LUTs (69.8%). `test_vga.elf` on the board:
+  **6/6 PASS**: readback, palette, 60 frames/s, raster line moves, 0 IRQs while
+  disabled, 120 IRQs in 2 s, pending clear, FB_BASE latch.
+  Visual check confirmed by the user: border colours, palette grid, smooth vsync palette cycling.

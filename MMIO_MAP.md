@@ -30,6 +30,7 @@ cache controller.
 0xF00E_xxxx                 2D DMA blitter (RGB565 framebuffer accelerator)
 0xF00F_xxxx                 timers / IRQ controller
 0xF010_xxxx                 AMP core 2 mailbox (control / load window / log)
+0xF011_xxxx                 VGA output (640x480@60, palette, vsync IRQ)
 ```
 
 Reserved ranges read as 0 and ignore writes (no bus error).
@@ -640,18 +641,19 @@ sleep_ms(120);                       /* allow auto-negotiation */
 Per-source interrupt controller and the source-0 timer. The CPU supports up
 to 4 interrupt sources; source 0 is wired to the periodic timer below,
 **source 1 is the 2D DMA blitter's DONE interrupt**, **source 2 is the
-Ethernet (LiteEth) RX/TX interrupt**, and source 3 is reserved. Dispatch
-priority when several are pending: timer > blitter > Ethernet. The only interrupt-related opcode is `IRET`
+Ethernet (LiteEth) RX/TX interrupt**, and **source 3 is the VGA vsync
+interrupt**. Dispatch
+priority when several are pending: timer > blitter > Ethernet > VGA. The only interrupt-related opcode is `IRET`
 (return from handler) — everything else is configured here.
 
 | Offset  | Reg            | RW | Width | Description |
 |---------|----------------|----|-------|-------------|
 | 0x0000  | `INT_MASK`     | RW | 4     | Per-source enable; bit N = source N. Only bits [3:0] are used; upper bits ignored on write, read as 0. |
-| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bit 2 = Ethernet (source 2, = LiteEth `interrupt`, i.e. any `EV_PENDING & EV_ENABLE`; 0 while core 2 owns the MAC); bit 3 reserved (reads 0). |
+| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bit 2 = Ethernet (source 2, = LiteEth `interrupt`, i.e. any `EV_PENDING & EV_ENABLE`; 0 while core 2 owns the MAC); bit 3 = VGA vsync (source 3, = `VGA_STATUS.VSYNC_PENDING & VGA_CTRL.VSYNC_IRQ_EN`; level, the ISR writes `VGA_STATUS` bit 1 to clear). |
 | 0x0010  | `INT_VEC0`     | RW | 32    | Handler byte address for source 0 (timer). A vector of 0 disables the source even when its mask bit is set. |
 | 0x0018  | `INT_VEC1`     | RW | 32    | Handler for source 1 (2D DMA blitter DONE). A vector of 0 disables the source. |
 | 0x0020  | `INT_VEC2`     | RW | 32    | Handler for source 2 (Ethernet RX/TX). A vector of 0 disables the source. |
-| 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (reserved). |
+| 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (VGA vsync). A vector of 0 disables the source. |
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
 | 0x0038  | `TIMER_COUNT`  | R  | 32    | Live cycle counter — useful for profiling. |
 | 0x0040  | `CLOCK_MS`     | R  | 64    | Free-running millisecond counter since FPGA power-on. Increments every 100 000 cycles at the 100 MHz `i_Clk` (constrained in `nexys_ddr.xdc`). 64-bit so it takes ~5.8 × 10⁸ years to wrap. Not reset by `CPU_RESETN` or by program load — programs that need a "time since started" value should snapshot it on entry. |
@@ -819,6 +821,35 @@ void blit_isr(void) {
 the CPU's ~1.6 MB/s software `memcpy`, and runs concurrently with the CPU, so
 frame time becomes `max(render, copy)` rather than `render + copy`. Read
 `BLIT_CYCLES` (or the `0xF00D` cycle counter) around a blit to measure.
+
+### VGA output — base `0xF011_0000`
+
+Drives the Nexys A7 VGA connector (12-bit resistor DAC) at 640×480 @ 59.5 Hz
+from the CPU clock: 25 MHz pixel clock enable, no separate clock. RTL:
+`vga_ctrl.sv` + `vga_timing.sv`; design and phases: `VGA_PLAN.md`. Phase 1
+(current) has CPU-free pixel sources only. Phase 2 adds DDR framebuffer
+scanout behind `SCANOUT_EN`; the `DOUBLE`/`BPP8`/`FB_BASE`/`STRIDE`/`VSTART`
+fields are stored for it already.
+
+| Offset | Reg | RW | Description |
+|--------|-----|----|-------------|
+| 0x000 | `VGA_CTRL` | RW | `[0]` SCANOUT_EN (Phase 2), `[1]` DOUBLE (Phase 2), `[2]` BPP8 (Phase 2), `[3]` TEST_PATTERN (reset 1), `[4]` VSYNC_IRQ_EN, `[5]` PALETTE_VIEW. Source priority: test pattern > palette view > scanout > `VGA_BORDER`. |
+| 0x008 | `VGA_FB_BASE` | RW | Framebuffer address `[31:4]`; copied to `VGA_FB_ACTIVE` at the start of vblank (tear-free flip). Reads return the pending value. |
+| 0x010 | `VGA_STRIDE` | RW | Bytes per source line `[15:4]` (reset 640) |
+| 0x018 | `VGA_STATUS` | R/W | R: `[0]` IN_VBLANK, `[1]` VSYNC_PENDING, `[31:16]` frame count, `[41:32]` current raster line (0–524), `[63:48]` scanout underflow count. W: bit 1 clears VSYNC_PENDING, bit 2 clears the underflow count. |
+| 0x020 | `VGA_BORDER` | RW | `[11:0]` RGB444 shown wherever no image is |
+| 0x028 | `VGA_VSTART` | RW | `[9:0]` first display line of the image (Phase 2) |
+| 0x030 | `VGA_FB_ACTIVE` | R | `FB_BASE` as latched at the last vblank |
+| 0x800–0xFF8 | `VGA_PALETTE[0..255]` | RW | `[11:0]` RGB444, 8 B per entry; not reset |
+
+- `PALETTE_VIEW` shows a 16×16 grid of 40×30 cells; cell (row, col) =
+  `VGA_PALETTE[row*16 + col]`.
+- Vsync: `VSYNC_PENDING` sets at raster line 480 (start of vblank) every
+  frame. With `VSYNC_IRQ_EN` it drives interrupt source 3 (level); the ISR
+  writes `VGA_STATUS = 2` before `IRET`. Vblank lasts 45 lines ≈ 1.43 ms:
+  the window for page flips and palette changes.
+- C names: `REG_VGA_*`, `VGA_CTRL_*`, `VGA_STATUS_*`, `INT_SRC_VGA` in the
+  runtime's `mmio.h`; board test `baremetal/programs/test_vga.c`.
 
 ### Crypto: AES-128 — base `0xF00A_0000`
 

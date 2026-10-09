@@ -1,5 +1,6 @@
 //===========================================================================
-// tb_vga — VGA_PLAN.md Phase 0 gate: vga_ctrl's 640×480 @ 60 Hz pin timing.
+// tb_vga — VGA_PLAN.md Phase 0/1 gate: vga_ctrl's 640×480 @ 60 Hz pin timing,
+// pixel sources, registers, palette and vsync IRQ.
 //
 // Watches ONLY the five pin-level outputs (as the converter would), one sample
 // per pixel, and checks against VESA DMT 640×480:
@@ -12,7 +13,13 @@
 //   * 480 active lines per frame, preceded by exactly 35 blank lines from the
 //     VS falling edge (sync 2 + back porch 33): the first active line is the
 //     one that ends at HS fall #34, counting the fall inside the VS line as #0
-//   * pattern spot checks: full-white top line, colour bars, ramp levels
+//   * content, per frame, by the mode the test sequence selected:
+//       frames 1-2  reset TEST_PATTERN: full-white top line, bars, ramps
+//       frame  3    border mode (CTRL=0, BORDER=0x123): every pixel 0x123
+//       frames 4+   PALETTE_VIEW: every pixel = palette[(y/30)*16 + x/40]
+//   * MMIO: reset values, STATUS fields, palette readback, vsync IRQ (fires at
+//     line 480, once per 420 000 px, W1C, gated by IRQ_EN), FB_BASE → FB_ACTIVE
+//     latched only at vblank
 //
 // Run: perf/m5a/run_vga.sh   (prints "TB_VGA PASS" on success)
 //===========================================================================
@@ -24,10 +31,43 @@ module tb_vga;
    logic [3:0] r, g, b;
    logic       hs, vs;
 
+   logic       irq;
+
+   mmio_if bus();
+   assign bus.byte_en = 8'hFF;
+   initial begin
+      bus.write_DV = 0; bus.read_DV = 0; bus.addr = 0; bus.write_data = 0;
+   end
+
    vga_ctrl dut (
-      .i_Clk(clk), .i_Rst_L(rst_l),
+      .i_Clk(clk), .i_Rst_L(rst_l), .mmio(bus.slave), .o_irq(irq),
       .o_vga_r(r), .o_vga_g(g), .o_vga_b(b), .o_vga_hs(hs), .o_vga_vs(vs)
    );
+
+   // ---------------- MMIO helpers (device window 0xF011_xxxx) ----------------
+   task automatic mmio_write(input logic [15:0] off, input logic [63:0] d);
+      @(negedge clk);
+      bus.addr = {16'hF011, off}; bus.write_data = d; bus.write_DV = 1'b1;
+      @(negedge clk);
+      bus.write_DV = 1'b0;
+   endtask
+
+   task automatic mmio_read(input logic [15:0] off, output logic [63:0] d);
+      @(negedge clk);
+      bus.addr = {16'hF011, off}; bus.read_DV = 1'b1;
+      @(posedge clk);
+      d = bus.read_data;
+      @(negedge clk);
+      bus.read_DV = 1'b0;
+   endtask
+
+   task automatic expect_reg(input logic [15:0] off, input logic [63:0] want,
+                             input logic [63:0] mask = '1);
+      logic [63:0] d;
+      mmio_read(off, d);
+      if ((d & mask) !== (want & mask))
+         fail($sformatf("reg %03h = %016h (want %016h mask %016h)", off, d, want, mask));
+   endtask
 
    int errors = 0;
    task automatic fail(input string msg);
@@ -51,6 +91,13 @@ module tb_vga;
    int          active_lines = 0;
    int          first_active_ln = -1;
    logic [11:0] line_buf [0:639];
+   int          mode = 0;         // 0 test pattern, 1 border, 2 palette view
+
+   localparam logic [11:0] BORDER_COL = 12'h123;
+   function automatic logic [11:0] pal_val(input int i);
+      logic [7:0] b = i;
+      return {b[7:4], b[3:0], 4'hA};               // never black (keeps the window check valid)
+   endfunction
 
    function automatic logic [11:0] expect_bar(input int x);
       int bar = x / 80;
@@ -65,6 +112,22 @@ module tb_vga;
       if (first_active_ln < 0) first_active_ln = ln;
       if (lit_first != 144) fail($sformatf("y=%0d first lit px %0d (want 144)", y, lit_first));
       if (lit_last  != 783) fail($sformatf("y=%0d last lit px %0d (want 783)",  y, lit_last));
+      if (mode == 1) begin
+         for (int x = 0; x < 640; x++)
+            if (line_buf[x] != BORDER_COL) begin
+               fail($sformatf("border y=%0d x=%0d = %03h", y, x, line_buf[x])); break;
+            end
+         return;
+      end
+      if (mode == 2) begin
+         for (int x = 0; x < 640; x++)
+            if (line_buf[x] != pal_val((y / 30) * 16 + x / 40)) begin
+               fail($sformatf("palette view y=%0d x=%0d = %03h (want %03h)", y, x,
+                              line_buf[x], pal_val((y / 30) * 16 + x / 40)));
+               break;
+            end
+         return;
+      end
       if (y == 0)
          for (int x = 0; x < 640; x++)
             if (line_buf[x] != 12'hFFF) begin
@@ -153,9 +216,65 @@ module tb_vga;
    end
 
    initial begin
+      logic [63:0] d;
+      realtime     t1, t2;
       repeat (10) @(posedge clk);
       rst_l = 1;
-      wait (frames == 3);                          // two complete frames checked
+
+      // ---- frames 1-2: reset test pattern (checked by the pixel monitor) ----
+      wait (frames == 3);                          // just after VS fall, line 490
+      expect_reg(16'h000, 64'h08);                 // CTRL reset = TEST_PATTERN
+      expect_reg(16'h008, 64'h0);
+      expect_reg(16'h010, 64'd640);
+      expect_reg(16'h020, 64'h0);
+      expect_reg(16'h028, 64'h0);
+      expect_reg(16'h030, 64'h0);
+      // STATUS: in vblank, pending (never cleared), frame 3, line 490, underflow 0
+      expect_reg(16'h018, {16'h0, 6'h0, 10'd490, 16'd3, 14'h0, 1'b1, 1'b1});
+      expect_reg(16'h7F8, 64'h0);                  // unmapped offset reads 0
+      if (irq !== 1'b0) fail("irq high with IRQ_EN=0");
+      mmio_write(16'h020, BORDER_COL);
+      mmio_write(16'h000, 64'h0);                  // border mode
+      expect_reg(16'h020, BORDER_COL);
+      mode = 1;
+
+      // ---- frame 3: border; load + read back the palette ----
+      wait (frames == 4);
+      for (int i = 0; i < 256; i++) mmio_write(16'h800 + 8*i, {52'hFFFF_FFFF_FFFF_F, pal_val(i)});
+      for (int i = 0; i < 256; i++) expect_reg(16'h800 + 8*i, pal_val(i));
+      mmio_write(16'h000, 64'h20);                 // PALETTE_VIEW
+      mode = 2;
+
+      // ---- frame 4+: palette view; vsync IRQ and the FB_BASE latch ----
+      wait (frames == 5);
+      mmio_write(16'h000, 64'h30);                 // + VSYNC_IRQ_EN
+      @(negedge clk);
+      if (irq !== 1'b1) fail("irq not raised by an already-pending vsync");
+      mmio_write(16'h018, 64'h2);                  // W1C pending
+      @(negedge clk);
+      if (irq !== 1'b0) fail("irq still high after W1C");
+      expect_reg(16'h018, 64'h0, 64'h2);
+
+      // flip request during the active picture must not take effect until vblank
+      do mmio_read(16'h018, d); while (d[0]);      // wait for the active area
+      mmio_write(16'h008, 64'h00AB_C000);
+      expect_reg(16'h008, 64'h00AB_C000);
+      expect_reg(16'h030, 64'h0);                  // still the old base
+
+      @(posedge irq); t1 = $realtime;
+      mmio_read(16'h018, d);
+      if (d[41:32] != 10'd480) fail($sformatf("IRQ at line %0d (want 480)", d[41:32]));
+      if (!d[0])               fail("IRQ outside vblank");
+      if (d[31:16] != 16'd6)   fail($sformatf("frame count %0d at IRQ (want 6)", d[31:16]));
+      expect_reg(16'h030, 64'h00AB_C000);          // latched at vblank
+      mmio_write(16'h018, 64'h2);
+      @(posedge irq); t2 = $realtime;
+      if (t2 - t1 != 420000 * 4 * 10)
+         fail($sformatf("vsync IRQ period %0t (want 16.8 ms)", t2 - t1));
+      mmio_write(16'h018, 64'h2);
+      $display("vsync IRQ period %0.3f ms", (t2 - t1) / 1.0e6);
+
+      wait (frames == 7);                          // palette frames 4-6 checked
       repeat (10) @(posedge clk);
       if (errors == 0) $display("TB_VGA PASS");
       else             $display("TB_VGA FAIL (%0d errors)", errors);
@@ -163,7 +282,7 @@ module tb_vga;
    end
 
    initial begin
-      #80ms;
+      #150ms;
       $display("TB_VGA TIMEOUT (frames=%0d)", frames);
       $finish;
    end

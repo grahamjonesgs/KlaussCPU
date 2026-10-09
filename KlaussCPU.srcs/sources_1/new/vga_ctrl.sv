@@ -1,31 +1,55 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
 // vga_ctrl — VGA output for the Nexys A7 VGA connector (VGA_PLAN.md).
+// MMIO device id 0x011, base 0xF011_0000.
 //
-// Phase 0: free-running 640×480 @ 60 Hz TEST PATTERN, no CPU involvement. It
-// exists to prove the pins, the 12-bit resistor DAC, and that the VGA→HDMI
-// converter locks to the timing before any DDR scanout work. Later phases add
-// the 0xF011 MMIO block and replace the pattern with the scanout line buffer;
-// the timing generator and the output register stage stay as they are.
+// 640×480 @ 60 Hz from vga_timing (25 MHz pixel CE on the 100 MHz CPU clock).
+// Phase 1: register file, 256-entry palette, vsync IRQ and three CPU-free
+// pixel sources. Phase 2 adds the DDR scanout source (CTRL.SCANOUT_EN; the
+// DOUBLE/BPP8/FB_BASE/STRIDE/VSTART fields are already stored for it).
 //
-// Test pattern (active area, x 0..639, y 0..479):
-//   border      1-pixel white frame on all four edges — proves the porches put
-//               the image exactly inside the converter's capture window
-//   y   0..359  8 colour bars, 80 px each: white yellow cyan green magenta red
-//               blue black
-//   y 360..479  four 30-line bands — R, G, B, grey ramps — 16 steps of 40 px,
-//               level 0..15: proves every DAC bit and the pin order
-//   square      32×32 orange square bouncing inside the bar area, moved once
-//               per frame — proves the image is live, not a frozen frame
+// Pixel source, highest priority first:
+//   CTRL.TEST_PATTERN  colour bars / ramps / border / bouncing square (Phase 0)
+//   CTRL.PALETTE_VIEW  16×16 grid of 40×30 cells, cell (row, col) shows
+//                      palette[row*16 + col] — checks the palette path
+//   otherwise          VGA_BORDER colour (Phase 2: the scanout image)
+// Reset state is TEST_PATTERN, so a fresh bitstream shows a picture with no
+// software running.
 //
-// Every output (RGB and both syncs) goes through ONE register stage loaded on
-// the pixel CE, so they stay aligned with each other; the FFs are IOB-packed so
-// the pin timing doesn't depend on placement.
+// Register layout (offsets within the device window, 64-bit accesses):
+//   0x000 VGA_CTRL      RW [0] SCANOUT_EN (Phase 2)   [1] DOUBLE (Phase 2)
+//                          [2] BPP8 (Phase 2)         [3] TEST_PATTERN (reset 1)
+//                          [4] VSYNC_IRQ_EN           [5] PALETTE_VIEW
+//   0x008 VGA_FB_BASE   RW framebuffer byte address [31:4] (16 B aligned).
+//                          Pending value; copied to FB_ACTIVE at the start of
+//                          vblank, so a write is a tear-free page flip.
+//   0x010 VGA_STRIDE    RW bytes per source line [15:4] (reset 640)
+//   0x018 VGA_STATUS    R  [0] IN_VBLANK  [1] VSYNC_PENDING  [31:16] FRAME
+//                          count  [41:32] current raster line  [63:48]
+//                          UNDERFLOW count (Phase 2; reads 0 until then)
+//                       W  [1]=1 clears VSYNC_PENDING, [2]=1 clears UNDERFLOW
+//   0x020 VGA_BORDER    RW [11:0] colour {R,G,B} outside the source image
+//   0x028 VGA_VSTART    RW [9:0] first display line of the image (Phase 2)
+//   0x030 VGA_FB_ACTIVE R  the FB_BASE latched at the last vblank
+//   0x800..0xFF8 VGA_PALETTE RW 256 entries, 8 B apart, [11:0] = {R,G,B}
+//
+// Vsync IRQ: VSYNC_PENDING sets at the start of vblank (line 480) every frame;
+// o_irq = VSYNC_PENDING & VSYNC_IRQ_EN, a level the ISR must clear with a
+// STATUS write of bit 1 before IRET (the blitter's DONE pattern). Vblank lasts
+// 45 lines ≈ 1.4 ms — the window for flips and palette updates.
+//
+// Pixel pipeline (all registered on the pixel CE, so every signal — RGB, HS,
+// VS — sees the same two-stage delay and stays aligned):
+//   stage 1  source select from (x, y): direct colour or palette index
+//   stage 2  palette lookup (LUTRAM) + blanking → IOB output FFs
 //////////////////////////////////////////////////////////////////////////////////
 
 module vga_ctrl (
     input              i_Clk,       // CPU clock (ui_clk, 100 MHz)
     input              i_Rst_L,
+
+    mmio_if.slave      mmio,        // offsets use mmio.addr[15:0]
+    output logic       o_irq,       // vsync, level (see header)
 
     output logic [3:0] o_vga_r,
     output logic [3:0] o_vga_g,
@@ -33,6 +57,16 @@ module vga_ctrl (
     output logic       o_vga_hs,
     output logic       o_vga_vs
 );
+
+    localparam logic [15:0] OFF_CTRL      = 16'h0000;
+    localparam logic [15:0] OFF_FB_BASE   = 16'h0008;
+    localparam logic [15:0] OFF_STRIDE    = 16'h0010;
+    localparam logic [15:0] OFF_STATUS    = 16'h0018;
+    localparam logic [15:0] OFF_BORDER    = 16'h0020;
+    localparam logic [15:0] OFF_VSTART    = 16'h0028;
+    localparam logic [15:0] OFF_FB_ACTIVE = 16'h0030;
+
+    localparam logic [5:0]  CTRL_RESET    = 6'b00_1000;   // TEST_PATTERN
 
     localparam int SQ_SIZE  = 32;
     localparam int SQ_X_MIN = 8,  SQ_X_MAX = 600;   // top-left corner bounds:
@@ -58,6 +92,100 @@ module vga_ctrl (
         .o_frame_start  (w_frame_start),
         .o_vblank_start (w_vblank_start)
     );
+
+    // -------------------------------------------------------------------------
+    // Registers
+    // -------------------------------------------------------------------------
+    logic [5:0]  r_ctrl       = CTRL_RESET;
+    logic [31:4] r_fb_base    = '0;
+    logic [31:4] r_fb_active  = '0;
+    logic [15:4] r_stride     = 12'd40;        // 640 B = 320 px of RGB565
+    logic [11:0] r_border     = 12'h000;
+    logic [9:0]  r_vstart     = 10'd0;
+    logic        r_vs_pending = 1'b0;
+    logic [15:0] r_frame      = '0;
+    logic [15:0] r_underflow  = '0;            // Phase 2 bumps this
+
+    wire w_test_pattern = r_ctrl[3];
+    wire w_irq_en       = r_ctrl[4];
+    wire w_palette_view = r_ctrl[5];
+
+    wire w_pal_sel = (mmio.addr[15:11] == 5'b00001);   // 0x0800..0x0FFF
+    wire [7:0] w_pal_cpu_idx = mmio.addr[10:3];
+
+    assign mmio.ready = 1'b1;
+    wire byte_en_unused = |mmio.byte_en;
+
+    always_ff @(posedge i_Clk) begin
+        if (!i_Rst_L) begin
+            r_ctrl       <= CTRL_RESET;
+            r_fb_base    <= '0;
+            r_fb_active  <= '0;
+            r_stride     <= 12'd40;
+            r_border     <= 12'h000;
+            r_vstart     <= 10'd0;
+            r_vs_pending <= 1'b0;
+            r_frame      <= '0;
+            r_underflow  <= '0;
+        end else begin
+            if (w_vblank_start) begin
+                r_fb_active  <= r_fb_base;
+                r_vs_pending <= 1'b1;
+                r_frame      <= r_frame + 16'd1;
+            end
+            // A W1C in the same cycle as a new vblank loses to the set, so a
+            // frame boundary can never be dropped.
+            if (mmio.write_DV) begin
+                case (mmio.addr[15:0])
+                    OFF_CTRL:    r_ctrl    <= mmio.write_data[5:0];
+                    OFF_FB_BASE: r_fb_base <= mmio.write_data[31:4];
+                    OFF_STRIDE:  r_stride  <= mmio.write_data[15:4];
+                    OFF_STATUS: begin
+                        if (mmio.write_data[1] && !w_vblank_start) r_vs_pending <= 1'b0;
+                        if (mmio.write_data[2])                    r_underflow  <= '0;
+                    end
+                    OFF_BORDER:  r_border  <= mmio.write_data[11:0];
+                    OFF_VSTART:  r_vstart  <= mmio.write_data[9:0];
+                    default: ;
+                endcase
+            end
+        end
+    end
+
+    assign o_irq = r_vs_pending & w_irq_en;
+
+    // -------------------------------------------------------------------------
+    // Palette: 256 × 12-bit LUTRAM. Port A = CPU write + readback, port B =
+    // display read (stage 2). Not reset — software loads it.
+    // -------------------------------------------------------------------------
+    (* ram_style = "distributed" *) logic [11:0] r_palette [0:255];
+    initial for (int i = 0; i < 256; i++) r_palette[i] = 12'h000;
+
+    always_ff @(posedge i_Clk)
+        if (mmio.write_DV && w_pal_sel) r_palette[w_pal_cpu_idx] <= mmio.write_data[11:0];
+
+    // -------------------------------------------------------------------------
+    // MMIO readback (combinational; the SoC registers it)
+    // -------------------------------------------------------------------------
+    wire w_in_vblank = (w_y >= 10'd480);
+
+    always_comb begin
+        mmio.read_data = 64'h0;
+        if (w_pal_sel)
+            mmio.read_data = {52'b0, r_palette[w_pal_cpu_idx]};
+        else
+            case (mmio.addr[15:0])
+                OFF_CTRL:      mmio.read_data = {58'b0, r_ctrl};
+                OFF_FB_BASE:   mmio.read_data = {32'b0, r_fb_base, 4'b0};
+                OFF_STRIDE:    mmio.read_data = {48'b0, r_stride, 4'b0};
+                OFF_STATUS:    mmio.read_data = {r_underflow, 6'b0, w_y, r_frame,
+                                                 14'b0, r_vs_pending, w_in_vblank};
+                OFF_BORDER:    mmio.read_data = {52'b0, r_border};
+                OFF_VSTART:    mmio.read_data = {54'b0, r_vstart};
+                OFF_FB_ACTIVE: mmio.read_data = {32'b0, r_fb_active, 4'b0};
+                default:       mmio.read_data = 64'h0;
+            endcase
+    end
 
     // -------------------------------------------------------------------------
     // Bouncing square: moves 2 px right/left and 1 px down/up per frame, at the
@@ -91,7 +219,8 @@ module vga_ctrl (
     end
 
     // -------------------------------------------------------------------------
-    // Test pattern (combinational from the raster position)
+    // Stage 1 (combinational from the raster position): test pattern, palette
+    // grid index, or border.
     // -------------------------------------------------------------------------
     // Bar index = x / 80 by comparison (no divider).
     logic [2:0] w_bar;
@@ -106,12 +235,15 @@ module vga_ctrl (
         else                    w_bar = 3'd7;
     end
 
-    // Ramp level = x / 40 for x < 640, as (x * 205) >> 13 — exact over 0..639
-    // (205/8192 is just above 1/40, and the error stays below one step).
-    logic [17:0] w_ramp_prod;
-    logic [3:0]  w_level;
-    assign w_ramp_prod = w_x * 18'd205;
-    assign w_level     = w_ramp_prod[16:13];
+    // x / 40 as (x * 205) >> 13 — exact over 0..639 (ramp step and grid
+    // column). y / 30 as (y * 1093) >> 15 — exact over 0..479 (grid row).
+    logic [17:0] w_xdiv_prod;
+    logic [19:0] w_ydiv_prod;
+    logic [3:0]  w_x40, w_y30;
+    assign w_xdiv_prod = w_x * 18'd205;
+    assign w_ydiv_prod = w_y * 20'd1093;
+    assign w_x40       = w_xdiv_prod[16:13];
+    assign w_y30       = w_ydiv_prod[18:15];
 
     wire w_border = (w_x == 10'd0) || (w_x == 10'd639) ||
                     (w_y == 10'd0) || (w_y == 10'd479);
@@ -120,28 +252,52 @@ module vga_ctrl (
 
     logic [11:0] w_pattern;   // {R, G, B}
     always_comb begin
-        if (!w_active)
-            w_pattern = 12'h000;          // RGB must be black during blanking
-        else if (w_border)
+        if (w_border)
             w_pattern = 12'hFFF;
         else if (w_square)
             w_pattern = 12'hF80;
         else if (w_y < 10'd360)           // colour bars: W Y C G M R B K
             w_pattern = {{4{~w_bar[1]}}, {4{~w_bar[2]}}, {4{~w_bar[0]}}};
         else if (w_y < 10'd390)
-            w_pattern = {w_level, 4'h0, 4'h0};
+            w_pattern = {w_x40, 4'h0, 4'h0};
         else if (w_y < 10'd420)
-            w_pattern = {4'h0, w_level, 4'h0};
+            w_pattern = {4'h0, w_x40, 4'h0};
         else if (w_y < 10'd450)
-            w_pattern = {4'h0, 4'h0, w_level};
+            w_pattern = {4'h0, 4'h0, w_x40};
         else
-            w_pattern = {w_level, w_level, w_level};
+            w_pattern = {w_x40, w_x40, w_x40};
+    end
+
+    logic [11:0] r_s1_rgb    = '0;     // direct colour
+    logic [7:0]  r_s1_idx    = '0;     // palette index
+    logic        r_s1_use_pal = 1'b0;
+    logic        r_s1_active = 1'b0;
+    logic        r_s1_hs_n   = 1'b1, r_s1_vs_n = 1'b1;
+
+    always_ff @(posedge i_Clk) begin
+        if (!i_Rst_L) begin
+            r_s1_active  <= 1'b0;
+            r_s1_hs_n    <= 1'b1;
+            r_s1_vs_n    <= 1'b1;
+            r_s1_use_pal <= 1'b0;
+        end else if (w_pix_ce) begin
+            r_s1_active  <= w_active;
+            r_s1_hs_n    <= w_hsync_n;
+            r_s1_vs_n    <= w_vsync_n;
+            r_s1_use_pal <= !w_test_pattern && w_palette_view;
+            r_s1_rgb     <= w_test_pattern ? w_pattern : r_border;
+            r_s1_idx     <= {w_y30, w_x40};
+        end
     end
 
     // -------------------------------------------------------------------------
-    // Output register stage — one stage for every signal, IOB-packed.
+    // Stage 2: palette lookup + blanking → output FFs (IOB-packed).
     // Reset: black, syncs at their inactive (high) level.
     // -------------------------------------------------------------------------
+    wire [11:0] w_s2_rgb = !r_s1_active ? 12'h000                 // black in blanking
+                         : r_s1_use_pal ? r_palette[r_s1_idx]
+                         :                r_s1_rgb;
+
     (* IOB = "TRUE" *) logic [3:0] r_vga_r = 4'h0, r_vga_g = 4'h0, r_vga_b = 4'h0;
     (* IOB = "TRUE" *) logic       r_vga_hs = 1'b1, r_vga_vs = 1'b1;
 
@@ -153,9 +309,9 @@ module vga_ctrl (
             r_vga_hs <= 1'b1;
             r_vga_vs <= 1'b1;
         end else if (w_pix_ce) begin
-            {r_vga_r, r_vga_g, r_vga_b} <= w_pattern;
-            r_vga_hs <= w_hsync_n;
-            r_vga_vs <= w_vsync_n;
+            {r_vga_r, r_vga_g, r_vga_b} <= w_s2_rgb;
+            r_vga_hs <= r_s1_hs_n;
+            r_vga_vs <= r_s1_vs_n;
         end
     end
 
