@@ -1,6 +1,6 @@
 # VGA output plan
 
-**STATUS: Phases 0–2 DONE (board-verified, timing met). Phase 3 (software: vga.h, Zephyr VGA output, doom) in progress.**
+**STATUS: Phases 0–3 DONE (Phase 3: Zephyr/doom on VGA verified by serial; visual check of the Zephyr apps pending). Phase 4 optional.**
 
 Drive the Nexys A7's on-board VGA connector (12-bit colour, a 4:4:4 resistor
 DAC plus HS/VS) from the SoC, displaying a framebuffer that lives in **DDR**.
@@ -189,16 +189,41 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
 - `tb_soc` on Windows: `xsim.bat` splits the `-testplusarg K=V` arguments at
   `=`, so `run_m5d_soc.sh` only runs on the Linux VM.
 
-### Phase 3: software
-- klausscc runtime `vga.h`: init, set mode, `vga_flip(base)` (write
-  FB_BASE, wait for vsync), palette load.
-- Coherency: the CPU draws through the write-back cache, so **flush the
-  framebuffer region before flipping** (the existing MAINT flush — same
-  contract as the VNC handoff in AMP_CORE2_PLAN.md). Blitter output needs no
-  flush (it writes DDR directly).
-- Zephyr display driver (RGB565, 320×240) with double buffering by flipping.
-- doom: present via VGA, optionally alongside VNC (same buffer).
-- Document `0xF011` in MMIO_MAP.md and the IRQ in CPU_ARCHITECTURE.md.
+### Phase 3: software (as built, Klausscpu-runtime)
+- **`vga.h`** (runtime root, header-only, baremetal + Zephyr):
+  `vga_set_mode()` / `vga_set_mode_centred()`, `vga_present()` (flip),
+  `vga_wait_vsync()`, `vga_cache_flush()`, `vga_set_palette_rgb888()`,
+  `vga_set_border()`, `vga_off()`, `vga_underflows()`.
+- **Zephyr `CONFIG_KLAUSSCPU_VGA`** (`vnc/vga_out.c`): from boot, VGA scans
+  the shared RGB565 `fb` (320 wide is doubled; centred vertically). `fb` is
+  now 32 B aligned. `fb_mark_dirty()` kicks a low-priority thread that
+  flushes the cache once per 16 ms while `fb` is dirty. This works unchanged
+  for gui_demo, mandel, LVGL (`display_vnc` writes into `fb`) and Doom over
+  VNC.
+- **`vga_out_show_indexed()`**: apps that render 8-bit palette frames hand
+  them over with their palette. The frame is copied into one of two
+  32 B-aligned heap buffers (`k_aligned_alloc`), flushed, and flipped at
+  vblank, so there is no tearing and no RGB565 conversion.
+  - Doom uses it (and skips the RGB565 conversion when no VNC consumer
+    exists); `vga.conf` builds VGA-only Doom with no networking.
+  - Mandel uses it for its rotating-palette posts. Without it, VGA would
+    show nothing in AMP builds, which only fill RGB565 for true-colour VNC
+    clients.
+- VGA is on by default in the prj.conf of doom, gui_demo, gui_lvgl and
+  mandel. All seven variants build: doom VNC / AMP / VGA-only, gui_demo,
+  gui_lvgl, and mandel VNC / AMP.
+- **Board:**
+  - VGA-only Doom: ~52 fps on the title screen, 16–25 fps in the
+    attract-mode demos; the VGA copy and flush cost ~2 ms per frame; **0
+    underflows** over ~90 s.
+  - mandel AMP: VGA costs ~6% of compute (1595/1644/1826 vs
+    1695/1756/1955 kiter/s at the same depths).
+  - gui_demo (640×480 native) boots with VGA.
+  - Visual confirmation of the Zephyr apps is pending.
+- **Docs:** `0xF011` in MMIO_MAP.md; interrupt sources 1–3 in
+  CPU_ARCHITECTURE.md; a VGA section in the Doom README.
+- **Not done:** keyboard input for VGA-only Doom (input still arrives only
+  via VNC; a UART or PS/2 keyboard path would be new work).
 
 ### Phase 4 (optional)
 - Native 640×480 RGB565 via the wide 32 B read path (measure occupancy first).
@@ -256,3 +281,4 @@ RGB565 waits until scanout uses the wide/pipelined read path (Phase 4).
 - 2026-10-09: Phase 2 full build (Performance_Explore): **MET tier 1, WNS
   +0.078 / WHS +0.022**, 44,482 LUTs (70.2%), BRAM 102.5. On that bitstream:
   test_vga_scan 7/7, test_vga 6/6, blit_selftest 19 PASS / 0 FAIL.
+- 2026-10-09: Phase 3 (software) — see the Phase 3 section; runtime commit on vga-output.
