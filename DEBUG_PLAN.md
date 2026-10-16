@@ -25,7 +25,7 @@ with a halt-at-entry flag. The debugger then attaches over JTAG.
 | 4 RTOS threads | **Done, changed** | lldb OS plugin `klausscpu-runtime/debug/klausscpu_rtos.py` instead of gdbserver code (see Phase 4) |
 | 5 Debug module RTL | **Done** | `klaussCPU` `debug-support`: `pipeline_core` hooks (`DEBUG_EN`), `debug_module.sv` (DMI, 74-bit DTM, BSCANE2 USER3), `dm_jtag.xdc`; `tb_pipeline_isa +DBG` modes and `tb_dm_jtag` via `perf/m5a/run_m5_dbg.sh` pass on hello/bst/queens/test_64bit/expr/crypto, EN=0 unchanged |
 | 6 Host JTAG backend | **Done** | `klausscc`: `--gdbserver PORT --board` (`--features board`, libftdi1); MPSSE layer unit-tested against a TAP model |
-| 7 Board end to end | **Done** | `DEBUG_EN=1` bitstream meets timing (WNS +0.029 ns; 72.6% LUTs, 75% BRAM). On the Nexys A7: `klausscpu-runtime/debug/run_board_smoke.sh` and the lldb-dap session pass; FreeRTOS and Zephyr show per-task backtraces, unwinding through the tick/timer ISRs; 64 KiB memory read in 0.3 s, byte-exact |
+| 7 Board end to end | **Done** | `DEBUG_EN=1` bitstream meets timing (WNS +0.144 ns; 72.6% LUTs, 75% BRAM). On the Nexys A7: `klausscpu-runtime/debug/run_board_smoke.sh` and the lldb-dap session pass; FreeRTOS and Zephyr show per-task backtraces, unwinding through the tick/timer ISRs; 64 KiB memory read in 0.3 s, byte-exact |
 
 Build the debugger bitstream with `tools/build_debug.sh` (a project copy
 with `debug_module.sv`, `dm_jtag.xdc` and `DEBUG_EN=1`; the checked-in
