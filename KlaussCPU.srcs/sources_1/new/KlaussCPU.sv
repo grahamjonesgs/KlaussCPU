@@ -21,7 +21,11 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 `timescale 1ns / 1ps
-module KlaussCPU (
+module KlaussCPU #(
+    // On-chip debugger on core 1 over the FPGA's JTAG port (USER3):
+    // debug_module.sv, DEBUG_PLAN.md Phase 5.  0 = not built in.
+    parameter bit DEBUG_EN = 1'b0
+) (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
     input             i_uart_rx,
@@ -239,6 +243,12 @@ module KlaussCPU (
    // M5d: the pipeline core owns int_mask; the FSM's st.int_mask is retired
    // from the gating (kept in st only as a dormant field).
    wire [3:0] pip_int_mask;
+   // On-chip debugger port of core 1 (DEBUG_EN; see g_debug below).  While
+   // the debugger holds the core, the timer, millisecond clock and cycle
+   // counter stop, so a debugged RTOS sees no time jump.
+   dbg_in_t  w_dbg_i;
+   dbg_out_t w_dbg_o;
+   wire      w_dbg_freeze = DEBUG_EN && w_dbg_o.halted;
    wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
    wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
    wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
@@ -454,7 +464,7 @@ module KlaussCPU (
   // break/command handling, and reset logic. Initial values come from the
   // top-level initial block (r_clock_ms = 0, r_clock_ms_div = 0). 64-bit
   // counter wraps in ~5.8e8 years at 100 MHz; the divider wraps every 1 ms.
-  always_ff @(posedge i_Clk) begin
+  always_ff @(posedge i_Clk) if (!w_dbg_freeze) begin
      if (r_clock_ms_div >= 17'd99_999) begin
         r_clock_ms_div <= 17'd0;
         r_clock_ms     <= r_clock_ms + 64'd1;
@@ -564,7 +574,27 @@ module KlaussCPU (
    wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
                                                 && (w_mmio_addr[15:0]  == 16'h0000);
 
-   pipeline_core pipeline_core_i (
+   // ---- on-chip debugger (DEBUG_EN): debug_module + JTAG transport ----
+   generate if (DEBUG_EN) begin : g_debug
+      wire        dmi_req, dmi_rsp;
+      wire [1:0]  dmi_op;
+      wire [7:0]  dmi_addr;
+      wire [63:0] dmi_wdata, dmi_rdata;
+      dm_jtag dm_jtag_i (
+         .clk(i_Clk), .rst(w_reset_H),
+         .dmi_req, .dmi_op, .dmi_addr, .dmi_wdata, .dmi_rsp, .dmi_rdata);
+      debug_module debug_module_i (
+         .clk(i_Clk), .rst(w_reset_H),
+         .dmi_req, .dmi_op, .dmi_addr, .dmi_wdata, .dmi_rsp, .dmi_rdata,
+         .dbg_i(w_dbg_i), .dbg_o(w_dbg_o),
+         .parked(pip_parked), .park_kind(pip_park_kind), .park_pc(pip_park_pc),
+         .core_r(pip_dbg_r), .core_sp(pip_dbg_sp), .core_flags(pip_dbg_flags),
+         .core_int_mask(pip_int_mask), .prog_start(r_pip_start));
+   end else begin : g_no_debug
+      assign w_dbg_i = '0;
+   end endgenerate
+
+   pipeline_core #(.DEBUG_EN(DEBUG_EN)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -611,7 +641,9 @@ module KlaussCPU (
       .park_op    (pip_park_op),
       .dbg_r      (pip_dbg_r),
       .dbg_sp     (pip_dbg_sp),
-      .dbg_flags  (pip_dbg_flags)
+      .dbg_flags  (pip_dbg_flags),
+      .dbg_i      (w_dbg_i),
+      .dbg_o      (w_dbg_o)
    );
 
    (* KEEP_HIERARCHY = "yes" *)
@@ -1452,7 +1484,9 @@ rams_sp_nc rams_sp_nc1 (
          r_msg_send_DV  <= 1'b0;
          st.rx_fifo_read <= 1'b0;
 
-         if (r_timer_interrupt_counter > r_timer_period) begin
+         // (frozen while the debugger holds core 1, so no tick is lost)
+         if (w_dbg_freeze) begin
+         end else if (r_timer_interrupt_counter > r_timer_period) begin
             r_timer_interrupt_counter <= 0;
             r_timer_interrupt <= 1;
          end else begin
@@ -2303,8 +2337,8 @@ rams_sp_nc rams_sp_nc1 (
          if ((pip_perf_br && pip_perf_br_taken) || pip_perf_fbr_taken)
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken
                                      + ((pip_perf_br && pip_perf_br_taken && pip_perf_fbr_taken) ? 64'd2 : 64'd1);
-         // Tier 0 — total cycles and retired instructions.
-         r_perf_cycles <= r_perf_cycles + 64'd1;
+         // Tier 0 — total cycles and retired instructions (not while debug-halted).
+         if (!w_dbg_freeze) r_perf_cycles <= r_perf_cycles + 64'd1;
          if (pip_ret_valid)
             r_perf_instr <= r_perf_instr + 64'd1;
 

@@ -13,8 +13,20 @@
 // RX_DATA reads 0, everything else reads 0; only TX_DATA writes take effect.
 //
 // Plusargs: +IMAGE=<file.mem> +TRACE=<out> +UARTF=<out> +MAXI=<n> +ENTRY=<hex>
+//
+// Debugger tests (elaborate with -generic_top DEBUG_EN=1; perf/m5a/run_m5_dbg.sh):
+// +DBG=<mode> drives the core's dbg_i port as a debugger would.  Every mode
+// except irqsteps must leave the program's trace identical to the golden.
+//   halts      random halt / resume
+//   steps      halt at entry, +STEPS=n single-steps (each retires exactly 1)
+//   bp         +BP=<pc hex>: breakpoint, count hits (TB_DBG: bp hits=)
+//   wp         +WP=<byte addr hex> +WPK=wr|rd|rw: watchpoint on that dword
+//   regmem     at random halts: memory reads vs the model, scratch write /
+//              readback, register write + restore
+//   attached   the final HALT becomes a debug halt (cause HALT)
+//   irqsteps   (+IRQ_PERIOD) single-steps never enter the handler
 //===========================================================================
-module tb_pipeline_isa;
+module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -43,8 +55,10 @@ module tb_pipeline_isa;
    logic [63:0]  dbg_r [0:15];
    logic [31:0]  dbg_sp;
    klauss_pkg::flags_t dbg_flags;
+   klauss_pkg::dbg_in_t  dbg_i = '0;
+   klauss_pkg::dbg_out_t dbg_o;
 
-   pipeline_core dut (.*, .lcd_ready(1'b1), .ce(1'b1));
+   pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (.*, .lcd_ready(1'b1), .ce(1'b1));
 
    always #5 clk = ~clk;
 
@@ -148,6 +162,10 @@ module tb_pipeline_isa;
    logic        timer_pending = 0;
    int          timer_cnt = 0;
    string       test_mode = "";
+   // debugger driver state (+DBG=<mode>; see the driver below)
+   string       dbg_mode = "";
+   int          dbg_halts = 0, dbg_steps = 0, dbg_bp_hits = 0, dbg_wp_hits = 0;
+   int          dbg_mem_checks = 0, dbg_errors = 0;
 
    assign irq_ready = timer_pending && int_mask_o[0];
 
@@ -239,12 +257,21 @@ module tb_pipeline_isa;
             3'd2: $display("TB_M5A: stop = InvalidOpcode(%08x) at pc=%08x", park_op, park_pc);
             default: ;   // WAIT park: not terminal — an IRQ wakes it (M5c)
          endcase
-         if (park_kind != 3'd3) done();
+         if (park_kind < 3'd3) done();
+         // debug halt: terminal only for an attached HALT (the program's end)
+         if (park_kind == 3'd4 && dbg_o.cause == klauss_pkg::DBG_CAUSE_HALT) begin
+            $display("TB_M5A: stop = Halt after %0d instructions", icount);
+            $display("TB_DBG: attached HALT at pc=%08x", park_pc);
+            done();
+         end
       end
    end
 
    task automatic done();
       $display("TB_M5A: %0d instructions retired, %0d UART bytes", icount, uart_n);
+      if (dbg_mode != "")
+         $display("TB_DBG: mode=%s halts=%0d steps=%0d bp hits=%0d wp hits=%0d mem checks=%0d errors=%0d",
+                  dbg_mode, dbg_halts, dbg_steps, dbg_bp_hits, dbg_wp_hits, dbg_mem_checks, dbg_errors);
       if (irq_period != 0 || irq_fire_at != 0)
          $display("TB_M5A: %0d interrupts dispatched", irq_acks);
       if (test_mode == "wait") begin
@@ -297,7 +324,8 @@ module tb_pipeline_isa;
    int     idle_n = 0;
    always @(posedge clk) begin
       if (!rst) begin
-         if (icount == last_i) begin
+         if (dbg_o.halted) idle_n = 0;   // a debugger is holding the core
+         else if (icount == last_i) begin
             idle_n++;
             if (idle_n > 5000) begin
                $display("TB_M5A: DEADLOCK at pc=%08x (no retire for 5000 cycles, i=%0d)",
@@ -306,6 +334,176 @@ module tb_pipeline_isa;
             end
          end else begin idle_n = 0; last_i = icount; end
       end
+   end
+
+   // ---------------- debugger driver (+DBG=<mode>) -----------------------------
+
+   task automatic dbg_err(input string msg);
+      $display("TB_DBG: ERROR %s (i=%0d)", msg, icount);
+      dbg_errors++;
+   endtask
+
+   // wait for a debug halt; returns 0 if the program ended first
+   task automatic wait_halted(output bit ok);
+      int n = 0;
+      ok = 1;
+      while (!dbg_o.halted) begin
+         @(negedge clk);
+         if (++n > 2_000_000) begin dbg_err("halt timeout"); ok = 0; return; end
+      end
+   endtask
+
+   task automatic dbg_halt(output bit ok);
+      @(negedge clk);  dbg_i.halt_req = 1'b1;
+      wait_halted(ok);
+      @(negedge clk);  dbg_i.halt_req = 1'b0;
+      if (ok) begin
+         dbg_halts++;
+         if (dbg_o.cause != klauss_pkg::DBG_CAUSE_REQ && dbg_o.cause != klauss_pkg::DBG_CAUSE_WATCH)
+            dbg_err($sformatf("halt request cause %0d", dbg_o.cause));
+      end
+   endtask
+
+   // while halted nothing may retire
+   task automatic check_frozen(input int cycles);
+      longint i0 = icount;
+      repeat (cycles) @(negedge clk);
+      if (icount != i0) dbg_err("instructions retired while halted");
+      if (!dbg_o.halted) dbg_err("left the halt without a resume");
+   endtask
+
+   task automatic dbg_resume(input bit step);
+      @(negedge clk);  dbg_i.step = step;  dbg_i.resume = 1'b1;
+      @(negedge clk);  dbg_i.resume = 1'b0;  dbg_i.step = 1'b0;
+   endtask
+
+   task automatic dbg_mem(input bit we, input logic [31:0] a, input logic [63:0] wd,
+                          input logic [7:0] be, output logic [63:0] rd);
+      @(negedge clk);
+      dbg_i.mem_req = 1'b1;  dbg_i.mem_we = we;  dbg_i.mem_addr = a;
+      dbg_i.mem_wdata = wd;  dbg_i.mem_be = be;
+      @(negedge clk);  dbg_i.mem_req = 1'b0;
+      while (!dbg_o.mem_done) @(negedge clk);
+      rd = dbg_o.mem_rdata;
+   endtask
+
+   task automatic dbg_reg_write(input logic [4:0] idx, input logic [63:0] v);
+      @(negedge clk);  dbg_i.reg_we = 1'b1;  dbg_i.reg_idx = idx;  dbg_i.reg_wdata = v;
+      @(negedge clk);  dbg_i.reg_we = 1'b0;
+   endtask
+
+   task automatic regmem_checks();
+      logic [63:0] v, orig;
+      logic [31:0] a;
+      // reads of program memory through the core's port vs the model
+      for (int k = 0; k < 4; k++) begin
+         a = 32'h20 + 32'(($urandom % 2048) * 8);
+         dbg_mem(1'b0, a, '0, 8'hFF, v);
+         if (v !== mem_lo[a[31:3]]) dbg_err($sformatf("mem read %08x = %016x, model %016x", a, v, mem_lo[a[31:3]]));
+         dbg_mem_checks++;
+      end
+      // scratch write + readback below the stack model
+      a = HI_BASE;
+      dbg_mem(1'b1, a, 64'h0123_4567_89AB_CDEF, 8'h3C, v);
+      dbg_mem(1'b0, a, '0, 8'hFF, v);
+      if (v !== 64'h0000_4567_89AB_0000) dbg_err($sformatf("mem write/readback %016x", v));
+      dbg_mem(1'b1, a, '0, 8'hFF, v);   // restore
+      dbg_mem_checks++;
+      // register write + restore (r13, SP, PC, FLAGS, INT_MASK)
+      orig = dbg_r[13];
+      dbg_reg_write(5'd13, ~orig);
+      if (dbg_r[13] !== ~orig) dbg_err("r13 write");
+      dbg_reg_write(5'd13, orig);
+      orig = {32'b0, dbg_sp};
+      dbg_reg_write(5'd16, orig ^ 64'h80);
+      if (dbg_sp !== (orig[31:0] ^ 32'h80)) dbg_err("sp write");
+      dbg_reg_write(5'd16, orig);
+      orig = {32'b0, park_pc};
+      dbg_reg_write(5'd17, orig);
+      if (park_pc !== orig[31:0]) dbg_err("pc write");
+      orig = {60'b0, dbg_flags.zero, dbg_flags.sign, dbg_flags.carry, dbg_flags.overflow};
+      dbg_reg_write(5'd18, orig ^ 64'hF);
+      if ({dbg_flags.zero, dbg_flags.sign, dbg_flags.carry, dbg_flags.overflow} !== (orig[3:0] ^ 4'hF))
+         dbg_err("flags write");
+      dbg_reg_write(5'd18, orig);
+      dbg_mem_checks++;
+   endtask
+
+   initial begin : debugger
+      bit ok;
+      logic [31:0] bp_pc, wp_addr;
+      string wpk;
+      int steps;
+      if (!$value$plusargs("DBG=%s", dbg_mode)) disable debugger;
+      if (!DEBUG_EN) begin $display("TB_DBG: +DBG needs DEBUG_EN=1"); $finish; end
+      @(negedge rst);
+      case (dbg_mode)
+         "halts", "regmem": begin
+            forever begin
+               repeat (50 + $urandom % 3000) @(negedge clk);
+               dbg_halt(ok);
+               if (!ok) disable debugger;
+               check_frozen(1 + $urandom % 20);
+               if (dbg_mode == "regmem") regmem_checks();
+               dbg_resume(1'b0);
+            end
+         end
+         "steps", "irqsteps": begin
+            if (!$value$plusargs("STEPS=%d", steps)) steps = 2000;
+            dbg_i.halt_req = 1'b1;               // halt at the first boundary
+            wait_halted(ok);
+            @(negedge clk);  dbg_i.halt_req = 1'b0;
+            if (park_pc !== start_pc) dbg_err($sformatf("entry halt at %08x", park_pc));
+            for (int k = 0; k < steps; k++) begin
+               automatic longint i0 = icount;
+               dbg_resume(1'b1);
+               wait_halted(ok);
+               if (!ok) disable debugger;
+               dbg_steps++;
+               if (dbg_o.cause != klauss_pkg::DBG_CAUSE_STEP)
+                  dbg_err($sformatf("step cause %0d", dbg_o.cause));
+               if (icount != i0 + 1)
+                  dbg_err($sformatf("step retired %0d instructions", icount - i0));
+               if (park_pc >= 32'h0010_0000 && park_pc < 32'h0010_0030)
+                  dbg_err($sformatf("step entered the IRQ handler at %08x", park_pc));
+            end
+            dbg_resume(1'b0);
+         end
+         "bp": begin
+            if (!$value$plusargs("BP=%h", bp_pc)) begin $display("TB_DBG: bp needs +BP"); $finish; end
+            @(negedge clk);  dbg_i.bp_addr[0] = bp_pc;  dbg_i.bp_en = 4'b0001;
+            forever begin
+               wait_halted(ok);
+               if (!ok) disable debugger;
+               dbg_bp_hits++;
+               if (dbg_o.cause != klauss_pkg::DBG_CAUSE_BP) dbg_err($sformatf("bp cause %0d", dbg_o.cause));
+               if (park_pc !== bp_pc) dbg_err($sformatf("bp halted at %08x", park_pc));
+               check_frozen(3);
+               dbg_resume(1'b0);
+            end
+         end
+         "wp": begin
+            if (!$value$plusargs("WP=%h", wp_addr)) begin $display("TB_DBG: wp needs +WP"); $finish; end
+            if (!$value$plusargs("WPK=%s", wpk)) wpk = "wr";
+            @(negedge clk);
+            dbg_i.wp_dw[0] = wp_addr[31:3];  dbg_i.wp_be[0] = 8'hFF;  dbg_i.wp_en = 2'b01;
+            dbg_i.wp_rd[0] = (wpk != "wr");  dbg_i.wp_wr[0] = (wpk != "rd");
+            forever begin
+               wait_halted(ok);
+               if (!ok) disable debugger;
+               dbg_wp_hits++;
+               if (dbg_o.cause != klauss_pkg::DBG_CAUSE_WATCH) dbg_err($sformatf("wp cause %0d", dbg_o.cause));
+               if (dbg_o.watch_addr[31:3] !== wp_addr[31:3])
+                  dbg_err($sformatf("wp address %08x", dbg_o.watch_addr));
+               check_frozen(3);
+               dbg_resume(1'b0);
+            end
+         end
+         "attached": begin
+            @(negedge clk);  dbg_i.attached = 1'b1;
+         end
+         default: begin $display("TB_DBG: unknown +DBG=%s", dbg_mode); $finish; end
+      endcase
    end
 
    string image_f, trace_fn, uart_fn;

@@ -28,7 +28,10 @@ module pipeline_core
 #(
    // Architectural SP after reset.  Core 1 = top of DDR; the AMP core-2
    // instance points it at the top of its local BRAM (AMP_CORE2_PLAN.md).
-   parameter logic [31:0] SP_RESET = 32'h0800_0000
+   parameter logic [31:0] SP_RESET = 32'h0800_0000,
+   // Debug hooks for debug_module.sv (DEBUG_PLAN.md Phase 5). 0 = none of the
+   // logic below exists and dbg_i is ignored (core 2, existing builds).
+   parameter bit DEBUG_EN = 1'b0
 )
 (
    input  logic         clk,
@@ -97,7 +100,11 @@ module pipeline_core
    // architectural state (tb reads for the trace line)
    output logic [63:0]  dbg_r [0:15],
    output logic [31:0]  dbg_sp,
-   output flags_t       dbg_flags
+   output flags_t       dbg_flags,
+   // debugger (DEBUG_EN): halt/resume/step, breakpoints, watchpoints, and
+   // register / memory access while debug-halted
+   input  dbg_in_t      dbg_i = '0,
+   output dbg_out_t     dbg_o
 );
 
    // ------------------------------------------------------------------ types
@@ -163,6 +170,43 @@ module pipeline_core
    logic       irq_xc;
    logic [1:0] irq_sel_q;
    logic [31:0] irq_vec_q;
+
+   // ------------------------------------------------------------- debug hooks
+   // A halt (request, step completion, watchpoint) is taken at a dispatch
+   // boundary like an IRQ: fetch stops, the pipe drains, and the core parks
+   // with park_kind 4 at the next instruction's PC.  A breakpoint squashes
+   // the matching instruction in ID before it executes and parks at its PC.
+   // TRAP / ILLEGAL / HALT park as debug halts while a debugger is attached.
+   // Resume restarts fetch at park_pc through the start path (which also
+   // invalidates the I-cache, so code patched while halted is refetched).
+   logic        dbg_active;      // halt taken at a boundary; pipe draining
+   logic [2:0]  dbg_cause_q;     // cause for that coming park
+   logic [2:0]  dbg_cause;       // cause of the current debug halt
+   logic        dbg_stepping;    // resumed with step
+   logic        dbg_step_done;   // ... and its one instruction has dispatched
+   logic        dbg_skip;        // first dispatch after resume: no breakpoint
+   logic        id_bp;           // ID instruction matched a breakpoint
+   logic        dbg_watch_req;   // a watchpoint fired: halt at the next boundary
+   logic [31:0] dbg_watch_addr;
+   logic        dbg_mx;          // debugger memory access in flight
+   logic        dbg_mem_done;
+   logic [63:0] dbg_mem_rdata;
+   wire dbg_halted = DEBUG_EN && parked && park_kind == 3'd4;
+   wire dbg_stop   = DEBUG_EN && (dbg_i.halt_req || dbg_watch_req || dbg_step_done);
+   // single-steps never take interrupts (and do not wake a WAIT)
+   wire irq_ok     = irq_ready && !(DEBUG_EN && dbg_stepping);
+   wire dbg_bp_hit = DEBUG_EN && !dbg_skip &&
+                     |(dbg_i.bp_en & {dbg_i.bp_addr[3] == pc, dbg_i.bp_addr[2] == pc,
+                                      dbg_i.bp_addr[1] == pc, dbg_i.bp_addr[0] == pc});
+   assign dbg_o.halted     = dbg_halted;
+   assign dbg_o.cause      = dbg_cause;
+   assign dbg_o.watch_addr = dbg_watch_addr;
+   assign dbg_o.mem_done   = dbg_mem_done;
+   assign dbg_o.mem_rdata  = dbg_mem_rdata;
+   // TRAP / ILLEGAL / HALT -> debug-halt cause
+   function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
+      return (kind == 3'd1) ? DBG_CAUSE_TRAP : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
+   endfunction
 
    // ------------------------------------------- IF: 2-dword window (IFB model)
    logic [63:0] ifb_dw [0:1];
@@ -1347,6 +1391,7 @@ module pipeline_core
    // clocked block (pure combinational locals to synthesis — never FFs);
    // r_ifq_p1 registers if_req_dw+1 at fill issue for the completion update.
    logic       ev_disp, ev_slide, ev_rebase, ev_fill, ev_pcz;
+   logic       ev_bp;   // a breakpoint was taken in ID this edge (debug)
    logic [1:0] ev_adv;
    logic [28:0] r_ifq_p1;
 
@@ -1366,6 +1411,10 @@ module pipeline_core
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
+         dbg_active <= 1'b0; dbg_cause_q <= '0; dbg_cause <= '0;
+         dbg_stepping <= 1'b0; dbg_step_done <= 1'b0; dbg_skip <= 1'b0; id_bp <= 1'b0;
+         dbg_watch_req <= 1'b0; dbg_watch_addr <= '0;
+         dbg_mx <= 1'b0; dbg_mem_done <= 1'b0; dbg_mem_rdata <= '0;
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
@@ -1376,19 +1425,28 @@ module pipeline_core
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
-         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0;
+         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0;
 
-         if (start) begin
+         if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
-            pc <= start_pc; running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
+            pc <= (DEBUG_EN && !start) ? park_pc : start_pc;
+            running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
             // invalidate-all: a fresh program image may reuse code addresses
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
+            if (DEBUG_EN) begin
+               dbg_stepping  <= !start && dbg_i.step;
+               dbg_step_done <= 1'b0;
+               dbg_skip      <= !start;   // don't re-break on the resume instruction
+               dbg_watch_req <= 1'b0;
+               dbg_active    <= 1'b0;
+            end
          end
 
          irq_ack <= 1'b0;
+         dbg_mem_done <= 1'b0;
 
          // ready-edge arming (issues below re-clear it; NBA last-write wins)
          if (!m_ready) rdy_armed <= 1'b1;
@@ -1396,9 +1454,40 @@ module pipeline_core
          // WAIT wake: a parked WAIT resumes on a pending IRQ; the next dispatch
          // boundary takes the interrupt (resume PC = WAIT+4, as the FSM's
          // WAITING -> OPCODE_REQUEST path does).
-         if (parked && park_kind == 3'd3 && irq_ready) begin
+         if (parked && park_kind == 3'd3 && irq_ok) begin
             parked     <= 1'b0;
             fetch_halt <= 1'b0;
+         end
+         if (DEBUG_EN && parked && park_kind == 3'd3) begin
+            // A halt request stops a WAIT in place (resume re-executes it);
+            // a step completes it as if woken (the interrupt stays pending).
+            if (dbg_stepping) begin
+               park_kind <= 3'd4;  dbg_cause <= DBG_CAUSE_STEP;  running <= 1'b0;
+               park_pc   <= park_pc + 32'd4;
+               dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
+            end else if (dbg_i.halt_req) begin
+               park_kind <= 3'd4;  dbg_cause <= DBG_CAUSE_REQ;  running <= 1'b0;
+            end
+         end
+
+         // Debug halt: the boundary was taken (dbg_active); park once drained.
+         // A TRAP/HALT/ILLEGAL that parked first (at WB) wins.
+         if (DEBUG_EN && dbg_active) begin
+            if (parked) begin
+               dbg_active <= 1'b0;
+            end else if (!id_valid && !ex_valid && !mem_valid && !wb_valid
+                         && mem_xc == 2'd0 && !if_xc) begin
+               dbg_active    <= 1'b0;
+               parked        <= 1'b1;
+               running       <= 1'b0;   // no dispatch / fetch until resume
+               park_kind     <= 3'd4;
+               park_pc       <= pc;
+               park_op       <= '0;
+               dbg_cause     <= dbg_cause_q;
+               dbg_stepping  <= 1'b0;
+               dbg_step_done <= 1'b0;
+               dbg_watch_req <= 1'b0;
+            end
          end
 
          // ---------------- IRQ entry sequencer ----------------
@@ -1466,6 +1555,12 @@ module pipeline_core
                parked   <= 1'b1;
                park_kind <= wb_park_kind;
                park_pc  <= wb_pc;  park_op <= wb_op;
+               if (DEBUG_EN && dbg_i.attached && wb_park_kind != 3'd3) begin
+                  park_kind <= 3'd4;
+                  running   <= 1'b0;
+                  dbg_cause <= f_dbg_park_cause(wb_park_kind);
+                  dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
+               end
                if (wb_park_kind != 3'd2) begin   // illegal: no trace line
                   ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                end
@@ -1570,6 +1665,18 @@ module pipeline_core
                   snoop_q     <= mem_port_wr &&
                                  ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4];
                   snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
+                  // Watchpoints: compare this access at issue; the halt is
+                  // taken at the next dispatch boundary (the instruction
+                  // completes; at most the two younger ones in EX/ID too).
+                  if (DEBUG_EN) begin
+                     for (int w = 0; w < 2; w++)
+                        if (dbg_i.wp_en[w] && mem_iaddr[31:3] == dbg_i.wp_dw[w] &&
+                            (mem_be & dbg_i.wp_be[w]) != 8'h00 &&
+                            ((dbg_i.wp_rd[w] && mem_port_rd) || (dbg_i.wp_wr[w] && mem_port_wr))) begin
+                           dbg_watch_req  <= 1'b1;
+                           dbg_watch_addr <= mem_iaddr;
+                        end
+                  end
                   // M9: issue-time NLB snoop + in-flight prefetch abort. Closes
                   // the 1-cycle race where a prefetch captures a BRAM read that
                   // predates this store's ic_v* clear (the mem_done_now
@@ -1598,6 +1705,28 @@ module pipeline_core
                   mem_xc    <= 2'd0;
                end
             endcase
+         end
+
+         // ---------------- debugger memory access (debug-halted only) ----------
+         // The parked core's port is idle; one access at a time through the
+         // same port (D-cache coherent, MMIO decoded by the SoC as usual).
+         if (DEBUG_EN && dbg_halted) begin
+            if (!dbg_mx) begin
+               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0) begin
+                  m_addr     <= dbg_i.mem_addr;
+                  m_wdata    <= dbg_i.mem_wdata;
+                  m_be       <= dbg_i.mem_be;
+                  m_read_DV  <= !dbg_i.mem_we;
+                  m_write_DV <= dbg_i.mem_we;
+                  rdy_armed  <= !m_ready;
+                  dbg_mx     <= 1'b1;
+               end
+            end else if (w_mrdy) begin
+               m_read_DV     <= 1'b0;  m_write_DV <= 1'b0;
+               dbg_mem_rdata <= m_rdata;
+               dbg_mem_done  <= 1'b1;
+               dbg_mx        <= 1'b0;
+            end
          end
 
          // ------------- IF fill engine: I-cache lookup -> hit | miss-fill -------
@@ -1662,7 +1791,8 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !irq_active) begin
+               end else if (!mem_port_op && mem_xc == 2'd0 && !irq_active
+                            && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
                   // push only checks !if_xc, so a same-cycle (or mid-push) fill issue
@@ -1799,7 +1929,7 @@ module pipeline_core
                end else if (raw_stall) begin
                   ex_valid <= 1'b0;     // bubble; hold ID/pc
                end else begin
-                  ex_valid   <= id_valid && !fetch_halt;
+                  ex_valid   <= id_valid && !fetch_halt && !(DEBUG_EN && id_bp);
                   ex_pc      <= id_pc;   ex_op <= id_op;
                   ex_var1    <= id_var1; ex_var2 <= id_var2;
                   ex_pc_next <= id_pc_next;
@@ -1826,18 +1956,42 @@ module pipeline_core
                               : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                               : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
-                  if (id_valid && !fetch_halt && id_ser) begin
+                  if (DEBUG_EN && id_valid && id_bp) begin
+                     // breakpoint: the ID op does not execute; park at its PC
+                     // once the older instructions drain
+                     ev_bp       = 1'b1;
+                     ev_pcz      = 1'b1;
+                     pc          <= id_pc;
+                     id_valid    <= 1'b0;
+                     id_bp       <= 1'b0;
+                     dbg_active  <= 1'b1;
+                     dbg_cause_q <= DBG_CAUSE_BP;
+                  end else if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
-                  end else if (running && !fetch_halt && !irq_active && irq_ready) begin
+                  end else if (DEBUG_EN && running && !fetch_halt && !irq_active
+                               && !dbg_active && dbg_stop) begin
+                     // debug halt at this boundary (like an IRQ, but parks)
+                     dbg_active  <= 1'b1;
+                     dbg_cause_q <= dbg_watch_req ? DBG_CAUSE_WATCH
+                                  : dbg_step_done ? DBG_CAUSE_STEP : DBG_CAUSE_REQ;
+                     id_valid    <= 1'b0;
+                  end else if (running && !fetch_halt && !irq_active
+                               && !(DEBUG_EN && dbg_active) && irq_ok) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
                      irq_active <= 1'b1;
                      irq_sel_q  <= irq_sel;
                      irq_vec_q  <= irq_vector;
                      id_valid   <= 1'b0;
-                  end else if (running && !fetch_halt && !irq_active && fetch_ok) begin
+                  end else if (running && !fetch_halt && !irq_active
+                               && !(DEBUG_EN && dbg_active) && fetch_ok) begin
                      id_valid <= 1'b1;
+                     if (DEBUG_EN) begin
+                        id_bp         <= dbg_bp_hit;
+                        dbg_skip      <= 1'b0;
+                        dbg_step_done <= dbg_stepping;   // its one instruction
+                     end
                      id_op    <= w_op;  id_var1 <= w_var1;  id_var2 <= w_var2;
                      if (w_short[32]) id_var1 <= w_short[31:0];
                      // B: the fused branch's displacement (4*simm13) rides in
@@ -1880,6 +2034,7 @@ module pipeline_core
          // (not a memory op), so it always leaves MEM this edge. An IRQ
          // taken meanwhile drains first and then pushes this corrected pc.
          if (fbr_taken) begin
+            if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
             ev_pcz     = 1'b1;
             pc         <= mem_eaddr;
             mem_valid  <= 1'b0;
@@ -1911,6 +2066,7 @@ module pipeline_core
             ifb_val <= 2'b00; ev_pcz = 1'b1;
          end
          if (sq_any) begin
+            if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // squashed; it re-dispatches
             // M13 fix: the EX op is fetched-before-the-store too, so it must
             // not commit (it used to advance into MEM here and ALSO be
             // refetched: stale execution, then a deadlock when the ID op
@@ -1925,6 +2081,18 @@ module pipeline_core
             // Every in-flight serializer is younger than the store, so it is
             // squashed here and re-arms fetch_halt when it re-dispatches.
             fetch_halt <= 1'b0;
+         end
+
+         // debugger register write (debug-halted: no WB activity competes)
+         if (dbg_halted && dbg_i.reg_we) begin
+            case (dbg_i.reg_idx)
+               5'd16:   sp      <= dbg_i.reg_wdata[31:0];
+               5'd17:   park_pc <= dbg_i.reg_wdata[31:0];   // resume PC
+               5'd18:   flags   <= '{zero: dbg_i.reg_wdata[3], sign: dbg_i.reg_wdata[2],
+                                     carry: dbg_i.reg_wdata[1], overflow: dbg_i.reg_wdata[0]};
+               5'd19:   int_mask <= dbg_i.reg_wdata[3:0];
+               default: if (dbg_i.reg_idx < 5'd16) rf[dbg_i.reg_idx[3:0]] <= dbg_i.reg_wdata;
+            endcase
          end
 
          // int_mask MMIO write-back (SoC handler owns 0xF00F_0000) — last, so

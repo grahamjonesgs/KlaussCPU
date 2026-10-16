@@ -382,4 +382,47 @@ package klauss_pkg;
       return {v, inv ? ~t : t};
    endfunction
 
+   // --- Debug interface (pipeline_core DEBUG_EN; DEBUG_PLAN.md Phase 5) -----
+   // Driven by debug_module.sv; tied off ('0) when no debugger is built in.
+   // Register numbers (reg_idx / debugger view, = klausscc gdbserver regnums):
+   // 0-15 R0-R15, 16 SP, 17 PC, 18 FLAGS {Z,S,C,V} in [3:0], 19 INT_MASK.
+   typedef struct packed {
+      logic             halt_req;   // level: halt at the next dispatch boundary
+      logic             resume;     // pulse, while debug-halted: run from PC
+      logic             step;       // with resume: halt after one instruction
+      logic             attached;   // TRAP / ILLEGAL / HALT enter a debug halt
+      logic [3:0]       bp_en;      // PC breakpoints
+      logic [3:0][31:0] bp_addr;
+      logic [1:0]       wp_en;      // data watchpoints (one doubleword each)
+      logic [1:0]       wp_rd;      //   trigger on loads
+      logic [1:0]       wp_wr;      //   trigger on stores
+      logic [1:0][28:0] wp_dw;      //   doubleword address (byte address >> 3)
+      logic [1:0][7:0]  wp_be;      //   byte lanes within it
+      logic             reg_we;     // pulse, while debug-halted: write a register
+      logic [4:0]       reg_idx;
+      logic [63:0]      reg_wdata;
+      logic             mem_req;    // pulse, while debug-halted: one access
+      logic             mem_we;
+      logic [31:0]      mem_addr;   //   doubleword-aligned
+      logic [63:0]      mem_wdata;  //   lane-placed
+      logic [7:0]       mem_be;
+   } dbg_in_t;
+
+   // Debug-halt causes (dbg_out_t.cause).
+   localparam logic [2:0] DBG_CAUSE_REQ   = 3'd0;  // halt request / halt-on-load
+   localparam logic [2:0] DBG_CAUSE_STEP  = 3'd1;
+   localparam logic [2:0] DBG_CAUSE_BP    = 3'd2;  // PC breakpoint (not executed)
+   localparam logic [2:0] DBG_CAUSE_WATCH = 3'd3;  // watchpoint (after the access)
+   localparam logic [2:0] DBG_CAUSE_TRAP  = 3'd4;  // PC = the TRAP
+   localparam logic [2:0] DBG_CAUSE_ILL   = 3'd5;  // PC = the illegal word
+   localparam logic [2:0] DBG_CAUSE_HALT  = 3'd6;  // PC = the HALT
+
+   typedef struct packed {
+      logic        halted;          // debug-halted (parked, park_kind 4)
+      logic [2:0]  cause;
+      logic [31:0] watch_addr;      // byte address of the access that fired
+      logic        mem_done;        // pulse: mem_req finished
+      logic [63:0] mem_rdata;
+   } dbg_out_t;
+
 endpackage : klauss_pkg
