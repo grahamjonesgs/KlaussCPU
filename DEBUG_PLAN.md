@@ -14,6 +14,19 @@ VS Code ─DAP─▶ lldb-dap ─GDB RSP (TCP)─▶ klausscc gdbserver ─┬�
 Programs are loaded the way they are today (UART loader, `write_to_board`),
 with a halt-at-entry flag. The debugger then attaches over JTAG.
 
+## Status (2026-10-17)
+
+| Phase | State | Where |
+|---|---|---|
+| 0 Toolchain foundations | **Done** | `klausscpu-llvm` `debug-support`: CFI, ELF/relocation support, TRAP, disassembler (+ lld −1 debug tombstone) |
+| 1 lldb | **Done** | `klausscpu-llvm`: ArchSpec, `ABISysV_klausscpu`, lldb-dap; DWARF tombstones, 8-byte watchpoints |
+| 2 Emulator gdbserver | **Done** | `klausscc` `debug-support`: `--gdbserver PORT`; `klausscpu-runtime` `debug-support`: VS Code config, `debug/run_debug_smoke.sh`, `DEBUGGING.md` |
+| 3 Emulator runs RTOS code | **Done** | `klausscc`: IRQ controller, timer, WAIT; FreeRTOS demo passes, Zephyr irq_soak 0 violations; ISR CFI in both ports (**needs a board run**) |
+| 4 RTOS threads | **Done, changed** | lldb OS plugin `klausscpu-runtime/debug/klausscpu_rtos.py` instead of gdbserver code (see Phase 4) |
+| 5 Debug module RTL | Not started | |
+| 6 Host JTAG backend | Not started | |
+| 7 Board end to end | Not started | |
+
 ---
 
 ## 1. Decisions
@@ -119,7 +132,16 @@ locals and globals, register view, watchpoint stop.
 emulator; a breakpoint in a task stops with a full backtrace, including through
 an interrupt frame.
 
-### Phase 4 — RTOS thread awareness (`klausscc` gdbserver; works on both backends)
+### Phase 4 — RTOS thread awareness (works on both backends)
+
+**As built:** an lldb Python OS plugin (`klausscpu-runtime/debug/klausscpu_rtos.py`)
+instead of code in the gdbserver.  It walks the kernel lists through lldb with
+the program's own DWARF, so items 2–3 below need no offset tables and no
+`gimli`, and it works unchanged on the board because it only reads memory.
+Zephyr uses `_kernel.threads` (`CONFIG_THREAD_MONITOR`) rather than
+`CONFIG_DEBUG_THREAD_INFO`.  An lldb fix was needed so plug-in threads refresh
+their name and core at each stop.  The original design, for reference:
+
 1. Thread list over RSP (`qfThreadInfo`, `qThreadExtraInfo`, `Hg`, per-thread `g`).
 2. **Zephyr:** use `CONFIG_DEBUG_THREAD_INFO` exported offsets (`_kernel_thread_info_offsets`), as OpenOCD does.
 3. **FreeRTOS:** `pxCurrentTCB`, ready/delayed/suspended/terminated lists; struct offsets read from the ELF's DWARF (`gimli`) rather than hard-coded.
