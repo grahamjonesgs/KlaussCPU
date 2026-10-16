@@ -15,6 +15,8 @@
 //                      [2] step: with resumereq, halt after one instruction
 //                      [3] attached: TRAP / ILLEGAL / HALT enter a debug halt
 //                      [4] halt_on_load: halt at the entry of the next program
+//                      (a load without it clears attached and every BP/WP
+//                      enable: no stale debugger state in a normal run)
 //   0x01 DMSTATUS   RO [0] halted   [1] running   [2] busy (memory command)
 //                      [3] error (sticky: command while running or busy;
 //                          cleared by writing DMSTATUS)
@@ -137,6 +139,11 @@ module debug_module
             halted_seen <= 1'b1;
          end
          if (prog_start && halt_on_load) haltreq <= 1'b1;   // halt at the entry
+         // A plain (non-debug) load starts with no debugger state: a host
+         // that went away without detaching must not leave breakpoints armed.
+         if (prog_start && !halt_on_load) begin
+            attached <= 1'b0;  bp_en <= '0;  wp_en <= '0;
+         end
 
          if (mem_busy && dbg_o.mem_done) begin
             mem_busy <= 1'b0;
