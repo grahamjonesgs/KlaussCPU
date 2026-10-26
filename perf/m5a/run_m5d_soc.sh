@@ -14,7 +14,7 @@ MAXI=${2:-0}
 K=/home/graham/Documents/src/klausscc/target/release/klausscc
 E=${E:-$HOME/Documents/src/klausscpu-runtime/baremetal}
 SRC=$(cd ../../KlaussCPU.srcs && pwd)
-export PATH=$PATH:/opt/Xilinx/2025.2/Vivado/bin
+export PATH=$PATH:/opt/xilinx/2025.2/Vivado/bin:/opt/Xilinx/2025.2/Vivado/bin
 mkdir -p out soc_run
 [ -f "$PROG.mem" ] || $K --mem-out "$E/$PROG.elf" --mem-file "$PROG.mem" 2>&1 | grep mem-out
 [ -f "$PROG.trace" ] || $K --input "$E/$PROG.elf" --emulate --trace "$PROG.trace" > "$PROG.emu.out" 2>&1
@@ -55,7 +55,7 @@ xvlog -sv \
   "$SRC/sim_1/new/tb_soc.sv" \
   -i "$SRC/sources_1/new" > xvlog.log 2>&1 || { grep ERROR xvlog.log | head -10; exit 1; }
 # liteeth_core + ring_osc are STUBBED inside tb_soc.sv (sim-hostile / unused)
-xvlog "/opt/Xilinx/2025.2/Vivado/data/verilog/src/glbl.v" >> xvlog.log 2>&1 \
+xvlog "$(dirname "$(command -v xvlog)")/../data/verilog/src/glbl.v" >> xvlog.log 2>&1 \
   || { grep ERROR xvlog.log | head -5; exit 1; }
 xelab tb_soc glbl -s tsoc -L unisims_ver --relax > xelab.log 2>&1 \
   || { grep -E "ERROR" xelab.log | head -10; exit 1; }

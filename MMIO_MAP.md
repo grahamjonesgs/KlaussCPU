@@ -1054,8 +1054,8 @@ UART opcodes are retired; these registers are the only UART interface.)
 
 | Offset | Name      | Access | Behaviour |
 |--------|-----------|--------|-----------|
-| `0x0000` | `TX_DATA` | W | Write bits[7:0] → transmit one byte. **Poll `STATUS.TX_BUSY==0` before writing** (single-buffered; a write while busy is **dropped** — the byte in flight is unaffected, the new one is never sent). The loader's `Load Complete OK` message is still being sent when a program starts, so a program's first write needs the poll too. |
-| `0x0008` | `RX_DATA` | R | Returns the head RX byte in bits[7:0] and **pops** the FIFO (read-to-consume). Read only when `STATUS.RX_EMPTY==0`. |
+| `0x0000` | `TX_DATA` | W | Write bits[7:0] → transmit one byte. **Poll `STATUS.TX_BUSY==0` before writing** (single-buffered; a write while busy is **dropped** — the byte in flight is unaffected, the new one is never sent). A program starts only once the loader's `Load Complete OK` message has been sent, so its first write finds the UART idle; every later one needs the poll. |
+| `0x0008` | `RX_DATA` | R | Returns the head RX byte in bits[7:0] and **pops** the FIFO (read-to-consume). Read only when `STATUS.RX_EMPTY==0`. The 16-byte FIFO is emptied at the end of every program load, so a program never sees input from before it was loaded. |
 | `0x0010` | `STATUS`  | R | bit0 `TX_BUSY` (sender transmitting), bit1 `RX_EMPTY`, bit2 `RX_FULL`. |
 
 C sketch:

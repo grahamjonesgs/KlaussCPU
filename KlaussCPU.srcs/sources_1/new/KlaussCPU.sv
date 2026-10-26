@@ -152,7 +152,10 @@ module KlaussCPU #(
    wire [31:0] w_var2;
    wire [31:0] w_mem;
    logic r_hcf_message_sent;
-   logic [31:0] r_start_wait_counter;
+   // START_WAIT: cycles spent waiting for the sender to take the load message
+   // (capped, see START_WAIT), and whether it has taken it.
+   logic [3:0]  r_start_wait_counter;
+   logic        r_start_wait_ack;
 
    // Crash-dump trace ring buffer — captures {PC, opcode} of every instruction
    // the pipeline retires (pip_ret_*, in PIPE_RUN).  On HCF entry the most recent 16 entries (newest at
@@ -1258,9 +1261,12 @@ module KlaussCPU #(
 
    // Write to FIFO only when the byte is not consumed by the break/command
    // handler (!r_break_received) or the program loader (st.SM != LOADING_BYTE).
+   // Emptied at LOAD_COMPLETE too, so a new program starts with no stale
+   // input: keys typed during the previous run, or bytes that arrived
+   // between loader states (writes are only blocked in LOADING_BYTE).
    uart_rx_fifo uart_rx_fifo1 (
        .i_Clk        (i_Clk),
-       .i_Reset      (w_reset_H),
+       .i_Reset      (w_reset_H | (st.SM == LOAD_COMPLETE)),
        .i_Write_En   (w_uart_rx_DV & !r_break_received & (st.SM != LOADING_BYTE)),
        .i_Write_Byte (w_uart_rx_value),
        .i_Read_En    (st.rx_fifo_read | w_uart_rx_pop),
@@ -1716,6 +1722,8 @@ rams_sp_nc rams_sp_nc1 (
                   st.seven_seg_value1 <= 32'h22_22_22_22;
                   st.seven_seg_value2 <= 32'h22_22_22_22;
                   st.SM <= START_WAIT;
+                  r_start_wait_counter <= 4'd0;
+                  r_start_wait_ack <= 1'b0;
                   st.timeout_counter <= 0;
                   r_timer_interrupt <= 0;
                   r_timer_interrupt_counter <= 0;
@@ -1732,10 +1740,20 @@ rams_sp_nc rams_sp_nc1 (
                end
             end
 
-            // Delay to enable load message to be sent before starting
+            // Start the program only once the "Load Complete OK" message has
+            // gone out, so the program has the UART to itself: a TX_DATA
+            // write while the sender is busy is dropped.  Two steps: wait for
+            // the sender to take the message (w_sending_msg rises the cycle
+            // after LOAD_COMPLETE's send_DV), then for it to finish.  If it
+            // never takes it, give up after 16 cycles rather than hang.
             START_WAIT: begin
                r_msg_send_DV <= 1'b0;
-               if (r_start_wait_counter == 0) begin
+               if (!r_start_wait_ack) begin
+                  if (w_sending_msg || r_start_wait_counter == 4'd15) r_start_wait_ack <= 1'b1;
+                  r_start_wait_counter <= r_start_wait_counter + 4'd1;
+                  st.seven_seg_value1 <= 32'h21_21_21_21;
+                  st.seven_seg_value2 <= 32'h21_21_21_21;
+               end else if (!w_sending_msg) begin
                   // M5d: execution belongs to the pipeline core.
                   r_pip_start    <= 1'b1;
                   r_pip_start_pc <= st.PC;
@@ -1743,7 +1761,6 @@ rams_sp_nc rams_sp_nc1 (
                   st.seven_seg_value1 <= 32'h22_22_22_22;
                   st.seven_seg_value2 <= 32'h22_22_22_22;
                end else begin
-                  r_start_wait_counter <= r_start_wait_counter - 1;
                   st.seven_seg_value1 <= 32'h21_21_21_21;
                   st.seven_seg_value2 <= 32'h21_21_21_21;
                end
