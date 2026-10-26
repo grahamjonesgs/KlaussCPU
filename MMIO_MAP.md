@@ -1049,13 +1049,12 @@ discipline.
 
 Byte-level UART. TX writes one byte to the message sender (length=1); RX reads
 pop the existing receive FIFO; STATUS exposes flow-control bits. Formatting
-(hex, strings) is done in software — the hardware is a byte pipe. (The legacy
-UART opcodes remain for now; they will be retired once software uses these
-registers.)
+(hex, strings) is done in software — the hardware is a byte pipe. (The v1
+UART opcodes are retired; these registers are the only UART interface.)
 
 | Offset | Name      | Access | Behaviour |
 |--------|-----------|--------|-----------|
-| `0x0000` | `TX_DATA` | W | Write bits[7:0] → transmit one byte. **Poll `STATUS.TX_BUSY==0` before writing** (single-buffered; a write while busy corrupts the in-flight byte). |
+| `0x0000` | `TX_DATA` | W | Write bits[7:0] → transmit one byte. **Poll `STATUS.TX_BUSY==0` before writing** (single-buffered; a write while busy is **dropped** — the byte in flight is unaffected, the new one is never sent). The loader's `Load Complete OK` message is still being sent when a program starts, so a program's first write needs the poll too. |
 | `0x0008` | `RX_DATA` | R | Returns the head RX byte in bits[7:0] and **pops** the FIFO (read-to-consume). Read only when `STATUS.RX_EMPTY==0`. |
 | `0x0010` | `STATUS`  | R | bit0 `TX_BUSY` (sender transmitting), bit1 `RX_EMPTY`, bit2 `RX_FULL`. |
 
