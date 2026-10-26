@@ -1,15 +1,19 @@
 //===========================================================================
-// pipeline_core — Phase B in-order 5-stage pipeline (feat/pipeline).
-// M5a: FULL ISA v2 (classes 1-C per ISA_ENCODING_V2_MAP.md), ideal memory.
-// See PIPELINE_IMPL.md §8. Interlock-only — no forwarding until M6:
-//   - GPR RAW: stall ID until the producer leaves WB.
-//   - Flag READERS (cond branches, ADC/SBC, RCL/RCR, GETF) stall on any
-//     in-flight flag writer. Flag WRITERS carry {value, mask} down the pipe
-//     and masked-merge at WB — writers never read flags (no writer hazard).
+// pipeline_core — in-order 5-stage pipeline (IF ID EX MEM WB).
+// Full ISA v2 + v3 (classes 1-D per ISA_ENCODING_V2_MAP.md). See
+// PIPELINE_IMPL.md §8. Hazards:
+//   - GPR RAW: register-sourced forwarding at the ID->EX operand latch
+//     (M6): MEM/WB producers forward; a producer still in EX costs one
+//     bubble, a load (in MEM) another.
+//   - Flag READERS (cond branches, ADC/SBC, RCL/RCR, GETF) stall on a flag
+//     writer in EX; one in MEM forwards via flags_eff (M6b). Flag WRITERS
+//     carry {value, mask} down the pipe and masked-merge at WB — writers
+//     never read flags (no writer hazard).
 //   - SP users serialize on in-flight SP writers; SP commits at WB.
 //   - RET/IRET/HALT/WAIT/RESET/TRAP/illegal serialize: ID stops fetching
 //     behind them; RET/IRET redirect at MEM, RESET at EX, the rest park.
-//   - Branches resolve in EX (predict-not-taken, flush IF/ID on taken).
+//   - Branches resolve in EX (predict-not-taken, flush IF/ID on taken);
+//     fused compare-and-branch (class D) resolves in MEM, squashing EX/ID.
 //   - MUL/DIV/DELAY/LCD occupy EX (busy interlock, M4); MEMGET32 cross-dword
 //     occupies MEM one extra cycle (mem busy).
 // Single retire point = WB: rf / flags(masked) / SP / int_mask commit there,

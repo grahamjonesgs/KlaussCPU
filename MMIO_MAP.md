@@ -676,7 +676,7 @@ or do the read-twice-and-retry-if-high-changed dance.
   (PC, flags, mask — see `CPU_ARCHITECTURE.md` §13.1), clears `INT_MASK[N]`
   for the dispatched source so the handler cannot re-enter on the same
   source, and jumps to `INT_VECn`.
-- `IRET` (opcode `0x0000_6011`) pops the slot and restores all three.
+- `IRET` (opcode `0x65C0_0000`) pops the slot and restores all three.
 
 **Pending-bit semantics:** `INT_PENDING[0]` (timer) follows the timer counter
 edge — it asserts when the counter rolls over, and is auto-cleared by
