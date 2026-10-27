@@ -9,7 +9,7 @@
 //
 //   2. "abc" (3 bytes):
 //        block: "abc" || 0x80 || 0x00 × 52 || (64-bit BE length = 24)
-//        digest: ba7816bf8f01cfea414140de5dae2223b00361a3396177a9cb410ff61f20015a
+//        digest: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 //
 //   3. 56-byte "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
 //        block 1: message bytes || 0x80 || 0x00 × 7
@@ -46,6 +46,7 @@ module tb_sha256_core;
     sha256_core dut (
         .i_clk    (clk),
         .i_rst    (rst),
+        .i_tick   (1'b1),   // M12 clock-enable: advance every cycle here
         .i_init   (init),
         .i_start  (start),
         .i_block  (block),
@@ -147,9 +148,9 @@ module tb_sha256_core;
             32'h 00000000, 32'h 00000000, 32'h 00000000, 32'h 00000000,
             32'h 00000000, 32'h 00000000, 32'h 00000000, 32'h 00000018
         });
-        // Canonical SHA256("abc") = ba7816bf_..._1f20015a (byte stream).
+        // Canonical SHA256("abc") = ba7816bf_..._f20015ad (byte stream).
         check_digest(2,
-            256'h 1f20015a_cb410ff6_396177a9_b00361a3_5dae2223_414140de_8f01cfea_ba7816bf);
+            256'h f20015ad_b410ff61_96177a9c_b00361a3_5dae2223_414140de_8f01cfea_ba7816bf);
 
         // ---- Vector 3: 56-byte "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" ----
         // Block 1: message bytes (M[0..13]) + 0x80 padding at byte 56 (M[14] hi byte)

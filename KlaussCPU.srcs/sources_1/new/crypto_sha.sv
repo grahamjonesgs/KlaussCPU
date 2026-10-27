@@ -234,7 +234,8 @@ module crypto_sha (
         .o_digest (w_digest_core)
     );
 
-    // Sticky DONE flag — set when core asserts done, cleared on next INIT/START.
+    // Sticky DONE flag — set when a software compression completes (busy
+    // falls), cleared on the next INIT/START write.
     // Gated by !w_hmac_busy so HMAC-FSM-driven SHA passes don't visibly mutate
     // the software-facing DONE bit.
     logic r_done_latch;
@@ -265,9 +266,13 @@ module crypto_sha (
             r_hmac_keyzero_pulse <= 1'b0;
             r_h_load_pulse       <= 1'b0;
 
-            // Sticky DONE — only reflect software-driven SHA ops, not the
-            // HMAC FSM's internal midstate-computation passes.
-            if (w_core_done && !w_hmac_busy)
+            // Sticky DONE — set when a software-driven compression finishes
+            // (busy falls with the HMAC FSM idle), not by the HMAC FSM's
+            // internal midstate passes.  Edge-triggered rather than following
+            // the core's sticky o_done, which stays high until the core takes
+            // the next INIT/START on a tick: that re-set DONE right after a
+            // KEY_LOAD or a START write cleared it.
+            if (r_core_busy_q && !w_core_busy && !w_hmac_busy)
                 r_done_latch <= 1'b1;
 
             if (mmio.write_DV) begin
@@ -372,7 +377,12 @@ module crypto_sha (
                     r_hmac_fsm         <= HMAC_WAIT_I;
                 end
                 HMAC_WAIT_I: begin
-                    if (w_core_done) begin
+                    // Wait for THIS pass to finish: busy falling.  o_done is
+                    // sticky until the core accepts the next INIT/START on a
+                    // tick, so when KEY_LOAD's INIT lands off-tick the PREVIOUS
+                    // operation's done is still high here and would latch its
+                    // H as the inner midstate (wrong HMAC ~50% of the time).
+                    if (r_core_busy_q && !w_core_busy) begin
                         r_inner_state          <= w_digest_core;
                         r_hmac_init_pulse      <= 1'b1;    // INIT outer pass
                         r_hmac_use_outer_block <= 1'b1;
@@ -384,7 +394,7 @@ module crypto_sha (
                     r_hmac_fsm         <= HMAC_WAIT_O;
                 end
                 HMAC_WAIT_O: begin
-                    if (w_core_done) begin
+                    if (r_core_busy_q && !w_core_busy) begin   // as HMAC_WAIT_I
                         r_outer_state          <= w_digest_core;
                         r_hmac_key_valid       <= 1'b1;
                         r_hmac_use_outer_block <= 1'b0;

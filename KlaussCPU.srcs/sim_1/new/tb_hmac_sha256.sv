@@ -38,6 +38,7 @@ module tb_hmac_sha256;
     sha256_core dut (
         .i_clk    (clk),
         .i_rst    (rst),
+        .i_tick   (1'b1),   // M12 clock-enable: advance every cycle here
         .i_init   (init),
         .i_start  (start),
         .i_block  (block),
@@ -175,11 +176,12 @@ module tb_hmac_sha256;
         //   M[14] = 0
         //   M[15] = 0x00000300
         pulse_hload(outer_state);
+        // o_digest is {H[7],...,H[0]}: M[0] = H[0] is the LOW word.
         feed_block({
-            inner_digest[255:224], inner_digest[223:192],
-            inner_digest[191:160], inner_digest[159:128],
-            inner_digest[127:96],  inner_digest[95:64],
-            inner_digest[63:32],   inner_digest[31:0],
+            inner_digest[31:0],    inner_digest[63:32],
+            inner_digest[95:64],   inner_digest[127:96],
+            inner_digest[159:128], inner_digest[191:160],
+            inner_digest[223:192], inner_digest[255:224],
             32'h 80000000, 32'h 00000000, 32'h 00000000, 32'h 00000000,
             32'h 00000000, 32'h 00000000, 32'h 00000000, 32'h 00000300
         });
