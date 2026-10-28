@@ -1389,7 +1389,11 @@ module pipeline_core
    // LCD port
    assign lcd_byte = (ex_d.len == 2'b01) ? ex_a[7:0] : ex_var1[7:0];
    assign lcd_dc   = ex_d.lcd_is_data;
-   assign lcd_dv   = ex_is_lcd && lcd_ready;
+   // Strobe only on the edge the LCD op leaves EX, as LCDRST does: while MEM
+   // is busy EX holds, and a strobe then (with lcd_ready dropping behind it,
+   // so ex_busy keeps the op in EX) sent the byte twice; a taken fused branch
+   // or an EX squash kills the op, so it must not send.
+   assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !sq_ex;
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -2045,6 +2049,7 @@ module pipeline_core
             ex_valid   <= 1'b0;
             id_valid   <= 1'b0;
             dly_on     <= 1'b0;
+            div_ph     <= MD_IDLE;   // a wrong-path DIV in EX may have started
             fetch_halt <= 1'b0;
          end
 
@@ -2076,9 +2081,17 @@ module pipeline_core
             // refetched: stale execution, then a deadlock when the ID op
             // dispatched this edge was a serializer that set fetch_halt).
             if (sq_ex) mem_valid <= 1'b0;
-            ex_valid   <= 1'b0;
+            // Only the ID op hit (!sq_ex): the EX op is older than it and
+            // stays.  Normally it advanced into MEM on this edge, so EX holds
+            // the squashed ID op and is cleared; but a busy multicycle op
+            // (DIV/MUL, DELAY, LCD) did not advance and must be kept — clearing
+            // it here dropped it, and the refetch starts after it (at id_pc).
+            if (sq_ex || !ex_busy) ex_valid <= 1'b0;
+            if (sq_ex) begin
+               dly_on <= 1'b0;
+               div_ph <= MD_IDLE;   // the squashed DIV may have started
+            end
             id_valid   <= 1'b0;
-            dly_on     <= 1'b0;
             ifb_val    <= 2'b00;
             ev_pcz     = 1'b1;
             pc         <= sq_ex ? ex_pc : id_pc;

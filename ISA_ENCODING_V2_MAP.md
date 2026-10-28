@@ -59,7 +59,7 @@ class-4 embedded-count forms).
   7=MIN 8=MAX 9=MINU 10=MAXU 14=LEA 15=MOV), `[21]` F (flags), `[20]` SGN
   (class 2: sign- vs zero-extend imm32).
 - **Class 3 (compare)**: `[25:23]` PRED (0=EQ 1=LT 2=LE 3=ULT 4=ULE),
-  `[22]` INV, `[21]` B (0=flag-setting CMP: writes E/L/U; 1=boolean rd=0/1),
+  `[22]` INV, `[21]` B (0=flag-setting CMP: writes Z/S/C/V; 1=boolean rd=0/1),
   `[20]` SGN (imm form). v3: `[19]` W (32-bit compare; reg form and 2-word
   form only) — §7.3; `LEN=01 SGN=1 B=0` is the short CMPRV — §7.1.
 - **Class 4 (shift/bit)**: `[25:22]` OP (0=SHL 1=SHR 2=SAR 3=ROL 4=ROR 5=RCL
@@ -128,8 +128,8 @@ are emitted as `rd == rs1`.
 
 | Symbol | Template | Regs | Flags/result | v1 opcode |
 |---|---|---|---|---|
-| CMPRR  | `0x4C00_0000` | rs1,rs2 | E,L,U | 0x0000_05xx |
-| CMPRV  | `0x8C10_0000` | rs1,imm32 sext | E,L,U | 0x0000_083x (reg was [3:0]) |
+| CMPRR  | `0x4C00_0000` | rs1,rs2 | Z,S,C,V | 0x0000_05xx |
+| CMPRV  | `0x8C10_0000` | rs1,imm32 sext | Z,S,C,V | 0x0000_083x (reg was [3:0]) |
 | CMPEQR | `0x4C20_0000` | rd,rs1,rs2 | rd=0/1 | 0x0030_0xxx |
 | CMPNER | `0x4C60_0000` | rd,rs1,rs2 | rd=0/1 | 0x0031_0xxx |
 | CMPLTR | `0x4CA0_0000` | rd,rs1,rs2 | rd=0/1 | 0x0032_0xxx |
@@ -345,15 +345,22 @@ CALLR 0x0000_407x. Rel O/NO variants remain unassigned, as in v1.)
 6. **Old binaries fail fast**: any v1 word 0 has bits [31:30] = 00 → LEN=00
    → ERR_INV_OPCODE crash dump on the first instruction.
 7. **Unassigned = trap.** Reserved classes, unassigned OP/attribute
-   combinations, and non-zero unused register/x fields all trap. The free
-   combinations the plan mentions (LDIDX32_S, MULHV, boolean compare-imm,
-   conditional indirect branches, SETF, …) are NOT implemented in this
-   checkpoint build.
-8. **Deferred semantic cleanups** (kept at v1 behaviour for this build,
-   revisit in the simplification pass): CMP does not drive Z (E flag and
-   JMPE/JMPNE stay); BTST-imm is flag-only while BTSTRR writes rd; SETFR
+   combinations, and non-zero unused register/x fields all trap. The
+   combinations the plan listed as free (LDIDX32_S, MULHV, the boolean
+   compare-immediate, conditional indirect branches, …) were not decoded
+   by the first checkpoint build. The field-driven decode has since made
+   them legal: §5 lists them, `pipeline_core.sv` (`f_decode_raw`)
+   implements them, and LLVM emits several of them (LDIDX32_S and the
+   other sign-extending loads, the boolean compare-immediates `CMPxxV`, the
+   sub-word reg+reg and absolute loads and stores). An encoding that is in
+   none of §3, §5 and §7 still traps. SETF (writing the flags from a
+   register) was never added; only GETF (`SETFR`) exists.
+8. **Deferred semantic cleanups** (kept at v1 behaviour, revisit in the
+   simplification pass): BTST-imm is flag-only while BTSTRR writes rd; SETFR
    still exposes only Z/E/C/V in the top nibble; rotates by N≠1 do not
-   update carry.
+   update carry. (CMP no longer differs: since the flag unification
+   (FLAG_UNIFICATION_CHANGES.md) only Z/S/C/V are stored, the flag-form CMP
+   writes all four, and E/L/U are derived — E = Z, so JMPE/JMPNE test Z.)
 9. **Retired v1 opcodes** (already MMIO, not re-encoded): LED/7-seg/RGB
    (0x3000/0x306x/0x307x), TXMEM/TXSTRMEM (0x5002/0x5003), UART ops.
 
