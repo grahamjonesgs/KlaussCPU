@@ -65,6 +65,13 @@ module KlaussCPU #(
     output     [ 1:0] ETH_TXD,
     output            ETH_REFCLK,          // 50 MHz to PHY (driven via ODDR from clk_50)
 
+    // VGA connector (12-bit resistor DAC; VGA_PLAN.md)
+    output     [ 3:0] VGA_R,
+    output     [ 3:0] VGA_G,
+    output     [ 3:0] VGA_B,
+    output            VGA_HS,
+    output            VGA_VS,
+
     // DDR2 Physical Interface Signals
     //Inouts
     inout [15:0] ddr2_dq,
@@ -241,8 +248,11 @@ module KlaussCPU #(
    //              `interrupt` = OR of (EV_PENDING & EV_ENABLE); level — the ISR
    //              must W1C RX_/TX_EV_PENDING before IRET). Only while core 1
    //              owns the MAC (C2_ETH_OWNER clear).
-   // w_irq_sel picks the source to dispatch: timer (0) > blitter (1) > eth (2).
-   // Source 3 remains free — OR it in here.
+   //   source 3 = VGA vsync (w_vga_irq = VSYNC_PENDING & VSYNC_IRQ_EN, set at
+   //              the start of vblank; level — the ISR must W1C VGA_STATUS[1]
+   //              before IRET).
+   // w_irq_sel picks the source to dispatch: timer (0) > blitter (1) > eth (2)
+   // > vga (3).
    // M5d: the pipeline core owns int_mask; the FSM's st.int_mask is retired
    // from the gating (kept in st only as a dormant field).
    wire [3:0] pip_int_mask;
@@ -257,8 +267,10 @@ module KlaussCPU #(
    wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
    logic r_eth_irq;   // registered LiteEth interrupt (driven after the LiteEth instance)
    wire w_irq_src2  = r_eth_irq         && (r_interrupt_table[2] != 32'h0) && pip_int_mask[2];
-   wire w_irq_ready = w_irq_src0 || w_irq_src1 || w_irq_src2;
-   wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : w_irq_src1 ? 2'd1 : 2'd2;
+   wire w_vga_irq;    // VGA vsync — driven at the vga_ctrl instance
+   wire w_irq_src3  = w_vga_irq         && (r_interrupt_table[3] != 32'h0) && pip_int_mask[3];
+   wire w_irq_ready = w_irq_src0 || w_irq_src1 || w_irq_src2 || w_irq_src3;
+   wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : w_irq_src1 ? 2'd1 : w_irq_src2 ? 2'd2 : 2'd3;
 
    // Free-running millisecond counter (since LOAD_COMPLETE). 64-bit so it
    // takes ~5.8e8 years to wrap at 100 MHz. Read-only via MMIO 0xF00F_0040.
@@ -822,6 +834,53 @@ module KlaussCPU #(
    assign w_blit_read_data = blit_bus.read_data;
 
    // -------------------------------------------------------------------------
+   // VGA output — device id 0x011. 640x480@60 on the ui_clk domain (25 MHz
+   // pixel CE). Registers, palette and the vsync IRQ (source 3); see
+   // vga_ctrl.sv and VGA_PLAN.md.
+   // -------------------------------------------------------------------------
+   wire        w_vga_sel      = (w_mmio_addr[27:16] == 12'h011);
+   wire        w_vga_write_DV = w_mmio_write_DV & w_vga_sel;
+   wire        w_vga_read_DV  = w_mmio_read_DV  & w_vga_sel;
+   wire [63:0] w_vga_read_data;
+   // (w_vga_irq declared near the IRQ source gating at the top of the module)
+
+   mmio_if vga_bus();
+   assign vga_bus.write_DV   = w_vga_write_DV;
+   assign vga_bus.read_DV    = w_vga_read_DV;
+   assign vga_bus.addr       = w_mmio_addr;
+   assign vga_bus.write_data = w_mmio_write_data;
+   assign vga_bus.byte_en    = w_mmio_byte_en;
+   // DDR master D (scanout) wires to mem_read_write (instantiated below).
+   wire         w_vga_dma_req;
+   wire         w_vga_dma_done;
+   wire         w_vga_dma_read_DV;
+   wire [31:0]  w_vga_dma_addr;
+   wire [255:0] w_vga_dma_read_data;
+   wire         w_vga_dma_ready;
+   wire         w_vga_dma_grant;
+
+   (* KEEP_HIERARCHY = "yes" *)
+   vga_ctrl vga_ctrl_i (
+       .i_Clk   (i_Clk),
+       .i_Rst_L (~w_reset_H),
+       .mmio    (vga_bus),
+       .o_irq   (w_vga_irq),
+       .o_dma_req      (w_vga_dma_req),
+       .o_dma_done     (w_vga_dma_done),
+       .o_dma_read_DV  (w_vga_dma_read_DV),
+       .o_dma_addr     (w_vga_dma_addr),
+       .i_dma_read_data(w_vga_dma_read_data),
+       .i_dma_ready    (w_vga_dma_ready),
+       .i_dma_grant    (w_vga_dma_grant),
+       .o_vga_r (VGA_R),
+       .o_vga_g (VGA_G),
+       .o_vga_b (VGA_B),
+       .o_vga_hs(VGA_HS),
+       .o_vga_vs(VGA_VS)
+   );
+   assign w_vga_read_data = vga_bus.read_data;
+
+   // -------------------------------------------------------------------------
    // AMP core 2 — device id 0x010.  A second pipeline_core at effective
    // 50 MHz (ce/2 + blanket multicycle, the M12 Stage-C pattern) with a 64 KB
    // local BRAM and a log FIFO, controlled by core 1 through this window.
@@ -957,10 +1016,11 @@ module KlaussCPU #(
          12'h00C: r_mmio_read_data_comb = w_trng_read_data; // Crypto: TRNG
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h010: r_mmio_read_data_comb = w_c2_read_data;   // AMP core 2 mailbox
+         12'h011: r_mmio_read_data_comb = w_vga_read_data;  // VGA output
          12'h00F: begin  // Interrupt controller / timer
             case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
-               16'h0008: r_mmio_read_data_comb = {61'b0, r_eth_irq, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter, [2]=eth
+               16'h0008: r_mmio_read_data_comb = {60'b0, w_vga_irq, r_eth_irq, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter, [2]=eth, [3]=vga vsync
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
                16'h0020: r_mmio_read_data_comb = {32'b0, r_interrupt_table[2]};
@@ -1095,6 +1155,15 @@ module KlaussCPU #(
        .o_c2_read_data(w_c2_ddr_read_data),
        .o_c2_ready(w_c2_ddr_ready),
        .o_c2_grant(w_c2_ddr_grant),
+
+       // DDR master D — VGA scanout (read-only wide reads; first among DMA masters).
+       .i_vga_req(w_vga_dma_req),
+       .i_vga_done(w_vga_dma_done),
+       .i_vga_read_DV(w_vga_dma_read_DV),
+       .i_vga_addr(w_vga_dma_addr),
+       .o_vga_read_data(w_vga_dma_read_data),
+       .o_vga_ready(w_vga_dma_ready),
+       .o_vga_grant(w_vga_dma_grant),
 
        // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
        .i_flush_go(w_cache_flush_go),

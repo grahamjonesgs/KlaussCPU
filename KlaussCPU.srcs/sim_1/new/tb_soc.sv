@@ -228,6 +228,7 @@ module tb_soc;
       .ETH_MDC(ETH_MDC), .ETH_MDIO(), .ETH_RSTN(ETH_RSTN),
       .ETH_CRSDV(1'b0), .ETH_RXERR(1'b0), .ETH_RXD(2'b00),
       .ETH_TXEN(ETH_TXEN), .ETH_TXD(ETH_TXD), .ETH_REFCLK(ETH_REFCLK),
+      .VGA_R(), .VGA_G(), .VGA_B(), .VGA_HS(), .VGA_VS(),
       .ddr2_dq(ddr2_dq), .ddr2_dqs_n(ddr2_dqs_n), .ddr2_dqs_p(ddr2_dqs_p),
       .ddr2_addr(ddr2_addr), .ddr2_ba(ddr2_ba),
       .ddr2_ras_n(), .ddr2_cas_n(), .ddr2_we_n(),

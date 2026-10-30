@@ -182,6 +182,11 @@ module tb_cache;
    wire           dma_ready, dma_grant;
    logic          flush_go = 0, inval_go = 0;
    wire           mnt_busy;
+   // VGA scanout master D (read-only, wide 32 B reads)
+   logic          vga_req = 0, vga_done = 0, vga_r = 0;
+   logic  [31:0]  vga_addr = 0;
+   wire  [255:0]  vga_rdata;
+   wire           vga_ready, vga_grant;
 
    mem_read_write dut (
       .i_Clk_board(clk),
@@ -198,6 +203,12 @@ module tb_cache;
       .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
       .i_dma_addr(dma_addr), .i_dma_write_data(dma_wdata), .i_dma_wdf_mask(16'h0),
       .o_dma_read_data(dma_rdata), .o_dma_ready(dma_ready), .o_dma_grant(dma_grant),
+      .i_c2_req(1'b0), .i_c2_done(1'b0), .i_c2_write_DV(1'b0), .i_c2_read_DV(1'b0),
+      .i_c2_addr(32'h0), .i_c2_write_data(128'h0), .i_c2_wdf_mask(16'h0),
+      .o_c2_read_data(), .o_c2_ready(), .o_c2_grant(),
+      .i_vga_req(vga_req), .i_vga_done(vga_done), .i_vga_read_DV(vga_r),
+      .i_vga_addr(vga_addr), .o_vga_read_data(vga_rdata), .o_vga_ready(vga_ready),
+      .o_vga_grant(vga_grant),
       .i_flush_go(flush_go), .i_inval_go(inval_go), .o_mnt_busy(mnt_busy)
    );
 
@@ -275,6 +286,25 @@ module tb_cache;
       grant_q <= dma_grant;
       imp_q   <= dut.is_miss_path;
       mnt_q   <= dut.r_mnt_active;
+   end
+
+   // 3) The VGA grant may rise only out of a cycle with no miss in flight and
+   //    the maintenance walk (if any) parked at its between-sets point; and no
+   //    two grants are ever up together.
+   logic vgrant_q = 0, vga_ok_q = 0;
+   integer vga_grants_in_walk = 0;
+   always @(posedge clk) begin
+      if (vga_grant && !vgrant_q) begin
+         if (!vga_ok_q) begin
+            errors++; $display("FAIL monitor: VGA grant rose during miss / mid-walk writeback (t=%0t)", $time);
+         end
+         if (dut.state == dut.MAINT) vga_grants_in_walk++;
+      end
+      if ((vga_grant + dma_grant) > 1) begin
+         errors++; $display("FAIL monitor: VGA and blitter grants overlap (t=%0t)", $time);
+      end
+      vgrant_q <= vga_grant;
+      vga_ok_q <= !dut.is_miss_path && (dut.state != dut.MAINT || dut.r_mnt_sub == dut.MS_READ);
    end
 
    // -------------------------------------------------------------------------
@@ -391,6 +421,39 @@ module tb_cache;
          repeat (2) @(negedge clk);
          dma_done = 1; @(negedge clk); dma_done = 0;
          dma_req = 0;
+      end
+   endtask
+
+   // -------------------------------------------------------------------------
+   // VGA scanout driver: one tenure of n consecutive wide 32 B reads from a,
+   // compared against the scoreboard (the cache-line layout: dword at byte
+   // offset 8k in bits [255-64k -: 64]).  Same shape vga_scanout.sv uses:
+   // DV low for a cycle between reads, done 2 cycles after the last ready.
+   // -------------------------------------------------------------------------
+   integer vga_reads = 0;
+   logic   v2_cpu_done = 0;
+   task vga_burst(input [31:0] a, input integer n);
+      logic [255:0] line;
+      begin
+         @(negedge clk); vga_req = 1;
+         while (!vga_grant) @(negedge clk);
+         for (int i = 0; i < n; i++) begin
+            vga_addr = a + 32'(i) * 32; vga_r = 1;
+            @(negedge clk);
+            while (!vga_ready) @(negedge clk);
+            line  = vga_rdata;
+            vga_r = 0;
+            @(negedge clk);
+            for (int k = 0; k < 4; k++)
+               if (line[255 - 64*k -: 64] !== sb_rd(vga_addr + 32'(8*k))) begin
+                  errors++;
+                  $display("FAIL vga read %h dw%0d: got %h want %h", vga_addr, k,
+                           line[255 - 64*k -: 64], sb_rd(vga_addr + 32'(8*k)));
+               end
+            vga_reads++;
+         end
+         @(negedge clk);
+         vga_done = 1; vga_req = 0; @(negedge clk); vga_done = 0;
       end
    endtask
 
@@ -640,6 +703,63 @@ module tb_cache;
       if (d !== 64'hA5A5_0123_4567_89AB) begin
          errors++; $display("FAIL midwalk-inval: got %h (request dropped)", d);
       end else $display("PASS midwalk-inval-rearmed");
+
+      // ===== Phase V1: VGA wide-read layout =================================
+      // CPU writes four distinct dwords into one line, flushes them to DDR,
+      // then one VGA read must return them in cache-line order.
+      $display("Phase V1: VGA master D wide-read layout");
+      for (int k = 0; k < 4; k++)
+         cpu_write(32'h0060_0000 + 32'(8*k), 64'hA0A0_0000_0000_0000 | 64'(k), 8'hFF);
+      do_flush;
+      vga_burst(32'h0060_0000, 1);
+      check_read(32'h0060_0010);                     // cache still sane after
+
+      // ===== Phase V2: VGA vs CPU thrash + blitter + a dirty flush walk =====
+      // Scanout-shaped traffic (4-read tenures over a 640 B line region) runs
+      // against everything else.  VGA data is checked against the scoreboard,
+      // so the VGA region is only ever written via flushed CPU stores (below,
+      // before the fork).  The walk must let VGA in at MS_READ.
+      $display("Phase V2: VGA concurrent with CPU, blitter and a flush walk");
+      v2_cpu_done = 0;
+      for (int k = 0; k < 80; k++)
+         cpu_write(32'h0061_0000 + 32'(8*k), {$urandom, $urandom}, 8'hFF);
+      do_flush;
+      fork
+         begin
+            for (int m = 0; m < 200; m++) begin
+               automatic logic [31:0] ca;
+               ca = {15'b0, 2'($urandom), 10'h010, 5'b0}
+                    | (32'($urandom & 1) << 5) | (32'($urandom & 3) << 3);
+               if (($urandom & 3) == 0) check_read(ca);
+               else cpu_write(ca, {$urandom, $urandom}, (8'($urandom) | 8'h01));
+            end
+            // dirty a spread of sets, then flush while VGA is streaming
+            for (int m = 0; m < 64; m++)
+               cpu_write(32'h0008_0000 + 32'(m) * 32, {$urandom, $urandom}, 8'hFF);
+            do_flush;
+            v2_cpu_done = 1;
+         end
+         begin
+            for (int m = 0; m < 10; m++) begin
+               automatic logic [127:0] dv, dr;
+               dv = {$urandom, $urandom, $urandom, $urandom};
+               dma_write(32'h0044_0000 + 32'(m) * 16, dv);
+               dma_read(32'h0044_0000 + 32'(m) * 16, dr);
+               if (dr !== dv) begin
+                  errors++; $display("FAIL V2 dma round-trip: got %h want %h", dr, dv);
+               end
+            end
+         end
+         begin
+            for (int m = 0; !v2_cpu_done; m++)          // stream until the walk is over
+               vga_burst(32'h0061_0000 + 32'(m % 5) * 128, 4);
+         end
+      join
+      $display("  VGA reads: %0d, VGA grants during a maintenance walk: %0d",
+               vga_reads, vga_grants_in_walk);
+      if (vga_grants_in_walk == 0) begin
+         errors++; $display("FAIL V2: VGA was never granted inside a maintenance walk");
+      end
 
       // ===== Phase H: final image equality ==================================
       // Flush everything, then the fake DDR must equal the scoreboard on every

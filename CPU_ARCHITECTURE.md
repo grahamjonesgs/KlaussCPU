@@ -378,10 +378,11 @@ timers and performance counters. See MMIO_MAP.md. The v1 UART/LED opcodes
 ### 13.1 Interrupt model
 
 Up to 4 sources: 0 = periodic timer, 1 = blitter DONE, 2 = Ethernet,
-3 = reserved. When several are pending, the priority is
-timer > blitter > Ethernet. Configuration is all MMIO at `0xF00F_0000`
-(`INT_MASK`, `INT_PENDING`, `INT_VECn`, `TIMER_PERIOD`, … — see MMIO_MAP.md).
-The only interrupt opcode is `IRET`.
+3 = VGA vsync (start of vblank). When several are pending, the priority is
+timer > blitter > Ethernet > VGA. Sources 1–3 are level-triggered: the
+handler must clear the device's pending bit before `IRET`. Configuration
+is all MMIO at `0xF00F_0000` (`INT_MASK`, `INT_PENDING`, `INT_VECn`,
+`TIMER_PERIOD`, … — see MMIO_MAP.md). The only interrupt opcode is `IRET`.
 
 A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`.
 
