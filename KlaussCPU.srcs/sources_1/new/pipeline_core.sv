@@ -120,7 +120,8 @@ module pipeline_core
       U_ENTER, U_LEAVE, U_LEAVERET,     // ISA v3 C
       U_FBR,                            // ISA v3 B fused compare-and-branch
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
-      U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST
+      U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST,
+      U_DI, U_EI                        // HW proposal 7a: interrupt disable/enable
    } uop_e;
 
    typedef struct packed {
@@ -157,6 +158,11 @@ module pipeline_core
    flags_t      flags;
    logic [31:0] sp;
    logic [3:0]  int_mask;
+   // HW proposal 7a: core-internal interrupt DISABLE bit (DI sets it, EI
+   // writes it from rs1[0]).  1 = no IRQ is taken at a dispatch boundary.
+   // Saved at frame bit [43] on IRQ entry and restored by IRET; the
+   // DISABLE sense keeps software-built frames (bit 43 = 0) enabled.
+   logic        irq_dis;
    logic [31:0] pc;
    logic        running;        // fetch enabled
    logic        fetch_halt;     // serialize op in flight — hold fetch
@@ -199,6 +205,10 @@ module pipeline_core
    wire dbg_stop   = DEBUG_EN && (dbg_i.halt_req || dbg_watch_req || dbg_step_done);
    // single-steps never take interrupts (and do not wake a WAIT)
    wire irq_ok     = irq_ready && !(DEBUG_EN && dbg_stepping);
+   // HW proposal 7a: an IRQ is TAKEN only while not disabled (committed
+   // bit; a DI still in flight is caught by the drain-time re-check). WAIT
+   // still wakes on irq_ok, WFI-style, so "DI; test; WAIT" cannot deadlock.
+   wire irq_take   = irq_ok && !(EN_DIEI && irq_dis);
    wire dbg_bp_hit = DEBUG_EN && !dbg_skip &&
                      |(dbg_i.bp_en & {dbg_i.bp_addr[3] == pc, dbg_i.bp_addr[2] == pc,
                                       dbg_i.bp_addr[1] == pc, dbg_i.bp_addr[0] == pc});
@@ -278,6 +288,9 @@ module pipeline_core
    // and the 2-word FBR with a sext(imm32) right-hand side.  0 = both trap
    // (the pre-proposal decode).
    localparam bit EN_FBR_W = 1'b1;
+   // HW proposal 7a (§2.7): DI rd / EI rs1, class B system OP 6 / 7.
+   // 0 = both trap and irq_dis stays 0.
+   localparam bit EN_DIEI = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -687,7 +700,17 @@ module pipeline_core
             end
          end
          4'hB: begin // system
-            if (op[25:22] == 4'h0 && op[15:8] == 8'h0 && op[3:0] == 4'h0) begin
+            if (EN_DIEI && len == 2'b01 && op[25:22] == 4'h0 && op[21:17] == 5'd3 &&
+                         op[15:12] == 4'h0 && op[3:0] == 4'h0) begin
+               // HW proposal 7a: OP 6 = DI rd (rd = old ENABLE bit, 0/1; then
+               // disable), OP 7 = EI rs1 (enable = rs1[0]), so DI r ; ... ;
+               // EI r restores the previous state.
+               if (!op[16] && op[7:4] == 4'h0) begin
+                  d.legal = 1'b1; d.uop = U_DI; d.wreg = 1'b1;
+               end else if (op[16] && op[11:8] == 4'h0) begin
+                  d.legal = 1'b1; d.uop = U_EI; d.use_rs1 = 1'b1;
+               end
+            end else if (op[25:22] == 4'h0 && op[15:8] == 8'h0 && op[3:0] == 4'h0) begin
                if (len == 2'b01) begin
                   case (op[21:16])
                      6'd0: if (op[7:4] == 4'h0) begin d.legal = 1'b1; d.uop = U_NOP; end
@@ -1002,6 +1025,14 @@ module pipeline_core
    end
    wire [1:0]  ex_bcvt_t = f_cond_eval(flags_eff, ex_d.bcond, ex_d.binv);
 
+   // HW proposal 7a: the disable bit as seen by the instruction in EX — the
+   // youngest older writer in MEM (DI/EI) or WB (DI/EI/IRET), else the
+   // committed bit.  All register-sourced.
+   logic        mem_dis_we, mem_dis_new;   // EX->MEM (DI/EI only)
+   logic        wb_dis_we,  wb_dis_new;    // MEM->WB (DI/EI/IRET)
+   wire ex_dis_eff = (mem_valid && mem_dis_we) ? mem_dis_new
+                   : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
+
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1197,6 +1228,7 @@ module pipeline_core
             end
          end
          U_RESET: begin exo_taken = 1'b1; exo_target = 32'h4; end
+         U_DI:    exo_result = {63'b0, !ex_dis_eff};   // old enable bit
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1426,7 +1458,8 @@ module pipeline_core
       if (rst) begin
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-         flags <= '0; sp <= SP_RESET; int_mask <= 4'h0;
+         flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
+         mem_dis_we <= 1'b0; wb_dis_we <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1529,7 +1562,8 @@ module pipeline_core
                   // inside the critical section / dispatch a spurious IRQ.
                   // All older stores have retired here (pipeline empty,
                   // mem_xc==0), so irq_ready is now final for this boundary.
-                  if (!irq_ready) begin
+                  if (!irq_ready || (EN_DIEI && irq_dis)) begin
+                     // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
                   end else begin
                      // Re-latch source+vector too: the drained stores may have
@@ -1537,7 +1571,7 @@ module pipeline_core
                      irq_sel_q  <= irq_sel;
                      irq_vec_q  <= irq_vector;
                      m_addr     <= sp - 32'd8;
-                     m_wdata    <= {21'b0, int_mask,
+                     m_wdata    <= {20'b0, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
                                     (flags.sign ^ flags.overflow), flags.carry,
@@ -1577,6 +1611,7 @@ module pipeline_core
             end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
+            if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
             if (wb_park) begin
                parked   <= 1'b1;
                park_kind <= wb_park_kind;
@@ -1913,6 +1948,8 @@ module pipeline_core
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
             wb_mask_new<= m_rdata[42:39];
+            wb_dis_we  <= mem_valid && (mem_dis_we || mem_d.uop == U_IRET);
+            wb_dis_new <= (mem_d.uop == U_IRET) ? m_rdata[43] : mem_dis_new;
             wb_park    <= mem_valid && (mem_d.uop == U_HALT || mem_d.uop == U_TRAP ||
                                         mem_d.uop == U_WAIT || mem_d.uop == U_ILL);
             wb_park_kind <= (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
@@ -1944,6 +1981,8 @@ module pipeline_core
                mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
+               mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
+               mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
                // EX redirect: taken branch/call, RESET
                if (ex_valid && exo_taken) begin
@@ -2003,7 +2042,7 @@ module pipeline_core
                                   : dbg_step_done ? DBG_CAUSE_STEP : DBG_CAUSE_REQ;
                      id_valid    <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
-                               && !(DEBUG_EN && dbg_active) && irq_ok) begin
+                               && !(DEBUG_EN && dbg_active) && irq_take) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
                      irq_active <= 1'b1;

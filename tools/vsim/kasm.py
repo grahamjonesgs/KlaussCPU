@@ -291,6 +291,12 @@ class Asm:
     def sys(self, op, rs1=0):
         return self.emit(H(1, 0xB) | op << 16 | rs1 << 4)
 
+    def di(self, rd):               # HW proposal 7a
+        return self.emit(H(1, 0xB) | 6 << 16 | rd << 8)
+
+    def ei(self, rs1):
+        return self.emit(H(1, 0xB) | 7 << 16 | rs1 << 4)
+
     def nop(self):  return self.sys(0)
     def halt(self): return self.sys(1)
     def wait(self): return self.sys(2)

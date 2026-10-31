@@ -110,6 +110,10 @@ def check(st, exp):
                 want = str(v)
         else:
             want = v
+        if want == 'nonzero':
+            if got is None or int(got, 16) == 0:
+                bad.append(f'{k}: got {got} want nonzero')
+            continue
         if got != want:
             bad.append(f'{k}: got {got} want {want}')
     return bad

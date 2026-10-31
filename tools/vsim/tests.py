@@ -147,3 +147,112 @@ def fbr_imm32_loop():
     a.nop()
     a.halt()
     return [(a, {'end': 'park', 'r1': 300, 'r2': 300 * 301 // 2}, [f'+LAT={l}']) for l in (1, 3, 9)]
+
+
+# ------------------------------------------------- HW proposal 7a: DI / EI
+CNT = 0x180000       # TB IRQ handler counter
+
+
+@test
+def diei_values():
+    a = Asm()
+    a.di(1)            # was enabled -> 1
+    a.di(2)            # back-to-back: sees the in-flight DI -> 0
+    a.ei(1)            # restore enabled (r1 = 1)
+    a.di(3)            # sees the in-flight EI -> 1
+    a.nop(); a.nop(); a.nop(); a.nop()
+    a.di(4)            # committed: 0
+    a.setr(5, 0)
+    a.ei(5)            # enable = 0: stays disabled
+    a.di(6)            # -> 0
+    a.setr(5, 3)       # bit 0 = 1
+    a.ei(5)
+    a.nop(); a.nop(); a.nop()
+    a.di(7)            # -> 1
+    a.ei(7)
+    a.alu('add', 8, 1, 3)   # forwarding of the DI result into an ALU op
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r1': 1, 'r2': 0, 'r3': 1, 'r4': 0,
+               'r6': 0, 'r7': 1, 'r8': 2}, []
+
+
+def _crit(use_di=True):
+    """IRQs every ~40 cycles; 300 critical sections each read the handler
+    counter at entry and exit (must be equal), with IRQs allowed between."""
+    a = Asm()
+    a.set_int_mask(1)
+    a.setr(10, CNT); a.setr(9, 0); a.setr(11, 300); a.setr(12, DATA)
+    a.label('top')
+    a.di(1) if use_di else a.nop()
+    a.ld(64, 2, 10)
+    for i in range(12):                 # ~critical work incl. memory ops
+        a.st(64, 2, 12, 8 * i)
+        a.inc(2)
+    a.ld(64, 3, 10)
+    a.ld(64, 4, 10)
+    a.ei(1) if use_di else a.nop()
+    a.alu('sub', 4, 4, 3)               # 0 unless the handler ran inside
+    a.alu('or', 9, 9, 4)
+    a.setr(7, 3)
+    a.label('gap')                      # interrupts allowed here
+    a.addi_s(7, 7, -1)
+    a.fbr('ne', 7, 0, 'gap', imm=True)
+    a.addi_s(11, 11, -1)
+    a.fbr('ne', 11, 0, 'top', imm=True)
+    a.ld(64, 8, 10)                     # total IRQs seen
+    a.halt()
+    return a
+
+
+@test
+def diei_irq_window():
+    out = []
+    # periods longer than the TB handler (~54 cycles): a faster timer starves
+    # the main program (pre-existing, unrelated to DI)
+    for lat in (1, 3, 7):
+        for per in (lat * 30 + 60, lat * 50 + 90, 401):
+            out.append((_crit(), {'end': 'park', 'kind': '0', 'r9': 0}, [f'+LAT={lat}', f'+IRQ_PERIOD={per}']))
+    return out
+
+
+@test
+def diei_irq_window_control():
+    """negative control: without DI/EI the window check must see handlers"""
+    return _crit(False), {'end': 'park', 'kind': '0', 'r9': 'nonzero'}, ['+LAT=3', '+IRQ_PERIOD=150']
+
+
+@test
+def diei_wait():
+    a = Asm()
+    a.setr(10, CNT)
+    a.di(1)
+    a.set_int_mask(1)
+    a.wait()               # disabled: wakes on the pending IRQ, no handler
+    a.ld(64, 2, 10)        # 0
+    a.ei(1)                # enable: the pending IRQ is taken now
+    for _ in range(6):
+        a.nop()
+    a.ld(64, 3, 10)        # 1
+    a.halt()
+    return [(a, {'end': 'park', 'kind': '0', 'r2': 0, 'r3': 1}, [f'+LAT={l}', '+IRQ_PERIOD=200'])
+            for l in (1, 3)]
+
+
+@test
+def diei_iret_frame():
+    a = Asm()
+    # hand-built frame: bit 43 = disabled, int_mask (bits 42:39) = 1, pc = 'back'
+    a.setr(1, 0)
+    a.leapc(2, 'back')
+    a.setr64(3, (1 << 43) | (1 << 39))
+    a.alu('or', 3, 3, 2)
+    a.push(3)
+    a.iret()
+    a.halt()                 # not reached
+    a.label('back')
+    a.di(4)                  # frame restored "disabled" -> 0
+    a.ei(4)                  # stays disabled
+    a.setr(5, 1); a.ei(5)
+    a.di(6)                  # -> 1
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r4': 0, 'r6': 1, 'int_mask': '1'}, []
