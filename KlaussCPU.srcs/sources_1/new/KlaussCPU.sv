@@ -189,6 +189,13 @@ module KlaussCPU #(
    logic [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
    logic [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
    logic        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
+   // Frame-record walk (F0..F5, HW proposals §3.4): the ABI keeps a record
+   // at R15 — [R15] = caller's R15, [R15+8] = return address.  Record k's
+   // base is R15 for k=0, else the saved R15 read by the previous record
+   // (r_hcf_fp, advanced from r_hcf_fp_nx after each record's second line).
+   // A base that is unaligned or outside DRAM prints the FF sentinel.
+   logic [31:0] r_hcf_fp, r_hcf_fp_nx;
+   // (w_fr_* decode wires: after r_register below)
 
    //load control
    //reg          o_ram_write_DV;
@@ -204,6 +211,12 @@ module KlaussCPU #(
 
    // Register control
    logic [63:0] r_register[15:0];
+   // §3.4 frame-record walk decode (see r_hcf_fp above)
+   wire  [6:0]  w_fr_k    = r_hcf_dump_phase - DUMP_FRAME_BASE;   // 0..5 in frame phases
+   wire         w_fr_ph   = (r_hcf_dump_phase >= DUMP_FRAME_BASE) &&
+                            (r_hcf_dump_phase <  DUMP_TRACE_BASE);
+   wire  [31:0] w_fr_base = (w_fr_k[2:1] == 2'd0) ? r_register[15][31:0] : r_hcf_fp;
+   wire         w_fr_bad  = (w_fr_base[2:0] != 3'd0) || (w_fr_base >= STACK_TOP - 32'd8);
 
    // Display value
    logic r_error_display_type;
@@ -1935,6 +1948,18 @@ rams_sp_nc rams_sp_nc1 (
                               st.mem_read_DV  <= 1'b1;
                               r_hcf_dump_sub <= 3'b011;
                            end
+                        end else if (w_fr_ph && !r_hcf_stack_loaded) begin
+                           // Frame record line (§3.4): even k reads the saved
+                           // R15 at base, odd k the return address at base+8.
+                           if (w_fr_bad) begin
+                              r_hcf_stack_data   <= 64'hFFFF_FFFF_FFFF_FFFF;
+                              r_hcf_stack_loaded <= 1'b1;
+                              if (!w_fr_k[0]) r_hcf_fp_nx <= 32'hFFFF_FFFF;
+                           end else begin
+                              st.mem_addr     <= w_fr_base + (w_fr_k[0] ? 32'd8 : 32'd0);
+                              st.mem_read_DV  <= 1'b1;
+                              r_hcf_dump_sub <= 3'b011;
+                           end
                         end else if (r_hcf_dump_phase == DUMP_V1H && !r_hcf_stack_loaded) begin
                            // Read DRAM at PC+8 to recover the hi32 of a 64-bit
                            // immediate (V64 encoding: lo32 at PC+4, hi32 at PC+8).
@@ -2011,11 +2036,14 @@ rams_sp_nc rams_sp_nc1 (
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE))
                          || ((r_hcf_dump_phase >= DUMP_STACK_BASE)
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
+                         || w_fr_ph
                          || (r_hcf_dump_phase == DUMP_V1H)
                          || (r_hcf_dump_phase == DUMP_OPCM)
                          || (r_hcf_dump_phase >= DUMP_TRACE_BASE)) begin
                            r_hcf_stack_loaded <= 1'b0;
                         end
+                        // §3.4: the next record's base is this record's saved R15
+                        if (w_fr_ph && w_fr_k[0]) r_hcf_fp <= r_hcf_fp_nx;
                         if (r_hcf_dump_phase == DUMP_FOOTER) begin
                            // After the footer line drains, drop into the BREAK
                            // sub-state to assert a UART break (line low for ~2.5
@@ -2036,6 +2064,7 @@ rams_sp_nc rams_sp_nc1 (
                      if (w_mem_ready) begin
                         r_hcf_stack_data   <= w_mem_read_data;
                         r_hcf_stack_loaded <= 1'b1;
+                        if (w_fr_ph && !w_fr_k[0]) r_hcf_fp_nx <= w_mem_read_data[31:0];
                         st.mem_read_DV      <= 1'b0;
                         r_hcf_dump_sub     <= 3'b000;
                      end

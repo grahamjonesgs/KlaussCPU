@@ -112,6 +112,25 @@ class Asm:
                 f.write(f'@{k:x} {mem[k]:016x}\n')
         return words
 
+    def write_boot_mem(self, path):
+        """dense boot-ROM image for tb_soc (netboot.mem format): dword 0 lo32 =
+        image byte length, dwords 1-3 zero, the program from 0x20."""
+        words = self.assemble()
+        mem = {}
+        for i, w in enumerate(words):
+            a = self.base + 4 * i
+            lo, hi = mem.get(a >> 3, (0, 0))
+            mem[a >> 3] = (w, hi) if not a & 4 else (lo, w)
+        dw = {k: (v[1] << 32) | v[0] for k, v in mem.items()}
+        for a, v in self.data.items():
+            dw[a >> 3] = v
+        n = max(dw) + 1
+        dw[0] = n * 8
+        with open(path, 'w') as f:
+            for k in range(n):
+                f.write(f'{dw.get(k, 0):016X}\n')
+        return words
+
     # ------------------------------------------------------------ ALU
     def alu(self, op, rd, rs1, rs2, w=False):
         o = ALU[op]

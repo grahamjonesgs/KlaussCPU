@@ -78,8 +78,10 @@ package klauss_pkg;
    localparam DUMP_INSTR      = 7'd10;  // INSTR=NNNNNNNN — instructions committed since program load
    localparam DUMP_REG_BASE   = 7'd11;  // R0..RF → phases 11..26
    localparam DUMP_STACK_BASE = 7'd27;  // S0..S3 → phases 27..30 (each preceded by a DDR2 read)
-   localparam DUMP_TRACE_BASE = 7'd31;  // T0..TF → phases 31..46 (newest-first)
-   localparam DUMP_FOOTER     = 7'd47;  // last phase; on completion → HCF_2
+   localparam DUMP_FRAME_BASE = 7'd31;  // F0..F5 → phases 31..36: three R15 frame records
+                                        // ([R15], [R15+8], then the caller's) — HW proposals §3.4
+   localparam DUMP_TRACE_BASE = 7'd37;  // T0..TF → phases 37..52 (newest-first)
+   localparam DUMP_FOOTER     = 7'd53;  // last phase; on completion → HCF_2
 
    // --- Architectural condition flags (r_flags) ----------------------------
    // The 7 CPU condition flags as one packed struct.  Fields are written/read

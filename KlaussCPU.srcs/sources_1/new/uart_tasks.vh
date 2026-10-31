@@ -67,8 +67,9 @@ endtask  // Send test message
 //   10          "INSTR=NNNNNNNN"
 //   11..26      "RX=NNNNNNNNNNNNNNNN"       16 register dumps (R0..RF)
 //   27..30      "SX=NNNNNNNNNNNNNNNN"       4 top-of-stack doublewords (S0..S3)
-//   31..46      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
-//   47          "*** END ***"
+//   31..36      "FX=NNNNNNNNNNNNNNNN"       3 R15 frame records (F0..F5: saved R15, return addr)
+//   37..52      "TX P=xxxxxxxx OP=xxxxxxxx" 16 trace entries (T0..TF, newest-first)
+//   53          "*** END ***"
 
 // Byte length of the dump line for the given phase.
 function [7:0] f_dump_length;
@@ -426,9 +427,13 @@ function [7:0] f_dump_byte;
                     // k is still derived from phase only, for the "RX=" label.
                     k    = phase[3:0] - DUMP_REG_BASE[3:0];
                     data = r_hcf_stack_data;
-                end else if (phase < DUMP_TRACE_BASE) begin
+                end else if (phase < DUMP_FRAME_BASE) begin
                     // Stack dump S0..S3 (data pre-fetched into r_hcf_stack_data)
                     k    = phase[3:0] - DUMP_STACK_BASE[3:0];
+                    data = r_hcf_stack_data;
+                end else if (phase < DUMP_TRACE_BASE) begin
+                    // Frame records F0..F5 (§3.4; DDR2-fetched like the stack)
+                    k    = phase[3:0] - DUMP_FRAME_BASE[3:0];
                     data = r_hcf_stack_data;
                 end else begin
                     // Trace dump T0..TF.  The r_trace_buf BRAM read is lifted
@@ -443,7 +448,8 @@ function [7:0] f_dump_byte;
                 if (phase < DUMP_TRACE_BASE) begin
                     // Reg/stack: "?X=NNNNNNNNNNNNNNNN\r\n"   (21 bytes)
                     case (pos)
-                        5'd0:  f_dump_byte = (phase < DUMP_STACK_BASE) ? "R" : "S";
+                        5'd0:  f_dump_byte = (phase < DUMP_STACK_BASE) ? "R"
+                                           : (phase < DUMP_FRAME_BASE) ? "S" : "F";
                         5'd1:  f_dump_byte = return_ascii_from_hex(k);
                         5'd2:  f_dump_byte = "=";
                         5'd3:  f_dump_byte = return_ascii_from_hex(data[63:60]);
