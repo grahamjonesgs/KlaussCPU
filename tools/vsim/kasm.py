@@ -165,6 +165,12 @@ class Asm:
         return self.emit(H(2, 2) | 14 << 22 | rd << 8,
                          lambda pc: u32(self._addr(tgt) - pc))
 
+    def leapc_s(self, rd, tgt):              # P9 LEAPC simm16 = {[19:12],[7:0]}
+        def enc(pc):
+            d = simm(self._addr(tgt) - pc, 16)
+            return H(1, 2) | 14 << 22 | 1 << 21 | (d >> 8) << 12 | rd << 8 | (d & 0xFF)
+        return self.emit(enc)
+
     # ------------------------------------------------------------ compare
     def cmp(self, rs1, rs2, w=False):
         return self.emit(H(1, 3) | (w << 19) | rs1 << 4 | rs2)
@@ -174,6 +180,9 @@ class Asm:
 
     def cmpi_s(self, rs1, imm8):
         return self.emit(H(1, 3) | 1 << 20 | simm(imm8, 8) << 12 | rs1 << 4)
+
+    def cmpi_s_w(self, rs1, imm8):          # P9 short CMPRVW (INV=1)
+        return self.emit(H(1, 3) | 1 << 22 | 1 << 20 | simm(imm8, 8) << 12 | rs1 << 4)
 
     def setcc(self, cond, rd, rs1, rs2, w=False):
         p, inv = CMP_PRED[cond]
@@ -299,6 +308,10 @@ class Asm:
 
     def mulv(self, rd, rs1, imm32, sgn=True):
         return self.emit(H(2, 0xA) | sgn << 23 | rd << 8 | rs1 << 4, u32(imm32))
+
+    def mulv_s(self, rd, rs1, imm8, sgn=True):   # P9 short MULV
+        v = simm(imm8, 8) if sgn else imm8 & 0xFF
+        return self.emit(H(1, 0xA) | 3 << 24 | sgn << 23 | v << 12 | rd << 8 | rs1 << 4)
 
     def div(self, rd, rs1, rs2, sgn=True):
         return self.emit(H(1, 0xA) | 1 << 24 | sgn << 23 | rd << 8 | rs1 << 4 | rs2)

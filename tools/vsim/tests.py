@@ -343,3 +343,72 @@ def ic_counters():
     a.fbr('ne', 1, 0, 'l', imm=True)
     a.halt()
     return a, {'end': 'park', 'kind': '0', 'ic_miss': '3', 'ic_fill': '15', 'bus_rd': '3'}, []
+
+
+# ------------------------------------------------- HW proposal 9: short forms
+M64 = 2**64 - 1
+
+
+@test
+def short_cmprvw():
+    """short CMPRVW simm8 sets the same flags as the 2-word CMPRVW"""
+    out = []
+    for v, imm in [(0x100000005, 5), (0xFFFFFFFD, 2), (0x7FFFFFFF, -1), (0x80000000, 127),
+                   (0x123400000000, 0), (5, 5), (3, -128), (0xFFFFFF80, -128)]:
+        for short in (False, True):
+            a = Asm()
+            a.setr64(1, v)
+            a.cmpi_s_w(1, imm) if short else a.cmpi(1, imm, w=True)
+            a.halt()
+            out.append((a, short, v, imm))
+    # reference flags from the 2-word form, run on the same core
+    import run
+    exe = run.build(None)
+    res = []
+    for a, short, v, imm in out:
+        if not short:
+            st, _ = run.run(exe, a, f'cmprvw_ref_{v:x}_{imm & 0xFF:x}')
+            ref = st['flags']
+        else:
+            res.append((a, {'end': 'park', 'kind': '0', 'flags': ref}, []))
+    return res
+
+
+@test
+def short_mulv():
+    out = []
+    for v, imm, sgn in [(7, 6, True), (7, -6, True), (-3 & M64, 100, True), (2**40 + 3, -128, True),
+                        (5, 0xF0, False), (2**63, 2, True), (0x123456789, 127, False)]:
+        a = Asm()
+        a.setr64(1, v)
+        a.mulv_s(2, 1, imm, sgn=sgn)
+        a.mulv(3, 1, imm if sgn else imm & 0xFF, sgn=sgn)   # 2-word reference
+        a.alu('sub', 4, 2, 3)
+        a.mulv_s(5, 1, imm, sgn=sgn)
+        a.halt()
+        sv = v - 2**64 if (sgn and v >> 63) else v
+        prod = (sv * (imm if sgn else imm & 0xFF)) & M64
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': prod, 'r3': prod, 'r4': 0, 'r5': prod}, []))
+    return out
+
+
+@test
+def short_leapc():
+    a = Asm()
+    a.label('top')
+    a.leapc_s(1, 'top')
+    a.leapc(2, 'top')
+    a.leapc_s(3, 'far')
+    a.leapc(4, 'far')
+    a.alu('sub', 5, 1, 2)
+    a.alu('sub', 6, 3, 4)
+    a.jmp('end')
+    for _ in range(3000):
+        a.nop()
+    a.label('far')
+    a.nop()
+    a.label('end')
+    a.leapc_s(7, 'top')          # backward ~12 KiB
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r1': 0x20, 'r2': 0x20, 'r5': 0, 'r6': 0,
+               'r3': a.labels['far'], 'r7': 0x20}, []

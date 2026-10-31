@@ -302,6 +302,12 @@ module pipeline_core
    // unaligned-tolerant form), byte and 64-bit accesses and the stack ops
    // keep their defined behaviour.  0 = the old silent align-down.
    localparam bit EN_MISAL_TRAP = 1'b1;
+   // HW proposal 9 (§2.9): the missing short forms — CMPRVW simm8 (class 3
+   // short with INV=1), MULV simm8 (class A OP=3, LEN=01, SGN [23]) and
+   // LEAPC simm16 (class 2 LEN=01 OP=14 F=1, simm16 = {[19:12],[7:0]}).
+   // All three trap today; 0 keeps it that way.  They add legs to
+   // f_short_imm on the w_op -> id_var1 latch path.
+   localparam bit EN_SHORT9 = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -445,7 +451,8 @@ module pipeline_core
                  (!op[19] || aluop <= 4'd1)) ||
                 (cls == 4'h2 && len == 2'b10 && op[18:12] == 7'h0 && op[3:0] == 4'h0 &&
                  (!op[19] || aluop == 4'd0)) ||
-                (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0)) begin  // v3 A5 short: imm8 [19:12]
+                (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0) ||   // v3 A5 short: imm8 [19:12]
+                (EN_SHORT9 && cls == 4'h2 && len == 2'b01 && aluop == 4'd14 && op[21:20] == 2'b10)) begin
                d.use_rs1 = 1'b1;  d.use_rs2 = (cls == 4'h1);
                case ({aluop, op[21]})
                   {4'd0,1'b1}, {4'd1,1'b1}, {4'd2,1'b1}, {4'd3,1'b1}: begin
@@ -463,6 +470,9 @@ module pipeline_core
                      end
                   end
                   {4'd14,1'b0}: if (cls == 4'h2) begin // LEAPC
+                     d.legal = 1'b1; d.uop = U_LEA; d.wreg = 1'b1; d.use_rs1 = 1'b0;
+                  end
+                  {4'd14,1'b1}: if (EN_SHORT9 && cls == 4'h2 && len == 2'b01) begin // P9 LEAPC simm16
                      d.legal = 1'b1; d.uop = U_LEA; d.wreg = 1'b1; d.use_rs1 = 1'b0;
                   end
                   {4'd15,1'b0}: if (cls == 4'h2) begin // MOV: SETR / zext-MOV
@@ -489,7 +499,9 @@ module pipeline_core
                      d.sub = 4'(f_cmp_op(op[25:23], op[22]));
                   end
                end else begin           // B=0: flag-setting CMP (= SUB, no wb)
-                  if (op[25:23] == 3'd0 && !op[22] && op[11:8] == 4'h0) begin
+                  // (P9: INV=1 on the SHORT form = the W compare, CMPRVW simm8)
+                  if (op[25:23] == 3'd0 && op[11:8] == 4'h0 &&
+                      (!op[22] || (EN_SHORT9 && len == 2'b01 && op[20]))) begin
                      d.legal = 1'b1; d.uop = U_ALU; d.sub = 4'd7; // internal CMP code
                      d.fmask = '1;
                   end
@@ -689,7 +701,13 @@ module pipeline_core
             d.mduns = !op[23]; d.mdhigh = op[22]; d.sgn = op[23];
             // v3 D3: MULW = W [19] on the low-half MUL
             d.w32 = op[19];
-            if (op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
+            if (EN_SHORT9 && len == 2'b01 && op[25:24] == 2'd3 && op[22:20] == 3'b000 &&
+                op[3:0] == 4'h0) begin
+               // P9 MULV simm8: rd = rs1 * ext(imm8 [19:12]), SGN [23] (as MULV)
+               d.use_rs1 = 1'b1; d.wreg = 1'b1; d.w32 = 1'b0;
+               d.legal = 1'b1; d.uop = U_MUL;
+               d.fmask.zero = 1'b1; d.fmask.sign = 1'b1; d.fmask.overflow = 1'b1;
+            end else if (op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
                 (!op[19] || (op[25:24] == 2'd0 && !op[22]))
                 && ((len == 2'b01) || (len == 2'b10 && op[3:0] == 4'h0))) begin
                d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01);  d.wreg = 1'b1;
@@ -814,7 +832,10 @@ module pipeline_core
       s8 = {{24{i8[7]}}, i8};
       if (op[31:30] != 2'b01) return {1'b0, 32'b0};
       case (op[29:26])
-         4'h2: return {1'b1, op[20] ? s8 : {24'b0, i8}};
+         4'h2: return {1'b1, (EN_SHORT9 && op[25:21] == 5'b11101)            // P9 LEAPC simm16
+                             ? {{16{op[19]}}, op[19:12], op[7:0]}
+                             : op[20] ? s8 : {24'b0, i8}};
+         4'hA: return {EN_SHORT9 && op[25:24] == 2'b11, op[23] ? s8 : {24'b0, i8}}; // P9 MULV
          4'h3: return {op[20] && !op[21], s8};
          4'h6, 4'h7: return {op[22:21] == 2'b01, s8 << op[25:24]};
          4'h8: return {!op[23], {{12{op[17]}}, op[17:0], 2'b00}};
@@ -2099,13 +2120,17 @@ module pipeline_core
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
-                                   (w_op[29:26] == 4'hD && w_op[21])) &&
+                                   (w_op[29:26] == 4'hD && w_op[21]) ||
+                                   (EN_SHORT9 && w_op[29:26] == 4'hA && w_op[25:24] == 2'b11)) &&
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize;
                      id_w      <= ((w_op[29:26] == 4'h3) && w_op[19] &&
                                    !(w_op[31:30] == 2'b01 && w_op[20])) ||
+                                  // P9: short CMPRVW (class 3 LEN=01 SGN=1 B=0 INV=1)
+                                  (EN_SHORT9 && w_op[29:26] == 4'h3 && w_op[31:30] == 2'b01 &&
+                                   w_op[20] && !w_op[21] && w_op[22]) ||
                                   // HW proposal 6: FBR PRED 5-7 (EQW/LTW/ULTW)
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
@@ -2303,7 +2328,8 @@ module pipeline_core
          assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
                  id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||
                                (id_op[29:26] == 4'h3 && id_op[20]) ||
-                               (id_op[29:26] == 4'hD && id_op[21])) &&
+                               (id_op[29:26] == 4'hD && id_op[21]) ||
+                               (EN_SHORT9 && id_op[29:26] == 4'hA && id_op[25:24] == 2'b11)) &&
                               (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                dec.uop == U_BOOL || dec.uop == U_ALU || dec.uop == U_FBR)) &&
                  id_b_sext == dec.sgn)
