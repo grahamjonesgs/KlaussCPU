@@ -96,6 +96,10 @@ module pipeline_core
    output logic         perf_br,        // conditional branch resolved (event)
    output logic         perf_br_taken,
    output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
+   // I-cache (HW proposals §2.6): [0] demand-lookup miss that issues a
+   // shared-port fill (event)  [1] fill in flight (cycle) — splits IF_MISS
+   // into I-cache refill vs window bubbles
+   output logic [1:0]   perf_ic,
    // park (drained stop)
    output logic         parked,
    output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT 4=debug 5=MISALIGNED
@@ -1351,6 +1355,11 @@ module pipeline_core
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
    assign perf_br_taken = exo_taken;
    assign perf_fbr_taken = fbr_taken;   // MEM ops always commit: counted as they redirect
+   // (mirrors the if_look miss-issue condition in the fill engine)
+   assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
+                       !mem_port_op && mem_xc == 2'd0 && !irq_active &&
+                       !(DEBUG_EN && (dbg_active || dbg_halted));
+   assign perf_ic[1] = if_xc;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
    // The 64-bit barrel LEAVES the EX cluster (exo_result's U_SHIFT leg is a

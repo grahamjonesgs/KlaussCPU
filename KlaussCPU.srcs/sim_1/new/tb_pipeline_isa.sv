@@ -37,6 +37,7 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
    logic [7:0]   perf_stall;
    logic         perf_br, perf_br_taken, perf_fbr_taken;
+   logic [1:0]   perf_ic;
    logic         irq_ready;
    logic [1:0]   irq_sel = 2'd0;
    logic [31:0]  irq_vector = 32'h0010_0000;

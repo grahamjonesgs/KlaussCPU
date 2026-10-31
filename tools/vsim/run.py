@@ -50,8 +50,8 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = []
-    if 'perf_ic_miss' in core:
-        defs.append('+define+HAS_IC_MISS')
+    if 'output logic [1:0]   perf_ic' in core:
+        defs.append('+define+HAS_PERF_IC')
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-O2', '-Wno-fatal', '-Wno-lint',
            '-Wno-style', '-Wno-MULTIDRIVEN', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_vsim',
            '-Mdir', os.path.join(d, 'obj'), *defs,

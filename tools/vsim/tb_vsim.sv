@@ -27,8 +27,8 @@ module tb_vsim;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
    logic [7:0]   perf_stall;
    logic         perf_br, perf_br_taken, perf_fbr_taken;
-`ifdef HAS_IC_MISS
-   logic         perf_ic_miss;
+`ifdef HAS_PERF_IC
+   logic [1:0]   perf_ic;
 `endif
    logic         irq_ready;
    logic [1:0]   irq_sel = 2'd0;
@@ -60,8 +60,8 @@ module tb_vsim;
       .mask_wr, .mask_wdata,
       .ret_valid, .ret_pc, .ret_op, .ret_wr, .ret_wr_addr, .ret_wr_be, .ret_wr_raw,
       .bus_idle, .perf_stall, .perf_br, .perf_br_taken, .perf_fbr_taken,
-`ifdef HAS_IC_MISS
-      .perf_ic_miss,
+`ifdef HAS_PERF_IC
+      .perf_ic,
 `endif
       .parked, .park_kind, .park_pc, .park_op,
       .dbg_r, .dbg_sp, .dbg_flags, .dbg_i, .dbg_o);
@@ -177,7 +177,7 @@ module tb_vsim;
    // ---------------- counters / trace ----------------------------------------
    longint icount = 0;
    longint pst [0:7];
-   longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0;
+   longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0, n_ic_fill = 0;
    integer trace_f = 0;
    string  out_name, trace_name, img;
    longint maxc = 2000000;
@@ -188,8 +188,9 @@ module tb_vsim;
       if (perf_br) n_br++;
       if (perf_br_taken && perf_br) n_br_taken++;
       if (perf_fbr_taken) n_fbr_taken++;
-`ifdef HAS_IC_MISS
-      if (perf_ic_miss) n_ic_miss++;
+`ifdef HAS_PERF_IC
+      if (perf_ic[0]) n_ic_miss++;
+      if (perf_ic[1]) n_ic_fill++;
 `endif
    end
 
@@ -219,7 +220,8 @@ module tb_vsim;
       $fdisplay(f, "flags=%b%b%b%b", dbg_flags.zero, dbg_flags.sign, dbg_flags.carry, dbg_flags.overflow);
       $fdisplay(f, "int_mask=%x", int_mask_o);
       for (int i = 0; i < 8; i++) $fdisplay(f, "perf%0d=%0d", i, pst[i]);
-      $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d", n_br, n_br_taken, n_fbr_taken, n_ic_miss);
+      $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d ic_fill=%0d", n_br, n_br_taken,
+                n_fbr_taken, n_ic_miss, n_ic_fill);
       $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d", n_rd, n_wr, n_mmio_wr);
       $fdisplay(f, "uart_n=%0d", uart_n);
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter

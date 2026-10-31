@@ -328,3 +328,18 @@ def misal_wrong_path():
     a.ld(32, 5, 13)                     # MEMGET32: unaligned-tolerant, fine
     a.halt()
     return a, {'end': 'park', 'kind': '0'}, []
+
+
+# ------------------------------------------------- §2.6 I-cache counters
+@test
+def ic_counters():
+    """a 2-line loop: cold misses on the first pass only, then all hits"""
+    a = Asm()
+    a.setr(1, 50)
+    a.label('l')
+    for _ in range(6):
+        a.nop()
+    a.addi_s(1, 1, -1)
+    a.fbr('ne', 1, 0, 'l', imm=True)
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'ic_miss': '3', 'ic_fill': '15', 'bus_rd': '3'}, []
