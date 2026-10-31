@@ -318,6 +318,15 @@ module pipeline_core
    // the slide that empties the NLB (see the prefetch engine).  0 = the M9
    // start condition only.
    localparam bit EN_PF_EARLY = 1'b1;
+   // HW proposal 2b-lite (§2.5): an EQ/NE fused branch (incl. EQW/NEW)
+   // redirects from EX like JMPcc, one cycle earlier than from MEM.  Only
+   // the equality forms: a 64-bit XOR-reduce from the ex_a/ex_b registers,
+   // in parallel with (and no deeper than) the 64-bit wb_value==0 reduce
+   // already on the JMPcc flags_eff -> exo_taken path.  The ordered compares
+   // (carry chains) stay in MEM — ISA_V3_IMPL.md: a 64-bit magnitude compare
+   // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
+   // until a build shows the exo_taken -> pc family still meets.
+   localparam bit EN_FBR_EQ_EX = 1'b0;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -1134,6 +1143,14 @@ module pipeline_core
                CMP_MINU: exo_result = (ex_a < ex_b) ? ex_a : ex_b;
                default:  exo_result = (ex_a > ex_b) ? ex_a : ex_b; // MAXU
             endcase
+            // 2b-lite: an equality FBR redirects from EX (exo_taken), and
+            // goes down the pipe as not-taken so MEM does not redirect again
+            if (EN_FBR_EQ_EX && ex_d.uop == U_FBR &&
+                (cmp_op_e'(ex_d.sub) == CMP_EQ || cmp_op_e'(ex_d.sub) == CMP_NE)) begin
+               exo_taken  = exo_result[0];
+               exo_target = exo_eaddr;          // ex_pc + ex_var2
+               exo_result = 64'b0;
+            end
          end
          U_SHIFT: exo_result = 64'b0;   // M12 Stage D: the result is produced
                                         // in MEM (w_sh2 via mem_result_eff);
@@ -1387,13 +1404,15 @@ module pipeline_core
    // An EX op killed this edge by an older fused branch or a store squash
    // never retires, so it is not counted.
    assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && exo_taken && !fbr_taken && !sq_ex
-                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken;
+                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL || ex_d.uop == U_FBR)) || fbr_taken;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
    assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
    assign perf_br_taken = exo_taken;
-   assign perf_fbr_taken = fbr_taken;   // MEM ops always commit: counted as they redirect
+   assign perf_fbr_taken = fbr_taken ||  // MEM ops always commit: counted as they redirect
+                           (EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
+                            ex_d.uop == U_FBR && !sq_ex);   // 2b-lite: EX-resolved
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
                        !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active &&

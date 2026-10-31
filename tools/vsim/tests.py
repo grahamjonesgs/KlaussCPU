@@ -505,3 +505,31 @@ def smc_data_in_code_line():
     a.label('D')
     a.raw(0xDEAD0000, 0xBEEF)            # 8 data bytes after the code
     return [(a, {'end': 'park', 'kind': '0', 'r1': 3, 'r3': 0x5A}, [f'+LAT={l}']) for l in (1, 3, 8)]
+
+
+# ------------------------------------------------- 2b-lite (opt-in switch)
+@test
+def fbr_eq_loops():
+    """EQ/NE/EQW fused branches, taken and not, back-to-back and in loops —
+    exercised whichever stage resolves them (EN_FBR_EQ_EX)"""
+    a = Asm()
+    a.setr(1, 0); a.setr(2, 0); a.setr(3, 37); a.setr64(4, 0xFFFFFFFF00000025)
+    a.label('l')
+    a.inc(1)
+    a.fbr('eq', 1, 3, 'out')               # taken once at 37
+    a.nop()
+    a.alu('add', 2, 2, 1)
+    a.fbr('ne', 1, 0, 'l', imm=True)       # always taken
+    a.label('never')
+    a.setr(2, 0xBAD)
+    a.label('out')
+    a.fbr(None, 1, 4, 'w_ok', pred=5, inv=0)   # EQW: low halves equal (37) -> taken
+    a.setr(2, 0xBAD2)
+    a.label('w_ok')
+    a.fbr('ne', 1, 1, 'bad')               # not taken
+    a.fbr('eq', 1, 1, 'ok')                # taken, right behind a not-taken one
+    a.label('bad')
+    a.setr(2, 0xBAD3)
+    a.label('ok')
+    a.halt()
+    return [(a, {'end': 'park', 'kind': '0', 'r1': 37, 'r2': 36 * 37 // 2}, [f'+LAT={l}']) for l in (1, 4)]
