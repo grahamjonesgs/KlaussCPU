@@ -308,6 +308,12 @@ module pipeline_core
    // All three trap today; 0 keeps it that way.  They add legs to
    // f_short_imm on the w_op -> id_var1 latch path.
    localparam bit EN_SHORT9 = 1'b1;
+   // HW proposal 1c (§2.4): posted DRAM stores — a 1-entry store buffer on
+   // the core side of the port.  A store that touches no fetch-side code
+   // copy leaves MEM one cycle after issue; the port stays busy (st_post)
+   // until its ready, and every other port user waits for that drain.  0 =
+   // every store holds MEM until its ready (the pre-proposal behaviour).
+   localparam bit EN_POST_ST = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -1295,9 +1301,16 @@ module pipeline_core
    // f_memget32's dead cycle) 3=wait-ready-2. if_xc: fill in flight.
    logic [1:0] mem_xc;
    logic       if_xc;
+   // 1c posted store: st_post = a retired store still draining on the port
+   // (its DV held until ready).  st_post_ok = the store issued last edge may
+   // post: DRAM, its line's tag not in the I-cache tag shadow, and no IFB /
+   // NLB / ID / EX code overlap — all compared at issue from registers into
+   // this flop, so the post decision (mem_done_now) reads registers only.
+   // A code-touching store keeps the completion-time SMC squash path.
+   logic       st_post, st_post_ok;
    logic [28:0] if_req_dw;
    logic        if_rebase;
-   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc
+   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post
                      && !m_read_DV && !m_write_DV;
 
    // Ready-EDGE arming: the real cache HOLDS ready high until its 2-FF sync
@@ -1329,7 +1342,8 @@ module pipeline_core
    wire lr_need2     = mem_valid && mem_d.uop == U_LEAVERET && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
    wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
-                       (mem_xc == 2'd3 && w_mrdy);
+                       (mem_xc == 2'd3 && w_mrdy) ||
+                       (mem_xc == 2'd1 && st_post_ok);   // 1c: posted (registered)
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
@@ -1378,7 +1392,7 @@ module pipeline_core
    assign perf_fbr_taken = fbr_taken;   // MEM ops always commit: counted as they redirect
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
-                       !mem_port_op && mem_xc == 2'd0 && !irq_active &&
+                       !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active &&
                        !(DEBUG_EN && (dbg_active || dbg_halted));
    assign perf_ic[1] = if_xc;
 
@@ -1511,6 +1525,7 @@ module pipeline_core
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
+         st_post <= 1'b0; st_post_ok <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1586,7 +1601,7 @@ module pipeline_core
             if (parked) begin
                dbg_active <= 1'b0;
             end else if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                         && mem_xc == 2'd0 && !if_xc) begin
+                         && mem_xc == 2'd0 && !if_xc && !st_post) begin
                dbg_active    <= 1'b0;
                parked        <= 1'b1;
                running       <= 1'b0;   // no dispatch / fetch until resume
@@ -1605,7 +1620,7 @@ module pipeline_core
             if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                   && mem_xc == 2'd0 && !if_xc) begin
+                   && mem_xc == 2'd0 && !if_xc && !st_post) begin
                   // RE-CHECK at the drain boundary: an OLDER in-flight store
                   // may have completed during the shadow and killed the cause
                   // — an INT_MASK write (Zephyr irq_lock) or a level-IRQ ack
@@ -1751,10 +1766,17 @@ module pipeline_core
             ic_vlo[snoop_idx_q] <= 1'b0;
          end
 
+         // 1c: posted-store drain.  Nothing else can be on the port (every
+         // issue point waits for !st_post), so this ready is the store's.
+         if (st_post && w_mrdy) begin
+            m_write_DV <= 1'b0;
+            st_post    <= 1'b0;
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
-               2'd0: if (!if_xc) begin        // wait for the port (IF may hold it)
+               2'd0: if (!if_xc && !st_post) begin  // wait for the port (IF / a posted store)
                   m_addr     <= mem_iaddr;
                   m_wdata    <= mem_wdata;
                   m_be       <= mem_be;
@@ -1777,6 +1799,15 @@ module pipeline_core
                   snoop_q     <= mem_port_wr &&
                                  ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4];
                   snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
+                  // 1c: may this store post next cycle? (no code copy of its
+                  // dword anywhere on the fetch side; MMIO never posts)
+                  st_post_ok  <= EN_POST_ST && mem_port_wr && mem_iaddr[31:28] != 4'hF &&
+                                 ic_tagff[mem_iaddr[IC_IDXW+3:4]] != mem_iaddr[31:IC_IDXW+4] &&
+                                 !(ifb_val[0] && ifb_base  == smc_dw) &&
+                                 !(ifb_val[1] && r_base_p1 == smc_dw) &&
+                                 !((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) &&
+                                 !(id_valid && (id_pc[31:3] == smc_dw || id_last_dw == smc_dw)) &&
+                                 !(ex_valid && (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw));
                   // Watchpoints: compare this access at issue; the halt is
                   // taken at the next dispatch boundary (the instruction
                   // completes; at most the two younger ones in EX/ID too).
@@ -1810,6 +1841,13 @@ module pipeline_core
                      m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
                      mem_xc    <= 2'd0;
                   end
+                  st_post_ok <= 1'b0;
+               end else if (st_post_ok) begin
+                  // 1c: post — the store retires from MEM now (mem_done_now);
+                  // its DV stays up and st_post owns the port until ready.
+                  st_post    <= 1'b1;
+                  st_post_ok <= 1'b0;
+                  mem_xc     <= 2'd0;
                end
                2'd2: mem_xc <= 2'd3;
                default: if (w_mrdy) begin     // 2'd3
@@ -1824,7 +1862,7 @@ module pipeline_core
          // same port (D-cache coherent, MMIO decoded by the SoC as usual).
          if (DEBUG_EN && dbg_halted) begin
             if (!dbg_mx) begin
-               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0) begin
+               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post) begin
                   m_addr     <= dbg_i.mem_addr;
                   m_wdata    <= dbg_i.mem_wdata;
                   m_be       <= dbg_i.mem_be;
@@ -1903,7 +1941,7 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !irq_active
+               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active
                             && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame

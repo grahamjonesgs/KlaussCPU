@@ -50,6 +50,8 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = []
+    if 'st_post_ok' in core:
+        defs.append('+define+HAS_POST')
     if 'output logic [1:0]   perf_ic' in core:
         defs.append('+define+HAS_PERF_IC')
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-O2', '-Wno-fatal', '-Wno-lint',
@@ -109,6 +111,11 @@ def build_soc(rev=None):
         allsrc += t
     tbp = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'tb_soc.sv')
     tb = git_show(rev, tbp) if rev else open(tbp).read()
+    # report the cycle count at HALTED (for real-cache A/B timing)
+    tb = tb.replace('$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);',
+                    '$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes, t=%0d", icount, uart_n, runcyc);')
+    tb = tb.replace('   longint last_i = -1;', '   longint last_i = -1;\n   longint runcyc = 0;\n'
+                    '   always @(posedge dut.i_Clk) if (dut.st.SM == PIPE_RUN) runcyc++;')
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -257,6 +264,30 @@ def cmd_diff(a):
     return 1 if fails else 0
 
 
+def cmd_socdiff(a):
+    """random programs through the full SoC (real cache / bus splitter):
+    base rev vs working tree, retire traces must be identical"""
+    import randprog
+    base = build_soc(a.base)
+    new = build_soc(None)
+    fails = 0
+    tb = tn = 0
+    for sd in range(a.seed0, a.seed0 + a.seeds):
+        asm = randprog.gen(sd)
+        rb = run_soc(base, asm, f'sd_b{sd}')
+        rn = run_soc(new, asm, f'sd_n{sd}')
+        okb = 'HALTED' in rb['log']
+        same = okb and open(rb['trace']).read() == open(rn['trace']).read()
+        t = [int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
+        tb += t[0]; tn += t[1]
+        if not same:
+            fails += 1
+        if not same or a.verbose:
+            print(f'{"same" if same else "DIFF"} seed={sd} cycles {t[0]} -> {t[1]}  {rb["log"].strip().splitlines()[-2][:60]}')
+    print(f'{fails} differing; PIPE_RUN cycles base={tb} new={tn} ({100.0 * (tn - tb) / max(1, tb):+.2f}%)')
+    return 1 if fails else 0
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -266,11 +297,16 @@ def main():
     d.add_argument('--seeds', type=int, default=20); d.add_argument('--seed0', type=int, default=1)
     d.add_argument('--lats', type=int, nargs='+', default=[3])
     d.add_argument('--irq', action='store_true'); d.add_argument('-v', '--verbose', action='store_true')
+    sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
+    sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
+    sd.add_argument('-v', '--verbose', action='store_true')
     a = p.parse_args()
     if a.cmd == 'build':
         print(build(a.rev))
     elif a.cmd == 'test':
         sys.exit(cmd_test(a))
+    elif a.cmd == 'socdiff':
+        sys.exit(cmd_socdiff(a))
     else:
         sys.exit(cmd_diff(a))
 

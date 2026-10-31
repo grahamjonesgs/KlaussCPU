@@ -215,6 +215,18 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
       return b ? "1" : "0";
    endfunction
 
+   // sub-word store lanes: the core replicates the raw value across the
+   // dword ({8{b}}, {4{h}}, {2{w}}) and enables 1, 2 or 4 byte lanes
+   function automatic logic [63:0] merge_sub(input logic [63:0] cur, input logic [63:0] raw,
+                                             input logic [7:0] be);
+      logic [63:0] rep;
+      int n;
+      n = $countones(be);
+      rep = (n == 1) ? {8{raw[7:0]}} : (n == 2) ? {4{raw[15:0]}} : {2{raw[31:0]}};
+      for (int i = 0; i < 8; i++) if (be[i]) cur[i*8 +: 8] = rep[i*8 +: 8];
+      return cur;
+   endfunction
+
    task automatic emit_trace();
       string s;
       logic [31:0] wa;
@@ -236,7 +248,11 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
             // sub-word: dword-aligned address; data = raw for MMIO, else the
             // merged dword read back after the write (emulator write_sub)
             wa   = {ret_wr_addr[31:3], 3'b000};
-            wdat = (ret_wr_addr[31:28] == 4'hF) ? ret_wr_raw : rd_dw(wa);
+            // A posted store (HW proposal 1c) may retire before it lands in
+            // the model, so merge its lanes into the current dword here
+            // (idempotent when it has already landed).
+            wdat = (ret_wr_addr[31:28] == 4'hF) ? ret_wr_raw
+                 : merge_sub(rd_dw(wa), ret_wr_raw, ret_wr_be);
             s = {s, $sformatf(" wr=%08x/%02x/%016x", wa, ret_wr_be, wdat)};
          end
       end

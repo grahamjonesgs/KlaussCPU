@@ -182,7 +182,16 @@ module tb_vsim;
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
+   longint n_post = 0, n_nopost_dram = 0;
    initial for (int i = 0; i < 8; i++) pst[i] = 0;
+`ifdef HAS_POST
+   // 1c coverage: stores that posted / DRAM stores that took the slow path
+   always @(posedge clk) if (!rst) begin
+      if (dut.mem_xc == 2'd1 && dut.st_post_ok && !dut.w_mrdy) n_post++;
+      if (dut.mem_xc == 2'd1 && dut.mem_is_write && !dut.st_post_ok && dut.w_mrdy &&
+          dut.mem_iaddr[31:28] != 4'hF) n_nopost_dram++;
+   end
+`endif
    always @(posedge clk) if (!rst && start == 0) begin
       for (int i = 0; i < 8; i++) if (perf_stall[i]) pst[i]++;
       if (perf_br) n_br++;
@@ -206,7 +215,9 @@ module tb_vsim;
             $fwrite(trace_f, "\n");
          end
       end
-      if (!rst && parked && park_kind != 3'd3) done("park");
+      // the SoC takes the bus only once the core's port is idle (a posted
+      // store may still be draining when the core parks)
+      if (!rst && parked && park_kind != 3'd3 && bus_idle && !in_flight) done("park");
       if (cyc > maxc) done("timeout");
    end
 
@@ -223,6 +234,7 @@ module tb_vsim;
       $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d ic_fill=%0d", n_br, n_br_taken,
                 n_fbr_taken, n_ic_miss, n_ic_fill);
       $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d", n_rd, n_wr, n_mmio_wr);
+      $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
       $fdisplay(f, "uart_n=%0d", uart_n);
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)

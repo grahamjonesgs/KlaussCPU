@@ -188,6 +188,10 @@ def _crit(use_di=True):
     for i in range(12):                 # ~critical work incl. memory ops
         a.st(64, 2, 12, 8 * i)
         a.inc(2)
+    a.setr(6, 8)                        # + a spin, so the window is long
+    a.label('spin')
+    a.addi_s(6, 6, -1)
+    a.fbr('ne', 6, 0, 'spin', imm=True)
     a.ld(64, 3, 10)
     a.ld(64, 4, 10)
     a.ei(1) if use_di else a.nop()
@@ -412,3 +416,89 @@ def short_leapc():
     a.halt()
     return a, {'end': 'park', 'kind': '0', 'r1': 0x20, 'r2': 0x20, 'r5': 0, 'r6': 0,
                'r3': a.labels['far'], 'r7': 0x20}, []
+
+
+# ------------------------------------------------- 1c: SMC under posted stores
+def _word(fn):
+    t = Asm()
+    fn(t)
+    return t.assemble()[0]
+
+
+def _smc(dist, size, warm, lat, pad_align=0):
+    """overwrite the instruction at X (= `addi r1,r1,1`) with `addi r1,r1,16`
+    using a `size`-bit store placed `dist` instructions before X.  With warm,
+    X runs once first (it is then in the I-cache / NLB / IFB)."""
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    a = Asm()
+    a.setr(1, 0); a.setr(3, new); a.setr(5, 0)
+    a.leapc(2, 'X')
+    for _ in range(pad_align):
+        a.nop()
+    if warm:
+        a.setr(6, 2)                        # run X twice before the store
+        a.label('warm')
+        a.call('X')
+        a.addi_s(6, 6, -1)
+        a.fbr('ne', 6, 0, 'warm', imm=True)
+    a.setr(7, 0x10000)
+    a.st(64, 7, 7, 0)                       # an unrelated (postable) store first
+    if size == 64:
+        a.ld(64, 4, 2)                      # the dword holding X: keep its other half
+        a.setr64(8, 0xFFFFFFFF00000000)
+        a.alu('and', 4, 4, 8)
+        a.alu('or', 4, 4, 3)                # X sits in the low half (aligned below)
+        a.st(64, 4, 2)
+    elif size == 32:
+        a.st(32, 3, 2)
+    else:                                   # byte store of the changed byte (imm8 [19:12] -> byte 2)
+        a.setr(10, (new >> 16) & 0xFF)
+        a.st(8, 10, 2, 2)
+    for _ in range(dist):
+        a.inc(5)
+    if warm:
+        a.call('X')
+        a.jmp('done')
+    while (a.pc & 7) != 0:
+        a.nop()
+    a.label('X')
+    a.alui_s('add', 1, 1, 1)
+    if warm:
+        a.ret()
+    a.label('done')
+    a.halt()
+    # (the byte store rewrites only imm8's high nibble: 1 -> 0x11)
+    want = (2 if warm else 0) + (0x11 if size == 8 else 16)
+    return a, {'end': 'park', 'kind': '0', 'r1': want, 'r5': dist}, [f'+LAT={lat}']
+
+
+@test
+def smc_posted():
+    out = []
+    for dist in (0, 1, 2, 3, 4, 6, 9, 15, 40):
+        for size in (64, 32, 8):
+            for warm in (False, True):
+                out.append(_smc(dist, size, warm, lat=1 + (dist + size) % 7))
+    return out
+
+
+@test
+def smc_data_in_code_line():
+    """a data store into a code line (not into an instruction) must not
+    corrupt the instructions around it"""
+    a = Asm()
+    a.setr(1, 0); a.setr(9, 0x5A)
+    a.leapc(2, 'D')
+    a.setr(4, 3)
+    a.label('loop')
+    a.st(64, 9, 2)                       # store into the data dword in this code line
+    a.inc(1)
+    a.addi_s(4, 4, -1)
+    a.fbr('ne', 4, 0, 'loop', imm=True)
+    a.ld(64, 3, 2)
+    a.halt()
+    while (a.pc & 7) != 0:
+        a.nop()
+    a.label('D')
+    a.raw(0xDEAD0000, 0xBEEF)            # 8 data bytes after the code
+    return [(a, {'end': 'park', 'kind': '0', 'r1': 3, 'r3': 0x5A}, [f'+LAT={l}']) for l in (1, 3, 8)]
