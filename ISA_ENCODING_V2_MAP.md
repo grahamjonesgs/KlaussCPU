@@ -659,3 +659,67 @@ SUBW,0x44680000,1,1,"rd,rs1,rs2",,ZCV,sext32 result (v3 D3)
 ADDIW,0x88380000,2,2,"rd,rs1",sext32,ZCV,sext32 result (v3 D3)
 MULW,0x68880000,1,10,"rd,rs1,rs2",,ZSV,low half sext32 (v3 D3)
 ```
+
+## 8. HW-proposal additions (2026-10-31, branch `hw-proposals`)
+
+From `HARDWARE_PROPOSALS.md` (klausscpu-llvm). All previously trapped; each
+has a build switch in `pipeline_core.sv` (`EN_*`, see
+`HARDWARE_PROPOSALS_RESPONSE.md`). **Not yet in klausscc or LLVM.**
+
+### 8.1 Fused branch: W predicates and a 32-bit immediate (class 0xD)
+
+- PRED `[25:23]` 5 = **EQW**, 6 = **LTW** (signed), 7 = **ULTW**: compare the
+  low 32 bits (as CMPRRW). INV gives NEW / GEW / UGEW; with swapped operands
+  LE/GT follow (LE = !(b<a), GT = b<a). Register or simm4 (IMM) rhs; the
+  simm4 is compared as a 32-bit value.
+- `LEN=10`, `IMM=1`, `[3:0]=0`: rhs = sext(imm32) from **word 1**; PRED 0-7
+  (64-bit or W); simm13 displacement still in word 0 `[20:8]`, relative to
+  the branch's own PC. Taken target = PC + 4·simm13, not taken = PC + 8.
+
+### 8.2 Interrupt disable / enable (class B system, LEN=01)
+
+| Symbol | Template | Operands | Semantics |
+|---|---|---|---|
+| DI | `0x6C060000` | rd `[11:8]` | rd = old enable bit (0/1); disable interrupts |
+| EI | `0x6C070000` | rs1 `[7:4]` | enable = rs1[0] (so `DI r ; … ; EI r` restores) |
+
+Core-internal bit, committed in order; an IRQ is never taken after a DI
+retires and before the matching EI. `WAIT` still wakes on a pending IRQ
+while disabled (it does not enter the handler — WFI semantics). Saved in the
+IRQ context word at bit **[43]** (1 = disabled) and restored by `IRET`; a
+software-built frame with bit 43 = 0 resumes enabled. Not atomic against
+core 2.
+
+### 8.3 Short forms (LEN=01)
+
+| Form | Template | Fields | Semantics |
+|---|---|---|---|
+| CMPRVW.S | `0x4C500000` | rs1 `[7:4]`, simm8 `[19:12]` | class 3 short CMP with **INV=1** = the W compare (= CMPRVW) |
+| MULV.S | `0x6B800000` (signed) / `0x6B000000` | rd, rs1, imm8 `[19:12]`, SGN `[23]` | class A OP=3: rd = rs1 × ext(imm8), extended by SGN as MULV's imm32; low half, flags as MUL |
+| LEAPC.S | `0x4BA00000` | rd, simm16 = `{[19:12],[7:0]}` | class 2 OP=14 F=1 (`[20]`=0): rd = PC + sext(simm16) bytes (±32 KiB) |
+
+Examples: `CMPRVW.S r1,-3` = `0x4C5FD010`; `MULV.S r2,r1,-6` = `0x6B8FA210`;
+`LEAPC.S r1,.+0x1234` = `0x4BA12134`; `EQW r1,r2,.` = `0x76800012`;
+`FBR.EQ r1,#0x1234,.` = `0xB4200010 0x00001234`.
+
+### 8.4 Behaviour change: misaligned sub-word accesses trap
+
+A 16-bit load/store at an odd address, or a 32-bit one not 4-aligned, now
+parks (`park_kind` 5 → crash dump `ERR=0A`) instead of silently aligning
+down. Exempt (unchanged): `MEMGET32` (32-bit load, `[rs1]` mode —
+unaligned-tolerant), byte accesses, 64-bit accesses (A=0 still uses the
+aligned dword) and stack ops. The faulting instruction does not execute and
+retires no trace line.
+
+### 8.5 Machine-readable additions
+
+```csv
+symbol,template,words,class,regs,imm,flags,notes
+FBR_W,0x76800000,1,13,"rs1,rs2|simm4",simm13,,PRED 5-7 = EQW/LTW/ULTW (hw-proposals 6)
+FBR_I32,0xB4200000,2,13,rs1,"simm13 + sext32",,rhs = sext(imm32) word 1; PRED 0-7 (hw-proposals 6)
+DI,0x6C060000,1,11,rd,,,rd = old enable; disable (hw-proposals 7a)
+EI,0x6C070000,1,11,rs1,,,enable = rs1[0] (hw-proposals 7a)
+CMPRVW_S,0x4C500000,1,3,rs1,simm8[19:12],ZSCV,short W compare (hw-proposals 9)
+MULV_S,0x6B800000,1,10,"rd,rs1",imm8[19:12] (SGN[23]),ZSV,short MULV (hw-proposals 9)
+LEAPC_S,0x4BA00000,1,2,rd,"simm16 {[19:12],[7:0]}",,PC-relative +-32 KiB (hw-proposals 9)
+```
