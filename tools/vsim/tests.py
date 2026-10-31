@@ -256,3 +256,75 @@ def diei_iret_frame():
     a.di(6)                  # -> 1
     a.halt()
     return a, {'end': 'park', 'kind': '0', 'r4': 0, 'r6': 1, 'int_mask': '1'}, []
+
+
+# ------------------------------------------------- §3.3 misaligned trap
+def _misal(kind_fn, lat=3, irq=None):
+    a = Asm()
+    a.setr(12, DATA)
+    a.setr(1, 0x1111); a.setr(2, 0x2222)
+    a.st(64, 1, 12, 0x100)          # older store: must land
+    a.setr(3, 0xABCD)
+    a.set_int_mask(1)
+    pc = kind_fn(a)                  # the misaligned access
+    a.st(64, 2, 12, 0x108)          # younger store: must NOT land
+    a.setr(4, 0x55)                  # younger: must not retire
+    a.halt()
+    exp = {'end': 'park', 'kind': '5', 'pc': pc, m(DATA + 0x100): 0x1111, 'r3': 0xABCD, 'r4': 0,
+           'r9': 0}
+    plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={irq}'] if irq else [])
+    return a, exp, plus
+
+
+@test
+def misal_trap():
+    cases = [
+        lambda a: (a.setr(9, 0), a.ld(16, 9, 12, 1, mode='long'))[1],          # 16-bit [rs1+1]
+        lambda a: (a.setr(9, 0), a.ld(32, 9, 12, 2, mode='long'))[1],          # 32-bit [rs1+2]
+        lambda a: (a.setr(9, 0), a.ld(32, 9, 12, 7, mode='long'))[1],
+        lambda a: (a.setr(9, 0), a.ld_abs(16, 9, DATA + 3))[1],                 # [imm]
+        lambda a: (a.setr(9, 0), a.setr(13, 5), a.ld_rr(32, 9, 12, 13))[2],    # [rs1+rs2]
+        lambda a: (a.setr(9, 0), a.setr(13, DATA + 1), a.ld(16, 9, 13))[2],    # 16-bit [rs1]
+        lambda a: (a.setr(9, 0), a.st(16, 3, 12, 0x101, mode='long'))[1],      # stores
+        lambda a: (a.setr(9, 0), a.st(32, 3, 12, 0x102, mode='long'))[1],
+        lambda a: (a.setr(9, 0), a.setr(13, DATA + 0x103), a.st(32, 3, 13))[2],
+        lambda a: (a.setr(9, 0), a.st_abs(16, 3, DATA + 0x10F))[1],
+    ]
+    out = []
+    for i, c in enumerate(cases):
+        a, exp, plus = _misal(c, lat=1 + (i % 3) * 3)
+        out.append((a, exp, plus))
+    # with a fast pending timer IRQ: still parks, handler never entered after
+    a, exp, plus = _misal(cases[1], irq=70)
+    out.append((a, exp, plus))
+    return out
+
+
+@test
+def misal_store_untouched():
+    """the misaligned store itself must not write anything"""
+    a = Asm()
+    a.setr(12, DATA); a.setr(3, 0xFFFFFFFF)
+    a.st(64, 0, 12, 0x200)
+    pc = a.st(32, 3, 12, 0x201, mode='long')
+    a.halt()
+    return a, {'end': 'park', 'kind': '5', 'pc': pc, 'bus_wr': '1'}, []
+
+
+@test
+def misal_wrong_path():
+    """misaligned accesses behind a taken FBR / taken JMP are never executed"""
+    a = Asm()
+    a.setr(12, DATA); a.setr(1, 1)
+    a.fbr('ne', 1, 0, 'ok', imm=True)
+    a.ld(16, 2, 12, 1, mode='long')
+    a.st(32, 2, 12, 2, mode='long')
+    a.label('ok')
+    a.jmp('ok2')
+    a.ld(32, 2, 12, 3, mode='long')
+    a.label('ok2')
+    a.ld(16, 2, 12, 2, mode='long')    # aligned: fine
+    a.setr(13, DATA + 1)
+    a.ld(32, 5, 13)                     # MEMGET32: unaligned-tolerant, fine
+    a.halt()
+    return a, {'end': 'park', 'kind': '0'}, []

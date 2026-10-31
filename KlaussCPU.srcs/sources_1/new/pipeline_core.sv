@@ -98,7 +98,7 @@ module pipeline_core
    output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
    // park (drained stop)
    output logic         parked,
-   output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT
+   output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT 4=debug 5=MISALIGNED
    output logic [31:0]  park_pc,
    output logic [31:0]  park_op,
    // architectural state (tb reads for the trace line)
@@ -219,7 +219,8 @@ module pipeline_core
    assign dbg_o.mem_rdata  = dbg_mem_rdata;
    // TRAP / ILLEGAL / HALT -> debug-halt cause
    function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
-      return (kind == 3'd1) ? DBG_CAUSE_TRAP : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
+      return (kind == 3'd1 || kind == 3'd5) ? DBG_CAUSE_TRAP
+           : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
    endfunction
 
    // ------------------------------------------- IF: 2-dword window (IFB model)
@@ -291,6 +292,12 @@ module pipeline_core
    // HW proposal 7a (§2.7): DI rd / EI rs1, class B system OP 6 / 7.
    // 0 = both trap and irq_dis stays 0.
    localparam bit EN_DIEI = 1'b1;
+   // HW proposal 8 / §3.3: a 16- or 32-bit load/store whose address is not
+   // naturally aligned parks (park_kind 5 -> crash dump ERR_MISALIGN)
+   // instead of silently aligning down.  MEMGET32 ([rs1] 32-bit load, the
+   // unaligned-tolerant form), byte and 64-bit accesses and the stack ops
+   // keep their defined behaviour.  0 = the old silent align-down.
+   localparam bit EN_MISAL_TRAP = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -1241,6 +1248,20 @@ module pipeline_core
       endcase
    end
 
+   // HW proposal 8 / §3.3 misaligned trap detect.  The low two EA bits come
+   // from their own 2-bit adds (off the 32-bit EA carry chain); the uop /
+   // size terms are register-sourced.  U_LOAD32 (MEMGET32) is exempt.
+   wire [1:0] ex_ea_lo = (ex_d.mmode == 2'b00) ? ex_a[1:0]
+                       : (ex_d.mmode == 2'b01) ? ex_a[1:0] + ex_var1[1:0]
+                       : (ex_d.mmode == 2'b10) ? ex_var1[1:0]
+                       :                         ex_a[1:0] + ex_b[1:0];
+   wire ex_misal = EN_MISAL_TRAP && ex_valid &&
+                   (ex_d.uop == U_LOAD || ex_d.uop == U_STORE) &&
+                   ((ex_d.msz == 2'd1 && ex_ea_lo[0]) ||
+                    (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00));
+   logic mem_misal;      // the MEM op is a converted misaligned access (parks 5)
+   logic ev_misal;       // blocking event: a misaligned op entered MEM this edge
+
    // mul/div operand B mux happens at dispatch: ex_b holds rs2 (len1) or
    // the sign/zero-extended imm32 (len2) — see the dispatch below.
 
@@ -1459,7 +1480,7 @@ module pipeline_core
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
-         mem_dis_we <= 1'b0; wb_dis_we <= 1'b0;
+         mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1484,7 +1505,7 @@ module pipeline_core
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
-         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0;
+         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
 
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
@@ -1622,7 +1643,7 @@ module pipeline_core
                   dbg_cause <= f_dbg_park_cause(wb_park_kind);
                   dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
                end
-               if (wb_park_kind != 3'd2) begin   // illegal: no trace line
+               if (wb_park_kind != 3'd2 && wb_park_kind != 3'd5) begin   // illegal / misaligned: not executed, no trace line
                   ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                end
             end else begin
@@ -1952,7 +1973,8 @@ module pipeline_core
             wb_dis_new <= (mem_d.uop == U_IRET) ? m_rdata[43] : mem_dis_new;
             wb_park    <= mem_valid && (mem_d.uop == U_HALT || mem_d.uop == U_TRAP ||
                                         mem_d.uop == U_WAIT || mem_d.uop == U_ILL);
-            wb_park_kind <= (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
+            wb_park_kind <= mem_misal ? 3'd5
+                          : (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
                           : (mem_d.uop == U_ILL)  ? 3'd2 : 3'd3;
             wb_wr      <= mem_is_write;
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
@@ -1981,6 +2003,7 @@ module pipeline_core
                mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
+               mem_misal  <= ex_misal;
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -2093,6 +2116,25 @@ module pipeline_core
                      id_valid <= 1'b0;    // IF window miss: bubble, engine fills
                   end
                end
+
+               // §3.3 misaligned access: it enters MEM as a non-memory parking
+               // op (no port access, no writeback; parks kind 5 at WB), and
+               // everything younger is dropped as behind a serializer.  An
+               // IRQ / debug boundary taken on this same edge is cancelled
+               // (the core parks first).  Older FBR / SMC squashes below
+               // still win (NBA order) and kill it as wrong-path.
+               if (ex_misal) begin
+                  ev_misal     = 1'b1;
+                  mem_d.uop    <= U_TRAP;
+                  mem_d.wreg   <= 1'b0;
+                  mem_d.is_mem <= 1'b0;
+                  ev_pcz       = 1'b1;
+                  id_valid     <= 1'b0;
+                  ex_valid     <= 1'b0;
+                  fetch_halt   <= 1'b1;
+                  irq_active   <= 1'b0;
+                  if (DEBUG_EN) dbg_active <= 1'b0;
+               end
             end
          end
 
@@ -2158,7 +2200,9 @@ module pipeline_core
             pc         <= sq_ex ? ex_pc : id_pc;
             // Every in-flight serializer is younger than the store, so it is
             // squashed here and re-arms fetch_halt when it re-dispatches.
-            fetch_halt <= 1'b0;
+            // (§3.3: a misaligned op that entered MEM this edge is older
+            // than the squashed ID op — it parks, so fetch stays halted.)
+            fetch_halt <= ev_misal && !sq_ex;
          end
 
          // debugger register write (debug-halted: no WB activity competes)

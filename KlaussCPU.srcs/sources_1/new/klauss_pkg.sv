@@ -60,6 +60,7 @@ package klauss_pkg;
    localparam ERR_DATA_LOAD = 8'h4, ERR_CHECKSUM_LOAD = 8'h5, ERR_OVERFLOW = 8'h6;
    localparam ERR_SEG_WRITE_TO_CODE = 'h7, ERR_SEG_EXEC_DATA = 'h8;
    localparam ERR_TRAP = 8'h9;        // Explicit software trap (TRAP opcode)
+   localparam ERR_MISALIGN = 8'hA;    // misaligned 16/32-bit load/store (pipeline park 5)
 
    // --- Crash dump phase boundaries (r_hcf_dump_phase) ---------------------
    // Each "phase" emits one UART line. Kept as localparams (not an enum) because

@@ -255,9 +255,10 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
             3'd0: $display("TB_M5A: stop = Halt after %0d instructions", icount);
             3'd1: $display("TB_M5A: stop = Trap at pc=%08x", park_pc);
             3'd2: $display("TB_M5A: stop = InvalidOpcode(%08x) at pc=%08x", park_op, park_pc);
+            3'd5: $display("TB_M5A: stop = Misaligned(%08x) at pc=%08x", park_op, park_pc);
             default: ;   // WAIT park: not terminal — an IRQ wakes it (M5c)
          endcase
-         if (park_kind < 3'd3) done();
+         if (park_kind < 3'd3 || park_kind == 3'd5) done();
          // debug halt: terminal only for an attached HALT (the program's end)
          if (park_kind == 3'd4 && dbg_o.cause == klauss_pkg::DBG_CAUSE_HALT) begin
             $display("TB_M5A: stop = Halt after %0d instructions", icount);
