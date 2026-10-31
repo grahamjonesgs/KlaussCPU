@@ -235,6 +235,12 @@ class Asm:
         return self.emit(lambda pc: H(1, 0xD) | p << 23 | i << 22 | imm << 21 |
                          simm((self._addr(tgt) - pc) >> 2, 13) << 8 | rs1 << 4 | rhs)
 
+    def fbr_imm32(self, cond, rs1, imm32, tgt, pred=None, inv=None):
+        """HW proposal 6: 2-word FBR, rhs = sext(imm32) from word 1."""
+        p, i = CMP_PRED[cond] if cond else (pred, inv)
+        return self.emit(lambda pc: H(2, 0xD) | p << 23 | i << 22 | 1 << 21 |
+                         simm((self._addr(tgt) - pc) >> 2, 13) << 8 | rs1 << 4, u32(imm32))
+
     def ret(self):
         return self.emit(H(1, 9) | 6 << 22)
 

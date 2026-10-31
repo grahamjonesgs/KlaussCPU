@@ -274,6 +274,20 @@ module pipeline_core
    // the redirect logic synthesizes away (compile with
    // -mllvm -klausscpu-fuse-cmp-br=false).
    localparam bit EN_FBR = 1'b1;
+   // HW proposal 6 (HARDWARE_PROPOSALS.md §2.6): FBR PRED 5-7 = EQW/LTW/ULTW
+   // and the 2-word FBR with a sext(imm32) right-hand side.  0 = both trap
+   // (the pre-proposal decode).
+   localparam bit EN_FBR_W = 1'b1;
+   // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
+   // function of the same 4 bits f_cmp_op already reads (no extra level).
+   function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
+      case (p)
+         3'd5:    return 3'd0;   // EQW
+         3'd6:    return 3'd1;   // LTW
+         3'd7:    return 3'd3;   // ULTW
+         default: return p;
+      endcase
+   endfunction
    localparam int IC_LINES = 512;
    localparam int IC_IDXW  = 9;                 // $clog2(IC_LINES)
    (* ram_style = "block" *) logic [127:0] ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
@@ -689,14 +703,18 @@ module pipeline_core
                end
             end
          end
-         4'hD: begin // ISA v3 B: fused compare-and-branch (1 word, no flags)
+         4'hD: begin // ISA v3 B: fused compare-and-branch (no flags)
             // PRED [25:23] (as class 3), INV [22], IMM [21] (rhs = simm4
             // [3:0]), simm13 word displacement [20:8]. The compare runs on
             // the EX boolean path; a taken branch redirects from MEM.
-            if (EN_FBR && len == 2'b01 && op[25:23] <= 3'd4) begin
+            // HW proposal 6 (EN_FBR_W): PRED 5/6/7 = EQW/LTW/ULTW, the 32-bit
+            // compare done by D2's dispatch shift (id_w); LEN=10 with IMM=1
+            // and [3:0]=0 = rhs sext(imm32) from word 1 (id_var1).
+            if (EN_FBR && (len == 2'b01 || (EN_FBR_W && len == 2'b10 && op[21] && op[3:0] == 4'h0))
+                && (EN_FBR_W || op[25:23] <= 3'd4)) begin
                d.legal = 1'b1; d.uop = U_FBR; d.sgn = 1'b1;
                d.use_rs1 = 1'b1; d.use_rs2 = !op[21];
-               d.sub = 4'(f_cmp_op(op[25:23], op[22]));
+               d.sub = 4'(f_cmp_op(f_fbr_pred(op[25:23]), op[22]));
             end
          end
          4'hC: begin // LCD
@@ -2004,7 +2022,8 @@ module pipeline_core
                      if (w_short[32]) id_var1 <= w_short[31:0];
                      // B: the fused branch's displacement (4*simm13) rides in
                      // id_var2 (a 1-word op has no second immediate word)
-                     if (w_op[31:30] == 2'b01 && w_op[29:26] == 4'hD)
+                     // (also the 2-word FBR: its word 1 is the imm32 rhs)
+                     if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
@@ -2014,8 +2033,11 @@ module pipeline_core
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize;
-                     id_w      <= (w_op[29:26] == 4'h3) && w_op[19] &&
-                                  !(w_op[31:30] == 2'b01 && w_op[20]);
+                     id_w      <= ((w_op[29:26] == 4'h3) && w_op[19] &&
+                                   !(w_op[31:30] == 2'b01 && w_op[20])) ||
+                                  // HW proposal 6: FBR PRED 5-7 (EQW/LTW/ULTW)
+                                  (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
+                                   (w_op[24] || w_op[23]));
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
                      id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
