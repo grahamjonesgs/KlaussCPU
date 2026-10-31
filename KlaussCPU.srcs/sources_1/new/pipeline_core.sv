@@ -314,6 +314,10 @@ module pipeline_core
    // until its ready, and every other port user waits for that drain.  0 =
    // every store holds MEM until its ready (the pre-proposal behaviour).
    localparam bit EN_POST_ST = 1'b1;
+   // HW proposal 3 (§2.6): start the NLB prefetch of the line after next on
+   // the slide that empties the NLB (see the prefetch engine).  0 = the M9
+   // start condition only.
+   localparam bit EN_PF_EARLY = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -2016,6 +2020,19 @@ module pipeline_core
                end
                pf_look <= 1'b0;                // hit captured / miss abandoned
             end
+         end else if (EN_PF_EARLY && running && !fetch_halt && !parked && !irq_active
+                      && w_slide && ifb_base[0] && !if_look && !if_xc) begin
+            // HW proposal 3 (§2.6): a slide from an ODD base consumes the
+            // NLB's last dword, and want_line moves to want_line+1 on this
+            // edge.  Start that line's lookup NOW instead of next cycle: the
+            // 3-cycle BRAM prefetch then lands as the window's last word
+            // dispatches, closing the one-bubble-per-8-words gap of
+            // straight-line 1-word code.  The NLB's old line is dead after
+            // this edge, so the earlier capture cannot clobber a live line.
+            // (Paired with the redirect abort in the pos_track composer: a
+            // prefetch must never hold the BRAM port into a redirect.)
+            pf_look <= 1'b1;
+            pf_line <= r_want_line + 28'd1;
          end else if (running && !fetch_halt && !parked && !irq_active
                       && fetch_ok && ifb_val[0] && !nlb_has_want
                       && !if_look && !if_xc) begin
@@ -2317,6 +2334,11 @@ module pipeline_core
             // PIPELINE_M12_TIMING.md.)
             if (ev_pcz)    p = 3'b000;              // conservative: forces rebase
             pos <= p;
+            // HW proposal 3: a redirect aborts any background prefetch (it was
+            // for the old sequential path), so the BRAM read port reads the
+            // new miss_dw on the very next cycle — the free first-cycle read
+            // the demand lookup relies on.  (NBA here wins over the engine.)
+            if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
             if (ev_rebase) begin

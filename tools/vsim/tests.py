@@ -215,14 +215,17 @@ def diei_irq_window():
     # the main program (pre-existing, unrelated to DI)
     for lat in (1, 3, 7):
         for per in (lat * 30 + 60, lat * 50 + 90, 401):
-            out.append((_crit(), {'end': 'park', 'kind': '0', 'r9': 0}, [f'+LAT={lat}', f'+IRQ_PERIOD={per}']))
+            # +LATR: random extra latency breaks timer / loop phase lock
+            out.append((_crit(), {'end': 'park', 'kind': '0', 'r9': 0},
+                        [f'+LAT={lat}', f'+IRQ_PERIOD={per}', '+LATR=4']))
     return out
 
 
 @test
 def diei_irq_window_control():
     """negative control: without DI/EI the window check must see handlers"""
-    return _crit(False), {'end': 'park', 'kind': '0', 'r9': 'nonzero'}, ['+LAT=3', '+IRQ_PERIOD=150']
+    return [(_crit(False), {'end': 'park', 'kind': '0', 'r9': 'nonzero'},
+             [f'+LAT={l}', f'+IRQ_PERIOD={p}', '+LATR=4']) for l, p in ((3, 150), (1, 211))]
 
 
 @test
