@@ -16,7 +16,7 @@
 //   +MAXC=<n>       cycle cap (default 2,000,000)
 //===========================================================================
 `timescale 1ns/1ps
-module tb_vsim;
+module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -51,7 +51,7 @@ module tb_vsim;
    klauss_pkg::dbg_in_t  dbg_i = '0;
    klauss_pkg::dbg_out_t dbg_o;
 
-   pipeline_core dut (
+   pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
       .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be,
       .m_rdata, .m_rdata_next, .m_next_valid, .m_ready,

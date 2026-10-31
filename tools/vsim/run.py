@@ -27,7 +27,8 @@ def git_show(rev, path):
 
 
 def build(rev=None, quiet=True):
-    tag = rev or 'wt'
+    dbg = os.environ.get('VSIM_DEBUG_EN') == '1'     # elaborate DEBUG_EN=1
+    tag = (rev or 'wt') + ('_dbg' if dbg else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -42,14 +43,14 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
-    defs = []
+    defs = ['-GDEBUG_EN=1'] if dbg else []
     if 'st_post_ok' in core:
         defs.append('+define+HAS_POST')
     if 'output logic [1:0]   perf_ic' in core:
