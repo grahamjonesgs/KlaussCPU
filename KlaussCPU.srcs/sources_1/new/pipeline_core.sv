@@ -1410,16 +1410,24 @@ module pipeline_core
    // branch / flush / fetch / port attribution (events and wait cycles)
    // An EX op killed this edge by an older fused branch or a store squash
    // never retires, so it is not counted.
-   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && exo_taken && !fbr_taken && !sq_ex
-                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL || ex_d.uop == U_FBR)) || fbr_taken;
+   // JMP / CALL take exo_taken = ex_bcvt_t[0]; the counters read that
+   // directly, keeping the counter adders off the exo_taken mux (which,
+   // with EN_FBR_EQ_EX, also carries the 64-bit FBR equality reduce).  An
+   // EX-resolved FBR is counted one cycle late from a register.
+   logic r_perf_fbr_ex;
+   always_ff @(posedge clk)
+      if (rst)     r_perf_fbr_ex <= 1'b0;
+      else if (ce) r_perf_fbr_ex <= EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
+                                    ex_d.uop == U_FBR && !fbr_taken && !sq_ex;
+   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && ex_bcvt_t[0] && !fbr_taken && !sq_ex
+                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken || r_perf_fbr_ex;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
    assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
-   assign perf_br_taken = exo_taken;
-   assign perf_fbr_taken = fbr_taken ||  // MEM ops always commit: counted as they redirect
-                           (EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
-                            ex_d.uop == U_FBR && !sq_ex);   // 2b-lite: EX-resolved
+   assign perf_br_taken = ex_bcvt_t[0];   // = exo_taken whenever perf_br (a JMP)
+   assign perf_fbr_taken = fbr_taken ||   // MEM ops always commit: counted as they redirect
+                           r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
                        !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active &&
