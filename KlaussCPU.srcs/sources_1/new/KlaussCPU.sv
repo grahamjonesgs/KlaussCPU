@@ -558,7 +558,16 @@ module KlaussCPU #(
    // idle: the pipeline parks only after draining (pip_bus_idle), and the FSM
    // is idle in PIPE_RUN.
    // ------------------------------------------------------------------------
-   wire        w_pipe_owns = (st.SM == PIPE_RUN);
+   // REGISTERED (one cycle behind st.SM): with the combinational DRAM
+   // return (bus_splitter COMB_DRAM_RET) the st.SM decode reached the core's
+   // pc through m_ready and through the address mux -> is_mmio -> response
+   // select (tier-1 -0.203 ns).  Ownership only changes when the core is
+   // idle — entering PIPE_RUN (the core issues nothing for several cycles
+   // after start) and leaving it (only after park && bus_idle) — so a
+   // one-cycle lag only delays the FSM's first access by a cycle.
+   logic       r_pipe_owns = 1'b0;
+   always_ff @(posedge i_Clk) r_pipe_owns <= (st.SM == PIPE_RUN);
+   wire        w_pipe_owns = r_pipe_owns;
    wire [31:0] pip_m_addr;
    wire        pip_m_read_DV, pip_m_write_DV;
    wire [63:0] pip_m_wdata;
