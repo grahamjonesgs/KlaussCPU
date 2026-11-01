@@ -186,6 +186,14 @@ module pipeline_core
    // (a wrong taken prediction costs a full redirect; a correct not-taken
    // one is free), while a loop branch reaches 3 within two iterations.
    localparam bit BP_STRONG = 1'b1;
+   // HW proposal 1 step (1a/1b): early load issue.  A read (load, POP,
+   // LEAVE, LEAVERET, RET, IRET) moving from EX into MEM while the port is
+   // idle puts DV and its address on the port on that same edge (from
+   // exo_iaddr, which already feeds mem_iaddr), so the cache sees it in
+   // MEM's first cycle: one MEM cycle less per such load.  Not when the
+   // MEM op then leaving is itself a port op (its DV must drop first), nor
+   // for stores (their post / snoop checks run at the issue cycle).
+   localparam bit EN_EARLY_LD = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -1448,6 +1456,13 @@ module pipeline_core
                        (mem_xc == 2'd1 && st_post_ok);   // 1c: posted (registered)
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && (ret_actual != mem_pred_tgt);
+   wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
+                        ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
+                        ex_d.uop == U_RET || ex_d.uop == U_IRET);
+   // (ex_misal is declared below; the early issue excludes it in the block)
+   wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op &&
+                       !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
+                       !fbr_taken && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -1526,7 +1541,7 @@ module pipeline_core
                            r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
-                       !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active &&
+                       !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active && !w_early_ld &&
                        !(DEBUG_EN && (dbg_active || dbg_halted));
    assign perf_ic[1] = if_xc;
 
@@ -2078,7 +2093,7 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active
+               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active && !w_early_ld
                             && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
@@ -2214,6 +2229,23 @@ module pipeline_core
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
             end else begin
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
+               // early load issue (see EN_EARLY_LD): the MEM engine then
+               // starts in its wait-ready state
+               if (w_early_ld && !ex_misal) begin
+                  m_addr     <= exo_iaddr;
+                  m_be       <= exo_be;
+                  m_read_DV  <= 1'b1;
+                  rdy_armed  <= !m_ready;
+                  mem_xc     <= 2'd1;
+                  if (DEBUG_EN) begin
+                     for (int w = 0; w < 2; w++)
+                        if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
+                            (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
+                           dbg_watch_req  <= 1'b1;
+                           dbg_watch_addr <= exo_iaddr;
+                        end
+                  end
+               end
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
                mem_ptk    <= ex_ptk;  mem_pc_next <= ex_pc_next;
