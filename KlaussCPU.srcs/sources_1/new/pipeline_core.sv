@@ -115,6 +115,63 @@ module pipeline_core
    output dbg_out_t     dbg_o
 );
 
+   // ------------------------------------------------------- build switches
+   // (declared first: xvlog / Vivado reject a localparam used before it)
+   // ISA v3 B (fused compare-and-branch) build switch. It adds a MEM-stage
+   // pc source; the M13 builds measured CPU pc-path margin +0.03 ns with it
+   // vs ~+0.2 ns without (WNS then set by SoC paths). 0 = class D traps and
+   // the redirect logic synthesizes away (compile with
+   // -mllvm -klausscpu-fuse-cmp-br=false).
+   localparam bit EN_FBR = 1'b1;
+   // HW proposal 6 (HARDWARE_PROPOSALS.md §2.6): FBR PRED 5-7 = EQW/LTW/ULTW
+   // and the 2-word FBR with a sext(imm32) right-hand side.  0 = both trap
+   // (the pre-proposal decode).
+   localparam bit EN_FBR_W = 1'b1;
+   // HW proposal 7a (§2.7): DI rd / EI rs1, class B system OP 6 / 7.
+   // 0 = both trap and irq_dis stays 0.
+   localparam bit EN_DIEI = 1'b1;
+   // HW proposal 8 / §3.3: a 16- or 32-bit load/store whose address is not
+   // naturally aligned parks (park_kind 5 -> crash dump ERR_MISALIGN)
+   // instead of silently aligning down.  MEMGET32 ([rs1] 32-bit load, the
+   // unaligned-tolerant form), byte and 64-bit accesses and the stack ops
+   // keep their defined behaviour.  0 = the old silent align-down.
+   localparam bit EN_MISAL_TRAP = 1'b1;
+   // HW proposal 9 (§2.9): the missing short forms — CMPRVW simm8 (class 3
+   // short with INV=1), MULV simm8 (class A OP=3, LEN=01, SGN [23]) and
+   // LEAPC simm16 (class 2 LEN=01 OP=14 F=1, simm16 = {[19:12],[7:0]}).
+   // All three trap today; 0 keeps it that way.  They add legs to
+   // f_short_imm on the w_op -> id_var1 latch path.
+   localparam bit EN_SHORT9 = 1'b1;
+   // HW proposal 1c (§2.4): posted DRAM stores — a 1-entry store buffer on
+   // the core side of the port.  A store that touches no fetch-side code
+   // copy leaves MEM one cycle after issue; the port stays busy (st_post)
+   // until its ready, and every other port user waits for that drain.  0 =
+   // every store holds MEM until its ready (the pre-proposal behaviour).
+   localparam bit EN_POST_ST = 1'b1;
+   // HW proposal 3 (§2.6): start the NLB prefetch of the line after next on
+   // the slide that empties the NLB (see the prefetch engine).  0 = the M9
+   // start condition only.
+   localparam bit EN_PF_EARLY = 1'b1;
+   // HW proposal 2b-lite (§2.5): an EQ/NE fused branch (incl. EQW/NEW)
+   // redirects from EX like JMPcc, one cycle earlier than from MEM.  Only
+   // the equality forms: a 64-bit XOR-reduce from the ex_a/ex_b registers,
+   // in parallel with (and no deeper than) the 64-bit wb_value==0 reduce
+   // already on the JMPcc flags_eff -> exo_taken path.  The ordered compares
+   // (carry chains) stay in MEM — ISA_V3_IMPL.md: a 64-bit magnitude compare
+   // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
+   // until a build shows the exo_taken -> pc family still meets.
+   localparam bit EN_FBR_EQ_EX = 1'b0;
+   // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
+   // function of the same 4 bits f_cmp_op already reads (no extra level).
+   function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
+      case (p)
+         3'd5:    return 3'd0;   // EQW
+         3'd6:    return 3'd1;   // LTW
+         3'd7:    return 3'd3;   // ULTW
+         default: return p;
+      endcase
+   endfunction
+
    // ------------------------------------------------------------------ types
    typedef enum logic [5:0] {
       U_ILL, U_ALU, U_BOOL, U_SHIFT, U_ROT1, U_BTSTN, U_UNARY,
@@ -283,60 +340,6 @@ module pipeline_core
    // read; SMC-correct, M7b refines to tag-checked). Miss path is unchanged (fetch
    // at miss_dw, install what returns; per-dword valid tolerates partial fills).
    //   dword addr = pc[31:3] (29b); line = dword[28:1]; dword-in-line = dword[0]=addr[3]
-   // ISA v3 B (fused compare-and-branch) build switch. It adds a MEM-stage
-   // pc source; the M13 builds measured CPU pc-path margin +0.03 ns with it
-   // vs ~+0.2 ns without (WNS then set by SoC paths). 0 = class D traps and
-   // the redirect logic synthesizes away (compile with
-   // -mllvm -klausscpu-fuse-cmp-br=false).
-   localparam bit EN_FBR = 1'b1;
-   // HW proposal 6 (HARDWARE_PROPOSALS.md §2.6): FBR PRED 5-7 = EQW/LTW/ULTW
-   // and the 2-word FBR with a sext(imm32) right-hand side.  0 = both trap
-   // (the pre-proposal decode).
-   localparam bit EN_FBR_W = 1'b1;
-   // HW proposal 7a (§2.7): DI rd / EI rs1, class B system OP 6 / 7.
-   // 0 = both trap and irq_dis stays 0.
-   localparam bit EN_DIEI = 1'b1;
-   // HW proposal 8 / §3.3: a 16- or 32-bit load/store whose address is not
-   // naturally aligned parks (park_kind 5 -> crash dump ERR_MISALIGN)
-   // instead of silently aligning down.  MEMGET32 ([rs1] 32-bit load, the
-   // unaligned-tolerant form), byte and 64-bit accesses and the stack ops
-   // keep their defined behaviour.  0 = the old silent align-down.
-   localparam bit EN_MISAL_TRAP = 1'b1;
-   // HW proposal 9 (§2.9): the missing short forms — CMPRVW simm8 (class 3
-   // short with INV=1), MULV simm8 (class A OP=3, LEN=01, SGN [23]) and
-   // LEAPC simm16 (class 2 LEN=01 OP=14 F=1, simm16 = {[19:12],[7:0]}).
-   // All three trap today; 0 keeps it that way.  They add legs to
-   // f_short_imm on the w_op -> id_var1 latch path.
-   localparam bit EN_SHORT9 = 1'b1;
-   // HW proposal 1c (§2.4): posted DRAM stores — a 1-entry store buffer on
-   // the core side of the port.  A store that touches no fetch-side code
-   // copy leaves MEM one cycle after issue; the port stays busy (st_post)
-   // until its ready, and every other port user waits for that drain.  0 =
-   // every store holds MEM until its ready (the pre-proposal behaviour).
-   localparam bit EN_POST_ST = 1'b1;
-   // HW proposal 3 (§2.6): start the NLB prefetch of the line after next on
-   // the slide that empties the NLB (see the prefetch engine).  0 = the M9
-   // start condition only.
-   localparam bit EN_PF_EARLY = 1'b1;
-   // HW proposal 2b-lite (§2.5): an EQ/NE fused branch (incl. EQW/NEW)
-   // redirects from EX like JMPcc, one cycle earlier than from MEM.  Only
-   // the equality forms: a 64-bit XOR-reduce from the ex_a/ex_b registers,
-   // in parallel with (and no deeper than) the 64-bit wb_value==0 reduce
-   // already on the JMPcc flags_eff -> exo_taken path.  The ordered compares
-   // (carry chains) stay in MEM — ISA_V3_IMPL.md: a 64-bit magnitude compare
-   // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
-   // until a build shows the exo_taken -> pc family still meets.
-   localparam bit EN_FBR_EQ_EX = 1'b0;
-   // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
-   // function of the same 4 bits f_cmp_op already reads (no extra level).
-   function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
-      case (p)
-         3'd5:    return 3'd0;   // EQW
-         3'd6:    return 3'd1;   // LTW
-         3'd7:    return 3'd3;   // ULTW
-         default: return p;
-      endcase
-   endfunction
    localparam int IC_LINES = 512;
    localparam int IC_IDXW  = 9;                 // $clog2(IC_LINES)
    (* ram_style = "block" *) logic [127:0] ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
@@ -350,6 +353,10 @@ module pipeline_core
    // CODE line's index and evicts it though the code is untouched — LVGL's
    // framebuffer/.bss writes thrashed the I-cache to ~51% IF_MISS / ~286 CPI).
    logic [18:0] ic_tagff [0:IC_LINES-1];
+   // Power-up value (the FPGA's register/LUTRAM init is 0): the 1c post
+   // check reads it for every store, so it must not be X in 4-state sims.
+   // A stale 0 tag only makes posting conservative for addresses below 8 KB.
+   initial for (int i = 0; i < IC_LINES; i++) ic_tagff[i] = '0;
    // M12 snoop split: the tag compare runs at store issue and is registered
    // here; the ic_v* clear lands one cycle later (the one-cycle compare +
    // clear was the tier-1 worst family: tagff LUTRAM read -> 19b compare ->
