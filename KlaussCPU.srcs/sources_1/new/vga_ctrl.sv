@@ -57,6 +57,7 @@
 module vga_ctrl (
     input              i_Clk,       // CPU clock (ui_clk, 100 MHz)
     input              i_Rst_L,
+    input              i_prog_start,     // pulse: a program is being started (CTRL -> reset value)
 
     mmio_if.slave      mmio,        // offsets use mmio.addr[15:0]
     output logic       o_irq,       // vsync, level (see header)
@@ -69,6 +70,7 @@ module vga_ctrl (
     input       [255:0] i_dma_read_data,
     input               i_dma_ready,
     input               i_dma_grant,
+    input               i_dma_yield,     // the cache is waiting for DDR (mem_read_write)
 
     output logic [3:0] o_vga_r,
     output logic [3:0] o_vga_g,
@@ -142,6 +144,14 @@ module vga_ctrl (
     wire byte_en_unused = |mmio.byte_en;
 
     always_ff @(posedge i_Clk) begin
+        if (i_prog_start) begin
+            // A new program starts with scan-out off (the reset CTRL: test
+            // pattern, no DDR traffic, vsync IRQ disabled) — one left on by
+            // the previous program would otherwise tax every DRAM access of
+            // the next (klausscpu-llvm handoff m8, item 3).
+            r_ctrl       <= CTRL_RESET;
+            r_vs_pending <= 1'b0;
+        end
         if (!i_Rst_L) begin
             r_ctrl       <= CTRL_RESET;
             r_fb_base    <= '0;
@@ -223,6 +233,10 @@ module vga_ctrl (
     logic [63:0] w_img_dword;
     logic [2:0]  w_img_sub;
 
+    // Tenures of up to CHUNK (4) reads, ended early when the cache has a
+    // miss waiting (i_dma_yield): a CPU miss then waits behind at most the
+    // read in flight (with fixed 4-read tenures the average miss penalty
+    // went 29 -> 56 cycles under 640x480x16 scan-out).
     vga_scanout scanout (
         .i_Clk          (i_Clk),
         .i_Rst_L        (i_Rst_L),
@@ -247,7 +261,8 @@ module vga_ctrl (
         .o_dma_addr     (o_dma_addr),
         .i_dma_read_data(i_dma_read_data),
         .i_dma_ready    (i_dma_ready),
-        .i_dma_grant    (i_dma_grant)
+        .i_dma_grant    (i_dma_grant),
+        .i_yield        (i_dma_yield)
     );
 
     // -------------------------------------------------------------------------

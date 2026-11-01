@@ -130,6 +130,7 @@ module mem_read_write (
     output     [255:0] o_vga_read_data,
     output            o_vga_ready,
     output            o_vga_grant,
+    output            o_vga_yield,      // a cache miss is waiting for DDR: VGA should end its tenure
 
     // -------------------------------------------------------------------------
     // Cache-maintenance control (MMIO 0xF005). Full-cache operations that walk
@@ -1094,6 +1095,7 @@ module mem_read_write (
                             (r_grant_vga  && !i_vga_req && !i_vga_done);
     wire w_no_grant = !r_grant_blit && !r_grant_c2 && !r_grant_vga;
     wire w_vga_gate = !is_miss_path && (state != MAINT || r_mnt_sub == MS_READ);
+    assign o_vga_yield = is_miss_path;
 
     always_ff @(posedge i_Clk) begin
         r_grant_orphan_cnt <= w_grant_orphaned ? r_grant_orphan_cnt + 4'd1 : 4'd0;
