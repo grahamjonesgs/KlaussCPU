@@ -181,6 +181,11 @@ module pipeline_core
    // EN_FBR_EQ_EX (that leg is ignored when EN_BP=1).  0 = no prediction.
    localparam bit EN_BP = 1'b1;
    localparam int BP_IDXW = 9;             // 512 counters
+   // Predict taken only at counter 3 ("strongly taken") instead of >= 2:
+   // a data-dependent ~50/50 branch then mostly stays predicted not-taken
+   // (a wrong taken prediction costs a full redirect; a correct not-taken
+   // one is free), while a loop branch reaches 3 within two iterations.
+   localparam bit BP_STRONG = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -942,7 +947,8 @@ module pipeline_core
    logic [31:0]        mem_pc_next;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
-   wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) && id_bp_ctr[1]));
+   wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
+                                   (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
    endfunction
