@@ -7,6 +7,13 @@ klausscpu-llvm `main`, 2026-10-29). The RTL was written in simulation on
 Every change has its own build switch (`localparam bit EN_*` at the top of
 `pipeline_core.sv`).
 
+Merged to master as `3508f87`; the `0de5b21` bitstream was written to QSPI on
+2026-11-01, verified by read-back, and boot-tested from flash: netboot banner,
+DHCP, a UART load, and `hwprop_test` all pass. Rollback (outside the repo):
+
+- `~/.cache/kbuild/rollback/`: the full pre-write flash dump and master
+  `e58530b`'s bitstream, with restore commands in its `README.txt`.
+
 ## 0. Board results (2026-11-01)
 
 **Timing:** met at tier 1 (Performance_Explore, no phys_opt rescue).
