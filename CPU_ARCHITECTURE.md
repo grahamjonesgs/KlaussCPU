@@ -3,8 +3,9 @@
 > **Currency (2026-10).** This document describes the CPU as executed by
 > `pipeline_core.sv` (5-stage in-order pipeline) with ISA encoding v2 + the
 > v3 additions. It is the *programmer's model*: semantics, flags, alignment,
-> calling convention, interrupts, and the pipeline costs that matter for code
-> generation. It deliberately does **not** repeat the opcode numbers:
+> interrupts, and the pipeline costs that matter for code generation. The
+> calling convention (registers, frames, argument passing) is specified in
+> klausscpu-llvm's `llvm/lib/Target/KlaussCPU/ABI.md`. It deliberately does **not** repeat the opcode numbers:
 > - [ISA_ENCODING_V2_MAP.md](ISA_ENCODING_V2_MAP.md) — authoritative
 >   symbol → encoding map (§7 there = v3 additions).
 > - [ISA_V3_IMPL.md](ISA_V3_IMPL.md) — v3 design notes and measurements.
@@ -138,7 +139,8 @@ mnemonic.
 
 | Where | Extension |
 |-------|-----------|
-| Class 2 ALU-imm / MOV (SETR), class A MUL/DIV/MOD imm | SGN bit `[20]`: 1 = sign-extend imm32, 0 = zero-extend. Toolchain convention: ADDI/SETR/MULV/DIVV/MODV sign-extend; ADDV/MINUSV/ANDV/ORV/XORV zero-extend. |
+| Class 2 ALU-imm / MOV (SETR) | SGN bit `[20]`: 1 = sign-extend imm32, 0 = zero-extend. Toolchain convention: ADDI/SETR sign-extend; ADDV/MINUSV/ANDV/ORV/XORV zero-extend. |
+| Class A MUL/DIV/MOD imm (MULV/DIVV/MODV) | SGN bit `[23]` (it also selects the signed operation): 1 = sign-extend imm32, 0 = zero-extend. The short MULV (imm8 `[19:12]`) uses the same bit. |
 | CMPRV (class 3 imm) | SGN bit; the short form is always sign-extended |
 | Load/store offset (`rs1 + imm32`) | **Effectively signed.** The effective address is a 32-bit modular add, so `imm32 = 0xFFFF_FFF8` gives `base − 8`. Short form: simm8 × access size. |
 | ADDSP | 32-bit modular add to SP (negative allocates) |
@@ -248,13 +250,16 @@ Sub-64-bit loads **zero-extend when SGN=0 and sign-extend when SGN=1**
 | Access | Behaviour |
 |--------|-----------|
 | 8-bit | any address |
-| 16-bit load/store | address bit 0 ignored (forced 2-byte aligned) |
-| 32-bit store; 32-bit load in modes 01/10/11; any signed 32-bit load | address bits [1:0] ignored (forced 4-byte aligned) |
+| 16-bit load/store | must be 2-byte aligned: an odd address **traps** (crash dump `ERR=0A`) |
+| 32-bit store; 32-bit load in modes 01/10/11; any signed 32-bit load | must be 4-byte aligned: otherwise it **traps** (`ERR=0A`) |
 | **32-bit unsigned load, mode 00 (`MEMGET32`)** | **unaligned-tolerant**, including across a doubleword boundary (a second read if the next doubleword is in another line) |
 | 64-bit with A=1 (`MEMGET64`, `LDIDX64A`, …) | address bits [2:0] ignored (forced 8-byte aligned) |
 | 64-bit with A=0 ("raw": `MEMREADRR`, `LDIDX64`, …) | address passed to the memory system unmodified; keep it 8-byte aligned |
 
-A misaligned access never faults; it silently uses the aligned slot.
+Since 3508f87 a misaligned 16/32-bit access (the two trap rows above)
+stops the CPU before it executes: park kind 5, crash dump `ERR=0A`, no
+retire. Before that it silently used the aligned slot. Byte accesses,
+`MEMGET32`, 64-bit accesses and the stack ops never trap.
 
 Sub-word stores replicate the data across lanes and use byte enables, and
 MMIO devices see the same `be` pattern.
@@ -335,9 +340,10 @@ f:  ENTER n       ; save FP, FP = SP, allocate n locals
 | `short` / `int16_t` | 2 | 2 | MEMGET16 / _S, LDIDX16 / LDIDX16_S | MEMSET16, STIDX16 |
 | `int` / `int32_t` | 4 | 4 | MEMGET32 / _S, LDIDX32 / LDIDX32_S | MEMSET32, STIDX32 |
 | `long` / `int64_t` | 8 | 8 | MEMGET64, LDIDX64A | MEMSET64, STIDX64A |
-| pointer | 4 | 4 | MEMGET32, LDIDX32 | MEMSET32, STIDX32 |
+| pointer | 8 | 8 | MEMGET64, LDIDX64A | MEMSET64, STIDX64A |
 
-Pointers are 32-bit and zero-extended in registers. 32-bit `int`
+Pointers occupy 8 bytes in memory (ABI.md); addresses are 32-bit and
+zero-extended in registers. 32-bit `int`
 arithmetic can use the W ops (ADDW/SUBW/ADDIW/MULW) and the 32-bit compares
 (`CMPRRW`/`CMPRVW` and boolean W), which keep the value sign-extended
 without a separate SEXTW.
@@ -382,9 +388,16 @@ Up to 4 sources: 0 = periodic timer, 1 = blitter DONE, 2 = Ethernet,
 timer > blitter > Ethernet > VGA. Sources 1–3 are level-triggered: the
 handler must clear the device's pending bit before `IRET`. Configuration
 is all MMIO at `0xF00F_0000` (`INT_MASK`, `INT_PENDING`, `INT_VECn`,
-`TIMER_PERIOD`, … — see MMIO_MAP.md). The only interrupt opcode is `IRET`.
+`TIMER_PERIOD`, … — see MMIO_MAP.md). The interrupt opcodes are `IRET` and,
+since 3508f87, `DI rd` / `EI rs1`: a core-internal disable bit that blocks
+every source without touching `INT_MASK`. `DI rd` returns the old enable bit
+(0/1) and disables; `EI rs1` sets enable = rs1[0], so `DI r ; … ; EI r`
+restores the previous state (encodings: ISA_ENCODING_V2_MAP.md §8.2). While
+disabled, `WAIT` still wakes on a pending interrupt but does not enter the
+handler.
 
-A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`.
+A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`
+and interrupts are not disabled by `DI`.
 
 **Entry sequence (in hardware):**
 1. At an instruction boundary, the core takes the interrupt *instead of*
@@ -401,7 +414,9 @@ Single-stepping under the debugger never takes interrupts.
 **Saved frame** (pushed on entry, popped by `IRET`):
 
 ```
-[63:43] = 0            (reserved)
+[63:44] = 0            (reserved)
+[43]    = DI disable   (restored by IRET; 1 = disabled, so a frame built
+                        by software with 0 here resumes enabled)
 [42:39] = INT_MASK     (restored by IRET)
 [38]    = Z            (restored)
 [37]    = Z  (equal)   (informational)
@@ -413,7 +428,8 @@ Single-stepping under the debugger never takes interrupts.
 [31:0]  = resume PC    (first instruction not yet executed)
 ```
 
-`IRET` restores PC, Z/S/C/V (from bits 38/36/35/34) and the 4-bit mask.
+`IRET` restores PC, Z/S/C/V (from bits 38/36/35/34), the 4-bit mask and
+the DI disable bit (bit 43).
 A handler that edits the saved flags must edit those bits. If an MMIO write
 to `INT_MASK` and an `IRET` restore land on the same cycle, the MMIO write
 wins. A debugger unwinding through an interrupt must mask the frame to
@@ -459,7 +475,9 @@ Costs relative to the ideal one instruction per cycle:
 | Situation | Cost |
 |-----------|------|
 | ALU result used by the **next** instruction | 1 bubble (forwarded from MEM after that) |
-| **Load** (or POP/LEAVE) result used by the next instruction | 2 bubbles (forwarded from WB) |
+| D-cache **load hit** | MEM is held ~4 cycles and the whole pipe freezes behind it (`PERF_MEM_WAIT`); a miss adds the DRAM time |
+| D-cache **store hit** | posted (3508f87): MEM ~2 cycles; the next memory access waits for the drain, so back-to-back stores still cost ~4 each |
+| **Load** (or POP/LEAVE) result used by the next instruction | 2 bubbles beyond the hit time (forwarded from WB) |
 | Flag reader (Jcc, ADC/SBC, RCL/RCR, GETF) right after a flag writer | 1 bubble |
 | SP user after an SP writer still in flight (push/pop/call/ADDSP/…) | waits until the writer commits |
 | Taken branch/call (resolved in EX; predict not-taken) | younger fetches flushed |
