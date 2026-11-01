@@ -1,15 +1,100 @@
 # Response to HARDWARE_PROPOSALS.md (RTL side)
 
-Branch `hw-proposals`, 2026-10-31. Answers `HARDWARE_PROPOSALS.md` (copied
-from klausscpu-llvm `main`, 2026-10-29). Written by an unattended session
-**without Vivado**: everything here is simulation-verified, and **nothing is
-timing-verified or board-verified yet**. Every change has its own build switch
-(`localparam bit EN_*` at the top of `pipeline_core.sv`), so a timing miss can
-be bisected one feature at a time.
+Branch `hw-proposals`. Answers `HARDWARE_PROPOSALS.md` (copied from
+klausscpu-llvm `main`, 2026-10-29). The RTL was written in simulation on
+2026-10-31, then built, timing-closed and **board-verified on 2026-11-01**
+(Nexys A7, 100 MHz, Vivado 2025.2). The tested bitstream is from `0de5b21`.
+Every change has its own build switch (`localparam bit EN_*` at the top of
+`pipeline_core.sv`).
+
+## 0. Board results (2026-11-01)
+
+**Timing:** met at tier 1 (Performance_Explore, no phys_opt rescue).
+
+| Build | WNS | WHS | Worst path |
+|---|---:|---:|---|
+| master `e58530b` (same flow, same day) | +0.077 | +0.013 | core 2 `mul_a_q → DSP PCIN` |
+| hw-proposals `23e616f` | +0.145 | +0.018 | core 2 `ex_b → pc` |
+| hw-proposals `0de5b21` (**shipped**) | +0.130 | +0.024 | — |
+| `0de5b21` with `EN_FBR_EQ_EX=1` | −0.123 (tier 2) | +0.024 | core 1 `ex_a → mul DSP CEA1` / `ex_a → pc` (−0.082) |
+
+**Correctness on silicon, `0de5b21`:**
+
+- M5e: 15 programs. 13 are byte-identical to the emulator. dhrystone and
+  test_atomic print timing-dependent numbers (as on master); both pass their
+  self-checks (`Self-check: PASS`; `test_atomic PASSED`, 137/0).
+- `tools/board/hwprop_test`: ALL PASS. It covers 704 FBR W / imm32 /
+  short-CMPRVW branch cases, short MULV and LEAPC, DI/EI values, 0 of 2342
+  timer ISRs inside a DI window, WAIT while disabled, and 21 posted-store SMC
+  cases.
+- `tools/board/hwprop_misal`: `ERR=0A`, with F1/F3/F5 = the three return
+  addresses of the call chain.
+- CoreMark (validation run) and all 19 Embench benchmarks verify.
+- xsim (M5a TB): the RTL retire traces of 15 programs (21M instructions) are
+  identical to master's.
+
+**Performance** (board cycles, master vs `0de5b21`; same ELFs, toolchain
+`56ee1aba697b`, -O2; Dhrystone -O1 as built by the runtime Makefile):
+
+| Benchmark | master | hw-proposals | change |
+|---|---:|---:|---:|
+| CoreMark (2000 it) | 1,978,438,739 | 1,904,365,769 | **−3.7%** (CoreMark/MHz 1.010 → 1.050) |
+| Dhrystone, cycles/run | 220 | 211 | **−4.1%** (DMIPS/MHz 2.587 → 2.697) |
+| Embench speed geomean | 0.554 | 0.579 | **+4.5%** |
+| aha-mont64 | 3,368,556 | 3,275,486 | −2.8% |
+| crc32 | 9,668,180 | 9,450,577 | −2.3% |
+| cubic | 5,964,424 | 5,654,580 | −5.2% |
+| edn | 10,111,893 | 9,861,322 | −2.5% |
+| huffbench | 7,702,720 | 7,329,033 | −4.9% |
+| matmult-int | 12,051,686 | 11,701,722 | −2.9% |
+| minver | 6,227,393 | 5,989,017 | −3.8% |
+| nbody | 4,154,365 | 3,938,662 | −5.2% |
+| nettle-aes | 9,400,924 | 9,129,353 | −2.9% |
+| nettle-sha256 | 7,587,069 | 7,007,204 | −7.6% |
+| nsichneu | 11,137,068 | 10,986,886 | −1.3% |
+| picojpeg | 8,997,125 | 8,497,143 | −5.6% |
+| qrduino | 7,314,940 | 7,112,953 | −2.8% |
+| sglib-combined | 8,600,966 | 8,244,659 | −4.1% |
+| slre | 9,570,491 | 9,096,269 | −5.0% |
+| st | 4,587,171 | 4,398,423 | −4.1% |
+| statemate | 5,432,553 | 5,019,666 | −7.6% |
+| ud | 8,410,233 | 7,926,206 | −5.8% |
+| wikisort | 2,608,484 | 2,471,588 | −5.2% |
+
+All of this gain comes from 1c and 3; the other items need compiler support
+first. No benchmark is slower.
+
+**Micro-kernels** (`hwprop_kern`, board `PERF_CYCLES` per body, minus the
+timer-read overhead):
+
+| Kernel | master | hw-proposals |
+|---|---:|---:|
+| 1-word ALU, independent | 1.12 | 1.01 |
+| SETR (2-word) | 2.00 | 2.03 |
+| store 64 (back to back) | 4.06 | 3.93 |
+| store ; ALU | 5.00 | 3.93 |
+| load 64 | 5.06 | 5.06 |
+| store ; load | 9.06 | 9.06 |
+| PUSH ; POP | 14.81 | 12.87 |
+| taken FBR | 6.00 | 5.81 |
+| not-taken FBR | 1.12 | 1.06 |
+| MUL | 4.00 | 4.06 |
+| DI ; EI | (traps) | 2.93 |
+
+How to read these:
+
+- A posted store hides behind non-memory work, but back-to-back stores still
+  wait for each other's drain. A store directly followed by a load gains
+  nothing.
+
+Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
+
+- localparams used before their declaration;
+- `ic_tagff` had no initial value, so it was X in 4-state sim.
 
 ## 1. Status
 
-| # | Proposal | State | Switch (default) | Measured (full-SoC sim, cycles) |
+| # | Proposal | State (all items board-verified unless noted) | Switch (default) | Measured (full-SoC sim, cycles) |
 |---|---|---|---|---|
 | 1c | store buffer | **done**: posted DRAM stores | `EN_POST_ST` (1) | store 12.17 → 10.18 per loop iter (−2.0); CALL+RET −2.0; PUSH;POP −2.0; CALL+ENTER+store+LEAVERET −4.0; loads unchanged |
 | 3 | front-end line bubble | **done** for 1-word code | `EN_PF_EARLY` (1) | 32 straight-line ALU ops 44.34 → 40.36 per iter; loop sweep (body 2..32 × 4 alignments) −5.2%, no case worse |
@@ -19,7 +104,7 @@ be bisected one feature at a time.
 | 9 | short CMPRVW / MULV / LEAPC | **done** (RTL; needs toolchain) | `EN_SHORT9` (1) | — (code size) |
 | §3.4 | call chain in crash dump | **done** (F0..F5 lines) | — | — |
 | §2.6 | I-cache miss counter | **done** (`PERF_IC_MISS` 0xF0, `PERF_IC_FILL_CYC` 0xF8) | — | — |
-| 2b | FBR resolved in EX | **partial, opt-in**: EQ/NE (+W) only | `EN_FBR_EQ_EX` (**0**) | taken FBR NE −1.0 per iteration when on |
+| 2b | FBR resolved in EX | **partial, opt-in, does not close**: EQ/NE (+W) only; −0.12 ns on the core-1 `ex_a → pc` / mul-enable families | `EN_FBR_EQ_EX` (**0**) | taken FBR NE −1.0 per iteration when on |
 | 1b | load hit 4 → 3 | not done: stage B (`feat/m10b-fused`, `daa0795`) is not on GitHub | — | — |
 | 4 | non-blocking MUL | not done: design below (§5.1) | — | — |
 | 2a | branch prediction | not done: design below (§5.2) | — | — |
@@ -31,13 +116,10 @@ The SoC numbers come from `sim_1/new/tb_soc.sv` (real `mem_read_write` cache,
 calibrated against your board figures: on master it gives store 4.05, load
 5.05, leaf CALL+RET 17.07 cycles, against §2.2's 4.25 / 5.25 / 16.9.
 
-Rough benchmark effect, scaled from §1's own estimates (not measured):
-
-- **1c**: saves 2 of the 3 store cycles §2.4 assumed, so about two thirds of
-  its gain (≈ −2.3% CoreMark, −2.6% Embench, −5% Dhrystone).
-- **3**: removes the window bubble in straight-line 1-word code (the
-  IFMISS-not-from-redirects row). It does not remove I-cache misses or 2-word
-  fetch cost.
+The measured benchmark effect is in §0: CoreMark −3.7%, Embench +4.5%,
+Dhrystone −4.1%, all from 1c and 3. The simulation-time estimate (from the
+proposal's own model) had been ≈ −2.3% CoreMark for 1c alone, plus 3's
+straight-line fetch gain.
 
 ## 2. What changed, item by item
 
@@ -154,40 +236,31 @@ sim with a three-deep chain (exact values) and with `ERR=0A`. See
 
 An equality FBR redirects from EX through the JMPcc path; ordered compares
 stay in MEM. The new logic is a 64-bit XOR-reduce from the `ex_a`/`ex_b`
-registers, in parallel with the equally deep `wb_value==0` reduce already on
-the `flags_eff → exo_taken` side. It may fit, but ISA_V3_IMPL measured this
-family at +0.41 ns, so it ships off until an A/B build decides.
+registers.
 
-## 3. Timing-closure plan (needs your Vivado runs)
+**Measured (2026-11-01): it does not close at 100 MHz.**
 
-None of this was built. In order:
+- **First build: −0.203 ns**, on the perf-counter strobe (`perf_fbr_taken` →
+  the SoC's 48-bit branch-taken counter adder).
+  - Fixed in `0de5b21`: the counters now read `ex_bcvt_t[0]` for JMP/CALL and
+    a registered strobe for the EX-resolved FBR.
+- **Rebuilt: −0.123 ns** (tier 2), now on the real families: core 1
+  `ex_a → pc` (−0.082 ns) and `ex_a → multiplier DSP clock enable`.
 
-1. **Build the branch as is** (Explore tier 1). For each switch, here is what
-   it adds, worst-risk first:
+Landing it would need the equality computed at dispatch, as a registered
+compare of the forwarded operands, which puts the forwarding muxes in front
+of the reduce instead. Not attempted.
 
-   | Switch | Adds to |
-   |---|---|
-   | `EN_SHORT9` | legs in `f_short_imm` on the **w_op → id_var1** latch path (the old fetch-serve family); class 2/3/A legality terms (ID decode cone) |
-   | `EN_FBR_W` | class D legality (+`op[21]`, `op[3:0]`); one class D term in `id_w` (w_op → register) |
-   | `EN_MISAL_TRAP` | a 2-bit add + size/uop terms into the EX→MEM enables (`id_valid`, `ex_valid`, `fetch_halt`, `irq_active`, `mem_d.uop`), alongside the existing deeper `exo_taken` cone |
-   | `EN_POST_ST` | at MEM issue: an `ic_tagff` LUTRAM read + 19-bit compare + seven 28/29-bit compares into **one flop**; then a registered term in `mem_done_now` |
-   | `EN_DIEI` | a leg in `exo_result`'s U_DI case (1 bit); one term in the IRQ boundary and re-check |
-   | `EN_PF_EARLY` | enables on `pf_look`/`pf_line` and a registered `want_line+1` |
+## 3. Timing closure (done 2026-11-01)
 
-2. **If WNS misses,** check which family the report names before flipping
-   anything (the M12 rule: diagnose, don't strategy-hunt). The switches are
-   ordered above by how much they add to an already-named family:
-   `EN_SHORT9` (fetch latch), then `EN_FBR_W` (ID decode), then the rest.
-3. **Then the opt-in:** a second build with `EN_FBR_EQ_EX=1`, compared on the
-   `exo_taken → pc` family.
-4. **Board checks:** m5e, then the §2.2 microbenchmarks.
-   - Expected: store / PUSH / CALL ≈ 2 cycles cheaper; loads, MUL and the
-     not-taken FBR unchanged; straight-line 1-word ALU code ≈ 1.03–1.06
-     cycles/instruction, from 1.25.
-   - Run the CoreMark / Embench / Dhrystone A/B as in §2.1. Read
-     `PERF_IC_MISS` / `PERF_IC_FILL_CYC` to split the remaining IFMISS.
+See §0. The default configuration met at tier 1 with more margin than master
+had on the same day: +0.130 ns against +0.077. WNS is set by core 2's EX/DSP
+paths in both. No switch had to be turned off.
 
-## 4. Verification done here
+How to rebuild: `vivado -mode batch -source tools/build_fast.tcl -tclargs
+-resynth` (about 12–14 min on this machine).
+
+## 4. Verification (simulation, 2026-10-31; see §0 for the board)
 
 `tools/vsim` is new and runs without Vivado. `tools/vsim/run.py`, with
 Verilator 5.020 and small sim-copy-only patches for that version's limits:
