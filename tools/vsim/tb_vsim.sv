@@ -182,8 +182,15 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
-   longint n_post = 0, n_nopost_dram = 0;
+   longint n_post = 0, n_nopost_dram = 0, n_ras_pred = 0, n_ras_miss = 0;
    initial for (int i = 0; i < 8; i++) pst[i] = 0;
+`ifdef HAS_RAS
+   // 2a coverage: predicted returns completing in MEM / mispredicted ones
+   always @(posedge clk) if (!rst) begin
+      if (dut.mem_valid && dut.mem_pred && !dut.mem_busy) n_ras_pred++;
+      if (dut.ras_miss) n_ras_miss++;
+   end
+`endif
 `ifdef HAS_POST
    // 1c coverage: stores that posted / DRAM stores that took the slow path
    always @(posedge clk) if (!rst) begin
@@ -235,6 +242,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
                 n_fbr_taken, n_ic_miss, n_ic_fill);
       $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d", n_rd, n_wr, n_mmio_wr);
       $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
+      $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d", uart_n);
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)

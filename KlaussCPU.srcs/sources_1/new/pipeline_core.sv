@@ -161,6 +161,15 @@ module pipeline_core
    // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
    // until a build shows the exo_taken -> pc family still meets.
    localparam bit EN_FBR_EQ_EX = 1'b0;
+   // HW proposal 2a, stage (a): return-address stack.  A taken CALL pushes
+   // its return address as it leaves EX; a RET / LEAVERET dispatching from
+   // ID with a non-empty stack redirects fetch to the top entry instead of
+   // serializing, and is verified when its stack read completes in MEM — a
+   // mismatch redirects there and squashes EX/ID exactly like a taken FBR.
+   // IRET stays serialized.  0 = every return serializes (the old path).
+   localparam bit EN_RAS = 1'b1;
+   localparam int RAS_DEPTH = 4;           // entries (power of two)
+   localparam int RAS_PW    = $clog2(RAS_DEPTH);
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -899,6 +908,17 @@ module pipeline_core
    // muxes inside EX, no use-site changes. Flags forward differently (M6b):
    // ex_fwd_f marks a consumer whose flags live in the mem_* registers.
    logic        ex_fwd_f;
+   // 2a RAS: circular stack (ras_ptr = next push slot, ras_cnt = valid
+   // entries, saturating — an overflowing push overwrites the oldest).
+   // id_ras_ret: the ID op is a RET / LEAVERET (latch-time predecode).
+   // ex_/mem_pred: this return was predicted, with its predicted target.
+   logic [31:0]        ras [0:RAS_DEPTH-1];
+   logic [RAS_PW-1:0]  ras_ptr;
+   logic [RAS_PW:0]    ras_cnt;
+   logic               id_ras_ret;
+   logic               ex_pred, mem_pred;
+   logic [31:0]        ex_pred_tgt, mem_pred_tgt;
+   wire  [31:0]        ras_top = ras[ras_ptr - 1'b1];
 
    // --------------------------------------------------------- MEM stage latch
    logic        mem_valid;
@@ -1353,6 +1373,10 @@ module pipeline_core
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
    wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
+   // 2a: a predicted return's actual target (as the RET redirect below takes
+   // it) and the mispredict, valid on its completion edge (!mem_busy).
+   wire [31:0] ret_actual = (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
+                          : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
 
    wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
@@ -1373,6 +1397,7 @@ module pipeline_core
                        (mem_xc == 2'd3 && w_mrdy) ||
                        (mem_xc == 2'd1 && st_post_ok);   // 1c: posted (registered)
    wire mem_busy     = mem_port_op && !mem_done_now;
+   wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && (ret_actual != mem_pred_tgt);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -1414,13 +1439,18 @@ module pipeline_core
    // directly, keeping the counter adders off the exo_taken mux (which,
    // with EN_FBR_EQ_EX, also carries the 64-bit FBR equality reduce).  An
    // EX-resolved FBR is counted one cycle late from a register.
-   logic r_perf_fbr_ex;
+   logic r_perf_fbr_ex, r_perf_ras_miss;
    always_ff @(posedge clk)
-      if (rst)     r_perf_fbr_ex <= 1'b0;
-      else if (ce) r_perf_fbr_ex <= EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
-                                    ex_d.uop == U_FBR && !fbr_taken && !sq_ex;
+      if (rst) begin
+         r_perf_fbr_ex <= 1'b0;  r_perf_ras_miss <= 1'b0;
+      end else if (ce) begin
+         r_perf_fbr_ex <= EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
+                          ex_d.uop == U_FBR && !fbr_taken && !sq_ex;
+         r_perf_ras_miss <= ras_miss;   // 2a: a mispredicted return redirects
+      end
    assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && ex_bcvt_t[0] && !fbr_taken && !sq_ex
-                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken || r_perf_fbr_ex;
+                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken || r_perf_fbr_ex
+                           || r_perf_ras_miss;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
    assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
@@ -1546,7 +1576,7 @@ module pipeline_core
    // is busy EX holds, and a strobe then (with lcd_ready dropping behind it,
    // so ex_busy keeps the op in EX) sent the byte twice; a taken fused branch
    // or an EX squash kills the op, so it must not send.
-   assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !sq_ex;
+   assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex;
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -1564,6 +1594,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0;
+         ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1791,7 +1822,7 @@ module pipeline_core
          end
 
          lcd_rst_wr <= 1'b0;
-         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !sq_ex) begin
+         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !ras_miss && !sq_ex) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end
@@ -2098,13 +2129,14 @@ module pipeline_core
             wb_wr      <= mem_is_write;
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
             // RET / IRET redirect + fetch resume at MEM completion
+            // (2a: a PREDICTED return does nothing here — fetch already
+            // runs at its target, and a mismatch is the ras_miss squash.)
             if (mem_valid && (mem_d.uop == U_RET || mem_d.uop == U_IRET ||
-                              mem_d.uop == U_LEAVERET)) begin
+                              mem_d.uop == U_LEAVERET) && !(EN_RAS && mem_pred)) begin
                ev_pcz = 1'b1;
                // LEAVERET's return address is the SECOND dword: the line
                // lookahead, or the 2nd read (mem_xc 3) with dw0 stashed.
-               pc <= (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
-                   : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
+               pc <= ret_actual;
                fetch_halt <= 1'b0;
             end
 
@@ -2115,6 +2147,15 @@ module pipeline_core
             end else begin
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
+               mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
+               // 2a: a taken CALL pushes its return address as it leaves EX
+               // (not when an older squash kills it this edge)
+               if (EN_RAS && ex_valid && ex_d.uop == U_CALL && exo_taken &&
+                   !fbr_taken && !ras_miss && !sq_ex) begin
+                  ras[ras_ptr] <= ex_pc_next;
+                  ras_ptr      <= ras_ptr + 1'b1;
+                  if (ras_cnt != (RAS_PW+1)'(RAS_DEPTH)) ras_cnt <= ras_cnt + 1'b1;
+               end
                mem_result <= (ex_d.uop == U_STORE || ex_d.uop == U_PUSH ||
                               ex_d.uop == U_CALL) ? exo_raw : exo_result;
                mem_fval   <= exo_fval; mem_fmask <= ex_valid ? exo_fmask : '0;
@@ -2140,6 +2181,7 @@ module pipeline_core
                   ex_pc      <= id_pc;   ex_op <= id_op;
                   ex_var1    <= id_var1; ex_var2 <= id_var2;
                   ex_pc_next <= id_pc_next;
+                  ex_pred    <= 1'b0;
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
@@ -2173,6 +2215,17 @@ module pipeline_core
                      id_bp       <= 1'b0;
                      dbg_active  <= 1'b1;
                      dbg_cause_q <= DBG_CAUSE_BP;
+                  end else if (EN_RAS && id_valid && !fetch_halt && id_ras_ret &&
+                               ras_cnt != '0) begin
+                     // 2a: predicted return — fetch continues at the RAS top
+                     // (no serialize); verified when the RET completes MEM
+                     ev_pcz      = 1'b1;
+                     pc          <= ras_top;
+                     id_valid    <= 1'b0;
+                     ex_pred     <= 1'b1;
+                     ex_pred_tgt <= ras_top;
+                     ras_ptr     <= ras_ptr - 1'b1;
+                     ras_cnt     <= ras_cnt - 1'b1;
                   end else if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
@@ -2215,6 +2268,7 @@ module pipeline_core
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize;
+                     id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_w      <= ((w_op[29:26] == 4'h3) && w_op[19] &&
                                    !(w_op[31:30] == 2'b01 && w_op[20])) ||
                                   // P9: short CMPRVW (class 3 LEN=01 SGN=1 B=0 INV=1)
@@ -2267,10 +2321,12 @@ module pipeline_core
          // two younger instructions and redirect. It never waits on the port
          // (not a memory op), so it always leaves MEM this edge. An IRQ
          // taken meanwhile drains first and then pushes this corrected pc.
-         if (fbr_taken) begin
+         // 2a: a mispredicted return squashes the same way, redirecting to
+         // its loaded target (the RET itself retires to WB this edge).
+         if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
             ev_pcz     = 1'b1;
-            pc         <= mem_eaddr;
+            pc         <= fbr_taken ? mem_eaddr : ret_actual;
             mem_valid  <= 1'b0;
             ex_valid   <= 1'b0;
             id_valid   <= 1'b0;

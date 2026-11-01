@@ -533,3 +533,106 @@ def fbr_eq_loops():
     a.label('ok')
     a.halt()
     return [(a, {'end': 'park', 'kind': '0', 'r1': 37, 'r2': 36 * 37 // 2}, [f'+LAT={l}']) for l in (1, 4)]
+
+
+# ------------------------------------------------- 2a: return-address stack
+def _fib(n):
+    return n if n < 2 else _fib(n - 1) + _fib(n - 2)
+
+
+@test
+def ras_recursion():
+    """recursive fib (depth 12 > RAS depth): every return predicted or
+    corrected, result exact; LEAVERET and plain RET frames"""
+    out = []
+    for leaveret in (False, True):
+        a = Asm()
+        a.setr(1, 12)
+        a.call('fib')
+        a.halt()
+        a.label('fib')                     # r1 = n -> r2 = fib(n); clobbers r3
+        if leaveret:
+            a.enter(2)
+            a.st(64, 1, 15, -8)            # save n (frame slot)
+        else:
+            a.push(1)
+        a.cmpi_s(1, 2)
+        a.jmp('rec', cond='ge')
+        a.mov(2, 1)
+        a.jmp('ret')
+        a.label('rec')
+        a.addi_s(1, 1, -1)
+        a.call('fib')
+        a.push(2)
+        a.addi_s(1, 1, -1)
+        a.call('fib')
+        a.pop(3)
+        a.alu('add', 2, 2, 3)
+        a.label('ret')
+        if leaveret:
+            a.ld(64, 1, 15, -8)
+            a.leaveret()
+        else:
+            a.pop(1)
+            a.ret()
+        for lat in (1, 3, 7):
+            out.append((a, {'end': 'park', 'kind': '0', 'r2': _fib(12), 'r1': 12, 'sp': 0x08000000},
+                        [f'+LAT={lat}']))
+    return out
+
+
+@test
+def ras_mispredict():
+    """the callee rewrites its return address: the predicted path (a store
+    of a marker, then HALT) must never take effect"""
+    out = []
+    for kind in ('ret', 'leaveret'):
+        for gap in (0, 1, 3):
+            a = Asm()
+            a.setr(12, DATA); a.setr(9, 0x77)
+            a.call('f')
+            # predicted (wrong) path: store a marker, then HALT
+            a.st(64, 9, 12, 0)
+            a.halt()
+            a.label('real')
+            a.setr(5, 0x55)
+            a.halt()
+            a.label('f')
+            if kind == 'leaveret':
+                a.enter(0)
+                a.leapc(4, 'real')
+                a.st(64, 4, 15, 8)         # [R15+8] = return address
+            else:
+                a.pop(4)
+                a.leapc(4, 'real')
+                a.push(4)
+            for _ in range(gap):
+                a.nop()
+            a.leaveret() if kind == 'leaveret' else a.ret()
+            for lat in (1, 4):
+                out.append((a, {'end': 'park', 'kind': '0', 'r5': 0x55, m(DATA): 0},
+                            [f'+LAT={lat}']))
+    return out
+
+
+@test
+def ras_irq():
+    """calls and returns under a timer: same result, handler count > 0"""
+    a = Asm()
+    a.set_int_mask(1)
+    a.setr(10, 0); a.setr(11, 400)
+    a.label('l')
+    a.call('g')
+    a.addi_s(11, 11, -1)
+    a.fbr('ne', 11, 0, 'l', imm=True)
+    a.setr(13, CNT); a.ld(64, 8, 13)
+    a.halt()
+    a.label('g')
+    a.call('h')
+    a.inc(10)
+    a.ret()
+    a.label('h')
+    a.inc(10)
+    a.ret()
+    return [(a, {'end': 'park', 'kind': '0', 'r10': 800, 'r8': 'nonzero'},
+             [f'+LAT={l}', f'+IRQ_PERIOD={p}', '+LATR=3']) for l, p in ((1, 150), (3, 233), (6, 401))]
