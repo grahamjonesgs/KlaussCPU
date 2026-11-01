@@ -349,7 +349,8 @@ def ic_counters():
     a.addi_s(1, 1, -1)
     a.fbr('ne', 1, 0, 'l', imm=True)
     a.halt()
-    return a, {'end': 'park', 'kind': '0', 'ic_miss': '3', 'ic_fill': '15', 'bus_rd': '3'}, []
+    # (EN_BP: the loop-exit fall-through is fetched after the mispredict: +1 miss)
+    return a, {'end': 'park', 'kind': '0', 'ic_miss': '4', 'ic_fill': '20', 'bus_rd': '4'}, []
 
 
 # ------------------------------------------------- HW proposal 9: short forms

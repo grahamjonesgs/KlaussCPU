@@ -170,6 +170,17 @@ module pipeline_core
    localparam bit EN_RAS = 1'b1;
    localparam int RAS_DEPTH = 4;           // entries (power of two)
    localparam int RAS_PW    = $clog2(RAS_DEPTH);
+   // HW proposal 2a, stage (b): ID-stage branch prediction.  A 2-bit
+   // counter table (LUTRAM, indexed by pc word bits, read at the IF->ID
+   // latch) predicts conditional JMPcc and FBR; direct unconditional
+   // JMP/CALL are always predicted taken.  A predicted-taken branch
+   // redirects fetch when it dispatches from ID (target = registered id_pc
+   // + displacement); it still resolves where it always did (JMPcc/CALL in
+   // EX, FBR in MEM), which now redirects only on a wrong prediction — to
+   // the taken target or the carried fall-through.  Incompatible with
+   // EN_FBR_EQ_EX (that leg is ignored when EN_BP=1).  0 = no prediction.
+   localparam bit EN_BP = 1'b1;
+   localparam int BP_IDXW = 9;             // 512 counters
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -919,6 +930,29 @@ module pipeline_core
    logic               ex_pred, mem_pred;
    logic [31:0]        ex_pred_tgt, mem_pred_tgt;
    wire  [31:0]        ras_top = ras[ras_ptr - 1'b1];
+   // 2b predictor state.  id_bp_unc: direct unconditional JMP/CALL;
+   // id_bp_cnd: direct conditional JMPcc; id_bp_fbr: fused branch;
+   // id_bp_abs: absolute (non-REL) target.  ex_/mem_ptk: predicted taken.
+   (* ram_style = "distributed" *) logic [1:0] pht [0:(1<<BP_IDXW)-1];
+   initial for (int i = 0; i < (1<<BP_IDXW); i++) pht[i] = 2'b01;   // weakly not-taken
+   logic [1:0]         id_bp_ctr, ex_bp_ctr, mem_bp_ctr;
+   logic [BP_IDXW-1:0] id_bp_idx, ex_bp_idx, mem_bp_idx;
+   logic               id_bp_unc, id_bp_cnd, id_bp_fbr, id_bp_abs;
+   logic               ex_bp_cnd, ex_ptk, mem_bp_fbr, mem_ptk;
+   logic [31:0]        mem_pc_next;
+   wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
+   wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
+   wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) && id_bp_ctr[1]));
+   function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
+      return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
+   endfunction
+   // Training: ONE write port (LUTRAM).  An FBR trains as it leaves MEM; a
+   // conditional JMPcc as it leaves EX unsquashed.  On a same-edge clash
+   // the (older) FBR wins and the JMPcc update is dropped.
+   logic                pht_we;
+   logic [BP_IDXW-1:0]  pht_wa;
+   logic [1:0]          pht_wd;
+   always_ff @(posedge clk) if (ce && pht_we) pht[pht_wa] <= pht_wd;
 
    // --------------------------------------------------------- MEM stage latch
    logic        mem_valid;
@@ -1172,7 +1206,7 @@ module pipeline_core
             endcase
             // 2b-lite: an equality FBR redirects from EX (exo_taken), and
             // goes down the pipe as not-taken so MEM does not redirect again
-            if (EN_FBR_EQ_EX && ex_d.uop == U_FBR &&
+            if (EN_FBR_EQ_EX && !EN_BP && ex_d.uop == U_FBR &&
                 (cmp_op_e'(ex_d.sub) == CMP_EQ || cmp_op_e'(ex_d.sub) == CMP_NE)) begin
                exo_taken  = exo_result[0];
                exo_target = exo_eaddr;          // ex_pc + ex_var2
@@ -1372,7 +1406,17 @@ module pipeline_core
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
-   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
+   // fbr_tk = the fused branch in MEM is taken; fbr_taken = it REDIRECTS
+   // (squashing EX/ID), i.e. it disagrees with the ID prediction (2b).
+   wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
+   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && (mem_result[0] != (EN_BP && mem_ptk));
+   wire [31:0] fbr_tgt = mem_result[0] ? mem_eaddr : mem_pc_next;
+   // EX redirect: a taken JMP/CALL/RESET, except a JMP/CALL already taken
+   // by the ID prediction; a predicted-taken one that falls through
+   // redirects to its fall-through.
+   wire ex_bj        = (ex_d.uop == U_JMP || ex_d.uop == U_CALL);
+   wire ex_redir     = exo_taken ^ (EN_BP && ex_ptk && ex_bj);
+   wire [31:0] ex_redir_tgt = exo_taken ? exo_target : ex_pc_next;
    // 2a: a predicted return's actual target (as the RET redirect below takes
    // it) and the mispredict, valid on its completion edge (!mem_busy).
    wire [31:0] ret_actual = (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
@@ -1426,6 +1470,13 @@ module pipeline_core
    wire [28:0] w_last_dw  = (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
                           : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
    wire        smc_hit_lat = smc_st && (pc_dw == smc_dw || w_last_dw == smc_dw);
+   // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
+   wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr;   // an FBR always leaves MEM
+   wire pht_we_ex    = EN_BP && ex_valid && ex_bp_cnd && !ex_busy && !mem_busy &&
+                       !fbr_taken && !ras_miss && !sq_ex;
+   assign pht_we = pht_we_mem || pht_we_ex;
+   assign pht_wa = pht_we_mem ? mem_bp_idx : ex_bp_idx;
+   assign pht_wd = pht_we_mem ? f_sat2(mem_bp_ctr, mem_result[0]) : f_sat2(ex_bp_ctr, ex_bcvt_t[0]);
 
    // M9+ slide enable (see slide_dw_ok above). Suppressed on a DRAM-store
    // COMPLETION edge: the SMC squash (end of the clocked block) indexes IFB
@@ -1445,24 +1496,27 @@ module pipeline_core
    // directly, keeping the counter adders off the exo_taken mux (which,
    // with EN_FBR_EQ_EX, also carries the 64-bit FBR equality reduce).  An
    // EX-resolved FBR is counted one cycle late from a register.
-   logic r_perf_fbr_ex, r_perf_ras_miss;
+   logic r_perf_fbr_ex, r_perf_ras_miss, r_perf_ex_redir;
    always_ff @(posedge clk)
       if (rst) begin
-         r_perf_fbr_ex <= 1'b0;  r_perf_ras_miss <= 1'b0;
+         r_perf_fbr_ex <= 1'b0;  r_perf_ras_miss <= 1'b0;  r_perf_ex_redir <= 1'b0;
       end else if (ce) begin
          r_perf_fbr_ex <= EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
                           ex_d.uop == U_FBR && !fbr_taken && !sq_ex;
          r_perf_ras_miss <= ras_miss;   // 2a: a mispredicted return redirects
+         r_perf_ex_redir <= EN_BP && ex_valid && !ex_busy && !mem_busy && ex_redir && ex_bj &&
+                            !fbr_taken && !ras_miss && !sq_ex;
       end
-   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && ex_bcvt_t[0] && !fbr_taken && !sq_ex
-                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken || r_perf_fbr_ex
+   // (with EN_BP, a redirect is a misprediction: the strobe registers it)
+   assign perf_stall[5] = (!EN_BP && ex_valid && !ex_busy && !mem_busy && ex_bcvt_t[0] && !fbr_taken && !sq_ex
+                           && ex_bj) || r_perf_ex_redir || fbr_taken || r_perf_fbr_ex
                            || r_perf_ras_miss;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
    assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
    assign perf_br_taken = ex_bcvt_t[0];   // = exo_taken whenever perf_br (a JMP)
-   assign perf_fbr_taken = fbr_taken ||   // MEM ops always commit: counted as they redirect
+   assign perf_fbr_taken = fbr_tk ||      // MEM ops always commit: counted when taken
                            r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
@@ -1601,6 +1655,8 @@ module pipeline_core
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
+         id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
+         ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -2154,6 +2210,9 @@ module pipeline_core
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
+               mem_ptk    <= ex_ptk;  mem_pc_next <= ex_pc_next;
+               mem_bp_idx <= ex_bp_idx;  mem_bp_ctr <= ex_bp_ctr;
+               mem_bp_fbr <= ex_valid && ex_d.uop == U_FBR;
                // 2a: a taken CALL pushes its return address as it leaves EX
                // (not when an older squash kills it this edge)
                if (EN_RAS && ex_valid && ex_d.uop == U_CALL && exo_taken &&
@@ -2174,9 +2233,9 @@ module pipeline_core
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
                // EX redirect: taken branch/call, RESET
-               if (ex_valid && exo_taken) begin
+               if (ex_valid && ex_redir) begin
                   ev_pcz     = 1'b1;
-                  pc         <= exo_target;
+                  pc         <= ex_redir_tgt;
                   id_valid   <= 1'b0;
                   ex_valid   <= 1'b0;
                   fetch_halt <= 1'b0;   // RESET resumes here
@@ -2188,6 +2247,9 @@ module pipeline_core
                   ex_var1    <= id_var1; ex_var2 <= id_var2;
                   ex_pc_next <= id_pc_next;
                   ex_pred    <= 1'b0;
+                  ex_ptk     <= 1'b0;
+                  ex_bp_idx  <= id_bp_idx;  ex_bp_ctr <= id_bp_ctr;
+                  ex_bp_cnd  <= id_bp_cnd;
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
@@ -2232,6 +2294,13 @@ module pipeline_core
                      ex_pred_tgt <= ras_top;
                      ras_ptr     <= ras_ptr - 1'b1;
                      ras_cnt     <= ras_cnt - 1'b1;
+                  end else if (EN_BP && id_valid && !fetch_halt && id_bp_tk) begin
+                     // 2b: predicted-taken branch — fetch continues at its
+                     // target; EX / MEM redirect only if it falls through
+                     ev_pcz      = 1'b1;
+                     pc          <= id_bp_tgt;
+                     id_valid    <= 1'b0;
+                     ex_ptk      <= 1'b1;
                   end else if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
@@ -2275,6 +2344,14 @@ module pipeline_core
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
+                     id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
+                     id_bp_idx  <= pc[BP_IDXW+1:2];
+                     id_bp_unc  <= EN_BP && (w_decf.uop == U_JMP || w_decf.uop == U_CALL) &&
+                                   !w_decf.brind && w_decf.bcond == 4'd0;
+                     id_bp_cnd  <= EN_BP && (w_decf.uop == U_JMP || w_decf.uop == U_CALL) &&
+                                   !w_decf.brind && w_decf.bcond != 4'd0;
+                     id_bp_fbr  <= EN_BP && w_decf.uop == U_FBR;
+                     id_bp_abs  <= !w_decf.brel && w_decf.uop != U_FBR;
                      id_w      <= ((w_op[29:26] == 4'h3) && w_op[19] &&
                                    !(w_op[31:30] == 2'b01 && w_op[20])) ||
                                   // P9: short CMPRVW (class 3 LEN=01 SGN=1 B=0 INV=1)
@@ -2332,7 +2409,7 @@ module pipeline_core
          if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
             ev_pcz     = 1'b1;
-            pc         <= fbr_taken ? mem_eaddr : ret_actual;
+            pc         <= fbr_taken ? fbr_tgt : ret_actual;
             mem_valid  <= 1'b0;
             ex_valid   <= 1'b0;
             id_valid   <= 1'b0;
