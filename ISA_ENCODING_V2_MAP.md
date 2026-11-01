@@ -264,8 +264,8 @@ forms are 1 word (target = rs2). No register fields otherwise.
 | JMPUGE  | `0xA03C_0000` | JMPUGTREL | `0xA144_0000` |
 | JMPULE  | `0xA040_0000` | JMPEREL   | `0xA148_0000` |
 | JMPUGT  | `0xA044_0000` | JMPNEREL  | `0xA14C_0000` |
-| JMPE    | `0xA048_0000` | | |
-| JMPNE   | `0xA04C_0000` | | |
+| JMPE    | `0xA048_0000` | JMPOREL   | `0xA118_0000` |
+| JMPNE   | `0xA04C_0000` | JMPNOREL  | `0xA11C_0000` |
 | CALL    | `0xA200_0000` | CALLO     | `0xA218_0000` |
 | CALLZ   | `0xA208_0000` | CALLNO    | `0xA21C_0000` |
 | CALLNZ  | `0xA20C_0000` | CALLE     | `0xA248_0000` |
@@ -274,7 +274,8 @@ forms are 1 word (target = rs2). No register fields otherwise.
 | JMPR    | `0x6080_0000` (rs2) | CALLR | `0x6280_0000` (rs2) |
 
 (v1: JMP family 0x0000_1000-101C, REL 0x0000_1030-1040, JMPR 0x0000_102x,
-CALLR 0x0000_407x. Rel O/NO variants remain unassigned, as in v1.)
+CALLR 0x0000_407x. The relative O/NO forms JMPOREL/JMPNOREL had no v1
+symbol; they are legal by the field-driven decode, §5.)
 
 ### Stack / SP (class 9)
 
@@ -696,7 +697,7 @@ core 2.
 |---|---|---|---|
 | CMPRVW.S | `0x4C500000` | rs1 `[7:4]`, simm8 `[19:12]` | class 3 short CMP with **INV=1** = the W compare (= CMPRVW) |
 | MULV.S | `0x6B800000` (signed) / `0x6B000000` | rd, rs1, imm8 `[19:12]`, SGN `[23]` | class A OP=3: rd = rs1 × ext(imm8), extended by SGN as MULV's imm32; low half, flags as MUL |
-| LEAPC.S | `0x4BA00000` | rd, simm16 = `{[19:12],[7:0]}` | class 2 OP=14 F=1 (`[20]`=0): rd = PC + sext(simm16) bytes (±32 KiB) |
+| LEAPC.S | `0x4BA00000` | rd, simm16 = `{[19:12],[7:0]}` | class 2 OP=14 F=1: rd = PC + sext(simm16) bytes (±32 KiB). Emit `[20]`=0; the RTL also accepts `[20]`=1 when `[3:0]`=0 (the generic short-form legality path) with the same meaning |
 
 Examples: `CMPRVW.S r1,-3` = `0x4C5FD010`; `MULV.S r2,r1,-6` = `0x6B8FA210`;
 `LEAPC.S r1,.+0x1234` = `0x4BA12134`; `EQW r1,r2,.` = `0x76800012`;
