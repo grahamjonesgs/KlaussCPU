@@ -636,3 +636,34 @@ def ras_irq():
     a.ret()
     return [(a, {'end': 'park', 'kind': '0', 'r10': 800, 'r8': 'nonzero'},
              [f'+LAT={l}', f'+IRQ_PERIOD={p}', '+LATR=3']) for l, p in ((1, 150), (3, 233), (6, 401))]
+
+
+@test
+def smc_ahead():
+    """a 32-bit store rewrites the instruction k slots ahead in straight-line
+    code (k = 1..8, every alignment, warm and cold): the new code must run"""
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    out = []
+    for k in range(1, 9):
+        for pad in range(4):
+            for warm in (False, True):
+                a = Asm()
+                a.setr(1, 0); a.setr(3, new); a.setr(6, 2 if warm else 1)
+                a.leapc(2, 'X')
+                a.label('again')
+                for _ in range(pad):
+                    a.nop()
+                # second pass (warm) performs the patch; first pass only runs X
+                a.fbr('ne', 6, 1, 'skip', imm=True) if warm else None
+                a.st(32, 3, 2)
+                a.label('skip')
+                for _ in range(k - 1):
+                    a.alu('add', 5, 5, 5)
+                a.label('X')
+                a.alui_s('add', 1, 1, 1)
+                a.addi_s(6, 6, -1)
+                a.fbr('ne', 6, 0, 'again', imm=True)
+                a.halt()
+                want = (1 + 16) if warm else 16
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': want}, [f'+LAT={1 + (k + pad) % 6}']))
+    return out

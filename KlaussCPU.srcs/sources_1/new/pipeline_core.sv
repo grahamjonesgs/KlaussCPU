@@ -1420,6 +1420,12 @@ module pipeline_core
    // store) / anything younger than the store.
    wire        sq_ex      = smc_hit_ex || (icinv && ex_valid);
    wire        sq_any     = sq_ex || smc_hit_id || (icinv && id_valid);
+   // The op being LATCHED into ID on this edge (from the IFB slot the store
+   // invalidates on this same edge) is a stale copy too: smc_hit_id only
+   // sees the op already in ID.  Its dword span, as id_last_dw computes it.
+   wire [28:0] w_last_dw  = (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
+                          : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
+   wire        smc_hit_lat = smc_st && (pc_dw == smc_dw || w_last_dw == smc_dw);
 
    // M9+ slide enable (see slide_dw_ok above). Suppressed on a DRAM-store
    // COMPLETION edge: the SMC squash (end of the clocked block) indexes IFB
@@ -2382,6 +2388,17 @@ module pipeline_core
             // (§3.3: a misaligned op that entered MEM this edge is older
             // than the squashed ID op — it parks, so fetch stays halted.)
             fetch_halt <= ev_misal && !sq_ex;
+         end
+
+         // SMC: an op latched into ID this edge from a now-stale IFB slot is
+         // dropped and refetched from its own pc (ev_disp = it was latched;
+         // a full sq_any above already refetches from an older pc).
+         if (smc_hit_lat && ev_disp && !sq_any) begin
+            if (DEBUG_EN) id_bp <= 1'b0;
+            id_valid <= 1'b0;
+            ifb_val  <= 2'b00;
+            ev_pcz   = 1'b1;
+            pc       <= pc;
          end
 
          // debugger register write (debug-halted: no WB activity competes)
