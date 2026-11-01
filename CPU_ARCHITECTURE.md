@@ -475,14 +475,15 @@ Costs relative to the ideal one instruction per cycle:
 | Situation | Cost |
 |-----------|------|
 | ALU result used by the **next** instruction | 1 bubble (forwarded from MEM after that) |
-| D-cache **load hit** | MEM is held ~4 cycles and the whole pipe freezes behind it (`PERF_MEM_WAIT`); a miss adds the DRAM time |
-| D-cache **store hit** | posted (3508f87): MEM ~2 cycles; the next memory access waits for the drain, so back-to-back stores still cost ~4 each |
+| D-cache **load hit** | MEM is held ~3 cycles and the whole pipe freezes behind it (`PERF_MEM_WAIT`); +1 when the previous instruction was also a memory access (no early issue, §14.1); a miss adds the DRAM time |
+| D-cache **store hit** | posted: MEM ~2 cycles; the next memory access waits for the drain, so back-to-back stores cost ~3 each |
 | **Load** (or POP/LEAVE) result used by the next instruction | 2 bubbles beyond the hit time (forwarded from WB) |
 | Flag reader (Jcc, ADC/SBC, RCL/RCR, GETF) right after a flag writer | 1 bubble |
 | SP user after an SP writer still in flight (push/pop/call/ADDSP/…) | waits until the writer commits |
-| Taken branch/call (resolved in EX; predict not-taken) | younger fetches flushed |
-| Taken fused branch (resolved in MEM) | the 2 younger instructions squashed |
-| RET, IRET, LEAVERET | fetch stops until the return address is read in MEM |
+| Branch / call **predicted** correctly (§14.1) | taken: ~3.3 cycles (redirect from ID); not taken: 1 |
+| Branch **mispredicted** | resolved in EX (JMPcc/CALL) or MEM (FBR): younger work squashed, ~6–7 cycles for an FBR |
+| RET / LEAVERET with a return-stack hit | fetch continues at the predicted address (CALL leaf + RET ≈ 12.8) |
+| RET / LEAVERET without one, IRET | fetch stops until the return address is read in MEM |
 | HALT, WAIT, RESET, TRAP, illegal | serialize (fetch stops behind them) |
 | MUL | occupies EX ~4 cycles |
 | DIV/MOD | occupies EX: setup + up to 64 steps (leading zeros of the dividend are skipped) |
@@ -490,9 +491,28 @@ Costs relative to the ideal one instruction per cycle:
 | Unaligned MEMGET32 or LEAVERET whose second dword is in another line | one extra memory read |
 | Data access while fetch holds the port, or a cache miss | MEM waits on the port |
 
-Practical rules: put an independent instruction between a load and its
-use; prefer the fused branch to CMP + Jcc in tight loops; ENTER/LEAVERET
-and the 1-word short forms reduce fetch traffic.
+Practical rules: interleave loads and stores with ALU work (an access
+right after another access loses the early issue); prefer the fused branch
+to CMP + Jcc in tight loops; ENTER/LEAVERET and the 1-word short forms
+reduce fetch traffic.
+
+### 14.1 Prediction and the memory path (branch mem-early)
+
+- **Branch prediction (ID stage).** 512 two-bit counters, indexed by
+  pc[10:2], start weakly not-taken. They predict JMPcc and FBR, and predict
+  taken only at counter 3, so a branch needs two takens after a not-taken
+  before it is predicted taken again. Direct JMP/CALL are always predicted
+  taken. A predicted-taken branch redirects fetch from ID; the branch
+  still resolves in EX/MEM and redirects only when the prediction was
+  wrong.
+- **Return stack.** 4 entries. A taken CALL pushes its return address; a
+  RET/LEAVERET with a non-empty stack is predicted and checked against the
+  loaded address in MEM. Deeper call chains fall back to the serialized
+  path.
+- **Early load issue.** A load entering MEM while the port is idle sends its
+  request on that edge, and the DRAM response returns to the core without
+  the old bus_splitter register. A 64-bit load hit then costs ~3 cycles,
+  or ~4 when it directly follows another memory access.
 
 The core exports per-cycle hazard counters (RAW, load-use, flag, SP,
 EX-busy, branch flush, fetch miss, port wait). They are readable through the
