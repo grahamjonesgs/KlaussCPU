@@ -60,6 +60,7 @@ package klauss_pkg;
    localparam ERR_DATA_LOAD = 8'h4, ERR_CHECKSUM_LOAD = 8'h5, ERR_OVERFLOW = 8'h6;
    localparam ERR_SEG_WRITE_TO_CODE = 'h7, ERR_SEG_EXEC_DATA = 'h8;
    localparam ERR_TRAP = 8'h9;        // Explicit software trap (TRAP opcode)
+   localparam ERR_MISALIGN = 8'hA;    // misaligned 16/32-bit load/store (pipeline park 5)
 
    // --- Crash dump phase boundaries (r_hcf_dump_phase) ---------------------
    // Each "phase" emits one UART line. Kept as localparams (not an enum) because
@@ -77,8 +78,10 @@ package klauss_pkg;
    localparam DUMP_INSTR      = 7'd10;  // INSTR=NNNNNNNN — instructions committed since program load
    localparam DUMP_REG_BASE   = 7'd11;  // R0..RF → phases 11..26
    localparam DUMP_STACK_BASE = 7'd27;  // S0..S3 → phases 27..30 (each preceded by a DDR2 read)
-   localparam DUMP_TRACE_BASE = 7'd31;  // T0..TF → phases 31..46 (newest-first)
-   localparam DUMP_FOOTER     = 7'd47;  // last phase; on completion → HCF_2
+   localparam DUMP_FRAME_BASE = 7'd31;  // F0..F5 → phases 31..36: three R15 frame records
+                                        // ([R15], [R15+8], then the caller's) — HW proposals §3.4
+   localparam DUMP_TRACE_BASE = 7'd37;  // T0..TF → phases 37..52 (newest-first)
+   localparam DUMP_FOOTER     = 7'd53;  // last phase; on completion → HCF_2
 
    // --- Architectural condition flags (r_flags) ----------------------------
    // The 7 CPU condition flags as one packed struct.  Fields are written/read

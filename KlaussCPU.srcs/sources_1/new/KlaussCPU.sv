@@ -189,6 +189,13 @@ module KlaussCPU #(
    logic [4:0]  r_hcf_dump_byte_pos;  // current byte index during BYTE_BUILD (0..length-1)
    logic [63:0] r_hcf_stack_data;    // captured stack doubleword for the active stack phase
    logic        r_hcf_stack_loaded;   // 1 when r_hcf_stack_data is valid for current phase
+   // Frame-record walk (F0..F5, HW proposals §3.4): the ABI keeps a record
+   // at R15 — [R15] = caller's R15, [R15+8] = return address.  Record k's
+   // base is R15 for k=0, else the saved R15 read by the previous record
+   // (r_hcf_fp, advanced from r_hcf_fp_nx after each record's second line).
+   // A base that is unaligned or outside DRAM prints the FF sentinel.
+   logic [31:0] r_hcf_fp, r_hcf_fp_nx;
+   // (w_fr_* decode wires: after r_register below)
 
    //load control
    //reg          o_ram_write_DV;
@@ -204,6 +211,12 @@ module KlaussCPU #(
 
    // Register control
    logic [63:0] r_register[15:0];
+   // §3.4 frame-record walk decode (see r_hcf_fp above)
+   wire  [6:0]  w_fr_k    = r_hcf_dump_phase - DUMP_FRAME_BASE;   // 0..5 in frame phases
+   wire         w_fr_ph   = (r_hcf_dump_phase >= DUMP_FRAME_BASE) &&
+                            (r_hcf_dump_phase <  DUMP_TRACE_BASE);
+   wire  [31:0] w_fr_base = (w_fr_k[2:1] == 2'd0) ? r_register[15][31:0] : r_hcf_fp;
+   wire         w_fr_bad  = (w_fr_base[2:0] != 3'd0) || (w_fr_base >= STACK_TOP - 32'd8);
 
    // Display value
    logic r_error_display_type;
@@ -391,6 +404,8 @@ module KlaussCPU #(
    logic [47:0] r_perf_branch_flush;   // 0xD8 taken-redirect events
    logic [47:0] r_perf_if_miss;        // 0xE0 fetch-window miss cycles
    logic [47:0] r_perf_mem_wait;       // 0xE8 MEM port wait cycles
+   logic [47:0] r_perf_ic_miss;        // 0xF0 I-cache miss fills (events)
+   logic [47:0] r_perf_ic_fill;        // 0xF8 I-cache fill-in-flight cycles
    // Bus-wedge flight recorder (0xF00D_0100/0108, RO; cleared by PERF_CTRL
    // bit 0 like the counters, so a snapshot SURVIVES a program reload). If a
    // CPU bus transaction holds its DV for 2^20 cycles (~10.5 ms — no legal
@@ -584,6 +599,7 @@ module KlaussCPU #(
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
    wire [7:0]   pip_perf_stall;
    wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
+   wire [1:0]   pip_perf_ic;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
    // "MMIO store wins" ordering is preserved inside pipeline_core.
    wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
@@ -643,6 +659,7 @@ module KlaussCPU #(
       .perf_br    (pip_perf_br),
       .perf_br_taken (pip_perf_br_taken),
       .perf_fbr_taken (pip_perf_fbr_taken),
+      .perf_ic    (pip_perf_ic),
       .ret_valid  (pip_ret_valid),
       .ret_pc     (pip_ret_pc),
       .ret_op     (pip_ret_op),
@@ -1064,6 +1081,8 @@ module KlaussCPU #(
                16'h00D8: r_mmio_read_data_comb = {16'b0, r_perf_branch_flush}; // events
                16'h00E0: r_mmio_read_data_comb = {16'b0, r_perf_if_miss};
                16'h00E8: r_mmio_read_data_comb = {16'b0, r_perf_mem_wait};
+               16'h00F0: r_mmio_read_data_comb = {16'b0, r_perf_ic_miss};
+               16'h00F8: r_mmio_read_data_comb = {16'b0, r_perf_ic_fill};
                // bus-wedge flight recorder (bit map at the r_wedge_* decl)
                16'h0100: r_mmio_read_data_comb = r_wedge_snap0;
                16'h0108: r_mmio_read_data_comb = r_wedge_snap1;
@@ -1876,6 +1895,7 @@ rams_sp_nc rams_sp_nc1 (
                      3'd0: st.SM <= HALTED_BREAK;                                  // HALT
                      3'd1: begin st.SM <= HCF_1; st.error_code <= ERR_TRAP; end    // TRAP
                      3'd2: begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
+                     3'd5: begin st.SM <= HCF_1; st.error_code <= ERR_MISALIGN; end  // §3.3
                      default: ;   // WAIT parks wake inside the pipeline
                   endcase
                end
@@ -1925,6 +1945,18 @@ rams_sp_nc rams_sp_nc1 (
                            end else begin
                               st.mem_addr     <= st.SP +
                                  ({25'b0, r_hcf_dump_phase - DUMP_STACK_BASE} << 3);
+                              st.mem_read_DV  <= 1'b1;
+                              r_hcf_dump_sub <= 3'b011;
+                           end
+                        end else if (w_fr_ph && !r_hcf_stack_loaded) begin
+                           // Frame record line (§3.4): even k reads the saved
+                           // R15 at base, odd k the return address at base+8.
+                           if (w_fr_bad) begin
+                              r_hcf_stack_data   <= 64'hFFFF_FFFF_FFFF_FFFF;
+                              r_hcf_stack_loaded <= 1'b1;
+                              if (!w_fr_k[0]) r_hcf_fp_nx <= 32'hFFFF_FFFF;
+                           end else begin
+                              st.mem_addr     <= w_fr_base + (w_fr_k[0] ? 32'd8 : 32'd0);
                               st.mem_read_DV  <= 1'b1;
                               r_hcf_dump_sub <= 3'b011;
                            end
@@ -2004,11 +2036,14 @@ rams_sp_nc rams_sp_nc1 (
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE))
                          || ((r_hcf_dump_phase >= DUMP_STACK_BASE)
                           && (r_hcf_dump_phase <  DUMP_STACK_BASE + 7'd4))
+                         || w_fr_ph
                          || (r_hcf_dump_phase == DUMP_V1H)
                          || (r_hcf_dump_phase == DUMP_OPCM)
                          || (r_hcf_dump_phase >= DUMP_TRACE_BASE)) begin
                            r_hcf_stack_loaded <= 1'b0;
                         end
+                        // §3.4: the next record's base is this record's saved R15
+                        if (w_fr_ph && w_fr_k[0]) r_hcf_fp <= r_hcf_fp_nx;
                         if (r_hcf_dump_phase == DUMP_FOOTER) begin
                            // After the footer line drains, drop into the BREAK
                            // sub-state to assert a UART break (line low for ~2.5
@@ -2029,6 +2064,7 @@ rams_sp_nc rams_sp_nc1 (
                      if (w_mem_ready) begin
                         r_hcf_stack_data   <= w_mem_read_data;
                         r_hcf_stack_loaded <= 1'b1;
+                        if (w_fr_ph && !w_fr_k[0]) r_hcf_fp_nx <= w_mem_read_data[31:0];
                         st.mem_read_DV      <= 1'b0;
                         r_hcf_dump_sub     <= 3'b000;
                      end
@@ -2111,7 +2147,7 @@ rams_sp_nc rams_sp_nc1 (
             end
             HCF_4: begin
                if (r_error_display_type) begin
-                  // Error codes 0x1..0x9 — see ERR_* localparams above (ERR_INV_OPCODE .. ERR_TRAP).
+                  // Error codes 0x1..0xA — see ERR_* localparams (ERR_INV_OPCODE .. ERR_MISALIGN).
 
                   case (st.error_code)
                      ERR_CHECKSUM_LOAD:
@@ -2408,6 +2444,7 @@ rams_sp_nc rams_sp_nc1 (
          r_perf_stall_flags <= 48'd0; r_perf_stall_sp <= 48'd0;
          r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
          r_perf_if_miss <= 48'd0;     r_perf_mem_wait <= 48'd0;
+         r_perf_ic_miss <= 48'd0;     r_perf_ic_fill  <= 48'd0;
       end else begin
          // M6 pipeline hazard attribution
          if (pip_perf_stall[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
@@ -2418,6 +2455,8 @@ rams_sp_nc rams_sp_nc1 (
          if (pip_perf_stall[5]) r_perf_branch_flush  <= r_perf_branch_flush  + 48'd1;
          if (pip_perf_stall[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
          if (pip_perf_stall[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
+         if (pip_perf_ic[0])    r_perf_ic_miss       <= r_perf_ic_miss       + 48'd1;
+         if (pip_perf_ic[1])    r_perf_ic_fill       <= r_perf_ic_fill       + 48'd1;
          // EX-resolved conditional jumps + MEM-resolved fused branches (v3 B);
          // both can land on the same cycle.
          if ((pip_perf_br && pip_perf_br_taken) || pip_perf_fbr_taken)

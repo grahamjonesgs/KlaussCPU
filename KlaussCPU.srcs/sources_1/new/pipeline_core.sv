@@ -96,9 +96,13 @@ module pipeline_core
    output logic         perf_br,        // conditional branch resolved (event)
    output logic         perf_br_taken,
    output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
+   // I-cache (HW proposals §2.6): [0] demand-lookup miss that issues a
+   // shared-port fill (event)  [1] fill in flight (cycle) — splits IF_MISS
+   // into I-cache refill vs window bubbles
+   output logic [1:0]   perf_ic,
    // park (drained stop)
    output logic         parked,
-   output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT
+   output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT 4=debug 5=MISALIGNED
    output logic [31:0]  park_pc,
    output logic [31:0]  park_op,
    // architectural state (tb reads for the trace line)
@@ -111,6 +115,63 @@ module pipeline_core
    output dbg_out_t     dbg_o
 );
 
+   // ------------------------------------------------------- build switches
+   // (declared first: xvlog / Vivado reject a localparam used before it)
+   // ISA v3 B (fused compare-and-branch) build switch. It adds a MEM-stage
+   // pc source; the M13 builds measured CPU pc-path margin +0.03 ns with it
+   // vs ~+0.2 ns without (WNS then set by SoC paths). 0 = class D traps and
+   // the redirect logic synthesizes away (compile with
+   // -mllvm -klausscpu-fuse-cmp-br=false).
+   localparam bit EN_FBR = 1'b1;
+   // HW proposal 6 (HARDWARE_PROPOSALS.md §2.6): FBR PRED 5-7 = EQW/LTW/ULTW
+   // and the 2-word FBR with a sext(imm32) right-hand side.  0 = both trap
+   // (the pre-proposal decode).
+   localparam bit EN_FBR_W = 1'b1;
+   // HW proposal 7a (§2.7): DI rd / EI rs1, class B system OP 6 / 7.
+   // 0 = both trap and irq_dis stays 0.
+   localparam bit EN_DIEI = 1'b1;
+   // HW proposal 8 / §3.3: a 16- or 32-bit load/store whose address is not
+   // naturally aligned parks (park_kind 5 -> crash dump ERR_MISALIGN)
+   // instead of silently aligning down.  MEMGET32 ([rs1] 32-bit load, the
+   // unaligned-tolerant form), byte and 64-bit accesses and the stack ops
+   // keep their defined behaviour.  0 = the old silent align-down.
+   localparam bit EN_MISAL_TRAP = 1'b1;
+   // HW proposal 9 (§2.9): the missing short forms — CMPRVW simm8 (class 3
+   // short with INV=1), MULV simm8 (class A OP=3, LEN=01, SGN [23]) and
+   // LEAPC simm16 (class 2 LEN=01 OP=14 F=1, simm16 = {[19:12],[7:0]}).
+   // All three trap today; 0 keeps it that way.  They add legs to
+   // f_short_imm on the w_op -> id_var1 latch path.
+   localparam bit EN_SHORT9 = 1'b1;
+   // HW proposal 1c (§2.4): posted DRAM stores — a 1-entry store buffer on
+   // the core side of the port.  A store that touches no fetch-side code
+   // copy leaves MEM one cycle after issue; the port stays busy (st_post)
+   // until its ready, and every other port user waits for that drain.  0 =
+   // every store holds MEM until its ready (the pre-proposal behaviour).
+   localparam bit EN_POST_ST = 1'b1;
+   // HW proposal 3 (§2.6): start the NLB prefetch of the line after next on
+   // the slide that empties the NLB (see the prefetch engine).  0 = the M9
+   // start condition only.
+   localparam bit EN_PF_EARLY = 1'b1;
+   // HW proposal 2b-lite (§2.5): an EQ/NE fused branch (incl. EQW/NEW)
+   // redirects from EX like JMPcc, one cycle earlier than from MEM.  Only
+   // the equality forms: a 64-bit XOR-reduce from the ex_a/ex_b registers,
+   // in parallel with (and no deeper than) the 64-bit wb_value==0 reduce
+   // already on the JMPcc flags_eff -> exo_taken path.  The ordered compares
+   // (carry chains) stay in MEM — ISA_V3_IMPL.md: a 64-bit magnitude compare
+   // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
+   // until a build shows the exo_taken -> pc family still meets.
+   localparam bit EN_FBR_EQ_EX = 1'b0;
+   // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
+   // function of the same 4 bits f_cmp_op already reads (no extra level).
+   function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
+      case (p)
+         3'd5:    return 3'd0;   // EQW
+         3'd6:    return 3'd1;   // LTW
+         3'd7:    return 3'd3;   // ULTW
+         default: return p;
+      endcase
+   endfunction
+
    // ------------------------------------------------------------------ types
    typedef enum logic [5:0] {
       U_ILL, U_ALU, U_BOOL, U_SHIFT, U_ROT1, U_BTSTN, U_UNARY,
@@ -120,7 +181,8 @@ module pipeline_core
       U_ENTER, U_LEAVE, U_LEAVERET,     // ISA v3 C
       U_FBR,                            // ISA v3 B fused compare-and-branch
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
-      U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST
+      U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST,
+      U_DI, U_EI                        // HW proposal 7a: interrupt disable/enable
    } uop_e;
 
    typedef struct packed {
@@ -157,6 +219,11 @@ module pipeline_core
    flags_t      flags;
    logic [31:0] sp;
    logic [3:0]  int_mask;
+   // HW proposal 7a: core-internal interrupt DISABLE bit (DI sets it, EI
+   // writes it from rs1[0]).  1 = no IRQ is taken at a dispatch boundary.
+   // Saved at frame bit [43] on IRQ entry and restored by IRET; the
+   // DISABLE sense keeps software-built frames (bit 43 = 0) enabled.
+   logic        irq_dis;
    logic [31:0] pc;
    logic        running;        // fetch enabled
    logic        fetch_halt;     // serialize op in flight — hold fetch
@@ -199,6 +266,10 @@ module pipeline_core
    wire dbg_stop   = DEBUG_EN && (dbg_i.halt_req || dbg_watch_req || dbg_step_done);
    // single-steps never take interrupts (and do not wake a WAIT)
    wire irq_ok     = irq_ready && !(DEBUG_EN && dbg_stepping);
+   // HW proposal 7a: an IRQ is TAKEN only while not disabled (committed
+   // bit; a DI still in flight is caught by the drain-time re-check). WAIT
+   // still wakes on irq_ok, WFI-style, so "DI; test; WAIT" cannot deadlock.
+   wire irq_take   = irq_ok && !(EN_DIEI && irq_dis);
    wire dbg_bp_hit = DEBUG_EN && !dbg_skip &&
                      |(dbg_i.bp_en & {dbg_i.bp_addr[3] == pc, dbg_i.bp_addr[2] == pc,
                                       dbg_i.bp_addr[1] == pc, dbg_i.bp_addr[0] == pc});
@@ -209,7 +280,8 @@ module pipeline_core
    assign dbg_o.mem_rdata  = dbg_mem_rdata;
    // TRAP / ILLEGAL / HALT -> debug-halt cause
    function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
-      return (kind == 3'd1) ? DBG_CAUSE_TRAP : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
+      return (kind == 3'd1 || kind == 3'd5) ? DBG_CAUSE_TRAP
+           : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
    endfunction
 
    // ------------------------------------------- IF: 2-dword window (IFB model)
@@ -268,12 +340,6 @@ module pipeline_core
    // read; SMC-correct, M7b refines to tag-checked). Miss path is unchanged (fetch
    // at miss_dw, install what returns; per-dword valid tolerates partial fills).
    //   dword addr = pc[31:3] (29b); line = dword[28:1]; dword-in-line = dword[0]=addr[3]
-   // ISA v3 B (fused compare-and-branch) build switch. It adds a MEM-stage
-   // pc source; the M13 builds measured CPU pc-path margin +0.03 ns with it
-   // vs ~+0.2 ns without (WNS then set by SoC paths). 0 = class D traps and
-   // the redirect logic synthesizes away (compile with
-   // -mllvm -klausscpu-fuse-cmp-br=false).
-   localparam bit EN_FBR = 1'b1;
    localparam int IC_LINES = 512;
    localparam int IC_IDXW  = 9;                 // $clog2(IC_LINES)
    (* ram_style = "block" *) logic [127:0] ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
@@ -287,6 +353,10 @@ module pipeline_core
    // CODE line's index and evicts it though the code is untouched — LVGL's
    // framebuffer/.bss writes thrashed the I-cache to ~51% IF_MISS / ~286 CPI).
    logic [18:0] ic_tagff [0:IC_LINES-1];
+   // Power-up value (the FPGA's register/LUTRAM init is 0): the 1c post
+   // check reads it for every store, so it must not be X in 4-state sims.
+   // A stale 0 tag only makes posting conservative for addresses below 8 KB.
+   initial for (int i = 0; i < IC_LINES; i++) ic_tagff[i] = '0;
    // M12 snoop split: the tag compare runs at store issue and is registered
    // here; the ic_v* clear lands one cycle later (the one-cycle compare +
    // clear was the tier-1 worst family: tagff LUTRAM read -> 19b compare ->
@@ -407,7 +477,8 @@ module pipeline_core
                  (!op[19] || aluop <= 4'd1)) ||
                 (cls == 4'h2 && len == 2'b10 && op[18:12] == 7'h0 && op[3:0] == 4'h0 &&
                  (!op[19] || aluop == 4'd0)) ||
-                (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0)) begin  // v3 A5 short: imm8 [19:12]
+                (cls == 4'h2 && len == 2'b01 && op[3:0] == 4'h0) ||   // v3 A5 short: imm8 [19:12]
+                (EN_SHORT9 && cls == 4'h2 && len == 2'b01 && aluop == 4'd14 && op[21:20] == 2'b10)) begin
                d.use_rs1 = 1'b1;  d.use_rs2 = (cls == 4'h1);
                case ({aluop, op[21]})
                   {4'd0,1'b1}, {4'd1,1'b1}, {4'd2,1'b1}, {4'd3,1'b1}: begin
@@ -425,6 +496,9 @@ module pipeline_core
                      end
                   end
                   {4'd14,1'b0}: if (cls == 4'h2) begin // LEAPC
+                     d.legal = 1'b1; d.uop = U_LEA; d.wreg = 1'b1; d.use_rs1 = 1'b0;
+                  end
+                  {4'd14,1'b1}: if (EN_SHORT9 && cls == 4'h2 && len == 2'b01) begin // P9 LEAPC simm16
                      d.legal = 1'b1; d.uop = U_LEA; d.wreg = 1'b1; d.use_rs1 = 1'b0;
                   end
                   {4'd15,1'b0}: if (cls == 4'h2) begin // MOV: SETR / zext-MOV
@@ -451,7 +525,9 @@ module pipeline_core
                      d.sub = 4'(f_cmp_op(op[25:23], op[22]));
                   end
                end else begin           // B=0: flag-setting CMP (= SUB, no wb)
-                  if (op[25:23] == 3'd0 && !op[22] && op[11:8] == 4'h0) begin
+                  // (P9: INV=1 on the SHORT form = the W compare, CMPRVW simm8)
+                  if (op[25:23] == 3'd0 && op[11:8] == 4'h0 &&
+                      (!op[22] || (EN_SHORT9 && len == 2'b01 && op[20]))) begin
                      d.legal = 1'b1; d.uop = U_ALU; d.sub = 4'd7; // internal CMP code
                      d.fmask = '1;
                   end
@@ -651,7 +727,13 @@ module pipeline_core
             d.mduns = !op[23]; d.mdhigh = op[22]; d.sgn = op[23];
             // v3 D3: MULW = W [19] on the low-half MUL
             d.w32 = op[19];
-            if (op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
+            if (EN_SHORT9 && len == 2'b01 && op[25:24] == 2'd3 && op[22:20] == 3'b000 &&
+                op[3:0] == 4'h0) begin
+               // P9 MULV simm8: rd = rs1 * ext(imm8 [19:12]), SGN [23] (as MULV)
+               d.use_rs1 = 1'b1; d.wreg = 1'b1; d.w32 = 1'b0;
+               d.legal = 1'b1; d.uop = U_MUL;
+               d.fmask.zero = 1'b1; d.fmask.sign = 1'b1; d.fmask.overflow = 1'b1;
+            end else if (op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
                 (!op[19] || (op[25:24] == 2'd0 && !op[22]))
                 && ((len == 2'b01) || (len == 2'b10 && op[3:0] == 4'h0))) begin
                d.use_rs1 = 1'b1;  d.use_rs2 = (len == 2'b01);  d.wreg = 1'b1;
@@ -673,7 +755,17 @@ module pipeline_core
             end
          end
          4'hB: begin // system
-            if (op[25:22] == 4'h0 && op[15:8] == 8'h0 && op[3:0] == 4'h0) begin
+            if (EN_DIEI && len == 2'b01 && op[25:22] == 4'h0 && op[21:17] == 5'd3 &&
+                         op[15:12] == 4'h0 && op[3:0] == 4'h0) begin
+               // HW proposal 7a: OP 6 = DI rd (rd = old ENABLE bit, 0/1; then
+               // disable), OP 7 = EI rs1 (enable = rs1[0]), so DI r ; ... ;
+               // EI r restores the previous state.
+               if (!op[16] && op[7:4] == 4'h0) begin
+                  d.legal = 1'b1; d.uop = U_DI; d.wreg = 1'b1;
+               end else if (op[16] && op[11:8] == 4'h0) begin
+                  d.legal = 1'b1; d.uop = U_EI; d.use_rs1 = 1'b1;
+               end
+            end else if (op[25:22] == 4'h0 && op[15:8] == 8'h0 && op[3:0] == 4'h0) begin
                if (len == 2'b01) begin
                   case (op[21:16])
                      6'd0: if (op[7:4] == 4'h0) begin d.legal = 1'b1; d.uop = U_NOP; end
@@ -689,14 +781,18 @@ module pipeline_core
                end
             end
          end
-         4'hD: begin // ISA v3 B: fused compare-and-branch (1 word, no flags)
+         4'hD: begin // ISA v3 B: fused compare-and-branch (no flags)
             // PRED [25:23] (as class 3), INV [22], IMM [21] (rhs = simm4
             // [3:0]), simm13 word displacement [20:8]. The compare runs on
             // the EX boolean path; a taken branch redirects from MEM.
-            if (EN_FBR && len == 2'b01 && op[25:23] <= 3'd4) begin
+            // HW proposal 6 (EN_FBR_W): PRED 5/6/7 = EQW/LTW/ULTW, the 32-bit
+            // compare done by D2's dispatch shift (id_w); LEN=10 with IMM=1
+            // and [3:0]=0 = rhs sext(imm32) from word 1 (id_var1).
+            if (EN_FBR && (len == 2'b01 || (EN_FBR_W && len == 2'b10 && op[21] && op[3:0] == 4'h0))
+                && (EN_FBR_W || op[25:23] <= 3'd4)) begin
                d.legal = 1'b1; d.uop = U_FBR; d.sgn = 1'b1;
                d.use_rs1 = 1'b1; d.use_rs2 = !op[21];
-               d.sub = 4'(f_cmp_op(op[25:23], op[22]));
+               d.sub = 4'(f_cmp_op(f_fbr_pred(op[25:23]), op[22]));
             end
          end
          4'hC: begin // LCD
@@ -762,7 +858,10 @@ module pipeline_core
       s8 = {{24{i8[7]}}, i8};
       if (op[31:30] != 2'b01) return {1'b0, 32'b0};
       case (op[29:26])
-         4'h2: return {1'b1, op[20] ? s8 : {24'b0, i8}};
+         4'h2: return {1'b1, (EN_SHORT9 && op[25:21] == 5'b11101)            // P9 LEAPC simm16
+                             ? {{16{op[19]}}, op[19:12], op[7:0]}
+                             : op[20] ? s8 : {24'b0, i8}};
+         4'hA: return {EN_SHORT9 && op[25:24] == 2'b11, op[23] ? s8 : {24'b0, i8}}; // P9 MULV
          4'h3: return {op[20] && !op[21], s8};
          4'h6, 4'h7: return {op[22:21] == 2'b01, s8 << op[25:24]};
          4'h8: return {!op[23], {{12{op[17]}}, op[17:0], 2'b00}};
@@ -984,6 +1083,14 @@ module pipeline_core
    end
    wire [1:0]  ex_bcvt_t = f_cond_eval(flags_eff, ex_d.bcond, ex_d.binv);
 
+   // HW proposal 7a: the disable bit as seen by the instruction in EX — the
+   // youngest older writer in MEM (DI/EI) or WB (DI/EI/IRET), else the
+   // committed bit.  All register-sourced.
+   logic        mem_dis_we, mem_dis_new;   // EX->MEM (DI/EI only)
+   logic        wb_dis_we,  wb_dis_new;    // MEM->WB (DI/EI/IRET)
+   wire ex_dis_eff = (mem_valid && mem_dis_we) ? mem_dis_new
+                   : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
+
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1043,6 +1150,14 @@ module pipeline_core
                CMP_MINU: exo_result = (ex_a < ex_b) ? ex_a : ex_b;
                default:  exo_result = (ex_a > ex_b) ? ex_a : ex_b; // MAXU
             endcase
+            // 2b-lite: an equality FBR redirects from EX (exo_taken), and
+            // goes down the pipe as not-taken so MEM does not redirect again
+            if (EN_FBR_EQ_EX && ex_d.uop == U_FBR &&
+                (cmp_op_e'(ex_d.sub) == CMP_EQ || cmp_op_e'(ex_d.sub) == CMP_NE)) begin
+               exo_taken  = exo_result[0];
+               exo_target = exo_eaddr;          // ex_pc + ex_var2
+               exo_result = 64'b0;
+            end
          end
          U_SHIFT: exo_result = 64'b0;   // M12 Stage D: the result is produced
                                         // in MEM (w_sh2 via mem_result_eff);
@@ -1179,6 +1294,7 @@ module pipeline_core
             end
          end
          U_RESET: begin exo_taken = 1'b1; exo_target = 32'h4; end
+         U_DI:    exo_result = {63'b0, !ex_dis_eff};   // old enable bit
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1191,6 +1307,20 @@ module pipeline_core
       endcase
    end
 
+   // HW proposal 8 / §3.3 misaligned trap detect.  The low two EA bits come
+   // from their own 2-bit adds (off the 32-bit EA carry chain); the uop /
+   // size terms are register-sourced.  U_LOAD32 (MEMGET32) is exempt.
+   wire [1:0] ex_ea_lo = (ex_d.mmode == 2'b00) ? ex_a[1:0]
+                       : (ex_d.mmode == 2'b01) ? ex_a[1:0] + ex_var1[1:0]
+                       : (ex_d.mmode == 2'b10) ? ex_var1[1:0]
+                       :                         ex_a[1:0] + ex_b[1:0];
+   wire ex_misal = EN_MISAL_TRAP && ex_valid &&
+                   (ex_d.uop == U_LOAD || ex_d.uop == U_STORE) &&
+                   ((ex_d.msz == 2'd1 && ex_ea_lo[0]) ||
+                    (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00));
+   logic mem_misal;      // the MEM op is a converted misaligned access (parks 5)
+   logic ev_misal;       // blocking event: a misaligned op entered MEM this edge
+
    // mul/div operand B mux happens at dispatch: ex_b holds rs2 (len1) or
    // the sign/zero-extended imm32 (len2) — see the dispatch below.
 
@@ -1199,9 +1329,16 @@ module pipeline_core
    // f_memget32's dead cycle) 3=wait-ready-2. if_xc: fill in flight.
    logic [1:0] mem_xc;
    logic       if_xc;
+   // 1c posted store: st_post = a retired store still draining on the port
+   // (its DV held until ready).  st_post_ok = the store issued last edge may
+   // post: DRAM, its line's tag not in the I-cache tag shadow, and no IFB /
+   // NLB / ID / EX code overlap — all compared at issue from registers into
+   // this flop, so the post decision (mem_done_now) reads registers only.
+   // A code-touching store keeps the completion-time SMC squash path.
+   logic       st_post, st_post_ok;
    logic [28:0] if_req_dw;
    logic        if_rebase;
-   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc
+   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post
                      && !m_read_DV && !m_write_DV;
 
    // Ready-EDGE arming: the real cache HOLDS ready high until its 2-FF sync
@@ -1233,7 +1370,8 @@ module pipeline_core
    wire lr_need2     = mem_valid && mem_d.uop == U_LEAVERET && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
    wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
-                       (mem_xc == 2'd3 && w_mrdy);
+                       (mem_xc == 2'd3 && w_mrdy) ||
+                       (mem_xc == 2'd1 && st_post_ok);   // 1c: posted (registered)
    wire mem_busy     = mem_port_op && !mem_done_now;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
@@ -1272,14 +1410,29 @@ module pipeline_core
    // branch / flush / fetch / port attribution (events and wait cycles)
    // An EX op killed this edge by an older fused branch or a store squash
    // never retires, so it is not counted.
-   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && exo_taken && !fbr_taken && !sq_ex
-                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken;
+   // JMP / CALL take exo_taken = ex_bcvt_t[0]; the counters read that
+   // directly, keeping the counter adders off the exo_taken mux (which,
+   // with EN_FBR_EQ_EX, also carries the 64-bit FBR equality reduce).  An
+   // EX-resolved FBR is counted one cycle late from a register.
+   logic r_perf_fbr_ex;
+   always_ff @(posedge clk)
+      if (rst)     r_perf_fbr_ex <= 1'b0;
+      else if (ce) r_perf_fbr_ex <= EN_FBR_EQ_EX && ex_valid && !ex_busy && !mem_busy && exo_taken &&
+                                    ex_d.uop == U_FBR && !fbr_taken && !sq_ex;
+   assign perf_stall[5] = (ex_valid && !ex_busy && !mem_busy && ex_bcvt_t[0] && !fbr_taken && !sq_ex
+                           && (ex_d.uop == U_JMP || ex_d.uop == U_CALL)) || fbr_taken || r_perf_fbr_ex;
    assign perf_stall[6] = running && !fetch_halt && !parked && !irq_active && !fetch_ok;
    assign perf_stall[7] = mem_busy;
    assign perf_br       = ex_valid && !ex_busy && !mem_busy && !fbr_taken && !sq_ex
                           && (ex_d.uop == U_JMP) && (ex_d.bcond != 4'd0);
-   assign perf_br_taken = exo_taken;
-   assign perf_fbr_taken = fbr_taken;   // MEM ops always commit: counted as they redirect
+   assign perf_br_taken = ex_bcvt_t[0];   // = exo_taken whenever perf_br (a JMP)
+   assign perf_fbr_taken = fbr_taken ||   // MEM ops always commit: counted as they redirect
+                           r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
+   // (mirrors the if_look miss-issue condition in the fill engine)
+   assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
+                       !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active &&
+                       !(DEBUG_EN && (dbg_active || dbg_halted));
+   assign perf_ic[1] = if_xc;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
    // The 64-bit barrel LEAVES the EX cluster (exo_result's U_SHIFT leg is a
@@ -1408,7 +1561,9 @@ module pipeline_core
       if (rst) begin
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-         flags <= '0; sp <= SP_RESET; int_mask <= 4'h0;
+         flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
+         mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
+         st_post <= 1'b0; st_post_ok <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
@@ -1433,7 +1588,7 @@ module pipeline_core
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
-         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0;
+         ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
 
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
@@ -1484,7 +1639,7 @@ module pipeline_core
             if (parked) begin
                dbg_active <= 1'b0;
             end else if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                         && mem_xc == 2'd0 && !if_xc) begin
+                         && mem_xc == 2'd0 && !if_xc && !st_post) begin
                dbg_active    <= 1'b0;
                parked        <= 1'b1;
                running       <= 1'b0;   // no dispatch / fetch until resume
@@ -1503,7 +1658,7 @@ module pipeline_core
             if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                   && mem_xc == 2'd0 && !if_xc) begin
+                   && mem_xc == 2'd0 && !if_xc && !st_post) begin
                   // RE-CHECK at the drain boundary: an OLDER in-flight store
                   // may have completed during the shadow and killed the cause
                   // — an INT_MASK write (Zephyr irq_lock) or a level-IRQ ack
@@ -1511,7 +1666,8 @@ module pipeline_core
                   // inside the critical section / dispatch a spurious IRQ.
                   // All older stores have retired here (pipeline empty,
                   // mem_xc==0), so irq_ready is now final for this boundary.
-                  if (!irq_ready) begin
+                  if (!irq_ready || (EN_DIEI && irq_dis)) begin
+                     // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
                   end else begin
                      // Re-latch source+vector too: the drained stores may have
@@ -1519,7 +1675,7 @@ module pipeline_core
                      irq_sel_q  <= irq_sel;
                      irq_vec_q  <= irq_vector;
                      m_addr     <= sp - 32'd8;
-                     m_wdata    <= {21'b0, int_mask,
+                     m_wdata    <= {20'b0, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
                                     (flags.sign ^ flags.overflow), flags.carry,
@@ -1559,6 +1715,7 @@ module pipeline_core
             end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
+            if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
             if (wb_park) begin
                parked   <= 1'b1;
                park_kind <= wb_park_kind;
@@ -1569,7 +1726,7 @@ module pipeline_core
                   dbg_cause <= f_dbg_park_cause(wb_park_kind);
                   dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
                end
-               if (wb_park_kind != 3'd2) begin   // illegal: no trace line
+               if (wb_park_kind != 3'd2 && wb_park_kind != 3'd5) begin   // illegal / misaligned: not executed, no trace line
                   ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                end
             end else begin
@@ -1647,10 +1804,17 @@ module pipeline_core
             ic_vlo[snoop_idx_q] <= 1'b0;
          end
 
+         // 1c: posted-store drain.  Nothing else can be on the port (every
+         // issue point waits for !st_post), so this ready is the store's.
+         if (st_post && w_mrdy) begin
+            m_write_DV <= 1'b0;
+            st_post    <= 1'b0;
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
-               2'd0: if (!if_xc) begin        // wait for the port (IF may hold it)
+               2'd0: if (!if_xc && !st_post) begin  // wait for the port (IF / a posted store)
                   m_addr     <= mem_iaddr;
                   m_wdata    <= mem_wdata;
                   m_be       <= mem_be;
@@ -1673,6 +1837,15 @@ module pipeline_core
                   snoop_q     <= mem_port_wr &&
                                  ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4];
                   snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
+                  // 1c: may this store post next cycle? (no code copy of its
+                  // dword anywhere on the fetch side; MMIO never posts)
+                  st_post_ok  <= EN_POST_ST && mem_port_wr && mem_iaddr[31:28] != 4'hF &&
+                                 ic_tagff[mem_iaddr[IC_IDXW+3:4]] != mem_iaddr[31:IC_IDXW+4] &&
+                                 !(ifb_val[0] && ifb_base  == smc_dw) &&
+                                 !(ifb_val[1] && r_base_p1 == smc_dw) &&
+                                 !((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) &&
+                                 !(id_valid && (id_pc[31:3] == smc_dw || id_last_dw == smc_dw)) &&
+                                 !(ex_valid && (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw));
                   // Watchpoints: compare this access at issue; the halt is
                   // taken at the next dispatch boundary (the instruction
                   // completes; at most the two younger ones in EX/ID too).
@@ -1706,6 +1879,13 @@ module pipeline_core
                      m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
                      mem_xc    <= 2'd0;
                   end
+                  st_post_ok <= 1'b0;
+               end else if (st_post_ok) begin
+                  // 1c: post — the store retires from MEM now (mem_done_now);
+                  // its DV stays up and st_post owns the port until ready.
+                  st_post    <= 1'b1;
+                  st_post_ok <= 1'b0;
+                  mem_xc     <= 2'd0;
                end
                2'd2: mem_xc <= 2'd3;
                default: if (w_mrdy) begin     // 2'd3
@@ -1720,7 +1900,7 @@ module pipeline_core
          // same port (D-cache coherent, MMIO decoded by the SoC as usual).
          if (DEBUG_EN && dbg_halted) begin
             if (!dbg_mx) begin
-               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0) begin
+               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post) begin
                   m_addr     <= dbg_i.mem_addr;
                   m_wdata    <= dbg_i.mem_wdata;
                   m_be       <= dbg_i.mem_be;
@@ -1799,7 +1979,7 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !irq_active
+               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active
                             && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
@@ -1874,6 +2054,19 @@ module pipeline_core
                end
                pf_look <= 1'b0;                // hit captured / miss abandoned
             end
+         end else if (EN_PF_EARLY && running && !fetch_halt && !parked && !irq_active
+                      && w_slide && ifb_base[0] && !if_look && !if_xc) begin
+            // HW proposal 3 (§2.6): a slide from an ODD base consumes the
+            // NLB's last dword, and want_line moves to want_line+1 on this
+            // edge.  Start that line's lookup NOW instead of next cycle: the
+            // 3-cycle BRAM prefetch then lands as the window's last word
+            // dispatches, closing the one-bubble-per-8-words gap of
+            // straight-line 1-word code.  The NLB's old line is dead after
+            // this edge, so the earlier capture cannot clobber a live line.
+            // (Paired with the redirect abort in the pos_track composer: a
+            // prefetch must never hold the BRAM port into a redirect.)
+            pf_look <= 1'b1;
+            pf_line <= r_want_line + 28'd1;
          end else if (running && !fetch_halt && !parked && !irq_active
                       && fetch_ok && ifb_val[0] && !nlb_has_want
                       && !if_look && !if_xc) begin
@@ -1895,9 +2088,12 @@ module pipeline_core
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
             wb_mask_new<= m_rdata[42:39];
+            wb_dis_we  <= mem_valid && (mem_dis_we || mem_d.uop == U_IRET);
+            wb_dis_new <= (mem_d.uop == U_IRET) ? m_rdata[43] : mem_dis_new;
             wb_park    <= mem_valid && (mem_d.uop == U_HALT || mem_d.uop == U_TRAP ||
                                         mem_d.uop == U_WAIT || mem_d.uop == U_ILL);
-            wb_park_kind <= (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
+            wb_park_kind <= mem_misal ? 3'd5
+                          : (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
                           : (mem_d.uop == U_ILL)  ? 3'd2 : 3'd3;
             wb_wr      <= mem_is_write;
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
@@ -1926,6 +2122,9 @@ module pipeline_core
                mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
+               mem_misal  <= ex_misal;
+               mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
+               mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
                // EX redirect: taken branch/call, RESET
                if (ex_valid && exo_taken) begin
@@ -1985,7 +2184,7 @@ module pipeline_core
                                   : dbg_step_done ? DBG_CAUSE_STEP : DBG_CAUSE_REQ;
                      id_valid    <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
-                               && !(DEBUG_EN && dbg_active) && irq_ok) begin
+                               && !(DEBUG_EN && dbg_active) && irq_take) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
                      irq_active <= 1'b1;
@@ -2004,18 +2203,26 @@ module pipeline_core
                      if (w_short[32]) id_var1 <= w_short[31:0];
                      // B: the fused branch's displacement (4*simm13) rides in
                      // id_var2 (a 1-word op has no second immediate word)
-                     if (w_op[31:30] == 2'b01 && w_op[29:26] == 4'hD)
+                     // (also the 2-word FBR: its word 1 is the imm32 rhs)
+                     if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
-                                   (w_op[29:26] == 4'hD && w_op[21])) &&
+                                   (w_op[29:26] == 4'hD && w_op[21]) ||
+                                   (EN_SHORT9 && w_op[29:26] == 4'hA && w_op[25:24] == 2'b11)) &&
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize;
-                     id_w      <= (w_op[29:26] == 4'h3) && w_op[19] &&
-                                  !(w_op[31:30] == 2'b01 && w_op[20]);
+                     id_w      <= ((w_op[29:26] == 4'h3) && w_op[19] &&
+                                   !(w_op[31:30] == 2'b01 && w_op[20])) ||
+                                  // P9: short CMPRVW (class 3 LEN=01 SGN=1 B=0 INV=1)
+                                  (EN_SHORT9 && w_op[29:26] == 4'h3 && w_op[31:30] == 2'b01 &&
+                                   w_op[20] && !w_op[21] && w_op[22]) ||
+                                  // HW proposal 6: FBR PRED 5-7 (EQW/LTW/ULTW)
+                                  (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
+                                   (w_op[24] || w_op[23]));
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
                      id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
@@ -2031,6 +2238,25 @@ module pipeline_core
                   end else begin
                      id_valid <= 1'b0;    // IF window miss: bubble, engine fills
                   end
+               end
+
+               // §3.3 misaligned access: it enters MEM as a non-memory parking
+               // op (no port access, no writeback; parks kind 5 at WB), and
+               // everything younger is dropped as behind a serializer.  An
+               // IRQ / debug boundary taken on this same edge is cancelled
+               // (the core parks first).  Older FBR / SMC squashes below
+               // still win (NBA order) and kill it as wrong-path.
+               if (ex_misal) begin
+                  ev_misal     = 1'b1;
+                  mem_d.uop    <= U_TRAP;
+                  mem_d.wreg   <= 1'b0;
+                  mem_d.is_mem <= 1'b0;
+                  ev_pcz       = 1'b1;
+                  id_valid     <= 1'b0;
+                  ex_valid     <= 1'b0;
+                  fetch_halt   <= 1'b1;
+                  irq_active   <= 1'b0;
+                  if (DEBUG_EN) dbg_active <= 1'b0;
                end
             end
          end
@@ -2097,7 +2323,9 @@ module pipeline_core
             pc         <= sq_ex ? ex_pc : id_pc;
             // Every in-flight serializer is younger than the store, so it is
             // squashed here and re-arms fetch_halt when it re-dispatches.
-            fetch_halt <= 1'b0;
+            // (§3.3: a misaligned op that entered MEM this edge is older
+            // than the squashed ID op — it parks, so fetch stays halted.)
+            fetch_halt <= ev_misal && !sq_ex;
          end
 
          // debugger register write (debug-halted: no WB activity competes)
@@ -2140,6 +2368,11 @@ module pipeline_core
             // PIPELINE_M12_TIMING.md.)
             if (ev_pcz)    p = 3'b000;              // conservative: forces rebase
             pos <= p;
+            // HW proposal 3: a redirect aborts any background prefetch (it was
+            // for the old sequential path), so the BRAM read port reads the
+            // new miss_dw on the very next cycle — the free first-cycle read
+            // the demand lookup relies on.  (NBA here wins over the engine.)
+            if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
             if (ev_rebase) begin
@@ -2189,7 +2422,8 @@ module pipeline_core
          assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
                  id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||
                                (id_op[29:26] == 4'h3 && id_op[20]) ||
-                               (id_op[29:26] == 4'hD && id_op[21])) &&
+                               (id_op[29:26] == 4'hD && id_op[21]) ||
+                               (EN_SHORT9 && id_op[29:26] == 4'hA && id_op[25:24] == 2'b11)) &&
                               (dec.uop == U_MUL || dec.uop == U_DIV || dec.uop == U_MOD ||
                                dec.uop == U_BOOL || dec.uop == U_ALU || dec.uop == U_FBR)) &&
                  id_b_sext == dec.sgn)

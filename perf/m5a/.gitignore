@@ -24,3 +24,4 @@ perf_clear.kla
 lvgl*.out
 lvgl.ops.uniq
 klausscc_opcodes*
+keep/

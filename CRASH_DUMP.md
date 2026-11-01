@@ -35,6 +35,10 @@ S0=NNNNNNNNNNNNNNNN
 S1=NNNNNNNNNNNNNNNN
 S2=NNNNNNNNNNNNNNNN
 S3=NNNNNNNNNNNNNNNN
+F0=NNNNNNNNNNNNNNNN
+F1=NNNNNNNNNNNNNNNN
+...
+F5=NNNNNNNNNNNNNNNN
 T0 P=xxxxxxxx OP=xxxxxxxx
 T1 P=xxxxxxxx OP=xxxxxxxx
 ...
@@ -61,6 +65,7 @@ TF P=xxxxxxxx OP=xxxxxxxx
 | `INSTR`  | 32-bit       | Committed instruction count since program load (`LOAD_COMPLETE`). |
 | `Rn`     | 64-bit × 16  | General registers R0..RF. |
 | `Sn`     | 64-bit × 4   | Top 4 doublewords of stack: `S0 = mem64[SP]`, `Sn = mem64[SP + n*8]`. Reads beyond `STACK_TOP` print as `FFFF_FFFF_FFFF_FFFF`. |
+| `Fn`     | 64-bit × 6   | Call chain from the R15 frame records (ABI: `[R15]` = caller's R15, `[R15+8]` = return address). `F0`/`F1` = `[R15]`/`[R15+8]`, `F2`/`F3` = `[F0]`/`[F0+8]`, `F4`/`F5` = `[F2]`/`[F2+8]` — i.e. three (saved R15, return address) pairs, innermost first. A record base that is not 8-aligned or not below `STACK_TOP-8` prints `FFFF_FFFF_FFFF_FFFF` (and so does everything after it). |
 | `Tn`     | `P=`32 + `OP=`32 × 16 | Fetch trace ring. T0 is the most recent fetch, T1 one before, … TF = 16 fetches back. |
 
 ## Error codes (`ERR`)
@@ -79,6 +84,7 @@ localparams).
 | 07  | `ERR_SEG_WRITE_TO_CODE`| Write into the code segment. |
 | 08  | `ERR_SEG_EXEC_DATA`    | Execute from the data segment. |
 | 09  | `ERR_TRAP`             | Software `TRAP` opcode (`0xF014`). |
+| 0A  | `ERR_MISALIGN`         | Misaligned 16-bit (odd address) or 32-bit (not 4-aligned) load/store; `MEMGET32`, byte, 64-bit and stack accesses are exempt (pipeline park kind 5). `PC`/`OPC` are the faulting access; it did not execute, so `T0` is the instruction before it. |
 
 ## Reading a dump
 
@@ -103,7 +109,11 @@ localparams).
    advance PC past the entry. The trace `T0..TF` disambiguates.
 7. **`T0..TF`** is the run-up: T0 is the fetch that faulted, T1 the one before,
    etc. — gives 16 instructions of execution history.
-8. **Registers / flags / stack** are the architectural state at fault time
+8. **`F0..F5`** give the call chain without a debugger: `F1`, `F3`, `F5`
+   are the return addresses of the current function, its caller and its
+   caller's caller (valid when the code keeps the R15 frame chain, which
+   the ABI does — a frameless leaf shows its caller's record).
+9. **Registers / flags / stack** are the architectural state at fault time
    (already updated for any retired instructions; not for the faulting one).
 
 ## V64 immediate encoding

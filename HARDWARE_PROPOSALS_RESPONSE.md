@@ -1,0 +1,385 @@
+# Response to HARDWARE_PROPOSALS.md (RTL side)
+
+Branch `hw-proposals`. Answers `HARDWARE_PROPOSALS.md` (copied from
+klausscpu-llvm `main`, 2026-10-29). The RTL was written in simulation on
+2026-10-31, then built, timing-closed and **board-verified on 2026-11-01**
+(Nexys A7, 100 MHz, Vivado 2025.2). The tested bitstream is from `0de5b21`.
+Every change has its own build switch (`localparam bit EN_*` at the top of
+`pipeline_core.sv`).
+
+## 0. Board results (2026-11-01)
+
+**Timing:** met at tier 1 (Performance_Explore, no phys_opt rescue).
+
+| Build | WNS | WHS | Worst path |
+|---|---:|---:|---|
+| master `e58530b` (same flow, same day) | +0.077 | +0.013 | core 2 `mul_a_q → DSP PCIN` |
+| hw-proposals `23e616f` | +0.145 | +0.018 | core 2 `ex_b → pc` |
+| hw-proposals `0de5b21` (**shipped**) | +0.130 | +0.024 | — |
+| `0de5b21` with `EN_FBR_EQ_EX=1` | −0.123 (tier 2) | +0.024 | core 1 `ex_a → mul DSP CEA1` / `ex_a → pc` (−0.082) |
+
+**Correctness on silicon, `0de5b21`:**
+
+- M5e: 15 programs. 13 are byte-identical to the emulator. dhrystone and
+  test_atomic print timing-dependent numbers (as on master); both pass their
+  self-checks (`Self-check: PASS`; `test_atomic PASSED`, 137/0).
+- `tools/board/hwprop_test`: ALL PASS. It covers 704 FBR W / imm32 /
+  short-CMPRVW branch cases, short MULV and LEAPC, DI/EI values, 0 of 2342
+  timer ISRs inside a DI window, WAIT while disabled, and 21 posted-store SMC
+  cases.
+- `tools/board/hwprop_misal`: `ERR=0A`, with F1/F3/F5 = the three return
+  addresses of the call chain.
+- CoreMark (validation run) and all 19 Embench benchmarks verify.
+- xsim (M5a TB): the RTL retire traces of 15 programs (21M instructions) are
+  identical to master's.
+
+**Performance** (board cycles, master vs `0de5b21`; same ELFs, toolchain
+`56ee1aba697b`, -O2; Dhrystone -O1 as built by the runtime Makefile):
+
+| Benchmark | master | hw-proposals | change |
+|---|---:|---:|---:|
+| CoreMark (2000 it) | 1,978,438,739 | 1,904,365,769 | **−3.7%** (CoreMark/MHz 1.010 → 1.050) |
+| Dhrystone, cycles/run | 220 | 211 | **−4.1%** (DMIPS/MHz 2.587 → 2.697) |
+| Embench speed geomean | 0.554 | 0.579 | **+4.5%** |
+| aha-mont64 | 3,368,556 | 3,275,486 | −2.8% |
+| crc32 | 9,668,180 | 9,450,577 | −2.3% |
+| cubic | 5,964,424 | 5,654,580 | −5.2% |
+| edn | 10,111,893 | 9,861,322 | −2.5% |
+| huffbench | 7,702,720 | 7,329,033 | −4.9% |
+| matmult-int | 12,051,686 | 11,701,722 | −2.9% |
+| minver | 6,227,393 | 5,989,017 | −3.8% |
+| nbody | 4,154,365 | 3,938,662 | −5.2% |
+| nettle-aes | 9,400,924 | 9,129,353 | −2.9% |
+| nettle-sha256 | 7,587,069 | 7,007,204 | −7.6% |
+| nsichneu | 11,137,068 | 10,986,886 | −1.3% |
+| picojpeg | 8,997,125 | 8,497,143 | −5.6% |
+| qrduino | 7,314,940 | 7,112,953 | −2.8% |
+| sglib-combined | 8,600,966 | 8,244,659 | −4.1% |
+| slre | 9,570,491 | 9,096,269 | −5.0% |
+| st | 4,587,171 | 4,398,423 | −4.1% |
+| statemate | 5,432,553 | 5,019,666 | −7.6% |
+| ud | 8,410,233 | 7,926,206 | −5.8% |
+| wikisort | 2,608,484 | 2,471,588 | −5.2% |
+
+All of this gain comes from 1c and 3; the other items need compiler support
+first. No benchmark is slower.
+
+**Micro-kernels** (`hwprop_kern`, board `PERF_CYCLES` per body, minus the
+timer-read overhead):
+
+| Kernel | master | hw-proposals |
+|---|---:|---:|
+| 1-word ALU, independent | 1.12 | 1.01 |
+| SETR (2-word) | 2.00 | 2.03 |
+| store 64 (back to back) | 4.06 | 3.93 |
+| store ; ALU | 5.00 | 3.93 |
+| load 64 | 5.06 | 5.06 |
+| store ; load | 9.06 | 9.06 |
+| PUSH ; POP | 14.81 | 12.87 |
+| taken FBR | 6.00 | 5.81 |
+| not-taken FBR | 1.12 | 1.06 |
+| MUL | 4.00 | 4.06 |
+| DI ; EI | (traps) | 2.93 |
+
+How to read these:
+
+- A posted store hides behind non-memory work, but back-to-back stores still
+  wait for each other's drain. A store directly followed by a load gains
+  nothing.
+
+Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
+
+- localparams used before their declaration;
+- `ic_tagff` had no initial value, so it was X in 4-state sim.
+
+## 1. Status
+
+| # | Proposal | State (all items board-verified unless noted) | Switch (default) | Measured (full-SoC sim, cycles) |
+|---|---|---|---|---|
+| 1c | store buffer | **done**: posted DRAM stores | `EN_POST_ST` (1) | store 12.17 → 10.18 per loop iter (−2.0); CALL+RET −2.0; PUSH;POP −2.0; CALL+ENTER+store+LEAVERET −4.0; loads unchanged |
+| 3 | front-end line bubble | **done** for 1-word code | `EN_PF_EARLY` (1) | 32 straight-line ALU ops 44.34 → 40.36 per iter; loop sweep (body 2..32 × 4 alignments) −5.2%, no case worse |
+| 6 | FBR W / imm32 | **done** (RTL; needs toolchain) | `EN_FBR_W` (1) | — (gain needs FuseCmpBr) |
+| 7a | DI / EI | **done** (RTL; needs runtime/toolchain) | `EN_DIEI` (1) | — |
+| 8 / §3.3 | misaligned 16/32-bit | **done as a trap** (park 5, `ERR=0A`) | `EN_MISAL_TRAP` (1) | — |
+| 9 | short CMPRVW / MULV / LEAPC | **done** (RTL; needs toolchain) | `EN_SHORT9` (1) | — (code size) |
+| §3.4 | call chain in crash dump | **done** (F0..F5 lines) | — | — |
+| §2.6 | I-cache miss counter | **done** (`PERF_IC_MISS` 0xF0, `PERF_IC_FILL_CYC` 0xF8) | — | — |
+| 2b | FBR resolved in EX | **partial, opt-in, does not close**: EQ/NE (+W) only; −0.12 ns on the core-1 `ex_a → pc` / mul-enable families | `EN_FBR_EQ_EX` (**0**) | taken FBR NE −1.0 per iteration when on |
+| 1b | load hit 4 → 3 | not done: stage B (`feat/m10b-fused`, `daa0795`) is not on GitHub | — | — |
+| 4 | non-blocking MUL | not done: design below (§5.1) | — | — |
+| 2a | branch prediction | not done: design below (§5.2) | — | — |
+| 5 | EX→EX forwarding | not done (−0.75 ns measured in M6) | — | — |
+| 1a | pipelined D-cache hit | not done (cache redesign) | — | — |
+
+The SoC numbers come from `sim_1/new/tb_soc.sv` (real `mem_read_write` cache,
+`bus_splitter`, MMIO, behavioural DDR) under Verilator. That model is
+calibrated against your board figures: on master it gives store 4.05, load
+5.05, leaf CALL+RET 17.07 cycles, against §2.2's 4.25 / 5.25 / 16.9.
+
+The measured benchmark effect is in §0: CoreMark −3.7%, Embench +4.5%,
+Dhrystone −4.1%, all from 1c and 3. The simulation-time estimate (from the
+proposal's own model) had been ≈ −2.3% CoreMark for 1c alone, plus 3's
+straight-line fetch gain.
+
+## 2. What changed, item by item
+
+### 1c — posted stores (`EN_POST_ST`)
+
+A DRAM store leaves MEM **one cycle after issue**; the port stays busy
+(`st_post`, DV held) until its ready. Every other port user waits for that
+drain: MEM issue, I-cache miss fill, IRQ frame push, debugger access, the
+IRQ/debug drains, and `bus_idle` (so the SoC never takes the bus mid-drain).
+
+It posts one cycle after issue rather than at issue because of the SMC
+protection. That protection relies on the store's *completion-time* squash to
+clean up an I-cache serve whose BRAM read was registered before the
+issue-time snoop clear. So eligibility is decided **at issue, from registers,
+into a flop** (`st_post_ok`):
+
+- a DRAM store, and
+- the line's tag is not in the I-cache tag shadow, and
+- no IFB / NLB / ID / EX code overlap.
+
+`mem_done_now` then gains only a registered term, so nothing new lands on the
+`mem_busy` fan-out cone. Code-touching stores and every MMIO store take the old
+path, so SMC, `ICACHE_INV` and `INT_MASK` ordering are unchanged.
+
+Known conservatism: the tag shadow has no valid bits, so a store whose 8 KB
+block shares a tag with a stale shadow entry at its index doesn't post. That
+mostly hits data in the same 8 KB block as cached code. Posting at issue
+(saving the third cycle) needs that eligibility one cycle earlier, off the EA
+adder. Not attempted.
+
+### 3 — line-crossing bubble (`EN_PF_EARLY`)
+
+Root cause, from cycle traces: the NLB holds one line, and the prefetch of the
+next line started only after the slide that emptied the NLB had moved
+`want_line`. The 3-cycle BRAM prefetch then landed one cycle after the
+2-dword window ran dry: one bubble per 8 one-word instructions.
+
+The fix has two parts:
+
+- **Early start.** On a slide from an odd base (the one that consumes the
+  NLB's last dword), start the lookup of `want_line+1` on that edge.
+- **Abort on redirect.** Any redirect (`ev_pcz`) aborts an in-flight
+  prefetch, so the BRAM port reads the new `miss_dw` on the very next cycle.
+  Without this, the earlier prefetch phase collided with short loops'
+  back-branch lookups (+1 cycle/iteration in about half the alignments).
+
+Both are enables on `pf_look` / `pf_line` only.
+
+**For the compiler:** loop-head alignment **still matters** (+1..2
+cycles/iteration with the head at line offset 12). That cost comes from where
+the redirect target lands in the window, not from this bubble, so keep
+`-klausscpu-pref-loop-align` for now. 2-word code is unchanged at one fetch
+cycle per word: that's window bandwidth (one slide per cycle), a separate
+problem.
+
+### 6 — FBR W and imm32 (`EN_FBR_W`)
+
+- **PRED 5/6/7** = EQW/LTW/ULTW. They reuse D2's dispatch-time `{x[31:0],0}`
+  shift (`id_w`), so EX is unchanged. The PRED remap folds into `f_cmp_op`'s
+  existing 4 inputs.
+- **`LEN=10`** compares rs1 against sext(imm32) from word 1 (`id_var1`), with
+  the simm13 displacement still in word 0.
+- Encodings are in `ISA_ENCODING_V2_MAP.md` §8.1.
+
+### 7a — DI / EI (`EN_DIEI`)
+
+- `DI rd` returns the old *enable* bit and disables; `EI rs1` sets
+  enable = rs1[0].
+- The bit commits at WB. DI's result comes from the youngest older in-flight
+  DI/EI/IRET in MEM/WB, all register-sourced, so there's no stall and no
+  forwarding change.
+- An IRQ boundary is taken only while enabled. A DI still in flight when a
+  boundary is taken is caught by the existing drain-time re-check, exactly
+  like an `INT_MASK` store.
+- `WAIT` wakes on a pending IRQ even while disabled (WFI semantics), so
+  `DI; test; WAIT` can't deadlock.
+- The frame saves the bit at [43] in *disable* sense, so software-built
+  frames (bit 43 = 0) resume enabled.
+- `SWAP`/`CAS` (7b) were not done.
+
+### §3.3 / 8 — misaligned trap (`EN_MISAL_TRAP`)
+
+This applies to 16-bit accesses at odd addresses and 32-bit accesses not
+4-aligned, both loads and stores.
+
+- **Exempt:** MEMGET32, byte, 64-bit and stack accesses. The klausscc
+  emulator specifies and tests those as defined behaviour.
+- **Detection:** in EX, from separate 2-bit low-EA adds (off the 32-bit EA
+  carry chain).
+- **Handling:** the op enters MEM converted to a non-memory parking op, so
+  `mem_port_op`/`mem_busy` are unchanged. Younger ops are dropped, a same-edge
+  IRQ/debug boundary is cancelled, and older FBR/SMC squashes still win.
+- **Result:** park kind 5, then HCF with `ERR_MISALIGN` (0x0A). No retire
+  line is emitted (as for ILLEGAL).
+- **Software risk:** any existing hand-written asm that relied on silent
+  align-down now crashes. The netboot image runs its first 600k instructions
+  identically and prints its banner (see §4).
+
+### 9 — short forms (`EN_SHORT9`)
+
+CMPRVW simm8 (class 3 short with INV=1), MULV simm8 (class A OP=3) and LEAPC
+simm16 (class 2 OP=14 F=1). Immediates are formed in `f_short_imm` at the
+IF→ID latch like the other short forms. Encodings are in §8.3 of the ISA map.
+
+### §3.4 — call chain in the crash dump
+
+Six lines `F0..F5` follow `S0..S3`: three R15 frame records (saved R15,
+return address), each read through the same DDR path as the stack lines. An
+unaligned or out-of-DRAM base prints the FF sentinel. Checked on the full-SoC
+sim with a three-deep chain (exact values) and with `ERR=0A`. See
+`CRASH_DUMP.md`.
+
+### 2b-lite — EQ/NE FBR in EX (`EN_FBR_EQ_EX`, default **off**)
+
+An equality FBR redirects from EX through the JMPcc path; ordered compares
+stay in MEM. The new logic is a 64-bit XOR-reduce from the `ex_a`/`ex_b`
+registers.
+
+**Measured (2026-11-01): it does not close at 100 MHz.**
+
+- **First build: −0.203 ns**, on the perf-counter strobe (`perf_fbr_taken` →
+  the SoC's 48-bit branch-taken counter adder).
+  - Fixed in `0de5b21`: the counters now read `ex_bcvt_t[0]` for JMP/CALL and
+    a registered strobe for the EX-resolved FBR.
+- **Rebuilt: −0.123 ns** (tier 2), now on the real families: core 1
+  `ex_a → pc` (−0.082 ns) and `ex_a → multiplier DSP clock enable`.
+
+Landing it would need the equality computed at dispatch, as a registered
+compare of the forwarded operands, which puts the forwarding muxes in front
+of the reduce instead. Not attempted.
+
+## 3. Timing closure (done 2026-11-01)
+
+See §0. The default configuration met at tier 1 with more margin than master
+had on the same day: +0.130 ns against +0.077. WNS is set by core 2's EX/DSP
+paths in both. No switch had to be turned off.
+
+How to rebuild: `vivado -mode batch -source tools/build_fast.tcl -tclargs
+-resynth` (about 12–14 min on this machine).
+
+## 4. Verification (simulation, 2026-10-31; see §0 for the board)
+
+`tools/vsim` is new and runs without Vivado. `tools/vsim/run.py`, with
+Verilator 5.020 and small sim-copy-only patches for that version's limits:
+
+- **`test`:** 112 directed cases in `tests.py`:
+  - every new instruction, compared against its 2-word equivalent where one
+    exists;
+  - DI windows under a fast timer with random latency, plus a negative control
+    that fails without DI;
+  - WAIT while disabled; IRET restoring a disabled frame;
+  - misaligned traps (10 size/mode cases, younger store suppressed, wrong-path
+    behind FBR/JMP);
+  - 54 store-into-code SMC variants under posted stores (distance 0–40,
+    8/32/64-bit, cold/warm I-cache) and data stores into code lines;
+  - I-cache counters.
+
+  The pos-tracker and predecode `$fatal` assertions are live throughout.
+- **`diff --base REV`:** random terminating programs (ALU/compare/shift/MUL/
+  DIV/loads/stores of all sizes/MEMGET32/PUSH-POP/CALL/ENTER/LEAVE/loops/
+  FBR/JMPcc), with and without timer IRQs, at three memory latencies. Retire
+  traces are identical to the previous commit at every step of this branch.
+- **`socdiff --base REV`:** the same programs through the **full SoC**.
+  Identical to master. `run_soc` also boots the real `netboot.mem` for 1M
+  retires. The first 600,733 retires are identical to master, and so is the
+  UART output. The traces then diverge only because timing-dependent polling
+  starts (the first difference is a UART `TX_BUSY` poll at pc 0x150 spinning
+  a different number of times).
+
+The xsim flows (`perf/m5a/*.sh`) remain canonical. `tb_pipeline_isa.sv` now
+merges sub-word store lanes itself for its trace line (a posted store can
+retire before it lands) and treats park kind 5 as terminal. klausscc couldn't
+be built here, so no emulator-golden diffs were run: that's the first thing
+to do with xsim.
+
+## 5. Not done: designs and the timing cost they face
+
+### 5.1 Proposal 4 (non-blocking MUL)
+
+With one in-order retire point, a MUL that leaves EX early still can't retire
+before its result (cycle 3), so overlapping younger work means **out-of-order
+completion**. That needs four things:
+
+- **Scoreboard:** a one-entry MUL scoreboard (`rd`, count). Readers and
+  writers of that `rd` stall in ID. That's a new `raw_stall` term, the same
+  shape as `hit1`, but `raw_stall` is the dispatch-hold critical path.
+- **Write port:** a second `rf` write port at completion (FF register file,
+  so it's area, not a port problem).
+- **Drains:** IRQ entry, debug halt and parks also wait for the scoreboard to
+  empty.
+- **Flags:** MUL writes Z/S/V. A younger flag reader or writer would also
+  have to wait.
+
+**Suggestion:** decide on the ISA side that **MUL does not write flags**. The
+klausscc emulator already doesn't model MUL/DIV flag writes, and the M5 trace
+diff strips `f=` for that reason, so validated compiled code can't depend on
+them. That removes the flag scoreboard.
+
+The retire trace then shows a MUL's `rd` only at completion, which the
+emulator-golden flow would have to accept. Recommended as its own milestone,
+with a board A/B on edn and ud.
+
+### 5.2 Proposal 2a (prediction)
+
+Start with the **return-address stack** alone (−0.5% CoreMark, −0.8% Embench,
+crc32 −5.2%):
+
+- Push `ex_pc_next` at a taken CALL in EX.
+- On a RET/LEAVERET dispatch, redirect fetch from ID to the top entry instead
+  of halting fetch.
+- Verify at MEM against the loaded address; the MEM RET redirect already
+  exists, so it fires only on a mismatch.
+
+It touches only `fetch_halt` and one new pc source. Then add an ID-stage
+direction predictor:
+
+- 2-bit counters in a LUTRAM indexed by `pc` at fetch, registered into ID.
+- The target formed in ID from `id_pc` + the word-0 displacement, as
+  `id_pc_nx` is.
+- A redirect from ID; recovery at EX/MEM using the carried fall-through
+  `id_pc_nx`.
+
+That leaves the IF serve cone alone (M11a's lesson). An IF-stage predecoder
+(the "no extra bubble" version) puts an adder on `w_op`, the family M12 just
+cleared.
+
+### 5.3 Proposals 5, 1a, 1b
+
+- **5 (EX→EX forwarding):** M6 measured the full `exo_result` feedback at
+  −0.75 ns. The partial bypass (ADD/SUB/logic/MOV into the next op's
+  `ex_a`/`ex_b`) still closes the same loop, adder → mux → adder, in one
+  cycle; it needs a floorplan or EX pblock experiment. Not attempted blind.
+- **1b:** stage B exists only on your machine. Its own notes say landing it
+  needs EX-cluster/SHA margin or a floorplan first.
+- **1a:** a pipelined hit is the `mem_read_write` redesign the proposal
+  describes. 1c's drain logic (`st_post`) is the first piece of the
+  "MEM occupancy 1" model it would need on the core side.
+
+## 6. Toolchain / runtime asks (klausscpu-llvm, klausscc, runtime)
+
+1. **klausscc emulator:**
+   - misaligned 16/32-bit → stop as *Misaligned* (no trace line);
+   - DI/EI (frame bit 43; WAIT wakes while disabled);
+   - FBR PRED 5–7 and LEN=10;
+   - the three short forms;
+   - park kind 5 in the trace stop reasons.
+2. **klausscc assembler / disassembler:** the encodings in
+   `ISA_ENCODING_V2_MAP.md` §8 (templates verified against the RTL decode by
+   `tools/vsim`).
+3. **LLVM:**
+   - FuseCmpBr for W compares and simm32 (drop `-klausscpu-fuse-loop-const`
+     once in);
+   - CompressPats for the short forms, plus a 16-bit PC-relative fixup and
+     relaxation for LEAPC.S;
+   - store latency in the schedule model (a store now occupies MEM 2 cycles,
+     not 4);
+   - re-measure `MaxGluedStoresPerMemcpy` and the frame-folding trades;
+   - keep loop alignment (§2, item 3).
+4. **Runtime / RTOS:** `arch_irq_lock` / `atomic.c` / FreeRTOS critical
+   sections can become `DI r` / `EI r` once the bitstream has `EN_DIEI`.
+   Inline atomics: DI, load, op, store, EI.
+5. **Crash-dump parser (if any):** six new `F` lines, and `T0..TF`/footer
+   moved down by six.
