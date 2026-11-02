@@ -1114,7 +1114,16 @@ module pipeline_core
                                       !ex_may_redir;
    // A tag match implies the same branch instruction, hence the same target:
    // an entry dies with its branch's line as well as its target's.
-   wire                bt_hit    = EN_BTIC && id_bt_hit && bt_v[id_bt_idx];
+   // (timing: no bt_v[id_bt_idx] re-read — a 64:1 mux on the redirect cone.
+   // The snapshot carries its entry's line indices (id_bt_li / id_bt_bli);
+   // an invalidation that matches them clears id_bt_hit, and one landing on
+   // the very edge a snapshot was taken is caught here from its registered
+   // index (r_btk_*).)
+   logic [IC_IDXW-1:0] id_bt_li, id_bt_bli, r_btk_ic, r_btk_sn;
+   logic               r_btk_icv, r_btk_snv, r_btk_all;
+   wire                bt_hit    = EN_BTIC && id_bt_hit && !r_btk_all &&
+                                   !(r_btk_icv && (id_bt_li == r_btk_ic || id_bt_bli == r_btk_ic)) &&
+                                   !(r_btk_snv && (id_bt_li == r_btk_sn || id_bt_bli == r_btk_sn));
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
    endfunction
@@ -2035,6 +2044,7 @@ module pipeline_core
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
+         r_btk_icv <= 1'b0; r_btk_snv <= 1'b0; r_btk_all <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
@@ -2938,6 +2948,7 @@ module pipeline_core
                      // 2a: BTIC lookup by this instruction's own pc
                      id_bt_hit  <= EN_BTIC && bt_v[bt_lidx_pc] && bt_tag[bt_lidx_pc] == pc[31:2];
                      id_bt_idx  <= bt_lidx_pc;
+                     id_bt_li   <= bt_lidx[bt_lidx_pc];  id_bt_bli <= bt_blidx[bt_lidx_pc];
                      id_bt_d0   <= bt_d0[bt_lidx_pc];   id_bt_d1  <= bt_d1[bt_lidx_pc];
                      id_bt_v1   <= bt_v1[bt_lidx_pc];   id_bt_base <= bt_base[bt_lidx_pc];
                      id_bt_bp1  <= bt_bp1[bt_lidx_pc];  id_bt_bp2 <= bt_bp2[bt_lidx_pc];
@@ -3159,6 +3170,15 @@ module pipeline_core
                if (snoop_q   && (bt_lidx[k] == snoop_idx_q   || bt_blidx[k] == snoop_idx_q))   bt_v[k] <= 1'b0;
             end
             if (icinv) bt_v <= '0;
+            // the ID snapshot is a copy of one entry: the same kills apply to
+            // it (an older snapshot via its own indices; one taken on this
+            // edge via r_btk_* next cycle, in bt_hit)
+            if (ev_icinst && (id_bt_li == ev_icinst_idx || id_bt_bli == ev_icinst_idx)) id_bt_hit <= 1'b0;
+            if (snoop_q   && (id_bt_li == snoop_idx_q   || id_bt_bli == snoop_idx_q))   id_bt_hit <= 1'b0;
+            if (icinv) id_bt_hit <= 1'b0;
+            r_btk_icv <= ev_icinst;  r_btk_ic <= ev_icinst_idx;
+            r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;
+            r_btk_all <= icinv;
          end
 
          // ---------------- M12 pos-tracker composer (runs LAST) ----------------
