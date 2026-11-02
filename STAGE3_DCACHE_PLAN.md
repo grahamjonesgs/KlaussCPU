@@ -1,8 +1,61 @@
 # 1a stage 3: a load-hit pipe beside the cache FSM
 
-Branch `dcache-s3`, on `timing-headroom` (`7d84761`). Status: design. It is
-the next RTL step agreed with the toolchain session (2026-11-02), after the
-cycle breakdown showed loads are the largest cost.
+Branch `dcache-s3`, on `timing-headroom` (`7d84761`). Agreed with the
+toolchain session on 2026-11-02, after the cycle breakdown showed loads are
+the largest cost.
+
+**Status:** built, and passed my board suite (`822baeb`). Toolchain
+validation is in progress.
+
+## 0. As built (differs from the first draft below)
+
+**The hit pipe reads shadow copies of the arrays.**
+- `h_tag_way0/1` and `h_data_way0/1` are written by exactly the FSM's array
+  writes, on the same edges, and read only by the pipe.
+- So the pipe never shares a read port with the FSM: §4 case 1 doesn't exist,
+  and IF fills or stores to other lines never push a load onto the slow path.
+- Cost: 54 → 68 RAMB36, out of 135.
+
+**Conflicts.**
+- The cache flags an H read that lands while the FSM is outside WAIT on the
+  same set index, or in MAINT (`r_h_conf`).
+- The core keeps a load off the pipe while a store to the same 32 B line is
+  still on the port (`m_write_DV`).
+
+**A LOAD/POP/LEAVE never early-issues.** When it can't use the pipe (MMIO,
+misaligned, a same-line store), it issues from MEM a cycle later. The first
+build met timing at only +0.038 with the pipe's address compare on the
+early-issue cone; `822baeb` met at +0.155.
+
+**Measured, SoC sim, cycles per group:**
+
+| Group | Before | After |
+|---|---:|---:|
+| `ld` (back to back) | 3.89 | 1.01 |
+| `ld;ld` | 5.97 | 2.03 |
+| `ld;use` | 5.03 | 4.02 (distance 3) |
+| `ld;2;use` | 5.05 | 4.05 |
+
+A same-line load is fast from store issue +3 (2 instructions between); +0/+1
+costs about 2 cycles.
+
+**Board, vs `7d84761`, same binaries:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −12.7% (1.554 → 1.780 /MHz) |
+| Embench speed geomean | 0.806 → 0.918 (cycles −12.3%; all faster, nsichneu −31%, matmult −25%) |
+| Dhrystone | 137 → 111 cycles/run |
+
+**Verification.**
+- **vsim:** directed tests and random diffs. `tb_vsim` has no hit pipe, so
+  there every load takes the slow path.
+- **socdiff:** run with `--span 64/32/64K` as well, so same-line hazards
+  occur.
+- **`+HCOV` coverage:** shows the store-blocked and conflict paths firing.
+
+**Next:** stores still go through the FSM. In sim, `st;ld` to another line
+costs 3.27 cycles for 2 instructions.
 
 ## 1. Why
 
