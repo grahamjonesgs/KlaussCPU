@@ -197,8 +197,12 @@ accesses.
 
 ## 0h. Fetch bandwidth: branch fetch-bypass (2026-11-02)
 
-`90dcb2d`, on master `0cccefa`. **Status:** passed my board suite. Toolchain
-validation is pending.
+`90dcb2d`, on master `0cccefa`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash). Toolchain validation passed:
+the board suite with no differences, csmith-board 150, zephyr (tick_cost 373,
+irq_soak unchanged, so no cold-code penalty is visible) and the hw_* fixtures.
+With llvm 148dc75: CoreMark -O2 184.31, -Os 150.05; Embench 0.979 / 0.869.
+Rollback to st-1slot: `~/.cache/kbuild/rollback/README.txt`.
 
 **Diagnosis** (`perf-attrib`, a sim-only per-cycle attribution). Most of the
 board's "unattributed" cycles are front end, about 15–18% of cycles:
