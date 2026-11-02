@@ -195,6 +195,57 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0h. Fetch bandwidth: branch fetch-bypass (2026-11-02)
+
+`90dcb2d`, on master `0cccefa`. **Status:** passed my board suite. Toolchain
+validation is pending.
+
+**Diagnosis** (`perf-attrib`, a sim-only per-cycle attribution). Most of the
+board's "unattributed" cycles are front end, about 15–18% of cycles:
+
+- the ID latch bubble after a refill;
+- taken-branch bubbles;
+- above all, fetch bandwidth.
+
+Straight-line 2-word ops ran at 2.0 cycles/op: the window slides a dword per
+cycle, but the single NLB was refilled about once per 3 cycles. Dynamic
+2-word share: statemate 37%, minver 25%, slre 13%, CoreMark 6.5% (older
+compiler; llvm 148dc75's global merging removes most of statemate's LEAPCs).
+
+**Changes:**
+- **`EN_BTPF`:** a BTIC-hit redirect starts the next-line prefetch on its own
+  edge.
+- **`EN_NLB2`:** two NLB entries, both serving slides and line crosses. The
+  prefetch fills `want`, then `want+1`, back to back.
+- **Dropped:**
+  - a "demand waits for the in-flight prefetch" rule, which interacted badly
+    with `EN_BTPF` on crc32;
+  - a "prefetch yields the BRAM port" rule, −1.1 ns on the IF cone.
+
+**Timing:** met after phys_opt, WNS +0.027 (tier 1 −0.054). The worst family
+is `st → ex_d` / `pc`, not the fetch cone.
+
+**Costs, SoC sim:**
+
+| Case | Before | After |
+|---|---:|---:|
+| Straight-line 2-word op | 2.01 | 1.24 cycles/op |
+| Straight-line 3-word op | 4.3 | 2.5 cycles/op |
+| Taken JMP + one op, target at word 0 / 1 / 2 / 3 of its line | 3.40 / 3.10 / 3.44 / 5.10 | 3.4 / 3.1 / 3.4 / 4.1 |
+
+Cold, branchy random programs are 1.3–2.5% slower: the prefetch holds the
+BRAM port more often.
+
+**Board, same binaries, vs st-1slot:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −0.8% (1.833 /MHz) |
+| Embench speed geomean | 0.938 → 0.966 (cycles −2.91%; statemate −12.6%, nettle-aes −8.5%, nbody −6.0%; none slower) |
+| Dhrystone | 107 cycles/run |
+
+The crc32 -Os layout pair is now 6,624,989 / 6,624,636 (layout-insensitive).
+
 ## 0g. One-slot stores, miss trim, BTIC race fix, post-check fix: branch st-1slot (2026-11-02)
 
 `ccdc289`, on dcache-s3 `822baeb`. **Merged to master and written to QSPI on
