@@ -260,6 +260,12 @@ module pipeline_core
    // in MEM (forwarded from the CALL's push: 1 cycle; cache hit: 2), not on
    // the port behind the push.  A miss falls back to the port in MEM.
    localparam bit EN_HRET = 1'b1;
+   // MUL holds EX 2 cycles, not 4: it travels on through MEM and WB commits
+   // its product straight from the DSP's last stage (mul_pipe2 holds it on
+   // the MUL's 2nd and 3rd cycle after leaving EX); a MUL still in MEM then
+   // captures it (mem_mres).  Consumers forward from WB (latency 4, was 5);
+   // flag readers wait for the MUL to commit (its flags stay off flags_eff).
+   localparam bit EN_MUL2 = 1'b1;
    localparam bit EN_PFYIELD = 1'b0;   // (timing: -1.1 ns on the IF cone)
    localparam bit EN_NLB2SRV = 1'b1;   // the 2nd entry also serves line-cross rebases
    // HW proposal 2a (front end): branch-target instruction cache.  16
@@ -1156,6 +1162,13 @@ module pipeline_core
    wire  [63:0] mem_hdw = mem_fq ? (mem_fsel ? mem_fwa : mem_fwb) : mem_hdw_r;
    logic [31:0] wb_iaddr;
    logic [7:0]  wb_be;
+   // EN_MUL2: mem_mage = cycles the MUL has spent in MEM; mem_mres / msgn /
+   // movf = its product (value, sign, overflow) captured on its 2nd MEM
+   // cycle; wb_mdir = the MUL in WB reads its product from mul_pipe2 now
+   logic [1:0]  mem_mage;
+   logic [63:0] mem_mres;
+   logic        mem_msgn, mem_movf;
+   logic        wb_mul, wb_mdir, wb_mhi, wb_muns, wb_mw32;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
    // itself is in WB, flagged wb_ld, waiting for the data).
    logic       ld_out;
@@ -1198,7 +1211,10 @@ module pipeline_core
    wire mem_loadlk  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LOAD32 ||
                                     mem_d.uop == U_POP || mem_d.uop == U_LEAVE ||
                                     mem_d.uop == U_LEAVERET);
-   wire mem_fwd_ok  = b_mem && !mem_loadlk;
+   // EN_MUL2: a MUL in MEM has no value yet (its product is in the DSP)
+   wire mem_mul     = EN_MUL2 && mem_valid && mem_d.uop == U_MUL;
+   wire mem_lk      = mem_loadlk || mem_mul;
+   wire mem_fwd_ok  = b_mem && !mem_lk;
    // Flag producers: in EX at dispatch -> 1 bubble; in MEM at dispatch -> the
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
    // in WB at dispatch -> they commit on this edge, committed flags are right.
@@ -1207,13 +1223,15 @@ module pipeline_core
    // 1a: a fast load in WB has no forwardable value until it commits
    wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy) &&
                   !(EN_DC_H && wb_h && wb_hok);
-   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
+   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_lk && mem_d.wreg && mem_d.rd == id_rs1) ||
                (wb_ldlk && wb_rd == id_rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_lk && mem_d.wreg && mem_d.rd == dec.rs2) ||
                (wb_ldlk && wb_rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rd) ||
+   wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_lk && mem_d.wreg && mem_d.rd == id_rd) ||
                (wb_ldlk && wb_rd == id_rd);
-   wire flag_busy = (ex_valid && ex_d.fmask != '0);
+   wire wb_mdflag = EN_MUL2 && wb_valid && wb_mul && wb_fmask != '0;
+   wire flag_busy = (ex_valid && ex_d.fmask != '0) ||
+                    (mem_mul && mem_fmask != '0) || wb_mdflag;     // EN_MUL2
    // EN_SPFWD: an SP writer in MEM / WB forwards its new SP into ex_sp at
    // dispatch, so only one still in EX holds an SP reader back
    wire sp_busy   = (ex_valid && ex_d.sp_wr) ||
@@ -1266,6 +1284,18 @@ module pipeline_core
       mul_pipe1 <= $signed(mul_a_q) * $signed(mul_b_q);
       mul_pipe2 <= mul_pipe1;
    end
+   // EN_MUL2: {overflow, sign, value} of a MUL from its 128-bit product (the
+   // EX-stage U_MUL arm's rules; W forms sign-extend the low 32 as MEM does)
+   function automatic logic [65:0] f_mulres(logic [127:0] pr, logic hi, logic uns, logic w32);
+      logic [63:0] r64, v;
+      logic        ov;
+      r64 = hi ? pr[127:64] : pr[63:0];
+      v   = w32 ? {{32{r64[31]}}, r64[31:0]} : r64;
+      ov  = hi ? 1'b0 : uns ? (pr[127:64] != 64'd0) : (pr[127:64] != {64{pr[63]}});
+      return {ov, r64[63], v};
+   endfunction
+   wire [65:0] mul_m = f_mulres(mul_pipe2, mem_d.mdhigh, mem_d.mduns, mem_d.w32);
+   wire [65:0] mul_w = f_mulres(mul_pipe2, wb_mhi, wb_muns, wb_mw32);
    // divide (silicon restoring divider, M4)
    typedef enum logic [1:0] { MD_IDLE, MD_PREP, MD_STEP } md_phase_t;
    md_phase_t  div_ph;
@@ -1279,7 +1309,7 @@ module pipeline_core
    wire ex_is_div  = ex_valid && (ex_d.uop == U_DIV || ex_d.uop == U_MOD);
    wire ex_div_mod = (ex_d.uop == U_MOD);
    wire ex_div_by0 = ex_is_div && (div_ph == MD_IDLE) && (ex_b == 64'd0);
-   wire md_done    = (ex_is_mul && mul_cnt == 2'd3) ||
+   wire md_done    = (ex_is_mul && mul_cnt == (EN_MUL2 ? 2'd1 : 2'd3)) ||
                      (ex_is_div && div_ph == MD_STEP && dv.counter >= 7'd64) || ex_div_by0;
    wire ex_is_dly  = ex_valid && (ex_d.uop == U_DELAY);
    wire dly_done   = dly_on && (dly_cnt >= dly_max);
@@ -1943,7 +1973,17 @@ module pipeline_core
    end
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
-   wire [63:0] wb_fwd_v = (EN_LD_FWD && wb_ld) ? wb_ldval : wb_value;
+   // EN_MUL2: a MUL in WB straight from the DSP (wb_mdir), else wb_value
+   wire [63:0] wb_val_eff = (EN_MUL2 && wb_mdir) ? mul_w[63:0] : wb_value;
+   wire [63:0] wb_fwd_v = (EN_LD_FWD && wb_ld) ? wb_ldval : wb_val_eff;
+   flags_t wb_fval_eff;
+   always_comb begin
+      wb_fval_eff = wb_fval;
+      if (EN_MUL2 && wb_mdir) begin
+         wb_fval_eff.sign     = mul_w[64];
+         wb_fval_eff.overflow = mul_w[65];
+      end
+   end
 
    // IRET context split (klauss_pkg f_iret bit layout)
    flags_t iret_fval;
@@ -1981,6 +2021,7 @@ module pipeline_core
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
+         wb_mul <= 1'b0; wb_mdir <= 1'b0; mem_mage <= 2'd0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2127,16 +2168,16 @@ module pipeline_core
          ret_valid <= 1'b0;  ret_wr <= 1'b0;
          if (wb_valid && !wb_wait) begin
             // (1a: a fast load commits its value straight from the response)
-            if (wb_wreg)    rf[wb_rd] <= (EN_LD_WB && wb_ld) ? wb_ldval : wb_value;
+            if (wb_wreg)    rf[wb_rd] <= (EN_LD_WB && wb_ld) ? wb_ldval : wb_val_eff;
             if (wb_fmask != '0) begin
-               flags <= (flags & ~wb_fmask) | (wb_fval & wb_fmask);
+               flags <= (flags & ~wb_fmask) | (wb_fval_eff & wb_fmask);
                // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
                // runs at the MEM->WB latch (wb_zero), not in EX behind the
                // shifter/adder (the WNS -0.351 path). Every Z-writer's zero is
                // (value==0) except BTSTN (~bit) and IRET (frame restore),
                // which keep wb_fval.zero. DIV negation preserves zero.
                if (wb_fmask.zero && wb_zval)
-                  flags.zero <= wb_zero;
+                  flags.zero <= (EN_MUL2 && wb_mdir) ? (mul_w[63:0] == 64'b0) : wb_zero;
             end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
@@ -2610,6 +2651,12 @@ module pipeline_core
          // 1a stage 3: the hit pipe answers in the load's first MEM cycle;
          // keep the answer for a load that stays in MEM (EX -> MEM below
          // re-arms mem_h1 for the next load: last write wins)
+         if (mem_mul) begin
+            if (mem_mage != 2'd3) mem_mage <= mem_mage + 2'd1;
+            if (mem_mage == 2'd1) begin
+               mem_mres <= mul_m[63:0];  mem_msgn <= mul_m[64];  mem_movf <= mul_m[65];
+            end
+         end
          if (mem_h1) begin
             mem_hok <= h_ok;
             mem_hdw_r <= h_dword;
@@ -2639,6 +2686,17 @@ module pipeline_core
             wb_zero    <= (mem_result_eff == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
+            // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
+            // (age 1) or the capture (age 2+)
+            wb_mul     <= mem_mul;
+            wb_mdir    <= mem_mul && mem_mage == 2'd0;
+            wb_mhi     <= mem_d.mdhigh;  wb_muns <= mem_d.mduns;  wb_mw32 <= mem_d.w32;
+            if (mem_mul && mem_mage != 2'd0) begin
+               wb_value         <= (mem_mage == 2'd1) ? mul_m[63:0] : mem_mres;
+               wb_zero          <= ((mem_mage == 2'd1) ? mul_m[63:0] : mem_mres) == 64'b0;
+               wb_fval.sign     <= (mem_mage == 2'd1) ? mul_m[64] : mem_msgn;
+               wb_fval.overflow <= (mem_mage == 2'd1) ? mul_m[65] : mem_movf;
+            end
             wb_fmask   <= mem_fmask;
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
@@ -2687,6 +2745,7 @@ module pipeline_core
                         end
                   end
                end
+               mem_mage   <= 2'd0;
                mem_h      <= h_elig;
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
                mem_fq   <= h_fwd;
