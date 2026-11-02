@@ -945,6 +945,10 @@ module pipeline_core
    // the extended immediate, or a register. Replaces a dec.len/dec.uop test
    // on the id_op->ex_b cone; asserted equal to the old decode below.
    logic id_b_one, id_b_imm, id_b_sext;
+   // rs1 / rd register indices, decoded at the latch: = op[7:4] / op[11:8]
+   // except ENTER / LEAVE / LEAVERET (R15).  Keeps the f_decode levels off
+   // the id_op -> rf[] -> ex_a operand mux (fanout 129).
+   logic [3:0] id_rs1, id_rd;
    // ISA v3 D2: 32-bit compare (class 3 W [19], not the short form). Both
    // operands are shifted left 32 at the dispatch mux: a 64-bit compare of
    // {a[31:0],0} vs {b[31:0],0} yields exactly the 32-bit Z/S/C/V (and the
@@ -1112,15 +1116,15 @@ module pipeline_core
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
    // in WB at dispatch -> they commit on this edge, committed flags are right.
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
-   // (register fields are raw id_op bits — dec.rs1/rs2/rd = op[7:4]/[3:0]/[11:8])
+   // (register fields: id_rs1 / id_rd predecoded at the latch; dec.rs2 = op[3:0])
    // 1a: a fast load in WB has no forwardable value until it commits
    wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy);
-   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1) ||
-               (wb_ldlk && wb_rd == dec.rs1);
+   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
+               (wb_ldlk && wb_rd == id_rs1);
    wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
                (wb_ldlk && wb_rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd) ||
-               (wb_ldlk && wb_rd == dec.rd);
+   wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rd) ||
+               (wb_ldlk && wb_rd == id_rd);
    wire flag_busy = (ex_valid && ex_d.fmask != '0);
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
@@ -1133,9 +1137,9 @@ module pipeline_core
    assign perf_stall[0] = id_valid && ((id_use_rs1 && hit1) || (id_use_rs2 && hit2)
                                        || (id_use_rdd && hitd));
    assign perf_stall[1] = id_valid && mem_loadlk && mem_d.wreg &&
-                          ((id_use_rs1 && mem_d.rd == dec.rs1) ||
+                          ((id_use_rs1 && mem_d.rd == id_rs1) ||
                            (id_use_rs2 && mem_d.rd == dec.rs2) ||
-                           (id_use_rdd && mem_d.rd == dec.rd));
+                           (id_use_rdd && mem_d.rd == id_rd));
    assign perf_stall[2] = id_valid && id_fread && flag_busy;
    assign perf_stall[3] = id_valid && id_sp_rw && sp_busy;
 
@@ -1820,6 +1824,7 @@ module pipeline_core
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
+         id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -2465,12 +2470,12 @@ module pipeline_core
                // M6 register-sourced forwarding at the operand-register
                // inputs: youngest writer wins (MEM over WB over rf).
                ex_a       <= f_wsh(id_w,
-                             (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
-                           : (b_wb       && wb_rd    == dec.rs1) ? wb_fwd_v
-                           : rf[dec.rs1]);
-               ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
-                           : (b_wb       && wb_rd    == dec.rd)  ? wb_fwd_v
-                           : rf[dec.rd];
+                             (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
+                           : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
+                           : rf[id_rs1]);
+               ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
+                           : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
+                           : rf[id_rd];
                // The b-operand fully resolves HERE (reg / extended imm32 /
                // constant 1 for INC-DEC / forwarded result) so EX's adder
                // and comparators read pure registers.
@@ -2572,6 +2577,8 @@ module pipeline_core
                      if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
+                     id_rs1    <= w_dec.rs1;
+                     id_rd     <= w_dec.rd;
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
                                    (w_op[29:26] == 4'hD && w_op[21]) ||
@@ -2856,6 +2863,9 @@ module pipeline_core
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (id_valid)
+         assert (id_rs1 == dec.rs1 && id_rd == dec.rd)
+            else $fatal(1, "id_rs1/id_rd predecode drift: op=%h", id_op);
       if (id_valid && dec.legal)
          assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
                  id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||
