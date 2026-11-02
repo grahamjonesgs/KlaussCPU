@@ -1576,6 +1576,15 @@ module pipeline_core
    // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
    // its port request — every younger port user holds off until it issues.
    wire wb_hmiss     = EN_DC_H && wb_valid && wb_h && !wb_hok && !ld_out;
+   // ...or, faster, on the edge it leaves MEM: its first MEM cycle knows the
+   // miss (h_ok), and with the port free nothing else issues that edge (the
+   // MEM op is this load, early issue waits on mem_h, and an I-cache fill
+   // only issues out of a lookup — so not while if_look: then the WB path).
+   // The load then reaches WB with its request already out (ld_out).
+   // (!ld_out && !wb_hmiss imply WB is not waiting, so it does leave MEM.)
+   wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok &&
+                       !wb_hmiss && !if_xc && !if_look && !st_post && !ld_out && mem_xc == 2'd0 &&
+                       !irq_xc && !(DEBUG_EN && dbg_mx);
    // (1a: a non-port op may now wait in MEM behind a fast load in WB —
    // act only on the edge it leaves MEM)
    wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0] && !wb_wait;
@@ -2155,6 +2164,13 @@ module pipeline_core
              !(DEBUG_EN && dbg_mx)) begin
             m_addr    <= wb_iaddr;
             m_be      <= wb_be;
+            m_read_DV <= 1'b1;
+            rdy_armed <= !m_ready;
+            ld_out    <= 1'b1;
+         end
+         if (h_miss_now) begin
+            m_addr    <= mem_iaddr;
+            m_be      <= mem_be;
             m_read_DV <= 1'b1;
             rdy_armed <= !m_ready;
             ld_out    <= 1'b1;
