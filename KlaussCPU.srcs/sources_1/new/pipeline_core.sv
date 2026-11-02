@@ -203,6 +203,11 @@ module pipeline_core
    // onto the completion edge when its address differs.  MEMGET32,
    // RET/IRET/LEAVERET, MMIO and non-posted stores keep the blocking path.
    localparam bit EN_LD_WB = 1'b1;
+   // 1a stage 2: a consumer dispatching on the edge a fast load's response
+   // arrives takes the extracted value directly (wb_ldval into the operand
+   // latches) instead of waiting for the register-file write: one cycle off
+   // every load-use.  A deeper operand-latch input — timing switch.
+   localparam bit EN_LD_FWD = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -999,6 +1004,13 @@ module pipeline_core
    logic        wb_ld, wb_ld_full, wb_ld_sgn;
    logic [1:0]  wb_ld_msz;
    logic [2:0]  wb_ld_ea;
+   // 1a: ld_out = a fast load's read is outstanding on the port (the load
+   // itself is in WB, flagged wb_ld, waiting for the data).
+   logic       ld_out;
+   // (ready-edge arming, see the MEM / IF port engines; declared here for
+   // the 1a hazard terms)
+   logic rdy_armed;
+   wire  w_mrdy = m_ready && rdy_armed;
    logic [31:0] wb_pc, wb_op;
    logic [3:0]  wb_rd;
    logic        wb_wreg;
@@ -1040,7 +1052,7 @@ module pipeline_core
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
    // (register fields are raw id_op bits — dec.rs1/rs2/rd = op[7:4]/[3:0]/[11:8])
    // 1a: a fast load in WB has no forwardable value until it commits
-   wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg;
+   wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy);
    wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1) ||
                (wb_ldlk && wb_rd == dec.rs1);
    wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
@@ -1423,9 +1435,6 @@ module pipeline_core
    // this flop, so the post decision (mem_done_now) reads registers only.
    // A code-touching store keeps the completion-time SMC squash path.
    logic       st_post, st_post_ok;
-   // 1a: ld_out = a fast load's read is outstanding on the port (the load
-   // itself is in WB, flagged wb_ld, waiting for the data).
-   logic       ld_out;
    logic [28:0] if_req_dw;
    logic        if_rebase;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !ld_out
@@ -1437,8 +1446,6 @@ module pipeline_core
    // instantly with stale data. Every issue clears the arm (unless ready is
    // already low); the arm sets once ready has been observed low; completions
    // require ready AND armed. One flag suffices — one transaction in flight.
-   logic rdy_armed;
-   wire  w_mrdy = m_ready && rdy_armed;
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
    // 1a: a load that may leave MEM once issued (see EN_LD_WB)
@@ -1690,6 +1697,9 @@ module pipeline_core
          default: wb_ldval = m_rdata;
       endcase
    end
+
+   // the WB forwarding source: a fast load's response value (1a stage 2)
+   wire [63:0] wb_fwd_v = (EN_LD_FWD && wb_ld) ? wb_ldval : wb_value;
 
    // IRET context split (klauss_pkg f_iret bit layout)
    flags_t iret_fval;
@@ -1990,8 +2000,9 @@ module pipeline_core
                // 1a: chain onto a fast load's completion edge when the address
                // differs (DV may stay high — the cache's served-DV guard then
                // sees a new request; the same address needs a DV-low cycle)
-               2'd0: if (!if_xc && !st_post &&
-                         (!ld_out || (w_mrdy && mem_iaddr != m_addr))) begin
+               // (stage 2: also onto a posted store's drain edge)
+               2'd0: if (!if_xc &&
+                         (!(ld_out || st_post) || (w_mrdy && mem_iaddr != m_addr))) begin
                   m_addr     <= mem_iaddr;
                   m_wdata    <= mem_wdata;
                   m_be       <= mem_be;
@@ -2368,10 +2379,10 @@ module pipeline_core
                   // inputs: youngest writer wins (MEM over WB over rf).
                   ex_a       <= f_wsh(id_w,
                                 (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs1) ? wb_value
+                              : (b_wb       && wb_rd    == dec.rs1) ? wb_fwd_v
                               : rf[dec.rs1]);
                   ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rd)  ? wb_value
+                              : (b_wb       && wb_rd    == dec.rd)  ? wb_fwd_v
                               : rf[dec.rd];
                   // The b-operand fully resolves HERE (reg / extended imm32 /
                   // constant 1 for INC-DEC / forwarded result) so EX's adder
@@ -2381,7 +2392,7 @@ module pipeline_core
                               : id_b_imm
                                 ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
                               : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs2) ? wb_value
+                              : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
                               : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
                   if (DEBUG_EN && id_valid && id_bp) begin

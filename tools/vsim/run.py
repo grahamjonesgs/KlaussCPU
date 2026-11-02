@@ -139,7 +139,7 @@ def build_soc(rev=None):
     return exe
 
 
-def run_soc(exe, image, name, maxi=0, timeout=1800):
+def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False):
     """image: an Asm (assembled into a boot image) or a .mem path"""
     d = os.path.join(WORK, 'socruns', name)
     os.makedirs(d, exist_ok=True)
@@ -148,7 +148,10 @@ def run_soc(exe, image, name, maxi=0, timeout=1800):
         shutil.copy(image, mem)
     else:
         image.write_boot_mem(mem)
-    args = [exe, f'+TRACE={d}/soc.trace', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
+    # The retire trace is ~400 B per instruction: only when asked for (a
+    # long program's trace once filled the disk).
+    tr = f'{d}/soc.trace' if trace else '/dev/null'
+    args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
     r = subprocess.run(args, capture_output=True, text=True, cwd=d, timeout=timeout)
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
             'uart': open(os.path.join(d, 'soc.uart'), 'rb').read().decode('latin-1')}
@@ -279,8 +282,8 @@ def cmd_socdiff(a):
     tb = tn = 0
     for sd in range(a.seed0, a.seed0 + a.seeds):
         asm = randprog.gen(sd)
-        rb = run_soc(base, asm, f'sd_b{sd}')
-        rn = run_soc(new, asm, f'sd_n{sd}')
+        rb = run_soc(base, asm, f'sd_b{sd}', trace=True)
+        rn = run_soc(new, asm, f'sd_n{sd}', trace=True)
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
         t = [int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
