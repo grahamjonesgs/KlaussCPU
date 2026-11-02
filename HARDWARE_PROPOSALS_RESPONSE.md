@@ -195,6 +195,68 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0f. 1a stage 3, the load-hit pipe: branch dcache-s3 (2026-11-02)
+
+`822baeb`, on master `060dd09`. **Merged to master as `9e15047` and written
+to QSPI on 2026-11-02** (that exact bitstream, `--verify`; it boots from flash
+and `hwprop_test` passes). Rollback to timing-headroom:
+`~/.cache/kbuild/rollback/README.txt`. The design and measurements are in
+`STAGE3_DCACHE_PLAN.md` (§0 has the as-built notes).
+
+- **How it works.**
+  - A DRAM LOAD/POP/LEAVE looks itself up in shadow copies of the cache's
+    tag and data arrays (+14 RAMB36) on its EX→MEM edge.
+  - On a hit it leaves MEM after one cycle with its data.
+  - On a miss or a conflict it issues the ordinary port request from WB.
+- **Timing:** met at tier 1, WNS +0.155 / WHS +0.018.
+- **Board, same binaries, vs `7d84761`:**
+
+  | Benchmark | Change |
+  |---|---|
+  | CoreMark | −12.7% (1.554 → 1.780 /MHz) |
+  | Embench speed geomean | 0.806 → 0.918 (cycles −12.3%) |
+  | Dhrystone | 137 → 111 cycles/run |
+
+- **Toolchain validation** (current compiler):
+  - CoreMark -O2 179.16, -Os 146.54; Embench 0.928 / 0.825.
+  - The board suite passes (only the known `test_rtos` interleaving), as do
+    csmith-board 150, zephyr (gui_demo / gui_lvgl / doom, over the blitter
+    and VGA) and blit_selftest.
+- **Known cost:** `perf_baseline` `ptr_chase` is +3.8% cycles. A dependent
+  load that misses pays one extra cycle, because it issues from WB.
+- **Compiler model:**
+  - load latency 3, issue to issue;
+  - 1 slot per load;
+  - no load serialization;
+  - a same-line load is fast from store issue +3.
+
+## 0e. Timing headroom + exclusive stall counters: branch timing-headroom (2026-11-02)
+
+`7d84761`, on master `d573c7b`. **Merged to master as `646f44e` and written to
+QSPI on 2026-11-02** (that exact bitstream, `--verify`; it boots from flash
+and `hwprop_test` passes). Toolchain validation passed: the board suite,
+csmith-board 150 and zephyr. Benchmarks are cycle-identical to fetch-2a
+(CoreMark 1,286,584,050). Rollback to fetch-2a:
+`~/.cache/kbuild/rollback/README.txt`.
+
+- **Timing headroom** (behaviour unchanged). The four changes:
+  - EX operands load on every non-busy cycle.
+  - The redundant dispatch-chain IRQ latch is gone.
+  - The deferred Z is reduced at MEM→WB (`wb_zero`).
+  - `id_rs1`/`id_rd` are predecoded at the latch.
+
+  Tier-1 WNS went from −0.194 to +0.150 on the same core, and no EX family
+  is left within 0.4 ns. The shipped build shows +0.003 because its worst
+  path is now in `blitter_dma` (placement); the core's worst is +0.195.
+- **`PERF_CTRL[1]`, exclusive stall attribution.** At most one bucket per
+  cycle, in priority memwait > exbusy > data > flags > sp > ifmiss.
+  MMIO_MAP.md has the exact rules.
+- **`PERF_STALL_LOADUSE`** now counts a load producer in EX, MEM or WB; it
+  used to count only the MEM case. A SoC-sim RAW histogram showed load
+  producers are most of the RAW stall (CoreMark ~10 of 13.9 points).
+- **Not taken:** a restricted ALU→ALU bypass (`alu-bypass`, `72e7374`) is
+  correct but gives −0.6% in sim, too little to spend margin on.
+
 ## 0d. 2a fetch stage + core 2 removed: branch fetch-2a (2026-11-02)
 
 `a2c9e4b`, on master `67efcfd`. **Merged to master as `b26385d` and written
