@@ -208,6 +208,17 @@ module pipeline_core
    // latches) instead of waiting for the register-file write: one cycle off
    // every load-use.  A deeper operand-latch input — timing switch.
    localparam bit EN_LD_FWD = 1'b1;
+   // HW proposal 2a (front end): branch-target instruction cache.  16
+   // entries indexed by branch pc[5:2], each holding the fetch window seen
+   // at that branch's target (base dword + 2 dwords).  A predicted-taken
+   // branch whose entry hits loads the IFB on its ID-dispatch edge, so the
+   // target instruction latches on the next edge instead of after an
+   // I-cache lookup + serve (2 cycles).  Entries are filled from the IFB
+   // right after a predicted-taken redirect is served, and die with their
+   // I-cache line (install / store snoop at that index), on ICACHE_INV and
+   // at start — so every entry is a copy of a resident, snooped I-cache line
+   // and the SMC completion squash covers the same window as for a serve.
+   localparam bit EN_BTIC = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -969,8 +980,25 @@ module pipeline_core
    logic [31:0]        mem_pc_next;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
+   // 2a BTIC (see EN_BTIC)
+   logic [15:0]        bt_v;
+   logic [29:0]        bt_tag  [0:15];   // branch pc[31:2]
+   logic [28:0]        bt_base [0:15];   // target dword (= IFB base)
+   logic [63:0]        bt_d0   [0:15], bt_d1 [0:15];
+   logic [15:0]        bt_v1;            // slot-1 dword valid (same line only)
+   logic               r_bt_pend;        // a missed entry waits for its serve
+   logic [3:0]         r_bt_widx;
+   logic [29:0]        r_bt_wtag;
+   logic [28:0]        r_bt_wbase;
+   logic               ev_btic;          // blocking event: IFB loaded from the BTIC
+   logic               ev_icinst;        // blocking event: an I-cache line install
+   logic [8:0]         ev_icinst_idx;
+   wire  [3:0]         bt_ridx   = id_pc[5:2];
    wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
+   wire                bt_hit    = EN_BTIC && bt_v[bt_ridx] && bt_tag[bt_ridx] == id_pc[31:2] &&
+                                   bt_base[bt_ridx] == id_bp_tgt[31:3];
+   wire  [28:0]        w_bt_base = bt_base[bt_ridx];
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
    endfunction
@@ -1738,6 +1766,7 @@ module pipeline_core
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
+         bt_v <= '0; r_bt_pend <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
@@ -1764,6 +1793,7 @@ module pipeline_core
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
+         ev_btic = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
 
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
@@ -1772,6 +1802,7 @@ module pipeline_core
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
+            bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
             // invalidate-all: a fresh program image may reuse code addresses
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
             if (DEBUG_EN) begin
@@ -2143,6 +2174,7 @@ module pipeline_core
                   logic [18:0]        wt;
                   wi = if_req_dw[IC_IDXW:1];
                   wt = if_req_dw[28:IC_IDXW+1];
+                  ev_icinst = 1'b1;  ev_icinst_idx = wi;   // 2a: BTIC entries of this line die
                   ic_tag[wi]   <= wt;
                   ic_tagff[wi] <= wt;   // M7b snoop shadow
                   if (if_req_dw[0] == 1'b0) begin        // even fill: full line
@@ -2423,6 +2455,21 @@ module pipeline_core
                      pc          <= id_bp_tgt;
                      id_valid    <= 1'b0;
                      ex_ptk      <= 1'b1;
+                     if (bt_hit) begin
+                        // 2a: the target's window, from the BTIC (pos_track
+                        // claims pos[0]: pc_dw == base)
+                        ev_btic    = 1'b1;
+                        ifb_base   <= w_bt_base;
+                        ifb_dw[0]  <= bt_d0[bt_ridx];
+                        ifb_dw[1]  <= bt_d1[bt_ridx];
+                        ifb_val    <= {bt_v1[bt_ridx], 1'b1};
+                        if_look    <= 1'b0;
+                     end else if (EN_BTIC) begin
+                        r_bt_pend  <= 1'b1;
+                        r_bt_widx  <= bt_ridx;
+                        r_bt_wtag  <= id_pc[31:2];
+                        r_bt_wbase <= id_bp_tgt[31:3];
+                     end
                   end else if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
@@ -2616,6 +2663,30 @@ module pipeline_core
          // a memory-mapped store wins over a same-edge IRET restore.
          if (mask_wr) int_mask <= mask_wdata;
 
+         // ---------------- 2a: BTIC capture and invalidation ----------------
+         // Capture: the redirect of a missed entry has been served — the
+         // window sits at the target with pc still on it.  (Slot 1 only when
+         // it is in the same I-cache line, so one line index covers it.)
+         if (EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
+             pc_dw == r_bt_wbase) begin
+            bt_v[r_bt_widx]    <= 1'b1;
+            bt_tag[r_bt_widx]  <= r_bt_wtag;
+            bt_base[r_bt_widx] <= r_bt_wbase;
+            bt_d0[r_bt_widx]   <= ifb_dw[0];
+            bt_d1[r_bt_widx]   <= ifb_dw[1];
+            bt_v1[r_bt_widx]   <= ifb_val[1] && !r_bt_wbase[0];
+            r_bt_pend          <= 1'b0;
+         end
+         // Invalidation (after the capture: NBA last wins): the entry's
+         // I-cache line is re-installed or store-snooped; ICACHE_INV.
+         if (EN_BTIC) begin
+            for (int k = 0; k < 16; k++) begin
+               if (ev_icinst && bt_base[k][IC_IDXW:1] == ev_icinst_idx) bt_v[k] <= 1'b0;
+               if (snoop_q   && bt_base[k][IC_IDXW:1] == snoop_idx_q)   bt_v[k] <= 1'b0;
+            end
+            if (icinv) bt_v <= '0;
+         end
+
          // ---------------- M12 pos-tracker composer (runs LAST) ----------------
          // Folds this edge's events (blocking flags set by the real write
          // sites above) into the position flags and the base+K triple. Fold
@@ -2639,6 +2710,7 @@ module pipeline_core
             // stale-base corner. The +1c/leaf-call residual is priced in
             // PIPELINE_M12_TIMING.md.)
             if (ev_pcz)    p = 3'b000;              // conservative: forces rebase
+            if (ev_btic)   p = 3'b001;              // 2a: window loaded at pc's dword
             pos <= p;
             // HW proposal 3: a redirect aborts any background prefetch (it was
             // for the old sequential path), so the BRAM read port reads the
@@ -2647,7 +2719,11 @@ module pipeline_core
             if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
-            if (ev_rebase) begin
+            if (ev_btic) begin                      // 2a: base' = the BTIC entry's base
+               r_base_p1   <= w_bt_base + 29'd1;
+               r_base_p2   <= w_bt_base + 29'd2;
+               r_want_line <= w_bt_base[28:1] + 28'd1;
+            end else if (ev_rebase) begin
                r_base_p1   <= pc_dw + 29'd1;        // base' = miss_dw = pc_dw (!in0)
                r_base_p2   <= pc_dw + 29'd2;
                r_want_line <= pc_dw[28:1] + 28'd1;
