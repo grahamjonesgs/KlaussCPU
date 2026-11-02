@@ -100,6 +100,7 @@ module pipeline_core
    // [4] mul/div/EX-busy [5] taken-branch flush (event)  [6] IF window miss
    // [7] MEM port wait
    output logic [7:0]   perf_stall,
+   output logic         perf_id_empty,  // ID holds no op (for exclusive attribution)
    output logic         perf_br,        // conditional branch resolved (event)
    output logic         perf_br_taken,
    output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
@@ -945,6 +946,10 @@ module pipeline_core
    // the extended immediate, or a register. Replaces a dec.len/dec.uop test
    // on the id_op->ex_b cone; asserted equal to the old decode below.
    logic id_b_one, id_b_imm, id_b_sext;
+   // rs1 / rd register indices, decoded at the latch: = op[7:4] / op[11:8]
+   // except ENTER / LEAVE / LEAVERET (R15).  Keeps the f_decode levels off
+   // the id_op -> rf[] -> ex_a operand mux (fanout 129).
+   logic [3:0] id_rs1, id_rd;
    // ISA v3 D2: 32-bit compare (class 3 W [19], not the short form). Both
    // operands are shifted left 32 at the dispatch mux: a 64-bit compare of
    // {a[31:0],0} vs {b[31:0],0} yields exactly the 32-bit Z/S/C/V (and the
@@ -1078,6 +1083,7 @@ module pipeline_core
    logic [63:0] wb_value;
    flags_t      wb_fval, wb_fmask;
    logic        wb_zval;
+   logic        wb_zero;            // (wb_value == 0), reduced at the MEM->WB latch
    logic [31:0] wb_sp_new;
    logic        wb_sp_we;
    logic [3:0]  wb_mask_new;
@@ -1111,15 +1117,15 @@ module pipeline_core
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
    // in WB at dispatch -> they commit on this edge, committed flags are right.
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
-   // (register fields are raw id_op bits — dec.rs1/rs2/rd = op[7:4]/[3:0]/[11:8])
+   // (register fields: id_rs1 / id_rd predecoded at the latch; dec.rs2 = op[3:0])
    // 1a: a fast load in WB has no forwardable value until it commits
    wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy);
-   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1) ||
-               (wb_ldlk && wb_rd == dec.rs1);
+   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
+               (wb_ldlk && wb_rd == id_rs1);
    wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
                (wb_ldlk && wb_rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd) ||
-               (wb_ldlk && wb_rd == dec.rd);
+   wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rd) ||
+               (wb_ldlk && wb_rd == id_rd);
    wire flag_busy = (ex_valid && ex_d.fmask != '0);
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
@@ -1131,11 +1137,21 @@ module pipeline_core
    // hazard-attribution strobes (events/cycles for the SoC perf counters)
    assign perf_stall[0] = id_valid && ((id_use_rs1 && hit1) || (id_use_rs2 && hit2)
                                        || (id_use_rdd && hitd));
-   assign perf_stall[1] = id_valid && mem_loadlk && mem_d.wreg &&
-                          ((id_use_rs1 && mem_d.rd == dec.rs1) ||
-                           (id_use_rs2 && mem_d.rd == dec.rs2) ||
-                           (id_use_rdd && mem_d.rd == dec.rd));
+   // load-use: the RAW stall is on a load — still in EX, in MEM, or a fast
+   // load waiting in WB (not only the MEM case: a consumer right behind a
+   // load first waits while the load is in EX).
+   function automatic logic f_id_reads(logic [3:0] r);
+      return (id_use_rs1 && r == id_rs1) || (id_use_rs2 && r == dec.rs2) ||
+             (id_use_rdd && r == id_rd);
+   endfunction
+   wire ex_loadp = ex_valid && ex_d.wreg &&
+                   (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
+                    ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET);
+   assign perf_stall[1] = id_valid && ((mem_loadlk && mem_d.wreg && f_id_reads(mem_d.rd)) ||
+                                       (ex_loadp && f_id_reads(ex_d.rd)) ||
+                                       (wb_ldlk && f_id_reads(wb_rd)));
    assign perf_stall[2] = id_valid && id_fread && flag_busy;
+   assign perf_id_empty = !id_valid;
    assign perf_stall[3] = id_valid && id_sp_rw && sp_busy;
 
    // ------------------------------------------------------------- EX units
@@ -1229,12 +1245,13 @@ module pipeline_core
    // the consumer's dispatch sits in the WB registers during the consumer's
    // EX cycle (it commits at the end of that cycle): merge its masked fields
    // over the still-uncommitted flags register. Deferred-Z producers
-   // contribute (wb_value == 0) — a register-sourced NOR.
+   // contribute wb_zero = (wb_value == 0), reduced a cycle early at the
+   // MEM->WB latch so the forwarded Z is a single register here.
    flags_t flags_eff;
    always_comb begin
       flags_eff = flags;
       if (ex_fwd_f) begin
-         if (wb_fmask.zero)     flags_eff.zero     = wb_zval ? (wb_value == 64'b0)
+         if (wb_fmask.zero)     flags_eff.zero     = wb_zval ? wb_zero
                                                              : wb_fval.zero;
          if (wb_fmask.carry)    flags_eff.carry    = wb_fval.carry;
          if (wb_fmask.overflow) flags_eff.overflow = wb_fval.overflow;
@@ -1818,6 +1835,7 @@ module pipeline_core
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
+         id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -1946,12 +1964,12 @@ module pipeline_core
             if (wb_fmask != '0) begin
                flags <= (flags & ~wb_fmask) | (wb_fval & wb_fmask);
                // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
-               // runs here from the REGISTERED wb_value, not in EX behind the
+               // runs at the MEM->WB latch (wb_zero), not in EX behind the
                // shifter/adder (the WNS -0.351 path). Every Z-writer's zero is
                // (value==0) except BTSTN (~bit) and IRET (frame restore),
                // which keep wb_fval.zero. DIV negation preserves zero.
                if (wb_fmask.zero && wb_zval)
-                  flags.zero <= (wb_value == 64'b0);
+                  flags.zero <= wb_zero;
             end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
@@ -2375,6 +2393,10 @@ module pipeline_core
             wb_pc      <= mem_pc;    wb_op <= mem_op;   wb_rd <= mem_d.rd;
             wb_wreg    <= mem_d.wreg;
             wb_value   <= mem_is_read ? mem_ldval : mem_result_eff;
+            // Z producers are never port reads (IRET's flags come from
+            // iret_fval with wb_zval 0), so the reduce sees mem_result_eff
+            // only and stays off the m_rdata path.
+            wb_zero    <= (mem_result_eff == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             wb_fmask   <= mem_fmask;
@@ -2452,6 +2474,30 @@ module pipeline_core
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
+               // Operand registers load on every non-busy cycle, also under an
+               // EX redirect or a RAW bubble (ex_valid <= 0 then, so the values
+               // are dead): their enable is !ex_busy alone, not the EX
+               // flags -> taken cone.
+               // M6 register-sourced forwarding at the operand-register
+               // inputs: youngest writer wins (MEM over WB over rf).
+               ex_a       <= f_wsh(id_w,
+                             (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
+                           : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
+                           : rf[id_rs1]);
+               ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
+                           : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
+                           : rf[id_rd];
+               // The b-operand fully resolves HERE (reg / extended imm32 /
+               // constant 1 for INC-DEC / forwarded result) so EX's adder
+               // and comparators read pure registers.
+               ex_b       <= f_wsh(id_w,
+                             id_b_one ? 64'd1
+                           : id_b_imm
+                             ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
+                           : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
+                           : rf[dec.rs2]);
+
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
                   ev_pcz     = 1'b1;
@@ -2473,25 +2519,6 @@ module pipeline_core
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
-                  // M6 register-sourced forwarding at the operand-register
-                  // inputs: youngest writer wins (MEM over WB over rf).
-                  ex_a       <= f_wsh(id_w,
-                                (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs1) ? wb_fwd_v
-                              : rf[dec.rs1]);
-                  ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rd)  ? wb_fwd_v
-                              : rf[dec.rd];
-                  // The b-operand fully resolves HERE (reg / extended imm32 /
-                  // constant 1 for INC-DEC / forwarded result) so EX's adder
-                  // and comparators read pure registers.
-                  ex_b       <= f_wsh(id_w,
-                                id_b_one ? 64'd1
-                              : id_b_imm
-                                ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                              : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
-                              : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
                   if (DEBUG_EN && id_valid && id_bp) begin
                      // breakpoint: the ID op does not execute; park at its PC
@@ -2541,9 +2568,9 @@ module pipeline_core
                                && !(DEBUG_EN && dbg_active) && irq_take) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
+                     // (irq_sel_q / irq_vec_q latch at the drain boundary in
+                     // the IRQ sequencer; not here, off the EX-redirect cone)
                      irq_active <= 1'b1;
-                     irq_sel_q  <= irq_sel;
-                     irq_vec_q  <= irq_vector;
                      id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
                                && !(DEBUG_EN && dbg_active) && fetch_ok) begin
@@ -2561,6 +2588,8 @@ module pipeline_core
                      if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
+                     id_rs1    <= w_dec.rs1;
+                     id_rd     <= w_dec.rd;
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
                                    (w_op[29:26] == 4'hD && w_op[21]) ||
@@ -2821,6 +2850,9 @@ module pipeline_core
    // design (a set flag must be TRUE; a clear flag may be conservative —
    // post-redirect zeros force the rebase path, which is correct). The
    // base+K triple is a hard invariant whenever the window is armed.
+   always_ff @(posedge clk) if (!rst && wb_valid && wb_fmask.zero && wb_zval)
+      assert (wb_zero == (wb_value == 64'b0))
+         else $fatal(1, "wb_zero stale: pc=%h value=%h", wb_pc, wb_value);
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
@@ -2842,6 +2874,9 @@ module pipeline_core
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (id_valid)
+         assert (id_rs1 == dec.rs1 && id_rd == dec.rd)
+            else $fatal(1, "id_rs1/id_rd predecode drift: op=%h", id_op);
       if (id_valid && dec.legal)
          assert (id_b_one == (dec.uop == U_ALU && id_op[29:26] == 4'h5) &&
                  id_b_imm == ((dec.len != 2'b01 || id_op[29:26] == 4'h2 ||

@@ -316,7 +316,7 @@ run, read.
 
 | Offset | Reg                     | RW | Width | Description |
 |--------|-------------------------|----|-------|-------------|
-| 0x0000 | `PERF_CTRL`             | RW | 1     | `[0]` write-1-clear-all (self-clearing; reads 0). |
+| 0x0000 | `PERF_CTRL`             | RW | 2     | `[0]` write-1-clear-all (self-clearing; reads 0). `[1]` exclusive stall attribution, a plain R/W mode bit loaded by **every** `PERF_CTRL` write (write 3 to clear and keep it; reset 0, untouched by CPU reset / program load). With `[1]`=1 each cycle feeds at most one of the `PERF_STALL_*` / `PERF_IF_MISS` / `PERF_MEM_WAIT` buckets, priority MEM_WAIT > MULDIV > DATA (LOADUSE its subset) > FLAGS > SP > IF_MISS: DATA/FLAGS/SP count only while neither MEM nor EX is busy, IF_MISS only while ID is also empty. With `[1]`=0 they are the raw per-cause strobes and overlap. Bitstreams before `timing-headroom` ignore `[1]`. |
 | **Tier 0 — denominators** | | | | |
 | 0x0008 | `PERF_CYCLES`           | R  | 64    | Every `i_Clk` cycle. The CPI denominator. |
 | 0x0010 | `PERF_INSTR`            | R  | 64    | Retired (committed) instructions: one per pipeline retire (`pip_ret_valid`). **CPI = CYCLES / INSTR.** |
@@ -342,7 +342,7 @@ run, read.
 | 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div, system, I/O, `NOP`, etc. |
 | 0x00A8 | `PERF_FASTPATH`         | R  | 64    | *Retired* — reads 0 (multicycle fast-path dispatches). |
 | 0x00B0 | `PERF_STALL_DATA`       | R  | 48    | Pipeline: GPR RAW stall cycles (producer in MEM/WB, or unforwardable in EX). |
-| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where a memory-read producer blocks from EX (load-use). |
+| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where the blocking producer is a load (LOAD/LOAD32/POP/LEAVE/LEAVERET) still in EX, in MEM, or a fast load waiting in WB (load-use). Before `timing-headroom` only the in-MEM case counted. |
 | 0x00C0 | `PERF_STALL_FLAGS`      | R  | 48    | Pipeline: flag-reader stall cycles (producer in MEM/WB; EX forwards). |
 | 0x00C8 | `PERF_STALL_SP`         | R  | 48    | Pipeline: SP-serialization stall cycles (class-9/CALL behind an SP writer). |
 | 0x00D0 | `PERF_STALL_MULDIV`     | R  | 48    | Pipeline: EX-busy cycles (mul/div/DELAY/LCD occupying EX). |
