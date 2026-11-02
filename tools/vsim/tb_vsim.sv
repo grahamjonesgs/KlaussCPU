@@ -58,6 +58,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
 `ifdef HAS_RDATA_DRAM
       .m_rdata_dram(m_rdata),
 `endif
+`ifdef HAS_DCH
+      .h_addr(), .h_ok(1'b0), .h_dword(64'b0),   // no hit pipe: every load takes the slow path
+`endif
       .m_rdata_next, .m_next_valid, .m_ready,
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
       .irq_ready, .irq_sel, .irq_vector, .irq_ack, .irq_ack_sel, .int_mask_o,

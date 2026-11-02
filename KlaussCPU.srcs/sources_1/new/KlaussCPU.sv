@@ -617,6 +617,10 @@ module KlaussCPU #(
    wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
    wire [7:0]   pip_perf_stall;
+   // 1a stage 3 load-hit pipe (core <-> mem_read_write, STAGE3_DCACHE_PLAN.md)
+   wire [31:0]  w_h_addr;
+   wire         w_h_ok;
+   wire [63:0]  w_h_dword;
    wire         pip_perf_id_empty;
    wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
    wire [1:0]   pip_perf_ic;
@@ -658,6 +662,9 @@ module KlaussCPU #(
       .m_be       (pip_m_be),
       .m_rdata    (w_mem_read_data),
       .m_rdata_dram (dram_mem.read_data),
+      .h_addr     (w_h_addr),
+      .h_ok       (w_h_ok),
+      .h_dword    (w_h_dword),
       .m_rdata_next (w_mem_read_data_next),
       .m_next_valid (w_mem_next_valid),
       .m_ready    (w_mem_ready && w_pipe_owns),
@@ -1232,7 +1239,10 @@ module KlaussCPU #(
        // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
        .i_flush_go(w_cache_flush_go),
        .i_inval_go(w_cache_inval_go),
-       .o_mnt_busy(w_cache_mnt_busy)
+       .o_mnt_busy(w_cache_mnt_busy),
+       .i_h_addr(w_h_addr),
+       .o_h_ok(w_h_ok),
+       .o_h_dword(w_h_dword)
    );
 
    // ==========================================================================
