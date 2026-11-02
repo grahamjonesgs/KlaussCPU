@@ -1169,6 +1169,10 @@ module pipeline_core
    logic [63:0] mem_mres;
    logic        mem_msgn, mem_movf;
    logic        wb_mul, wb_mdir, wb_mhi, wb_muns, wb_mw32;
+   // registered MEM / WB op class for the hazard cone: mem_lkq = a load or
+   // (EN_MUL2) MUL (no MEM forward), mem_mulq = MUL, mem_mulf / wb_mulf = a
+   // flag-setting MUL
+   logic        mem_lkq, mem_mulq, mem_mulf, wb_mulf;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
    // itself is in WB, flagged wb_ld, waiting for the data).
    logic       ld_out;
@@ -1212,8 +1216,11 @@ module pipeline_core
                                     mem_d.uop == U_POP || mem_d.uop == U_LEAVE ||
                                     mem_d.uop == U_LEAVERET);
    // EN_MUL2: a MUL in MEM has no value yet (its product is in the DSP)
-   wire mem_mul     = EN_MUL2 && mem_valid && mem_d.uop == U_MUL;
-   wire mem_lk      = mem_loadlk || mem_mul;
+   // (timing: the MEM op's class is registered at EX -> MEM — mem_lkq /
+   // mem_mulq — so the RAW-hazard cone ANDs a flop with mem_valid instead of
+   // decoding mem_d.uop)
+   wire mem_mul     = EN_MUL2 && mem_valid && mem_mulq;
+   wire mem_lk      = mem_valid && mem_lkq;
    wire mem_fwd_ok  = b_mem && !mem_lk;
    // Flag producers: in EX at dispatch -> 1 bubble; in MEM at dispatch -> the
    // consumer's EX cycle reads them from the WB registers (flags_eff below);
@@ -1229,9 +1236,9 @@ module pipeline_core
                (wb_ldlk && wb_rd == dec.rs2);
    wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_lk && mem_d.wreg && mem_d.rd == id_rd) ||
                (wb_ldlk && wb_rd == id_rd);
-   wire wb_mdflag = EN_MUL2 && wb_valid && wb_mul && wb_fmask != '0;
+   wire wb_mdflag = EN_MUL2 && wb_valid && wb_mulf;
    wire flag_busy = (ex_valid && ex_d.fmask != '0) ||
-                    (mem_mul && mem_fmask != '0) || wb_mdflag;     // EN_MUL2
+                    (EN_MUL2 && mem_valid && mem_mulf) || wb_mdflag;   // EN_MUL2
    // EN_SPFWD: an SP writer in MEM / WB forwards its new SP into ex_sp at
    // dispatch, so only one still in EX holds an SP reader back
    wire sp_busy   = (ex_valid && ex_d.sp_wr) ||
@@ -2022,6 +2029,7 @@ module pipeline_core
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          wb_mul <= 1'b0; wb_mdir <= 1'b0; mem_mage <= 2'd0;
+         mem_lkq <= 1'b0; mem_mulq <= 1'b0; mem_mulf <= 1'b0; wb_mulf <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2689,6 +2697,7 @@ module pipeline_core
             // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
             // (age 1) or the capture (age 2+)
             wb_mul     <= mem_mul;
+            wb_mulf    <= mem_mul && mem_mulf;
             wb_mdir    <= mem_mul && mem_mage == 2'd0;
             wb_mhi     <= mem_d.mdhigh;  wb_muns <= mem_d.mduns;  wb_mw32 <= mem_d.w32;
             if (mem_mul && mem_mage != 2'd0) begin
@@ -2746,6 +2755,11 @@ module pipeline_core
                   end
                end
                mem_mage   <= 2'd0;
+               mem_lkq    <= (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
+                              ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
+                              (EN_MUL2 && ex_d.uop == U_MUL));
+               mem_mulq   <= EN_MUL2 && ex_d.uop == U_MUL;
+               mem_mulf   <= EN_MUL2 && ex_d.uop == U_MUL && exo_fmask != '0;
                mem_h      <= h_elig;
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
                mem_fq   <= h_fwd;
@@ -2969,6 +2983,7 @@ module pipeline_core
                   mem_d.uop    <= U_TRAP;
                   mem_d.wreg   <= 1'b0;
                   mem_d.is_mem <= 1'b0;
+                  mem_lkq      <= 1'b0;  mem_mulq <= 1'b0;  mem_mulf <= 1'b0;
                   ev_pcz       = 1'b1;
                   id_valid     <= 1'b0;
                   ex_valid     <= 1'b0;
@@ -3258,6 +3273,9 @@ module pipeline_core
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (mem_valid)
+         assert (mem_lkq == (mem_loadlk || (EN_MUL2 && mem_d.uop == U_MUL)) && mem_mulq == (EN_MUL2 && mem_d.uop == U_MUL))
+            else $fatal(1, "mem_lkq / mem_mulq drift: pc=%h", mem_pc);
       if (id_valid)
          assert (id_rs1 == dec.rs1 && id_rd == dec.rd)
             else $fatal(1, "id_rs1/id_rd predecode drift: op=%h", id_op);
