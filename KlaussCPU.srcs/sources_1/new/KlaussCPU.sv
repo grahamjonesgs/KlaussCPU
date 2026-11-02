@@ -2467,6 +2467,13 @@ rams_sp_nc rams_sp_nc1 (
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
    //=========================================================================
+   // The branch strobes come late out of EX/MEM (flags -> taken); register
+   // them so the 48-bit increment starts from a flop.  Counts land 1 cycle late.
+   logic r_perf_br_tk, r_perf_fbr_tk;
+   always_ff @(posedge i_Clk) begin
+      r_perf_br_tk  <= pip_perf_br && pip_perf_br_taken && !(w_reset_H || w_perf_stat_clear);
+      r_perf_fbr_tk <= pip_perf_fbr_taken && !(w_reset_H || w_perf_stat_clear);
+   end
    always_ff @(posedge i_Clk) begin
       if (w_reset_H || w_perf_stat_clear) begin
          r_perf_cycles           <= 64'd0;  r_perf_instr            <= 64'd0;
@@ -2496,9 +2503,9 @@ rams_sp_nc rams_sp_nc1 (
          if (pip_perf_ic[1])    r_perf_ic_fill       <= r_perf_ic_fill       + 48'd1;
          // EX-resolved conditional jumps + MEM-resolved fused branches (v3 B);
          // both can land on the same cycle.
-         if ((pip_perf_br && pip_perf_br_taken) || pip_perf_fbr_taken)
+         if (r_perf_br_tk || r_perf_fbr_tk)
             r_perf_cnt_branch_taken <= r_perf_cnt_branch_taken
-                                     + ((pip_perf_br && pip_perf_br_taken && pip_perf_fbr_taken) ? 64'd2 : 64'd1);
+                                     + ((r_perf_br_tk && r_perf_fbr_tk) ? 64'd2 : 64'd1);
          // Tier 0 — total cycles and retired instructions (not while debug-halted).
          if (!w_dbg_freeze) r_perf_cycles <= r_perf_cycles + 64'd1;
          if (pip_ret_valid)
