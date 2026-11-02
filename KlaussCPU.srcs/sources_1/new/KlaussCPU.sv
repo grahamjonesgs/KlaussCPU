@@ -435,6 +435,12 @@ module KlaussCPU #(
                                  && (w_mmio_addr[27:16] == 12'h00D)
                                  && (w_mmio_addr[15:0]  == 16'h0000)
                                  && w_mmio_write_data[0];
+   // PERF_CTRL[1] mode bit (see w_perf_st): loaded by every PERF_CTRL write;
+   // like the counters, untouched by CPU reset / program load.
+   logic r_perf_excl = 1'b0;
+   always_ff @(posedge i_Clk)
+      if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h00D && w_mmio_addr[15:0] == 16'h0000)
+         r_perf_excl <= w_mmio_write_data[1];
 
    logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
    logic  [63:0] r_mmio_read_data;       // registered version delivered to bus_splitter (breaks long timing path)
@@ -611,6 +617,7 @@ module KlaussCPU #(
    wire         pip_lcd_dc, pip_lcd_dv, pip_lcd_rst_n, pip_lcd_rst_wr;
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
    wire [7:0]   pip_perf_stall;
+   wire         pip_perf_id_empty;
    wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
    wire [1:0]   pip_perf_ic;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
@@ -670,6 +677,7 @@ module KlaussCPU #(
       .lcd_ready  (i_TX_LCD_Ready),
       .bus_idle   (pip_bus_idle),
       .perf_stall (pip_perf_stall),
+      .perf_id_empty (pip_perf_id_empty),
       .perf_br    (pip_perf_br),
       .perf_br_taken (pip_perf_br_taken),
       .perf_fbr_taken (pip_perf_fbr_taken),
@@ -1084,9 +1092,9 @@ module KlaussCPU #(
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
-         12'h00D: begin  // Performance counters (RO; PERF_CTRL self-clearing reads 0)
+         12'h00D: begin  // Performance counters (RO; PERF_CTRL reads {[1] excl mode, [0] 0})
             case (r_mmio_addr_q[15:0])
-               16'h0000: r_mmio_read_data_comb = 64'h0;            // PERF_CTRL
+               16'h0000: r_mmio_read_data_comb = {62'b0, r_perf_excl, 1'b0};   // PERF_CTRL
                16'h0008: r_mmio_read_data_comb = r_perf_cycles;
                16'h0010: r_mmio_read_data_comb = r_perf_instr;
                16'h0018: r_mmio_read_data_comb = 64'h0;            // FETCH_CYCLES (multicycle CPU; retired)
@@ -2467,6 +2475,31 @@ rams_sp_nc rams_sp_nc1 (
    // Writes only the r_perf_* counters, so it adds no logic to the main CPU
    // critical path. Free-running; PERF_CTRL bit 0 (or hard reset) clears all.
    //=========================================================================
+   // PERF_CTRL[1]: exclusive stall attribution (a plain R/W mode bit, set by
+   // every PERF_CTRL write — write 3 to clear the counters and keep it).
+   // When set, each cycle feeds at most one bucket, priority memwait >
+   // exbusy > data (loaduse its subset) > flags > sp > ifmiss: data / flags /
+   // sp count only while neither MEM nor EX is busy, and ifmiss only while ID
+   // is also empty.  0 = the raw per-cause strobes (they overlap).
+   // (r_perf_excl is declared with the PERF_CTRL decode, w_perf_stat_clear.)
+   wire       w_px_free = !pip_perf_stall[7] && !pip_perf_stall[4];
+   wire [7:0] w_perf_st = !r_perf_excl ? pip_perf_stall : {
+         pip_perf_stall[7],
+         pip_perf_stall[6] && w_px_free && pip_perf_id_empty,
+         pip_perf_stall[5],
+         pip_perf_stall[4] && !pip_perf_stall[7],
+         pip_perf_stall[3] && w_px_free && !pip_perf_stall[0] && !pip_perf_stall[2],
+         pip_perf_stall[2] && w_px_free && !pip_perf_stall[0],
+         pip_perf_stall[1] && w_px_free,
+         pip_perf_stall[0] && w_px_free };
+`ifndef SYNTHESIS
+   always_ff @(posedge i_Clk) if (r_perf_excl)
+      assert ($countones({w_perf_st[7], w_perf_st[6], w_perf_st[4], w_perf_st[3],
+                          w_perf_st[2], w_perf_st[0]}) <= 1 &&
+              (!w_perf_st[1] || w_perf_st[0]))
+         else $fatal(1, "exclusive perf attribution not exclusive: %b", w_perf_st);
+`endif
+
    // The branch strobes come late out of EX/MEM (flags -> taken); register
    // them so the 48-bit increment starts from a flop.  Counts land 1 cycle late.
    logic r_perf_br_tk, r_perf_fbr_tk;
@@ -2491,14 +2524,14 @@ rams_sp_nc rams_sp_nc1 (
          r_perf_ic_miss <= 48'd0;     r_perf_ic_fill  <= 48'd0;
       end else begin
          // M6 pipeline hazard attribution
-         if (pip_perf_stall[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
-         if (pip_perf_stall[1]) r_perf_stall_loaduse <= r_perf_stall_loaduse + 48'd1;
-         if (pip_perf_stall[2]) r_perf_stall_flags   <= r_perf_stall_flags   + 48'd1;
-         if (pip_perf_stall[3]) r_perf_stall_sp      <= r_perf_stall_sp      + 48'd1;
-         if (pip_perf_stall[4]) r_perf_stall_muldiv  <= r_perf_stall_muldiv  + 48'd1;
+         if (w_perf_st[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
+         if (w_perf_st[1]) r_perf_stall_loaduse <= r_perf_stall_loaduse + 48'd1;
+         if (w_perf_st[2]) r_perf_stall_flags   <= r_perf_stall_flags   + 48'd1;
+         if (w_perf_st[3]) r_perf_stall_sp      <= r_perf_stall_sp      + 48'd1;
+         if (w_perf_st[4]) r_perf_stall_muldiv  <= r_perf_stall_muldiv  + 48'd1;
          if (pip_perf_stall[5]) r_perf_branch_flush  <= r_perf_branch_flush  + 48'd1;
-         if (pip_perf_stall[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
-         if (pip_perf_stall[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
+         if (w_perf_st[6]) r_perf_if_miss       <= r_perf_if_miss       + 48'd1;
+         if (w_perf_st[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
          if (pip_perf_ic[0])    r_perf_ic_miss       <= r_perf_ic_miss       + 48'd1;
          if (pip_perf_ic[1])    r_perf_ic_fill       <= r_perf_ic_fill       + 48'd1;
          // EX-resolved conditional jumps + MEM-resolved fused branches (v3 B);

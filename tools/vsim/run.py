@@ -129,7 +129,7 @@ def build_soc(rev=None):
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
-           '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--top-module', 'tb_soc',
+           '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + \
           [os.path.join(src, n) for n in SOC_FILES] + \
           [os.path.join(src, 'tb_soc.sv'), os.path.join(src, 'unisim_stubs.v')]

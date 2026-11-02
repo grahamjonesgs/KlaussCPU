@@ -100,6 +100,7 @@ module pipeline_core
    // [4] mul/div/EX-busy [5] taken-branch flush (event)  [6] IF window miss
    // [7] MEM port wait
    output logic [7:0]   perf_stall,
+   output logic         perf_id_empty,  // ID holds no op (for exclusive attribution)
    output logic         perf_br,        // conditional branch resolved (event)
    output logic         perf_br_taken,
    output logic         perf_fbr_taken, // ISA v3 B: taken fused branch (resolves in MEM)
@@ -1141,6 +1142,7 @@ module pipeline_core
                            (id_use_rs2 && mem_d.rd == dec.rs2) ||
                            (id_use_rdd && mem_d.rd == id_rd));
    assign perf_stall[2] = id_valid && id_fread && flag_busy;
+   assign perf_id_empty = !id_valid;
    assign perf_stall[3] = id_valid && id_sp_rw && sp_busy;
 
    // ------------------------------------------------------------- EX units
