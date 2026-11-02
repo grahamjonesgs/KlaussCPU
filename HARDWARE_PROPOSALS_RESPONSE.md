@@ -195,6 +195,56 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0i. CALL/RET and store→load: branch callret (2026-11-02)
+
+`c39ef27`, on master `3f2f82a`. **Status:** passed my board suite. Toolchain
+validation is pending.
+
+**Diagnosis** (sim trace). A call + ret of an empty function cost about 10
+cycles (`perf_kern` call1 9.93):
+- the RET waited in ID for the CALL's SP to commit;
+- its stack read then froze MEM on the port, behind the CALL's still-posted
+  push of that same dword.
+
+**Changes:**
+- **`EN_SPFWD`:** `ex_sp` is captured at dispatch from the youngest older SP
+  writer in MEM/WB, so only an SP writer still in EX holds an SP reader back.
+- **`EN_STLF`:** a LOAD/POP/LEAVE/RET takes the youngest older store's
+  lane-replicated dword when the addresses match and the byte enables cover
+  the load (from the store leaving MEM on this edge, or the one posted on the
+  port). It enters MEM as an answered hit-pipe load. The data select sits
+  after the registers (timing).
+- **`EN_HRET`:** RET joins the hit pipe:
+  - forwarded: 1 cycle in MEM;
+  - hit: it holds MEM for one cycle and the return check reads the captured
+    address;
+  - miss: the port read in MEM.
+
+**Store→load cases** (cycles over the no-hazard reference):
+
+| Case | Penalty |
+|---|---|
+| Same dword, covered | none |
+| Same dword, not covered | +2.1 / +2.9 / +1.5 with 0 / 1 / 2 ops between |
+| Same line, other dword | +1.5 only with exactly 2 ops between (the load's read collides with the cache's line write) |
+
+**Timing:** met at tier 1, WNS +0.071 / WHS +0.030.
+
+**SoC sim, cycles per group:**
+
+| Group | Before | After |
+|---|---:|---:|
+| call+ret+add | 10.88 | 7.50 |
+| push+pop+add | 8.12 | 5.25 |
+
+**Board, same binaries, vs fetch-bypass:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −0.5% (1.843 /MHz) |
+| Embench speed geomean | 0.966 → 0.974 (crc32 −7.2%, statemate −3.0%; none slower) |
+| crc32 -Os pair | 6.62M → 6.28M |
+
 ## 0h. Fetch bandwidth: branch fetch-bypass (2026-11-02)
 
 `90dcb2d`, on master `0cccefa`. **Merged to master and written to QSPI on
