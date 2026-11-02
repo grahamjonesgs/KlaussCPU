@@ -195,9 +195,9 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
-## 0g. One-slot stores + miss trim + BTIC race fix: branch st-1slot (2026-11-02)
+## 0g. One-slot stores, miss trim, BTIC race fix, post-check fix: branch st-1slot (2026-11-02)
 
-`4026d92`, on dcache-s3 `822baeb`. **Status:** passed my board suite.
+`ccdc289`, on dcache-s3 `822baeb`. **Status:** passed my board suite.
 Toolchain validation is pending.
 
 - **One-slot stores (`EN_ST1`).**
@@ -211,29 +211,36 @@ Toolchain validation is pending.
     bubble per store whenever the two coincided.
   - Back-to-back stores are still about 2 cycles each, limited by the cache
     FSM.
+- **`st_post_ok` needs a VALID I-cache line** (also a fix for dcache-s3).
+  - The check compared only the I-cache tag shadow. A snoop or program start
+    clears the valid bits but not the tags, so once a line's index had held
+    code with that tag, every later store into the line was refused.
+  - On dcache-s3 such stores just don't post. On `4026d92` they squashed on
+    every call: board crc32 -Os went 6.63M → 8.02M cycles, depending on what
+    ran before. The SoC sim starts with zero tags, so it never showed.
+  - A new directed test, `smc_stale_tag`, covers it, and
+    `tools/board/perfclr` / `perfdump` dump the counters around any program.
 - **Miss trim.** A hit-pipe miss issues its port request on the edge it leaves
   MEM, not from WB. In sim, a pointer chase that misses every step goes 13 → 12
-  cycles per step, the pre-stage-3 figure (board ptr_chase was +3.8% on
-  dcache-s3).
+  cycles per step.
 - **BTIC race fix (also latent in 2a).** A BTIC capture that landed on a
   store-snoop edge for its lines survived the invalidation with the pre-store
   window. The capture now waits for a later window.
-- **Timing:** met at tier 1, WNS +0.018 / WHS +0.024. The worst path is
-  placement in `blitter_dma`; the core's worst is +0.042 (`ic_tag →
-  want_line`).
+- **Timing:** met at tier 1, WNS +0.180 / WHS +0.024.
 - **Board, same binaries, vs dcache-s3:**
 
   | Benchmark | Change |
   |---|---|
   | CoreMark | −2.1% (1.780 → 1.818 /MHz) |
-  | Embench speed geomean | 0.918 → 0.936 (cycles −1.9%; matmult −7.0%, sha256 −4.2%, edn +0.3%) |
+  | Embench speed geomean | 0.918 → 0.938 (cycles −2.06%; matmult −7.0%, sha256 −4.2%, picojpeg −4.1%; none slower) |
   | Dhrystone | 111 → 108 cycles/run |
 
+  The crc32 -Os layout pair: 6,624,982 / 6,798,718, the same as sim.
 - **Compiler model:** a store costs 1 slot. A same-line load is fast from
   store issue +4, so 3 instructions between.
 - **Verification:**
   - vsim: directed tests (including `smc_*`), diff with IRQ, and socdiff plus
-    about 450 dense same-line programs (`--span 16..256K`). The dense mode
+    about 600 dense same-line programs (`--span 16..256K`). The dense mode
     caught a same-edge store→load hazard, fixed before the build.
 
 ## 0f. 1a stage 3, the load-hit pipe: branch dcache-s3 (2026-11-02)
