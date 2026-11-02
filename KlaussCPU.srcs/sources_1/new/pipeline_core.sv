@@ -1609,11 +1609,15 @@ module pipeline_core
    // 1a stage 3: the EX op enters MEM through the hit pipe (on its EX->MEM
    // edge).  Not while a store to the same 32 B line is on the port (latching
    // or in its CHECK write: the line write has not landed yet).
+   // (an ex_hld load never early-issues, even when it cannot use the pipe —
+   // MMIO, misaligned, a same-line store on the port: it issues from MEM a
+   // cycle later.  Keeps h_elig's address compare out of the early-issue /
+   // IF-issue cones, the build's worst paths.)
    wire ex_hld       = (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
    wire h_elig       = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                        !(m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) && !(DEBUG_EN && dbg_mx);
    assign h_addr     = exo_iaddr;
-   wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !h_elig && !wb_hmiss &&
+   wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
                        !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
