@@ -239,6 +239,9 @@ module pipeline_core
    // the I-cache snoop has cleared the line by then.  0 = a store holds MEM
    // for its issue cycle plus the post cycle (1c).
    localparam bit EN_ST1 = 1'b1;
+   // Front end: start the next-line prefetch on a BTIC-hit redirect edge
+   // (the window is already loaded; no demand lookup needs the BRAM port).
+   localparam bit EN_BTPF = 1'b1;
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -2997,6 +3000,14 @@ module pipeline_core
             // new miss_dw on the very next cycle — the free first-cycle read
             // the demand lookup relies on.  (NBA here wins over the engine.)
             if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
+            // A BTIC-hit redirect loaded the window itself (no demand lookup
+            // follows), so its next line's prefetch starts on the same edge
+            // instead of after the window is seen valid (~3 cycles later):
+            // short target runs no longer drain the window before the NLB.
+            if (EN_BTPF && ev_btic && !ev_ovr) begin
+               pf_look <= 1'b1;
+               pf_line <= id_bt_want;
+            end
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
             if (ev_btic) begin                      // 2a: base' = the loaded base
