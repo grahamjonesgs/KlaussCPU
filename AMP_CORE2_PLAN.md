@@ -1,5 +1,11 @@
 # AMP core 2 — 50 MHz KlaussCPU running lwIP, owning display + network
 
+**Status 2026-11-02:** core 2 is no longer built by default.  The top-level
+parameter `EN_CORE2` (KlaussCPU.sv, default 0) leaves `core2_subsys` out to
+free area for core-1 timing closure (branch prediction 2a).  The mailbox at
+`0xF010_0000` still decodes (reads 0, writes ignored) and LiteEth belongs to
+core 1.  Set `EN_CORE2=1` to bring it back.
+
 The coprocessor milestone: a second KlaussCPU `pipeline_core` instance at an
 effective 50 MHz that owns LiteEth and the VNC/display path, so core 1 only
 renders.  Kills the measured single-core spiral (doom tick 175→323 ms under
