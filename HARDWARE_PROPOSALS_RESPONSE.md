@@ -195,6 +195,47 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0g. One-slot stores + miss trim + BTIC race fix: branch st-1slot (2026-11-02)
+
+`4026d92`, on dcache-s3 `822baeb`. **Status:** passed my board suite.
+Toolchain validation is pending.
+
+- **One-slot stores (`EN_ST1`).**
+  - A DRAM store with an idle port leaves MEM on its issue edge, posted at
+    once.
+  - The registered "no fetch-side code copy" check (`st_post_ok`) decides the
+    cycle after. If the store overlaps code, it squashes MEM/EX/ID/IFB, drops
+    in-flight I-cache lookups, prefetch and the NLB, and refetches from its
+    fall-through (`sq_spec`).
+  - The IFB may now slide on such a store's edge. The old gate cost a fetch
+    bubble per store whenever the two coincided.
+  - Back-to-back stores are still about 2 cycles each, limited by the cache
+    FSM.
+- **Miss trim.** A hit-pipe miss issues its port request on the edge it leaves
+  MEM, not from WB. In sim, a pointer chase that misses every step goes 13 → 12
+  cycles per step, the pre-stage-3 figure (board ptr_chase was +3.8% on
+  dcache-s3).
+- **BTIC race fix (also latent in 2a).** A BTIC capture that landed on a
+  store-snoop edge for its lines survived the invalidation with the pre-store
+  window. The capture now waits for a later window.
+- **Timing:** met at tier 1, WNS +0.018 / WHS +0.024. The worst path is
+  placement in `blitter_dma`; the core's worst is +0.042 (`ic_tag →
+  want_line`).
+- **Board, same binaries, vs dcache-s3:**
+
+  | Benchmark | Change |
+  |---|---|
+  | CoreMark | −2.1% (1.780 → 1.818 /MHz) |
+  | Embench speed geomean | 0.918 → 0.936 (cycles −1.9%; matmult −7.0%, sha256 −4.2%, edn +0.3%) |
+  | Dhrystone | 111 → 108 cycles/run |
+
+- **Compiler model:** a store costs 1 slot. A same-line load is fast from
+  store issue +4, so 3 instructions between.
+- **Verification:**
+  - vsim: directed tests (including `smc_*`), diff with IRQ, and socdiff plus
+    about 450 dense same-line programs (`--span 16..256K`). The dense mode
+    caught a same-edge store→load hazard, fixed before the build.
+
 ## 0f. 1a stage 3, the load-hit pipe: branch dcache-s3 (2026-11-02)
 
 `822baeb`, on master `060dd09`. **Merged to master as `9e15047` and written
