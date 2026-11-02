@@ -3021,6 +3021,39 @@ module pipeline_core
    end
 
 `ifndef SYNTHESIS
+   // +ATTRIB (sim only): every PIPE_RUN cycle into one bucket, the board's
+   // exclusive buckets first, then the cycles they leave "unattributed".
+   bit at_on = $test$plusargs("ATTRIB");
+   longint at[string];
+   logic at_p_tk, at_p_misp, at_p_ifm, at_p_ser;
+   wire  at_misp_now = (ex_valid && ex_redir && !ex_busy && !mem_busy) || fbr_taken || ras_miss || sq_any || sq_spec;
+   wire  at_tk_now   = !mem_busy && !ex_busy && !(ex_valid && ex_redir) && !raw_stall && id_valid && !fetch_halt &&
+                       ((EN_RAS && id_ras_ret && ras_cnt != '0) || (EN_BP && id_bp_tk && id_rpend));
+   always_ff @(posedge clk) if (at_on && !rst && running) begin
+      string k;
+      if (mem_busy)                          k = "memwait";
+      else if (ex_busy)                      k = "exbusy";
+      else if (id_valid && raw_stall)        k = perf_stall[1] ? "loaduse" : perf_stall[0] ? "raw" : perf_stall[2] ? "flags" : "sp";
+      else if (id_valid && !fetch_halt)      k = at_misp_now ? "issue.killed_this_edge" : "issue";
+      else if (id_valid)                     k = "id_held.fetch_halt";
+      else if (irq_active)                   k = "irq";
+      else if (fetch_halt)                   k = "serialize";
+      else if (!fetch_ok)                    k = at_p_misp ? "ifmiss.after_mispredict" : at_p_tk ? "ifmiss.after_taken" : "ifmiss";
+      else                                   k = at_p_misp ? "U.latch_after_mispredict" : at_p_tk ? "U.taken_bubble"
+                                               : at_p_ifm ? "U.latch_after_ifmiss" : at_p_ser ? "U.after_serialize" : "U.other";
+      at[k]++;
+      at_p_misp <= at_misp_now;
+      at_p_tk   <= at_tk_now;
+      at_p_ifm  <= !mem_busy && !ex_busy && !id_valid && !fetch_ok;
+      at_p_ser  <= fetch_halt;
+   end
+   int at_ret = 0;
+   always_ff @(posedge clk) if (at_on && !rst && running && ret_valid) at_ret++;
+   final if (at_on) begin
+      $display("ATTRIB retired %0d", at_ret);
+      foreach (at[k]) $display("ATTRIB %s %0d", k, at[k]);
+   end
+
    // Load-hit pipe coverage (sim only, +HCOV): loads that left MEM through
    // the hit pipe as hits / misses, and loads kept off it by a same-line
    // store still on the port.
