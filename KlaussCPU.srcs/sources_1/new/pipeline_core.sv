@@ -239,6 +239,8 @@ module pipeline_core
    // the I-cache snoop has cleared the line by then.  0 = a store holds MEM
    // for its issue cycle plus the post cycle (1c).
    localparam bit EN_ST1 = 1'b1;
+   // Front end: start the next-line prefetch on a BTIC-hit redirect edge.
+   localparam bit EN_BTPF = 1'b1;
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -2997,6 +2999,14 @@ module pipeline_core
             // new miss_dw on the very next cycle — the free first-cycle read
             // the demand lookup relies on.  (NBA here wins over the engine.)
             if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
+            // A BTIC-hit redirect loaded the window itself (no demand lookup
+            // follows), so its next line's prefetch starts on the same edge
+            // instead of after the window is seen valid (~3 cycles later):
+            // short target runs no longer drain the window before the NLB.
+            if (EN_BTPF && ev_btic && !ev_ovr) begin
+               pf_look <= 1'b1;
+               pf_line <= id_bt_want;
+            end
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
             if (ev_btic) begin                      // 2a: base' = the loaded base
@@ -3026,6 +3036,13 @@ module pipeline_core
    bit at_on = $test$plusargs("ATTRIB");
    longint at[string];
    logic at_p_tk, at_p_misp, at_p_ifm, at_p_ser;
+   int at_n_dbg = 0, at_cyc = 0;
+   logic [2:0] at_p_src;   // the fetch serve on the previous edge: 0 none 1 fill 2 I-cache 3 NLB 4 BTIC 5 slide
+   wire [2:0] at_src_now = (if_xc && w_mrdy) ? 3'd1
+                         : (!if_xc && if_look && ic_rd_current && ic_hit) ? 3'd2
+                         : (!if_xc && !if_look && running && !fetch_halt && !parked && !irq_active && !fetch_ok && nlb_dw_ok) ? 3'd3
+                         : (id_early_rd && bt_hit) ? 3'd4
+                         : (!if_xc && !if_look && w_slide) ? 3'd5 : 3'd0;
    wire  at_misp_now = (ex_valid && ex_redir && !ex_busy && !mem_busy) || fbr_taken || ras_miss || sq_any || sq_spec;
    wire  at_tk_now   = !mem_busy && !ex_busy && !(ex_valid && ex_redir) && !raw_stall && id_valid && !fetch_halt &&
                        ((EN_RAS && id_ras_ret && ras_cnt != '0) || (EN_BP && id_bp_tk && id_rpend));
@@ -3039,13 +3056,25 @@ module pipeline_core
       else if (irq_active)                   k = "irq";
       else if (fetch_halt)                   k = "serialize";
       else if (!fetch_ok)                    k = at_p_misp ? "ifmiss.after_mispredict" : at_p_tk ? "ifmiss.after_taken" : "ifmiss";
-      else                                   k = at_p_misp ? "U.latch_after_mispredict" : at_p_tk ? "U.taken_bubble"
-                                               : at_p_ifm ? "U.latch_after_ifmiss" : at_p_ser ? "U.after_serialize" : "U.other";
+      else begin
+         string src;
+         src = at_p_src == 1 ? "fill" : at_p_src == 2 ? "icache" : at_p_src == 3 ? "nlb" : at_p_src == 4 ? "btic"
+             : at_p_src == 5 ? "slide" : "none";
+         k = at_p_misp ? "U.latch_after_mispredict" : at_p_tk ? {"U.taken_bubble.", src}
+           : at_p_ifm ? {"U.latch_after_ifmiss.", src} : at_p_ser ? "U.after_serialize" : {"U.other.", src};
+      end
       at[k]++;
       at_p_misp <= at_misp_now;
       at_p_tk   <= at_tk_now;
       at_p_ifm  <= !mem_busy && !ex_busy && !id_valid && !fetch_ok;
       at_p_ser  <= fetch_halt;
+      at_p_src  <= at_src_now;
+      if ($test$plusargs("NLBDBG") && at_src_now == 3 && at_n_dbg < 40 && at_cyc > 200000) begin
+         at_n_dbg++;
+         $display("NLBDBG pc=%h len=%b span=%b pos=%b ifbv=%b base=%h in0=%b in1=%b nlbline=%h id=%b ex=%b sdok=%b",
+                  pc, w_op[31:30], w_span, pos, ifb_val, ifb_base, in0, in1, nlb_line, id_valid, ex_valid, slide_dw_ok);
+      end
+      at_cyc++;
    end
    int at_ret = 0;
    always_ff @(posedge clk) if (at_on && !rst && running && ret_valid) at_ret++;
