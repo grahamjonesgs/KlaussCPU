@@ -197,9 +197,11 @@ accesses.
 
 ## 0d. 2a fetch stage + core 2 removed: branch fetch-2a (2026-11-02)
 
-`a2c9e4b`, on master `67efcfd`. Board-verified on 2026-11-02 against the
-dcache-1a QSPI image; toolchain validation (board, csmith-board 150, zephyr)
-pending at the time of writing.
+`a2c9e4b`, on master `67efcfd`. **Merged to master as `b26385d` and written
+to QSPI on 2026-11-02** (that exact bitstream, `--verify`; it boots from flash
+and `hwprop_test` passes). Toolchain validation passed: the board suite,
+csmith-board 150 and zephyr; CoreMark -O2 155.89 / -Os 131.25. Rollback to
+dcache-1a: `~/.cache/kbuild/rollback/README.txt`.
 
 | Item | Change | Switch |
 |---|---|---|
