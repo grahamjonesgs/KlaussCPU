@@ -102,7 +102,10 @@ Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
 ## 0c. 1a stage 2: branch dcache-1a (2026-11-02)
 
 `cd9b76e`, on master `8e6b8e5`. Timing met at tier 1 (WNS +0.135 / WHS
-+0.028). **Board-verified, loaded over JTAG; not merged.**
++0.028). **Merged to master as `67efcfd` and written to QSPI on 2026-11-02**
+(that exact bitstream, sha256 `996b6950e002…`, read-back verified; it boots
+from flash and `hwprop_test` passes). Rollback to mem-early:
+`~/.cache/kbuild/rollback/README.txt`.
 
 - **Load leaves MEM once issued:** a DRAM load hit (LOAD/POP/LEAVE) moves on
   once its request is on the port. WB collects the data, and a consumer
