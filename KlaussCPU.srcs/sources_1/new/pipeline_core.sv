@@ -1542,8 +1542,11 @@ module pipeline_core
                         ex_d.uop == U_RET || ex_d.uop == U_IRET);
    // (ex_misal is declared below; the early issue excludes it in the block)
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op &&
-                       !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
-                       !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
+                       !mem_port_op && mem_xc == 2'd0 && !if_xc && !irq_xc &&
+                       // port idle, or (1a) a fast load / posted store completing
+                       // this edge at another address: chain straight on
+                       (!(ld_out || st_post) || (w_mrdy && exo_iaddr != m_addr)) &&
+                       !fbr_taken && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
