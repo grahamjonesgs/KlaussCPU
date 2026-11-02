@@ -2215,8 +2215,14 @@ module pipeline_core
                   snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
                   // 1c: may this store post next cycle? (no code copy of its
                   // dword anywhere on the fetch side; MMIO never posts)
+                  // (the I-cache holds a copy only if the line is VALID: the
+                  // snoop clears ic_v* but not the tag shadow, so a tag-only
+                  // compare kept refusing every later store to a once-code
+                  // line — on the board, lines left by earlier programs /
+                  // the boot ROM: stores stopped posting (EN_ST1: squashed))
                   st_post_ok  <= EN_POST_ST && mem_port_wr && mem_iaddr[31:28] != 4'hF &&
-                                 ic_tagff[mem_iaddr[IC_IDXW+3:4]] != mem_iaddr[31:IC_IDXW+4] &&
+                                 !(ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4] &&
+                                   (ic_vhi[mem_iaddr[IC_IDXW+3:4]] || ic_vlo[mem_iaddr[IC_IDXW+3:4]])) &&
                                  !(ifb_val[0] && ifb_base  == smc_dw) &&
                                  !(ifb_val[1] && r_base_p1 == smc_dw) &&
                                  !((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) &&

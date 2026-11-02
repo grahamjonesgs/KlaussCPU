@@ -487,6 +487,36 @@ def smc_posted():
 
 
 @test
+def smc_stale_tag():
+    """a once-code line, invalidated by a store, keeps its tag in the I-cache
+    tag shadow: later data stores into it must post (st_post_ok checks the
+    valid bits), and a code patch into it must still run the new code"""
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    out = []
+    for nst in (1, 4):
+        for lat in (1, 3, 7):
+            a = Asm()
+            a.setr(1, 0); a.setr(3, new); a.setr(9, 0x5A)
+            a.leapc(2, 'C')
+            a.call('C')                         # r1 = 1; line C installed
+            for _ in range(nst):
+                a.st(64, 9, 2, 8)               # data dword of the code line
+                a.alu('add', 5, 5, 5)
+            a.st(32, 3, 2)                      # patch C: addi r1,r1,16
+            a.call('C')                         # r1 = 17
+            a.ld(64, 4, 2, 8)
+            a.halt()
+            while (a.pc & 15) != 0:
+                a.nop()
+            a.label('C')
+            a.alui_s('add', 1, 1, 1)
+            a.ret()
+            a.raw(0, 0)                         # the data dword at C+8
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 17, 'r4': 0x5A}, [f'+LAT={lat}']))
+    return out
+
+
+@test
 def smc_data_in_code_line():
     """a data store into a code line (not into an instruction) must not
     corrupt the instructions around it"""
