@@ -24,7 +24,11 @@
 module KlaussCPU #(
     // On-chip debugger on core 1 over the FPGA's JTAG port (USER3):
     // debug_module.sv, DEBUG_PLAN.md Phase 5.  0 = not built in.
-    parameter bit DEBUG_EN = 1'b0
+    parameter bit DEBUG_EN = 1'b0,
+    // AMP core 2 (core2_subsys.sv, AMP_CORE2_PLAN.md).  0 = not built in:
+    // its 0xF0100000 register block stays decoded (reads 0, writes ignored),
+    // it never requests DDR and LiteEth belongs to core 1.
+    parameter bit EN_CORE2 = 1'b0
 ) (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
@@ -945,6 +949,7 @@ module KlaussCPU #(
    assign c2_bus.addr       = w_mmio_addr;
    assign c2_bus.write_data = w_mmio_write_data;
    assign c2_bus.byte_en    = w_mmio_byte_en;
+   if (EN_CORE2) begin : g_core2
    (* KEEP_HIERARCHY = "yes" *)
    core2_subsys core2_subsys_i (
        .i_Clk(i_Clk),
@@ -971,6 +976,24 @@ module KlaussCPU #(
        .i_clock_ms(r_clock_ms)
    );
    assign w_c2_read_data = c2_bus.read_data;
+   end else begin : g_no_core2
+   assign w_c2_read_data      = 64'h0;
+   assign c2_bus.read_data    = 64'h0;
+   assign c2_bus.ready        = 1'b1;
+   assign w_c2_ddr_req        = 1'b0;
+   assign w_c2_ddr_done       = 1'b0;
+   assign w_c2_ddr_write_DV   = 1'b0;
+   assign w_c2_ddr_read_DV    = 1'b0;
+   assign w_c2_ddr_addr       = 32'h0;
+   assign w_c2_ddr_write_data = 128'h0;
+   assign w_c2_ddr_wdf_mask   = 16'h0;
+   assign w_c2_eth_owner      = 1'b0;
+   assign w_c2e_write_DV      = 1'b0;
+   assign w_c2e_read_DV       = 1'b0;
+   assign w_c2e_addr          = 32'h0;
+   assign w_c2e_write_data    = 64'h0;
+   assign w_c2e_byte_en       = 8'h0;
+   end
 
    // -------------------------------------------------------------------------
    // MMIO read mux — combinational decode into r_mmio_read_data_comb.
