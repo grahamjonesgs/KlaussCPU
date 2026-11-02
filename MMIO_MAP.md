@@ -342,7 +342,7 @@ run, read.
 | 0x00A0 | `PERF_CNT_OTHER`        | R  | 64    | Everything else: mul/div, system, I/O, `NOP`, etc. |
 | 0x00A8 | `PERF_FASTPATH`         | R  | 64    | *Retired* — reads 0 (multicycle fast-path dispatches). |
 | 0x00B0 | `PERF_STALL_DATA`       | R  | 48    | Pipeline: GPR RAW stall cycles (producer in MEM/WB, or unforwardable in EX). |
-| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where a memory-read producer blocks from EX (load-use). |
+| 0x00B8 | `PERF_STALL_LOADUSE`    | R  | 48    | Of `STALL_DATA`, cycles where the blocking producer is a load (LOAD/LOAD32/POP/LEAVE/LEAVERET) still in EX, in MEM, or a fast load waiting in WB (load-use). Before `timing-headroom` only the in-MEM case counted. |
 | 0x00C0 | `PERF_STALL_FLAGS`      | R  | 48    | Pipeline: flag-reader stall cycles (producer in MEM/WB; EX forwards). |
 | 0x00C8 | `PERF_STALL_SP`         | R  | 48    | Pipeline: SP-serialization stall cycles (class-9/CALL behind an SP writer). |
 | 0x00D0 | `PERF_STALL_MULDIV`     | R  | 48    | Pipeline: EX-busy cycles (mul/div/DELAY/LCD occupying EX). |

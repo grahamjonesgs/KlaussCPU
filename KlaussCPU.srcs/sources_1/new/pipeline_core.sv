@@ -1137,10 +1137,19 @@ module pipeline_core
    // hazard-attribution strobes (events/cycles for the SoC perf counters)
    assign perf_stall[0] = id_valid && ((id_use_rs1 && hit1) || (id_use_rs2 && hit2)
                                        || (id_use_rdd && hitd));
-   assign perf_stall[1] = id_valid && mem_loadlk && mem_d.wreg &&
-                          ((id_use_rs1 && mem_d.rd == id_rs1) ||
-                           (id_use_rs2 && mem_d.rd == dec.rs2) ||
-                           (id_use_rdd && mem_d.rd == id_rd));
+   // load-use: the RAW stall is on a load — still in EX, in MEM, or a fast
+   // load waiting in WB (not only the MEM case: a consumer right behind a
+   // load first waits while the load is in EX).
+   function automatic logic f_id_reads(logic [3:0] r);
+      return (id_use_rs1 && r == id_rs1) || (id_use_rs2 && r == dec.rs2) ||
+             (id_use_rdd && r == id_rd);
+   endfunction
+   wire ex_loadp = ex_valid && ex_d.wreg &&
+                   (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
+                    ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET);
+   assign perf_stall[1] = id_valid && ((mem_loadlk && mem_d.wreg && f_id_reads(mem_d.rd)) ||
+                                       (ex_loadp && f_id_reads(ex_d.rd)) ||
+                                       (wb_ldlk && f_id_reads(wb_rd)));
    assign perf_stall[2] = id_valid && id_fread && flag_busy;
    assign perf_id_empty = !id_valid;
    assign perf_stall[3] = id_valid && id_sp_rw && sp_busy;
