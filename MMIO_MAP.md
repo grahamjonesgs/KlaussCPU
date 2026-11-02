@@ -41,6 +41,11 @@ Control window for the second pipeline_core (effective 50 MHz, 64 KB local
 BRAM — P1 scope, no DDR/IRQ/LiteEth yet).  Full design: `AMP_CORE2_PLAN.md`;
 implementation: `core2_subsys.sv`.
 
+**Not built by default** (since 2026-11-02, top-level parameter `EN_CORE2`
+= 0, to free area for core-1 timing).  This block then reads 0 and ignores
+writes (no bus error), `C2_ETH_OWNER` reads 0 so LiteEth stays with core 1,
+and DDR master C never requests.  The table describes an `EN_CORE2=1` build.
+
 | Offset | Reg            | RW | Description |
 |--------|----------------|----|-------------|
 | 0x0000 | `C2_CTRL`      | RW | `[0]`=RUN (0 holds core-2 reset).  Read adds `[1]`=parked, `[4:2]`=park_kind (0=HALT 1=TRAP 2=ILLEGAL 3=WAIT), `[8]`=start pending. |

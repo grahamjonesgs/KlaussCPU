@@ -44,6 +44,7 @@ KlaussCPU/
 │   │   ├── blitter_dma.sv    2D DMA blitter (MMIO 0xF00E_xxxx)
 │   │   ├── core2_subsys.sv   AMP core 2 — second pipeline_core at ce/2 with
 │   │   │                     local BRAM, DDR master C, LiteEth owner mux
+│   │   │                     (not built by default: KlaussCPU EN_CORE2=0)
 │   │   ├── crypto_aes.sv, aes_core.sv, aes_sbox.sv, ghash.sv   AES-128 + GCM
 │   │   ├── crypto_sha.sv, sha256_core.sv                       SHA-256 + HMAC
 │   │   ├── trng.sv, ring_osc.sv                                TRNG (16 ROs)

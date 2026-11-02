@@ -195,6 +195,53 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0d. 2a fetch stage + core 2 removed: branch fetch-2a (2026-11-02)
+
+`a2c9e4b`, on master `67efcfd`. Board-verified on 2026-11-02 against the
+dcache-1a QSPI image; toolchain validation (board, csmith-board 150, zephyr)
+pending at the time of writing.
+
+| Item | Change | Switch |
+|---|---|---|
+| 2a (c) | branch-target instruction cache: 32 entries (index `pc[6:2]^pc[11:7]`) holding the first fetch dword pair at a predicted-taken target, so the redirect from ID serves the target without waiting for the I-cache | `EN_BTIC` (`BTIC_EN` parameter) |
+| 2a (c) | the predicted-taken redirect fires on the branch's first cycle in ID (unless an EX redirect may fire that cycle) | — |
+| area | AMP core 2 not built: `0xF010_0000` still decodes (reads 0, writes ignored), it never requests DDR, LiteEth belongs to core 1 | `EN_CORE2` (top level, **0**) |
+| timing | branch-taken perf strobes registered before their 48-bit counter (counts land 1 cycle late) | — |
+
+The BTIC is invalidated by I-cache line index on fills and stores (the SMC
+snoop), and cleared on ICINV and program start.
+
+**Timing:** met only after one tier-2 phys_opt pass, WNS +0.007 / WHS
++0.021; tier 1 was −0.194. The design is route-bound (54% LUTs): the
+failing paths are 70–80% routing, and placement noise is around 0.1 ns.
+Builds before the final one:
+
+- with core 2 still in (BTIC off in core 2): −0.082;
+- with core 2 removed, before the perf-strobe register: −0.165. The remaining near-critical paths are all in core 1:
+
+- `id_op → ex_a`;
+- `id_op → pos`;
+- `wb_value → flags → mul-pipe enable`;
+- `ex_b → m_addr`.
+
+**Board, same ABI-v3 binaries, against dcache-1a (`67efcfd`):**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | 1,417,339,321 → 1,286,584,050 cycles (**−9.2%**) |
+| Embench speed geomean | 0.767 → 0.806 (cycles geomean −5.0%; all 19 faster, huffbench −13.4%) |
+| Dhrystone | 143 → 137 cycles/run |
+
+- **`perf_kern` loops:** all 21 are faster, −12% to −47%, for example
+  `e_cmp_jne` 1027 → 729 and `e_jmp_back` 920 → 719.
+- **Correctness:** M5e 13/15 (the same two timing prints as before, both
+  self-check PASS); `hwprop_test`, `hwprop_kern` and `hwprop_misal` pass;
+  all benchmarks verify; `vga_bw` shows no underflow.
+- **Sim branch costs** (cycles per taken branch, predicted):
+  - FBR: 2.11;
+  - JMP: 2.04;
+  - CMP+JMPcc: 3.09.
+
 ## 1. Status
 
 | # | Proposal | State (all items board-verified unless noted) | Switch (default) | Measured (full-SoC sim, cycles) |
@@ -210,9 +257,9 @@ accesses.
 | 2b | FBR resolved in EX | **partial, opt-in, does not close**: EQ/NE (+W) only; −0.12 ns on the core-1 `ex_a → pc` / mul-enable families | `EN_FBR_EQ_EX` (**0**) | taken FBR NE −1.0 per iteration when on |
 | 1b | load hit 4 → 3 | not done: stage B (`feat/m10b-fused`, `daa0795`) is not on GitHub | — | — |
 | 4 | non-blocking MUL | not done: design below (§5.1) | — | — |
-| 2a | branch prediction | not done: design below (§5.2) | — | — |
+| 2a | branch prediction | **done**: RAS + ID predictor (§0b), BTIC + first-cycle redirect (§0d) | `EN_RAS`, `EN_BP`, `EN_BTIC` (1) | §0b, §0d |
 | 5 | EX→EX forwarding | not done (−0.75 ns measured in M6) | — | — |
-| 1a | pipelined D-cache hit | not done (cache redesign) | — | — |
+| 1a | pipelined D-cache hit | **stage 2 done** (§0c); stage 3, the pipelined cache, not done | `EN_LD_WB`, `EN_LD_FWD` (1) | §0c |
 
 The SoC numbers come from `sim_1/new/tb_soc.sv` (real `mem_read_write` cache,
 `bus_splitter`, MMIO, behavioural DDR) under Verilator. That model is

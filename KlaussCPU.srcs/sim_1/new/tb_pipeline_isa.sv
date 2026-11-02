@@ -32,6 +32,7 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    logic [31:0]  m_addr;
    logic         m_read_DV, m_write_DV;
    logic [63:0]  m_wdata, m_rdata, m_rdata_next;
+   wire  [63:0]  m_rdata_dram = m_rdata;   // (no bus_splitter here)
    logic [7:0]   m_be;
    logic         m_next_valid, m_ready;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;

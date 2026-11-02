@@ -51,6 +51,8 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = ['-GDEBUG_EN=1'] if dbg else []
+    if 'm_rdata_dram' in core:
+        defs.append('+define+HAS_RDATA_DRAM')
     if 'ras_miss' in core:
         defs.append('+define+HAS_RAS')
     if 'st_post_ok' in core:
