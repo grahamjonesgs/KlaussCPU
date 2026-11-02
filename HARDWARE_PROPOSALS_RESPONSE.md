@@ -197,8 +197,12 @@ accesses.
 
 ## 0j. MUL: 2-cycle issue, product committed from the DSP: branch mul2 (2026-11-02)
 
-`54cb0a4`, on callret `c39ef27`. **Status:** passed my board suite. Toolchain
-validation is pending.
+`54cb0a4`, on callret `c39ef27`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash; mul 2.00 cycles). Toolchain
+validation passed: the hw_* fixtures, the board suite, csmith-board 150 and
+zephyr. CoreMark -O2 194.97, -Os 154.66; Embench 1.021 / 0.898. The
+compiler models MUL latency 4 with a 2-cycle hold. Rollback to callret:
+`~/.cache/kbuild/rollback/README.txt`.
 
 **Change (`EN_MUL2`).**
 - A MUL holds EX 2 cycles (it was 4), then travels on through MEM.
