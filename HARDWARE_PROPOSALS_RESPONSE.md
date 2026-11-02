@@ -99,6 +99,42 @@ Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
 - localparams used before their declaration;
 - `ic_tagff` had no initial value, so it was X in 4-state sim.
 
+## 0c. 1a stage 2: branch dcache-1a (2026-11-02)
+
+`cd9b76e`, on master `8e6b8e5`. Timing met at tier 1 (WNS +0.135 / WHS
++0.028). **Board-verified, loaded over JTAG; not merged.**
+
+- **Load leaves MEM once issued:** a DRAM load hit (LOAD/POP/LEAVE) moves on
+  once its request is on the port. WB collects the data, and a consumer
+  dispatching that cycle takes it directly (`EN_LD_WB`, `EN_LD_FWD`).
+- **Chaining:** the next request chains onto the completion edge when the
+  address differs.
+- **Blocking path unchanged:** MEMGET32, RET/IRET/LEAVERET, MMIO and
+  non-posted stores.
+- **Board, against mem-early (same ABI-v3 binaries):**
+
+  | Benchmark | Change |
+  |---|---|
+  | CoreMark | −7.7% (1.65 → 1.79 /MHz) |
+  | Embench geomean | +8.6% (0.706 → 0.767) |
+  | Dhrystone | 173 → 143 cycles/run |
+
+- **Kernels (`perf_kern`, cycles per body):**
+
+  | Kernel | mem-early | stage 2 |
+  |---|---:|---:|
+  | ld;use | 5.99 | 4.99 |
+  | st;ld | 6.99 | 4.99 |
+  | ld;st(dep) | 8.87 | 6.93 |
+  | `cp_4l4s` | 27.9 | 19.9 |
+  | ld;ld, different addresses (sim) | 3.95 | 2.96 |
+  | ld;ld, same address | 3.93 | 3.87 |
+
+- **What's left of 1a:** the bus allows one outstanding request, so memory
+  code is bounded at ~one access per 2–3 cycles. A load still holds the
+  pipe one cycle in WB. Stage 3, a pipelined cache with an accept
+  handshake, is deferred behind 2a at the toolchain session's request.
+
 ## 0b. Second round: branch mem-early (2026-11-02)
 
 Built from the klausscpu-llvm handoff (HANDOFF-m8.md). Branch `mem-early`,
