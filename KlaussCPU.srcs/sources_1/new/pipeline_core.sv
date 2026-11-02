@@ -65,6 +65,12 @@ module pipeline_core
    // the bus_splitter response select) — a fast load is always DRAM, so its
    // value skips the address decode / select (timing); = m_rdata elsewhere
    input  logic [63:0]  m_rdata_dram,
+   // 1a stage 3 load-hit pipe (mem_read_write): the EX op's load address goes
+   // out every cycle; the cache answers the cycle after with the doubleword
+   // and whether it is a clean hit (STAGE3_DCACHE_PLAN.md)
+   output logic [31:0]  h_addr,
+   input  logic         h_ok,
+   input  logic [63:0]  h_dword,
    input  logic         m_next_valid,
    input  logic         m_ready,
    // LCD side port
@@ -216,6 +222,14 @@ module pipeline_core
    // latches) instead of waiting for the register-file write: one cycle off
    // every load-use.  A deeper operand-latch input — timing switch.
    localparam bit EN_LD_FWD = 1'b1;
+   // 1a stage 3: a DRAM LOAD/POP/LEAVE looks itself up in the cache's
+   // load-hit pipe (h_addr at its EX->MEM edge, the answer in its first MEM
+   // cycle) instead of going on the port.  A hit leaves MEM after one cycle
+   // with its data, so a load holds one issue slot and its consumer issues 3
+   // after it; back-to-back hits need no port.  A miss or conflict issues the
+   // ordinary port request from WB (wb_hmiss) and waits there like a 1a fast
+   // load.  0 = 1a stage 2 (the port for every load).
+   localparam bit EN_DC_H = 1'b1;
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -1070,6 +1084,14 @@ module pipeline_core
    logic        wb_ld, wb_ld_full, wb_ld_sgn;
    logic [1:0]  wb_ld_msz;
    logic [2:0]  wb_ld_ea;
+   // 1a stage 3: mem_h = the MEM op is a hit-pipe load; mem_h1 = its first
+   // MEM cycle (the cache's answer is live); mem_hok/mem_hdw = that answer
+   // captured, for a load held in MEM.  wb_h/wb_hok/wb_hdw follow it into
+   // WB, with its address and byte enables for a slow-path request.
+   logic        mem_h, mem_h1, mem_hok, wb_h, wb_hok;
+   logic [63:0] mem_hdw, wb_hdw;
+   logic [31:0] wb_iaddr;
+   logic [7:0]  wb_be;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
    // itself is in WB, flagged wb_ld, waiting for the data).
    logic       ld_out;
@@ -1119,7 +1141,8 @@ module pipeline_core
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
    // (register fields: id_rs1 / id_rd predecoded at the latch; dec.rs2 = op[3:0])
    // 1a: a fast load in WB has no forwardable value until it commits
-   wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy);
+   wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy) &&
+                  !(EN_DC_H && wb_h && wb_hok);
    wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
                (wb_ldlk && wb_rd == id_rs1);
    wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
@@ -1534,7 +1557,11 @@ module pipeline_core
    // (squashing EX/ID), i.e. it disagrees with the ID prediction (2b).
    // 1a: WB holds a fast load whose data has not arrived: nothing advances
    // (ready is earliest 2 cycles after DV, the load reaches WB after 1)
-   wire wb_wait      = EN_LD_WB && wb_valid && wb_ld && !(ld_out && w_mrdy);
+   wire wb_wait      = EN_LD_WB && wb_valid && wb_ld && !(ld_out && w_mrdy) &&
+                       !(EN_DC_H && wb_h && wb_hok);
+   // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
+   // its port request — every younger port user holds off until it issues.
+   wire wb_hmiss     = EN_DC_H && wb_valid && wb_h && !wb_hok && !ld_out;
    // (1a: a non-port op may now wait in MEM behind a fast load in WB —
    // act only on the edge it leaves MEM)
    wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0] && !wb_wait;
@@ -1552,7 +1579,8 @@ module pipeline_core
    wire [31:0] ret_actual = (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
                           : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
 
-   wire mem_port_rd  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
+   wire mem_port_rd  = mem_valid && !(EN_DC_H && mem_h) &&
+                                    (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
                                      mem_is_ld32);
@@ -1578,7 +1606,19 @@ module pipeline_core
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
                         ex_d.uop == U_RET || ex_d.uop == U_IRET);
    // (ex_misal is declared below; the early issue excludes it in the block)
-   wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op &&
+   // 1a stage 3: the EX op enters MEM through the hit pipe (on its EX->MEM
+   // edge).  Not while a store to the same 32 B line is on the port (latching
+   // or in its CHECK write: the line write has not landed yet).
+   // (an ex_hld load never early-issues, even when it cannot use the pipe —
+   // MMIO, misaligned, a same-line store on the port: it issues from MEM a
+   // cycle later.  Keeps h_elig's address compare out of the early-issue /
+   // IF-issue cones, the build's worst paths.)
+   wire ex_hld       = (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
+   wire h_elig       = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
+                       !(m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) && !(DEBUG_EN && dbg_mx);
+   assign h_addr     = exo_iaddr;
+   wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
+                       !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
                        !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
@@ -1660,7 +1700,7 @@ module pipeline_core
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
                        !mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld &&
-                       !(DEBUG_EN && (dbg_active || dbg_halted));
+                       !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted));
    assign perf_ic[1] = if_xc;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
@@ -1759,20 +1799,22 @@ module pipeline_core
    end
 
    // 1a: a fast load's value at its WB commit (the response this cycle)
+   // (stage 3: a hit-pipe hit's doubleword, else the port response)
    logic [63:0] wb_ldval;
+   wire  [63:0] wb_lddw = (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
    always_comb begin
       logic [7:0]  b8;
       logic [15:0] h16;
       logic [31:0] w32;
-      b8  = m_rdata_dram[(wb_ld_ea * 8) +: 8];
-      h16 = m_rdata_dram[(wb_ld_ea[2:1] * 16) +: 16];
-      w32 = wb_ld_ea[2] ? m_rdata_dram[63:32] : m_rdata_dram[31:0];
-      if (wb_ld_full) wb_ldval = m_rdata_dram;
+      b8  = wb_lddw[(wb_ld_ea * 8) +: 8];
+      h16 = wb_lddw[(wb_ld_ea[2:1] * 16) +: 16];
+      w32 = wb_ld_ea[2] ? wb_lddw[63:32] : wb_lddw[31:0];
+      if (wb_ld_full) wb_ldval = wb_lddw;
       else case (wb_ld_msz)
          2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
          2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
          2'd2:    wb_ldval = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-         default: wb_ldval = m_rdata_dram;
+         default: wb_ldval = wb_lddw;
       endcase
    end
 
@@ -1814,6 +1856,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0;
+         mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2075,6 +2118,19 @@ module pipeline_core
             ld_out    <= 1'b0;
          end
 
+         // 1a stage 3: a hit-pipe load that missed issues its port request
+         // from WB once the port is free; from here it is a 1a fast load
+         // (ld_out, WB collects the response).  Younger port users wait on
+         // wb_hmiss, so it is the oldest request.
+         if (wb_hmiss && !if_xc && !st_post && mem_xc == 2'd0 && !irq_xc &&
+             !(DEBUG_EN && dbg_mx)) begin
+            m_addr    <= wb_iaddr;
+            m_be      <= wb_be;
+            m_read_DV <= 1'b1;
+            rdy_armed <= !m_ready;
+            ld_out    <= 1'b1;
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
@@ -2083,7 +2139,7 @@ module pipeline_core
                // differs (DV may stay high — the cache's served-DV guard then
                // sees a new request; the same address needs a DV-low cycle)
                // (stage 2: also onto a posted store's drain edge)
-               2'd0: if (!if_xc &&
+               2'd0: if (!if_xc && !wb_hmiss &&
                          (!(ld_out || st_post) || (w_mrdy && mem_iaddr != m_addr))) begin
                   m_addr     <= mem_iaddr;
                   m_wdata    <= mem_wdata;
@@ -2256,7 +2312,7 @@ module pipeline_core
                   end
                   if_look <= 1'b0;
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld
-                            && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
+                            && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
                   // push only checks !if_xc, so a same-cycle (or mid-push) fill issue
@@ -2380,6 +2436,15 @@ module pipeline_core
             end
          end
 
+         // 1a stage 3: the hit pipe answers in the load's first MEM cycle;
+         // keep the answer for a load that stays in MEM (EX -> MEM below
+         // re-arms mem_h1 for the next load: last write wins)
+         if (mem_h1) begin
+            mem_hok <= h_ok;
+            mem_hdw <= h_dword;
+         end
+         mem_h1 <= 1'b0;
+
          // ---------------- MEM -> WB ----------------
          if (mem_busy) begin
             if (!wb_wait) wb_valid <= 1'b0;   // (1a: a waiting fast load stays in WB)
@@ -2390,6 +2455,10 @@ module pipeline_core
             wb_ld_msz  <= mem_d.msz;
             wb_ld_sgn  <= mem_d.sgn;
             wb_ld_ea   <= mem_eaddr[2:0];
+            wb_h       <= mem_valid && mem_h;
+            wb_hok     <= mem_h1 ? h_ok : mem_hok;
+            wb_hdw     <= mem_h1 ? h_dword : mem_hdw;
+            wb_iaddr   <= mem_iaddr;  wb_be <= mem_be;
             wb_pc      <= mem_pc;    wb_op <= mem_op;   wb_rd <= mem_d.rd;
             wb_wreg    <= mem_d.wreg;
             wb_value   <= mem_is_read ? mem_ldval : mem_result_eff;
@@ -2446,6 +2515,16 @@ module pipeline_core
                            dbg_watch_addr <= exo_iaddr;
                         end
                   end
+               end
+               mem_h      <= h_elig;
+               mem_h1     <= h_elig;
+               if (DEBUG_EN && h_elig) begin
+                  for (int w = 0; w < 2; w++)
+                     if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
+                         (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
+                        dbg_watch_req  <= 1'b1;
+                        dbg_watch_addr <= exo_iaddr;
+                     end
                end
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
@@ -2846,6 +2925,20 @@ module pipeline_core
    end
 
 `ifndef SYNTHESIS
+   // Load-hit pipe coverage (sim only, +HCOV): loads that left MEM through
+   // the hit pipe as hits / misses, and loads kept off it by a same-line
+   // store still on the port.
+   int hc_hit = 0, hc_miss = 0, hc_stblk = 0;
+   bit hc_on = $test$plusargs("HCOV");
+   always_ff @(posedge clk) if (hc_on && !rst && running && !mem_busy) begin
+      if (mem_valid && mem_h) begin
+         if (mem_h1 ? h_ok : mem_hok) hc_hit++; else hc_miss++;
+      end
+      if (!ex_busy && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
+          m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) hc_stblk++;
+   end
+   final if (hc_on) $display("HCOV core hit=%0d miss=%0d store_blocked=%0d", hc_hit, hc_miss, hc_stblk);
+
    // M12 pos-tracker self-checks. Position flags are ONE-DIRECTIONAL by
    // design (a set flag must be TRUE; a clear flag may be conservative —
    // post-redirect zeros force the rebase path, which is correct). The

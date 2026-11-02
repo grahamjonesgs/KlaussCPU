@@ -53,6 +53,8 @@ def build(rev=None, quiet=True):
     defs = ['-GDEBUG_EN=1'] if dbg else []
     if 'm_rdata_dram' in core:
         defs.append('+define+HAS_RDATA_DRAM')
+    if 'input  logic [63:0]  h_dword' in core:
+        defs.append('+define+HAS_DCH')
     if 'ras_miss' in core:
         defs.append('+define+HAS_RAS')
     if 'st_post_ok' in core:
@@ -283,7 +285,7 @@ def cmd_socdiff(a):
     fails = 0
     tb = tn = 0
     for sd in range(a.seed0, a.seed0 + a.seeds):
-        asm = randprog.gen(sd)
+        asm = randprog.gen(sd, span=a.span)
         rb = run_soc(base, asm, f'sd_b{sd}', trace=True)
         rn = run_soc(new, asm, f'sd_n{sd}', trace=True)
         okb = 'HALTED' in rb['log']
@@ -310,6 +312,8 @@ def main():
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
+    sd.add_argument('--span', type=lambda v: int(v, 0), default=0x800,
+                    help='data footprint of the random loads/stores (e.g. 64: same-line hazards)')
     a = p.parse_args()
     if a.cmd == 'build':
         print(build(a.rev))

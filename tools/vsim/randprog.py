@@ -12,7 +12,9 @@ DATA = 0x10000
 R = list(range(1, 11))
 
 
-def gen(seed, n_blocks=40, irq=False):
+def gen(seed, n_blocks=40, irq=False, span=0x800):
+    # span: the data footprint in bytes for [R12+off] accesses (a small span
+    # makes same-line store->load pairs common: the D-cache hazard paths)
     rnd = random.Random(seed)
     a = Asm()
     lbl = [0]
@@ -33,7 +35,7 @@ def gen(seed, n_blocks=40, irq=False):
     funcs = []
 
     def off(size):
-        return rnd.randrange(0, 0x800 // size) * size if size > 1 else rnd.randrange(0, 0x800)
+        return rnd.randrange(0, span // size) * size if size > 1 else rnd.randrange(0, span)
 
     def straight(n):
         for _ in range(n):

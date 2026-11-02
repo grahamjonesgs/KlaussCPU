@@ -142,6 +142,9 @@ module core2_subsys
       .m_be       (c2_be),
       .m_rdata    (m2_rdata),
       .m_rdata_dram (m2_rdata),
+      .h_addr     (),            // no hit pipe on core 2: the slow path
+      .h_ok       (1'b0),
+      .h_dword    (64'b0),
       .m_rdata_next (m2_rdata_next),
       .m_next_valid (m2_next_valid),
       .m_ready    (m2_ready),

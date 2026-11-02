@@ -146,7 +146,16 @@ module mem_read_write (
     // -------------------------------------------------------------------------
     input             i_flush_go,
     input             i_inval_go,
-    output            o_mnt_busy
+    output            o_mnt_busy,
+
+    // 1a stage 3 (STAGE3_DCACHE_PLAN.md): the load-hit pipe.  i_h_addr is the
+    // core's AGU result; its shadow tag/data arrays are read EVERY cycle at
+    // that address (side-effect free).  o_h_ok / o_h_dword are combinational
+    // from those registered reads, the cycle after: the doubleword at the
+    // address presented one cycle earlier, valid only when o_h_ok.
+    input      [31:0] i_h_addr,
+    output            o_h_ok,
+    output     [63:0] o_h_dword
 );
 
     parameter  CACHE_SIZE = 1_024;              // number of sets — 2 ways × 1024 sets = 2048 total lines × 32 B = 64 KB
@@ -328,6 +337,19 @@ module mem_read_write (
     (* ram_style = "block" *)
     logic [255:0] cache_val_data_way1 [CACHE_SIZE-1:0];
 
+    // Load-hit pipe shadow copies of the tag and data arrays.  Written by
+    // exactly the statements (and on exactly the edges) that write the arrays
+    // above, read only by the hit pipe on their own port — so the FSM's
+    // single read port and its timing are untouched.  (+8 RAMB36.)
+    (* ram_style = "block" *)
+    logic [TAG_BITS:0] h_tag_way0 [CACHE_SIZE-1:0];
+    (* ram_style = "block" *)
+    logic [TAG_BITS:0] h_tag_way1 [CACHE_SIZE-1:0];
+    (* ram_style = "block" *)
+    logic [255:0] h_data_way0 [CACHE_SIZE-1:0];
+    (* ram_style = "block" *)
+    logic [255:0] h_data_way1 [CACHE_SIZE-1:0];
+
     // Dirty bits — 1-bit wide, distributed RAM. Written via dedicated always
     // blocks below (separate from the FSM) so Vivado can infer DRAM cleanly.
     (* ram_style = "distributed" *)
@@ -496,6 +518,8 @@ module mem_read_write (
         for (init_i = 0; init_i < CACHE_SIZE; init_i = init_i + 1) begin
             cache_val_addr_way0[init_i] = 0;
             cache_val_addr_way1[init_i] = 0;
+            h_tag_way0[init_i]          = 0;
+            h_tag_way1[init_i]          = 0;
             cache_dirty_way0[init_i]    = 0;
             cache_dirty_way1[init_i]    = 0;
             cache_lru[init_i]           = 0;
@@ -539,6 +563,46 @@ module mem_read_write (
     always_ff @(posedge i_Clk) begin
         if (dirty1_wen) cache_dirty_way1[r_cache_index] <= dirty1_din;
     end
+
+    // -------------------------------------------------------------------------
+    // 1a stage 3 load-hit pipe.  H1 (this edge): read both shadow ways at
+    // i_h_addr.  H2 (next cycle, comb): compare, select, qualify.  Every array
+    // write is at r_cache_index in a non-WAIT state, so a read in the same
+    // edge as a write to its set (read-first: the old line) or during a
+    // maintenance walk is flagged and the core takes its slow path.  A store
+    // still on the port (latching, not yet written) is the core's check.
+    // -------------------------------------------------------------------------
+    wire [INDEX_BITS-1:0] w_h_idx = i_h_addr[5+INDEX_BITS-1:5];
+    logic [TAG_BITS:0]    r_h_tq0, r_h_tq1;
+    logic [255:0]         r_h_dq0, r_h_dq1;
+    logic [TAG_BITS-1:0]  r_h_tag;
+    logic [1:0]           r_h_off;
+    logic                 r_h_conf = 1'b1;
+    always_ff @(posedge i_Clk) begin
+        r_h_tq0  <= h_tag_way0[w_h_idx];
+        r_h_tq1  <= h_tag_way1[w_h_idx];
+        r_h_dq0  <= h_data_way0[w_h_idx];
+        r_h_dq1  <= h_data_way1[w_h_idx];
+        r_h_tag  <= i_h_addr[31:5+INDEX_BITS];
+        r_h_off  <= i_h_addr[4:3];
+        r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);
+    end
+    wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_tq0[TAG_BITS-1:0] == r_h_tag);
+    wire w_h_hit1 = r_h_tq1[TAG_BITS] && (r_h_tq1[TAG_BITS-1:0] == r_h_tag);
+    assign o_h_ok = (w_h_hit0 || w_h_hit1) && !r_h_conf;
+`ifndef SYNTHESIS
+    // +HCOV: cycles whose hit-pipe read would have hit but overlapped an FSM
+    // write to its set (flagged, the core's slow path) — hazard coverage
+    int hc_conf = 0;
+    bit hc_on = $test$plusargs("HCOV");
+    always_ff @(posedge i_Clk) if (hc_on && r_h_conf && (w_h_hit0 || w_h_hit1) && state != MAINT) hc_conf++;
+    final if (hc_on) $display("HCOV cache conflict_hits=%0d", hc_conf);
+`endif
+    wire [255:0] w_h_line = w_h_hit0 ? r_h_dq0 : r_h_dq1;
+    assign o_h_dword = (r_h_off == 2'b00) ? w_h_line[255:192]
+                     : (r_h_off == 2'b01) ? w_h_line[191:128]
+                     : (r_h_off == 2'b10) ? w_h_line[127:64]
+                     :                      w_h_line[63:0];
 
     // -------------------------------------------------------------------------
     // Main FSM
@@ -663,10 +727,14 @@ module mem_read_write (
                         end
 
                         // Separate write-enable per way — one write per array per cycle, BRAM-friendly.
-                        if (r_hit_way0)
+                        if (r_hit_way0) begin
                             cache_val_data_way0[r_cache_index] <= merged;
-                        if (r_hit_way1)
+                            h_data_way0[r_cache_index]         <= merged;
+                        end
+                        if (r_hit_way1) begin
                             cache_val_data_way1[r_cache_index] <= merged;
+                            h_data_way1[r_cache_index]         <= merged;
+                        end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
                         // Already acked at the WAIT latch (write-ack-at-latch).
@@ -780,10 +848,14 @@ module mem_read_write (
                     if (r_evict_way == 1'b0) begin
                         cache_val_data_way0[r_cache_index] <= merged;
                         cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
+                        h_data_way0[r_cache_index]         <= merged;
+                        h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     if (r_evict_way == 1'b1) begin
                         cache_val_data_way1[r_cache_index] <= merged;
                         cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
+                        h_data_way1[r_cache_index]         <= merged;
+                        h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;
 
@@ -835,10 +907,14 @@ module mem_read_write (
                     if (r_evict_way == 1'b0) begin
                         cache_val_data_way0[r_cache_index] <= i_ddr_mem_read_data;
                         cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
+                        h_data_way0[r_cache_index]         <= i_ddr_mem_read_data;
+                        h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     if (r_evict_way == 1'b1) begin
                         cache_val_data_way1[r_cache_index] <= i_ddr_mem_read_data;
                         cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
+                        h_data_way1[r_cache_index]         <= i_ddr_mem_read_data;
+                        h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;
 
@@ -989,6 +1065,8 @@ module mem_read_write (
                         if (r_mnt_walk_mode) begin   // INVALIDATE
                             cache_val_addr_way0[r_cache_index] <= {(TAG_BITS+1){1'b0}};
                             cache_val_addr_way1[r_cache_index] <= {(TAG_BITS+1){1'b0}};
+                            h_tag_way0[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                            h_tag_way1[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
                         end
                         if (r_cache_index == CACHE_SIZE - 1) begin
                             r_mnt_sub <= MS_DONE;
