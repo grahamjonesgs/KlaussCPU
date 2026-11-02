@@ -72,7 +72,8 @@ def gen(seed, n_blocks=40, irq=False, span=0x800):
                 a.shift_n(rnd.choice(['shl', 'shr', 'sar', 'rol', 'ror']), rd, r1, rnd.randrange(64),
                           f=rnd.random() < 0.3)
             elif k < 0.73:
-                a.mul(rd, r1, r2, sgn=rnd.random() < 0.5, high=rnd.random() < 0.3)
+                hi = rnd.random() < 0.3
+                a.mul(rd, r1, r2, sgn=rnd.random() < 0.5, high=hi, w=(not hi) and rnd.random() < 0.25)
             elif k < 0.745:
                 (a.div if rnd.random() < 0.5 else a.mod)(rd, r1, r2, sgn=rnd.random() < 0.5)
             elif k < 0.78:

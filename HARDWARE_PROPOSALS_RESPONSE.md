@@ -195,6 +195,42 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0j. MUL: 2-cycle issue, product committed from the DSP: branch mul2 (2026-11-02)
+
+`54cb0a4`, on callret `c39ef27`. **Status:** passed my board suite. Toolchain
+validation is pending.
+
+**Change (`EN_MUL2`).**
+- A MUL holds EX 2 cycles (it was 4), then travels on through MEM.
+- `mul_pipe2` holds its product on its 2nd and 3rd cycle after leaving EX:
+  - a MUL that reaches WB on time commits straight from the DSP;
+  - one held in MEM captures the product (`mem_mres`).
+- Hazards:
+  - a MUL in MEM is not forwardable, like a load;
+  - from WB, the product enters the load-forward path's first select (timing);
+  - flag readers wait while a MUL is in MEM/WB, so the product stays off
+    `flags_eff`.
+- The MEM op class (load / MUL) is registered at EX→MEM for the RAW-hazard
+  cone.
+
+**Timing:** met at tier 1, WNS +0.005 / WHS +0.015.
+
+**SoC sim, cycles per group:**
+
+| Group | Before | After |
+|---|---:|---:|
+| mul | 4.00 | 2.01 |
+| mul;use | 6.01 | 5.01 (latency 4) |
+| mul;mul | 8.01 | 4.02 |
+| mul + 3 independent | 7.05 | 5.05 |
+
+**Board, same binaries, vs callret:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −5.3% (1.843 → 1.946 /MHz) |
+| Embench speed geomean | 0.974 → 1.005 (cycles −3.10%; edn −21.3%, matmult −6.6%, ud −5.9%; none slower) |
+
 ## 0i. CALL/RET and store→load: branch callret (2026-11-02)
 
 `c39ef27`, on master `3f2f82a`. **Merged to master and written to QSPI on
