@@ -980,24 +980,37 @@ module pipeline_core
    logic [31:0]        mem_pc_next;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
-   // 2a BTIC (see EN_BTIC)
-   logic [15:0]        bt_v;
-   logic [29:0]        bt_tag  [0:15];   // branch pc[31:2]
-   logic [28:0]        bt_base [0:15];   // target dword (= IFB base)
-   logic [63:0]        bt_d0   [0:15], bt_d1 [0:15];
-   logic [15:0]        bt_v1;            // slot-1 dword valid (same line only)
-   logic               r_bt_pend;        // a missed entry waits for its serve
-   logic [3:0]         r_bt_widx;
+   // 2a BTIC (see EN_BTIC): 32 entries, index = pc[6:2] ^ pc[11:7].  Tag,
+   // base and data are read only at the index (LUTRAM-shaped); the line
+   // index is a separate FF copy for the all-entry invalidation compare.
+   localparam int BT_N = 32;
+   logic [BT_N-1:0]    bt_v;
+   logic [29:0]        bt_tag  [0:BT_N-1];   // branch pc[31:2]
+   logic [28:0]        bt_base [0:BT_N-1];   // target dword (= IFB base)
+   logic [63:0]        bt_d0   [0:BT_N-1], bt_d1 [0:BT_N-1];
+   logic [BT_N-1:0]    bt_v1;                // slot-1 dword valid (same line only)
+   logic [IC_IDXW-1:0] bt_lidx [0:BT_N-1];   // I-cache line index of the entry
+   logic [BT_N-1:0]    bt_kr;                // a return entry: indexed and tagged by its target
+   logic               r_bt_pend;            // a missed entry waits for its serve
+   logic [4:0]         r_bt_widx;
    logic [29:0]        r_bt_wtag;
    logic [28:0]        r_bt_wbase;
+   logic               r_bt_wkr;
+   logic               ev_btic_r;        // blocking event: the BTIC load was a return's
    logic               ev_btic;          // blocking event: IFB loaded from the BTIC
+   logic               ev_ovr;           // blocking event: an older squash moved pc after dispatch
    logic               ev_icinst;        // blocking event: an I-cache line install
    logic [8:0]         ev_icinst_idx;
-   wire  [3:0]         bt_ridx   = id_pc[5:2];
+   wire  [4:0]         bt_ridx   = id_pc[6:2] ^ id_pc[11:7];
    wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
-   wire                bt_hit    = EN_BTIC && bt_v[bt_ridx] && bt_tag[bt_ridx] == id_pc[31:2] &&
+   wire                bt_hit    = EN_BTIC && bt_v[bt_ridx] && !bt_kr[bt_ridx] && bt_tag[bt_ridx] == id_pc[31:2] &&
                                    bt_base[bt_ridx] == id_bp_tgt[31:3];
+   // a RAS-predicted return: the entry indexed by the RETURN TARGET (one
+   // RET has many call sites; a call site has one return point)
+   wire  [4:0]         bt_rridx  = ras_top[6:2] ^ ras_top[11:7];
+   wire                bt_hit_r  = EN_BTIC && bt_v[bt_rridx] && bt_kr[bt_rridx] &&
+                                   bt_base[bt_rridx] == ras_top[31:3];
    wire  [28:0]        w_bt_base = bt_base[bt_ridx];
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
@@ -1793,7 +1806,7 @@ module pipeline_core
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
-         ev_btic = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
+         ev_btic = 1'b0; ev_btic_r = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
 
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
@@ -2446,6 +2459,21 @@ module pipeline_core
                      id_valid    <= 1'b0;
                      ex_pred     <= 1'b1;
                      ex_pred_tgt <= ras_top;
+                     if (bt_hit_r) begin            // 2a: the return point's window
+                        ev_btic    = 1'b1;
+                        ev_btic_r  = 1'b1;
+                        ifb_base   <= ras_top[31:3];
+                        ifb_dw[0]  <= bt_d0[bt_rridx];
+                        ifb_dw[1]  <= bt_d1[bt_rridx];
+                        ifb_val    <= {bt_v1[bt_rridx], 1'b1};
+                        if_look    <= 1'b0;
+                     end else if (EN_BTIC) begin
+                        r_bt_pend  <= 1'b1;
+                        r_bt_wkr   <= 1'b1;
+                        r_bt_widx  <= bt_rridx;
+                        r_bt_wtag  <= ras_top[31:2];
+                        r_bt_wbase <= ras_top[31:3];
+                     end
                      ras_ptr     <= ras_ptr - 1'b1;
                      ras_cnt     <= ras_cnt - 1'b1;
                   end else if (EN_BP && id_valid && !fetch_halt && id_bp_tk) begin
@@ -2466,6 +2494,7 @@ module pipeline_core
                         if_look    <= 1'b0;
                      end else if (EN_BTIC) begin
                         r_bt_pend  <= 1'b1;
+                        r_bt_wkr   <= 1'b0;
                         r_bt_widx  <= bt_ridx;
                         r_bt_wtag  <= id_pc[31:2];
                         r_bt_wbase <= id_bp_tgt[31:3];
@@ -2578,6 +2607,7 @@ module pipeline_core
          if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
             ev_pcz     = 1'b1;
+            ev_ovr     = 1'b1;
             pc         <= fbr_taken ? fbr_tgt : ret_actual;
             mem_valid  <= 1'b0;
             ex_valid   <= 1'b0;
@@ -2606,9 +2636,10 @@ module pipeline_core
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;
             if_look <= 1'b0;  snoop_q <= 1'b0;
-            ifb_val <= 2'b00; ev_pcz = 1'b1;
+            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
          end
          if (sq_any) begin
+            ev_ovr = 1'b1;
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // squashed; it re-dispatches
             // M13 fix: the EX op is fetched-before-the-store too, so it must
             // not commit (it used to advance into MEM here and ALSO be
@@ -2640,6 +2671,7 @@ module pipeline_core
          // dropped and refetched from its own pc (ev_disp = it was latched;
          // a full sq_any above already refetches from an older pc).
          if (smc_hit_lat && ev_disp && !sq_any) begin
+            ev_ovr   = 1'b1;
             if (DEBUG_EN) id_bp <= 1'b0;
             id_valid <= 1'b0;
             ifb_val  <= 2'b00;
@@ -2675,14 +2707,16 @@ module pipeline_core
             bt_d0[r_bt_widx]   <= ifb_dw[0];
             bt_d1[r_bt_widx]   <= ifb_dw[1];
             bt_v1[r_bt_widx]   <= ifb_val[1] && !r_bt_wbase[0];
+            bt_lidx[r_bt_widx] <= r_bt_wbase[IC_IDXW:1];
+            bt_kr[r_bt_widx]   <= r_bt_wkr;
             r_bt_pend          <= 1'b0;
          end
          // Invalidation (after the capture: NBA last wins): the entry's
          // I-cache line is re-installed or store-snooped; ICACHE_INV.
          if (EN_BTIC) begin
-            for (int k = 0; k < 16; k++) begin
-               if (ev_icinst && bt_base[k][IC_IDXW:1] == ev_icinst_idx) bt_v[k] <= 1'b0;
-               if (snoop_q   && bt_base[k][IC_IDXW:1] == snoop_idx_q)   bt_v[k] <= 1'b0;
+            for (int k = 0; k < BT_N; k++) begin
+               if (ev_icinst && bt_lidx[k] == ev_icinst_idx) bt_v[k] <= 1'b0;
+               if (snoop_q   && bt_lidx[k] == snoop_idx_q)   bt_v[k] <= 1'b0;
             end
             if (icinv) bt_v <= '0;
          end
@@ -2710,7 +2744,9 @@ module pipeline_core
             // stale-base corner. The +1c/leaf-call residual is priced in
             // PIPELINE_M12_TIMING.md.)
             if (ev_pcz)    p = 3'b000;              // conservative: forces rebase
-            if (ev_btic)   p = 3'b001;              // 2a: window loaded at pc's dword
+            // 2a: window loaded at pc's dword — unless an older squash moved
+            // pc after the dispatch (the base below still follows the load)
+            if (ev_btic && !ev_ovr) p = 3'b001;
             pos <= p;
             // HW proposal 3: a redirect aborts any background prefetch (it was
             // for the old sequential path), so the BRAM read port reads the
@@ -2719,10 +2755,13 @@ module pipeline_core
             if (EN_PF_EARLY && ev_pcz) pf_look <= 1'b0;
             // base+K triple: track this edge's base writer (sites are
             // mutually exclusive; pcz does not move base)
-            if (ev_btic) begin                      // 2a: base' = the BTIC entry's base
-               r_base_p1   <= w_bt_base + 29'd1;
-               r_base_p2   <= w_bt_base + 29'd2;
-               r_want_line <= w_bt_base[28:1] + 28'd1;
+            if (ev_btic) begin                      // 2a: base' = the loaded base
+               // (a return loads at ras_top, a branch at its entry's base;
+               // ev_btic_r is this block's own blocking flag, so it is read
+               // here, not through a continuous assign)
+               r_base_p1   <= (ev_btic_r ? ras_top[31:3] : w_bt_base) + 29'd1;
+               r_base_p2   <= (ev_btic_r ? ras_top[31:3] : w_bt_base) + 29'd2;
+               r_want_line <= (ev_btic_r ? ras_top[31:4] : w_bt_base[28:1]) + 28'd1;
             end else if (ev_rebase) begin
                r_base_p1   <= pc_dw + 29'd1;        // base' = miss_dw = pc_dw (!in0)
                r_base_p2   <= pc_dw + 29'd2;
