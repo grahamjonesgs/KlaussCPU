@@ -558,7 +558,16 @@ module KlaussCPU #(
    // idle: the pipeline parks only after draining (pip_bus_idle), and the FSM
    // is idle in PIPE_RUN.
    // ------------------------------------------------------------------------
-   wire        w_pipe_owns = (st.SM == PIPE_RUN);
+   // REGISTERED (one cycle behind st.SM): with the combinational DRAM
+   // return (bus_splitter COMB_DRAM_RET) the st.SM decode reached the core's
+   // pc through m_ready and through the address mux -> is_mmio -> response
+   // select (tier-1 -0.203 ns).  Ownership only changes when the core is
+   // idle — entering PIPE_RUN (the core issues nothing for several cycles
+   // after start) and leaving it (only after park && bus_idle) — so a
+   // one-cycle lag only delays the FSM's first access by a cycle.
+   logic       r_pipe_owns = 1'b0;
+   always_ff @(posedge i_Clk) r_pipe_owns <= (st.SM == PIPE_RUN);
+   wire        w_pipe_owns = r_pipe_owns;
    wire [31:0] pip_m_addr;
    wire        pip_m_read_DV, pip_m_write_DV;
    wire [63:0] pip_m_wdata;
@@ -875,11 +884,13 @@ module KlaussCPU #(
    wire [255:0] w_vga_dma_read_data;
    wire         w_vga_dma_ready;
    wire         w_vga_dma_grant;
+   wire         w_vga_dma_yield;
 
    (* KEEP_HIERARCHY = "yes" *)
    vga_ctrl vga_ctrl_i (
        .i_Clk   (i_Clk),
        .i_Rst_L (~w_reset_H),
+       .i_prog_start (r_pip_start),
        .mmio    (vga_bus),
        .o_irq   (w_vga_irq),
        .o_dma_req      (w_vga_dma_req),
@@ -889,6 +900,7 @@ module KlaussCPU #(
        .i_dma_read_data(w_vga_dma_read_data),
        .i_dma_ready    (w_vga_dma_ready),
        .i_dma_grant    (w_vga_dma_grant),
+       .i_dma_yield    (w_vga_dma_yield),
        .o_vga_r (VGA_R),
        .o_vga_g (VGA_G),
        .o_vga_b (VGA_B),
@@ -1183,6 +1195,7 @@ module KlaussCPU #(
        .o_vga_read_data(w_vga_dma_read_data),
        .o_vga_ready(w_vga_dma_ready),
        .o_vga_grant(w_vga_dma_grant),
+       .o_vga_yield(w_vga_dma_yield),
 
        // Cache-maintenance control (MMIO 0xF005) — flush/invalidate for DMA coherency.
        .i_flush_go(w_cache_flush_go),

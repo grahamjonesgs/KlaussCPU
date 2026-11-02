@@ -71,8 +71,14 @@ module vga_scanout #(
     output logic [31:0] o_dma_addr,
     input       [255:0] i_dma_read_data,
     input               i_dma_ready,
-    input               i_dma_grant
+    input               i_dma_grant,
+    // The cache has a miss waiting for DDR: end the tenure after the read in
+    // flight (instead of at CHUNK) — unless this line fetch is already
+    // YIELD_AGE cycles old (half a native line's 3200), so a CPU that misses
+    // continuously cannot starve the display.
+    input               i_yield
 );
+    localparam int YIELD_AGE = 1600;
 
     // -------------------------------------------------------------------------
     // Frame-latched configuration
@@ -183,6 +189,7 @@ module vga_scanout #(
     logic [5:0]  r_left;                 // reads left in this line
     logic [7:0]  r_widx;                 // next line-buffer word (within the half)
     logic [2:0]  r_chunk;                // reads done in this tenure
+    logic [11:0] r_age = '0;             // cycles since this line fetch started (saturating)
     logic [1:0]  r_gap;
     logic [255:0] r_wline;               // captured read, drained 1 dword/cycle
     logic [8:0]  r_wbase;
@@ -224,6 +231,7 @@ module vga_scanout #(
                 end
             end
 
+            if (r_age != 12'hFFF) r_age <= r_age + 12'd1;
             case (r_fs)
                 F_IDLE: begin
                     if (r_pend) begin
@@ -233,6 +241,7 @@ module vga_scanout #(
                         r_left         <= w_line_reads;
                         r_widx         <= 8'd0;
                         r_chunk        <= 3'd0;
+                        r_age          <= '0;
                         r_valid[r_pend_half] <= 1'b0;
                         o_dma_req      <= 1'b1;
                         r_fs           <= F_REQ;
@@ -265,7 +274,8 @@ module vga_scanout #(
                 F_GAP: begin                     // DV low >= 1 cycle between reads
                     if (r_gap != 2'd0) begin
                         r_gap <= r_gap - 2'd1;
-                    end else if (r_pend || r_left == 6'd0 || r_chunk == CHUNK) begin
+                    end else if (r_pend || r_left == 6'd0 || r_chunk == CHUNK ||
+                                 (i_yield && r_age < 12'(YIELD_AGE))) begin
                         r_gap <= 2'd1;
                         r_fs  <= F_REL;          // end of line / abandon / chunk
                     end else begin

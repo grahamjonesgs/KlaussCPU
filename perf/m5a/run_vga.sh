@@ -21,7 +21,7 @@ xvlog -sv \
   || { tail -30 xvlog.log; exit 1; }
 xelab tb_vga -s tvga --relax > xelab.log 2>&1 \
   || { tail -30 xelab.log; exit 1; }
-xsim tvga -runall > xsim.log 2>&1 || { tail -30 xsim.log; exit 1; }
+xsim tvga -runall ${VGA_PLUS:+-testplusarg $VGA_PLUS} > xsim.log 2>&1 || { tail -30 xsim.log; exit 1; }
 
 grep -E "frame|vsync|FAIL|PASS|TIMEOUT" xsim.log
 grep -q "TB_VGA PASS" xsim.log && echo "VGA-P1: PASS" || { echo "VGA-P1: FAIL"; exit 1; }

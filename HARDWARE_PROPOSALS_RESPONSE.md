@@ -99,6 +99,60 @@ Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
 - localparams used before their declaration;
 - `ic_tagff` had no initial value, so it was X in 4-state sim.
 
+## 0b. Second round: branch mem-early (2026-11-02)
+
+Built from the klausscpu-llvm handoff (HANDOFF-m8.md). Branch `mem-early`,
+bitstream from `9ea49da`. **Board-verified, not yet merged.**
+
+| Item | Change | Switch |
+|---|---|---|
+| 2a (a) | 4-entry return-address stack; RET/LEAVERET predicted in ID, checked in MEM | `EN_RAS` |
+| 2a (b) | ID-stage prediction: 512 × 2-bit counters for JMPcc/FBR (taken only at counter 3), direct JMP/CALL always taken | `EN_BP`, `BP_STRONG` |
+| 1 (step) | early load issue: a load entering MEM with the port idle issues on that edge | `EN_EARLY_LD` |
+| 1 (step) | DRAM response to the core without the bus_splitter register (MMIO stays registered); `w_pipe_owns` registered | `COMB_DRAM_RET` |
+| 3 (handoff) | VGA scan-out ends its DDR tenure early when a cache miss waits (not when the line fetch runs late); `VGA_CTRL` resets at program start | — |
+| fix | SMC: an op latched into ID from an IFB slot that the completing store invalidates is refetched (pre-existing hole on master) | — |
+
+**Timing:** met at tier 1, WNS +0.176 / WHS +0.023. The `EN_FBR_EQ_EX` and
+ownership lessons are in the commit messages.
+
+**Board, ABI-v3 binaries (toolchain c335750ad0d9), against QSPI `3508f87`:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | 1,880,300,228 → 1,534,185,701 cycles (**−18.4%**) |
+| Embench speed geomean | 0.588 → 0.706 (**+20.1%**; all 19 faster) |
+| Dhrystone | 211 → 173 cycles/run (DMIPS/MHz 2.697 → 3.289) |
+
+Correctness:
+
+- M5e 13/15 byte-identical; the other two are timing prints and pass their
+  self-checks.
+- `hwprop_test` passes everything (704 branch cases, DI window, SMC).
+- `hwprop_misal` gives `ERR=0A` with the call chain.
+- All benchmarks verify.
+
+Costs (board, cycles per body):
+
+| Kernel | QSPI | mem-early |
+|---|---:|---:|
+| load64 back-to-back | 5.06 | 3.93 |
+| store64 back-to-back | 3.93 | 3.00 |
+| store;load | 9.06 | 7.00 |
+| PUSH;POP | 12.81 | 10.75 |
+| predicted-taken FBR | 5.81 | 3.25 |
+
+Also, from simulation: a mispredicted FBR costs ≈ 7, and CALL leaf + RET
+15.1 → 12.8.
+
+VGA scan-out (640×480×16) costs a framebuffer fill +37.6% on QSPI and
++11.7% on mem-early. Pre-proposal bitstreams can no longer run phase-9
+binaries (they use the 2-word FBR), so the LVGL A/B was done this way.
+
+Still open: true 1a (load hits that don't freeze the pipe, which needs the
+pipelined cache/bus redesign); early issue for stores and for back-to-back
+accesses.
+
 ## 1. Status
 
 | # | Proposal | State (all items board-verified unless noted) | Switch (default) | Measured (full-SoC sim, cycles) |

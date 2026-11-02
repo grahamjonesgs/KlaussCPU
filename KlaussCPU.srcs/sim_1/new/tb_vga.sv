@@ -51,12 +51,16 @@ module tb_vga;
    logic [31:0]  dma_addr;
    logic [255:0] dma_rdata = '0;
    logic         dma_ready = 0, dma_grant = 0;
+   // +YIELD: the cache always has a miss waiting (worst case for the early
+   // tenure release; the line-age guard must still keep every line on time)
+   logic         dma_yield = 0;
+   initial if ($test$plusargs("YIELD")) dma_yield = 1'b1;
 
    vga_ctrl dut (
-      .i_Clk(clk), .i_Rst_L(rst_l), .mmio(bus.slave), .o_irq(irq),
+      .i_Clk(clk), .i_Rst_L(rst_l), .i_prog_start(1'b0), .mmio(bus.slave), .o_irq(irq),
       .o_dma_req(dma_req), .o_dma_done(dma_done), .o_dma_read_DV(dma_rd),
       .o_dma_addr(dma_addr), .i_dma_read_data(dma_rdata), .i_dma_ready(dma_ready),
-      .i_dma_grant(dma_grant),
+      .i_dma_grant(dma_grant), .i_dma_yield(dma_yield),
       .o_vga_r(r), .o_vga_g(g), .o_vga_b(b), .o_vga_hs(hs), .o_vga_vs(vs)
    );
 

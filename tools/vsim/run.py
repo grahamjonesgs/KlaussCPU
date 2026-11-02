@@ -51,6 +51,8 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = ['-GDEBUG_EN=1'] if dbg else []
+    if 'ras_miss' in core:
+        defs.append('+define+HAS_RAS')
     if 'st_post_ok' in core:
         defs.append('+define+HAS_POST')
     if 'output logic [1:0]   perf_ic' in core:
@@ -197,6 +199,8 @@ def check(st, exp):
                 want = str(v)
         else:
             want = v
+        if got is None and k.startswith('m') and int(want, 16) == 0:
+            continue                      # the TB dumps only non-zero dwords
         if want == 'nonzero':
             if got is None or int(got, 16) == 0:
                 bad.append(f'{k}: got {got} want nonzero')

@@ -15,11 +15,18 @@
 // CPU-facing handshake is identical to the original mem_read_write interface,
 // so the CPU FSM and memory_tasks.vh need no changes.
 //
-// All paths are combinational — the CPU holds the request stable until ready,
-// so the routing decision can be re-decoded each cycle from cpu.addr.
+// All request paths are combinational — the CPU holds the request stable
+// until ready, so the routing decision can be re-decoded each cycle from
+// cpu.addr.  Responses: see COMB_DRAM_RET.
 //////////////////////////////////////////////////////////////////////////////////
 
-module bus_splitter (
+module bus_splitter #(
+    // 1: the DRAM response (cache ready / data, both registered at the
+    // cache) reaches the CPU combinationally, one cycle earlier on every
+    // DRAM access; MMIO / Ethernet responses stay registered here.  0:
+    // every response is registered (the original, FSM-era shape).
+    parameter bit COMB_DRAM_RET = 1'b1
+) (
     input             i_clk,           // clock for output pipeline (see below)
 
     // ----- CPU side (membus request/response from the CPU FSM) -----
@@ -89,18 +96,29 @@ module bus_splitter (
     wire [63:0] mem_read_data_next_comb = dram.read_data_next;
     wire        mem_next_valid_comb     = is_mmio ? 1'b0 : dram.next_valid;
 
-    initial begin
-        cpu.read_data      = 64'b0;
-        cpu.read_data_next = 64'b0;
-        cpu.next_valid     = 1'b0;
-        cpu.ready          = 1'b0;
-    end
-
+    // Registered response.  With COMB_DRAM_RET the register carries only
+    // the MMIO / Ethernet side (never a stale DRAM ready across a change of
+    // destination).
+    logic [63:0] r_read_data = 64'b0, r_read_data_next = 64'b0;
+    logic        r_next_valid = 1'b0, r_ready = 1'b0;
     always_ff @(posedge i_clk) begin
-        cpu.read_data      <= mem_read_data_comb;
-        cpu.read_data_next <= mem_read_data_next_comb;
-        cpu.next_valid     <= mem_next_valid_comb;
-        cpu.ready          <= mem_ready_comb;
+        r_read_data      <= mem_read_data_comb;
+        r_read_data_next <= mem_read_data_next_comb;
+        r_next_valid     <= mem_next_valid_comb;
+        r_ready          <= COMB_DRAM_RET ? (is_mmio && mem_ready_comb) : mem_ready_comb;
+    end
+    always_comb begin
+        if (COMB_DRAM_RET && !is_mmio) begin
+            cpu.read_data      = dram.read_data;
+            cpu.read_data_next = dram.read_data_next;
+            cpu.next_valid     = dram.next_valid;
+            cpu.ready          = dram.ready;
+        end else begin
+            cpu.read_data      = r_read_data;
+            cpu.read_data_next = r_read_data_next;
+            cpu.next_valid     = r_next_valid;
+            cpu.ready          = r_ready;
+        end
     end
 
 endmodule
