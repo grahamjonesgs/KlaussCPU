@@ -35,7 +35,10 @@ module pipeline_core
    parameter logic [31:0] SP_RESET = 32'h0800_0000,
    // Debug hooks for debug_module.sv (DEBUG_PLAN.md Phase 5). 0 = none of the
    // logic below exists and dbg_i is ignored (core 2, existing builds).
-   parameter bit DEBUG_EN = 1'b0
+   parameter bit DEBUG_EN = 1'b0,
+   // 2a branch-target instruction cache (see EN_BTIC).  Core 2 turns it off:
+   // it is ~2k LUTs + a BRAM per instance and core 2 does not need it.
+   parameter bit BTIC_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -222,7 +225,7 @@ module pipeline_core
    // I-cache line (install / store snoop at that index), on ICACHE_INV and
    // at start — so every entry is a copy of a resident, snooped I-cache line
    // and the SMC completion squash covers the same window as for a serve.
-   localparam bit EN_BTIC = 1'b1;
+   localparam bit EN_BTIC = BTIC_EN;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
