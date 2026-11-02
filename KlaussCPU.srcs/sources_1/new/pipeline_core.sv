@@ -3217,7 +3217,10 @@ module pipeline_core
             // follows), so its next line's prefetch starts on the same edge
             // instead of after the window is seen valid (~3 cycles later):
             // short target runs no longer drain the window before the NLB.
-            if (EN_BTPF && ev_btic && !ev_ovr) begin
+            // (no !ev_ovr guard: it put every squash — the RAS-miss
+            // m_rdata -> ret_actual cone — into the pf_line enable; a
+            // prefetch started on a squash edge is only a wasted lookup)
+            if (EN_BTPF && ev_btic) begin
                pf_look <= 1'b1;
                pf_line <= id_bt_want;
             end
