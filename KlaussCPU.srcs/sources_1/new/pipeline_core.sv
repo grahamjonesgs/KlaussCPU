@@ -1078,6 +1078,7 @@ module pipeline_core
    logic [63:0] wb_value;
    flags_t      wb_fval, wb_fmask;
    logic        wb_zval;
+   logic        wb_zero;            // (wb_value == 0), reduced at the MEM->WB latch
    logic [31:0] wb_sp_new;
    logic        wb_sp_we;
    logic [3:0]  wb_mask_new;
@@ -1229,12 +1230,13 @@ module pipeline_core
    // the consumer's dispatch sits in the WB registers during the consumer's
    // EX cycle (it commits at the end of that cycle): merge its masked fields
    // over the still-uncommitted flags register. Deferred-Z producers
-   // contribute (wb_value == 0) — a register-sourced NOR.
+   // contribute wb_zero = (wb_value == 0), reduced a cycle early at the
+   // MEM->WB latch so the forwarded Z is a single register here.
    flags_t flags_eff;
    always_comb begin
       flags_eff = flags;
       if (ex_fwd_f) begin
-         if (wb_fmask.zero)     flags_eff.zero     = wb_zval ? (wb_value == 64'b0)
+         if (wb_fmask.zero)     flags_eff.zero     = wb_zval ? wb_zero
                                                              : wb_fval.zero;
          if (wb_fmask.carry)    flags_eff.carry    = wb_fval.carry;
          if (wb_fmask.overflow) flags_eff.overflow = wb_fval.overflow;
@@ -1946,12 +1948,12 @@ module pipeline_core
             if (wb_fmask != '0) begin
                flags <= (flags & ~wb_fmask) | (wb_fval & wb_fmask);
                // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
-               // runs here from the REGISTERED wb_value, not in EX behind the
+               // runs at the MEM->WB latch (wb_zero), not in EX behind the
                // shifter/adder (the WNS -0.351 path). Every Z-writer's zero is
                // (value==0) except BTSTN (~bit) and IRET (frame restore),
                // which keep wb_fval.zero. DIV negation preserves zero.
                if (wb_fmask.zero && wb_zval)
-                  flags.zero <= (wb_value == 64'b0);
+                  flags.zero <= wb_zero;
             end
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
@@ -2375,6 +2377,10 @@ module pipeline_core
             wb_pc      <= mem_pc;    wb_op <= mem_op;   wb_rd <= mem_d.rd;
             wb_wreg    <= mem_d.wreg;
             wb_value   <= mem_is_read ? mem_ldval : mem_result_eff;
+            // Z producers are never port reads (IRET's flags come from
+            // iret_fval with wb_zval 0), so the reduce sees mem_result_eff
+            // only and stays off the m_rdata path.
+            wb_zero    <= (mem_result_eff == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             wb_fmask   <= mem_fmask;
@@ -2452,6 +2458,30 @@ module pipeline_core
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
+               // Operand registers load on every non-busy cycle, also under an
+               // EX redirect or a RAW bubble (ex_valid <= 0 then, so the values
+               // are dead): their enable is !ex_busy alone, not the EX
+               // flags -> taken cone.
+               // M6 register-sourced forwarding at the operand-register
+               // inputs: youngest writer wins (MEM over WB over rf).
+               ex_a       <= f_wsh(id_w,
+                             (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
+                           : (b_wb       && wb_rd    == dec.rs1) ? wb_fwd_v
+                           : rf[dec.rs1]);
+               ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
+                           : (b_wb       && wb_rd    == dec.rd)  ? wb_fwd_v
+                           : rf[dec.rd];
+               // The b-operand fully resolves HERE (reg / extended imm32 /
+               // constant 1 for INC-DEC / forwarded result) so EX's adder
+               // and comparators read pure registers.
+               ex_b       <= f_wsh(id_w,
+                             id_b_one ? 64'd1
+                           : id_b_imm
+                             ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
+                           : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
+                           : rf[dec.rs2]);
+
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
                   ev_pcz     = 1'b1;
@@ -2473,25 +2503,6 @@ module pipeline_core
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
-                  // M6 register-sourced forwarding at the operand-register
-                  // inputs: youngest writer wins (MEM over WB over rf).
-                  ex_a       <= f_wsh(id_w,
-                                (mem_fwd_ok && mem_d.rd == dec.rs1) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs1) ? wb_fwd_v
-                              : rf[dec.rs1]);
-                  ex_c       <= (mem_fwd_ok && mem_d.rd == dec.rd)  ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rd)  ? wb_fwd_v
-                              : rf[dec.rd];
-                  // The b-operand fully resolves HERE (reg / extended imm32 /
-                  // constant 1 for INC-DEC / forwarded result) so EX's adder
-                  // and comparators read pure registers.
-                  ex_b       <= f_wsh(id_w,
-                                id_b_one ? 64'd1
-                              : id_b_imm
-                                ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                              : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
-                              : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
-                              : rf[dec.rs2]);
                   mul_cnt    <= 2'd0;
                   if (DEBUG_EN && id_valid && id_bp) begin
                      // breakpoint: the ID op does not execute; park at its PC
@@ -2541,9 +2552,9 @@ module pipeline_core
                                && !(DEBUG_EN && dbg_active) && irq_take) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
+                     // (irq_sel_q / irq_vec_q latch at the drain boundary in
+                     // the IRQ sequencer; not here, off the EX-redirect cone)
                      irq_active <= 1'b1;
-                     irq_sel_q  <= irq_sel;
-                     irq_vec_q  <= irq_vector;
                      id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
                                && !(DEBUG_EN && dbg_active) && fetch_ok) begin
@@ -2821,6 +2832,9 @@ module pipeline_core
    // design (a set flag must be TRUE; a clear flag may be conservative —
    // post-redirect zeros force the rebase path, which is correct). The
    // base+K triple is a hard invariant whenever the window is armed.
+   always_ff @(posedge clk) if (!rst && wb_valid && wb_fmask.zero && wb_zval)
+      assert (wb_zero == (wb_value == 64'b0))
+         else $fatal(1, "wb_zero stale: pc=%h value=%h", wb_pc, wb_value);
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
