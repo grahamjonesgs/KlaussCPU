@@ -197,8 +197,13 @@ accesses.
 
 ## 0i. CALL/RET and store→load: branch callret (2026-11-02)
 
-`c39ef27`, on master `3f2f82a`. **Status:** passed my board suite. Toolchain
-validation is pending.
+`c39ef27`, on master `3f2f82a`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash; push;pop 4.00 cycles).
+Toolchain validation passed: the hw_* fixtures, csmith-board 150, zephyr and
+the board suite. CoreMark -O2 185.35, -Os 153.44; Embench 0.988 / 0.879.
+With this forwarding the compiler's same-line store→load scheduling rule no
+longer pays (it measured +0.08% Embench) and has been removed. Rollback to
+fetch-bypass: `~/.cache/kbuild/rollback/README.txt`.
 
 **Diagnosis** (sim trace). A call + ret of an empty function cost about 10
 cycles (`perf_kern` call1 9.93):
