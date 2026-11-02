@@ -1070,10 +1070,10 @@ module pipeline_core
    logic [31:0]        mem_pc_next;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
-   // 2a BTIC (see EN_BTIC): 32 entries, index = pc[6:2] ^ pc[11:7].  Tag,
+   // 2a BTIC (see EN_BTIC): 64 entries, index = pc[7:2] ^ pc[13:8].  Tag,
    // base and data are read only at the index (LUTRAM-shaped); the line
    // index is a separate FF copy for the all-entry invalidation compare.
-   localparam int BT_N = 32;
+   localparam int BT_N = 64;
    logic [BT_N-1:0]    bt_v;
    logic [29:0]        bt_tag  [0:BT_N-1];   // branch pc[31:2]
    logic [28:0]        bt_base [0:BT_N-1];   // target dword (= IFB base)
@@ -1092,13 +1092,13 @@ module pipeline_core
    // two never meet on one edge (keeps EX's exo_taken off the pos claim)
    wire                ex_may_redir = ex_valid && (ex_d.uop == U_JMP || ex_d.uop == U_CALL ||
                                                     ex_d.uop == U_RESET);
-   logic [4:0]         id_bt_idx;
+   logic [5:0]         id_bt_idx;
    logic [63:0]        id_bt_d0, id_bt_d1;
    logic               id_bt_v1;
    logic [28:0]        id_bt_base, id_bt_bp1, id_bt_bp2;
    logic [27:0]        id_bt_want;
    logic               r_bt_pend;            // a missed entry waits for its serve
-   logic [4:0]         r_bt_widx;
+   logic [5:0]         r_bt_widx;
    logic [29:0]        r_bt_wtag;
    logic [28:0]        r_bt_wbase;
    logic [IC_IDXW-1:0] r_bt_wblidx;
@@ -1106,7 +1106,7 @@ module pipeline_core
    logic               ev_ovr;           // blocking event: an older squash moved pc after dispatch
    logic               ev_icinst;        // blocking event: an I-cache line install
    logic [8:0]         ev_icinst_idx;
-   wire  [4:0]         bt_lidx_pc = pc[6:2] ^ pc[11:7];   // looked up at the IF->ID latch
+   wire  [5:0]         bt_lidx_pc = pc[7:2] ^ pc[13:8];   // looked up at the IF->ID latch
    wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
    // 2a early redirect (see id_rpend)
@@ -2651,7 +2651,7 @@ module pipeline_core
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
                r_bt_pend   <= 1'b1;
-               r_bt_widx   <= id_pc[6:2] ^ id_pc[11:7];
+               r_bt_widx   <= id_pc[7:2] ^ id_pc[13:8];
                r_bt_wtag   <= id_pc[31:2];
                r_bt_wbase  <= id_bp_tgt[31:3];
                r_bt_wblidx <= id_pc[IC_IDXW+3:4];
