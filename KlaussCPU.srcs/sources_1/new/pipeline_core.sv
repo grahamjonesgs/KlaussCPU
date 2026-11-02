@@ -1962,7 +1962,11 @@ module pipeline_core
    // 1a: a fast load's value at its WB commit (the response this cycle)
    // (stage 3: a hit-pipe hit's doubleword, else the port response)
    logic [63:0] wb_ldval;
-   wire  [63:0] wb_lddw = (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
+   // (EN_MUL2: a MUL in WB taking its product from the DSP joins here, the
+   // first select of the load-forward path, as a full-dword "load" — no
+   // extra mux level at the end of the forward cone)
+   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_w[63:0]
+                        : (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
    always_comb begin
       logic [7:0]  b8;
       logic [15:0] h16;
@@ -1970,7 +1974,7 @@ module pipeline_core
       b8  = wb_lddw[(wb_ld_ea * 8) +: 8];
       h16 = wb_lddw[(wb_ld_ea[2:1] * 16) +: 16];
       w32 = wb_ld_ea[2] ? wb_lddw[63:32] : wb_lddw[31:0];
-      if (wb_ld_full) wb_ldval = wb_lddw;
+      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval = wb_lddw;
       else case (wb_ld_msz)
          2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
          2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
@@ -1980,9 +1984,7 @@ module pipeline_core
    end
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
-   // EN_MUL2: a MUL in WB straight from the DSP (wb_mdir), else wb_value
-   wire [63:0] wb_val_eff = (EN_MUL2 && wb_mdir) ? mul_w[63:0] : wb_value;
-   wire [63:0] wb_fwd_v = (EN_LD_FWD && wb_ld) ? wb_ldval : wb_val_eff;
+   wire [63:0] wb_fwd_v = ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
    flags_t wb_fval_eff;
    always_comb begin
       wb_fval_eff = wb_fval;
@@ -2176,7 +2178,7 @@ module pipeline_core
          ret_valid <= 1'b0;  ret_wr <= 1'b0;
          if (wb_valid && !wb_wait) begin
             // (1a: a fast load commits its value straight from the response)
-            if (wb_wreg)    rf[wb_rd] <= (EN_LD_WB && wb_ld) ? wb_ldval : wb_val_eff;
+            if (wb_wreg)    rf[wb_rd] <= ((EN_LD_WB && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
             if (wb_fmask != '0) begin
                flags <= (flags & ~wb_fmask) | (wb_fval_eff & wb_fmask);
                // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
