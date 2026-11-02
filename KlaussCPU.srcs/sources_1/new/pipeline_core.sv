@@ -3255,6 +3255,12 @@ module pipeline_core
    bit at_on = $test$plusargs("ATTRIB");
    longint at[string];
    logic at_p_tk, at_p_misp, at_p_ifm, at_p_ser;
+   logic [2:0] at_p_src;
+   wire [2:0] at_src_now = (if_xc && w_mrdy) ? 3'd1
+                         : (!if_xc && if_look && ic_rd_current && ic_hit) ? 3'd2
+                         : (!if_xc && !if_look && running && !fetch_halt && !parked && !irq_active && !fetch_ok && nlb_dw_ok) ? 3'd3
+                         : (id_early_rd && bt_hit) ? 3'd4
+                         : (!if_xc && !if_look && w_slide) ? 3'd5 : 3'd0;
    wire  at_misp_now = (ex_valid && ex_redir && !ex_busy && !mem_busy) || fbr_taken || ras_miss || sq_any || sq_spec;
    wire  at_tk_now   = !mem_busy && !ex_busy && !(ex_valid && ex_redir) && !raw_stall && id_valid && !fetch_halt &&
                        ((EN_RAS && id_ras_ret && ras_cnt != '0) || (EN_BP && id_bp_tk && id_rpend));
@@ -3268,13 +3274,19 @@ module pipeline_core
       else if (irq_active)                   k = "irq";
       else if (fetch_halt)                   k = "serialize";
       else if (!fetch_ok)                    k = at_p_misp ? "ifmiss.after_mispredict" : at_p_tk ? "ifmiss.after_taken" : "ifmiss";
-      else                                   k = at_p_misp ? "U.latch_after_mispredict" : at_p_tk ? "U.taken_bubble"
-                                               : at_p_ifm ? "U.latch_after_ifmiss" : at_p_ser ? "U.after_serialize" : "U.other";
+      else begin
+         string src;
+         src = at_p_src == 1 ? "fill" : at_p_src == 2 ? "icache" : at_p_src == 3 ? "nlb" : at_p_src == 4 ? "btic"
+             : at_p_src == 5 ? "slide" : "none";
+         k = at_p_misp ? "U.latch_after_mispredict" : at_p_tk ? {"U.taken_bubble.", src}
+           : at_p_ifm ? {"U.latch_after_ifmiss.", src} : at_p_ser ? "U.after_serialize" : {"U.other.", src};
+      end
       at[k]++;
       at_p_misp <= at_misp_now;
       at_p_tk   <= at_tk_now;
       at_p_ifm  <= !mem_busy && !ex_busy && !id_valid && !fetch_ok;
       at_p_ser  <= fetch_halt;
+      at_p_src  <= at_src_now;
    end
    int at_ret = 0;
    always_ff @(posedge clk) if (at_on && !rst && running && ret_valid) at_ret++;
@@ -3283,6 +3295,23 @@ module pipeline_core
       foreach (at[k]) $display("ATTRIB %s %0d", k, at[k]);
    end
 
+   int raw_hist [string];
+   bit raw_hist_on = $test$plusargs("RAWHIST");
+   always_ff @(posedge clk) if (raw_hist_on && !rst && running && !mem_busy && !ex_busy && id_valid && raw_stall) begin
+      string pk, ck;
+      logic h1x, h2x, hdx;
+      h1x = id_use_rs1 && b_ex && ex_d.rd == id_rs1;
+      h2x = id_use_rs2 && b_ex && ex_d.rd == dec.rs2;
+      hdx = id_use_rdd && b_ex && ex_d.rd == id_rd;
+      if (h1x || h2x || hdx) pk = {"EX:", ex_d.uop.name()};
+      else if (mem_lk && mem_d.wreg) pk = {"MEM:", mem_d.uop.name()};
+      else if (wb_ldlk) pk = "WBLD";
+      else if (id_fread && flag_busy) pk = "FLAGS";
+      else pk = "SP";
+      ck = {dec.uop.name(), h1x ? ".a" : h2x ? ".b" : hdx ? ".d" : ""};
+      raw_hist[{pk, " -> ", ck}]++;
+   end
+   final if (raw_hist_on) foreach (raw_hist[k]) $display("RAWH %0d %s", raw_hist[k], k);
    // Load-hit pipe coverage (sim only, +HCOV): loads that left MEM through
    // the hit pipe as hits / misses, and loads kept off it by a same-line
    // store still on the port.
