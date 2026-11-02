@@ -102,7 +102,10 @@ Two bugs only xsim/Vivado showed, both fixed in `23e616f`:
 ## 0b. Second round: branch mem-early (2026-11-02)
 
 Built from the klausscpu-llvm handoff (HANDOFF-m8.md). Branch `mem-early`,
-bitstream from `9ea49da`. **Board-verified, not yet merged.**
+bitstream from `9ea49da`. **Merged to master as `8e6b8e5` and written to QSPI
+on 2026-11-02** (that exact bitstream, sha256 `28efc551f080…`; read-back
+verified; boot from flash shows the netboot banner and `hwprop_test` passes).
+Rollback to `3508f87`: `~/.cache/kbuild/rollback/` (`README.txt`).
 
 | Item | Change | Switch |
 |---|---|---|
