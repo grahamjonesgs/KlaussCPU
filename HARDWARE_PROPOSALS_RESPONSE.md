@@ -195,6 +195,44 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0l. Load → ALU/BOOL/FBR bypass: branch ldbyp (2026-11-02)
+
+`c6ba1db`, on master `f8fd12c`. **Status:** passed my board suite. Toolchain
+validation is pending.
+
+**Change (`EN_LDBYP`).**
+- An ALU / BOOL / FBR consumer may dispatch while the fast load (LOAD / POP /
+  LEAVE, DRAM) that writes its rs1/rs2 is in MEM.
+- The load's hit-pipe or forwarded value is extracted at its MEM→WB edge
+  (`wb_hext`) and feeds the consumer's ALU / compare operands in EX, with the
+  W-compare shift.
+- A consumer that does not leave EX on the edge its load commits (a miss held
+  it, or the pipe is frozen) captures the value into `ex_a`/`ex_b` then.
+
+**Load-use distance** is 2 for these consumers, 3 for everything else (shifts,
+MUL/DIV, MOV/LEA, address and store-data operands, JMPR).
+
+**Timing:** met at tier 1, WNS +0.027 / WHS +0.027.
+
+**SoC sim, cycles per group:**
+
+| Group | Before | After |
+|---|---:|---:|
+| ld;use | 4.02 | 3.02 |
+| ld;1;use | 4.04 | 3.05 |
+| ld;fbr | 4.02 | 3.02 |
+
+**Board, same binaries, vs btic64:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −4.9% (1.961 → 2.063 /MHz) |
+| Embench speed geomean | 1.014 → 1.033 (cycles −1.85%; nsichneu −10.4%, sglib −5.9%, huffbench −5.4%; none slower) |
+| Dhrystone | 105 cycles/run |
+
+CoreMark at 2000 iterations now runs under 10 s and reports `SHORT` (CRCs
+correct), so the harness iteration count needs raising.
+
 ## 0k. BTIC 64 entries: branch btic64 (2026-11-02)
 
 `51a3e2b`, on mul2 `54cb0a4`. **Merged to master and written to QSPI on
