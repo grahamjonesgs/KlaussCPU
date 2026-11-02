@@ -197,9 +197,14 @@ accesses.
 
 ## 0k. BTIC 64 entries: branch btic64 (2026-11-02)
 
-`51a3e2b`, on mul2 `54cb0a4`. **Status:** passed my board suite; the
-toolchain re-check is pending. The full validation passed on `be7fa38`, which
-differs only in one guard term.
+`51a3e2b`, on mul2 `54cb0a4`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash). Toolchain validation:
+- on `51a3e2b`: the hw_* fixtures, the board suite (-O2, no differences or
+  regressions) and csmith-board 50;
+- on `be7fa38` (one guard term different): zephyr and csmith-board 150.
+
+Board, current compiler: CoreMark -O2 196.12, -Os 156.19; Embench 1.030 /
+0.908. Rollback to mul2: `~/.cache/kbuild/rollback/README.txt`.
 
 **Changes:**
 - **BTIC 32 → 64 entries,** indexed by `pc[7:2] ^ pc[13:8]`. The sim
