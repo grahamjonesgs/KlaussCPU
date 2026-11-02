@@ -195,10 +195,47 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0k. BTIC 64 entries: branch btic64 (2026-11-02)
+
+`51a3e2b`, on mul2 `54cb0a4`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash). Toolchain validation:
+- on `51a3e2b`: the hw_* fixtures, the board suite (-O2, no differences or
+  regressions) and csmith-board 50;
+- on `be7fa38` (one guard term different): zephyr and csmith-board 150.
+
+Board, current compiler: CoreMark -O2 196.12, -Os 156.19; Embench 1.030 /
+0.908. Rollback to mul2: `~/.cache/kbuild/rollback/README.txt`.
+
+**Changes:**
+- **BTIC 32 → 64 entries,** indexed by `pc[7:2] ^ pc[13:8]`. The sim
+  attribution had about 2.1% of cycles in ifmiss after a taken branch.
+- **The early-redirect hit check comes from the ID snapshot only.** It
+  carries its entry's line indices and is cleared by matching invalidations;
+  one landing on the very edge the snapshot was taken is caught a cycle later
+  from a registered index. This replaces a 64:1 `bt_v` re-read on the
+  redirect cone.
+- **`EN_BTPF` is guarded by `!fbr_taken` only.** The full `!ev_ovr` guard put
+  the RAS-miss compare cone into the `pf_line` enable: one build failed at
+  −0.903. With no guard at all, aha-mont64 lost 0.85% to prefetches started
+  on a fused-branch mispredict edge.
+
+**Timing:** met at tier 1, WNS +0.077 / WHS +0.027.
+
+**Board, same binaries, vs mul2:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −0.8% (1.961 /MHz) |
+| Embench speed geomean | 1.005 → 1.014 (cycles −0.93%; slre −4.0%, st −3.8%, minver −2.6%; none slower) |
+
 ## 0j. MUL: 2-cycle issue, product committed from the DSP: branch mul2 (2026-11-02)
 
-`54cb0a4`, on callret `c39ef27`. **Status:** passed my board suite. Toolchain
-validation is pending.
+`54cb0a4`, on callret `c39ef27`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash; mul 2.00 cycles). Toolchain
+validation passed: the hw_* fixtures, the board suite, csmith-board 150 and
+zephyr. CoreMark -O2 194.97, -Os 154.66; Embench 1.021 / 0.898. The
+compiler models MUL latency 4 with a 2-cycle hold. Rollback to callret:
+`~/.cache/kbuild/rollback/README.txt`.
 
 **Change (`EN_MUL2`).**
 - A MUL holds EX 2 cycles (it was 4), then travels on through MEM.

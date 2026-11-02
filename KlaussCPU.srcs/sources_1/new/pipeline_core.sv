@@ -1070,10 +1070,10 @@ module pipeline_core
    logic [31:0]        mem_pc_next;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
-   // 2a BTIC (see EN_BTIC): 32 entries, index = pc[6:2] ^ pc[11:7].  Tag,
+   // 2a BTIC (see EN_BTIC): 64 entries, index = pc[7:2] ^ pc[13:8].  Tag,
    // base and data are read only at the index (LUTRAM-shaped); the line
    // index is a separate FF copy for the all-entry invalidation compare.
-   localparam int BT_N = 32;
+   localparam int BT_N = 64;
    logic [BT_N-1:0]    bt_v;
    logic [29:0]        bt_tag  [0:BT_N-1];   // branch pc[31:2]
    logic [28:0]        bt_base [0:BT_N-1];   // target dword (= IFB base)
@@ -1092,13 +1092,13 @@ module pipeline_core
    // two never meet on one edge (keeps EX's exo_taken off the pos claim)
    wire                ex_may_redir = ex_valid && (ex_d.uop == U_JMP || ex_d.uop == U_CALL ||
                                                     ex_d.uop == U_RESET);
-   logic [4:0]         id_bt_idx;
+   logic [5:0]         id_bt_idx;
    logic [63:0]        id_bt_d0, id_bt_d1;
    logic               id_bt_v1;
    logic [28:0]        id_bt_base, id_bt_bp1, id_bt_bp2;
    logic [27:0]        id_bt_want;
    logic               r_bt_pend;            // a missed entry waits for its serve
-   logic [4:0]         r_bt_widx;
+   logic [5:0]         r_bt_widx;
    logic [29:0]        r_bt_wtag;
    logic [28:0]        r_bt_wbase;
    logic [IC_IDXW-1:0] r_bt_wblidx;
@@ -1106,7 +1106,7 @@ module pipeline_core
    logic               ev_ovr;           // blocking event: an older squash moved pc after dispatch
    logic               ev_icinst;        // blocking event: an I-cache line install
    logic [8:0]         ev_icinst_idx;
-   wire  [4:0]         bt_lidx_pc = pc[6:2] ^ pc[11:7];   // looked up at the IF->ID latch
+   wire  [5:0]         bt_lidx_pc = pc[7:2] ^ pc[13:8];   // looked up at the IF->ID latch
    wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
    // 2a early redirect (see id_rpend)
@@ -1114,7 +1114,16 @@ module pipeline_core
                                       !ex_may_redir;
    // A tag match implies the same branch instruction, hence the same target:
    // an entry dies with its branch's line as well as its target's.
-   wire                bt_hit    = EN_BTIC && id_bt_hit && bt_v[id_bt_idx];
+   // (timing: no bt_v[id_bt_idx] re-read — a 64:1 mux on the redirect cone.
+   // The snapshot carries its entry's line indices (id_bt_li / id_bt_bli);
+   // an invalidation that matches them clears id_bt_hit, and one landing on
+   // the very edge a snapshot was taken is caught here from its registered
+   // index (r_btk_*).)
+   logic [IC_IDXW-1:0] id_bt_li, id_bt_bli, r_btk_ic, r_btk_sn;
+   logic               r_btk_icv, r_btk_snv, r_btk_all;
+   wire                bt_hit    = EN_BTIC && id_bt_hit && !r_btk_all &&
+                                   !(r_btk_icv && (id_bt_li == r_btk_ic || id_bt_bli == r_btk_ic)) &&
+                                   !(r_btk_snv && (id_bt_li == r_btk_sn || id_bt_bli == r_btk_sn));
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
    endfunction
@@ -2035,6 +2044,7 @@ module pipeline_core
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
+         r_btk_icv <= 1'b0; r_btk_snv <= 1'b0; r_btk_all <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
@@ -2651,7 +2661,7 @@ module pipeline_core
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
                r_bt_pend   <= 1'b1;
-               r_bt_widx   <= id_pc[6:2] ^ id_pc[11:7];
+               r_bt_widx   <= id_pc[7:2] ^ id_pc[13:8];
                r_bt_wtag   <= id_pc[31:2];
                r_bt_wbase  <= id_bp_tgt[31:3];
                r_bt_wblidx <= id_pc[IC_IDXW+3:4];
@@ -2938,6 +2948,7 @@ module pipeline_core
                      // 2a: BTIC lookup by this instruction's own pc
                      id_bt_hit  <= EN_BTIC && bt_v[bt_lidx_pc] && bt_tag[bt_lidx_pc] == pc[31:2];
                      id_bt_idx  <= bt_lidx_pc;
+                     id_bt_li   <= bt_lidx[bt_lidx_pc];  id_bt_bli <= bt_blidx[bt_lidx_pc];
                      id_bt_d0   <= bt_d0[bt_lidx_pc];   id_bt_d1  <= bt_d1[bt_lidx_pc];
                      id_bt_v1   <= bt_v1[bt_lidx_pc];   id_bt_base <= bt_base[bt_lidx_pc];
                      id_bt_bp1  <= bt_bp1[bt_lidx_pc];  id_bt_bp2 <= bt_bp2[bt_lidx_pc];
@@ -3159,6 +3170,15 @@ module pipeline_core
                if (snoop_q   && (bt_lidx[k] == snoop_idx_q   || bt_blidx[k] == snoop_idx_q))   bt_v[k] <= 1'b0;
             end
             if (icinv) bt_v <= '0;
+            // the ID snapshot is a copy of one entry: the same kills apply to
+            // it (an older snapshot via its own indices; one taken on this
+            // edge via r_btk_* next cycle, in bt_hit)
+            if (ev_icinst && (id_bt_li == ev_icinst_idx || id_bt_bli == ev_icinst_idx)) id_bt_hit <= 1'b0;
+            if (snoop_q   && (id_bt_li == snoop_idx_q   || id_bt_bli == snoop_idx_q))   id_bt_hit <= 1'b0;
+            if (icinv) id_bt_hit <= 1'b0;
+            r_btk_icv <= ev_icinst;  r_btk_ic <= ev_icinst_idx;
+            r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;
+            r_btk_all <= icinv;
          end
 
          // ---------------- M12 pos-tracker composer (runs LAST) ----------------
@@ -3197,7 +3217,12 @@ module pipeline_core
             // follows), so its next line's prefetch starts on the same edge
             // instead of after the window is seen valid (~3 cycles later):
             // short target runs no longer drain the window before the NLB.
-            if (EN_BTPF && ev_btic && !ev_ovr) begin
+            // (not the full !ev_ovr guard: it put every squash — the RAS-miss
+            // m_rdata -> ret_actual cone — into the pf_line enable.  Only the
+            // common squash, a mispredicted fused branch in MEM (registers),
+            // is excluded: a prefetch started on that edge would hold the
+            // BRAM port the redirect's demand lookup needs next cycle.)
+            if (EN_BTPF && ev_btic && !fbr_taken) begin
                pf_look <= 1'b1;
                pf_line <= id_bt_want;
             end
