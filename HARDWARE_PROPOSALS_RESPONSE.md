@@ -197,8 +197,12 @@ accesses.
 
 ## 0l. Load → ALU/BOOL/FBR bypass: branch ldbyp (2026-11-02)
 
-`c6ba1db`, on master `f8fd12c`. **Status:** passed my board suite. Toolchain
-validation is pending.
+`c6ba1db`, on master `f8fd12c`. **Merged to master and written to QSPI on
+2026-11-02** (`--verify`; it boots from flash). Toolchain validation passed:
+the hw_* fixtures, csmith-board 150, zephyr and the board suite. Current
+compiler: CoreMark -O2 205.29, -Os 162.44; Embench 1.049 / 0.919. The
+compiler's ReadAdvance model of the latency-2 consumers is in (Embench
+−0.27% at -O2 and -Os). Rollback to btic64: `~/.cache/kbuild/rollback/README.txt`.
 
 **Change (`EN_LDBYP`).**
 - An ALU / BOOL / FBR consumer may dispatch while the fast load (LOAD / POP /

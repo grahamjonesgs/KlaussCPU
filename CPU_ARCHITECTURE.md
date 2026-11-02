@@ -470,14 +470,15 @@ single commit point: registers, flags, SP and mask commit here, in order).
 Every instruction becomes visible in program order at WB, so interrupts and
 debug halts are precise.
 
-Costs relative to the ideal one instruction per cycle (master `f8fd12c`,
+Costs relative to the ideal one instruction per cycle (master with ldbyp,
 2026-11-02; measured in the SoC simulator and on the board):
 
 | Situation | Cost |
 |-----------|------|
 | ALU result used by the **next** instruction | 1 bubble (forwarded from MEM) |
 | **Load** (LOAD/POP/LEAVE/RET) **hit** | 1 issue slot; independent loads issue every cycle (the load-hit pipe, §14.1) |
-| Load result used by a later instruction | the consumer issues 3 cycles after the load (2 bubbles if it is the very next instruction) |
+| Load result used by an **ALU / compare / fused-branch** op (ADD…XOR, CMP, INC/DEC, SETcc, MIN/MAX, FBR; rs1, or rs2 when a register) | the consumer issues 2 cycles after the load (1 bubble if it is the very next instruction) — LOAD/POP/LEAVE from DRAM only |
+| Load result used by anything else (shifts, MUL/DIV, MOV/LEA, an address or store-data operand, JMPR), or a MEMGET32 / LEAVERET / RET result | the consumer issues 3 cycles after the load |
 | Load **miss** | the DRAM time; the request goes out as the load leaves MEM |
 | **Store** | 1 issue slot when the port is idle (posted); back-to-back stores ~2 cycles each (the cache controller's write rate) |
 | Load after a store to the **same doubleword** whose bytes the store covers | none (store-to-load forwarding) |
@@ -499,7 +500,8 @@ Costs relative to the ideal one instruction per cycle (master `f8fd12c`,
 | Unaligned MEMGET32 or LEAVERET whose second dword is in another line | one extra memory read |
 
 Practical rules:
-- Put 2 independent instructions between a load and its use.
+- Put 1 independent instruction between a load and an ALU/compare/FBR use,
+  2 before any other use.
 - Prefer 1-word forms in hot straight-line code (2-word ops cost ~0.25 extra).
 - Keep hot loop tops and branch targets off the last word of a 16 B line.
 - Prefer the fused branch to CMP + Jcc.
