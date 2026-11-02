@@ -266,6 +266,14 @@ module pipeline_core
    // captures it (mem_mres).  Consumers forward from WB (latency 4, was 5);
    // flag readers wait for the MUL to commit (its flags stay off flags_eff).
    localparam bit EN_MUL2 = 1'b1;
+   // Load -> ALU/BOOL/FBR bypass: such a consumer may dispatch while the
+   // fast load (LOAD/POP/LEAVE) that writes its rs1/rs2 is in MEM, provided
+   // EX is empty (the load is the youngest writer).  The load's extracted
+   // value is registered at its MEM -> WB edge (wb_hext) and feeds the
+   // consumer's ALU / compare operands in EX; a load that missed holds the
+   // consumer in EX until its response commits, which is captured into the
+   // operand register.  Load-use distance 3 -> 2 for these consumers.
+   localparam bit EN_LDBYP = 1'b1;
    localparam bit EN_PFYIELD = 1'b0;   // (timing: -1.1 ns on the IF cone)
    localparam bit EN_NLB2SRV = 1'b1;   // the 2nd entry also serves line-cross rebases
    // HW proposal 2a (front end): branch-target instruction cache.  16
@@ -1182,6 +1190,12 @@ module pipeline_core
    // (EN_MUL2) MUL (no MEM forward), mem_mulq = MUL, mem_mulf / wb_mulf = a
    // flag-setting MUL
    logic        mem_lkq, mem_mulq, mem_mulf, wb_mulf;
+   // EN_LDBYP: mem_fastq = the MEM op is a fast load (registered at EX ->
+   // MEM); id_ldc = the ID op may consume through the bypass; ex_lb_a/b =
+   // the EX op reads rs1 / rs2 from the bypass; ex_w = its W-compare shift;
+   // wb_hext = the WB load's extracted value
+   logic        mem_fastq, id_ldc, ex_lb_a, ex_lb_b, ex_w;
+   logic [63:0] wb_hext;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
    // itself is in WB, flagged wb_ld, waiting for the data).
    logic       ld_out;
@@ -1239,9 +1253,15 @@ module pipeline_core
    // 1a: a fast load in WB has no forwardable value until it commits
    wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy) &&
                   !(EN_DC_H && wb_h && wb_hok);
-   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_lk && mem_d.wreg && mem_d.rd == id_rs1) ||
+   // EN_LDBYP: a fast load in MEM, an ALU/BOOL/FBR consumer: no hazard on
+   // that operand (it reads the load from WB through opa / opb; a younger
+   // writer of the same register in EX is still the b_ex hazard)
+   wire lb_ok = EN_LDBYP && id_ldc && mem_valid && mem_fastq && mem_d.wreg;
+   wire lb1   = lb_ok && mem_d.rd == id_rs1;
+   wire lb2   = lb_ok && mem_d.rd == dec.rs2 && !id_b_imm && !id_b_one;
+   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_lk && mem_d.wreg && mem_d.rd == id_rs1 && !lb1) ||
                (wb_ldlk && wb_rd == id_rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_lk && mem_d.wreg && mem_d.rd == dec.rs2) ||
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_lk && mem_d.wreg && mem_d.rd == dec.rs2 && !lb2) ||
                (wb_ldlk && wb_rd == dec.rs2);
    wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_lk && mem_d.wreg && mem_d.rd == id_rd) ||
                (wb_ldlk && wb_rd == id_rd);
@@ -1330,8 +1350,11 @@ module pipeline_core
    wire ex_is_dly  = ex_valid && (ex_d.uop == U_DELAY);
    wire dly_done   = dly_on && (dly_cnt >= dly_max);
    wire ex_is_lcd  = ex_valid && (ex_d.uop == U_LCD);
+   // EN_LDBYP: a bypass consumer whose load is not a hit-pipe answer in WB
+   // (it missed) waits in EX for the load's response (captured into ex_a/b)
+   wire ex_lbhold  = EN_LDBYP && ex_valid && (ex_lb_a || ex_lb_b) && !(wb_valid && wb_h && wb_hok);
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
-                  || (ex_is_lcd && !lcd_ready);
+                  || (ex_is_lcd && !lcd_ready) || ex_lbhold;
    assign perf_stall[4] = ex_busy;
 
    wire [63:0] w_div_abs_a   = (ex_d.sgn && ex_a[63]) ? (~ex_a + 64'd1) : ex_a;
@@ -1404,6 +1427,10 @@ module pipeline_core
                    : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
 
    wire [31:0] ex_sp_r = EN_SPFWD ? ex_sp : sp;
+   // EN_LDBYP: the ALU / BOOL / FBR operands (a bypassed load's value from
+   // WB, with the W-compare shift applied as at dispatch)
+   wire [63:0] opa = (EN_LDBYP && ex_lb_a) ? (ex_w ? {wb_hext[31:0], 32'b0} : wb_hext) : ex_a;
+   wire [63:0] opb = (EN_LDBYP && ex_lb_b) ? (ex_w ? {wb_hext[31:0], 32'b0} : wb_hext) : ex_b;
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1428,17 +1455,17 @@ module pipeline_core
             is_sub = (ex_d.sub == 4'd1) || (ex_d.sub == 4'd3) || (ex_d.sub == 4'd7);
             cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags_eff.carry : 1'b0;
             case (ex_d.sub)
-               4'd4: exo_result = ex_a & ex_b;
-               4'd5: exo_result = ex_a | ex_b;
-               4'd6: exo_result = ex_a ^ ex_b;
+               4'd4: exo_result = opa & opb;
+               4'd5: exo_result = opa | opb;
+               4'd6: exo_result = opa ^ opb;
                default: begin
-                  if (is_sub) sum = {1'b0, ex_a} - {1'b0, ex_b} - {64'b0, cin};
-                  else        sum = {1'b0, ex_a} + {1'b0, ex_b} + {64'b0, cin};
+                  if (is_sub) sum = {1'b0, opa} - {1'b0, opb} - {64'b0, cin};
+                  else        sum = {1'b0, opa} + {1'b0, opb} + {64'b0, cin};
                   exo_result        = sum[63:0];
                   exo_fval.carry    = sum[64];
                   exo_fval.sign     = sum[63];
-                  exo_fval.overflow = is_sub ? ((ex_a[63] != ex_b[63]) && (sum[63] != ex_a[63]))
-                                             : ((ex_a[63] == ex_b[63]) && (sum[63] != ex_a[63]));
+                  exo_fval.overflow = is_sub ? ((opa[63] != opb[63]) && (sum[63] != opa[63]))
+                                             : ((opa[63] == opb[63]) && (sum[63] != opa[63]));
                end
             endcase
          end
@@ -1446,22 +1473,22 @@ module pipeline_core
             // U_FBR: the taken bit lands in mem_result[0]; its target
             // (PC + 4*simm13, from ex_var2) rides in the EA register.
             if (ex_d.uop == U_FBR) exo_eaddr = ex_pc + ex_var2;
-            sa = ex_a; sb = ex_b;
+            sa = opa; sb = opb;
             case (cmp_op_e'(ex_d.sub))
-               CMP_EQ:   exo_result = (ex_a == ex_b) ? 64'b1 : 64'b0;
-               CMP_NE:   exo_result = (ex_a != ex_b) ? 64'b1 : 64'b0;
+               CMP_EQ:   exo_result = (opa == opb) ? 64'b1 : 64'b0;
+               CMP_NE:   exo_result = (opa != opb) ? 64'b1 : 64'b0;
                CMP_LT:   exo_result = (sa < sb)   ? 64'b1 : 64'b0;
                CMP_LE:   exo_result = (sa <= sb)  ? 64'b1 : 64'b0;
                CMP_GT:   exo_result = (sa > sb)   ? 64'b1 : 64'b0;
                CMP_GE:   exo_result = (sa >= sb)  ? 64'b1 : 64'b0;
-               CMP_ULT:  exo_result = (ex_a < ex_b)  ? 64'b1 : 64'b0;
-               CMP_ULE:  exo_result = (ex_a <= ex_b) ? 64'b1 : 64'b0;
-               CMP_UGT:  exo_result = (ex_a > ex_b)  ? 64'b1 : 64'b0;
-               CMP_UGE:  exo_result = (ex_a >= ex_b) ? 64'b1 : 64'b0;
-               CMP_MIN:  exo_result = (sa < sb) ? ex_a : ex_b;
-               CMP_MAX:  exo_result = (sa > sb) ? ex_a : ex_b;
-               CMP_MINU: exo_result = (ex_a < ex_b) ? ex_a : ex_b;
-               default:  exo_result = (ex_a > ex_b) ? ex_a : ex_b; // MAXU
+               CMP_ULT:  exo_result = (opa < opb)  ? 64'b1 : 64'b0;
+               CMP_ULE:  exo_result = (opa <= opb) ? 64'b1 : 64'b0;
+               CMP_UGT:  exo_result = (opa > opb)  ? 64'b1 : 64'b0;
+               CMP_UGE:  exo_result = (opa >= opb) ? 64'b1 : 64'b0;
+               CMP_MIN:  exo_result = (sa < sb) ? opa : opb;
+               CMP_MAX:  exo_result = (sa > sb) ? opa : opb;
+               CMP_MINU: exo_result = (opa < opb) ? opa : opb;
+               default:  exo_result = (opa > opb) ? opa : opb; // MAXU
             endcase
             // 2b-lite: an equality FBR redirects from EX (exo_taken), and
             // goes down the pipe as not-taken so MEM does not redirect again
@@ -1969,6 +1996,20 @@ module pipeline_core
    end
 
    // 1a: a fast load's value at its WB commit (the response this cycle)
+   function automatic logic [63:0] f_ldext(logic [63:0] dw, logic [2:0] ea, logic [1:0] msz,
+                                           logic sgn, logic full);
+      logic [7:0] b8; logic [15:0] h16; logic [31:0] w32;
+      b8  = dw[(ea * 8) +: 8];
+      h16 = dw[(ea[2:1] * 16) +: 16];
+      w32 = ea[2] ? dw[63:32] : dw[31:0];
+      if (full) return dw;
+      case (msz)
+         2'd0:    return sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
+         2'd1:    return sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
+         2'd2:    return sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
+         default: return dw;
+      endcase
+   endfunction
    // (stage 3: a hit-pipe hit's doubleword, else the port response)
    logic [63:0] wb_ldval;
    // (EN_MUL2: a MUL in WB taking its product from the DSP joins here, the
@@ -2041,6 +2082,7 @@ module pipeline_core
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          wb_mul <= 1'b0; wb_mdir <= 1'b0; mem_mage <= 2'd0;
          mem_lkq <= 1'b0; mem_mulq <= 1'b0; mem_mulf <= 1'b0; wb_mulf <= 1'b0;
+         mem_fastq <= 1'b0; ex_lb_a <= 1'b0; ex_lb_b <= 1'b0; id_ldc <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2182,6 +2224,16 @@ module pipeline_core
                irq_xc              <= 1'b0;
                irq_active          <= 1'b0;
             end
+         end
+
+         // EN_LDBYP: a bypass consumer that does not leave EX on the edge its
+         // load commits out of WB (a miss held it, or the pipe is frozen)
+         // captures the load's value then and runs from ex_a / ex_b
+         if (EN_LDBYP && ex_valid && (ex_lb_a || ex_lb_b) && wb_valid && !wb_wait &&
+             (ex_busy || mem_busy)) begin
+            if (ex_lb_a) ex_a <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
+            if (ex_lb_b) ex_b <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
+            ex_lb_a <= 1'b0;  ex_lb_b <= 1'b0;
          end
 
          // ---------------- WB: the single retire point ----------------
@@ -2709,6 +2761,10 @@ module pipeline_core
             // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
             // (age 1) or the capture (age 2+)
             wb_mul     <= mem_mul;
+            // EN_LDBYP: the hit-pipe / forwarded answer, extracted (a missed
+            // load's value comes from the port; its consumer captures that)
+            wb_hext    <= f_ldext(mem_h1 ? h_dword : mem_hdw, mem_eaddr[2:0], mem_d.msz, mem_d.sgn,
+                                  mem_d.uop != U_LOAD);
             wb_mulf    <= mem_mul && mem_mulf;
             wb_mdir    <= mem_mul && mem_mage == 2'd0;
             wb_mhi     <= mem_d.mdhigh;  wb_muns <= mem_d.mduns;  wb_mw32 <= mem_d.w32;
@@ -2771,6 +2827,8 @@ module pipeline_core
                               ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
                               (EN_MUL2 && ex_d.uop == U_MUL));
                mem_mulq   <= EN_MUL2 && ex_d.uop == U_MUL;
+               mem_fastq  <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE) &&
+                             !ex_misal && exo_iaddr[31:28] != 4'hF;
                mem_mulf   <= EN_MUL2 && ex_d.uop == U_MUL && exo_fmask != '0;
                mem_h      <= h_elig;
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
@@ -2826,6 +2884,9 @@ module pipeline_core
                            : rf[id_rs1]);
                // EN_SPFWD: the youngest older SP writer's value (one in EX
                // holds this op back via sp_busy)
+               ex_lb_a    <= id_use_rs1 && lb1;
+               ex_lb_b    <= id_use_rs2 && lb2;
+               ex_w       <= id_w;
                ex_sp      <= (mem_valid && mem_sp_we) ? mem_sp_new
                            : (wb_valid && wb_sp_we)   ? wb_sp_new : sp;
                ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
@@ -2933,6 +2994,7 @@ module pipeline_core
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_rs1    <= w_dec.rs1;
+                     id_ldc    <= (w_dec.uop == U_ALU || w_dec.uop == U_BOOL || w_dec.uop == U_FBR);
                      id_rd     <= w_dec.rd;
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
@@ -2996,7 +3058,7 @@ module pipeline_core
                   mem_d.uop    <= U_TRAP;
                   mem_d.wreg   <= 1'b0;
                   mem_d.is_mem <= 1'b0;
-                  mem_lkq      <= 1'b0;  mem_mulq <= 1'b0;  mem_mulf <= 1'b0;
+                  mem_lkq      <= 1'b0;  mem_mulq <= 1'b0;  mem_mulf <= 1'b0;  mem_fastq <= 1'b0;
                   ev_pcz       = 1'b1;
                   id_valid     <= 1'b0;
                   ex_valid     <= 1'b0;
@@ -3300,6 +3362,13 @@ module pipeline_core
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (mem_valid)
+         assert (mem_fastq == (mem_fastld && EN_LD_WB))
+            else $fatal(1, "mem_fastq drift: pc=%h", mem_pc);
+      if (ex_valid && (ex_lb_a || ex_lb_b) && wb_valid && wb_h && wb_hok)
+         assert (wb_ld && (!ex_lb_a || wb_rd == ex_d.rs1) && (!ex_lb_b || wb_rd == ex_d.rs2) &&
+                 wb_hext == wb_ldval)
+            else $fatal(1, "load bypass: producer not in WB: pc=%h", ex_pc);
       if (mem_valid)
          assert (mem_lkq == (mem_loadlk || (EN_MUL2 && mem_d.uop == U_MUL)) && mem_mulq == (EN_MUL2 && mem_d.uop == U_MUL))
             else $fatal(1, "mem_lkq / mem_mulq drift: pc=%h", mem_pc);
