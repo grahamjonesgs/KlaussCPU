@@ -169,6 +169,14 @@ module pipeline_core
    // on the EX redirect path would not close.  TIMING-UNVERIFIED: default 0
    // until a build shows the exo_taken -> pc family still meets.
    localparam bit EN_FBR_EQ_EX = 1'b0;
+   // HW proposal 5 (restricted): ALU -> ALU bypass.  A U_ALU op (ADD/SUB/
+   // ADC/SBC/AND/OR/XOR/CMP/INC/DEC, not the W compare) may dispatch right
+   // behind the U_ALU op that writes its rs1/rs2: it reads the producer's
+   // mem_result (sign-extended for a W producer) through a mux on the ALU
+   // operand copies only.  The AGU, branch targets, MUL/DIV and every other
+   // EX consumer keep reading the ex_a/ex_b registers.  0 = such a pair waits
+   // one cycle for the dispatch-time forward (ALU latency 2).
+   localparam bit EN_ALU_BYP = 1'b1;
    // HW proposal 2a, stage (a): return-address stack.  A taken CALL pushes
    // its return address as it leaves EX; a RET / LEAVERET dispatching from
    // ID with a non-empty stack redirects fetch to the top entry instead of
@@ -950,6 +958,9 @@ module pipeline_core
    // except ENTER / LEAVE / LEAVERET (R15).  Keeps the f_decode levels off
    // the id_op -> rf[] -> ex_a operand mux (fanout 129).
    logic [3:0] id_rs1, id_rd;
+   // EN_ALU_BYP: the ID op is U_ALU (latched); the EX op is U_ALU; the EX op
+   // reads rs1 / rs2 from the MEM producer (set at dispatch).
+   logic id_isalu, ex_isalu, ex_byp_a, ex_byp_b;
    // ISA v3 D2: 32-bit compare (class 3 W [19], not the short form). Both
    // operands are shifted left 32 at the dispatch mux: a 64-bit compare of
    // {a[31:0],0} vs {b[31:0],0} yields exactly the 32-bit Z/S/C/V (and the
@@ -1120,9 +1131,14 @@ module pipeline_core
    // (register fields: id_rs1 / id_rd predecoded at the latch; dec.rs2 = op[3:0])
    // 1a: a fast load in WB has no forwardable value until it commits
    wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg && !(EN_LD_FWD && ld_out && w_mrdy);
-   wire hit1 = (b_ex && ex_d.rd == id_rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
+   // EN_ALU_BYP: an EX U_ALU producer feeding an ID U_ALU consumer is no
+   // hazard — the consumer takes it from MEM through the ALU operand mux.
+   wire byp_pair = EN_ALU_BYP && ex_isalu && id_isalu && !id_w;
+   wire byp1 = b_ex && ex_d.rd == id_rs1  && byp_pair;
+   wire byp2 = b_ex && ex_d.rd == dec.rs2 && byp_pair;
+   wire hit1 = (b_ex && ex_d.rd == id_rs1 && !byp_pair) || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rs1) ||
                (wb_ldlk && wb_rd == id_rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2 && !byp_pair) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
                (wb_ldlk && wb_rd == dec.rs2);
    wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rd) ||
                (wb_ldlk && wb_rd == id_rd);
@@ -1259,6 +1275,12 @@ module pipeline_core
    wire ex_dis_eff = (mem_valid && mem_dis_we) ? mem_dis_new
                    : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
 
+   // EN_ALU_BYP operand copies for the U_ALU case only: the MEM producer's
+   // value is mem_result_eff without the shift leg (a U_ALU producer is
+   // never a MEM-stage shift).
+   wire [63:0] byp_v = mem_d.w32 ? {{32{mem_result[31]}}, mem_result[31:0]} : mem_result;
+   wire [63:0] alu_a = (EN_ALU_BYP && ex_byp_a) ? byp_v : ex_a;
+   wire [63:0] alu_b = (EN_ALU_BYP && ex_byp_b) ? byp_v : ex_b;
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1283,17 +1305,17 @@ module pipeline_core
             is_sub = (ex_d.sub == 4'd1) || (ex_d.sub == 4'd3) || (ex_d.sub == 4'd7);
             cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags_eff.carry : 1'b0;
             case (ex_d.sub)
-               4'd4: exo_result = ex_a & ex_b;
-               4'd5: exo_result = ex_a | ex_b;
-               4'd6: exo_result = ex_a ^ ex_b;
+               4'd4: exo_result = alu_a & alu_b;
+               4'd5: exo_result = alu_a | alu_b;
+               4'd6: exo_result = alu_a ^ alu_b;
                default: begin
-                  if (is_sub) sum = {1'b0, ex_a} - {1'b0, ex_b} - {64'b0, cin};
-                  else        sum = {1'b0, ex_a} + {1'b0, ex_b} + {64'b0, cin};
+                  if (is_sub) sum = {1'b0, alu_a} - {1'b0, alu_b} - {64'b0, cin};
+                  else        sum = {1'b0, alu_a} + {1'b0, alu_b} + {64'b0, cin};
                   exo_result        = sum[63:0];
                   exo_fval.carry    = sum[64];
                   exo_fval.sign     = sum[63];
-                  exo_fval.overflow = is_sub ? ((ex_a[63] != ex_b[63]) && (sum[63] != ex_a[63]))
-                                             : ((ex_a[63] == ex_b[63]) && (sum[63] != ex_a[63]));
+                  exo_fval.overflow = is_sub ? ((alu_a[63] != alu_b[63]) && (sum[63] != alu_a[63]))
+                                             : ((alu_a[63] == alu_b[63]) && (sum[63] != alu_a[63]));
                end
             endcase
          end
@@ -1827,6 +1849,7 @@ module pipeline_core
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
          id_rs1 <= 4'd0; id_rd <= 4'd0;
+         id_isalu <= 1'b0; ex_isalu <= 1'b0; ex_byp_a <= 1'b0; ex_byp_b <= 1'b0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
       end else if (ce) begin
@@ -2489,6 +2512,10 @@ module pipeline_core
                            : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
                            : rf[dec.rs2]);
 
+               ex_isalu   <= id_isalu;
+               ex_byp_a   <= id_use_rs1 && byp1;
+               ex_byp_b   <= id_use_rs2 && !id_b_imm && !id_b_one && byp2;
+
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
                   ev_pcz     = 1'b1;
@@ -2580,6 +2607,7 @@ module pipeline_core
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
                      id_rs1    <= w_dec.rs1;
+                     id_isalu  <= (w_dec.uop == U_ALU);
                      id_rd     <= w_dec.rd;
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
@@ -2837,6 +2865,27 @@ module pipeline_core
    end
 
 `ifndef SYNTHESIS
+   // RAW-stall histogram (sim only, +RAWHIST): for each exclusive data-stall
+   // cycle (ID blocked by a GPR RAW while neither MEM nor EX is busy), the
+   // blocking producer (EX op uop, or a load in MEM / WB) and the consumer.
+   int raw_hist [string];
+   bit raw_hist_on = $test$plusargs("RAWHIST");
+   always_ff @(posedge clk) if (raw_hist_on && !rst && running && !mem_busy && !ex_busy && id_valid) begin
+      string pk, ck;
+      logic h1x, h2x, hdx;
+      h1x = id_use_rs1 && b_ex && ex_d.rd == id_rs1 && !(EN_ALU_BYP && byp_pair);
+      h2x = id_use_rs2 && b_ex && ex_d.rd == dec.rs2 && !(EN_ALU_BYP && byp_pair);
+      hdx = id_use_rdd && b_ex && ex_d.rd == id_rd;
+      if ((id_use_rs1 && hit1) || (id_use_rs2 && hit2) || (id_use_rdd && hitd)) begin
+         if (h1x || h2x || hdx) pk = {"EX:", ex_d.uop.name()};
+         else if (mem_loadlk) pk = {"MEMLD:", mem_d.uop.name()};
+         else pk = "WBLD";
+         ck = {dec.uop.name(), h1x ? ".a" : h2x ? ".b" : hdx ? ".d" : ""};
+         raw_hist[{pk, " -> ", ck}]++;
+      end
+   end
+   final if (raw_hist_on) foreach (raw_hist[k]) $display("RAWH %0d %s", raw_hist[k], k);
+
    // M12 pos-tracker self-checks. Position flags are ONE-DIRECTIONAL by
    // design (a set flag must be TRUE; a clear flag may be conservative —
    // post-redirect zeros force the rebase path, which is correct). The
@@ -2865,6 +2914,15 @@ module pipeline_core
                  id_use_rdd == dec.use_rdd && id_fread == dec.fread &&
                  id_sp_rw == (dec.sp_rd || dec.sp_wr))
             else $fatal(1, "id hazard predecode drift: op=%h", id_op);
+      if (id_valid)
+         assert (id_isalu == (dec.uop == U_ALU))
+            else $fatal(1, "id_isalu predecode drift: op=%h", id_op);
+      if (ex_valid && (ex_byp_a || ex_byp_b))
+         assert (EN_ALU_BYP && ex_d.uop == U_ALU && mem_valid && mem_d.wreg &&
+                 mem_d.uop == U_ALU && !mem_is_sh && !mem_is_read &&
+                 (!ex_byp_a || mem_d.rd == ex_d.rs1) && (!ex_byp_b || mem_d.rd == ex_d.rs2) &&
+                 byp_v == mem_result_eff)
+            else $fatal(1, "ALU bypass: producer not in MEM: pc=%h", ex_pc);
       if (id_valid)
          assert (id_rs1 == dec.rs1 && id_rd == dec.rd)
             else $fatal(1, "id_rs1/id_rd predecode drift: op=%h", id_op);
