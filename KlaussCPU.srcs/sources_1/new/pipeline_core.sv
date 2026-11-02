@@ -249,6 +249,8 @@ module pipeline_core
    // in-flight prefetch" rule was tried and dropped: it interacted badly with
    // EN_BTPF on crc32.)  0 = the M9 single NLB.
    localparam bit EN_NLB2 = 1'b1;
+   localparam bit EN_PFYIELD = 1'b0;   // (timing: -1.1 ns on the IF cone)
+   localparam bit EN_NLB2SRV = 1'b1;   // the 2nd entry also serves line-cross rebases
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -504,7 +506,7 @@ module pipeline_core
    // supply the next op and neither NLB entry nor a slide can: the demand's
    // free first-cycle read of miss_dw stays free; the prefetch resumes.)
    logic              pf_yield;
-   wire               pf_sel      = pf_look && !if_look && !(EN_NLB2 && pf_yield);
+   wire               pf_sel      = pf_look && !if_look && !(EN_NLB2 && EN_PFYIELD && pf_yield);
    wire [IC_IDXW-1:0] ic_look_idx = pf_sel ? pf_line[IC_IDXW-1:0]
                                            : miss_dw[IC_IDXW:1];
    wire [18:0]        ic_look_tag = miss_dw[28:IC_IDXW+1];
@@ -545,7 +547,7 @@ module pipeline_core
    // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
    wire        nlb0_dw_ok     = (nlb_line == miss_dw[28:1]) &&
                                 (miss_dw[0] ? nlb_vlo : nlb_vhi);
-   wire        nlb1_dw_ok     = EN_NLB2 && (nlb1_line == miss_dw[28:1]) &&
+   wire        nlb1_dw_ok     = EN_NLB2 && EN_NLB2SRV && (nlb1_line == miss_dw[28:1]) &&
                                 (miss_dw[0] ? nlb1_vlo : nlb1_vhi);
    wire        nlb_dw_ok      = nlb0_dw_ok || nlb1_dw_ok;
    wire [127:0] nlb_srv_data  = nlb0_dw_ok ? nlb_data : nlb1_data;
