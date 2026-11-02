@@ -470,49 +470,70 @@ single commit point: registers, flags, SP and mask commit here, in order).
 Every instruction becomes visible in program order at WB, so interrupts and
 debug halts are precise.
 
-Costs relative to the ideal one instruction per cycle:
+Costs relative to the ideal one instruction per cycle (master `f8fd12c`,
+2026-11-02; measured in the SoC simulator and on the board):
 
 | Situation | Cost |
 |-----------|------|
-| ALU result used by the **next** instruction | 1 bubble (forwarded from MEM after that) |
-| D-cache **load hit** | MEM is held ~3 cycles and the whole pipe freezes behind it (`PERF_MEM_WAIT`); +1 when the previous instruction was also a memory access (no early issue, §14.1); a miss adds the DRAM time |
-| D-cache **store hit** | posted: MEM ~2 cycles; the next memory access waits for the drain, so back-to-back stores cost ~3 each |
-| **Load** (or POP/LEAVE) result used by the next instruction | 2 bubbles beyond the hit time (forwarded from WB) |
-| Flag reader (Jcc, ADC/SBC, RCL/RCR, GETF) right after a flag writer | 1 bubble |
-| SP user after an SP writer still in flight (push/pop/call/ADDSP/…) | waits until the writer commits |
-| Branch / call **predicted** correctly (§14.1) | taken: ~3.3 cycles (redirect from ID); not taken: 1 |
-| Branch **mispredicted** | resolved in EX (JMPcc/CALL) or MEM (FBR): younger work squashed, ~6–7 cycles for an FBR |
-| RET / LEAVERET with a return-stack hit | fetch continues at the predicted address (CALL leaf + RET ≈ 12.8) |
-| RET / LEAVERET without one, IRET | fetch stops until the return address is read in MEM |
-| HALT, WAIT, RESET, TRAP, illegal | serialize (fetch stops behind them) |
-| MUL | occupies EX ~4 cycles |
+| ALU result used by the **next** instruction | 1 bubble (forwarded from MEM) |
+| **Load** (LOAD/POP/LEAVE/RET) **hit** | 1 issue slot; independent loads issue every cycle (the load-hit pipe, §14.1) |
+| Load result used by a later instruction | the consumer issues 3 cycles after the load (2 bubbles if it is the very next instruction) |
+| Load **miss** | the DRAM time; the request goes out as the load leaves MEM |
+| **Store** | 1 issue slot when the port is idle (posted); back-to-back stores ~2 cycles each (the cache controller's write rate) |
+| Load after a store to the **same doubleword** whose bytes the store covers | none (store-to-load forwarding) |
+| Load after a store to the same doubleword it only **partly** overlaps | +2 to +3 within 2 instructions of the store |
+| Load after a store to **another doubleword of the same 32 B line** | +1.5, only when exactly 2 instructions after the store |
+| Flag reader (Jcc, FBR on flags, ADC/SBC, RCL/RCR, GETF) right after a flag writer | 1 bubble; after a MUL, it waits for the MUL to commit (issue +4) |
+| SP user right after an SP writer (PUSH/POP/CALL/RET/ADDSP/…) | 1 bubble (the new SP is forwarded from MEM/WB) |
+| **MUL** | occupies EX 2 cycles; its result is usable 4 cycles after it issues |
 | DIV/MOD | occupies EX: setup + up to 64 steps (leading zeros of the dividend are skipped) |
+| Branch predicted **taken**, target in the branch-target cache | about 2 cycles beyond the branch's own slot; ~1 more when the target is the last word of a 16 B line |
+| Branch predicted taken, target not cached | about 3–4 cycles (I-cache lookup) |
+| Branch predicted **not taken** | none |
+| Branch **mispredicted** | resolved in EX (JMPcc/CALL) or MEM (FBR): younger work squashed, ~6–7 cycles |
+| CALL + RET of an empty function (return-stack hit) | ~6.5 cycles for the pair |
+| RET / LEAVERET without a return-stack hit, IRET | fetch stops until the return address is read |
+| HALT, WAIT, RESET, TRAP, illegal | serialize (fetch stops behind them) |
 | DELAY, LCD | occupy EX until done / port ready |
+| Straight-line fetch | 1-word ops 1/cycle; 2-word ops ~1.25 cycles each; 3-word ops ~2.5 |
 | Unaligned MEMGET32 or LEAVERET whose second dword is in another line | one extra memory read |
-| Data access while fetch holds the port, or a cache miss | MEM waits on the port |
 
-Practical rules: interleave loads and stores with ALU work (an access
-right after another access loses the early issue); prefer the fused branch
-to CMP + Jcc in tight loops; ENTER/LEAVERET and the 1-word short forms
-reduce fetch traffic.
+Practical rules:
+- Put 2 independent instructions between a load and its use.
+- Prefer 1-word forms in hot straight-line code (2-word ops cost ~0.25 extra).
+- Keep hot loop tops and branch targets off the last word of a 16 B line.
+- Prefer the fused branch to CMP + Jcc.
+- Don't put a narrow store and a wider load of the same doubleword within 2
+  instructions of each other.
 
-### 14.1 Prediction and the memory path (branch mem-early)
+### 14.1 Prediction, fetch and the memory path
 
 - **Branch prediction (ID stage).** 512 two-bit counters, indexed by
   pc[10:2], start weakly not-taken. They predict JMPcc and FBR, and predict
-  taken only at counter 3, so a branch needs two takens after a not-taken
-  before it is predicted taken again. Direct JMP/CALL are always predicted
-  taken. A predicted-taken branch redirects fetch from ID; the branch
-  still resolves in EX/MEM and redirects only when the prediction was
+  taken only at counter 3. Direct JMP/CALL are always predicted taken. A
+  predicted-taken branch redirects fetch on its first cycle in ID; the
+  branch still resolves in EX/MEM and redirects only when the prediction was
   wrong.
+- **Branch-target instruction cache (BTIC).** 64 entries, indexed by
+  pc[7:2] ^ pc[13:8]. Each holds the first fetch window at a taken branch's
+  target, so the redirect does not wait for the I-cache. It is invalidated
+  with the I-cache lines it was captured from.
 - **Return stack.** 4 entries. A taken CALL pushes its return address; a
   RET/LEAVERET with a non-empty stack is predicted and checked against the
-  loaded address in MEM. Deeper call chains fall back to the serialized
-  path.
-- **Early load issue.** A load entering MEM while the port is idle sends its
-  request on that edge, and the DRAM response returns to the core without
-  the old bus_splitter register. A 64-bit load hit then costs ~3 cycles,
-  or ~4 when it directly follows another memory access.
+  stack when the RET reaches MEM.
+- **Fetch.** A 16 B window slides a dword per cycle from a 2-entry
+  next-line buffer that a background I-cache prefetch keeps one line ahead.
+  A BTIC-hit redirect starts the prefetch of the target's next line at once.
+- **Load-hit pipe.** A DRAM load (LOAD/POP/LEAVE/RET) looks itself up in a
+  read-only copy of the D-cache arrays as it enters MEM. A hit leaves MEM
+  after one cycle with its data. A miss, or a conflict with a cache write in
+  progress, takes the cache controller's path.
+- **Stores.** A DRAM store leaves MEM as it issues (posted). If it turns out
+  to overwrite code the front end holds (self-modifying code), everything
+  younger is refetched.
+- **Store-to-load forwarding.** A load whose doubleword matches the youngest
+  in-flight store, and whose bytes that store covers, takes the store's data
+  directly.
 
 The core exports per-cycle hazard counters (RAW, load-use, flag, SP,
 EX-busy, branch flush, fetch miss, port wait). They are readable through the
