@@ -230,6 +230,15 @@ module pipeline_core
    // ordinary port request from WB (wb_hmiss) and waits there like a 1a fast
    // load.  0 = 1a stage 2 (the port for every load).
    localparam bit EN_DC_H = 1'b1;
+   // One-slot stores: a DRAM store whose port is completely idle leaves MEM
+   // on its issue edge, posted at once (st_post) — before st_post_ok (the
+   // registered "no fetch-side code copy" check) is known.  The cycle after,
+   // a store that should not have posted (it overlaps code somewhere on the
+   // fetch side: SMC) squashes everything younger (MEM/EX/ID) and refetches
+   // from its fall-through; the refetch goes through the port behind it and
+   // the I-cache snoop has cleared the line by then.  0 = a store holds MEM
+   // for its issue cycle plus the post cycle (1c).
+   localparam bit EN_ST1 = 1'b1;
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -1536,6 +1545,11 @@ module pipeline_core
    // this flop, so the post decision (mem_done_now) reads registers only.
    // A code-touching store keeps the completion-time SMC squash path.
    logic       st_post, st_post_ok;
+   // EN_ST1: st_spec = the store that left MEM last edge posted
+   // speculatively (st_post_ok is its verdict this cycle); st_spec_nx = its
+   // fall-through, the refetch pc if it was not postable
+   logic        st_spec;
+   logic [31:0] st_spec_nx;
    logic [28:0] if_req_dw;
    logic        if_rebase;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !ld_out
@@ -1595,7 +1609,15 @@ module pipeline_core
    // LEAVERET: [R15+8] not in the same line -> second read (same path)
    wire lr_need2     = mem_valid && mem_d.uop == U_LEAVERET && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
-   wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
+   // EN_ST1: the store issues this edge onto a completely idle port (no
+   // chaining — registers only) and leaves MEM with it
+   wire st_spec_now  = EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
+                       mem_iaddr[31:28] != 4'hF && mem_xc == 2'd0 &&
+                       !if_xc && !wb_hmiss && !ld_out && !st_post && !(DEBUG_EN && dbg_mx);
+   // ...and, the cycle after, turns out to overlap fetch-side code
+   wire sq_spec      = EN_ST1 && st_spec && !st_post_ok;
+   wire mem_done_now = st_spec_now ||
+                       (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
                        (mem_xc == 2'd3 && w_mrdy) ||
                        (mem_xc == 2'd1 && st_post_ok) ||  // 1c: posted (registered)
                        (mem_xc == 2'd1 && mem_fastld);    // 1a: issued; WB collects the data
@@ -1615,7 +1637,11 @@ module pipeline_core
    // IF-issue cones, the build's worst paths.)
    wire ex_hld       = (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
    wire h_elig       = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
-                       !(m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) && !(DEBUG_EN && dbg_mx);
+                       !(m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) &&
+                       // (EN_ST1: nor behind a same-line store leaving MEM on
+                       // this very edge — it is not on the port yet)
+                       !(mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]) &&
+                       !(DEBUG_EN && dbg_mx);
    assign h_addr     = exo_iaddr;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
@@ -1627,7 +1653,8 @@ module pipeline_core
    // ---- completing-store squashes (evaluated on the store's completion edge,
    // the same edge the EX op would advance into MEM) ----
    // SMC: a DRAM store overlapping the code of the younger op in EX or ID.
-   wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF;
+   wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF &&
+                            !st_spec_now;   // (EN_ST1: checked the cycle after, sq_spec)
    wire [28:0] smc_dw     = mem_iaddr[31:3];
    wire        smc_hit_id = smc_st && id_valid &&
                             (id_pc[31:3] == smc_dw || id_last_dw == smc_dw);
@@ -1665,8 +1692,10 @@ module pipeline_core
    // clear stop any re-capture of the stored line, and a pre-store copy slid
    // into the window is still at base/base+1 (or squashes via hit_id/hit_ex)
    // when the completion snoop lands — the same window the 1-cycle serve has.
+   // (EN_ST1: a speculatively posted store has no completion-edge squash —
+   // sq_spec, a cycle later, clears the whole IFB — so it does not gate.)
    wire w_slide = in1 && slide_dw_ok &&
-                  !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF);
+                  !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF && !st_spec_now);
 
    // branch / flush / fetch / port attribution (events and wait cycles)
    // An EX op killed this edge by an older fused branch or a store squash
@@ -1855,7 +1884,7 @@ module pipeline_core
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
-         st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0;
+         st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
@@ -2131,6 +2160,11 @@ module pipeline_core
             ld_out    <= 1'b1;
          end
 
+         // EN_ST1: the speculative post's verdict (st_post_ok) is consumed
+         // this cycle (sq_spec, below); a new issue below re-sets both
+         st_spec <= 1'b0;
+         if (st_spec) st_post_ok <= 1'b0;
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
@@ -2194,6 +2228,13 @@ module pipeline_core
                   end
                   if (mem_port_wr && pf_look && pf_line == mem_iaddr[31:4])
                      pf_look <= 1'b0;
+                  // EN_ST1: the store leaves MEM now, already posted
+                  if (st_spec_now) begin
+                     mem_xc     <= 2'd0;
+                     st_post    <= 1'b1;
+                     st_spec    <= 1'b1;
+                     st_spec_nx <= mem_pc_next;
+                  end
                end
                2'd1: if (w_mrdy) begin
                   if (mem_need2) begin         // cross-line MEMGET32 / LEAVERET: 2nd read
@@ -2449,7 +2490,7 @@ module pipeline_core
          if (mem_busy) begin
             if (!wb_wait) wb_valid <= 1'b0;   // (1a: a waiting fast load stays in WB)
          end else begin
-            wb_valid   <= mem_valid;
+            wb_valid   <= mem_valid && !sq_spec;
             wb_ld      <= mem_fastld;
             wb_ld_full <= (mem_d.uop != U_LOAD);   // POP / LEAVE: the whole dword
             wb_ld_msz  <= mem_d.msz;
@@ -2537,7 +2578,7 @@ module pipeline_core
                // mispredicted RET redirects costs only a later RAS miss, and the
                // m_rdata compare would sit on the RAS write enable)
                if (EN_RAS && ex_valid && ex_d.uop == U_CALL && exo_taken &&
-                   !fbr_taken && !sq_ex) begin
+                   !fbr_taken && !sq_ex && !sq_spec) begin
                   ras[ras_ptr] <= ex_pc_next;
                   ras_ptr      <= ras_ptr + 1'b1;
                   if (ras_cnt != (RAS_PW+1)'(RAS_DEPTH)) ras_cnt <= ras_cnt + 1'b1;
@@ -2823,6 +2864,32 @@ module pipeline_core
             pc       <= pc;
          end
 
+         // EN_ST1: the store that posted speculatively last edge overlaps
+         // fetch-side code.  Everything younger (MEM, EX, ID, the IFB) was
+         // fetched before its write: squash it all and refetch from the
+         // store's fall-through.  Last in the block: wins over every other
+         // redirect / dispatch this edge.  (MEM -> WB and the RAS push are
+         // gated by sq_spec where they are written.)
+         if (sq_spec) begin
+            ev_ovr = 1'b1;
+            if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;
+            if (DEBUG_EN) id_bp <= 1'b0;
+            mem_valid  <= 1'b0;
+            ex_valid   <= 1'b0;
+            dly_on     <= 1'b0;
+            div_ph     <= MD_IDLE;
+            id_valid   <= 1'b0;
+            ifb_val    <= 2'b00;
+            // one cycle after the issue an I-cache lookup / prefetch started
+            // before the snoop (clearing the line on this edge) may still be
+            // in flight: drop them and the NLB, as ICACHE_INV does
+            nlb_vhi    <= 1'b0;  nlb_vlo <= 1'b0;
+            pf_look    <= 1'b0;  if_look <= 1'b0;
+            ev_pcz     = 1'b1;
+            pc         <= st_spec_nx;
+            fetch_halt <= 1'b0;
+         end
+
          // debugger register write (debug-halted: no WB activity competes)
          if (dbg_halted && dbg_i.reg_we) begin
             case (dbg_i.reg_idx)
@@ -2843,8 +2910,15 @@ module pipeline_core
          // Capture: the redirect of a missed entry has been served — the
          // window sits at the target with pc still on it.  (Slot 1 only when
          // it is in the same I-cache line, so one line index covers it.)
+         // Not on an edge whose store snoop covers the entry's lines: the
+         // invalidation below compares the entries' OLD line indices, so a
+         // capture landing on the snoop edge would survive it holding the
+         // pre-store window.  Nor on an EN_ST1 squash edge (the window may
+         // predate the store).  The capture stays pending; a later, fresh
+         // window at the target installs it.
          if (EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
-             pc_dw == r_bt_wbase) begin
+             pc_dw == r_bt_wbase && !sq_spec &&
+             !(snoop_q && (r_bt_wbase[IC_IDXW:1] == snoop_idx_q || r_bt_wblidx == snoop_idx_q))) begin
             bt_v[r_bt_widx]    <= 1'b1;
             bt_tag[r_bt_widx]  <= r_bt_wtag;
             bt_base[r_bt_widx] <= r_bt_wbase;
@@ -2938,6 +3012,14 @@ module pipeline_core
           m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) hc_stblk++;
    end
    final if (hc_on) $display("HCOV core hit=%0d miss=%0d store_blocked=%0d", hc_hit, hc_miss, hc_stblk);
+   // +HCOV: cycles a store spends in MEM after its issue cycle (its 2nd
+   // slot: posting, or waiting for ready), and the total cycles
+   int sc_st2 = 0, sc_cyc = 0;
+   always_ff @(posedge clk) if (hc_on && !rst && running) begin
+      sc_cyc++;
+      if (mem_valid && mem_is_write && mem_xc != 2'd0) sc_st2++;
+   end
+   final if (hc_on) $display("HCOV store2 %0d of %0d cycles", sc_st2, sc_cyc);
 
    // M12 pos-tracker self-checks. Position flags are ONE-DIRECTIONAL by
    // design (a set flag must be TRUE; a clear flag may be conservative —
