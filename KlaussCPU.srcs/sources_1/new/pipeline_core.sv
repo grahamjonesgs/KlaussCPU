@@ -242,6 +242,13 @@ module pipeline_core
    // Front end: start the next-line prefetch on a BTIC-hit redirect edge
    // (the window is already loaded; no demand lookup needs the BRAM port).
    localparam bit EN_BTPF = 1'b1;
+   // Front end: a 2-entry next-line buffer.  Either entry serves slides and
+   // line crosses; the prefetch fills want_line, then (pipelined, no idle
+   // cycle) want_line+1, so straight code runs a line ahead: 2-word code
+   // fetches at ~1.2 cycles/op instead of 2.0.  (A "demand waits for the
+   // in-flight prefetch" rule was tried and dropped: it interacted badly with
+   // EN_BTPF on crc32.)  0 = the M9 single NLB.
+   localparam bit EN_NLB2 = 1'b1;
    // HW proposal 2a (front end): branch-target instruction cache.  16
    // entries indexed by branch pc[5:2], each holding the fetch window seen
    // at that branch's target (base dword + 2 dwords).  A predicted-taken
@@ -467,6 +474,10 @@ module pipeline_core
    logic [127:0] nlb_data;
    logic [27:0]  nlb_line;            // line address = dword[28:1] = byte[31:4]
    logic         nlb_vhi, nlb_vlo;    // per-dword valid (addr3=0 / addr3=1)
+   // EN_NLB2: the second entry (same shape; either entry may hold any line)
+   logic [127:0] nlb1_data;
+   logic [27:0]  nlb1_line;
+   logic         nlb1_vhi, nlb1_vlo;
    logic         pf_look;             // prefetch lookup owns the BRAM read port
    logic [27:0]  pf_line;
    logic         if_look;             // demand I-cache lookup phase (no port) —
@@ -476,12 +487,24 @@ module pipeline_core
    // the current straddle line's missing low dword). M12: registered
    // (r_want_line, maintained with the base+K triple) — no live +1 adder.
    wire  [27:0]  want_line    = r_want_line;
-   wire          nlb_has_want = (nlb_vhi || nlb_vlo) && (nlb_line == want_line);
+   wire          nlb0_has_want = (nlb_vhi || nlb_vlo) && (nlb_line == want_line);
+   wire          nlb1_has_want = EN_NLB2 && (nlb1_vhi || nlb1_vlo) && (nlb1_line == want_line);
+   wire          nlb_has_want  = nlb0_has_want || nlb1_has_want;
+   // EN_NLB2: the line after want (the prefetch's second target)
+   wire  [27:0]  want_p1       = r_want_line + 28'd1;
+   wire          nlb0_has_wp1  = (nlb_vhi || nlb_vlo) && (nlb_line == want_p1);
+   wire          nlb1_has_wp1  = EN_NLB2 && (nlb1_vhi || nlb1_vlo) && (nlb1_line == want_p1);
+   wire          nlb_has_wp1   = nlb0_has_wp1 || nlb1_has_wp1;
 
    // Demand lookups own the BRAM read port whenever if_look is (or is about to
    // go) active; the prefetch leg uses it only in the gaps. Same-index reads
    // return the same row, so a mux switch can never serve stale data.
-   wire               pf_sel      = pf_look && !if_look;
+   // (EN_NLB2: the prefetch runs most of the time, so it also yields the
+   // port on a cycle the demand side will start a lookup — the window cannot
+   // supply the next op and neither NLB entry nor a slide can: the demand's
+   // free first-cycle read of miss_dw stays free; the prefetch resumes.)
+   logic              pf_yield;
+   wire               pf_sel      = pf_look && !if_look && !(EN_NLB2 && pf_yield);
    wire [IC_IDXW-1:0] ic_look_idx = pf_sel ? pf_line[IC_IDXW-1:0]
                                            : miss_dw[IC_IDXW:1];
    wire [18:0]        ic_look_tag = miss_dw[28:IC_IDXW+1];
@@ -520,11 +543,16 @@ module pipeline_core
    wire pf_rd_current = pf_sel && (ic_rd_idx == pf_line[IC_IDXW-1:0]);
    wire pf_tag_match  = pf_rd_current && (ic_rd_tag == pf_line[27:IC_IDXW]);
    // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
-   wire        nlb_dw_ok      = (nlb_line == miss_dw[28:1]) &&
+   wire        nlb0_dw_ok     = (nlb_line == miss_dw[28:1]) &&
                                 (miss_dw[0] ? nlb_vlo : nlb_vhi);
-   wire [63:0] nlb_rdata      = miss_dw[0] ? nlb_data[63:0] : nlb_data[127:64];
-   wire [63:0] nlb_rdata_next = nlb_data[63:0];
-   wire        nlb_next_valid = !miss_dw[0] && nlb_vlo;
+   wire        nlb1_dw_ok     = EN_NLB2 && (nlb1_line == miss_dw[28:1]) &&
+                                (miss_dw[0] ? nlb1_vlo : nlb1_vhi);
+   wire        nlb_dw_ok      = nlb0_dw_ok || nlb1_dw_ok;
+   wire [127:0] nlb_srv_data  = nlb0_dw_ok ? nlb_data : nlb1_data;
+   wire        nlb_srv_vlo    = nlb0_dw_ok ? nlb_vlo  : nlb1_vlo;
+   wire [63:0] nlb_rdata      = miss_dw[0] ? nlb_srv_data[63:0] : nlb_srv_data[127:64];
+   wire [63:0] nlb_rdata_next = nlb_srv_data[63:0];
+   wire        nlb_next_valid = !miss_dw[0] && nlb_srv_vlo;
 
    // M9+ 0-CYCLE serve: sliding window. Whenever pc is running from IFB slot 1
    // (in1) and the NLB holds the dword after the window (ifb_base+2 — its line
@@ -535,9 +563,13 @@ module pipeline_core
    // (~3c: odd-read rebase + top-up) costs at most 1. Register moves only —
    // nothing new lands on the w_op/dispatch cone. (w_slide, which needs the
    // MEM-stage store-completion signals, is declared after mem_done_now below.)
-   wire        slide_dw_ok = (nlb_line == want_line) &&
+   wire        slide0_ok   = (nlb_line == want_line) &&
                              (ifb_base[0] ? nlb_vlo : nlb_vhi);
-   wire [63:0] slide_data  = ifb_base[0] ? nlb_data[63:0] : nlb_data[127:64];
+   wire        slide1_ok   = EN_NLB2 && (nlb1_line == want_line) &&
+                             (ifb_base[0] ? nlb1_vlo : nlb1_vhi);
+   wire        slide_dw_ok = slide0_ok || slide1_ok;
+   wire [127:0] slide_line = slide0_ok ? nlb_data : nlb1_data;
+   wire [63:0] slide_data  = ifb_base[0] ? slide_line[63:0] : slide_line[127:64];
 
    // ----------------------------------------------------------- ID latch
    logic        id_valid;
@@ -1708,6 +1740,7 @@ module pipeline_core
    // sq_spec, a cycle later, clears the whole IFB — so it does not gate.)
    wire w_slide = in1 && slide_dw_ok &&
                   !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF && !st_spec_now);
+   assign pf_yield = !fetch_ok && !nlb_dw_ok && !w_slide;
 
    // branch / flush / fetch / port attribution (events and wait cycles)
    // An EX op killed this edge by an older fused branch or a store squash
@@ -1907,7 +1940,7 @@ module pipeline_core
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00;
-         nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
+         nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
@@ -1936,7 +1969,7 @@ module pipeline_core
             running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
             ifb_val <= 2'b00; if_look <= 1'b0;
-            nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0;
+            nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
             // invalidate-all: a fresh program image may reuse code addresses
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
@@ -2229,6 +2262,7 @@ module pipeline_core
                                  !(ifb_val[0] && ifb_base  == smc_dw) &&
                                  !(ifb_val[1] && r_base_p1 == smc_dw) &&
                                  !((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) &&
+                                 !((nlb1_vhi || nlb1_vlo) && nlb1_line == smc_dw[28:1]) &&
                                  !(id_valid && (id_pc[31:3] == smc_dw || id_last_dw == smc_dw)) &&
                                  !(ex_valid && (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw));
                   // Watchpoints: compare this access at issue; the halt is
@@ -2250,6 +2284,10 @@ module pipeline_core
                   if (mem_port_wr && (nlb_vhi || nlb_vlo)
                       && nlb_line == mem_iaddr[31:4]) begin
                      nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
+                  end
+                  if (mem_port_wr && (nlb1_vhi || nlb1_vlo)
+                      && nlb1_line == mem_iaddr[31:4]) begin
+                     nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
                   end
                   if (mem_port_wr && pf_look && pf_line == mem_iaddr[31:4])
                      pf_look <= 1'b0;
@@ -2445,15 +2483,31 @@ module pipeline_core
                pf_look <= 1'b0;                // demand owns the port — retry later
             end else if (pf_rd_current) begin
                if (pf_tag_match && (ic_rd_vhi || ic_rd_vlo)) begin
-                  nlb_data <= ic_rd_data;
-                  nlb_line <= pf_line;
-                  nlb_vhi  <= ic_rd_vhi;
-                  nlb_vlo  <= ic_rd_vlo;
+                  // EN_NLB2: into the entry that does not hold a line still
+                  // ahead of the window (want / want+1)
+                  if (EN_NLB2 && (nlb0_has_want || nlb0_has_wp1)) begin
+                     nlb1_data <= ic_rd_data;
+                     nlb1_line <= pf_line;
+                     nlb1_vhi  <= ic_rd_vhi;
+                     nlb1_vlo  <= ic_rd_vlo;
+                  end else begin
+                     nlb_data <= ic_rd_data;
+                     nlb_line <= pf_line;
+                     nlb_vhi  <= ic_rd_vhi;
+                     nlb_vlo  <= ic_rd_vlo;
+                  end
                end
-               pf_look <= 1'b0;                // hit captured / miss abandoned
+               // EN_NLB2: pipelined — having captured the window's next line,
+               // go straight on to the one after it (no idle cycle between
+               // lookups: a line per 2 cycles, the rate of 2-word code)
+               if (EN_NLB2 && pf_tag_match && pf_line == want_line && !nlb_has_wp1)
+                  pf_line <= want_p1;
+               else
+                  pf_look <= 1'b0;             // hit captured / miss abandoned
             end
          end else if (EN_PF_EARLY && running && !fetch_halt && !parked && !irq_active
-                      && w_slide && ifb_base[0] && !if_look && !if_xc) begin
+                      && w_slide && ifb_base[0] && !if_look && !if_xc &&
+                      !(EN_NLB2 && nlb_has_wp1)) begin
             // HW proposal 3 (§2.6): a slide from an ODD base consumes the
             // NLB's last dword, and want_line moves to want_line+1 on this
             // edge.  Start that line's lookup NOW instead of next cycle: the
@@ -2466,10 +2520,11 @@ module pipeline_core
             pf_look <= 1'b1;
             pf_line <= r_want_line + 28'd1;
          end else if (running && !fetch_halt && !parked && !irq_active
-                      && fetch_ok && ifb_val[0] && !nlb_has_want
+                      && fetch_ok && ifb_val[0] && (!nlb_has_want || (EN_NLB2 && !nlb_has_wp1))
                       && !if_look && !if_xc) begin
+            // the window's next line first; then (EN_NLB2) the one after it
             pf_look <= 1'b1;
-            pf_line <= want_line;
+            pf_line <= nlb_has_want ? want_p1 : want_line;
          end
 
          // ---------------- 2a: predicted-taken redirect at ID entry ----------
@@ -2841,10 +2896,13 @@ module pipeline_core
             if ((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) begin
                nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
             end
+            if ((nlb1_vhi || nlb1_vlo) && nlb1_line == smc_dw[28:1]) begin
+               nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
+            end
          end
          if (icinv) begin
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
-            nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;
+            nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;  snoop_q <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
          end
@@ -2908,7 +2966,7 @@ module pipeline_core
             // one cycle after the issue an I-cache lookup / prefetch started
             // before the snoop (clearing the line on this edge) may still be
             // in flight: drop them and the NLB, as ICACHE_INV does
-            nlb_vhi    <= 1'b0;  nlb_vlo <= 1'b0;
+            nlb_vhi    <= 1'b0;  nlb_vlo <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             pf_look    <= 1'b0;  if_look <= 1'b0;
             ev_pcz     = 1'b1;
             pc         <= st_spec_nx;
