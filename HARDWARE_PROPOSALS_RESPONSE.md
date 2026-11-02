@@ -195,6 +195,34 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0k. BTIC 64 entries: branch btic64 (2026-11-02)
+
+`51a3e2b`, on mul2 `54cb0a4`. **Status:** passed my board suite; the
+toolchain re-check is pending. The full validation passed on `be7fa38`, which
+differs only in one guard term.
+
+**Changes:**
+- **BTIC 32 → 64 entries,** indexed by `pc[7:2] ^ pc[13:8]`. The sim
+  attribution had about 2.1% of cycles in ifmiss after a taken branch.
+- **The early-redirect hit check comes from the ID snapshot only.** It
+  carries its entry's line indices and is cleared by matching invalidations;
+  one landing on the very edge the snapshot was taken is caught a cycle later
+  from a registered index. This replaces a 64:1 `bt_v` re-read on the
+  redirect cone.
+- **`EN_BTPF` is guarded by `!fbr_taken` only.** The full `!ev_ovr` guard put
+  the RAS-miss compare cone into the `pf_line` enable: one build failed at
+  −0.903. With no guard at all, aha-mont64 lost 0.85% to prefetches started
+  on a fused-branch mispredict edge.
+
+**Timing:** met at tier 1, WNS +0.077 / WHS +0.027.
+
+**Board, same binaries, vs mul2:**
+
+| Benchmark | Change |
+|---|---|
+| CoreMark | −0.8% (1.961 /MHz) |
+| Embench speed geomean | 1.005 → 1.014 (cycles −0.93%; slre −4.0%, st −3.8%, minver −2.6%; none slower) |
+
 ## 0j. MUL: 2-cycle issue, product committed from the DSP: branch mul2 (2026-11-02)
 
 `54cb0a4`, on callret `c39ef27`. **Merged to master and written to QSPI on
