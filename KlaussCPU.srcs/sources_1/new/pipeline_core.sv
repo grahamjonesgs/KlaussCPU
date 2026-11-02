@@ -194,6 +194,15 @@ module pipeline_core
    // MEM op then leaving is itself a port op (its DV must drop first), nor
    // for stores (their post / snoop checks run at the issue cycle).
    localparam bit EN_EARLY_LD = 1'b1;
+   // HW proposal 1a (first stage): a plain DRAM load (LOAD, POP, LEAVE)
+   // leaves MEM as soon as its request is on the port; WB waits for the
+   // data and commits it straight from the response (the depth of the old
+   // MEM-completion path).  The next instruction enters MEM a cycle earlier
+   // and independent work behind the load overlaps its latency.  A load's
+   // consumer waits until it has committed.  The next port request chains
+   // onto the completion edge when its address differs.  MEMGET32,
+   // RET/IRET/LEAVERET, MMIO and non-posted stores keep the blocking path.
+   localparam bit EN_LD_WB = 1'b1;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -985,6 +994,11 @@ module pipeline_core
 
    // --------------------------------------------------------- WB stage latch
    logic        wb_valid;
+   // 1a: WB holds a fast load (its value comes from the port response at
+   // commit) and the fields to extract it
+   logic        wb_ld, wb_ld_full, wb_ld_sgn;
+   logic [1:0]  wb_ld_msz;
+   logic [2:0]  wb_ld_ea;
    logic [31:0] wb_pc, wb_op;
    logic [3:0]  wb_rd;
    logic        wb_wreg;
@@ -1025,9 +1039,14 @@ module pipeline_core
    // in WB at dispatch -> they commit on this edge, committed flags are right.
    wire ex_f_fwdable = mem_valid && (mem_fmask != '0);
    // (register fields are raw id_op bits — dec.rs1/rs2/rd = op[7:4]/[3:0]/[11:8])
-   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1);
-   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2);
-   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd);
+   // 1a: a fast load in WB has no forwardable value until it commits
+   wire wb_ldlk = EN_LD_WB && wb_valid && wb_ld && wb_wreg;
+   wire hit1 = (b_ex && ex_d.rd == dec.rs1) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs1) ||
+               (wb_ldlk && wb_rd == dec.rs1);
+   wire hit2 = (b_ex && ex_d.rd == dec.rs2) || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rs2) ||
+               (wb_ldlk && wb_rd == dec.rs2);
+   wire hitd = (b_ex && ex_d.rd == dec.rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == dec.rd) ||
+               (wb_ldlk && wb_rd == dec.rd);
    wire flag_busy = (ex_valid && ex_d.fmask != '0);
    wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
                  || (wb_valid && wb_sp_we);
@@ -1404,9 +1423,12 @@ module pipeline_core
    // this flop, so the post decision (mem_done_now) reads registers only.
    // A code-touching store keeps the completion-time SMC squash path.
    logic       st_post, st_post_ok;
+   // 1a: ld_out = a fast load's read is outstanding on the port (the load
+   // itself is in WB, flagged wb_ld, waiting for the data).
+   logic       ld_out;
    logic [28:0] if_req_dw;
    logic        if_rebase;
-   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post
+   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !ld_out
                      && !m_read_DV && !m_write_DV;
 
    // Ready-EDGE arming: the real cache HOLDS ready high until its 2-FF sync
@@ -1419,11 +1441,20 @@ module pipeline_core
    wire  w_mrdy = m_ready && rdy_armed;
 
    wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
+   // 1a: a load that may leave MEM once issued (see EN_LD_WB)
+   wire mem_fastld   = EN_LD_WB && mem_valid && !mem_misal && mem_iaddr[31:28] != 4'hF &&
+                       (mem_d.uop == U_LOAD || mem_d.uop == U_POP || mem_d.uop == U_LEAVE);
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
    // fbr_tk = the fused branch in MEM is taken; fbr_taken = it REDIRECTS
    // (squashing EX/ID), i.e. it disagrees with the ID prediction (2b).
-   wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0];
-   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && (mem_result[0] != (EN_BP && mem_ptk));
+   // 1a: WB holds a fast load whose data has not arrived: nothing advances
+   // (ready is earliest 2 cycles after DV, the load reaches WB after 1)
+   wire wb_wait      = EN_LD_WB && wb_valid && wb_ld && !(ld_out && w_mrdy);
+   // (1a: a non-port op may now wait in MEM behind a fast load in WB —
+   // act only on the edge it leaves MEM)
+   wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0] && !wb_wait;
+   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && (mem_result[0] != (EN_BP && mem_ptk))
+                       && !wb_wait;
    wire [31:0] fbr_tgt = mem_result[0] ? mem_eaddr : mem_pc_next;
    // EX redirect: a taken JMP/CALL/RESET, except a JMP/CALL already taken
    // by the ID prediction; a predicted-taken one that falls through
@@ -1453,8 +1484,10 @@ module pipeline_core
    wire mem_need2    = ld32_need2 || lr_need2;
    wire mem_done_now = (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
                        (mem_xc == 2'd3 && w_mrdy) ||
-                       (mem_xc == 2'd1 && st_post_ok);   // 1c: posted (registered)
-   wire mem_busy     = mem_port_op && !mem_done_now;
+                       (mem_xc == 2'd1 && st_post_ok) ||  // 1c: posted (registered)
+                       (mem_xc == 2'd1 && mem_fastld);    // 1a: issued; WB collects the data
+   wire mem_port_wait = mem_port_op && !mem_done_now;
+   wire mem_busy     = mem_port_wait || wb_wait;
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && (ret_actual != mem_pred_tgt);
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
@@ -1462,7 +1495,7 @@ module pipeline_core
    // (ex_misal is declared below; the early issue excludes it in the block)
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op &&
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
-                       !fbr_taken && !(DEBUG_EN && dbg_mx);
+                       !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -1492,7 +1525,7 @@ module pipeline_core
                           : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
    wire        smc_hit_lat = smc_st && (pc_dw == smc_dw || w_last_dw == smc_dw);
    // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
-   wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr;   // an FBR always leaves MEM
+   wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr && !wb_wait;   // as it leaves MEM
    wire pht_we_ex    = EN_BP && ex_valid && ex_bp_cnd && !ex_busy && !mem_busy &&
                        !fbr_taken && !ras_miss && !sq_ex;
    assign pht_we = pht_we_mem || pht_we_ex;
@@ -1541,7 +1574,7 @@ module pipeline_core
                            r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
-                       !mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active && !w_early_ld &&
+                       !mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld &&
                        !(DEBUG_EN && (dbg_active || dbg_halted));
    assign perf_ic[1] = if_xc;
 
@@ -1640,6 +1673,24 @@ module pipeline_core
       end
    end
 
+   // 1a: a fast load's value at its WB commit (the response this cycle)
+   logic [63:0] wb_ldval;
+   always_comb begin
+      logic [7:0]  b8;
+      logic [15:0] h16;
+      logic [31:0] w32;
+      b8  = m_rdata[(wb_ld_ea * 8) +: 8];
+      h16 = m_rdata[(wb_ld_ea[2:1] * 16) +: 16];
+      w32 = wb_ld_ea[2] ? m_rdata[63:32] : m_rdata[31:0];
+      if (wb_ld_full) wb_ldval = m_rdata;
+      else case (wb_ld_msz)
+         2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
+         2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
+         2'd2:    wb_ldval = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
+         default: wb_ldval = m_rdata;
+      endcase
+   end
+
    // IRET context split (klauss_pkg f_iret bit layout)
    flags_t iret_fval;
    always_comb begin
@@ -1674,7 +1725,7 @@ module pipeline_core
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
-         st_post <= 1'b0; st_post_ok <= 1'b0;
+         st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
@@ -1753,7 +1804,7 @@ module pipeline_core
             if (parked) begin
                dbg_active <= 1'b0;
             end else if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                         && mem_xc == 2'd0 && !if_xc && !st_post) begin
+                         && mem_xc == 2'd0 && !if_xc && !st_post && !ld_out) begin
                dbg_active    <= 1'b0;
                parked        <= 1'b1;
                running       <= 1'b0;   // no dispatch / fetch until resume
@@ -1772,7 +1823,7 @@ module pipeline_core
             if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                   && mem_xc == 2'd0 && !if_xc && !st_post) begin
+                   && mem_xc == 2'd0 && !if_xc && !st_post && !ld_out) begin
                   // RE-CHECK at the drain boundary: an OLDER in-flight store
                   // may have completed during the shadow and killed the cause
                   // — an INT_MASK write (Zephyr irq_lock) or a level-IRQ ack
@@ -1815,8 +1866,9 @@ module pipeline_core
 
          // ---------------- WB: the single retire point ----------------
          ret_valid <= 1'b0;  ret_wr <= 1'b0;
-         if (wb_valid) begin
-            if (wb_wreg)    rf[wb_rd] <= wb_value;
+         if (wb_valid && !wb_wait) begin
+            // (1a: a fast load commits its value straight from the response)
+            if (wb_wreg)    rf[wb_rd] <= (EN_LD_WB && wb_ld) ? wb_ldval : wb_value;
             if (wb_fmask != '0) begin
                flags <= (flags & ~wb_fmask) | (wb_fval & wb_fmask);
                // Deferred Z (the FSM's set_zero): the 64-bit ==0 reduction
@@ -1925,10 +1977,21 @@ module pipeline_core
             st_post    <= 1'b0;
          end
 
+         // 1a: the fast load's response arrives (its WB commit is this edge)
+         if (ld_out && w_mrdy) begin
+            m_read_DV <= 1'b0;
+            ld_out    <= 1'b0;
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          if (mem_port_op) begin
             case (mem_xc)
-               2'd0: if (!if_xc && !st_post) begin  // wait for the port (IF / a posted store)
+               // wait for the port (IF / a posted store / a fast load's read);
+               // 1a: chain onto a fast load's completion edge when the address
+               // differs (DV may stay high — the cache's served-DV guard then
+               // sees a new request; the same address needs a DV-low cycle)
+               2'd0: if (!if_xc && !st_post &&
+                         (!ld_out || (w_mrdy && mem_iaddr != m_addr))) begin
                   m_addr     <= mem_iaddr;
                   m_wdata    <= mem_wdata;
                   m_be       <= mem_be;
@@ -2000,6 +2063,11 @@ module pipeline_core
                   st_post    <= 1'b1;
                   st_post_ok <= 1'b0;
                   mem_xc     <= 2'd0;
+               end else if (mem_fastld) begin
+                  // 1a: the read is on the port; the load moves on to WB,
+                  // which collects the response (ld_out owns the port)
+                  ld_out <= 1'b1;
+                  mem_xc <= 2'd0;
                end
                2'd2: mem_xc <= 2'd3;
                default: if (w_mrdy) begin     // 2'd3
@@ -2014,7 +2082,7 @@ module pipeline_core
          // same port (D-cache coherent, MMIO decoded by the SoC as usual).
          if (DEBUG_EN && dbg_halted) begin
             if (!dbg_mx) begin
-               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post) begin
+               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post && !ld_out) begin
                   m_addr     <= dbg_i.mem_addr;
                   m_wdata    <= dbg_i.mem_wdata;
                   m_be       <= dbg_i.mem_be;
@@ -2093,7 +2161,7 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !irq_active && !w_early_ld
+               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld
                             && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
@@ -2190,9 +2258,14 @@ module pipeline_core
 
          // ---------------- MEM -> WB ----------------
          if (mem_busy) begin
-            wb_valid <= 1'b0;
+            if (!wb_wait) wb_valid <= 1'b0;   // (1a: a waiting fast load stays in WB)
          end else begin
             wb_valid   <= mem_valid;
+            wb_ld      <= mem_fastld;
+            wb_ld_full <= (mem_d.uop != U_LOAD);   // POP / LEAVE: the whole dword
+            wb_ld_msz  <= mem_d.msz;
+            wb_ld_sgn  <= mem_d.sgn;
+            wb_ld_ea   <= mem_eaddr[2:0];
             wb_pc      <= mem_pc;    wb_op <= mem_op;   wb_rd <= mem_d.rd;
             wb_wreg    <= mem_d.wreg;
             wb_value   <= mem_is_read ? mem_ldval : mem_result_eff;
@@ -2616,6 +2689,12 @@ module pipeline_core
                                dec.uop == U_BOOL || dec.uop == U_ALU || dec.uop == U_FBR)) &&
                  id_b_sext == dec.sgn)
             else $fatal(1, "id ex_b-select predecode drift: op=%h", id_op);
+      // 1a invariants: a fast load hands off only when WB can take it, and
+      // its response arrives only while it is waiting in WB
+      if (EN_LD_WB && mem_xc == 2'd1 && mem_fastld && !w_mrdy && !st_post_ok)
+         assert (!wb_wait) else $fatal(1, "1a: fast load handed off while WB waits");
+      if (EN_LD_WB && ld_out && w_mrdy)
+         assert (wb_valid && wb_ld) else $fatal(1, "1a: fast-load response without the load in WB");
       if (id_valid)
          assert (id_ser == dec.serialize)
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
