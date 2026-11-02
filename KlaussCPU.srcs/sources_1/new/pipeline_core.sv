@@ -1147,7 +1147,13 @@ module pipeline_core
    // captured, for a load held in MEM.  wb_h/wb_hok/wb_hdw follow it into
    // WB, with its address and byte enables for a slow-path request.
    logic        mem_h, mem_h1, mem_hok, wb_h, wb_hok;
-   logic [63:0] mem_hdw, wb_hdw;
+   logic [63:0] mem_hdw_r, wb_hdw;
+   // EN_STLF (timing): a forwarded load's data is selected AFTER the
+   // registers — both candidate store dwords are captured every advance,
+   // and only the 1-bit select / valid come from the dword compare
+   logic [63:0] mem_fwa, mem_fwb;
+   logic        mem_fq, mem_fsel;
+   wire  [63:0] mem_hdw = mem_fq ? (mem_fsel ? mem_fwa : mem_fwb) : mem_hdw_r;
    logic [31:0] wb_iaddr;
    logic [7:0]  wb_be;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
@@ -1729,7 +1735,6 @@ module pipeline_core
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                             !(DEBUG_EN && dbg_mx);
    wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b) && sf_cov;
-   wire [63:0] h_fwd_dw   = sf_a ? mem_wdata : m_wdata;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    assign h_addr     = exo_iaddr;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
@@ -1975,7 +1980,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
-         mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0;
+         mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2607,7 +2612,7 @@ module pipeline_core
          // re-arms mem_h1 for the next load: last write wins)
          if (mem_h1) begin
             mem_hok <= h_ok;
-            mem_hdw <= h_dword;
+            mem_hdw_r <= h_dword;
          end
          mem_h1 <= 1'b0;
 
@@ -2684,10 +2689,11 @@ module pipeline_core
                end
                mem_h      <= h_elig;
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
-               if (h_fwd) begin
-                  mem_hok <= 1'b1;
-                  mem_hdw <= h_fwd_dw;
-               end
+               mem_fq   <= h_fwd;
+               mem_fsel <= sf_a;
+               mem_fwa  <= mem_wdata;
+               mem_fwb  <= m_wdata;
+               if (h_fwd) mem_hok <= 1'b1;
                if (DEBUG_EN && h_elig) begin
                   for (int w = 0; w < 2; w++)
                      if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
