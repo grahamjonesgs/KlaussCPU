@@ -197,8 +197,12 @@ accesses.
 
 ## 0g. One-slot stores, miss trim, BTIC race fix, post-check fix: branch st-1slot (2026-11-02)
 
-`ccdc289`, on dcache-s3 `822baeb`. **Status:** passed my board suite.
-Toolchain validation is pending.
+`ccdc289`, on dcache-s3 `822baeb`. **Merged to master and written to QSPI on
+2026-11-02** (that exact bitstream, `--verify`; it boots from flash and
+`hwprop_test` passes). Toolchain validation passed: the board suite with no
+UART differences, csmith-board 150, zephyr and the klausscc hw_* fixtures.
+CoreMark -O2 183.24, -Os 148.21; Embench 0.946 / 0.840. Rollback to
+dcache-s3: `~/.cache/kbuild/rollback/README.txt`.
 
 - **One-slot stores (`EN_ST1`).**
   - A DRAM store with an idle port leaves MEM on its issue edge, posted at
