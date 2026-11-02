@@ -646,6 +646,7 @@ module KlaussCPU #(
       .m_wdata    (pip_m_wdata),
       .m_be       (pip_m_be),
       .m_rdata    (w_mem_read_data),
+      .m_rdata_dram (dram_mem.read_data),
       .m_rdata_next (w_mem_read_data_next),
       .m_next_valid (w_mem_next_valid),
       .m_ready    (w_mem_ready && w_pipe_owns),

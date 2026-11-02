@@ -54,7 +54,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
       .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be,
-      .m_rdata, .m_rdata_next, .m_next_valid, .m_ready,
+      .m_rdata,
+`ifdef HAS_RDATA_DRAM
+      .m_rdata_dram(m_rdata),
+`endif
+      .m_rdata_next, .m_next_valid, .m_ready,
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
       .irq_ready, .irq_sel, .irq_vector, .irq_ack, .irq_ack_sel, .int_mask_o,
       .mask_wr, .mask_wdata,

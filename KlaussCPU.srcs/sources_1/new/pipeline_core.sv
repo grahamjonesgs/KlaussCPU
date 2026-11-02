@@ -58,6 +58,10 @@ module pipeline_core
    output logic [7:0]   m_be,
    input  logic [63:0]  m_rdata,
    input  logic [63:0]  m_rdata_next,   // next sequential dword, same line
+   // 1a: the DRAM side's read data (the cache's registered output, before
+   // the bus_splitter response select) — a fast load is always DRAM, so its
+   // value skips the address decode / select (timing); = m_rdata elsewhere
+   input  logic [63:0]  m_rdata_dram,
    input  logic         m_next_valid,
    input  logic         m_ready,
    // LCD side port
@@ -997,7 +1001,11 @@ module pipeline_core
    // ID-stage snapshot of the entry looked up at the IF->ID latch by the
    // branch's own pc (so the dispatch edge only muxes registers)
    logic               id_bt_hit;
-   logic               id_first;         // the ID op's first cycle in ID (2a early redirect)
+   logic               id_rpend;         // the ID op's early redirect (2a) has not been done
+   // ...which waits while EX holds an op that can redirect from EX, so the
+   // two never meet on one edge (keeps EX's exo_taken off the pos claim)
+   wire                ex_may_redir = ex_valid && (ex_d.uop == U_JMP || ex_d.uop == U_CALL ||
+                                                    ex_d.uop == U_RESET);
    logic [4:0]         id_bt_idx;
    logic [63:0]        id_bt_d0, id_bt_d1;
    logic               id_bt_v1;
@@ -1015,6 +1023,9 @@ module pipeline_core
    wire  [4:0]         bt_lidx_pc = pc[6:2] ^ pc[11:7];   // looked up at the IF->ID latch
    wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
+   // 2a early redirect (see id_rpend)
+   wire                id_early_rd  = EN_BP && id_valid && id_rpend && id_bp_tk && !fetch_halt &&
+                                      !ex_may_redir;
    // A tag match implies the same branch instruction, hence the same target:
    // an entry dies with its branch's line as well as its target's.
    wire                bt_hit    = EN_BTIC && id_bt_hit && bt_v[id_bt_idx];
@@ -1733,15 +1744,15 @@ module pipeline_core
       logic [7:0]  b8;
       logic [15:0] h16;
       logic [31:0] w32;
-      b8  = m_rdata[(wb_ld_ea * 8) +: 8];
-      h16 = m_rdata[(wb_ld_ea[2:1] * 16) +: 16];
-      w32 = wb_ld_ea[2] ? m_rdata[63:32] : m_rdata[31:0];
-      if (wb_ld_full) wb_ldval = m_rdata;
+      b8  = m_rdata_dram[(wb_ld_ea * 8) +: 8];
+      h16 = m_rdata_dram[(wb_ld_ea[2:1] * 16) +: 16];
+      w32 = wb_ld_ea[2] ? m_rdata_dram[63:32] : m_rdata_dram[31:0];
+      if (wb_ld_full) wb_ldval = m_rdata_dram;
       else case (wb_ld_msz)
          2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
          2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
          2'd2:    wb_ldval = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-         default: wb_ldval = m_rdata;
+         default: wb_ldval = m_rdata_dram;
       endcase
    end
 
@@ -1785,7 +1796,7 @@ module pipeline_core
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
-         bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0;
+         bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
@@ -1835,7 +1846,6 @@ module pipeline_core
 
          irq_ack <= 1'b0;
          dbg_mem_done <= 1'b0;
-         id_first <= 1'b0;   // (the IF->ID latch below sets it)
 
          // ready-edge arming (issues below re-clear it; NBA last-write wins)
          if (!m_ready) rdy_armed <= 1'b1;
@@ -2329,9 +2339,10 @@ module pipeline_core
          // this block and wins (ev_ovr drops the BTIC position claim); it
          // sits after the IF engine so its window load wins over a same-edge
          // slide / serve.
-         if (EN_BP && id_valid && id_first && id_bp_tk && !fetch_halt && !start) begin
+         if (id_early_rd && !start) begin
             ev_pcz = 1'b1;
             pc     <= id_bp_tgt;
+            id_rpend <= 1'b0;
             if (bt_hit) begin
                ev_btic    = 1'b1;
                ifb_base   <= id_bt_base;
@@ -2441,7 +2452,6 @@ module pipeline_core
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
                   ev_pcz     = 1'b1;
-                  ev_ovr     = 1'b1;
                   pc         <= ex_redir_tgt;
                   id_valid   <= 1'b0;
                   ex_valid   <= 1'b0;
@@ -2502,13 +2512,18 @@ module pipeline_core
 
                      ras_ptr     <= ras_ptr - 1'b1;
                      ras_cnt     <= ras_cnt - 1'b1;
-                  end else if (EN_BP && id_valid && !fetch_halt && id_bp_tk && id_first) begin
-                     // 2b: a predicted-taken branch dispatching in its first
-                     // cycle: its redirect (above) rewrites pc / the window
-                     // this edge, so nothing is latched behind it.  (Later,
-                     // after a stall, it dispatches normally and the target
+                  end else if (EN_BP && id_valid && !fetch_halt && id_bp_tk && id_rpend) begin
+                     // 2b: a predicted-taken branch dispatching before (or on
+                     // the edge of) its early redirect: nothing is latched
+                     // behind it.  If the early redirect was held off (EX
+                     // could redirect) it is done here, without the BTIC.
+                     // (After a stall it dispatches normally and the target
                      // op latches behind it.)
                      id_valid    <= 1'b0;
+                     if (!id_early_rd) begin
+                        ev_pcz = 1'b1;
+                        pc     <= id_bp_tgt;
+                     end
                   end else if (id_valid && !fetch_halt && id_ser) begin
                      fetch_halt <= 1'b1;   // stop fetching behind a serializer
                      id_valid   <= 1'b0;
@@ -2553,7 +2568,7 @@ module pipeline_core
                      id_ser    <= w_decf.serialize;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
-                     id_first   <= 1'b1;
+                     id_rpend   <= 1'b1;
                      // 2a: BTIC lookup by this instruction's own pc
                      id_bt_hit  <= EN_BTIC && bt_v[bt_lidx_pc] && bt_tag[bt_lidx_pc] == pc[31:2];
                      id_bt_idx  <= bt_lidx_pc;
@@ -2840,6 +2855,8 @@ module pipeline_core
          assert (!wb_wait) else $fatal(1, "1a: fast load handed off while WB waits");
       if (EN_LD_WB && ld_out && w_mrdy)
          assert (wb_valid && wb_ld) else $fatal(1, "1a: fast-load response without the load in WB");
+      // 2a: an early redirect never meets an EX redirect on one edge
+      if (id_early_rd) assert (!(ex_valid && ex_redir)) else $fatal(1, "2a: early redirect met an EX redirect");
       // 2a: a BTIC hit's window is at the predicted target
       if (EN_BTIC && id_valid && id_bp_tk && bt_hit)
          assert (id_bt_base == id_bp_tgt[31:3]) else $fatal(1, "BTIC base != target: pc=%h", id_pc);

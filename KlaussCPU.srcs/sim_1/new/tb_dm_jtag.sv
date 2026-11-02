@@ -41,7 +41,7 @@ module tb_dm_jtag;
 
    pipeline_core #(.DEBUG_EN(1'b1)) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
-      .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be, .m_rdata, .m_rdata_next,
+      .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be, .m_rdata, .m_rdata_dram(m_rdata), .m_rdata_next,
       .m_next_valid, .m_ready,
       .lcd_byte(), .lcd_dc(), .lcd_dv(), .lcd_rst_n(), .lcd_rst_wr(), .lcd_ready(1'b1),
       .irq_ready(1'b0), .irq_sel(2'd0), .irq_vector(32'h0), .irq_ack(), .irq_ack_sel(),

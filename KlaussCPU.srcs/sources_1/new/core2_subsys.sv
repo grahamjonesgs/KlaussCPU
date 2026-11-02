@@ -141,6 +141,7 @@ module core2_subsys
       .m_wdata    (c2_wdata),
       .m_be       (c2_be),
       .m_rdata    (m2_rdata),
+      .m_rdata_dram (m2_rdata),
       .m_rdata_next (m2_rdata_next),
       .m_next_valid (m2_next_valid),
       .m_ready    (m2_ready),
