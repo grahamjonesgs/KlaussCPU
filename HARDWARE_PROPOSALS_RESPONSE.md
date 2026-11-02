@@ -195,6 +195,33 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0e. Timing headroom + exclusive stall counters: branch timing-headroom (2026-11-02)
+
+`7d84761`, on master `d573c7b`. **Merged to master as `646f44e` and written to
+QSPI on 2026-11-02** (that exact bitstream, `--verify`; it boots from flash
+and `hwprop_test` passes). Toolchain validation passed: the board suite,
+csmith-board 150 and zephyr. Benchmarks are cycle-identical to fetch-2a
+(CoreMark 1,286,584,050). Rollback to fetch-2a:
+`~/.cache/kbuild/rollback/README.txt`.
+
+- **Timing headroom** (behaviour unchanged). The four changes:
+  - EX operands load on every non-busy cycle.
+  - The redundant dispatch-chain IRQ latch is gone.
+  - The deferred Z is reduced at MEM→WB (`wb_zero`).
+  - `id_rs1`/`id_rd` are predecoded at the latch.
+
+  Tier-1 WNS went from −0.194 to +0.150 on the same core, and no EX family
+  is left within 0.4 ns. The shipped build shows +0.003 because its worst
+  path is now in `blitter_dma` (placement); the core's worst is +0.195.
+- **`PERF_CTRL[1]`, exclusive stall attribution.** At most one bucket per
+  cycle, in priority memwait > exbusy > data > flags > sp > ifmiss.
+  MMIO_MAP.md has the exact rules.
+- **`PERF_STALL_LOADUSE`** now counts a load producer in EX, MEM or WB; it
+  used to count only the MEM case. A SoC-sim RAW histogram showed load
+  producers are most of the RAW stall (CoreMark ~10 of 13.9 points).
+- **Not taken:** a restricted ALU→ALU bypass (`alu-bypass`, `72e7374`) is
+  correct but gives −0.6% in sim, too little to spend margin on.
+
 ## 0d. 2a fetch stage + core 2 removed: branch fetch-2a (2026-11-02)
 
 `a2c9e4b`, on master `67efcfd`. **Merged to master as `b26385d` and written
