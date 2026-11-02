@@ -249,6 +249,17 @@ module pipeline_core
    // in-flight prefetch" rule was tried and dropped: it interacted badly with
    // EN_BTPF on crc32.)  0 = the M9 single NLB.
    localparam bit EN_NLB2 = 1'b1;
+   // SP forwarding: the stack pointer an EX op sees (ex_sp) is captured at
+   // dispatch from the youngest older SP writer in MEM / WB (or sp), so a
+   // RET / POP / PUSH behind a CALL / PUSH no longer waits for that SP to
+   // commit in WB.  0 = SP readers wait for every in-flight SP writer.
+   localparam bit EN_SPFWD = 1'b1;
+   // Store -> load forwarding into the hit pipe (see h_fwd).
+   localparam bit EN_STLF = 1'b1;
+   // RET through the hit pipe / store forwarding: its stack read is answered
+   // in MEM (forwarded from the CALL's push: 1 cycle; cache hit: 2), not on
+   // the port behind the push.  A miss falls back to the port in MEM.
+   localparam bit EN_HRET = 1'b1;
    localparam bit EN_PFYIELD = 1'b0;   // (timing: -1.1 ns on the IF cone)
    localparam bit EN_NLB2SRV = 1'b1;   // the 2nd entry also serves line-cross rebases
    // HW proposal 2a (front end): branch-target instruction cache.  16
@@ -1023,6 +1034,7 @@ module pipeline_core
    logic [28:0] ex_last_dw;         // M13: id_last_dw carried (SMC squash)
    dec_t        ex_d;
    logic [63:0] ex_a, ex_b, ex_c;   // rs1 / rs2 / rd-data values
+   logic [31:0] ex_sp;              // EN_SPFWD: the SP this EX op reads
    // M6: GPR forwarding happens at the ID->EX register INPUT (the proven P41
    // shape): a producer completing EX forwards its combinational exo_result
    // straight into the consumer's operand latch on the dispatch edge — no
@@ -1135,7 +1147,13 @@ module pipeline_core
    // captured, for a load held in MEM.  wb_h/wb_hok/wb_hdw follow it into
    // WB, with its address and byte enables for a slow-path request.
    logic        mem_h, mem_h1, mem_hok, wb_h, wb_hok;
-   logic [63:0] mem_hdw, wb_hdw;
+   logic [63:0] mem_hdw_r, wb_hdw;
+   // EN_STLF (timing): a forwarded load's data is selected AFTER the
+   // registers — both candidate store dwords are captured every advance,
+   // and only the 1-bit select / valid come from the dword compare
+   logic [63:0] mem_fwa, mem_fwb;
+   logic        mem_fq, mem_fsel;
+   wire  [63:0] mem_hdw = mem_fq ? (mem_fsel ? mem_fwa : mem_fwb) : mem_hdw_r;
    logic [31:0] wb_iaddr;
    logic [7:0]  wb_be;
    // 1a: ld_out = a fast load's read is outstanding on the port (the load
@@ -1196,8 +1214,10 @@ module pipeline_core
    wire hitd = (b_ex && ex_d.rd == id_rd)  || (mem_loadlk && mem_d.wreg && mem_d.rd == id_rd) ||
                (wb_ldlk && wb_rd == id_rd);
    wire flag_busy = (ex_valid && ex_d.fmask != '0);
-   wire sp_busy   = (ex_valid && ex_d.sp_wr) || (mem_valid && mem_sp_we)
-                 || (wb_valid && wb_sp_we);
+   // EN_SPFWD: an SP writer in MEM / WB forwards its new SP into ex_sp at
+   // dispatch, so only one still in EX holds an SP reader back
+   wire sp_busy   = (ex_valid && ex_d.sp_wr) ||
+                    (!EN_SPFWD && ((mem_valid && mem_sp_we) || (wb_valid && wb_sp_we)));
    wire raw_stall = id_valid && (
         (id_use_rs1 && hit1) || (id_use_rs2 && hit2) || (id_use_rdd && hitd) ||
         (id_fread && flag_busy) ||
@@ -1337,6 +1357,7 @@ module pipeline_core
    wire ex_dis_eff = (mem_valid && mem_dis_we) ? mem_dis_new
                    : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
 
+   wire [31:0] ex_sp_r = EN_SPFWD ? ex_sp : sp;
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1348,7 +1369,7 @@ module pipeline_core
       exo_result = '0;  exo_fval = '0;  exo_fmask = ex_d.fmask;
       exo_taken  = 1'b0; exo_target = '0;
       exo_eaddr  = '0;  exo_wdata = '0; exo_be = 8'hFF; exo_raw = '0;
-      exo_sp_new = sp;  exo_sp_we = ex_d.sp_wr;
+      exo_sp_new = ex_sp_r;  exo_sp_we = ex_d.sp_wr;
       // effective address (loads/stores)
       case (ex_d.mmode)
          2'b00: exo_eaddr = ex_a[31:0];
@@ -1481,29 +1502,29 @@ module pipeline_core
             endcase
          end
          U_PUSH: begin
-            exo_eaddr  = sp - 32'd8;
+            exo_eaddr  = ex_sp_r - 32'd8;
             exo_wdata  = (ex_d.len == 2'b01) ? ex_a
                        : (ex_d.len == 2'b10) ? {32'b0, ex_var1} : {ex_var2, ex_var1};
             exo_raw    = exo_wdata;  exo_be = 8'hFF;
-            exo_sp_new = sp - 32'd8;
+            exo_sp_new = ex_sp_r - 32'd8;
          end
          U_POP, U_RET, U_IRET: begin
-            exo_eaddr  = sp;
-            exo_sp_new = sp + 32'd8;
+            exo_eaddr  = ex_sp_r;
+            exo_sp_new = ex_sp_r + 32'd8;
          end
          U_ENTER: begin                          // push R15; R15 = SP; SP -= 8N
-            exo_eaddr  = sp - 32'd8;
+            exo_eaddr  = ex_sp_r - 32'd8;
             exo_wdata  = ex_a;  exo_raw = ex_a;  exo_be = 8'hFF;
-            exo_result = {32'b0, sp - 32'd8};    // new R15 (forwards from MEM)
-            exo_sp_new = sp + ex_var1;           // ex_var1 = -(8 + 8N)
+            exo_result = {32'b0, ex_sp_r - 32'd8};    // new R15 (forwards from MEM)
+            exo_sp_new = ex_sp_r + ex_var1;           // ex_var1 = -(8 + 8N)
          end
          U_LEAVE, U_LEAVERET: begin              // SP = R15; pop R15 (; pop PC)
             exo_eaddr  = ex_a[31:0];
             exo_sp_new = ex_a[31:0] + ((ex_d.uop == U_LEAVERET) ? 32'd16 : 32'd8);
          end
-         U_GETSP: exo_result = {32'b0, sp};
+         U_GETSP: exo_result = {32'b0, ex_sp_r};
          U_SETSP: exo_sp_new = ex_a[31:0];
-         U_ADDSP: exo_sp_new = sp + ex_var1;   // sext imm32 added to 32-bit SP
+         U_ADDSP: exo_sp_new = ex_sp_r + ex_var1;   // sext imm32 added to 32-bit SP
          U_JMP: begin
             exo_taken  = ex_bcvt_t[0];
             exo_target = ex_d.brind ? ex_b[31:0]
@@ -1513,10 +1534,10 @@ module pipeline_core
             exo_taken  = ex_bcvt_t[0];
             exo_target = ex_d.brind ? ex_b[31:0]
                        : ex_d.brel  ? (ex_pc + ex_var1) : ex_var1;
-            exo_eaddr  = sp - 32'd8;
+            exo_eaddr  = ex_sp_r - 32'd8;
             exo_wdata  = {32'b0, ex_pc_next};   // return address
             exo_raw    = exo_wdata;  exo_be = 8'hFF;
-            exo_sp_new = sp - 32'd8;
+            exo_sp_new = ex_sp_r - 32'd8;
             exo_sp_we  = ex_bcvt_t[0];          // only a taken call touches SP/mem
          end
          U_MUL: begin
@@ -1619,7 +1640,7 @@ module pipeline_core
    // only issues out of a lookup — so not while if_look: then the WB path).
    // The load then reaches WB with its request already out (ld_out).
    // (!ld_out && !wb_hmiss imply WB is not waiting, so it does leave MEM.)
-   wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok &&
+   wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok && mem_d.uop != U_RET &&
                        !wb_hmiss && !if_xc && !if_look && !st_post && !ld_out && mem_xc == 2'd0 &&
                        !irq_xc && !(DEBUG_EN && dbg_mx);
    // (1a: a non-port op may now wait in MEM behind a fast load in WB —
@@ -1636,10 +1657,16 @@ module pipeline_core
    wire [31:0] ex_redir_tgt = exo_taken ? exo_target : ex_pc_next;
    // 2a: a predicted return's actual target (as the RET redirect below takes
    // it) and the mispredict, valid on its completion edge (!mem_busy).
-   wire [31:0] ret_actual = (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
+   // (EN_HRET: a RET answered by the hit pipe / a forwarded store has its
+   // return address in the captured doubleword)
+   wire        mem_ret_h  = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && !mem_h1 && mem_hok;
+   wire [31:0] ret_actual = mem_ret_h ? mem_hdw[31:0]
+                          : (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
                           : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
 
-   wire mem_port_rd  = mem_valid && !(EN_DC_H && mem_h) &&
+   // (EN_HRET: a hit-pipe RET is a port read only once its answer came back
+   // a miss — the cycle after its first, with nothing captured)
+   wire mem_port_rd  = mem_valid && !(EN_DC_H && mem_h && !(mem_d.uop == U_RET && !mem_h1 && !mem_hok)) &&
                                     (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
@@ -1668,7 +1695,10 @@ module pipeline_core
                        (mem_xc == 2'd1 && st_post_ok) ||  // 1c: posted (registered)
                        (mem_xc == 2'd1 && mem_fastld);    // 1a: issued; WB collects the data
    wire mem_port_wait = mem_port_op && !mem_done_now;
-   wire mem_busy     = mem_port_wait || wb_wait;
+   // EN_HRET: a hit-pipe RET holds MEM for its first cycle (its return
+   // address is checked from the captured answer, a register, the cycle after)
+   wire ret_h_wait   = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && mem_h1;
+   wire mem_busy     = mem_port_wait || wb_wait || ret_h_wait;
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && (ret_actual != mem_pred_tgt);
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
@@ -1681,13 +1711,31 @@ module pipeline_core
    // MMIO, misaligned, a same-line store on the port: it issues from MEM a
    // cycle later.  Keeps h_elig's address compare out of the early-issue /
    // IF-issue cones, the build's worst paths.)
-   wire ex_hld       = (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
-   wire h_elig       = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
-                       !(m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) &&
-                       // (EN_ST1: nor behind a same-line store leaving MEM on
-                       // this very edge — it is not on the port yet)
-                       !(mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]) &&
-                       !(DEBUG_EN && dbg_mx);
+   wire ex_hld       = (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE ||
+                        (EN_HRET && ex_d.uop == U_RET));
+   // EN_STLF: store -> load forwarding.  The youngest older store whose
+   // dword is the load's — the one leaving MEM on this edge (sf_a), else the
+   // one on the port (sf_b) — supplies the load's data when its byte enables
+   // cover the load's bytes (its data is lane-replicated, so the covered lanes
+   // are exactly the load's).  Such a load enters MEM as an answered hit-pipe
+   // load.  A store to the SAME dword that does not cover keeps the load on
+   // the slow path; a store to another dword of the line no longer does (it
+   // changes only its own dword; the cache flags its line-write cycle).
+   wire [7:0]  ex_ldmask  = (ex_d.uop != U_LOAD || ex_d.msz == 2'd3) ? 8'hFF
+                          : (ex_d.msz == 2'd2) ? (exo_iaddr[2] ? 8'hF0 : 8'h0F)
+                          : (ex_d.msz == 2'd1) ? (8'h03 << {exo_iaddr[2:1], 1'b0})
+                          :                      (8'h01 << exo_iaddr[2:0]);
+   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[31:3] == exo_iaddr[31:3];
+   wire        sf_b       = m_write_DV && m_addr[31:3] == exo_iaddr[31:3];
+   wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
+                                 : ((m_be & ex_ldmask) == ex_ldmask);
+   wire        h_line_blk = EN_STLF ? (sf_a || sf_b)
+                                    : ((m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) ||
+                                       (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
+   wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
+                            !(DEBUG_EN && dbg_mx);
+   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b) && sf_cov;
+   wire h_elig       = h_base && (!h_line_blk || h_fwd);
    assign h_addr     = exo_iaddr;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
@@ -1932,7 +1980,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
-         mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0;
+         mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
@@ -2564,7 +2612,7 @@ module pipeline_core
          // re-arms mem_h1 for the next load: last write wins)
          if (mem_h1) begin
             mem_hok <= h_ok;
-            mem_hdw <= h_dword;
+            mem_hdw_r <= h_dword;
          end
          mem_h1 <= 1'b0;
 
@@ -2578,7 +2626,7 @@ module pipeline_core
             wb_ld_msz  <= mem_d.msz;
             wb_ld_sgn  <= mem_d.sgn;
             wb_ld_ea   <= mem_eaddr[2:0];
-            wb_h       <= mem_valid && mem_h;
+            wb_h       <= mem_valid && mem_h && mem_d.uop != U_RET;   // (a RET resolves in MEM)
             wb_hok     <= mem_h1 ? h_ok : mem_hok;
             wb_hdw     <= mem_h1 ? h_dword : mem_hdw;
             wb_iaddr   <= mem_iaddr;  wb_be <= mem_be;
@@ -2640,7 +2688,12 @@ module pipeline_core
                   end
                end
                mem_h      <= h_elig;
-               mem_h1     <= h_elig;
+               mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
+               mem_fq   <= h_fwd;
+               mem_fsel <= sf_a;
+               mem_fwa  <= mem_wdata;
+               mem_fwb  <= m_wdata;
+               if (h_fwd) mem_hok <= 1'b1;
                if (DEBUG_EN && h_elig) begin
                   for (int w = 0; w < 2; w++)
                      if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
@@ -2686,6 +2739,10 @@ module pipeline_core
                              (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
                            : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
                            : rf[id_rs1]);
+               // EN_SPFWD: the youngest older SP writer's value (one in EX
+               // holds this op back via sp_busy)
+               ex_sp      <= (mem_valid && mem_sp_we) ? mem_sp_new
+                           : (wb_valid && wb_sp_we)   ? wb_sp_new : sp;
                ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
                            : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
                            : rf[id_rd];
