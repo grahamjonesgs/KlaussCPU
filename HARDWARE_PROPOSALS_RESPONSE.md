@@ -274,6 +274,10 @@ area; stq had +0.066. Re-placing from the same `_opt.dcp` with
   - CTR mode: 15.5 MB/s, against 6.4 MB/s for its old per-block loop;
   - GCM: 5.3 MB/s;
   - SHA via the restore path in 1500-byte updates: 18.4 MB/s (one-shot 20.1).
+- `validate.sh zephyr` passed on `27ff737` with no perf regressions.
+- `ssh_shell` uses CTR mode through the shared driver. HTTPS rose to
+  331 KiB/s from 286, and SFTP/HTTPS round trips are byte-identical.
+- The driver and tests are in runtime `9a34059`. No rollback needed.
 - Bitstream 2 is deferred until TLS GCM matters. The Zephyr 4.5 SSH path is
   CTR + HMAC only.
 
