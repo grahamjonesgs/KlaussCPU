@@ -195,6 +195,46 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0m. A second store entry: branch stq (2026-11-03)
+
+`27439c7`, on master `e87c722`. **Status:** passed my board suite. Toolchain
+validation is pending. This is "back-to-back stores, step A", the user's
+choice of next step.
+
+**Change (`EN_SQ`).**
+- A DRAM store that finds the port busy with a posted store leaves MEM into
+  a queue entry (`sq_*`), with the same issue-time snoop, post check and
+  squash as `EN_ST1`.
+- If the posted store drains on that edge to another address, it goes
+  straight onto the port instead.
+- The queue goes on the port as soon as the posted store drains. Every other
+  port user waits for it.
+- The hit pipe checks the queued store like the other in-flight stores
+  (forwarding when it covers the load).
+
+**Timing:** met at tier 1, WNS +0.066 / WHS +0.020.
+
+**SoC sim, cycles per group:**
+
+| Group | Before | After |
+|---|---:|---:|
+| st;1 | 2.54 | 2.04 |
+| st;ld | 2.54 | 2.04 |
+| st;st | 2.02 | 1.90 |
+
+**Board, same binaries, vs ldbyp:**
+
+| Benchmark | Change |
+|---|---|
+| Dhrystone | 105 → 96 cycles/run |
+| Embench speed geomean | 1.033 → 1.046 (cycles −1.21%; statemate −4.7%, slre −2.8%; none slower) |
+| CoreMark | −0.2% |
+
+**Not done: step B** (1 store/cycle: a pulse write protocol, a cache write
+buffer, pipelined write hits). With step A in, stores wait for the port only
+0.9% of cycles on average (statemate 3.2%), so B was dropped, with the user's
+agreement.
+
 ## 0l. Load → ALU/BOOL/FBR bypass: branch ldbyp (2026-11-02)
 
 `c6ba1db`, on master `f8fd12c`. **Merged to master and written to QSPI on
