@@ -21,6 +21,13 @@
 //                                     digest H[0..7].  Layout matches
 //                                     BLOCK (low = H[2i], high = H[2i+1],
 //                                     each byteswapped).
+//   0x0C0..0x0D8  SHA_HIN0..3    RW  256-bit H staging for RESTORE, packed
+//                                     exactly like DIGEST, so writing back a
+//                                     saved DIGEST0..3 round-trips.
+//   0x0F8  SHA_CAP      R  capability bits: [0] RESTORE, [1] ZERO.
+//   SHA_CTRL [2] RESTORE (H <- SHA_HIN), [3] ZERO (H, HIN, BLOCK <- 0); both
+//   self-clearing, ignored while the core or the HMAC FSM is busy.  Same-write
+//   priority INIT > RESTORE (> ZERO); RESTORE|START restores, then compresses.
 //
 // Byte-order rationale
 // --------------------
@@ -57,6 +64,9 @@ module crypto_sha (
     localparam OFF_BLOCK7  = 16'h0048;
     localparam OFF_DIGEST0 = 16'h0050;
     localparam OFF_DIGEST3 = 16'h0068;
+    localparam OFF_HIN0    = 16'h00C0;   // ..0x0D8: H staging for RESTORE
+    localparam OFF_CAP     = 16'h00F8;
+    localparam [63:0] SHA_CAP = 64'h3;   // [0] RESTORE  [1] ZERO
 
     // -------------------------------------------------------------------------
     // Register offsets — HMAC wrapper (see CRYPTO_PLAN.md §8)
@@ -130,7 +140,19 @@ module crypto_sha (
     logic         r_hmac_kl_trigger;       // 1-cycle pulse: software wrote HMAC_CTRL.KEY_LOAD
     logic         r_hmac_keyzero_pulse;    // 1-cycle pulse: software wrote HMAC_CTRL.KEY_ZERO
     logic         r_h_load_pulse;          // 1-cycle pulse to core's i_h_load
-    logic         r_h_load_sel;            // 0 = inner_state, 1 = outer_state
+    logic [1:0]   r_h_load_sel;            // 0 inner, 1 outer, 2 SHA_HIN, 3 zero
+
+    // SHA_HIN staging (raw MMIO view, packed like DIGEST) and its core-order
+    // form: H[2i] = bswap32(slot[31:0]), H[2i+1] = bswap32(slot[63:32]) —
+    // the inverse of digest_pack below.
+    logic [63:0] r_hin_mmio [0:3];
+    wire [255:0] w_hin_core;
+    generate
+        for (gi = 0; gi < 4; gi = gi + 1) begin : g_hin_bswap
+            assign w_hin_core[64*gi      +: 32] = bswap32(r_hin_mmio[gi][31:0]);
+            assign w_hin_core[64*gi + 32 +: 32] = bswap32(r_hin_mmio[gi][63:32]);
+        end
+    endgenerate
 
     wire w_hmac_busy = (r_hmac_fsm != HMAC_IDLE);
 
@@ -172,7 +194,14 @@ module crypto_sha (
                                 ? (r_hmac_use_outer_block ? w_outer_block_hmac
                                                           : w_inner_block_hmac)
                                 : w_block_core;
-    wire [255:0] w_sha_h_in      = r_h_load_sel ? r_outer_state : r_inner_state;
+    logic [255:0] w_sha_h_in;
+    always_comb
+        case (r_h_load_sel)
+            2'd0:    w_sha_h_in = r_inner_state;
+            2'd1:    w_sha_h_in = r_outer_state;
+            2'd2:    w_sha_h_in = w_hin_core;
+            default: w_sha_h_in = 256'h0;          // ZERO
+        endcase
 
     // 512-bit pipeline register on the SHA block input (CRYPTO_PLAN.md §10a).
     // The combinational network selecting between three 512-bit sources
@@ -234,6 +263,15 @@ module crypto_sha (
         .o_digest (w_digest_core)
     );
 
+    // Software-visible BUSY: the core is compressing OR a request is still
+    // queued for the next tick.  RESTORE|START takes two ticks (h_load wins
+    // over start in the core), so core busy alone reads 0 for a few cycles
+    // after that write — software polling it would then overwrite BLOCK
+    // under the pending START.  Including the holds closes that window for
+    // every request type (it only ever makes BUSY more conservative).
+    wire w_sw_busy = w_core_busy | r_start_pulse | r_start_hold
+                   | r_h_load_pulse | r_hload_hold | r_init_pulse | r_init_hold;
+
     // Sticky DONE flag — set when a software compression completes (busy
     // falls), cleared on the next INIT/START write.
     // Gated by !w_hmac_busy so HMAC-FSM-driven SHA passes don't visibly mutate
@@ -255,9 +293,10 @@ module crypto_sha (
             r_hmac_kl_trigger    <= 1'b0;
             r_hmac_keyzero_pulse <= 1'b0;
             r_h_load_pulse       <= 1'b0;
-            r_h_load_sel         <= 1'b0;
+            r_h_load_sel         <= 2'd0;
             r_hmac_key           <= 256'h0;
             for (i = 0; i < 8; i = i + 1) r_block_mmio[i] <= 64'h0;
+            for (i = 0; i < 4; i = i + 1) r_hin_mmio[i]   <= 64'h0;
         end else begin
             // Default: deassert single-cycle pulses each cycle.
             r_init_pulse         <= 1'b0;
@@ -286,7 +325,31 @@ module crypto_sha (
                             r_start_pulse <= 1'b1;
                             r_done_latch  <= 1'b0;
                         end
+                        // [2] RESTORE: H <- SHA_HIN.  The core takes h_load
+                        // before start on the same tick, so RESTORE|START
+                        // restores and then compresses.  INIT wins over it.
+                        // The write strobe is level (held ~3 cycles); both
+                        // ops are idempotent so repeats are harmless.
+                        if (mmio.write_data[2] && !mmio.write_data[0]
+                                && !w_hmac_busy && !w_core_busy) begin
+                            r_h_load_pulse <= 1'b1;
+                            r_h_load_sel   <= 2'd2;
+                            r_done_latch   <= 1'b0;
+                        end
+                        // [3] ZERO: wipe H, the HIN staging and the block.
+                        else if (mmio.write_data[3] && !mmio.write_data[0]
+                                && !w_hmac_busy && !w_core_busy) begin
+                            r_h_load_pulse <= 1'b1;
+                            r_h_load_sel   <= 2'd3;
+                            r_done_latch   <= 1'b0;
+                            for (i = 0; i < 8; i = i + 1) r_block_mmio[i] <= 64'h0;
+                            for (i = 0; i < 4; i = i + 1) r_hin_mmio[i]   <= 64'h0;
+                        end
                     end
+                    OFF_HIN0 + 16'h00: r_hin_mmio[0] <= mmio.write_data;
+                    OFF_HIN0 + 16'h08: r_hin_mmio[1] <= mmio.write_data;
+                    OFF_HIN0 + 16'h10: r_hin_mmio[2] <= mmio.write_data;
+                    OFF_HIN0 + 16'h18: r_hin_mmio[3] <= mmio.write_data;
                     OFF_BLOCK0 + 16'h00: r_block_mmio[0] <= mmio.write_data;
                     OFF_BLOCK0 + 16'h08: r_block_mmio[1] <= mmio.write_data;
                     OFF_BLOCK0 + 16'h10: r_block_mmio[2] <= mmio.write_data;
@@ -311,11 +374,11 @@ module crypto_sha (
                             r_hmac_kl_trigger <= 1'b1;
                         if (mmio.write_data[1] && !w_hmac_busy && !w_core_busy) begin
                             r_h_load_pulse <= 1'b1;
-                            r_h_load_sel   <= 1'b0;   // inner
+                            r_h_load_sel   <= 2'd0;   // inner
                         end
                         if (mmio.write_data[2] && !w_hmac_busy && !w_core_busy) begin
                             r_h_load_pulse <= 1'b1;
-                            r_h_load_sel   <= 1'b1;   // outer
+                            r_h_load_sel   <= 2'd1;   // outer
                         end
                     end
                     OFF_HMAC_KEY0: r_hmac_key[63:0]    <= mmio.write_data;
@@ -425,7 +488,7 @@ module crypto_sha (
     always_comb begin
         mmio.read_data = 64'h0;
         case (mmio.addr[15:0])
-            OFF_STATUS:  mmio.read_data = { 62'h0, r_done_latch, w_core_busy };
+            OFF_STATUS:  mmio.read_data = { 62'h0, r_done_latch, w_sw_busy };
             OFF_BLOCK0 + 16'h00: mmio.read_data = r_block_mmio[0];
             OFF_BLOCK0 + 16'h08: mmio.read_data = r_block_mmio[1];
             OFF_BLOCK0 + 16'h10: mmio.read_data = r_block_mmio[2];
@@ -438,6 +501,11 @@ module crypto_sha (
             OFF_DIGEST0 + 16'h08: mmio.read_data = digest_pack(2'd1);
             OFF_DIGEST0 + 16'h10: mmio.read_data = digest_pack(2'd2);
             OFF_DIGEST0 + 16'h18: mmio.read_data = digest_pack(2'd3);
+            OFF_HIN0 + 16'h00:    mmio.read_data = r_hin_mmio[0];
+            OFF_HIN0 + 16'h08:    mmio.read_data = r_hin_mmio[1];
+            OFF_HIN0 + 16'h10:    mmio.read_data = r_hin_mmio[2];
+            OFF_HIN0 + 16'h18:    mmio.read_data = r_hin_mmio[3];
+            OFF_CAP:              mmio.read_data = SHA_CAP;
             // HMAC registers
             OFF_HMAC_STATUS: mmio.read_data = { 62'h0, r_hmac_key_valid, w_hmac_busy };
             // HMAC key registers are WRITE-ONLY (same zeroization rationale
