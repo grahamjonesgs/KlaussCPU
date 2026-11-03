@@ -262,6 +262,21 @@ area; stq had +0.066. Re-placing from the same `_opt.dcp` with
 | AES-CTR, software counter + ECB GO + XOR, tight C loop | 69 / block |
 | SHA state save + restore (4 reads, 4 writes, RESTORE, poll) | 65 |
 
+**Runtime confirmation (same day, its shared driver picks the fast paths from
+`AES_CAP` / `SHA_CAP`):**
+
+- `crypto_selftest`: 27/27, identical to its board baseline.
+- New `crypto_selftest2`: 35/35. It covers the CTR carry/wrap/readback
+  cases, a 37-byte tail, GCM round trips 0..4096, SHA restore and interleaved
+  contexts, ZERO, and HMAC midstates on RFC 4231 TC1-4, a 131-byte key and
+  interleaved keys.
+- Bare-metal 16 KiB throughput:
+  - CTR mode: 15.5 MB/s, against 6.4 MB/s for its old per-block loop;
+  - GCM: 5.3 MB/s;
+  - SHA via the restore path in 1500-byte updates: 18.4 MB/s (one-shot 20.1).
+- Bitstream 2 is deferred until TLS GCM matters. The Zephyr 4.5 SSH path is
+  CTR + HMAC only.
+
 The hardware counter saves no cycles over a tight software-counter loop. The
 ~1,400 cycles/block the runtime measured is in its software layers, not on the
 bus. Hardware CTR mainly makes a tight driver simpler, and SHA RESTORE makes
