@@ -887,13 +887,27 @@ for putting bulk crypto in fabric. Implemented in
 | Offset | Reg          | RW | Width | Description |
 |--------|--------------|----|-------|-------------|
 | 0x000  | `AES_CTRL`   | W  | 8     | `[0]` GO (encrypt/decrypt one block; self-clearing). `[1]` ENC (1 = encrypt, 0 = decrypt; sampled with GO). `[2]` KEY_LOAD (expand key schedule; self-clearing). `[3]` KEY_ZERO (full zeroization: staging key, the expanded round-key schedule inside the core, and the key-derived GCM state H/X/TAG; self-clearing). |
-| 0x008  | `AES_STATUS` | R  | 8     | `[0]` BUSY (operation in progress). `[1]` DONE (last operation completed; sticky until next GO/KEY_LOAD). |
+| 0x008  | `AES_STATUS` | R  | 8     | `[0]` BUSY (operation in progress). `[1]` DONE (last operation completed — set when BUSY falls; sticky until next GO/KEY_LOAD/CTR start). |
 | 0x010  | `AES_KEY0`   | W  | 64    | Key bits [63:0]. Write-only — reads return 0 (keys are never readable over MMIO). |
 | 0x018  | `AES_KEY1`   | W  | 64    | Key bits [127:64]. Write-only — reads return 0. |
 | 0x040  | `AES_IN0`    | RW | 64    | Input block bits [63:0] (plaintext for encrypt, ciphertext for decrypt). |
 | 0x048  | `AES_IN1`    | RW | 64    | Input block bits [127:64]. |
 | 0x050  | `AES_OUT0`   | R  | 64    | Output block bits [63:0]. |
 | 0x058  | `AES_OUT1`   | R  | 64    | Output block bits [127:64]. |
+| 0x0C0  | `AES_CTR0`   | RW | 64    | CTR counter block bytes 0..7 (same byte layout as `AES_IN`). |
+| 0x0C8  | `AES_CTR1`   | RW | 64    | Counter bytes 8..15.  Byte 15 (`CTR1[63:56]`) is the least-significant byte of the big-endian counter.  Reads give start + N after N CTR blocks. |
+| 0x0D0  | `AES_MODE`   | RW | 13    | `[0]` CTR: a write to `AES_IN1` starts one block — `OUT = E_K(CTR) XOR IN`, then `CTR++` (always the encrypt direction).  `[3]` INC32: `CTR++` touches bytes 12..15 only (GCM inc32, wraps mod 2^32); 0 = full 128-bit carry (SP 800-38A).  `[1]` GCM_FUSE, `[2]` GCM_DEC, `[12:8]` LEN reserved (read 0). Reset 0. |
+| 0x0F8  | `AES_CAP`    | R  | 64    | Capability bits: `[0]` CTR, `[1]` INC32.  Reserved: `[2]` GCM_FUSE, `[3]` GCM_DEC, `[4]` LEN, `[5]` GCM_TAG writable.  Reads 0 on bitstreams before these features. |
+
+**CTR mode** (added 2026-11-03 for the Zephyr 4.5 port).  Per block: write
+`AES_IN0`, then `AES_IN1` (that write starts the block), poll `BUSY == 0`
+(or `DONE`), read `AES_OUT0/1`.  No counter writes and no software XOR.  An
+`AES_IN1` write while BUSY is ignored; do not rewrite `AES_IN*` or
+`AES_CTR*` while BUSY.  `AES_CTRL.GO` still does a raw ECB/decrypt block on
+`AES_IN` (and `OUT` then shows that raw result) whatever `AES_MODE` says;
+with `AES_MODE = 0`, `AES_IN1` writes start nothing.  The key is a single
+slot: switching between keys (SSH directions, sessions) is a `KEY0/1` write +
+`KEY_LOAD` plus a `CTR0/1` restore.  `KEY_ZERO` also clears the CTR output.
 
 **Timing.** Key schedule expansion takes ~11 cycles after `KEY_LOAD`.
 Encrypt and decrypt each take 10 cycles after `GO`. `BUSY` is high for the
@@ -995,6 +1009,24 @@ encoding are software's job; hardware compresses one 512-bit block per
 | 0x008        | `SHA_STATUS`     | R  | 8     | `[0]` BUSY (compression in progress). `[1]` DONE (sticky; cleared by next INIT/START). |
 | 0x010..0x048 | `SHA_BLOCK0..7`  | RW | 64×8  | 512-bit message block.  Low 32 of slot `i` = M[2i]; high 32 = M[2i+1].  Hardware byteswaps each 32-bit half, so software just does `((uint64_t*)BLOCK)[i] = ((uint64_t*)msg)[i]`. |
 | 0x050..0x068 | `SHA_DIGEST0..3` | R  | 64×4  | 256-bit current digest, packed and byteswapped identically.  `((uint64_t*)out)[i] = REG_SHA_DIGEST_i` yields the standard SHA-256 byte order. |
+| 0x0C0..0x0D8 | `SHA_HIN0..3`    | RW | 64×4  | H staging for `RESTORE`, packed exactly like `SHA_DIGEST0..3` — writing back a saved digest round-trips. |
+| 0x0F8        | `SHA_CAP`        | R  | 64    | Capability bits: `[0]` RESTORE, `[1]` ZERO.  Reads 0 on older bitstreams. |
+
+`SHA_CTRL` also has `[2]` RESTORE (`H ← SHA_HIN`) and `[3]` ZERO (`H`,
+`SHA_HIN0..3`, `SHA_BLOCK0..7` ← 0).  Both self-clear, clear DONE, and are
+ignored while BUSY; INIT in the same write wins.  `RESTORE|START` (`0x6`) in
+one write restores, then compresses the block.  **`SHA_STATUS.BUSY` covers a
+queued request as well as a running compression** — poll `BUSY == 0` after
+every `SHA_CTRL` write before touching `BLOCK`/`HIN` (RESTORE|START takes two
+core ticks).
+
+**Interleaved hashes (PSA multipart).**  Save: wait `BUSY == 0`, read
+`SHA_DIGEST0..3`.  Restore: write `SHA_HIN0..3`, `SHA_CTRL = RESTORE` (or
+`RESTORE|START` with the next block already in `BLOCK`).  The message-length
+count stays in software.  HMAC with any number of keys works the same way:
+compress `K ⊕ ipad` and `K ⊕ opad` once per key, save both digests as the
+inner/outer midstates, then RESTORE them per MAC — the HMAC wrapper below
+(one key slot) is not needed for that.
 
 **Timing.** 64 cycles per block + ~3 cycles FSM overhead.  Reads of
 `SHA_DIGEST0..3` reflect the live `H[0..7]` — valid after each block
@@ -1071,7 +1103,7 @@ debiasing and a NIST SP 800-90B repetition-count health monitor.  See
 | Offset | Reg            | RW | Width | Description |
 |--------|----------------|----|-------|-------------|
 | 0x000  | `TRNG_CTRL`    | RW | 8     | `[0]` ENABLE (1 = sample ROs and produce output). `[1]` RESEED (self-clearing — drains FIFO, resets accumulator, restarts the RCT). |
-| 0x008  | `TRNG_STATUS`  | R  | 8     | `[0]` READY (≥1 conditioned 64-bit word in FIFO). `[1]` HEALTH_OK (Repetition-Count Test has not tripped). |
+| 0x008  | `TRNG_STATUS`  | R  | 8     | `[0]` READY (≥1 conditioned 64-bit word in FIFO). `[1]` HEALTH_OK (Repetition-Count Test has not tripped since the last RESEED / reset — the failure latches, and no new words enter the FIFO while it is latched). |
 | 0x010  | `TRNG_DATA`    | R  | 64    | 64-bit conditioned word.  **Reading this register consumes one FIFO entry** — side-effecting MMIO read.  Reads when READY = 0 return the current (stale) head slot — always check READY first. |
 
 **Pipeline.**  16 ring oscillators → metastability double-FF → XOR-fold to
