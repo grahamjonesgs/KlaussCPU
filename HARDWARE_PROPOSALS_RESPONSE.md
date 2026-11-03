@@ -197,9 +197,13 @@ accesses.
 
 ## 0m. A second store entry: branch stq (2026-11-03)
 
-`27439c7`, on master `e87c722`. **Status:** passed my board suite. Toolchain
-validation is pending. This is "back-to-back stores, step A", the user's
-choice of next step.
+`27439c7`, on master `e87c722`. **Merged to master and written to QSPI on
+2026-11-03** (`--verify`; it boots from flash). Toolchain validation passed:
+the hw_* fixtures, the board suite, csmith-board 150 and zephyr (tick_cost
+median 282; irq_soak +2%, as IRQ entry now also drains the queued store).
+Current compiler: CoreMark -O2 205.78, -Os 162.73; Embench 1.067 / 0.934.
+Rollback to ldbyp: `~/.cache/kbuild/rollback/README.txt`. This is "back-to-back
+stores, step A", the user's choice of next step.
 
 **Change (`EN_SQ`).**
 - A DRAM store that finds the port busy with a posted store leaves MEM into

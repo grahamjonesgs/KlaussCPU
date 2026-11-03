@@ -480,7 +480,7 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 | Load result used by an **ALU / compare / fused-branch** op (ADD…XOR, CMP, INC/DEC, SETcc, MIN/MAX, FBR; rs1, or rs2 when a register) | the consumer issues 2 cycles after the load (1 bubble if it is the very next instruction) — LOAD/POP/LEAVE from DRAM only |
 | Load result used by anything else (shifts, MUL/DIV, MOV/LEA, an address or store-data operand, JMPR), or a MEMGET32 / LEAVERET / RET result | the consumer issues 3 cycles after the load |
 | Load **miss** | the DRAM time; the request goes out as the load leaves MEM |
-| **Store** | 1 issue slot when the port is idle (posted); back-to-back stores ~2 cycles each (the cache controller's write rate) |
+| **Store** | 1 issue slot (posted; a second store waits in a queue entry behind it); only 3+ stores back to back are limited by the cache's write rate, ~2 cycles each |
 | Load after a store to the **same doubleword** whose bytes the store covers | none (store-to-load forwarding) |
 | Load after a store to the same doubleword it only **partly** overlaps | +2 to +3 within 2 instructions of the store |
 | Load after a store to **another doubleword of the same 32 B line** | +1.5, only when exactly 2 instructions after the store |
