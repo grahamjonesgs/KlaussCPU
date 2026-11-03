@@ -195,6 +195,78 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0n. Crypto for the Zephyr 4.5 port: branch crypto-restore-ctr (2026-11-03)
+
+Asked by klausscpu-runtime (its `ZEPHYR_4_5_PLAN.md` §4). Zephyr 4.5's SSH
+offers only aes128-ctr + hmac-sha2-256 on PSA multipart operations, which
+interleave hashes. RTL `fb6bf4e`, on master `da5371a`. **Merged to master and
+written to QSPI on 2026-11-03** (`--verify`; it boots from flash). Rollback to
+stq: `~/.cache/kbuild/rollback/README.txt`. Register details: `MMIO_MAP.md`.
+Every addition is new registers or bits. With them at reset, the old map
+behaves as before.
+
+**What shipped (bitstream 1):**
+
+- **SHA state save/restore.** `SHA_HIN0..3` (`0xF00B_00C0..D8`) are packed
+  like `SHA_DIGEST`. `SHA_CTRL[2]` RESTORE loads H from them and `[3]` ZERO
+  wipes H, HIN and BLOCK. Software keeps HMAC inner/outer midstates per key,
+  so the one-key HMAC wrapper isn't needed and is unchanged. `SHA_STATUS.BUSY`
+  now also covers a request queued for the next core tick. Without that, the
+  sim showed RESTORE|START reading not-busy for a few cycles, and software
+  overwrote BLOCK under the pending START.
+- **AES-CTR.** `AES_CTR0/1` (`0xF00A_00C0/C8`) and `AES_MODE` (`0x0D0`):
+  `[0]` CTR (a write to `AES_IN1` starts a block, `OUT = E(CTR) ^ IN`,
+  CTR++ with full 128-bit big-endian carry), `[3]` INC32. `AES_STATUS.DONE` is
+  now set when busy falls. Before, a level copy of the core's sticky done
+  could set it again just after a GO; the runtime polls BUSY, so it wasn't
+  affected.
+- **Capability registers** at offset `0x0F8` in both blocks: `SHA_CAP = 0x3`
+  (RESTORE, ZERO) and `AES_CAP = 0x3` (CTR, INC32). Older bitstreams read 0,
+  so drivers choose the fast path at run time.
+- **TRNG:** unchanged. HEALTH_OK already latches until RESEED.
+- **Bitstream 2 (agreed):** GCM_FUSE / GCM_DEC / LEN (LEN masks the GHASH
+  input only, never OUT) and a writable GCM_TAG. The bits are reserved in
+  `AES_MODE` / `AES_CAP`. RSA/Montgomery help only if the runtime's
+  measurement asks for it.
+
+**Timing:** build_fast (Performance_Explore + tier 2) gave −0.009. The single
+failing endpoint was a core-1 path, `ic_tag → r_want_line`, moved by the added
+area; stq had +0.066. Re-placing from the same `_opt.dcp` with
+`tools/build_alt_place.tcl` gave ExtraPostPlacementOpt **+0.050** / WHS +0.024
+(shipped) and ExtraTimingOpt +0.012.
+
+**Verification:**
+
+- `tools/vsim/crypto_kat.py` drives both wrappers at the MMIO level under
+  Verilator. The write strobe is held 3 cycles, as on the SoC. Expected values
+  come from Python hashlib / hmac / cryptography; 159 checks:
+  - SP 800-38A F.5.1 CTR;
+  - carry into byte 7, carry across bytes 3..15, and the all-FF wrap;
+  - inc32 with no carry into byte 11;
+  - CTR readback = start + N;
+  - legacy GO after CTR;
+  - SHA save → another whole hash → restore → finish, both as RESTORE;START
+    and as RESTORE|START;
+  - ZERO;
+  - HMAC from software midstates with two keys interleaved;
+  - the legacy HMAC wrapper on RFC 4231 TC1.
+- On the board, `tools/board/crypto_kat_hw.c` replays the same op list
+  (`--emit-c`): ALL PASS on the JTAG image and again after flash boot.
+  `hwprop_test` ALL PASS.
+
+**Board numbers** (`crypto_kat_hw`, 100 MHz):
+
+| Loop | Cycles |
+|---|---:|
+| AES-CTR, hardware counter, tight C loop | 69 / block (≈22 MB/s) |
+| AES-CTR, software counter + ECB GO + XOR, tight C loop | 69 / block |
+| SHA state save + restore (4 reads, 4 writes, RESTORE, poll) | 65 |
+
+The hardware counter saves no cycles over a tight software-counter loop. The
+~1,400 cycles/block the runtime measured is in its software layers, not on the
+bus. Hardware CTR mainly makes a tight driver simpler, and SHA RESTORE makes
+the hardware usable at all under PSA.
+
 ## 0m. A second store entry: branch stq (2026-11-03)
 
 `27439c7`, on master `e87c722`. **Merged to master and written to QSPI on

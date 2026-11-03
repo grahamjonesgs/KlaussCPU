@@ -18,6 +18,14 @@
 //   0x048  AES_IN1     RW data_in[127:64]
 //   0x050  AES_OUT0    R  data_out[63:0]
 //   0x058  AES_OUT1    R  data_out[127:64]
+//   0x0C0  AES_CTR0    RW CTR counter block bytes 0..7  (same byte layout as
+//   0x0C8  AES_CTR1    RW   AES_IN; byte 15 = CTR1[63:56] is the counter LSB)
+//   0x0D0  AES_MODE    RW [0] CTR: a write to AES_IN1 starts a block:
+//                           OUT = AES_K(CTR) XOR IN, then CTR++ (encrypt dir).
+//                         [3] INC32: CTR++ touches bytes 12..15 only (GCM
+//                           inc32); else full 128-bit big-endian carry.
+//                         [1] [2] [12:8] reserved (GCM_FUSE / GCM_DEC / LEN).
+//   0x0F8  AES_CAP     R  capability bits: [0] CTR, [1] INC32.
 //
 // All registers are 64-bit; the MMIO read mux always returns 64 bits and the
 // caller selects the relevant half (sub-64-bit MMIO accesses are not used
@@ -48,6 +56,13 @@ module crypto_aes (
     localparam OFF_IN1     = 16'h0048;
     localparam OFF_OUT0    = 16'h0050;
     localparam OFF_OUT1    = 16'h0058;
+    localparam OFF_CTR0    = 16'h00C0;
+    localparam OFF_CTR1    = 16'h00C8;
+    localparam OFF_MODE    = 16'h00D0;
+    localparam OFF_CAP     = 16'h00F8;
+    // AES_CAP: [0] CTR  [1] INC32  ([2] GCM_FUSE [3] GCM_DEC [4] LEN
+    // [5] GCM_TAG writable are reserved for the next step, read 0 here).
+    localparam [63:0] AES_CAP = 64'h3;
 
     // -------------------------------------------------------------------------
     // Register offsets — GCM / GHASH (CRYPTO_PLAN.md §5).
@@ -92,6 +107,46 @@ module crypto_aes (
     logic r_go_enc_pulse;
     logic r_go_dec_pulse;
 
+    // ---- CTR mode -----------------------------------------------------------
+    // r_ctr holds the counter block in AES_IN's byte layout (byte k at
+    // bits[8k+7:8k]); as a big-endian integer it is V = bswap128(r_ctr), so
+    // byte 15 (bits[127:120]) is the least-significant byte.
+    logic [127:0] r_ctr;
+    logic         r_mode_ctr;       // AES_MODE[0]
+    logic         r_mode_inc32;     // AES_MODE[3]
+    logic         r_go_ctr_pulse;   // 1-cycle: start a CTR block
+    logic         r_sel_ctr;        // last data op was CTR: core input = r_ctr,
+                                    // OUT reads come from r_ctr_out
+    logic [127:0] r_ctr_out;        // AES_K(CTR) XOR IN of the last CTR block
+    logic         r_in1_wr_q;       // IN1 write strobe, delayed (edge detect)
+    logic         r_core_busy_q;
+    logic         r_ctr_inflight;   // a CTR block is in the core
+
+    wire [127:0] w_core_data_in = r_sel_ctr ? r_ctr : r_data_in;
+
+    function [127:0] bswap128;
+        input [127:0] v;
+        integer k;
+        logic [127:0] o;
+        begin
+            for (k = 0; k < 16; k = k + 1)
+                o[8*k +: 8] = v[8*(15-k) +: 8];
+            bswap128 = o;
+        end
+    endfunction
+
+    // Counter increment, split 32/32/64 so INC32 can cut the carry at bit 32
+    // and so no single adder is wider than 64 bits.  Carry-ins come from
+    // all-ones reductions of the old value (V+1 carries into bit n exactly
+    // when V[n-1:0] is all ones).
+    wire [127:0] w_ctr_v   = bswap128(r_ctr);
+    wire         w_c32     = (&w_ctr_v[31:0]) & ~r_mode_inc32;
+    wire         w_c64     = w_c32 & (&w_ctr_v[63:32]);
+    wire [127:0] w_ctr_v_n = { w_ctr_v[127:64] + {63'h0, w_c64},
+                               w_ctr_v[63:32]  + {31'h0, w_c32},
+                               w_ctr_v[31:0]   + 32'h1 };
+    wire [127:0] w_ctr_inc = bswap128(w_ctr_v_n);
+
     wire w_core_busy;
     wire w_core_done;
 
@@ -101,10 +156,10 @@ module crypto_aes (
         .i_rst      (~i_Rst_L),
         .i_key_load (r_key_load_pulse),
         .i_key_zero (r_key_zero_pulse),
-        .i_go_enc   (r_go_enc_pulse),
+        .i_go_enc   (r_go_enc_pulse | r_go_ctr_pulse),
         .i_go_dec   (r_go_dec_pulse),
         .i_key      (r_key),
-        .i_data_in  (r_data_in),
+        .i_data_in  (w_core_data_in),
         .o_busy     (w_core_busy),
         .o_done     (w_core_done),
         .o_data_out (w_data_out)
@@ -144,20 +199,9 @@ module crypto_aes (
 
     wire w_gcm_busy = (r_gcm_fsm != GCM_IDLE);
 
-    // Per-byte swap of a 128-bit value: input byte 0 (at bits[7:0]) becomes
-    // output byte 15 (at bits[127:120]).  Used to translate software's
+    // bswap128 (declared above with the CTR logic) translates software's
     // little-endian uint64_t view into the network-bit-order representation
     // that ghash.v operates on, and vice-versa for the result.
-    function [127:0] bswap128;
-        input [127:0] v;
-        integer k;
-        logic [127:0] o;
-        begin
-            for (k = 0; k < 16; k = k + 1)
-                o[8*k +: 8] = v[8*(15-k) +: 8];
-            bswap128 = o;
-        end
-    endfunction
 
     // GHASH inputs: byteswap r_gcm_H and (r_gcm_tag XOR r_gcm_X) into the
     // network-bit-order view ghash.v expects.
@@ -211,6 +255,15 @@ module crypto_aes (
             r_go_enc_pulse    <= 1'b0;
             r_go_dec_pulse    <= 1'b0;
             r_done_latch      <= 1'b0;
+            r_ctr             <= 128'h0;
+            r_mode_ctr        <= 1'b0;
+            r_mode_inc32      <= 1'b0;
+            r_go_ctr_pulse    <= 1'b0;
+            r_sel_ctr         <= 1'b0;
+            r_ctr_out         <= 128'h0;
+            r_in1_wr_q        <= 1'b0;
+            r_core_busy_q     <= 1'b0;
+            r_ctr_inflight    <= 1'b0;
             r_gcm_H           <= 128'h0;
             r_gcm_X           <= 128'h0;
             r_gcm_go_pulse    <= 1'b0;
@@ -221,12 +274,31 @@ module crypto_aes (
             r_key_zero_pulse  <= 1'b0;
             r_go_enc_pulse    <= 1'b0;
             r_go_dec_pulse    <= 1'b0;
+            r_go_ctr_pulse    <= 1'b0;
             r_gcm_go_pulse    <= 1'b0;
             r_gcm_reset_pulse <= 1'b0;
+            r_core_busy_q     <= w_core_busy;
+            r_in1_wr_q        <= mmio.write_DV && (mmio.addr[15:0] == OFF_IN1);
 
-            // Sticky DONE: set when core asserts done, cleared on the next GO.
-            if (w_core_done)
+            // Sticky DONE: set when an operation completes (busy falls),
+            // cleared on the next GO / KEY_LOAD / CTR start.  Edge-triggered:
+            // the core's o_done is itself sticky until it takes the next GO,
+            // which (one cycle after the write) would re-set a level copy.
+            if (r_core_busy_q && !w_core_busy)
                 r_done_latch <= 1'b1;
+
+            // CTR block result: keystream XOR the data written to AES_IN.
+            // Software must not rewrite AES_IN while BUSY.
+            if (r_core_busy_q && !w_core_busy && r_ctr_inflight) begin
+                r_ctr_out      <= w_data_out ^ r_data_in;
+                r_ctr_inflight <= 1'b0;
+            end
+
+            // CTR++ the cycle the core samples r_ctr (on the go pulse).
+            if (r_go_ctr_pulse) begin
+                r_ctr          <= w_ctr_inc;
+                r_ctr_inflight <= 1'b1;
+            end
 
             if (mmio.write_DV) begin
                 case (mmio.addr[15:0])
@@ -241,6 +313,7 @@ module crypto_aes (
                             r_key_zero_pulse <= 1'b1;
                             r_gcm_H          <= 128'h0;
                             r_gcm_X          <= 128'h0;
+                            r_ctr_out        <= 128'h0;
                             // (r_gcm_tag wiped by the GCM FSM block, which
                             // owns it — it watches r_key_zero_pulse.)
                         end
@@ -255,12 +328,30 @@ module crypto_aes (
                             else
                                 r_go_dec_pulse <= 1'b1;
                             r_done_latch <= 1'b0;
+                            r_sel_ctr    <= 1'b0;   // raw block op on AES_IN
                         end
                     end
                     OFF_KEY0: r_key[63:0]    <= mmio.write_data;
                     OFF_KEY1: r_key[127:64]  <= mmio.write_data;
                     OFF_IN0:  r_data_in[63:0]   <= mmio.write_data;
-                    OFF_IN1:  r_data_in[127:64] <= mmio.write_data;
+                    OFF_IN1: begin
+                        r_data_in[127:64] <= mmio.write_data;
+                        // CTR auto-start: once per IN1 write (the strobe is
+                        // level, held ~3 cycles — first cycle only), and
+                        // only when the core is idle.
+                        if (r_mode_ctr && !r_in1_wr_q && !w_core_busy
+                                && !r_go_ctr_pulse) begin
+                            r_go_ctr_pulse <= 1'b1;
+                            r_sel_ctr      <= 1'b1;
+                            r_done_latch   <= 1'b0;
+                        end
+                    end
+                    OFF_CTR0: if (!r_go_ctr_pulse) r_ctr[63:0]   <= mmio.write_data;
+                    OFF_CTR1: if (!r_go_ctr_pulse) r_ctr[127:64] <= mmio.write_data;
+                    OFF_MODE: begin
+                        r_mode_ctr   <= mmio.write_data[0];
+                        r_mode_inc32 <= mmio.write_data[3];
+                    end
                     OFF_GCM_CTRL: begin
                         // [0] GO    : kick (tag XOR X) • H accumulation
                         // [1] RESET : tag <= 0  (handed to FSM via pulse)
@@ -343,8 +434,12 @@ module crypto_aes (
             OFF_KEY1:   mmio.read_data = 64'h0;
             OFF_IN0:    mmio.read_data = r_data_in[63:0];
             OFF_IN1:    mmio.read_data = r_data_in[127:64];
-            OFF_OUT0:   mmio.read_data = w_data_out[63:0];
-            OFF_OUT1:   mmio.read_data = w_data_out[127:64];
+            OFF_OUT0:   mmio.read_data = r_sel_ctr ? r_ctr_out[63:0]   : w_data_out[63:0];
+            OFF_OUT1:   mmio.read_data = r_sel_ctr ? r_ctr_out[127:64] : w_data_out[127:64];
+            OFF_CTR0:   mmio.read_data = r_ctr[63:0];
+            OFF_CTR1:   mmio.read_data = r_ctr[127:64];
+            OFF_MODE:   mmio.read_data = {60'h0, r_mode_inc32, 2'b00, r_mode_ctr};
+            OFF_CAP:    mmio.read_data = AES_CAP;
             // GCM / GHASH
             OFF_GCM_STATUS: mmio.read_data = {62'h0, r_gcm_done_latch, w_gcm_busy};
             OFF_GCM_H0:     mmio.read_data = r_gcm_H[63:0];
