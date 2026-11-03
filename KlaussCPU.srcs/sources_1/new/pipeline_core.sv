@@ -274,6 +274,12 @@ module pipeline_core
    // consumer in EX until its response commits, which is captured into the
    // operand register.  Load-use distance 3 -> 2 for these consumers.
    localparam bit EN_LDBYP = 1'b1;
+   // A second store entry: a DRAM store that finds the port busy with a
+   // posted store leaves MEM into sq_* (with the same issue-time snoop / post
+   // check / squash as EN_ST1) and goes on the port when the posted one
+   // drains.  Every other port user waits behind it.  0 = a second store
+   // waits in MEM for the drain.
+   localparam bit EN_SQ = 1'b1;
    localparam bit EN_PFYIELD = 1'b0;   // (timing: -1.1 ns on the IF cone)
    localparam bit EN_NLB2SRV = 1'b1;   // the 2nd entry also serves line-cross rebases
    // HW proposal 2a (front end): branch-target instruction cache.  16
@@ -1174,9 +1180,9 @@ module pipeline_core
    // EN_STLF (timing): a forwarded load's data is selected AFTER the
    // registers — both candidate store dwords are captured every advance,
    // and only the 1-bit select / valid come from the dword compare
-   logic [63:0] mem_fwa, mem_fwb;
-   logic        mem_fq, mem_fsel;
-   wire  [63:0] mem_hdw = mem_fq ? (mem_fsel ? mem_fwa : mem_fwb) : mem_hdw_r;
+   logic [63:0] mem_fwa, mem_fwb, mem_fwc;
+   logic        mem_fq, mem_fsel, mem_fselc;
+   wire  [63:0] mem_hdw = mem_fq ? (mem_fsel ? mem_fwa : mem_fselc ? mem_fwc : mem_fwb) : mem_hdw_r;
    logic [31:0] wb_iaddr;
    logic [7:0]  wb_be;
    // EN_MUL2: mem_mage = cycles the MUL has spent in MEM; mem_mres / msgn /
@@ -1676,6 +1682,11 @@ module pipeline_core
    // this flop, so the post decision (mem_done_now) reads registers only.
    // A code-touching store keeps the completion-time SMC squash path.
    logic       st_post, st_post_ok;
+   // EN_SQ: the queued store (address, lane-replicated data, byte enables)
+   logic        sq_v;
+   logic [31:0] sq_addr;
+   logic [63:0] sq_wdata;
+   logic [7:0]  sq_be;
    // EN_ST1: st_spec = the store that left MEM last edge posted
    // speculatively (st_post_ok is its verdict this cycle); st_spec_nx = its
    // fall-through, the refetch pc if it was not postable
@@ -1683,7 +1694,7 @@ module pipeline_core
    logic [31:0] st_spec_nx;
    logic [28:0] if_req_dw;
    logic        if_rebase;
-   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !ld_out
+   assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
 
    // Ready-EDGE arming: the real cache HOLDS ready high until its 2-FF sync
@@ -1714,7 +1725,7 @@ module pipeline_core
    // The load then reaches WB with its request already out (ld_out).
    // (!ld_out && !wb_hmiss imply WB is not waiting, so it does leave MEM.)
    wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok && mem_d.uop != U_RET &&
-                       !wb_hmiss && !if_xc && !if_look && !st_post && !ld_out && mem_xc == 2'd0 &&
+                       !wb_hmiss && !if_xc && !if_look && !st_post && !sq_v && !ld_out && mem_xc == 2'd0 &&
                        !irq_xc && !(DEBUG_EN && dbg_mx);
    // (1a: a non-port op may now wait in MEM behind a fast load in WB —
    // act only on the edge it leaves MEM)
@@ -1759,10 +1770,15 @@ module pipeline_core
    // chaining — registers only) and leaves MEM with it
    wire st_spec_now  = EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
                        mem_iaddr[31:28] != 4'hF && mem_xc == 2'd0 &&
-                       !if_xc && !wb_hmiss && !ld_out && !st_post && !(DEBUG_EN && dbg_mx);
+                       !if_xc && !wb_hmiss && !ld_out && !st_post && !sq_v && !(DEBUG_EN && dbg_mx);
+   // EN_SQ: ...or leaves MEM behind the posted store (into sq_*, or straight
+   // onto the port if that one drains this edge)
+   wire sq_enq_now   = EN_SQ && EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
+                       mem_iaddr[31:28] != 4'hF && mem_xc == 2'd0 &&
+                       st_post && !sq_v && !if_xc && !wb_hmiss && !ld_out && !(DEBUG_EN && dbg_mx);
    // ...and, the cycle after, turns out to overlap fetch-side code
    wire sq_spec      = EN_ST1 && st_spec && !st_post_ok;
-   wire mem_done_now = st_spec_now ||
+   wire mem_done_now = st_spec_now || sq_enq_now ||
                        (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
                        (mem_xc == 2'd3 && w_mrdy) ||
                        (mem_xc == 2'd1 && st_post_ok) ||  // 1c: posted (registered)
@@ -1800,19 +1816,22 @@ module pipeline_core
                           :                      (8'h01 << exo_iaddr[2:0]);
    wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[31:3] == exo_iaddr[31:3];
    wire        sf_b       = m_write_DV && m_addr[31:3] == exo_iaddr[31:3];
+   // EN_SQ: the queued store (younger than the posted one on the port)
+   wire        sf_c       = EN_SQ && sq_v && sq_addr[31:3] == exo_iaddr[31:3];
    wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
+                          : sf_c ? ((sq_be  & ex_ldmask) == ex_ldmask)
                                  : ((m_be & ex_ldmask) == ex_ldmask);
-   wire        h_line_blk = EN_STLF ? (sf_a || sf_b)
+   wire        h_line_blk = EN_STLF ? (sf_a || sf_b || sf_c)
                                     : ((m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) ||
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                             !(DEBUG_EN && dbg_mx);
-   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b) && sf_cov;
+   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    assign h_addr     = exo_iaddr;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
-                       !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !irq_xc &&
+                       !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
                        !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
@@ -1821,7 +1840,7 @@ module pipeline_core
    // the same edge the EX op would advance into MEM) ----
    // SMC: a DRAM store overlapping the code of the younger op in EX or ID.
    wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF &&
-                            !st_spec_now;   // (EN_ST1: checked the cycle after, sq_spec)
+                            !st_spec_now && !sq_enq_now;   // (EN_ST1 / EN_SQ: checked the cycle after, sq_spec)
    wire [28:0] smc_dw     = mem_iaddr[31:3];
    wire        smc_hit_id = smc_st && id_valid &&
                             (id_pc[31:3] == smc_dw || id_last_dw == smc_dw);
@@ -1862,7 +1881,7 @@ module pipeline_core
    // (EN_ST1: a speculatively posted store has no completion-edge squash —
    // sq_spec, a cycle later, clears the whole IFB — so it does not gate.)
    wire w_slide = in1 && slide_dw_ok &&
-                  !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF && !st_spec_now);
+                  !(mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF && !st_spec_now && !sq_enq_now);
    assign pf_yield = !fetch_ok && !nlb_dw_ok && !w_slide;
 
    // branch / flush / fetch / port attribution (events and wait cycles)
@@ -1896,7 +1915,7 @@ module pipeline_core
                            r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
-                       !mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld &&
+                       !mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld &&
                        !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted));
    assign perf_ic[1] = if_xc;
 
@@ -2078,7 +2097,7 @@ module pipeline_core
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
-         st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0;
+         st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          wb_mul <= 1'b0; wb_mdir <= 1'b0; mem_mage <= 2'd0;
          mem_lkq <= 1'b0; mem_mulq <= 1'b0; mem_mulf <= 1'b0; wb_mulf <= 1'b0;
@@ -2166,7 +2185,7 @@ module pipeline_core
             if (parked) begin
                dbg_active <= 1'b0;
             end else if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                         && mem_xc == 2'd0 && !if_xc && !st_post && !ld_out) begin
+                         && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !ld_out) begin
                dbg_active    <= 1'b0;
                parked        <= 1'b1;
                running       <= 1'b0;   // no dispatch / fetch until resume
@@ -2185,7 +2204,7 @@ module pipeline_core
             if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
-                   && mem_xc == 2'd0 && !if_xc && !st_post && !ld_out) begin
+                   && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !ld_out) begin
                   // RE-CHECK at the drain boundary: an OLDER in-flight store
                   // may have completed during the shadow and killed the cause
                   // — an INT_MASK write (Zephyr irq_lock) or a level-IRQ ack
@@ -2347,6 +2366,27 @@ module pipeline_core
          if (st_post && w_mrdy) begin
             m_write_DV <= 1'b0;
             st_post    <= 1'b0;
+            // EN_SQ: the queued store follows on the same edge (the cache
+            // needs a DV-low cycle between two requests to one address)
+            if (sq_v && sq_addr != m_addr) begin
+               m_addr     <= sq_addr;
+               m_wdata    <= sq_wdata;
+               m_be       <= sq_be;
+               m_write_DV <= 1'b1;
+               rdy_armed  <= !m_ready;
+               st_post    <= 1'b1;
+               sq_v       <= 1'b0;
+            end
+         end
+         // ...or on an idle port (the same-address case, a cycle later)
+         if (EN_SQ && sq_v && !st_post && !if_xc && !ld_out && mem_xc == 2'd0) begin
+            m_addr     <= sq_addr;
+            m_wdata    <= sq_wdata;
+            m_be       <= sq_be;
+            m_write_DV <= 1'b1;
+            rdy_armed  <= !m_ready;
+            st_post    <= 1'b1;
+            sq_v       <= 1'b0;
          end
 
          // 1a: the fast load's response arrives (its WB commit is this edge)
@@ -2359,7 +2399,7 @@ module pipeline_core
          // from WB once the port is free; from here it is a 1a fast load
          // (ld_out, WB collects the response).  Younger port users wait on
          // wb_hmiss, so it is the oldest request.
-         if (wb_hmiss && !if_xc && !st_post && mem_xc == 2'd0 && !irq_xc &&
+         if (wb_hmiss && !if_xc && !st_post && !sq_v && mem_xc == 2'd0 && !irq_xc &&
              !(DEBUG_EN && dbg_mx)) begin
             m_addr    <= wb_iaddr;
             m_be      <= wb_be;
@@ -2388,14 +2428,24 @@ module pipeline_core
                // differs (DV may stay high — the cache's served-DV guard then
                // sees a new request; the same address needs a DV-low cycle)
                // (stage 2: also onto a posted store's drain edge)
-               2'd0: if (!if_xc && !wb_hmiss &&
-                         (!(ld_out || st_post) || (w_mrdy && mem_iaddr != m_addr))) begin
-                  m_addr     <= mem_iaddr;
-                  m_wdata    <= mem_wdata;
-                  m_be       <= mem_be;
-                  m_read_DV  <= mem_port_rd;
-                  m_write_DV <= mem_port_wr;
-                  rdy_armed  <= !m_ready;
+               2'd0: if ((!if_xc && !wb_hmiss && !sq_v &&
+                          (!(ld_out || st_post) || (w_mrdy && mem_iaddr != m_addr))) || sq_enq_now) begin
+                  // (EN_SQ: a store queued behind the posted one goes on the
+                  // port now only if that one drains this edge to another
+                  // address; else it waits in sq_*)
+                  if (!sq_enq_now || (w_mrdy && mem_iaddr != m_addr)) begin
+                     m_addr     <= mem_iaddr;
+                     m_wdata    <= mem_wdata;
+                     m_be       <= mem_be;
+                     m_read_DV  <= mem_port_rd;
+                     m_write_DV <= mem_port_wr;
+                     rdy_armed  <= !m_ready;
+                  end else begin
+                     sq_v       <= 1'b1;
+                     sq_addr    <= mem_iaddr;
+                     sq_wdata   <= mem_wdata;
+                     sq_be      <= mem_be;
+                  end
                   mem_xc     <= 2'd1;
                   // M7b store-snoop: TAG-CHECKED. Invalidate only if the store's
                   // tag matches the cached line's tag (the store actually writes
@@ -2455,9 +2505,12 @@ module pipeline_core
                   if (mem_port_wr && pf_look && pf_line == mem_iaddr[31:4])
                      pf_look <= 1'b0;
                   // EN_ST1: the store leaves MEM now, already posted
-                  if (st_spec_now) begin
+                  // (EN_SQ: or queued behind the posted store)
+                  if (st_spec_now || sq_enq_now) begin
                      mem_xc     <= 2'd0;
-                     st_post    <= 1'b1;
+                     // (a queued store is not on the port: st_post stays the
+                     // posted store's — unless it chained on as that drained)
+                     if (st_spec_now || (w_mrdy && mem_iaddr != m_addr)) st_post <= 1'b1;
                      st_spec    <= 1'b1;
                      st_spec_nx <= mem_pc_next;
                   end
@@ -2498,7 +2551,7 @@ module pipeline_core
          // same port (D-cache coherent, MMIO decoded by the SoC as usual).
          if (DEBUG_EN && dbg_halted) begin
             if (!dbg_mx) begin
-               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post && !ld_out) begin
+               if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out) begin
                   m_addr     <= dbg_i.mem_addr;
                   m_wdata    <= dbg_i.mem_wdata;
                   m_be       <= dbg_i.mem_be;
@@ -2578,7 +2631,7 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !ld_out && !irq_active && !w_early_ld
+               end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
@@ -2834,8 +2887,10 @@ module pipeline_core
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
                mem_fq   <= h_fwd;
                mem_fsel <= sf_a;
+               mem_fselc <= sf_c;
                mem_fwa  <= mem_wdata;
                mem_fwb  <= m_wdata;
+               mem_fwc  <= sq_wdata;
                if (h_fwd) mem_hok <= 1'b1;
                if (DEBUG_EN && h_elig) begin
                   for (int w = 0; w < 2; w++)
