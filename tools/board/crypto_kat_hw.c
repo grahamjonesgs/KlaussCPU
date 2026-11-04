@@ -92,6 +92,26 @@ int main(void) {
     printf("aes-ctr sw counter : %lu cycles/block (%lu KB/s @100MHz)\n",
            (unsigned long)(t_sw / NBLK), (unsigned long)(100000000ull * 16 * NBLK / t_sw / 1024));
 
+    // ---- timing: fused AES-GCM encrypt, NBLK blocks (H/tag state is whatever
+    //      the KAT left; only the cycle count matters here) ----
+    if (REG(0, 0xF8) & 4) {
+        REG(0, 0x80) = 2;                       // GCM tag reset
+        REG(0, 0xD0) = 1 | 2 | 8;               // CTR | GCM_FUSE | INC32
+        t0 = CYCLES;
+        for (int b = 0; b < NBLK; b++) {
+            REG(0, 0x40) = buf[2 * b];
+            REG(0, 0x48) = buf[2 * b + 1];
+            while (REG(0, 0x08) & 1) {}
+            buf[2 * b]     = REG(0, 0x50);
+            buf[2 * b + 1] = REG(0, 0x58);
+        }
+        while (REG(0, 0x88) & 1) {}
+        uint64_t t_gcm = CYCLES - t0;
+        REG(0, 0xD0) = 0;
+        printf("aes-gcm fused      : %lu cycles/block (%lu KB/s @100MHz)\n",
+               (unsigned long)(t_gcm / NBLK), (unsigned long)(100000000ull * 16 * NBLK / t_gcm / 1024));
+    }
+
     // ---- timing: SHA save (4 reads) + restore (4 writes + RESTORE + wait) ----
     uint64_t h[4];
     t0 = CYCLES;
