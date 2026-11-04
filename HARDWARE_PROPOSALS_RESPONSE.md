@@ -195,6 +195,62 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0o. Crypto bitstream 2 (fused GCM): branch crypto-gcm-fuse — parked (2026-11-04)
+
+**Not shipped. QSPI stays on bitstream 1 (`27ff737`), by Graham's decision.**
+The branch is pushed for later: RTL `783cfe8`, head `9d1e890`, with docs and
+the board test.
+
+What the branch adds:
+
+- `AES_MODE[1]` GCM_FUSE folds each CTR block's ciphertext into `GCM_TAG`.
+- `[2]` GCM_DEC hashes `AES_IN` instead of `OUT`.
+- `[12:8]` LEN masks the GHASH input of a final partial block. `OUT` is never
+  masked.
+- `GCM_TAG0/1` are writable while idle.
+- A CTR-mode IN1 write is queued, one request deep (`AES_IN` is
+  single-buffered, so no write-ahead).
+- `AES_CAP` reads `0x3F`.
+
+**Sim:** `crypto_kat.py`, 1351 checks pass:
+
+- NIST GCM TC2-4, encrypt and decrypt;
+- AAD-only;
+- fused round trips at 1/15/16/17/4096 bytes, with garbage-padded partial
+  blocks;
+- legacy GCM_X/GO with MODE=0;
+- tag + CTR save/restore around an interleaved op.
+
+Disabling the LEN mask or GCM_DEC makes 20 / 12 checks fail.
+
+**Why parked: timing.** Every failing path is a core-1 path made worse by the
+added area: store `mem_addr` → `bus_splitter` → fetch `pos`/`pc`, 74% route.
+None is in the crypto logic.
+
+| Flow | WNS |
+|---|---:|
+| Route of the build_fast placement + tier 2 | −0.207 |
+| ExtraPostPlacementOpt | −0.310 |
+
+Three more placer directives were stopped unfinished when the decision came.
+
+Runtime data from 2026-11-04 shows GCM is no longer the end-to-end
+bottleneck on bitstream 1:
+
+- a 1 MiB SFTP get takes 2.07 s with hardware AES and 2.29 s with software
+  AES;
+- the SD card's polled SPI reads and the network stack dominate.
+
+If this is resumed, the runtime's trim order is:
+
+1. drop the writable GCM_TAG;
+2. then drop LEN (the final partial block is hashed via GCM_X/GO with
+   GCM_FUSE off);
+3. keep GCM_FUSE and GCM_DEC.
+
+Don't trade core-1 timing margin for it. Checkpoints are in
+`~/.cache/kbuild/gcm/`.
+
 ## 0n. Crypto for the Zephyr 4.5 port: branch crypto-restore-ctr (2026-11-03)
 
 Asked by klausscpu-runtime (its `ZEPHYR_4_5_PLAN.md` §4). Zephyr 4.5's SSH
