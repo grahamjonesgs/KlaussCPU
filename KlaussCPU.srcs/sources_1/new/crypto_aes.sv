@@ -24,8 +24,18 @@
 //                           OUT = AES_K(CTR) XOR IN, then CTR++ (encrypt dir).
 //                         [3] INC32: CTR++ touches bytes 12..15 only (GCM
 //                           inc32); else full 128-bit big-endian carry.
-//                         [1] [2] [12:8] reserved (GCM_FUSE / GCM_DEC / LEN).
-//   0x0F8  AES_CAP     R  capability bits: [0] CTR, [1] INC32.
+//                         [1] GCM_FUSE (with CTR): each CTR block's ciphertext
+//                           C is also folded into GCM_TAG: tag <- (tag^C)*H.
+//                         [2] GCM_DEC: C is AES_IN (decrypt) instead of OUT.
+//                         [12:8] LEN: valid bytes of the next block (0 or >=16
+//                           = full).  Masks only the GHASH input (bytes >= LEN
+//                           zeroed); OUT is never masked.
+//   0x0F8  AES_CAP     R  capability bits: [0] CTR, [1] INC32, [2] GCM_FUSE,
+//                         [3] GCM_DEC, [4] LEN, [5] GCM_TAG writable.
+//   A CTR-mode IN1 write is queued while the core (or, fused, the GHASH) is
+//   busy; AES_STATUS.BUSY covers the queue and the OUT/GHASH hand-off, and
+//   GCM_STATUS.BUSY covers a queued GHASH, so "BUSY == 0" polls cannot race.
+//   GCM_TAG0/1 are writable while GCM is idle (accumulator save/restore).
 //
 // All registers are 64-bit; the MMIO read mux always returns 64 bits and the
 // caller selects the relevant half (sub-64-bit MMIO accesses are not used
@@ -60,9 +70,9 @@ module crypto_aes (
     localparam OFF_CTR1    = 16'h00C8;
     localparam OFF_MODE    = 16'h00D0;
     localparam OFF_CAP     = 16'h00F8;
-    // AES_CAP: [0] CTR  [1] INC32  ([2] GCM_FUSE [3] GCM_DEC [4] LEN
-    // [5] GCM_TAG writable are reserved for the next step, read 0 here).
-    localparam [63:0] AES_CAP = 64'h3;
+    // AES_CAP: [0] CTR  [1] INC32  [2] GCM_FUSE  [3] GCM_DEC  [4] LEN
+    // [5] GCM_TAG writable.
+    localparam [63:0] AES_CAP = 64'h3F;
 
     // -------------------------------------------------------------------------
     // Register offsets — GCM / GHASH (CRYPTO_PLAN.md §5).
@@ -121,6 +131,21 @@ module crypto_aes (
     logic         r_in1_wr_q;       // IN1 write strobe, delayed (edge detect)
     logic         r_core_busy_q;
     logic         r_ctr_inflight;   // a CTR block is in the core
+    logic         r_ctr_req;        // CTR start requested (IN1 written), queued
+    logic         r_mode_fuse;      // AES_MODE[1] GCM_FUSE
+    logic         r_mode_dec;       // AES_MODE[2] GCM_DEC
+    logic  [4:0]  r_mode_len;       // AES_MODE[12:8] LEN
+
+    // GHASH input of a fused block: C = IN (decrypt) or keystream^IN
+    // (encrypt), bytes >= LEN zeroed.  Byte k is bits[8k+7:8k] — the same
+    // software view as GCM_X.
+    logic [127:0] w_len_mask;
+    always_comb
+        for (int k = 0; k < 16; k++)
+            w_len_mask[8*k +: 8] = (r_mode_len == 5'd0 || r_mode_len >= 5'd16
+                                    || k < r_mode_len) ? 8'hFF : 8'h00;
+    wire [127:0] w_ctr_result = w_data_out ^ r_data_in;
+    wire [127:0] w_fused_c    = (r_mode_dec ? r_data_in : w_ctr_result) & w_len_mask;
 
     wire [127:0] w_core_data_in = r_sel_ctr ? r_ctr : r_data_in;
 
@@ -183,6 +208,8 @@ module crypto_aes (
     logic         r_gcm_done_latch; // FSM-owned
     logic         r_gcm_go_pulse;       // MMIO → FSM
     logic         r_gcm_reset_pulse;    // MMIO → FSM
+    logic         r_tag_wr_lo, r_tag_wr_hi; // MMIO → FSM: GCM_TAG0/1 write
+    logic [63:0]  r_tag_wr_data;
     logic         r_gcm_start_pulse;    // FSM → ghash
     // 3 states (still fits in 2 bits).
     //   GCM_IDLE     — no operation in flight.
@@ -264,6 +291,13 @@ module crypto_aes (
             r_in1_wr_q        <= 1'b0;
             r_core_busy_q     <= 1'b0;
             r_ctr_inflight    <= 1'b0;
+            r_ctr_req         <= 1'b0;
+            r_mode_fuse       <= 1'b0;
+            r_mode_dec        <= 1'b0;
+            r_mode_len        <= 5'd0;
+            r_tag_wr_lo       <= 1'b0;
+            r_tag_wr_hi       <= 1'b0;
+            r_tag_wr_data     <= 64'h0;
             r_gcm_H           <= 128'h0;
             r_gcm_X           <= 128'h0;
             r_gcm_go_pulse    <= 1'b0;
@@ -277,6 +311,8 @@ module crypto_aes (
             r_go_ctr_pulse    <= 1'b0;
             r_gcm_go_pulse    <= 1'b0;
             r_gcm_reset_pulse <= 1'b0;
+            r_tag_wr_lo       <= 1'b0;
+            r_tag_wr_hi       <= 1'b0;
             r_core_busy_q     <= w_core_busy;
             r_in1_wr_q        <= mmio.write_DV && (mmio.addr[15:0] == OFF_IN1);
 
@@ -284,20 +320,37 @@ module crypto_aes (
             // cleared on the next GO / KEY_LOAD / CTR start.  Edge-triggered:
             // the core's o_done is itself sticky until it takes the next GO,
             // which (one cycle after the write) would re-set a level copy.
-            if (r_core_busy_q && !w_core_busy)
+            // (A CTR block sets DONE at its capture below, with OUT.)
+            if (r_core_busy_q && !w_core_busy && !r_ctr_inflight)
                 r_done_latch <= 1'b1;
 
             // CTR block result: keystream XOR the data written to AES_IN.
-            // Software must not rewrite AES_IN while BUSY.
+            // Software must not rewrite AES_IN while BUSY.  Fused: the same
+            // edge hands C to the GCM FSM (GCM_X + GO); the start gate below
+            // guaranteed the FSM is idle.
             if (r_core_busy_q && !w_core_busy && r_ctr_inflight) begin
-                r_ctr_out      <= w_data_out ^ r_data_in;
+                r_ctr_out      <= w_ctr_result;
                 r_ctr_inflight <= 1'b0;
+                r_done_latch   <= 1'b1;
+                if (r_mode_fuse) begin
+                    r_gcm_X        <= w_fused_c;
+                    r_gcm_go_pulse <= 1'b1;
+                end
             end
 
             // CTR++ the cycle the core samples r_ctr (on the go pulse).
             if (r_go_ctr_pulse) begin
                 r_ctr          <= w_ctr_inc;
                 r_ctr_inflight <= 1'b1;
+            end
+
+            // Queued CTR start: core idle, no block between go and capture,
+            // and (fused) no GHASH running or about to start.
+            if (r_ctr_req && !w_core_busy && !r_go_ctr_pulse && !r_ctr_inflight
+                    && !(r_mode_fuse && (w_gcm_busy || r_gcm_go_pulse))) begin
+                r_ctr_req      <= 1'b0;
+                r_go_ctr_pulse <= 1'b1;
+                r_sel_ctr      <= 1'b1;
             end
 
             if (mmio.write_DV) begin
@@ -314,6 +367,7 @@ module crypto_aes (
                             r_gcm_H          <= 128'h0;
                             r_gcm_X          <= 128'h0;
                             r_ctr_out        <= 128'h0;
+                            r_ctr_req        <= 1'b0;
                             // (r_gcm_tag wiped by the GCM FSM block, which
                             // owns it — it watches r_key_zero_pulse.)
                         end
@@ -337,20 +391,21 @@ module crypto_aes (
                     OFF_IN1: begin
                         r_data_in[127:64] <= mmio.write_data;
                         // CTR auto-start: once per IN1 write (the strobe is
-                        // level, held ~3 cycles — first cycle only), and
-                        // only when the core is idle.
-                        if (r_mode_ctr && !r_in1_wr_q && !w_core_busy
-                                && !r_go_ctr_pulse) begin
-                            r_go_ctr_pulse <= 1'b1;
-                            r_sel_ctr      <= 1'b1;
-                            r_done_latch   <= 1'b0;
+                        // level, held ~3 cycles — first cycle only).  Queued
+                        // in r_ctr_req; issued by the start gate above.
+                        if (r_mode_ctr && !r_in1_wr_q) begin
+                            r_ctr_req    <= 1'b1;
+                            r_done_latch <= 1'b0;
                         end
                     end
                     OFF_CTR0: if (!r_go_ctr_pulse) r_ctr[63:0]   <= mmio.write_data;
                     OFF_CTR1: if (!r_go_ctr_pulse) r_ctr[127:64] <= mmio.write_data;
                     OFF_MODE: begin
                         r_mode_ctr   <= mmio.write_data[0];
+                        r_mode_fuse  <= mmio.write_data[1];
+                        r_mode_dec   <= mmio.write_data[2];
                         r_mode_inc32 <= mmio.write_data[3];
+                        r_mode_len   <= mmio.write_data[12:8];
                     end
                     OFF_GCM_CTRL: begin
                         // [0] GO    : kick (tag XOR X) • H accumulation
@@ -364,6 +419,14 @@ module crypto_aes (
                     OFF_GCM_H1: r_gcm_H[127:64]  <= mmio.write_data;
                     OFF_GCM_X0: r_gcm_X[63:0]    <= mmio.write_data;
                     OFF_GCM_X1: r_gcm_X[127:64]  <= mmio.write_data;
+                    // GCM_TAG0/1 writes (accumulator restore): handed to the
+                    // FSM, which owns the tag; ignored while GCM is busy.
+                    OFF_GCM_TAG0: if (!w_gcm_busy && !r_gcm_go_pulse) begin
+                        r_tag_wr_lo <= 1'b1; r_tag_wr_data <= mmio.write_data;
+                    end
+                    OFF_GCM_TAG1: if (!w_gcm_busy && !r_gcm_go_pulse) begin
+                        r_tag_wr_hi <= 1'b1; r_tag_wr_data <= mmio.write_data;
+                    end
                     default: ;  // ignored
                 endcase
             end
@@ -391,6 +454,10 @@ module crypto_aes (
             // idle).
             if (r_gcm_reset_pulse || r_key_zero_pulse)
                 r_gcm_tag <= 128'h0;   // key-zero wipes the keyed tag too
+            else if (r_gcm_fsm == GCM_IDLE) begin
+                if (r_tag_wr_lo) r_gcm_tag[63:0]   <= r_tag_wr_data;
+                if (r_tag_wr_hi) r_gcm_tag[127:64] <= r_tag_wr_data;
+            end
 
             case (r_gcm_fsm)
                 GCM_IDLE: begin
@@ -426,7 +493,8 @@ module crypto_aes (
     always_comb begin
         mmio.read_data = 64'h0;
         case (mmio.addr[15:0])
-            OFF_STATUS: mmio.read_data = {62'h0, r_done_latch, w_core_busy};
+            OFF_STATUS: mmio.read_data = {62'h0, r_done_latch,
+                                          w_core_busy | r_ctr_req | r_go_ctr_pulse | r_ctr_inflight};
             // Key registers are WRITE-ONLY: reading back key material over
             // MMIO defeats zeroization (reads return 0; software never read
             // these — verified across the runtime tree).
@@ -438,10 +506,11 @@ module crypto_aes (
             OFF_OUT1:   mmio.read_data = r_sel_ctr ? r_ctr_out[127:64] : w_data_out[127:64];
             OFF_CTR0:   mmio.read_data = r_ctr[63:0];
             OFF_CTR1:   mmio.read_data = r_ctr[127:64];
-            OFF_MODE:   mmio.read_data = {60'h0, r_mode_inc32, 2'b00, r_mode_ctr};
+            OFF_MODE:   mmio.read_data = {51'h0, r_mode_len, 4'h0, r_mode_inc32,
+                                          r_mode_dec, r_mode_fuse, r_mode_ctr};
             OFF_CAP:    mmio.read_data = AES_CAP;
             // GCM / GHASH
-            OFF_GCM_STATUS: mmio.read_data = {62'h0, r_gcm_done_latch, w_gcm_busy};
+            OFF_GCM_STATUS: mmio.read_data = {62'h0, r_gcm_done_latch, w_gcm_busy | r_gcm_go_pulse};
             OFF_GCM_H0:     mmio.read_data = r_gcm_H[63:0];
             OFF_GCM_H1:     mmio.read_data = r_gcm_H[127:64];
             OFF_GCM_X0:     mmio.read_data = r_gcm_X[63:0];

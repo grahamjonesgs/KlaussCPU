@@ -84,7 +84,7 @@ def ctr_case(name_mark, ctr0, nblk, inc32, poll_done, pts=None):
 
 
 MARK(1)                                    # capability registers
-R(AES, A_CAP, 0x3); R(SHA, S_CAP, 0x3)
+R(AES, A_CAP, 0x3F); R(SHA, S_CAP, 0x3)
 R(AES, A_MODE, 0)
 
 MARK(2)                                    # legacy ECB encrypt (FIPS-197 / SP800-38A)
@@ -127,6 +127,144 @@ W(AES, A_CTRL, 3); aes_wait()
 R(AES, A_OUT0, le64(E(pt), 0)); R(AES, A_OUT1, le64(E(pt), 8))
 # and CTR again afterwards picks up its own output path
 ctr_case(9, bytes.fromhex('00000000000000000000000000000000'), 2, False, poll_done=True)
+W(AES, A_MODE, 0)
+
+# ---------------------------------------------------------------- GCM ----
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+G_CTRL, G_STATUS, G_H0, G_H1, G_X0, G_X1, G_TAG0, G_TAG1 = 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8
+M_CTR, M_FUSE, M_DEC, M_INC32 = 1, 2, 4, 8
+S_H, S_EJ0, S_SAVE = 40, 42, 44          # scratch slots
+
+def gcm_wait(): POLL(AES, G_STATUS, 0, 1)
+
+def gcm_setkey(key):
+    """Key load + H = E(0) on chip (SAVE/REPLAY, as the driver does)."""
+    W(AES, A_KEY0, le64(key, 0)); W(AES, A_KEY1, le64(key, 8)); W(AES, A_CTRL, 4); aes_wait()
+    W(AES, A_MODE, 0)
+    W(AES, A_IN0, 0); W(AES, A_IN1, 0); W(AES, A_CTRL, 3); aes_wait()
+    SAVE(AES, A_OUT0, S_H); SAVE(AES, A_OUT1, S_H + 1)
+    REPLAY(AES, G_H0, S_H); REPLAY(AES, G_H1, S_H + 1)
+
+def ghash_blocks(data):
+    for k in range(0, len(data), 16):
+        b = data[k:k + 16].ljust(16, b'\x00')
+        W(AES, G_X0, le64(b, 0)); W(AES, G_X1, le64(b, 8)); W(AES, G_CTRL, 1); gcm_wait()
+
+def len_block(alen, clen):
+    return (alen * 8).to_bytes(8, 'big') + (clen * 8).to_bytes(8, 'big')
+
+def gcm_begin(key, iv, aad):
+    """RESET, AAD, CTR=J0 -> E(J0); returns (E(J0), ecb) and leaves CTR=J0+1."""
+    e = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    j0 = iv + b'\x00\x00\x00\x01'
+    W(AES, G_CTRL, 2)                                    # tag = 0
+    ghash_blocks(aad)
+    W(AES, A_MODE, M_CTR | M_INC32)
+    W(AES, A_CTR0, le64(j0, 0)); W(AES, A_CTR1, le64(j0, 8))
+    W(AES, A_IN0, 0); W(AES, A_IN1, 0); aes_wait()
+    ej0 = e.update(j0)
+    R(AES, A_OUT0, le64(ej0, 0)); R(AES, A_OUT1, le64(ej0, 8))
+    return ej0, e, j0
+
+def gcm_stream(e, j0, data, dec, first_blk, nblk=None, check_busy_last=False):
+    """Fused blocks [first_blk, first_blk+nblk) of data (IN = data, garbage-padded)."""
+    nb = (len(data) + 15) // 16
+    last = nb if nblk is None else min(nb, first_blk + nblk)
+    base = M_CTR | M_INC32 | M_FUSE | (M_DEC if dec else 0)
+    W(AES, A_MODE, base)
+    for b in range(first_blk, last):
+        chunk = data[16 * b:16 * b + 16]
+        L = len(chunk)
+        inb = chunk + bytes((0xA5 ^ (7 * i)) & 0xFF for i in range(16 - L))   # garbage pad
+        if L < 16:
+            W(AES, A_MODE, base | (L << 8))
+        W(AES, A_IN0, le64(inb, 0)); W(AES, A_IN1, le64(inb, 8))
+        aes_wait()
+        if check_busy_last and b == nb - 1:
+            R(AES, G_STATUS, 1, 1)                       # GHASH of this block still running
+        ctr = (int.from_bytes(j0, 'big') & ~0xFFFFFFFF) | ((int.from_bytes(j0[12:], 'big') + 1 + b) & 0xFFFFFFFF)
+        out = xor(e.update(ctr.to_bytes(16, 'big')), inb)                    # OUT is never masked
+        R(AES, A_OUT0, le64(out, 0)); R(AES, A_OUT1, le64(out, 8))
+    W(AES, A_MODE, base)
+
+def gcm_finish(aad_len, c_len, want_tag, ej0):
+    gcm_wait()
+    ghash_blocks(len_block(aad_len, c_len))
+    pre = xor(want_tag, ej0)
+    R(AES, G_TAG0, le64(pre, 0)); R(AES, G_TAG1, le64(pre, 8))
+    W(AES, A_MODE, 0)
+
+def gcm_case(mark, key, iv, pt, aad, dec=False, check_busy=True):
+    MARK(mark)
+    ct_tag = AESGCM(key).encrypt(iv, pt, aad)
+    ct, tag = ct_tag[:-16], ct_tag[-16:]
+    gcm_setkey(key)
+    ej0, e, j0 = gcm_begin(key, iv, aad)
+    gcm_stream(e, j0, ct if dec else pt, dec, 0, check_busy_last=check_busy)
+    gcm_finish(len(aad), len(pt), tag, ej0)
+
+MARK(30)
+R(AES, A_CAP, 0x3F)
+W(AES, A_MODE, 0x1F0F); R(AES, A_MODE, 0x1F0F); W(AES, A_MODE, 0)
+
+K0 = bytes(16)
+KF = bytes.fromhex('feffe9928665731c6d6a8f9467308308')
+IVF = bytes.fromhex('cafebabefacedbaddecaf888')
+PTF = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
+                    '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255')
+AADF = bytes.fromhex('feedfacedeadbeeffeedfacedeadbeefabaddad2')
+# NIST GCM TC2 / TC3 / TC4 (TC4: 60-byte PT, 20-byte AAD), encrypt and decrypt
+gcm_case(31, K0, bytes(12), bytes(16), b'')
+gcm_case(32, KF, IVF, PTF, b'')
+gcm_case(33, KF, IVF, PTF[:60], AADF)
+gcm_case(34, KF, IVF, PTF[:60], AADF, dec=True)
+assert AESGCM(KF).encrypt(IVF, PTF[:60], AADF)[-16:] == bytes.fromhex('5bc94fbc3221a5db94fae95ae7121a47')
+# AAD only (empty plaintext)
+gcm_case(35, KF, IVF, b'', AADF, check_busy=False)
+# round trips at 1, 15, 16, 17, 4096 (encrypt then decrypt; with AAD)
+KR = bytes(range(16, 32)); IVR = bytes(range(100, 112))
+for n, L in enumerate((1, 15, 16, 17, 4096)):
+    pt = bytes((i * 31 + L) & 0xFF for i in range(L))
+    gcm_case(36 + 2 * n, KR, IVR, pt, AADF[:13])
+    gcm_case(37 + 2 * n, KR, IVR, pt, AADF[:13], dec=True)
+
+# 50: legacy GCM_X/GO with MODE=0 (TC4, ciphertext from Python)
+MARK(50)
+ct_tag = AESGCM(KF).encrypt(IVF, PTF[:60], AADF)
+gcm_setkey(KF)
+W(AES, A_MODE, 0)
+W(AES, G_CTRL, 2)
+ghash_blocks(AADF); ghash_blocks(ct_tag[:-16]); ghash_blocks(len_block(20, 60))
+ej0 = Cipher(algorithms.AES(KF), modes.ECB()).encryptor().update(IVF + b'\x00\x00\x00\x01')
+pre = xor(ct_tag[-16:], ej0)
+R(AES, G_TAG0, le64(pre, 0)); R(AES, G_TAG1, le64(pre, 8))
+
+# 51: GCM_TAG + CTR save/restore across an interleaved GCM op (same key)
+MARK(51)
+pt = bytes((i * 11) & 0xFF for i in range(200))
+ct_tag = AESGCM(KR).encrypt(IVR, pt, AADF)
+gcm_setkey(KR)
+ej0, e, j0 = gcm_begin(KR, IVR, AADF)
+gcm_stream(e, j0, pt, False, 0, nblk=5)
+gcm_wait()
+for i, a in enumerate((G_TAG0, G_TAG1, A_CTR0, A_CTR1)): SAVE(AES, a, S_SAVE + i)
+iv2 = bytes(range(50, 62)); pt2 = b'interleaved record' * 3
+ct2 = AESGCM(KR).encrypt(iv2, pt2, b'')
+ej02, e2, j02 = gcm_begin(KR, iv2, b'')
+gcm_stream(e2, j02, pt2, False, 0)
+gcm_finish(0, len(pt2), ct2[-16:], ej02)
+for i, a in enumerate((G_TAG0, G_TAG1, A_CTR0, A_CTR1)): REPLAY(AES, a, S_SAVE + i)
+e = Cipher(algorithms.AES(KR), modes.ECB()).encryptor()
+gcm_stream(e, j0, pt, False, 5)
+gcm_finish(len(AADF), len(pt), ct_tag[-16:], ej0)
+# GCM_TAG write is ignored while GHASH is busy
+W(AES, G_X0, 1); W(AES, G_CTRL, 1); W(AES, G_TAG0, 0x1234)
+gcm_wait()
+W(AES, G_TAG0, 0x5678); W(AES, G_TAG1, 0x9abc)
+R(AES, G_TAG0, 0x5678); R(AES, G_TAG1, 0x9abc)
+
+# restore the ECB key for anything after
+W(AES, A_KEY0, le64(KEY, 0)); W(AES, A_KEY1, le64(KEY, 8)); W(AES, A_CTRL, 4); aes_wait()
 W(AES, A_MODE, 0)
 
 # ---------------------------------------------------------------- SHA ----
