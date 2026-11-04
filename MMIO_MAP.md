@@ -896,18 +896,31 @@ for putting bulk crypto in fabric. Implemented in
 | 0x058  | `AES_OUT1`   | R  | 64    | Output block bits [127:64]. |
 | 0x0C0  | `AES_CTR0`   | RW | 64    | CTR counter block bytes 0..7 (same byte layout as `AES_IN`). |
 | 0x0C8  | `AES_CTR1`   | RW | 64    | Counter bytes 8..15.  Byte 15 (`CTR1[63:56]`) is the least-significant byte of the big-endian counter.  Reads give start + N after N CTR blocks. |
-| 0x0D0  | `AES_MODE`   | RW | 13    | `[0]` CTR: a write to `AES_IN1` starts one block — `OUT = E_K(CTR) XOR IN`, then `CTR++` (always the encrypt direction).  `[3]` INC32: `CTR++` touches bytes 12..15 only (GCM inc32, wraps mod 2^32); 0 = full 128-bit carry (SP 800-38A).  `[1]` GCM_FUSE, `[2]` GCM_DEC, `[12:8]` LEN reserved (read 0). Reset 0. |
-| 0x0F8  | `AES_CAP`    | R  | 64    | Capability bits: `[0]` CTR, `[1]` INC32.  Reserved: `[2]` GCM_FUSE, `[3]` GCM_DEC, `[4]` LEN, `[5]` GCM_TAG writable.  Reads 0 on bitstreams before these features. |
+| 0x0D0  | `AES_MODE`   | RW | 13    | `[0]` CTR: a write to `AES_IN1` starts one block — `OUT = E_K(CTR) XOR IN`, then `CTR++` (always the encrypt direction).  `[3]` INC32: `CTR++` touches bytes 12..15 only (GCM inc32, wraps mod 2^32); 0 = full 128-bit carry (SP 800-38A).  `[1]` GCM_FUSE (with CTR): the block's ciphertext C is also folded into `GCM_TAG` (`tag ← (tag XOR C) • H`).  `[2]` GCM_DEC: C is `AES_IN` instead of `OUT`.  `[12:8]` LEN: valid bytes of the next block (0 or ≥16 = full); zeroes GHASH-input bytes ≥ LEN only — `OUT` is never masked. Reset 0. |
+| 0x0F8  | `AES_CAP`    | R  | 64    | Capability bits: `[0]` CTR, `[1]` INC32, `[2]` GCM_FUSE, `[3]` GCM_DEC, `[4]` LEN, `[5]` GCM_TAG writable (`0x3F`).  Bitstream 1 (2026-11-03) reads `0x3`; older bitstreams read 0. |
 
 **CTR mode** (added 2026-11-03 for the Zephyr 4.5 port).  Per block: write
 `AES_IN0`, then `AES_IN1` (that write starts the block), poll `BUSY == 0`
 (or `DONE`), read `AES_OUT0/1`.  No counter writes and no software XOR.  An
-`AES_IN1` write while BUSY is ignored; do not rewrite `AES_IN*` or
-`AES_CTR*` while BUSY.  `AES_CTRL.GO` still does a raw ECB/decrypt block on
+`AES_IN1` write while BUSY is queued (one request; `BUSY` covers it), but
+`AES_IN` is single-buffered — do not rewrite `AES_IN*` or `AES_CTR*` while
+BUSY, so no write-ahead.  `AES_CTRL.GO` still does a raw ECB/decrypt block on
 `AES_IN` (and `OUT` then shows that raw result) whatever `AES_MODE` says;
 with `AES_MODE = 0`, `AES_IN1` writes start nothing.  The key is a single
 slot: switching between keys (SSH directions, sessions) is a `KEY0/1` write +
 `KEY_LOAD` plus a `CTR0/1` restore.  `KEY_ZERO` also clears the CTR output.
+
+**Fused GCM** (bitstream 2, 2026-11-04).  `GCM_CTRL.RESET`; AAD blocks
+through `GCM_X`/`GO`; `CTR = J0`, `AES_MODE = CTR|INC32`, write `IN = 0` →
+`OUT = E(J0)` (the tag mask) and `CTR = J0+1`; `AES_MODE |= GCM_FUSE`
+(`|GCM_DEC` to decrypt); stream the blocks, setting `LEN` before a final
+partial block; the lengths block through `GCM_X`/`GO`; wait
+`GCM_STATUS.BUSY == 0`; tag = `GCM_TAG XOR E(J0)`.  A fused block's IN1
+write waits for the previous GHASH; `AES_STATUS.BUSY` clears only once `OUT`
+is latched and its GHASH launched, and `GCM_STATUS.BUSY` covers that GHASH.
+Each fused block writes its masked C into `GCM_X` (reads back the last C) —
+do not use `GCM_X`/`GO` while a fused block is in flight.  The GHASH
+(~131 cycles, bit-serial) bounds fused throughput.
 
 **Timing.** Key schedule expansion takes ~11 cycles after `KEY_LOAD`.
 Encrypt and decrypt each take 10 cycles after `GO`. `BUSY` is high for the
@@ -939,13 +952,13 @@ GHASH steps to build a full AES-GCM AEAD.  See
 | Offset | Reg          | RW | Width | Description |
 |--------|--------------|----|-------|-------------|
 | 0x080  | `GCM_CTRL`   | W  | 8     | `[0]` GO (kick `tag ← (tag XOR X) • H`; ignored if BUSY).  `[1]` RESET (`tag ← 0`).  Both self-clearing. |
-| 0x088  | `GCM_STATUS` | R  | 8     | `[0]` BUSY (GHASH multiply in progress).  `[1]` DONE (sticky; cleared by next GO). |
+| 0x088  | `GCM_STATUS` | R  | 8     | `[0]` BUSY (GHASH multiply in progress or queued by a fused CTR block).  `[1]` DONE (sticky; cleared by next GO). |
 | 0x090  | `GCM_H0`     | RW | 64    | Hash subkey H bytes 0..7 (little-endian uint64 view; software writes the raw `AES_K(0^128)` output here). |
 | 0x098  | `GCM_H1`     | RW | 64    | H bytes 8..15. |
 | 0x0A0  | `GCM_X0`     | RW | 64    | Next-block X bytes 0..7 (ciphertext, AAD, or length encoding). |
 | 0x0A8  | `GCM_X1`     | RW | 64    | X bytes 8..15. |
-| 0x0B0  | `GCM_TAG0`   | R  | 64    | Current tag bytes 0..7. |
-| 0x0B8  | `GCM_TAG1`   | R  | 64    | Tag bytes 8..15. |
+| 0x0B0  | `GCM_TAG0`   | RW | 64    | Current tag bytes 0..7.  Writable (accumulator restore) while `GCM_STATUS.BUSY == 0`; ignored while busy.  (Read-only before bitstream 2 — `AES_CAP[5]`.) |
+| 0x0B8  | `GCM_TAG1`   | RW | 64    | Tag bytes 8..15 (writable likewise). |
 
 **Byte order.** All GCM registers use software's natural little-endian
 `uint64_t` view — byte 0 at bits `[7:0]`, byte 7 at `[63:56]`, etc.
