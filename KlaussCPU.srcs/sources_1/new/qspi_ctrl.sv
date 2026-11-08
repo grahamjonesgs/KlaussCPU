@@ -17,39 +17,57 @@
 //
 //   * Only whitelisted opcodes run (table below).  Anything else — status /
 //     configuration register writes (WRR 0x01), bulk erase (0x60/0xC7), bank
-//     register writes, OTP program, 4-byte-address commands … — is rejected
-//     without touching the flash and sets STATUS.rejected.
+//     register writes, OTP program, … — is rejected without touching the
+//     flash and sets STATUS.rejected.
+//   * Addressed commands go on the wire as their 4-byte-address forms (4READ
+//     0x13, 4PP 0x12, 4SE 0xDC, 4P4E 0x21) with a 0x00 top byte.  Those ignore
+//     the flash's volatile BAR.EXTADD bit, so a flash left in 4-byte mode by
+//     some other design cannot turn {ADDR, data byte} into a low address.
 //   * Page program and sector erase are rejected unless ADDR >= PROT_FLOOR
 //     (0xF0_0000 by default).  The floor is aligned to 256 KiB, the largest
 //     S25FL128S erase sector, so no erase or program that passes the check can
 //     reach below it.  The floor is a synthesis parameter — software cannot
 //     move it.
 //
-// Whitelist (kind: R = read len bytes into the buffer, W = send len bytes
-// from the buffer, N = no data phase; A = 3 address bytes follow the opcode):
+// Whitelist (software opcode; kind: R = read len bytes into the buffer,
+// W = send len bytes from the buffer, N = no data phase; A = addressed, sent
+// as the 4-byte form shown in brackets):
 //   0x9F RDID   R      0x05 RDSR1  R      0x07 RDSR2  R      0x35 RDCR   R
-//   0x16 BRRD   R      0x03 READ   R A    0x06 WREN   N      0x04 WRDI   N
-//   0x30 CLSR   N      0x02 PP     W A g  0xD8 SE     N A g  0x20 P4E    N A g
+//   0x16 BRRD   R      0x03 READ   R A [13]               0x06 WREN   N
+//   0x04 WRDI   N      0x30 CLSR   N      0x02 PP     W A g [12]
+//   0xD8 SE     N A g [DC]                0x20 P4E    N A g [21]
 //   (g = guarded by PROT_FLOOR; len is forced to 0 for N commands)
 //
 // Register layout (offsets within the device window, all 64-bit aligned):
-//   0x000  QSPI_CMD    W   [7:0] opcode, [24:16] len (0..256 bytes).  Starts
-//                          the transaction (ignored while busy).
+//   0x000  QSPI_CMD    W   [7:0] opcode, [31:16] len (0..256 bytes; more is
+//                          refused).  Starts the transaction.  Refused (and
+//                          STATUS.rejected set) if not ready, not whitelisted,
+//                          guarded and below the floor, len > 256, or if any
+//                          write was dropped since the previous CMD (below).
 //                      R   last command word written
 //   0x008  QSPI_ADDR   RW  [23:0] flash byte address
 //   0x010  QSPI_STATUS R   [0] busy, [1] rejected (last CMD refused; sticky
 //                          until the next CMD write), [2] ready (start-up
 //                          dummy clocks done; CMD writes before this are
-//                          refused)
+//                          refused), [3] dropped: a CMD/ADDR/CLKDIV/buffer
+//                          write arrived while busy and was discarded.  The
+//                          next CMD write is then refused and clears it, so a
+//                          driver that forgets to poll busy fails loudly
+//                          instead of programming the wrong address or data.
 //   0x018  QSPI_CLKDIV RW  [7:0] SCK half-period in i_Clk cycles minus 1;
-//                          reset 1 → 25 MHz at i_Clk = 100 MHz.  0 → 50 MHz.
+//                          reset 1 → 25 MHz at i_Clk = 100 MHz.  Writing 0
+//                          stores 1: 50 MHz leaves no MISO margin through
+//                          STARTUPE2 (CCLK delay + flash tV ≈ 20 ns).
 //   0x020  QSPI_FLOOR  R   [23:0] PROT_FLOOR
 //   0x028  QSPI_ID     R   0x5153_5049_0000_0001 ("QSPI", version 1).  Older
 //                          bitstreams read 0 here — drivers probe this.
 //   0x100..0x1F8       RW  256-byte data buffer (32 × 64-bit dwords, little-
 //                          endian: buffer byte i is dword i/8, bits
-//                          (i%8)*8+:8).  Flash byte ADDR+i ↔ buffer byte i.
-//                          MMIO writes are dropped while busy.
+//                          (i%8)*8+:8).  READ: buffer byte i = flash
+//                          ADDR+i.  PP: buffer byte i goes to ADDR+i within
+//                          the 256-byte page (the flash wraps at the page
+//                          end).  Any R command (e.g. an RDSR poll) overwrites
+//                          bytes 0..len-1, so fill the buffer after polling.
 //
 // SPI mode 0, MSB first, single-bit (DQ0 = MOSI, DQ1 = MISO; WP#/DQ2 and
 // HOLD#/DQ3 are held high).  MISO is sampled at the end of each SCK-high half,
@@ -103,11 +121,22 @@ module qspi_ctrl #(
         // returns {allowed, has_addr, kind[1:0]}
         case (op)
             8'h9F, 8'h05, 8'h07, 8'h35, 8'h16: f_decode = {1'b1, 1'b0, K_READ};
-            8'h03:                             f_decode = {1'b1, 1'b1, K_READ};
+            8'h03:                             f_decode = {1'b1, 1'b1, K_READ};  // 4READ
             8'h06, 8'h04, 8'h30:               f_decode = {1'b1, 1'b0, K_NONE};
             8'h02:                             f_decode = {1'b1, 1'b1, K_WRITE};
             8'hD8, 8'h20:                      f_decode = {1'b1, 1'b1, K_NONE};
             default:                           f_decode = 4'b0;
+        endcase
+    endfunction
+
+    // Opcode on the wire: addressed commands use the 4-byte-address forms.
+    function automatic logic [7:0] f_wire_op(input logic [7:0] op);
+        case (op)
+            8'h03:   f_wire_op = 8'h13;   // 4READ
+            8'h02:   f_wire_op = 8'h12;   // 4PP
+            8'hD8:   f_wire_op = 8'hDC;   // 4SE
+            8'h20:   f_wire_op = 8'h21;   // 4P4E
+            default: f_wire_op = op;
         endcase
     endfunction
 
@@ -124,16 +153,22 @@ module qspi_ctrl #(
     logic        r_rejected;
     logic        r_ready;
     logic        r_busy;
+    logic        r_dropped;
 
     wire        w_cmd_wr  = mmio.write_DV && (mmio.addr[15:0] == OFF_CMD);
     wire [7:0]  w_op      = mmio.write_data[7:0];
-    wire [8:0]  w_len_in  = mmio.write_data[24:16];
+    wire [15:0] w_len_in  = mmio.write_data[31:16];
     wire [3:0]  w_dec     = f_decode(w_op);
+    wire [7:0]  w_wire_op = f_wire_op(w_op);
     wire        w_allowed = w_dec[3];
     wire        w_guard_ok = !f_guarded(w_op) || (r_addr >= PROT_FLOOR);
-    wire        w_len_ok  = (w_len_in <= 9'd256);
-    wire        w_accept  = w_cmd_wr && !r_busy && r_ready
+    wire        w_len_ok  = (w_len_in <= 16'd256);
+    wire        w_accept  = w_cmd_wr && !r_busy && r_ready && !r_dropped
                             && w_allowed && w_guard_ok && w_len_ok;
+    // Any write into the device window while busy is discarded and flagged.
+    wire        w_dev_wr  = mmio.write_DV
+                            && ((mmio.addr[15:0] == OFF_CMD) || (mmio.addr[15:0] == OFF_ADDR)
+                                || (mmio.addr[15:0] == OFF_CLKDIV) || is_buf);
     wire        w_reject  = w_cmd_wr && !r_busy && !w_accept;
 
     always_ff @(posedge i_Clk or negedge i_Rst_L) begin
@@ -142,14 +177,18 @@ module qspi_ctrl #(
             r_clk_div  <= 8'd1;
             r_cmd_word <= 32'h0;
             r_rejected <= 1'b0;
+            r_dropped  <= 1'b0;
         end else begin
             if (mmio.write_DV && (mmio.addr[15:0] == OFF_ADDR) && !r_busy)
                 r_addr <= mmio.write_data[23:0];
             if (mmio.write_DV && (mmio.addr[15:0] == OFF_CLKDIV) && !r_busy)
-                r_clk_div <= mmio.write_data[7:0];
+                r_clk_div <= (mmio.write_data[7:0] == 8'd0) ? 8'd1 : mmio.write_data[7:0];
             if (w_cmd_wr && !r_busy) begin
                 r_cmd_word <= mmio.write_data[31:0];
                 r_rejected <= w_reject;
+                r_dropped  <= 1'b0;
+            end else if (w_dev_wr && r_busy) begin
+                r_dropped  <= 1'b1;
             end
         end
     end
@@ -188,8 +227,8 @@ module qspi_ctrl #(
     logic        r_sck_phase;       // 0 = SCK low half, 1 = SCK high half
     logic [ 2:0] r_bit;             // bit index within the byte, 7..0
     logic [ 9:0] r_byte;            // byte index in the transaction
-    logic [ 9:0] r_nbytes;          // total bytes: 1 + (3) + len
-    logic [ 2:0] r_hdr;             // header bytes: 1 or 4
+    logic [ 9:0] r_nbytes;          // total bytes: 1 + (4) + len
+    logic [ 2:0] r_hdr;             // header bytes: 1, or 5 (opcode + 4 address)
     logic [ 1:0] r_kind;
     logic [ 7:0] r_opcode;
     logic [23:0] r_xaddr;
@@ -209,9 +248,10 @@ module qspi_ctrl #(
                                              input logic [23:0] a,
                                              input logic [7:0] bufb);
         if (i == 10'd0)                    f_tx_byte = op;
-        else if (hdr == 3'd4 && i == 10'd1) f_tx_byte = a[23:16];
-        else if (hdr == 3'd4 && i == 10'd2) f_tx_byte = a[15:8];
-        else if (hdr == 3'd4 && i == 10'd3) f_tx_byte = a[7:0];
+        else if (hdr == 3'd5 && i == 10'd1) f_tx_byte = 8'h00;     // A[31:24]
+        else if (hdr == 3'd5 && i == 10'd2) f_tx_byte = a[23:16];
+        else if (hdr == 3'd5 && i == 10'd3) f_tx_byte = a[15:8];
+        else if (hdr == 3'd5 && i == 10'd4) f_tx_byte = a[7:0];
         else if (kind == K_WRITE)          f_tx_byte = bufb;
         else                               f_tx_byte = 8'hFF;
     endfunction
@@ -287,16 +327,16 @@ module qspi_ctrl #(
                     r_busy <= 1'b0;
                     if (w_accept) begin
                         r_busy      <= 1'b1;
-                        r_opcode    <= w_op;
+                        r_opcode    <= w_wire_op;
                         r_xaddr     <= r_addr;
                         r_kind      <= w_dec[1:0];
-                        r_hdr       <= w_dec[2] ? 3'd4 : 3'd1;
-                        r_nbytes    <= (w_dec[2] ? 10'd4 : 10'd1)
-                                       + ((w_dec[1:0] == K_NONE) ? 10'd0 : {1'b0, w_len_in});
+                        r_hdr       <= w_dec[2] ? 3'd5 : 3'd1;
+                        r_nbytes    <= (w_dec[2] ? 10'd5 : 10'd1)
+                                       + ((w_dec[1:0] == K_NONE) ? 10'd0 : w_len_in[9:0]);
                         r_byte      <= 10'd0;
                         r_bit       <= 3'd7;
-                        r_tx        <= w_op;
-                        o_mosi      <= w_op[7];
+                        r_tx        <= w_wire_op;
+                        o_mosi      <= w_wire_op[7];
                         r_div_cnt   <= 8'd0;
                         r_sck_phase <= 1'b0;
                         o_cs_n      <= 1'b0;
@@ -381,7 +421,7 @@ module qspi_ctrl #(
             case (mmio.addr[15:0])
                 OFF_CMD:    mmio.read_data = {32'b0, r_cmd_word};
                 OFF_ADDR:   mmio.read_data = {40'b0, r_addr};
-                OFF_STATUS: mmio.read_data = {61'b0, r_ready, r_rejected, r_busy};
+                OFF_STATUS: mmio.read_data = {60'b0, r_dropped, r_ready, r_rejected, r_busy};
                 OFF_CLKDIV: mmio.read_data = {56'b0, r_clk_div};
                 OFF_FLOOR:  mmio.read_data = {40'b0, PROT_FLOOR};
                 OFF_ID:     mmio.read_data = ID_VALUE;

@@ -45,13 +45,22 @@ module s25fl_model (
         sh_in = {sh_in[6:0], mosi};
         nbits++;
         if (nbits % 8 == 0) begin
-            if (nbytes == 0) begin op = sh_in; ops_seen++; end
-            else if (nbytes == 1) addr[23:16] = sh_in;
-            else if (nbytes == 2) addr[15:8]  = sh_in;
-            else if (nbytes == 3) addr[7:0]   = sh_in;
-            else if (op == 8'h02 && wel && !wip) begin
-                pp_buf[(addr[7:0] + (nbytes - 4)) & 8'hFF] = sh_in;
-                pp_used[(addr[7:0] + (nbytes - 4)) & 8'hFF] = 1;
+            // Addressed commands must arrive in their 4-byte forms
+            // (13/12/DC/21); the 3-byte ones would follow BAR.EXTADD.
+            if (nbytes == 0) begin
+                op = sh_in; ops_seen++;
+                if (op == 8'h03 || op == 8'h02 || op == 8'hD8 || op == 8'h20) begin
+                    protocol_err++;
+                    $display("MODEL: 3-byte-address opcode %02x on the wire", op);
+                end
+            end
+            else if (nbytes == 1 && (op == 8'h13 || op == 8'h12 || op == 8'hDC || op == 8'h21)) begin if (sh_in != 8'h00) protocol_err++; end
+            else if (nbytes == 2) addr[23:16] = sh_in;
+            else if (nbytes == 3) addr[15:8]  = sh_in;
+            else if (nbytes == 4) addr[7:0]   = sh_in;
+            else if (op == 8'h12 && wel && !wip) begin
+                pp_buf[(addr[7:0] + (nbytes - 5)) & 8'hFF] = sh_in;
+                pp_used[(addr[7:0] + (nbytes - 5)) & 8'hFF] = 1;
             end
             nbytes++;
         end
@@ -69,7 +78,7 @@ module s25fl_model (
                 end
                 8'h05: sh_out = {6'b0, wel, wip};
                 8'h07, 8'h35, 8'h16: sh_out = 8'h00;
-                8'h03: sh_out = (nbytes >= 4) ? rd(addr + nbytes - 4) : 8'hFF;
+                8'h13: sh_out = (nbytes >= 5) ? rd(addr + nbytes - 5) : 8'hFF;
                 default: sh_out = 8'hFF;
             endcase
         end else begin
@@ -87,16 +96,16 @@ module s25fl_model (
             case (op)
                 8'h06: wel = 1;
                 8'h04: wel = 0;
-                8'h02: if (nbytes >= 4 && wel && !wip) begin
+                8'h12: if (nbytes >= 5 && wel && !wip) begin
                     if (addr < 24'hF0_0000) low_writes++;
                     for (int i = 0; i < 256; i++)
                         if (pp_used[i]) mem[{addr[23:8], 8'(i)}] = rd({addr[23:8], 8'(i)}) & pp_buf[i];
                     wip = 1; wel = 0;
                     fork begin #3000; wip = 0; end join_none
                 end
-                8'hD8, 8'h20: if (nbytes == 4 && wel && !wip) begin
+                8'hDC, 8'h21: if (nbytes == 5 && wel && !wip) begin
                     automatic int base, size;
-                    size = (op == 8'hD8) ? 32'h1_0000 : 32'h1000;
+                    size = (op == 8'hDC) ? 32'h1_0000 : 32'h1000;
                     base = addr & ~(size - 1);
                     if (base < 24'hF0_0000) low_writes++;
                     for (int a = base; a < base + size; a++)
@@ -163,7 +172,7 @@ module tb_qspi_ctrl;
 
     task automatic cmd(input logic [7:0] op, input int len, input logic [23:0] a = 0);
         mw(16'h0008, {40'b0, a});
-        mw(16'h0000, {39'b0, 9'(len), 8'h00, op});
+        mw(16'h0000, {32'b0, 16'(len), 8'h00, op});
         wait_idle();
     endtask
 
@@ -240,6 +249,8 @@ module tb_qspi_ctrl;
         expect_reject("4PP",             8'h12, 4, 24'hF0_0000);
         expect_reject("4SE",             8'hDC, 0, 24'hF0_0000);
         expect_reject("len 257",         8'h03, 257, 24'hF0_0000);
+        expect_reject("len 512",         8'h03, 512, 24'hF0_0000);
+        expect_reject("len 513",         8'h03, 513, 24'hF0_0000);
         cmd(8'h04, 0);
 
         // Erase + program + read back at the floor (256-byte page)
@@ -268,10 +279,12 @@ module tb_qspi_ctrl;
         cmd(8'h03, 4, 24'hF0_0000); read_buf(dw);
         check("P4E erased", dw[0][31:0], 32'hFFFF_FFFF);
 
-        // 50 MHz read
+        // CLKDIV 0 is stored as 1 (no 50 MHz); 3 → 12.5 MHz still reads
         mw(16'h0018, 64'h0);
+        mr(16'h0018, d); check("CLKDIV 0 clamps to 1", d, 64'h1);
+        mw(16'h0018, 64'h3);
         cmd(8'h03, 8, 24'h000000); read_buf(dw);
-        for (int i = 0; i < 8; i++) begin e = pat(i); check($sformatf("50MHz READ %0d", i), bufbyte(dw, i), e); end
+        for (int i = 0; i < 8; i++) begin e = pat(i); check($sformatf("12.5MHz READ %0d", i), bufbyte(dw, i), e); end
         mw(16'h0018, 64'h1);
 
         // CMD and ADDR writes while busy are ignored
@@ -282,6 +295,20 @@ module tb_qspi_ctrl;
         mr(16'h0008, d); check("ADDR write ignored while busy", d, 64'h0);
         wait_idle();
         mr(16'h0000, d); check("CMD while busy ignored", d[7:0], 8'h03);
+        mr(16'h0010, d); check("dropped flag set", d[3], 1'b1);
+        begin
+            int n0 = flash.ops_seen;
+            mw(16'h0000, {32'b0, 16'd1, 8'h00, 8'h05});
+            mr(16'h0010, d); check("CMD after a dropped write refused", d[3:0], 4'b0110);
+            check("refused CMD: no flash traffic", flash.ops_seen, n0);
+        end
+        cmd(8'h05, 1); mr(16'h0010, d); check("next CMD accepted", d[3:0], 4'b0100);
+        // a dropped buffer write also arms the flag
+        mw(16'h0000, {32'b0, 16'd64, 8'h00, 8'h03});
+        mw(16'h0100, 64'h1234);
+        wait_idle();
+        mr(16'h0010, d); check("buffer write while busy flagged", d[3], 1'b1);
+        cmd(8'h05, 1); mr(16'h0010, d); check("refused after buffer drop", d[1], 1'b1);
 
         // The bitstream area must be untouched.
         check("no program/erase below floor", flash.low_writes, 0);
