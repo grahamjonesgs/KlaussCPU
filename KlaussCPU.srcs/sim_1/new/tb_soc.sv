@@ -225,6 +225,7 @@ module tb_soc;
       .o_SD_RESET(o_SD_RESET), .i_SD_CD(1'b0), .o_SD_SCK(o_SD_SCK),
       .o_SD_MOSI(o_SD_MOSI), .i_SD_MISO(1'b0), .o_SD_CS_n(o_SD_CS_n),
       .o_SD_DAT1(o_SD_DAT1), .o_SD_DAT2(o_SD_DAT2),
+      .o_QSPI_CS_n(), .o_QSPI_DQ0(), .i_QSPI_DQ1(1'b1), .o_QSPI_DQ2(), .o_QSPI_DQ3(),
       .ETH_MDC(ETH_MDC), .ETH_MDIO(), .ETH_RSTN(ETH_RSTN),
       .ETH_CRSDV(1'b0), .ETH_RXERR(1'b0), .ETH_RXD(2'b00),
       .ETH_TXEN(ETH_TXEN), .ETH_TXD(ETH_TXD), .ETH_REFCLK(ETH_REFCLK),
