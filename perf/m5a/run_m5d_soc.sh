@@ -37,6 +37,7 @@ xvlog -sv \
   "$SRC/sources_1/new/uart_rx.sv" \
   "$SRC/sources_1/new/uart_rx_fifo.sv" \
   "$SRC/sources_1/new/sd_spi.sv" \
+  "$SRC/sources_1/new/qspi_ctrl.sv" \
   "$SRC/sources_1/new/crypto_aes.sv" \
   "$SRC/sources_1/new/crypto_sha.sv" \
   "$SRC/sources_1/new/aes_core.sv" \

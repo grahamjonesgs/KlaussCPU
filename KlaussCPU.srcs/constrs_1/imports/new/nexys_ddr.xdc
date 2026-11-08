@@ -245,13 +245,14 @@ set_property -dict { PACKAGE_PIN D5    IOSTANDARD LVCMOS33 } [get_ports { ETH_RE
 #set_property -dict { PACKAGE_PIN B8    IOSTANDARD LVCMOS33 } [get_ports { ETH_INTN }]; #IO_L12P_T1_MRCC_16 Sch=eth_intn  -- not used by LiteEth; leave commented
 
 
-##Quad SPI Flash
-
-#set_property -dict { PACKAGE_PIN K17   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[0] }]; #IO_L1P_T0_D00_MOSI_14 Sch=qspi_dq[0]
-#set_property -dict { PACKAGE_PIN K18   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[1] }]; #IO_L1N_T0_D01_DIN_14 Sch=qspi_dq[1]
-#set_property -dict { PACKAGE_PIN L14   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[2] }]; #IO_L2P_T0_D02_14 Sch=qspi_dq[2]
-#set_property -dict { PACKAGE_PIN M14   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[3] }]; #IO_L2N_T0_D03_14 Sch=qspi_dq[3]
-#set_property -dict { PACKAGE_PIN L13   IOSTANDARD LVCMOS33 } [get_ports { QSPI_CSN }]; #IO_L6P_T0_FCS_B_14 Sch=qspi_csn
+##Quad SPI Flash — the configuration flash, used after boot by qspi_ctrl.sv
+## (MMIO 0xF012_xxxx).  Single-bit SPI: DQ0 = MOSI, DQ1 = MISO, DQ2 = WP#,
+## DQ3 = HOLD#.  CCLK (E9) has no port: it is driven via STARTUPE2.USRCCLKO.
+set_property -dict { PACKAGE_PIN K17   IOSTANDARD LVCMOS33 } [get_ports { o_QSPI_DQ0 }];  #IO_L1P_T0_D00_MOSI_14 Sch=qspi_dq[0]
+set_property -dict { PACKAGE_PIN K18   IOSTANDARD LVCMOS33 } [get_ports { i_QSPI_DQ1 }];  #IO_L1N_T0_D01_DIN_14 Sch=qspi_dq[1]
+set_property -dict { PACKAGE_PIN L14   IOSTANDARD LVCMOS33 } [get_ports { o_QSPI_DQ2 }];  #IO_L2P_T0_D02_14 Sch=qspi_dq[2]
+set_property -dict { PACKAGE_PIN M14   IOSTANDARD LVCMOS33 } [get_ports { o_QSPI_DQ3 }];  #IO_L2N_T0_D03_14 Sch=qspi_dq[3]
+set_property -dict { PACKAGE_PIN L13   IOSTANDARD LVCMOS33 } [get_ports { o_QSPI_CS_n }]; #IO_L6P_T0_FCS_B_14 Sch=qspi_csn
 
 set_property CONFIG_VOLTAGE 3.3 [current_design]
 set_property CFGBVS VCCO [current_design]
@@ -280,6 +281,7 @@ set_false_path -from [get_ports i_load_H]
 # fanning out to the whole synchronous-reset tree).
 set_false_path -from [get_ports CPU_RESETN]
 set_false_path -from [get_ports i_SPI_LCD_MISO]
+set_false_path -from [get_ports i_QSPI_DQ1]
 
 set_false_path -to [get_ports {o_led[*]}]
 set_false_path -to [get_ports {o_LED_RGB_1[*]}]
@@ -290,6 +292,7 @@ set_false_path -to [get_ports o_uart_tx]
 set_false_path -to [get_ports o_SPI_LCD_MOSI]
 set_false_path -to [get_ports o_SPI_LCD_Clk]
 set_false_path -to [get_ports o_SPI_LCD_CS_n]
+set_false_path -to [get_ports {o_QSPI_CS_n o_QSPI_DQ0 o_QSPI_DQ2 o_QSPI_DQ3}]
 set_false_path -to [get_ports o_LCD_DC]
 set_false_path -to [get_ports o_LCD_reset_n]
 # VGA: registered (IOB) on a 25 MHz CE; the resistor DAC and cable dwarf any

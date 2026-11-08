@@ -76,12 +76,17 @@ def build(rev=None, quiet=True):
 
 SOC_FILES = ['klauss_pkg.sv', 'membus_if.sv', 'mmio_if.sv', 'pipeline_core.sv', 'core2_subsys.sv',
              'bus_splitter.sv', 'mem_read_write.sv', 'boot_rom.sv', 'uart_send_msg.sv', 'uart_rx.sv',
-             'uart_rx_fifo.sv', 'sd_spi.sv', 'crypto_aes.sv', 'crypto_sha.sv', 'aes_core.sv',
+             'uart_rx_fifo.sv', 'sd_spi.sv', 'qspi_ctrl.sv', 'crypto_aes.sv', 'crypto_sha.sv', 'aes_core.sv',
              'aes_sbox.sv', 'ghash.sv', 'sha256_core.sv', 'trng.sv', 'blitter_dma.sv',
              'eth_mmio_bridge.sv', 'Seven_seg_LED_Display_Controller.sv', 'SPI_Master.sv',
              'SPI_Master_With_Single_CS.sv', 'RGB_LED.sv', 'vga_timing.sv', 'vga_scanout.sv',
              'vga_ctrl.sv', 'uart_tx.sv', 'KlaussCPU.sv']
-ODDR_STUB = '''module ODDR #(parameter DDR_CLK_EDGE = "SAME_EDGE", parameter INIT = 1'b0, parameter SRTYPE = "SYNC")
+ODDR_STUB = '''module STARTUPE2 #(parameter PROG_USR = "FALSE", parameter real SIM_CCLK_FREQ = 0.0)
+   (output CFGCLK, output CFGMCLK, output EOS, output PREQ, input CLK, input GSR, input GTS,
+    input KEYCLEARB, input PACK, input USRCCLKO, input USRCCLKTS, input USRDONEO, input USRDONETS);
+   assign EOS = 1'b1; assign CFGCLK = 1'b0; assign CFGMCLK = 1'b0; assign PREQ = 1'b0;
+endmodule
+module ODDR #(parameter DDR_CLK_EDGE = "SAME_EDGE", parameter INIT = 1'b0, parameter SRTYPE = "SYNC")
    (output reg Q, input C, input CE, input D1, input D2, input R, input S);
    initial Q = INIT;
    always @(posedge C) Q <= D1;
@@ -105,9 +110,14 @@ def build_soc(rev=None):
     os.makedirs(src, exist_ok=True)
     allsrc = ''
     names = SOC_FILES + ['uart_tasks.vh']
+    present = []
     for n in names:
         p = os.path.join(SRC, n)
-        t = git_show(rev, p) if rev else open(p).read()
+        try:
+            t = git_show(rev, p) if rev else open(p).read()
+        except subprocess.CalledProcessError:
+            continue        # newer than `rev` (e.g. qspi_ctrl.sv on an old base)
+        present.append(n)
         if n == 'pipeline_core.sv':
             t = patch_core(t)
         if n == 'uart_send_msg.sv':
@@ -133,7 +143,7 @@ def build_soc(rev=None):
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + \
-          [os.path.join(src, n) for n in SOC_FILES] + \
+          [os.path.join(src, n) for n in SOC_FILES if n in present] + \
           [os.path.join(src, 'tb_soc.sv'), os.path.join(src, 'unisim_stubs.v')]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

@@ -58,6 +58,14 @@ module KlaussCPU #(
     output            o_SD_DAT1,     // unused in SPI mode — driven high
     output            o_SD_DAT2,     // unused in SPI mode — driven high
 
+    // QSPI configuration flash (qspi_ctrl, MMIO 0xF012_xxxx).  CCLK is
+    // driven through STARTUPE2 below, so it has no port.
+    output            o_QSPI_CS_n,
+    output            o_QSPI_DQ0,    // MOSI
+    input             i_QSPI_DQ1,    // MISO
+    output            o_QSPI_DQ2,    // WP#   — held high
+    output            o_QSPI_DQ3,    // HOLD# — held high
+
     // Ethernet (Nexys A7 SMSC LAN8720A PHY, RMII)
     output            ETH_MDC,
     inout             ETH_MDIO,
@@ -763,6 +771,58 @@ module KlaussCPU #(
    assign w_sd_read_data = sd_bus.read_data;
 
    // -------------------------------------------------------------------------
+   // QSPI configuration flash — device id 0x012.  See qspi_ctrl.sv and
+   // MMIO_MAP.md.  Program / erase below PROT_FLOOR (the bitstream) are
+   // refused in hardware.  CCLK only reaches the pin through STARTUPE2.
+   // -------------------------------------------------------------------------
+   wire        w_qspi_sel      = (w_mmio_addr[27:16] == 12'h012);
+   wire        w_qspi_write_DV = w_mmio_write_DV & w_qspi_sel;
+   wire        w_qspi_read_DV  = w_mmio_read_DV  & w_qspi_sel;
+   wire [63:0] w_qspi_read_data;
+   wire        w_qspi_sck;
+   wire        w_cfg_eos;
+
+   mmio_if qspi_bus();
+   assign qspi_bus.write_DV   = w_qspi_write_DV;
+   assign qspi_bus.read_DV    = w_qspi_read_DV;
+   assign qspi_bus.addr       = w_mmio_addr;
+   assign qspi_bus.write_data = w_mmio_write_data;
+   assign qspi_bus.byte_en    = w_mmio_byte_en;
+   (* KEEP_HIERARCHY = "yes" *)
+   qspi_ctrl qspi_ctrl_i (
+       .i_Clk   (i_Clk),
+       .i_Rst_L (~w_reset_H),
+       .i_eos   (w_cfg_eos),
+       .mmio    (qspi_bus),
+       .o_sck   (w_qspi_sck),
+       .o_cs_n  (o_QSPI_CS_n),
+       .o_mosi  (o_QSPI_DQ0),
+       .i_miso  (i_QSPI_DQ1),
+       .o_wp_n  (o_QSPI_DQ2),
+       .o_hold_n(o_QSPI_DQ3)
+   );
+   assign w_qspi_read_data = qspi_bus.read_data;
+
+   STARTUPE2 #(
+       .PROG_USR("FALSE"),
+       .SIM_CCLK_FREQ(0.0)
+   ) startupe2_qspi (
+       .CFGCLK   (),
+       .CFGMCLK  (),
+       .EOS      (w_cfg_eos),
+       .PREQ     (),
+       .CLK      (1'b0),
+       .GSR      (1'b0),
+       .GTS      (1'b0),
+       .KEYCLEARB(1'b1),
+       .PACK     (1'b0),
+       .USRCCLKO (w_qspi_sck),
+       .USRCCLKTS(1'b0),       // 0 = USRCCLKO drives CCLK
+       .USRDONEO (1'b1),
+       .USRDONETS(1'b1)
+   );
+
+   // -------------------------------------------------------------------------
    // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
    wire        w_aes_sel      = (w_mmio_addr[27:16] == 12'h00A);
@@ -1085,6 +1145,7 @@ module KlaussCPU #(
          12'h00E: r_mmio_read_data_comb = w_blit_read_data; // 2D DMA blitter
          12'h010: r_mmio_read_data_comb = w_c2_read_data;   // AMP core 2 mailbox
          12'h011: r_mmio_read_data_comb = w_vga_read_data;  // VGA output
+         12'h012: r_mmio_read_data_comb = w_qspi_read_data; // QSPI flash
          12'h00F: begin  // Interrupt controller / timer
             case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's

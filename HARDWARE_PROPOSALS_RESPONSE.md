@@ -195,6 +195,60 @@ Still open: true 1a (load hits that don't freeze the pipe, which needs the
 pipelined cache/bus redesign); early issue for stores and for back-to-back
 accesses.
 
+## 0p. CPU access to the QSPI flash; keys survive SD swaps: branch qspi-keystore (2026-11-09)
+
+**Merged to master and written to QSPI on 2026-11-09** (`--verify`). The
+board boots from flash, and `qspi_verify`, `crypto_kat_hw` and `hwprop_test`
+pass on the flash image. RTL `ba339e2`. Bitstream
+`~/.cache/kbuild/qspi-keystore_ba339e2.bit`, placed with ExtraTimingOpt:
+WNS +0.003 / WHS +0.010. The Performance_Explore run missed at −0.015.
+
+**What it is:** `qspi_ctrl.sv` gives software access to the configuration
+flash (S25FL128S, 16 MiB) at MMIO `0xF012_0000`; `MMIO_MAP.md` has the
+register map and flash layout.
+- CCLK goes through `STARTUPE2`.
+- It is a command engine with a 256-byte buffer.
+- **Hardware guard:** only whitelisted opcodes run. Program and erase are
+  refused below `0xF0_0000`, where the bitstream lives. Addressed commands go
+  out in their 4-byte forms, so `BAR.EXTADD` cannot redirect them.
+- A write that arrives while the engine is busy sets `dropped`, and the next
+  CMD is refused.
+- **Bug found on the board:** the core holds an MMIO `write_DV` for about 3
+  cycles, and keeps it high across back-to-back stores to different
+  addresses. So a refused CMD could be accepted on the second cycle of the
+  same store. The fix makes CMD and `dropped` act only on the first cycle of
+  each store.
+- 25 MHz SPI: a 64 KiB erase takes 109 ms, a page program 290 µs, and reads
+  run at about 3 MB/s. 50 MHz is not allowed, because MISO has no timing
+  margin through STARTUPE2.
+
+**Zephyr** (klausscpu-runtime main): `drivers/flash/flash_klausscpu_qspi.c`
+and the DTS partitions. `ssh/keystore.c` keeps the SSH host key and the TLS
+key and cert in NVS on `storage_partition` (`0xF0_0000`, 768 KiB).
+- A key that is only on the SD card is copied into flash on first boot. The
+  host-key fingerprint stayed the same on the board.
+- New shell command: `keystore status | purge_sd`.
+- On a bitstream without `qspi_ctrl`, keys stay on the SD card, as before.
+  This was tested on the old bitstream.
+
+**Checks:**
+- **Sim:** `tb_qspi_ctrl` (behavioural S25FL128S with write_DV held 1 or 3
+  cycles), an independent 200k-step fuzz of the guard, and Verilator
+  `socdiff` vs master (identical).
+- **Board:** `qspi_test` ALL PASS. Every guard case is refused, erase,
+  program and read-back work in the scratch sector, and the bitstream is
+  unchanged.
+- **Validation:** `validate.sh board` and `validate.sh zephyr` (128 PASS)
+  both PASSED on the JTAG image.
+- **Keys:** with `/SD:/sys` hidden, all three keys load from flash with the
+  same fingerprint. After `openFPGALoader -f` of the new bitstream, a full
+  dump shows `0x300000–0xFFFFFF` byte-identical: only the bitstream's
+  sectors are erased.
+
+**Note:** full-flash dumps now contain the private keys. See
+`~/.cache/kbuild/rollback/README.txt` for how to roll back the bitstream
+without rolling back the keys.
+
 ## 0o. Crypto bitstream 2 (fused GCM): branch crypto-gcm-fuse — parked (2026-11-04)
 
 **Not shipped. QSPI stays on bitstream 1 (`27ff737`), by Graham's decision.**
