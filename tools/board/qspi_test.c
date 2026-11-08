@@ -59,7 +59,8 @@ static int wait_wip(uint64_t *cyc) {
     uint64_t t0 = CYCLES;
     uint8_t sr;
     unsigned long n = 0;
-    do { sr = rdsr(0x05); n++; } while ((sr & 1) && n < 50000000ul);
+    // P_ERR/E_ERR keep WIP set until CLSR: check them on every poll.
+    do { sr = rdsr(0x05); n++; } while ((sr & 1) && !(sr & 0x60) && n < 50000000ul);
     if (cyc) *cyc = CYCLES - t0;
     if (sr & 0x60) { printf("  SR1 error bits %02x\n", sr); qcmd(0x30, 0, 0); return -1; }
     return (sr & 1) ? -1 : 0;

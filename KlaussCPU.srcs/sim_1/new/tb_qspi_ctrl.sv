@@ -141,10 +141,25 @@ module tb_qspi_ctrl;
     localparam logic [31:0] BASE = 32'hF012_0000;
     int errors = 0;
 
+    // Like the CPU: write_DV held for HOLD cycles (until the MMIO ready).
+    int hold = 3;
     task automatic mw(input logic [15:0] off, input logic [63:0] d, input logic [7:0] be = 8'hFF);
         @(negedge clk);
         bus.addr = BASE | off; bus.write_data = d; bus.byte_en = be; bus.write_DV = 1;
+        repeat (hold) @(negedge clk);
+        bus.write_DV = 0;
+    endtask
+
+    // Two stores back to back with write_DV held high across both (allowed
+    // when the addresses differ).
+    task automatic mw2(input logic [15:0] o1, input logic [63:0] d1,
+                       input logic [15:0] o2, input logic [63:0] d2);
         @(negedge clk);
+        bus.byte_en = 8'hFF; bus.write_DV = 1;
+        bus.addr = BASE | o1; bus.write_data = d1;
+        repeat (hold) @(negedge clk);
+        bus.addr = BASE | o2; bus.write_data = d2;
+        repeat (hold) @(negedge clk);
         bus.write_DV = 0;
     endtask
 
@@ -303,6 +318,18 @@ module tb_qspi_ctrl;
             check("refused CMD: no flash traffic", flash.ops_seen, n0);
         end
         cmd(8'h05, 1); mr(16'h0010, d); check("next CMD accepted", d[3:0], 4'b0100);
+        // continuous DV: CMD accepted, then an ADDR store under the same DV
+        mw(16'h0008, 64'h0);
+        mw2(16'h0000, {32'b0, 16'd64, 8'h00, 8'h03}, 16'h0008, 64'hF0_0000);
+        wait_idle();
+        mr(16'h0008, d); check("held-DV ADDR while busy dropped", d, 64'h0);
+        mr(16'h0010, d); check("held-DV dropped flagged", d[3], 1'b1);
+        cmd(8'h05, 1); mr(16'h0010, d); check("refused after held-DV drop", d[1], 1'b1);
+        // continuous DV: ADDR then CMD (both land; the CMD sees the new ADDR)
+        mw2(16'h0008, 64'h000004, 16'h0000, {32'b0, 16'd4, 8'h00, 8'h03});
+        wait_idle();
+        mr(16'h0010, d); check("held-DV ADDR+CMD accepted", d[3:0], 4'b0100);
+        read_buf(dw); e = pat(4); check("held-DV ADDR+CMD read", bufbyte(dw, 0), e);
         // a dropped buffer write also arms the flag
         mw(16'h0000, {32'b0, 16'd64, 8'h00, 8'h03});
         mw(16'h0100, 64'h1234);

@@ -31,6 +31,7 @@ cache controller.
 0xF00F_xxxx                 timers / IRQ controller
 0xF010_xxxx                 AMP core 2 mailbox (control / load window / log)
 0xF011_xxxx                 VGA output (640x480@60, DDR scanout, palette, vsync IRQ)
+0xF012_xxxx                 QSPI configuration flash (S25FL128S; bitstream read-only)
 ```
 
 Reserved ranges read as 0 and ignore writes (no bus error).
@@ -130,6 +131,73 @@ removing a card.
 before issuing CMD24, or reads the incoming sector here after CMD17. Use
 `MEMSET64`/`MEMGET64` for fast 8-byte transfers; byte/halfword/word stores
 also work via byte enables.
+
+### QSPI flash — base `0xF012_0000`
+
+CPU access to the board's configuration flash, a Spansion S25FL128S
+(16 MiB), through [qspi_ctrl.sv](KlaussCPU.srcs/sources_1/new/qspi_ctrl.sv).
+The FPGA bitstream is at offset 0 (about 3.1 MB). CCLK is driven through
+`STARTUPE2.USRCCLKO`; the other flash pins are ordinary I/O after
+configuration.
+
+It is a command engine. Software sets `QSPI_ADDR`, fills the buffer (for a
+program) and writes `QSPI_CMD`; the hardware runs the whole transaction
+(SPI mode 0, single-bit, 25 MHz). Then software polls `QSPI_STATUS.busy`.
+
+**Bitstream guard (hardware):**
+
+- Only whitelisted opcodes run.
+- Program and erase are refused below `QSPI_FLOOR` (0xF0_0000, a synthesis
+  parameter).
+- Addressed commands go out in their 4-byte-address forms, so the flash's
+  `BAR.EXTADD` bit cannot redirect them.
+- A refused command does not touch the flash and sets `rejected`.
+
+| Offset | Reg           | RW | Description |
+|--------|---------------|----|-------------|
+| 0x000  | `QSPI_CMD`    | W  | `[7:0]` opcode, `[31:16]` length (0..256 bytes). Starts the command. Refused if the engine is not ready, the opcode is not whitelisted, a guarded command is below the floor, len > 256, or a write was dropped since the previous CMD. R: the last value written. |
+| 0x008  | `QSPI_ADDR`   | RW | `[23:0]` flash byte address |
+| 0x010  | `QSPI_STATUS` | R  | `[0]` busy, `[1]` rejected (last CMD refused), `[2]` ready (start-up done), `[3]` dropped (a CMD/ADDR/CLKDIV/buffer write arrived while busy and was discarded; the next CMD is refused and clears it) |
+| 0x018  | `QSPI_CLKDIV` | RW | `[7:0]` SCK half-period − 1 in 100 MHz cycles. Reset 1 = 25 MHz; 0 is stored as 1. |
+| 0x020  | `QSPI_FLOOR`  | R  | Lowest programmable/erasable address (0xF0_0000) |
+| 0x028  | `QSPI_ID`     | R  | `0x5153_5049_0000_0001` ("QSPI" v1). Bitstreams without the block read 0. |
+| 0x100..0x1F8 | `QSPI_BUF` | RW | 256-byte buffer, little-endian dwords (byte *i* = dword *i*/8, bits (*i*%8)·8). A read command fills bytes 0..len−1; a page program sends them. |
+
+Whitelisted opcodes (R = read len bytes into the buffer, W = send len bytes,
+N = no data; g = guarded by the floor):
+
+| Opcode | Command | Kind | On the wire |
+|--------|---------|------|-------------|
+| 0x9F | RDID | R | 0x9F |
+| 0x05 / 0x07 / 0x35 / 0x16 | RDSR1 / RDSR2 / RDCR / BRRD | R | same |
+| 0x03 | READ | R, address | 0x13 (4READ) |
+| 0x06 / 0x04 / 0x30 | WREN / WRDI / CLSR | N | same |
+| 0x02 | Page program (within one 256-byte page) | W, address, g | 0x12 (4PP) |
+| 0xD8 | Sector erase, 64 KiB | N, address, g | 0xDC (4SE) |
+| 0x20 | Parameter-sector erase, 4 KiB | N, address, g | 0x21 (4P4E) |
+
+**Program sequence:**
+1. Poll RDSR1 until WIP = 0.
+2. Fill the buffer. Any read command, including an RDSR poll, overwrites
+   buffer bytes 0..len−1, so the buffer has to be filled after polling.
+3. Send WREN.
+4. Send PP with `ADDR` and len.
+5. Poll RDSR1 until WIP = 0. Check E_ERR/P_ERR (bits 5 and 6) on every
+   poll: after a failed program or erase, WIP stays 1 until CLSR, and the
+   flash ignores every other command until then.
+
+**Flash layout:**
+
+| Range | Use |
+|-------|-----|
+| 0x00_0000–0xEF_FFFF | FPGA bitstream (read-only from the CPU) |
+| 0xF0_0000–0xFB_FFFF | Zephyr keystore (NVS, `storage_partition`) |
+| 0xFC_0000–0xFF_FFFF | Scratch for board tests (`tools/board/qspi_test.c`) |
+
+`openFPGALoader -f x.bit` erases and writes only the sectors that the
+bitstream covers, so the keystore survives a bitstream update. A full
+16 MiB `--dump-flash` image now contains the private keys. To roll back,
+restore only the bitstream range.
 
 ### RGB LED — base `0xF002_0000`
 

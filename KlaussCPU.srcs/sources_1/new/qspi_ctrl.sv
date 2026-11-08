@@ -54,6 +54,8 @@
 //                          next CMD write is then refused and clears it, so a
 //                          driver that forgets to poll busy fails loudly
 //                          instead of programming the wrong address or data.
+//                          (A store is one event however long the CPU holds
+//                          write_DV; see w_new_wr.)
 //   0x018  QSPI_CLKDIV RW  [7:0] SCK half-period in i_Clk cycles minus 1;
 //                          reset 1 → 25 MHz at i_Clk = 100 MHz.  Writing 0
 //                          stores 1: 50 MHz leaves no MISO margin through
@@ -155,7 +157,16 @@ module qspi_ctrl #(
     logic        r_busy;
     logic        r_dropped;
 
-    wire        w_cmd_wr  = mmio.write_DV && (mmio.addr[15:0] == OFF_CMD);
+    // One store holds write_DV for several cycles (until the MMIO ready, two
+    // cycles later), and back-to-back stores to different addresses can keep
+    // it high throughout (pipeline_core: the same address always gets a
+    // DV-low cycle between).  Side effects with history — accepting or
+    // refusing a CMD, the dropped flag — act only on the first cycle of each
+    // store: DV rising, or the address changing under a held DV.
+    logic        r_wr_q;
+    logic [15:0] r_waddr_q;
+    wire        w_new_wr  = mmio.write_DV && (!r_wr_q || (mmio.addr[15:0] != r_waddr_q));
+    wire        w_cmd_wr  = w_new_wr && (mmio.addr[15:0] == OFF_CMD);
     wire [7:0]  w_op      = mmio.write_data[7:0];
     wire [15:0] w_len_in  = mmio.write_data[31:16];
     wire [3:0]  w_dec     = f_decode(w_op);
@@ -166,7 +177,7 @@ module qspi_ctrl #(
     wire        w_accept  = w_cmd_wr && !r_busy && r_ready && !r_dropped
                             && w_allowed && w_guard_ok && w_len_ok;
     // Any write into the device window while busy is discarded and flagged.
-    wire        w_dev_wr  = mmio.write_DV
+    wire        w_dev_wr  = w_new_wr
                             && ((mmio.addr[15:0] == OFF_CMD) || (mmio.addr[15:0] == OFF_ADDR)
                                 || (mmio.addr[15:0] == OFF_CLKDIV) || is_buf);
     wire        w_reject  = w_cmd_wr && !r_busy && !w_accept;
@@ -178,7 +189,11 @@ module qspi_ctrl #(
             r_cmd_word <= 32'h0;
             r_rejected <= 1'b0;
             r_dropped  <= 1'b0;
+            r_wr_q     <= 1'b0;
+            r_waddr_q  <= 16'h0;
         end else begin
+            r_wr_q    <= mmio.write_DV;
+            r_waddr_q <= mmio.addr[15:0];
             if (mmio.write_DV && (mmio.addr[15:0] == OFF_ADDR) && !r_busy)
                 r_addr <= mmio.write_data[23:0];
             if (mmio.write_DV && (mmio.addr[15:0] == OFF_CLKDIV) && !r_busy)
