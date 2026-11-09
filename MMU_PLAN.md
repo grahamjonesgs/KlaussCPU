@@ -1303,22 +1303,25 @@ the shipped bitstream.
   entry count went to 16 (§11.5) and why the later steps are stage 2
   walls. They are fixed exactly and CPI-neutrally, and also buy margin for
   master.
-- **Release bitstream: `52bece8`** (`~/.cache/kbuild/mmu_stage3_release_52bece8.bit`,
-  md5 `c75aa83d…`). Closed by `build_alt_place` with ExtraPostPlacementOpt
-  from the standard flow's opt checkpoint: fully met, WNS +0.008 / TNS 0,
-  WHS +0.015 / THS 0. **LEAN**: MPU off, TRNG-only crypto, CPU_FEATURES
-  `0x0010_100D`. Board validation (2026-11-09): test_tlb 26/26 (with T11),
-  test_exc 53/53, test_mpu SKIP (no MPU), board_suite with only the
-  expected crypto_selftest SKIPs, performance equal to master, and
-  ssh_shell / HTTPS working on software AES. Graham's aim for the
-  "standard placement" rule was fast builds, not a ban on alt-place
-  (master's own bitstream is an ExtraPostPlacementOpt closure too).
-  (`875296e`'s alt-place bitstream was an earlier SRAM-only interim, without
-  the review 3 CRITICAL fix; superseded.)
-- **After the release**, `10413af` and `98fe470` are exact and stay on the
-  branch as measurements. `98fe470` happened to meet in the standard flow's
-  tier 1 (+0.011, 12 min 40 s; kept as `mmu_98fe470_LEAN.bit`), but it is
-  not the release.
+- **Release bitstream: `98fe470`** (`~/.cache/kbuild/mmu_stage3_release_98fe470.bit`,
+  md5 `9a6ee8bc…`), chosen by Graham on 2026-11-09. It closed with the
+  **standard flow in tier 1** (WNS +0.011 / TNS 0, WHS +0.026 / THS 0,
+  12 min 40 s), so a normal `build_fast` of the commit reproduces it.
+  **LEAN**: MPU off, TRNG-only crypto, CPU_FEATURES `0x0010_100D`. It is
+  `52bece8` plus two exact timing fixes (`10413af`, `98fe470`). Board
+  validation (2026-11-09, runtime mmu with the mnemonic switch): klausscc
+  all_tests 30/31 with 0 failed, hw_tlb.kla 19/19, test_tlb 26/26 (T11a/b,
+  the review 3 CRITICAL check), test_exc 53/53, test_atomic 139/139,
+  test_mpu SKIP, board_suite -O2 with only the expected crypto_selftest
+  SKIPs, perf_baseline within ±0.03 % of master.
+- **First release, superseded: `52bece8`** (`mmu_stage3_release_52bece8.bit`,
+  md5 `c75aa83d…`), an alt-place ExtraPostPlacementOpt closure (WNS +0.008,
+  WHS +0.015) of the same design without the last two fixes. Its board
+  validation also covered ssh_shell / HTTPS on software AES. Graham's aim
+  for the "standard placement" rule was fast builds, not a ban on alt-place
+  (master's own bitstream is an alt-place closure too). (`875296e`'s
+  alt-place bitstream was an earlier SRAM-only interim, without the review 3
+  CRITICAL fix.)
 - **Synthesis folding.** Without `keep_hierarchy`, synthesis placed core
   logic inside `mmu_tlb` (`pc`-mux LUTs) and `mmu_mpu` (`id_ser`, the
   multiplier). Both are kept now, like `mmu_sr`.
