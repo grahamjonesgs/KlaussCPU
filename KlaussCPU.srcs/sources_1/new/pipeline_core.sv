@@ -836,6 +836,17 @@ module pipeline_core
                end else begin
                   d.legal = 1'b1; d.uop = U_STORE; d.use_rdd = 1'b1;
                end
+            end else if (EN_EXC && len == 2'b01 && op[22:21] == 2'b00 && op[19:13] == 7'h0 &&
+                         op[12] && !op[20] && op[25]) begin
+               // MMU stage 1 LR/SC: MODE=00 with [12]=1 (illegal before);
+               // 32 / 64-bit.  LR.D: SGN = 0; LR.W: SGN = sign-extend.  SC:
+               // rd = 0/1 result, rs2 = data, SGN = 0.
+               d.is_mem = 1'b1;  d.use_rs1 = 1'b1;  d.wreg = 1'b1;
+               if (cls == 4'h6 && op[3:0] == 4'h0 && !(op[24] && op[23])) begin
+                  d.legal = 1'b1; d.uop = U_LR;
+               end else if (cls == 4'h7 && !op[23]) begin
+                  d.legal = 1'b1; d.uop = U_SC; d.use_rs2 = 1'b1;
+               end
             end
          end
          4'h8: begin // branch / call
@@ -1348,7 +1359,7 @@ module pipeline_core
    // Every forward mux sits at an ID->EX register D-input, fed by registers.
    wire mem_loadlk  = mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LOAD32 ||
                                     mem_d.uop == U_POP || mem_d.uop == U_LEAVE ||
-                                    mem_d.uop == U_LEAVERET);
+                                    mem_d.uop == U_LEAVERET || mem_d.uop == U_LR);
    // EN_MUL2: a MUL in MEM has no value yet (its product is in the DSP)
    // (timing: the MEM op's class is registered at EX -> MEM — mem_lkq /
    // mem_mulq — so the RAW-hazard cone ANDs a flop with mem_valid instead of
@@ -1400,7 +1411,7 @@ module pipeline_core
    endfunction
    wire ex_loadp = ex_valid && ex_d.wreg &&
                    (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
-                    ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET);
+                    ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET || ex_d.uop == U_LR);
    assign perf_stall[1] = id_valid && ((mem_loadlk && mem_d.wreg && f_id_reads(mem_d.rd)) ||
                                        (ex_loadp && f_id_reads(ex_d.rd)) ||
                                        (wb_ldlk && f_id_reads(wb_rd)));
@@ -1537,6 +1548,16 @@ module pipeline_core
    wire ex_dis_eff = (mem_valid && mem_dis_we) ? mem_dis_new
                    : (wb_valid  && wb_dis_we)  ? wb_dis_new : irq_dis;
 
+   // MMU stage 1: does the SC in EX succeed?  The reservation as it will be
+   // after the older LR / SC in WB, then in MEM, commit (both always do: a
+   // faulting one is no longer an LR / SC uop, and a squash of either kills
+   // this SC too).  SC is [rs1] only, so its address is ex_a (no adder).
+   logic wb_lr, wb_sc;
+   wire ex_sc_ok = (mem_valid && mem_d.uop == U_LR) ? (mem_iaddr[31:3] == ex_a[31:3])
+                 : (mem_valid && mem_d.uop == U_SC) ? 1'b0
+                 : (wb_valid && wb_lr)              ? (wb_iaddr[31:3] == ex_a[31:3])
+                 : (wb_valid && wb_sc)              ? 1'b0
+                 :                                    (res_valid && res_dw == ex_a[31:3]);
    wire [31:0] ex_sp_r = EN_SPFWD ? ex_sp : sp;
    // EN_LDBYP: the ALU / BOOL / FBR operands (a bypassed load's value from
    // WB, with the W-compare shift applied as at dispatch)
@@ -1692,6 +1713,16 @@ module pipeline_core
             exo_raw    = exo_wdata;  exo_be = 8'hFF;
             exo_sp_new = ex_sp_r - 32'd8;
          end
+         U_SC: begin                             // MMU stage 1: data = rs2
+            exo_raw = ex_b;
+            if (ex_d.msz == 2'd2) begin
+               exo_wdata = {ex_b[31:0], ex_b[31:0]};
+               exo_be    = exo_eaddr[2] ? 8'b1111_0000 : 8'b0000_1111;
+            end else begin
+               exo_wdata = ex_b;  exo_be = 8'hFF;
+            end
+            exo_result = {63'b0, !ex_sc_ok};     // 0 = stored, 1 = failed
+         end
          U_POP, U_RET, U_IRET: begin
             exo_eaddr  = ex_sp_r;
             exo_sp_new = ex_sp_r + 32'd8;
@@ -1770,9 +1801,13 @@ module pipeline_core
                        : (ex_d.mmode == 2'b10) ? ex_var1[1:0]
                        :                         ex_a[1:0] + ex_b[1:0];
    wire ex_misal = EN_MISAL_TRAP && ex_valid &&
-                   (ex_d.uop == U_LOAD || ex_d.uop == U_STORE) &&
-                   ((ex_d.msz == 2'd1 && ex_ea_lo[0]) ||
-                    (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00));
+                   (((ex_d.uop == U_LOAD || ex_d.uop == U_STORE) &&
+                     ((ex_d.msz == 2'd1 && ex_ea_lo[0]) ||
+                      (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00))) ||
+                    // MMU stage 1: LR/SC ([rs1] only) must be naturally aligned
+                    (EN_EXC && (ex_d.uop == U_LR || ex_d.uop == U_SC) &&
+                     ((ex_d.msz == 2'd2 && ex_a[1:0] != 2'b00) ||
+                      (ex_d.msz == 2'd3 && ex_a[2:0] != 3'b000))));
    logic mem_misal;      // the MEM op is a converted misaligned access (parks 5)
    logic ev_misal;       // blocking event: a misaligned op entered MEM this edge
    // MMU stage 1: the raw effective address (a sub-word store's exo_eaddr
@@ -1913,10 +1948,13 @@ module pipeline_core
                                     (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
                                      mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
                                      mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
-                                     mem_is_ld32);
+                                     mem_d.uop == U_LR || mem_is_ld32);
    wire mem_port_wr  = mem_valid && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
                                      mem_d.uop == U_ENTER ||
-                                     (mem_d.uop == U_CALL && mem_sp_we));
+                                     (mem_d.uop == U_CALL && mem_sp_we) ||
+                                     // MMU stage 1: an SC stores only on success
+                                     // (its result, registered in EX, is mem_result[0] = 0)
+                                     (mem_d.uop == U_SC && !mem_result[0]));
    wire mem_port_op  = mem_port_rd || mem_port_wr;
    // MEMGET32 spanning a dword: served by the read lookahead when the next
    // dword is in the same line, else a second read (f_memget32 exactly).
@@ -2163,7 +2201,7 @@ module pipeline_core
          endcase
       end else if (mem_valid && mem_d.uop == U_LEAVERET) begin
          mem_ldval = (mem_xc == 2'd3) ? mem_dw0 : m_rdata;   // saved R15
-      end else if (mem_valid && mem_d.uop == U_LOAD) begin
+      end else if (mem_valid && (mem_d.uop == U_LOAD || mem_d.uop == U_LR)) begin
          case (mem_d.msz)
             2'd0: mem_ldval = mem_d.sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
             2'd1: mem_ldval = mem_d.sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
@@ -2260,7 +2298,7 @@ module pipeline_core
          scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
-         wb_um_we <= 1'b0;
+         wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2468,6 +2506,9 @@ module pipeline_core
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
             if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
+            // MMU stage 1: the LR/SC reservation (LR sets it, any SC clears it)
+            if (EN_EXC && wb_lr) begin res_valid <= 1'b1; res_dw <= wb_iaddr[31:3]; end
+            if (EN_EXC && wb_sc) res_valid <= 1'b0;
             if (EN_EXC && wb_um_we) begin          // IRET (MMU stage 1)
                umode     <= wb_um_new;
                if (wb_um_new) sp_alt <= wb_spalt_new;
@@ -3103,8 +3144,10 @@ module pipeline_core
                         : mem_op;
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
+            wb_lr      <= EN_EXC && mem_valid && mem_d.uop == U_LR;
+            wb_sc      <= EN_EXC && mem_valid && mem_d.uop == U_SC;
             wb_wr      <= mem_is_write;
-            wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
+            wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER || mem_d.uop == U_SC) ? mem_wdata : mem_result; // ENTER: stored R15; SC: its data
             // RET / IRET redirect + fetch resume at MEM completion
             // (2a: a PREDICTED return does nothing here — fetch already
             // runs at its target, and a mismatch is the ras_miss squash.)
@@ -3142,7 +3185,7 @@ module pipeline_core
                end
                mem_mage   <= 2'd0;
                mem_lkq    <= (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
-                              ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
+                              ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET || ex_d.uop == U_LR ||
                               (EN_MUL2 && ex_d.uop == U_MUL));
                mem_mulq   <= EN_MUL2 && ex_d.uop == U_MUL;
                mem_fastq  <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE) &&
@@ -3189,7 +3232,7 @@ module pipeline_core
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
                mem_misal  <= ex_misal;
-               mem_misal_st <= (ex_d.uop == U_STORE);
+               mem_misal_st <= (ex_d.uop == U_STORE || ex_d.uop == U_SC);
                mem_ea_raw <= ex_ea_raw;
                // MMU stage 1: an access fault enters MEM as an exception op
                // with no effects (the squash of EX / ID follows in MEM)

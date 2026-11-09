@@ -291,6 +291,112 @@ def cmd_diff(a):
     return 1 if fails else 0
 
 
+def _exc_variant(seed, user, p_inj, irq=False, **kw):
+    """MMU stage 1: the random program `seed` with exception ops injected
+    before random instructions (SYSCALL, TRAP, an illegal word, and in user
+    mode privileged ops), run from a user-mode (or supervisor) start, with a
+    handler that returns past each one.  Its final state must equal the plain
+    program's.  Returns (asm, number injected)."""
+    import random, randprog
+    from kasm import Asm, u32
+    from tests import _xsetup, _to_user, HALT_W
+    rnd = random.Random(seed * 7919 + 1)
+    words = [0x6C080000, 0x6C040000, 0x7C000000] + \
+            ([0x6C060000, 0x6C070000, 0x6C401000, 0x6C011000, 0x65C00000, 0x6C020000,
+              0x6C030000, 0x70000010] if user else [])
+    # (0x6C011000 is not HALT: a reserved-field HALT = ILLEGAL; HALT itself
+    # ends the program)
+
+    class InjAsm(Asm):
+        def __init__(self, *aa, **kk):
+            super().__init__(*aa, **kk)
+            self.inj = False
+            self.n_inj = 0
+            _xsetup(self)
+            if user:
+                # (with IRQs: the timer is unmasked by the IRET frame; the
+                # program's own INT_MASK store faults in user mode and is
+                # stepped over)
+                _to_user(self, 'u', mask=1 if irq else 0)
+            self.label('u')
+            self.inj = True
+
+        def emit(self, *ws):
+            if self.inj and rnd.random() < p_inj:
+                self.n_inj += 1
+                super().emit(rnd.choice(words))
+            return super().emit(*ws)
+
+    old = randprog.Asm
+    randprog.Asm = InjAsm
+    try:
+        asm = randprog.gen(seed, irq=irq, **kw)
+    finally:
+        randprog.Asm = old
+    asm.inj = False
+    # the handler: no memory writes outside the kernel stack; a user HALT
+    # (PRIVILEGED, EADDR = the HALT word) halts here
+    asm.label('h')
+    asm.push(13); asm.push(14)
+    asm.mfsr(13, 'eaddr'); asm.setr(14, HALT_W)
+    asm.fbr('ne', 13, 14, 'h_nh'); asm.halt()
+    asm.label('h_nh')
+    asm.mfsr(13, 'ecause')
+    asm.fbr('eq', 13, 4, 'h_r', imm=True)
+    asm.getsp(13); asm.ld(64, 14, 13, 16); asm.addi_s(14, 14, 4); asm.st(64, 14, 13, 16)
+    asm.label('h_r')
+    asm.pop(14); asm.pop(13)
+    asm.iret()
+    return asm, asm.n_inj
+
+
+def cmd_excdiff(a):
+    """MMU stage 1: random programs with injected exceptions (user mode and
+    supervisor) vs the same programs without: r1-r12, r15 and the data
+    window must match"""
+    import randprog
+    exe = build(None)
+    fails = n_tot = 0
+    for s in range(a.seed0, a.seed0 + a.seeds):
+        for lat in a.lats:
+            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else [])
+            sa, _ = run(exe, randprog.gen(s, **({'irq': True} if a.irq else {})), f'xa{s}_{lat}', plus)
+            for user in (True, False):
+                asm, n = _exc_variant(s, user, a.p, irq=a.irq)
+                n_tot += n
+                sb, _ = run(exe, asm, f'xb{s}_{lat}_{int(user)}', plus)
+                keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
+                       sorted({k for k in list(sa) + list(sb)
+                               if re.fullmatch(r'm[0-9a-f]{8}', k) and k != 'm00180000'})
+                bad = [k for k in keys if sa.get(k) != sb.get(k)]
+                ok = sa.get('end') == 'park' and sb.get('end') == 'park' and sb.get('kind') == '0' and not bad
+                if 'fatal' in (sa['log'] + sb['log']).lower():
+                    ok = False
+                if not ok:
+                    fails += 1
+                if not ok or a.verbose:
+                    print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} user={user} injected={n} '
+                          f'end {sa.get("end")}/{sb.get("end")} kind {sb.get("kind")} {bad[:4]}')
+    print(f'{fails} differing; {n_tot} exception ops injected')
+    return 1 if fails else 0
+
+
+def cmd_dmtest(a):
+    """tb_dm: the debug module's MMU stage 1 registers (self-checking)"""
+    d = os.path.join(WORK, 'dm')
+    os.makedirs(d, exist_ok=True)
+    cmd = ['verilator', '--binary', '--timing', '-Wno-fatal', '-Wno-lint', '-Wno-style', '--top-module', 'tb_dm',
+           '-Mdir', os.path.join(d, 'obj'), os.path.join(SRC, 'klauss_pkg.sv'), os.path.join(SRC, 'debug_module.sv'),
+           os.path.join(HERE, 'tb_dm.sv')]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-3000:], r.stderr[-3000:])
+        return 1
+    r = subprocess.run([os.path.join(d, 'obj', 'Vtb_dm')], capture_output=True, text=True)
+    print(r.stdout)
+    return 0 if '0 failing' in r.stdout else 1
+
+
 def cmd_socdiff(a):
     """random programs through the full SoC (real cache / bus splitter):
     base rev vs working tree, retire traces must be identical"""
@@ -324,6 +430,11 @@ def main():
     d.add_argument('--seeds', type=int, default=20); d.add_argument('--seed0', type=int, default=1)
     d.add_argument('--lats', type=int, nargs='+', default=[3])
     d.add_argument('--irq', action='store_true'); d.add_argument('-v', '--verbose', action='store_true')
+    sub.add_parser('dmtest')
+    x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
+    x.add_argument('--seed0', type=int, default=1); x.add_argument('--lats', type=int, nargs='+', default=[3])
+    x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
+    x.add_argument('-v', '--verbose', action='store_true')
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
@@ -336,6 +447,10 @@ def main():
         sys.exit(cmd_test(a))
     elif a.cmd == 'socdiff':
         sys.exit(cmd_socdiff(a))
+    elif a.cmd == 'excdiff':
+        sys.exit(cmd_excdiff(a))
+    elif a.cmd == 'dmtest':
+        sys.exit(cmd_dmtest(a))
     else:
         sys.exit(cmd_diff(a))
 

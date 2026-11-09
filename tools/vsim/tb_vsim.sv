@@ -258,6 +258,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d", uart_n);
+`ifdef HAS_EXC
+      $fdisplay(f, "ecause=%02x eaddr=%08x um=%0d", dut.ecause, dut.eaddr, dut.umode);
+`endif
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)
          if (mem_lo[i] != 64'h0) $fdisplay(f, "m%08x=%016x", i*8, mem_lo[i]);

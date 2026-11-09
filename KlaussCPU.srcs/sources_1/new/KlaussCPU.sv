@@ -1161,9 +1161,9 @@ module KlaussCPU #(
                16'h0038: r_mmio_read_data_comb = {32'b0, r_timer_interrupt_counter};
                16'h0040: r_mmio_read_data_comb = r_clock_ms;
                // CPU_FEATURES (MMU_PLAN.md §6.3): [0] stage 1 exceptions /
-               // user mode / SYSCALL / MFSR / MTSR / TP / CYCLE.  Reads 0 on
-               // earlier bitstreams (a reserved offset).
-               16'h0048: r_mmio_read_data_comb = {63'b0, CORE1_EXC_EN};
+               // user mode / SYSCALL / MFSR / MTSR / TP / CYCLE, [3] LR/SC.
+               // Reads 0 on earlier bitstreams (a reserved offset).
+               16'h0048: r_mmio_read_data_comb = {60'b0, CORE1_EXC_EN, 2'b00, CORE1_EXC_EN};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end

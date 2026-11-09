@@ -1325,3 +1325,256 @@ def exc_debugger():
                 exp = {'end': 'park', 'kind': '0', 'r5': 2, m(XD): cause}
             out.append((a, exp, plus))
     return out
+
+
+# --------------------------------------------------------------- (e) LR/SC
+@test
+def lrsc_basic():
+    out = []
+    for lat in (1, 3, 7):
+        a = Asm()
+        a.setr(1, DATA); a.setr(2, DATA + 8); a.setr(14, DATA + 16)
+        a.setr(3, 0x1111); a.st(64, 3, 1)
+        a.setr(3, 0x2222); a.st(64, 3, 2)
+        a.setr(3, 0x80000001); a.st(64, 3, 14)
+        a.setr64(5, 0xAAAABBBBCCCCDDDD); a.setr(4, 0x5A5A5A5A)
+        a.lr(64, 3, 1)                 # back to back: the SC sees the LR in MEM
+        a.sc(64, 6, 5, 1)              # ok -> 0
+        a.sc(64, 7, 5, 1)              # reservation gone -> 1
+        a.lr(64, 8, 1)
+        a.sc(64, 9, 5, 2)              # other doubleword -> 1, no store
+        a.lr(32, 10, 2)                # zero-extended
+        a.lr(32, 11, 14, sgn=True)     # sign-extended
+        a.nop()                        # the SC sees the LR in WB
+        a.sc(32, 12, 4, 14)            # SC.W to the reserved word -> 0 (its low half)
+        a.lr(64, 13, 1); a.nop(); a.nop(); a.nop()
+        a.sc(64, 15, 4, 1)             # committed reservation -> 0
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', 'r3': 0x1111, 'r6': 0, 'r7': 1,
+                        'r8': 0xAAAABBBBCCCCDDDD, 'r9': 1, 'r10': 0x2222,
+                        'r11': 0xFFFFFFFF80000001, 'r12': 0, 'r13': 0xAAAABBBBCCCCDDDD,
+                        'r15': 0, m(DATA): 0x5A5A5A5A, m(DATA + 8): 0x2222,
+                        m(DATA + 16): 0x5A5A5A5A}, [f'+LAT={lat}']))
+    return out
+
+
+@test
+def lrsc_cancel():
+    """an exception (SYSCALL), an interrupt or an intervening SC between LR
+    and SC makes the SC fail; an IRET does too (it ends every handler)"""
+    out = []
+    a = Asm()
+    _xsetup(a)
+    a.setr(1, DATA); a.setr(5, 0x77)
+    a.lr(64, 3, 1); a.syscall(); a.sc(64, 6, 5, 1)
+    a.lr(64, 3, 1); a.sc(64, 7, 5, 1); a.sc(64, 8, 5, 1)
+    a.halt()
+    _xhandler(a)
+    out.append((a, {'end': 'park', 'kind': '0', 'r6': 1, 'r7': 0, 'r8': 1, m(DATA): 0x77}, []))
+    a = Asm()
+    a.setr(1, DATA); a.setr(5, 0x77)
+    a.set_int_mask(1)
+    a.lr(64, 3, 1)
+    a.setr(2, 300)
+    a.label('w'); a.dec(2); a.fbr('ne', 2, 0, 'w', imm=True)   # IRQs taken here
+    a.sc(64, 6, 5, 1)
+    a.halt()
+    out.append((a, {'end': 'park', 'kind': '0', 'r6': 1, m(DATA): 0, 'm00180000': 'nonzero'},
+                ['+IRQ_PERIOD=60']))
+    return out
+
+
+@test
+def lrsc_faults():
+    out = []
+    # misaligned LR.D / SC.D / SC.W: rd and memory untouched, cause, EADDR
+    for kind, cause, ea in (('lrd', X_MISAL_LD, DATA + 4), ('scd', X_MISAL_ST, DATA + 4),
+                            ('scw', X_MISAL_ST, DATA + 2), ('lrw', X_MISAL_LD, DATA + 2)):
+        a = Asm()
+        _xsetup(a)
+        a.setr(1, ea); a.setr(3, 0x33); a.setr(5, 0x55)
+        at = {'lrd': lambda: a.lr(64, 3, 1), 'scd': lambda: a.sc(64, 3, 5, 1),
+              'scw': lambda: a.sc(32, 3, 5, 1), 'lrw': lambda: a.lr(32, 3, 1)}[kind]()
+        a.halt()
+        _xhandler(a)
+        exp = {'end': 'park', 'kind': '0', 'r3': 0x33, m(DATA): 0}
+        exp.update(_xexp(cause, ea, at))
+        out.append((a, exp, []))
+    # LR / SC to MMIO fault in supervisor mode too; nothing reaches the bus
+    for kind, cause in (('lr', X_ACC_LD), ('sc', X_ACC_ST)):
+        a = Asm()
+        _xsetup(a)
+        a.setr(1, 0xF0010000); a.setr(3, 0x33); a.setr(5, 0x55)
+        at = a.lr(64, 3, 1) if kind == 'lr' else a.sc(64, 3, 5, 1)
+        a.halt()
+        _xhandler(a)
+        exp = {'end': 'park', 'kind': '0', 'r3': 0x33, 'mmio_rd': '0', 'mmio_wr': '0'}
+        exp.update(_xexp(cause, 0xF0010000, at))
+        out.append((a, exp, []))
+    # a faulting SC leaves rd alone; its exception entry clears the
+    # reservation (MMU_PLAN.md §3.3 step 4), so the retried SC fails
+    a = Asm()
+    _xsetup(a)
+    a.setr(1, DATA); a.setr(2, DATA + 4); a.setr(5, 0x55); a.setr(6, 0x66)
+    a.lr(64, 3, 1); a.sc(64, 6, 5, 2); a.sc(64, 7, 5, 1)
+    a.halt()
+    _xhandler(a)
+    out.append((a, {'end': 'park', 'kind': '0', 'r6': 0x66, 'r7': 1, m(DATA): 0}, []))
+    # EVEC = 0: a misaligned LR parks 5; an LR to MMIO parks as ILLEGAL
+    a = Asm(); a.setr(1, DATA + 4); at = a.lr(64, 3, 1); a.halt()
+    out.append((a, {'end': 'park', 'kind': '5', 'pc': at}, []))
+    a = Asm(); a.setr(1, 0xF0010000); at = a.lr(64, 3, 1); a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'pc': at, 'mmio_rd': '0'}, []))
+    # reserved encodings with [12] = 1 stay illegal: LR.D with SGN, SC with
+    # SGN, 16-bit size, A = 1, LR with rs2 != 0
+    for w in (0x5B801310, 0x5F801615, 0x59001310, 0x5B101310, 0x5B001311):
+        a = Asm(); at = a.raw(w); a.halt()
+        out.append((a, {'end': 'park', 'kind': '2', 'pc': at}, []))
+    return out
+
+
+def _cas_loop(a, n, cnt='L'):
+    a.setr(1, DATA); a.setr(7, n); a.setr(9, 0)
+    a.label(cnt)
+    a.lr(64, 3, 1); a.addi_s(4, 3, 1); a.sc(64, 6, 4, 1)
+    a.fbr('eq', 6, 0, cnt + '_ok', imm=True)
+    a.inc(9); a.jmp(cnt)
+    a.label(cnt + '_ok')
+    a.dec(7); a.fbr('ne', 7, 0, cnt, imm=True)
+
+
+@test
+def lrsc_cas_irq():
+    """an LR/SC increment loop under frequent timer IRQs: every increment
+    lands exactly once; some SCs fail and retry"""
+    out = []
+    for lat, per in ((1, 61), (3, 151), (7, 307)):   # (shorter periods livelock at lat 7: §5.1)
+        a = Asm()
+        a.set_int_mask(1)
+        _cas_loop(a, 300)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', m(DATA): 300, 'r9': 'nonzero'},
+                    [f'+LAT={lat}', f'+IRQ_PERIOD={per}']))
+    return out
+
+
+@test
+def lrsc_user():
+    def body(a):
+        _cas_loop(a, 50)
+        a.ld(64, 5, 1)
+    return _ufault(body, {'r5': 50, m(DATA): 50, m(FLOG): X_PRIV}, ['+LAT=3'])
+
+
+# ------------------------- clarifications recorded in MMU_PLAN.md (507990d)
+@test
+def clar_park_keeps_srs():
+    """parking with EVEC = 0 does not write ECAUSE / EADDR"""
+    out = []
+    for kind, emit in (('1', lambda a: a.trap()), ('2', lambda a: a.raw(0x7C000000)),
+                       ('2', lambda a: a.syscall()),
+                       ('5', lambda a: (a.setr(2, DATA + 1), a.ld(16, 3, 2)))):
+        a = Asm()
+        a.setr(1, 0x55); a.mtsr('ecause', 1)
+        a.setr(1, 0x1234); a.mtsr('eaddr', 1)
+        emit(a)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': kind, 'ecause': '55', 'eaddr': '00001234'}, []))
+    return out
+
+
+@test
+def clar_user_illegal_sr():
+    """legality before privilege: MTSR CYCLE and SR numbers above 8 are
+    ILLEGAL in user mode too (not PRIVILEGED)"""
+    words = (0x6C608010,          # MTSR cycle, r1
+             0x6C409100,          # MFSR r1, sr9
+             0x6C609010,          # MTSR sr9, r1
+             0x6C4FF100)          # MFSR r1, sr255
+    def body(a):
+        for w in words:
+            a.raw(w)
+    exp = {m(FLOG + 0x30 * i): X_ILL for i in range(len(words))}
+    exp.update({m(FLOG + 0x30 * i + 8): w for i, w in enumerate(words)})
+    exp[m(FLOG + 0x30 * len(words))] = X_PRIV       # the closing HALT
+    return _ufault(body, exp)
+
+
+@test
+def clar_priority():
+    """MISALIGNED_FETCH > ACCESS_FETCH; MISALIGNED_LOAD/STORE > ACCESS_*"""
+    out = []
+
+    def fe(a):                     # misaligned AND in MMIO
+        a.leapc(10, 'ok'); a.setr(5, 0xF0010002); a.jmpr(5)
+        a.label('ok'); a.setr(6, 0x60)
+    out.append(_ufault(fe, {'r6': 0x60, m(FLOG): X_MISAL_FE, m(FLOG + 8): 0xF0010002}))
+
+    def mld(a):                    # misaligned 16-bit load from MMIO
+        a.setr(9, 0xF0010001); a.setr(10, 0xF0010001); a.setr(3, 0x33)
+        a.ld(16, 3, 9)
+    out.append(_ufault(mld, {'r3': 0x33, m(FLOG): X_MISAL_LD, m(FLOG + 8): 0xF0010001}))
+
+    def mst(a):                    # misaligned 32-bit store to MMIO
+        a.setr(9, 0xF0010002); a.setr(1, 0x11)
+        a.st(32, 1, 9)
+    out.append(_ufault(mst, {m(FLOG): X_MISAL_ST, m(FLOG + 8): 0xF0010002}))
+
+    def mlr(a):                    # misaligned LR.D to MMIO
+        a.setr(9, 0xF0010004); a.setr(3, 0x33)
+        a.lr(64, 3, 9)
+    out.append(_ufault(mlr, {'r3': 0x33, m(FLOG): X_MISAL_LD, m(FLOG + 8): 0xF0010004}))
+    return out
+
+
+@test
+def clar_eaddr_raw():
+    """EADDR is the raw EA: A = 1 64-bit accesses (whose port address is
+    aligned down) and sub-word stores report the address as computed"""
+    def ld64a(a):        # LDIDX64A r3, [r9 + 3]
+        a.setr64(3, 0x0102030405060708); a.st(64, 3, 12)
+        a.setr(10, GOOD - 3); a.setr(9, 0xF0010000); a.setr(3, 0)
+        a.raw(0x80000000 | 6 << 26 | 3 << 24 | 1 << 21 | 1 << 20 | 3 << 8 | 9 << 4, 3)
+    def st64a(a):        # STIDX64A [r9 + 5], r1
+        a.setr(10, GOOD - 5); a.setr(9, 0xF0010000); a.setr(1, 0x77)
+        a.raw(0x80000000 | 7 << 26 | 3 << 24 | 1 << 21 | 1 << 20 | 1 << 8 | 9 << 4, 5)
+    def st8(a):
+        a.setr(10, GOOD); a.setr(9, 0xF0010000); a.setr(1, 0x61)
+        a.st(8, 1, 9, 7)
+    def st16(a):
+        a.setr(10, GOOD); a.setr(9, 0xF0010000); a.setr(1, 0x6162)
+        a.st(16, 1, 9, 6)
+    return [_ufault(ld64a, {'r3': 0x0102030405060708, m(FLOG): X_ACC_LD, m(FLOG + 8): 0xF0010003}),
+            _ufault(st64a, {m(GOOD): 0x77, m(FLOG): X_ACC_ST, m(FLOG + 8): 0xF0010005}),
+            _ufault(st8, {m(GOOD): 0x61 << 56, m(FLOG): X_ACC_ST, m(FLOG + 8): 0xF0010007}),
+            _ufault(st16, {m(GOOD): 0x6162 << 48, m(FLOG): X_ACC_ST, m(FLOG + 8): 0xF0010006})]
+
+
+@test
+def clar_misal_fetch_no_halt():
+    """with the debugger attached (no EXC_PASS), MISALIGNED_FETCH and
+    ACCESS_* still go to EVEC; only ILLEGAL / TRAP / MISALIGNED_LOAD/STORE
+    debug-halt"""
+    out = []
+
+    def fe(a):
+        a.leapc(10, 'ok'); a.leapc(5, 'ok'); a.addi_s(5, 5, 2); a.jmpr(5)
+        a.label('ok'); a.setr(6, 0x60)
+    def acc(a):
+        a.setr(10, GOOD); a.setr(9, 0xF0010000); a.ld(64, 3, 9)
+    for body, cause in ((fe, X_MISAL_FE), (acc, X_ACC_LD)):
+        a, exp, plus = _ufault(body, {m(FLOG): cause}, ['+DBG_ATTACHED'])
+        if _DBG:                   # the closing HALT (in the handler) is a debug halt
+            exp['kind'] = '4'
+        exp.pop('mmio_rd', None)
+        out.append((a, exp, plus))
+    # control: a misaligned LOAD does debug-halt when attached
+    def mld(a):
+        a.setr(9, DATA + 1); a.ld(16, 3, 9)
+    a, exp, plus = _ufault(mld, {}, ['+DBG_ATTACHED'])
+    if _DBG:
+        exp = {'end': 'park', 'kind': '4'}
+    else:
+        exp[m(FLOG)] = X_MISAL_LD
+    out.append((a, exp, plus))
+    return out
