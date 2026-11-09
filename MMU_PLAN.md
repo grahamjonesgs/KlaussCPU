@@ -540,37 +540,76 @@ instead, and the ID override (§7.5) turns the op into ACCESS_FETCH. The NLB
 prefetch only reads the I-cache, so it never touches the port. The BTIC only
 holds copies of I-cache lines. Supervisor fetch is unchanged.
 
-### 7.7 MFSR / MTSR datapath
+### 7.7 MFSR / MTSR datapath (as built)
 
-- MTSR writes its SR at WB, then restarts fetch at `wb_pc + 4`, which is
-  the RESET-style redirect done at WB.
-- MFSR needs its 64-bit value somewhere on the result path. Candidates: a
-  leg on `exo_result`, or loading `ex_a` at dispatch and executing as COPY.
-  Both touch timing-sensitive muxes. I'll pick by building both. This is an
-  RTL detail with no software impact.
+- **MTSR** decodes as a flag-less COPY of rs1 (`dec_t.mtsr`, serializing).
+  It writes its SR at WB, then restarts fetch at `wb_pc + 4`: the
+  RESET-style redirect, done at WB.
+- **MFSR of any SR except STATUS** decodes as `U_MOV64`. Its 64-bit value
+  is loaded into `ex_var1`/`ex_var2` at dispatch, from a mux on `id_op[15:12]`
+  selected by a latch-time predecode (`id_mfsr`), so `exo_result` gains no
+  leg. CYCLE is sampled on the edge the MFSR enters EX.
+- **MFSR STATUS** is its own uop (`U_GETST`) with a 2-bit `exo_result` leg
+  `{ex_dis_eff, umode}`. Its DI bit is forwarded from an older DI/EI in
+  MEM/WB, exactly as DI's own result is. That is program-order correct,
+  which is stronger than "the committed bit" in §6.1.
 
-CYCLE is a 64-bit free-running counter in the core. MFSR CYCLE samples it
-in EX, the same as any other SR read, and ignores serialization (§5).
+### 7.7a LR/SC datapath (as built)
 
-### 7.7a LR/SC datapath
-
-- LR and SC take the **slow port path**: no load-hit pipe, no early issue,
-  no store posting, no queue entry. They are not performance-critical, and
-  this keeps the reservation logic off the tuned load and store paths.
+- LR and SC take the **slow port path**: no load-hit pipe, no early issue.
   Misaligned and MMIO checks use the §7.1 slots (EX→MEM for misaligned,
   MEM cycle 1 for ACCESS).
 - **The reservation** is a register pair `{res_valid, res_dw}`. LR sets it
-  as it commits at WB. SC decides success in MEM, before any port access:
-  `res_valid && res_dw == EA[31:3]`, with an older LR still in WB forwarded
-  (LR is a slow-path load, so at most one can be between MEM and commit). A
-  failed SC makes no port access. A successful SC issues a normal
-  non-posted store, and writes rd = 0 / 1 and clears the reservation at WB.
-  Entry, IRET and `start` clear it.
-- SC reads its data from rs2 (`ex_b`), not from the rd-data operand that
-  other stores use (`ex_c`). The rd write is the success bit. The decoder
-  marks SC as `use_rs2`, `wreg` and `is_mem`.
+  as it commits at WB.
+- **Deviation:** SC decides success **in EX**, not in MEM. It uses the
+  reservation as it will be once the older LR/SC in WB, then in MEM, has
+  committed. Both always commit: a faulting one is no longer an LR/SC
+  uop, and a squash of either kills this SC too. SC is `[rs1]`-only, so the
+  compare uses `ex_a` with no adder in front. The 0/1 result is the SC's EX
+  result (`mem_result[0]`, so MEM forwarding of rd is correct), and the
+  port write is `U_SC && !mem_result[0]`, a register term. Deciding in MEM
+  would have put a 29-bit compare on `mem_port_wr`, which feeds `mem_busy`.
+- **Deviation:** a successful SC is an ordinary store, and it **may be
+  posted** (`EN_ST1`/`EN_SQ`) like any other. That is architecturally
+  invisible on one core and keeps SC off the post-decision paths.
+- SC reads its data from rs2 (`ex_b`). Its lane-replicated data is what the
+  retire trace prints as the stored value.
 - SC's store goes through the normal self-modifying-code and store-snoop
-  checks, so an SC that overwrites code behaves like any other store.
+  checks.
+- A faulting SC leaves rd and memory alone, and does not itself clear the
+  reservation. Its exception entry does (§3.3 step 4), so the retried SC
+  fails and the LR/SC loop starts again. The §4.2 table's "so the retry
+  after the handler can still succeed" does not hold as written; this has
+  been raised with the runtime session and §4.2 is left as is.
+
+### 7.7b Other implementation notes
+
+- **Access faults** (§7.1) are converted at EX→MEM into `U_EXC`, with
+  every MEM-side effect flag cleared (SP write, flags, DI/EI, load class,
+  hit pipe, RAS prediction). `mem_xsq` then squashes EX/ID through the
+  `fbr_taken` shape. The gated EX side effects are the LCD strobe, LCDRST,
+  the RAS push, early load issue and PHT training; DIV and DELAY are reset.
+  The squash runs before the SMC and `EN_ST1` squashes, so an older store's
+  squash still wins.
+- **User fetch from 0xF…**: the I-cache fill path serves a zero window
+  (no port, no install), and the BTIC never captures a window whose base is
+  in 0xF…, so a zero window can never become a BTIC entry.
+- **Wrong-path fetch toward MMIO** could not be constructed in this
+  pipeline. While EX is busy nothing new latches into ID, so a wrong-path
+  JMP's early redirect only fires on the edge its older branch resolves,
+  and a long-lived wrong path (RET, load-dependent branch) holds the
+  memory port, so no I-cache fill can issue. The fill block is
+  unconditional on the fill path. It is tested with a correct-path jump
+  and with early fetch behind a DIV (`user_early_fetch`, with a supervisor
+  control that does read MMIO).
+- **Exception entry** reuses the IRQ sequencer. `exc_ent` marks an
+  exception: no abandon, EPC in the frame, EVEC, DI, ECAUSE/EADDR on
+  completion.
+- **Tests**: `tools/vsim/tests.py` (`exc_*`, `user_*`, `lrsc_*`, `clar_*`,
+  `sr_roundtrip`), `run.py excdiff` (random programs with injected
+  exception ops, user and supervisor, against the plain program), `run.py
+  dmtest` (`tb_dm.sv`), and `VSIM_EXC_EN=0 run.py diff` for the core-2
+  configuration.
 
 ### 7.8 Build switches and core 2
 
