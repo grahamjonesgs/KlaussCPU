@@ -1744,6 +1744,7 @@ def _mpuhandler(a, name='h'):
     a.mfsr(13, 'ecause'); a.alui('and', 13, 13, 0xFF, sgn=False)
     a.fbr('eq', 13, X_SYSCALL, name + '_ret', imm=True)
     a.addi_s(14, 13, -X_ACC_FE); a.fbr('ule', 14, 1, name + '_fe', imm=True)    # 9 / 10
+    a.fbr('eq', 14, X_TLB_FE - X_ACC_FE, name + '_fe', imm=True)             # 13: TLB_MISS_FE
     a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
     a.jmp(name + '_ret')
     a.label(name + '_fe')
@@ -2348,3 +2349,158 @@ def tlb_double_fault():
             e.update({'pc': at + 4, 'ecause': '055', 'eaddr': '00000000'})
         out.append((a, e, []))
     return out
+
+
+def _place(a, base, emit):
+    """assemble emit(sub) at base (its VA's page offset = base's) and store
+    its words at PA base as image data (dword-aligned)"""
+    b0 = base & ~7
+    sub = Asm(base=b0)
+    if base & 4:
+        sub.nop()
+    emit(sub)
+    ws = sub.assemble()
+    ws += [0x6C000000] * (len(ws) & 1)
+    for i in range(0, len(ws), 2):
+        a.dword(b0 + 4 * i, ws[i] | (ws[i + 1] << 32))
+    return sub
+
+
+@test
+def tlb_fetch_translate():
+    """TE = 1 fetch, supervisor: code runs through its kseg alias and a kmap
+    entry; an instruction straddling two useg pages mapped to different
+    frames runs; a page without X is ACCESS_FETCH and one with no entry
+    TLB_MISS_FETCH (through TLBVEC), both loading TLB_HI; straddling into
+    an unmapped page faults at that page's start; the hole is ACCESS_FETCH
+    (TLB_HI not loaded)"""
+    def setup(a):
+        _tlb_set(a, 2, 0xC000, 0x000, TLB_V | TLB_X, g=1)          # kmap -> the code page
+        _tlb_set(a, 3, 0x0060, 0x001, TLB_V | TLB_X)                # 0x0060xxxx -> PA 0x1xxxx
+        _tlb_set(a, 4, 0x0061, 0x002, TLB_V | TLB_X)                # 0x0061xxxx -> PA 0x2xxxx
+        _tlb_set(a, 5, 0x0070, 0x000, TLB_V | TLB_R | TLB_W)        # the code page, no X
+        _tlb_set(a, 6, 0x0080, 0x001, TLB_V | TLB_X)                # 0x0081: no entry
+    def body(a):
+        def far(va_or, lbl, ret):
+            a.leapc(9, lbl); a.setr(5, va_or); a.alu('or', 9, 9, 5)
+            a.leapc(10, ret); a.jmpr(9)
+        far(0x80000000, 'kx', 'kb')
+        a.label('kx'); a.setr(4, 0x44); a.jmpr(10)
+        a.label('kb')
+        far(0xC0000000, 'mx', 'mb')
+        a.label('mx'); a.setr(3, 0x33); a.jmpr(10)
+        a.label('mb')
+        a.setr(9, 0x0060FFFC); a.leapc(10, 'sb'); a.jmpr(9)          # the straddle snippet
+        a.label('sb')
+        far(0x00700000, 'nx', 'nb')                                   # no X: ACC_FE
+        a.label('nx'); a.setr(6, 0xBAD); a.jmpr(10)
+        a.label('nb'); a.mfsr(8, 'tlb_hi')
+        far(0x00710000, 'nx2', 'nb2')                                 # no entry: TLB_MISS_FE
+        a.label('nx2'); a.setr(6, 0xBAD); a.jmpr(10)
+        a.label('nb2')
+        a.setr(9, 0x0080FFFC); a.leapc(10, 'sb2'); a.jmpr(9)         # straddle into 0x0081
+        a.label('sb2')
+        a.setr(9, 0x88000000); a.leapc(10, 'hb'); a.jmpr(9)          # the hole
+        a.label('hb'); a.mfsr(11, 'tlb_hi')
+    def snip(s):
+        s.setr(7, 0x12345678)                                         # at 0xFFFC: imm at 0x10000
+        s.addi_s(7, 7, 1)
+        s.jmpr(10)
+    a, e, p = _te_prog(body, False, {'r3': 0x33, 'r4': 0x44, 'r6': 0, 'r7': 0x12345679,
+                                     'r8': 0x00700000, 'r11': 0x00810000, m(XD + 0x58): 2},
+                       tlbvec=True, setup=setup)
+    _place(a, 0x1FFFC, snip)
+    L = a.labels
+    logs = [(X_ACC_FE, 0x00700000 | L['nx']), (X_TLB_FE, 0x00710000 | L['nx2']),
+            (X_TLB_FE, 0x00810000), (X_ACC_FE, 0x88000000)]
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        e[m(FLOG + 0x30 * i + 8)] = ea
+    e[m(XD + 32)] = len(logs)
+    return a, e, p
+
+
+@test
+def tlb_fetch_user():
+    """TE = 1 fetch, user mode: kseg, kmap (with X) and MMIO are
+    ACCESS_FETCH; a useg entry of another ASID misses, a matching one runs"""
+    def setup(a):
+        _tlb_set(a, 2, 0xC000, 0x000, TLB_V | TLB_X, g=1)
+        _tlb_set(a, 3, 0x0070, 0x000, TLB_V | TLB_X, asid=0)
+        _tlb_set(a, 4, 0x0071, 0x000, TLB_V | TLB_X, asid=3)
+    def body(a):
+        def far(va_or, lbl, ret, reg, val):
+            a.leapc(9, lbl); a.setr(5, va_or); a.alu('or', 9, 9, 5)
+            a.leapc(10, ret); a.jmpr(9)
+            a.label(lbl); a.setr(reg, val); a.jmpr(10)
+            a.label(ret)
+        far(0x80000000, 'k', 'kb', 6, 0xBAD)
+        far(0xC0000000, 'c', 'cb', 6, 0xBAD)
+        a.setr(9, 0xF0000000); a.leapc(10, 'fb'); a.jmpr(9)
+        a.label('fb')
+        far(0x00700000, 'w', 'wb', 4, 0x44)
+        far(0x00710000, 'v', 'vb', 6, 0xBAD)
+    a, e, p = _te_prog(body, True, {'r6': 0, 'r4': 0x44, m(XD + 0x58): 1}, tlbvec=True, setup=setup)
+    L = a.labels
+    logs = [(X_ACC_FE, 0x80000000 | L['k']), (X_ACC_FE, 0xC0000000 | L['c']),
+            (X_ACC_FE, 0xF0000000), (X_TLB_FE, 0x00710000 | L['v'])]
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        e[m(FLOG + 0x30 * i + 8)] = ea
+    e[m(FLOG + 0x30 * len(logs))] = X_PRIV
+    e[m(XD + 32)] = len(logs) + 1
+    return a, e, p
+
+
+@test
+def tlb_fetch_alias_icinv():
+    """code written through kseg and run through a different useg VA after
+    ICACHE_INV; rewritten (through kseg) and run again after another
+    ICACHE_INV: the new code runs"""
+    def setup(a):
+        _tlb_set(a, 2, 0x0050, 0x002, TLB_V | TLB_R | TLB_X)       # 0x0050xxxx -> PA 0x2xxxx
+    def code(val):
+        s = Asm(base=0)
+        s.setr(7, val); s.jmpr(10)
+        ws = s.assemble()
+        ws += [0x6C000000] * (len(ws) & 1)
+        return [ws[i] | (ws[i + 1] << 32) for i in range(0, len(ws), 2)]
+    def body(a):
+        for k, val in enumerate((0x71, 0x72)):
+            a.setr(9, 0x80020100)
+            for i, dw in enumerate(code(val)):
+                a.setr64(3, dw); a.st(64, 3, 9, 8 * i)
+            a.setr(1, 0xF0050000); a.setr(2, 8); a.st(32, 2, 1)       # ICACHE_INV
+            a.setr(9, 0x00500100); a.leapc(10, f'b{k}'); a.jmpr(9)
+            a.label(f'b{k}')
+            a.mov(8 - k, 7)
+    return _te_prog(body, False, {'r8': 0x71, 'r7': 0x72}, setup=setup)
+
+
+@test
+def tlb_te_on_refill():
+    """TE turned on with no TLB entry: the next fetch is TLB_MISS_FETCH, a
+    kseg refill handler at TLBVEC installs an identity entry from TLB_HI and
+    returns; the data page then misses (TLB_MISS_STORE) and is refilled the
+    same way; the program completes"""
+    CNT = 0x10700
+    a = Asm()
+    a.leapc(1, 'rf'); a.setr(2, 0x80000000); a.alu('or', 1, 1, 2)
+    a.mtsr('evec', 1); a.mtsr('tlbvec', 1)
+    a.setr(1, KSP); a.setsp(1)
+    a.setr(1, 0x200); a.mtsr('status', 1)                          # TE on: the next fetch misses
+    a.setr(12, DATA); a.setr(3, 0x5A); a.st(64, 3, 12)              # page 1: TLB_MISS_ST
+    a.ld(64, 4, 12)
+    a.mfsr(5, 'ecause'); a.mfsr(6, 'eaddr')
+    a.halt()
+    a.label('rf')                                                   # runs at its kseg alias
+    a.push(13); a.push(14)
+    a.mfsr(13, 'tlb_hi')
+    a.shift_n('shr', 13, 13, 16); a.shift_n('shl', 13, 13, 16)
+    a.alui('or', 13, 13, TLB_RWX, sgn=False); a.mtsr('tlb_lo', 13)
+    a.setr(13, 0x80000000 | CNT); a.ld(64, 14, 13); a.inc(14); a.st(64, 14, 13)
+    a.mtsr('tlb_index', 14); a.tlbwi()
+    a.pop(14); a.pop(13)
+    a.iret()
+    return a, {'end': 'park', 'kind': '0', 'r4': 0x5A, m(DATA): 0x5A, m(CNT): 2,
+               'r5': X_TLB_ST, 'r6': DATA}, []

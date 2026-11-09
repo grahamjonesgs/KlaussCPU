@@ -371,6 +371,7 @@ module pipeline_core
       logic       w32;          // ISA v3 D3: result = sext of its low 32 bits (in MEM)
       logic       mtsr;         // MMU stage 1: MTSR (SR written at WB, then refetch)
       logic       fx2, fxg;     // a fetch fault: on the instruction's 2nd granule only / a GUARD denial
+      logic       fxl;          // (stage 3) a TLB-related fetch fault (miss / X): TLB_HI auto-load
       logic       tlbi;         // MMU stage 3: TLBWI / TLBR / TLBP / TLBINV (at WB, then refetch)
    } dec_t;
 
@@ -494,6 +495,11 @@ module pipeline_core
    logic [63:0] ifb_dw [0:1];
    logic [28:0] ifb_base;          // dword address of slot 0
    logic [1:0]  ifb_val;
+   // MMU stage 3: per-slot fetch-fault tags.  A slot served by a fake fill
+   // for a page the micro-ITLB refused (TE = 1) holds zeros and ft = 1;
+   // fm = the refusal was a TLB miss.  The IF->ID latch turns them into
+   // TLB_MISS_FETCH / ACCESS_FETCH.  Every real serve writes 0.
+   logic [1:0]  ifb_ft, ifb_fm;
 
    wire [28:0] pc_dw = pc[31:3];
    // M12 position-flag fetch tracker (PIPELINE_M12_TIMING.md): pc's window
@@ -615,6 +621,21 @@ module pipeline_core
    wire [IC_IDXW-1:0] ic_look_idx = pf_sel ? pf_line[IC_IDXW-1:0]
                                            : miss_dw[IC_IDXW:1];
    wire [18:0]        ic_look_tag = miss_dw[28:IC_IDXW+1];
+   // MMU stage 3 (TE = 1): VIPT.  The index (VA[12:4]) is untranslated;
+   // the tag is PA[31:13] = {PA[31:16], VA[15:13]}.  A one-entry micro-ITLB
+   // (ut_*) holds one page's translation and fetch verdict (for the fetch
+   // mode ut_um); it is read alongside the BRAM, into r_look_*, so the tag
+   // compare reads registers only.  A lookup whose page it does not cover
+   // stalls while it_ref refills it from the main TLB's fetch port (one
+   // cycle); a refused page is served as a fake fill with a fault tag, so
+   // no untranslated or faulting address ever reaches the port.
+   logic        ut_v, ut_um, ut_ok, ut_miss;
+   logic [15:0] ut_vpn, ut_pa;
+   logic        it_ref;
+   logic [15:0] it_vpn;
+   wire  [15:0] look_vpn = pf_sel ? pf_line[27:12] : miss_dw[28:13];
+   logic [15:0] r_look_vpn = '0, r_look_pa = '0;
+   logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
    // registered read of the line for the current miss_dw (1-cycle BRAM latency)
    logic [IC_IDXW-1:0] ic_rd_idx;
    logic [127:0]       ic_rd_data;
@@ -628,10 +649,22 @@ module pipeline_core
       ic_rd_tag  <= ic_tag [ic_look_idx];
       ic_rd_vhi  <= ic_vhi [ic_look_idx] && !snoop_kill;
       ic_rd_vlo  <= ic_vlo [ic_look_idx] && !snoop_kill;
+      if (EN_TLB) begin
+         r_look_vpn  <= look_vpn;
+         r_look_um   <= fe_um;
+         r_look_hit  <= ut_v && ut_vpn == look_vpn && ut_um == fe_um;
+         r_look_pa   <= ut_pa;
+         r_look_ok   <= ut_ok;
+         r_look_miss <= ut_miss;
+      end
    end
    // hit once the registered read has caught up to the (stable, stalled) miss_dw
    wire ic_rd_current = (ic_rd_idx == ic_look_idx);
-   wire ic_tag_match  = ic_rd_current && (ic_rd_tag == ic_look_tag);
+   // (stage 3: the registered look is for this page and fetch mode)
+   wire lk_cov        = r_look_hit && r_look_vpn == miss_dw[28:13] && r_look_um == fe_um;
+   wire ic_tag_match  = ic_rd_current &&
+                        ((EN_TLB && te) ? (lk_cov && r_look_ok && ic_rd_tag == {r_look_pa, miss_dw[12:10]})
+                                        : (ic_rd_tag == ic_look_tag));
    wire ic_dw_valid   = miss_dw[0] ? ic_rd_vlo : ic_rd_vhi;
    wire ic_hit        = ic_tag_match && ic_dw_valid;
    // (A registered dword-select shadow with a defer guard was tried here and
@@ -648,7 +681,10 @@ module pipeline_core
 
    // M9: prefetch-side decode of the registered read (meaningful under pf_sel)
    wire pf_rd_current = pf_sel && (ic_rd_idx == pf_line[IC_IDXW-1:0]);
-   wire pf_tag_match  = pf_rd_current && (ic_rd_tag == pf_line[27:IC_IDXW]);
+   wire pf_tag_match  = pf_rd_current &&
+                        ((EN_TLB && te) ? (r_look_hit && r_look_vpn == pf_line[27:12] && r_look_um == fe_um &&
+                                           r_look_ok && ic_rd_tag == {r_look_pa, pf_line[11:9]})
+                                        : (ic_rd_tag == pf_line[27:IC_IDXW]));
    // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
    wire        nlb0_dw_ok     = (nlb_line == miss_dw[28:1]) &&
                                 (miss_dw[0] ? nlb_vlo : nlb_vhi);
@@ -1107,7 +1143,8 @@ module pipeline_core
    // stage 1: user fetch from 0xF... (0) or a misaligned user PC (1)),
    // which wins over ILLEGAL and PRIVILEGED
    function automatic dec_t f_decode(logic [31:0] op, logic um, logic fx, logic fxc,
-                                     logic fx2 = 1'b0, logic fxg = 1'b0);
+                                     logic fx2 = 1'b0, logic fxg = 1'b0,
+                                     logic fxm = 1'b0, logic fxl = 1'b0);
       dec_t d;
       d = f_decode_raw(op);
       if (!d.legal) begin
@@ -1118,18 +1155,18 @@ module pipeline_core
          d = f_mkx(d, X_PRIV);
       end
       if (EN_EXC && fx) begin
-         d = f_mkx(d, fxc ? X_MISAL_FE : X_ACC_FE);
-         d.fx2 = fx2 && !fxc;  d.fxg = fxg && !fxc;
+         d = f_mkx(d, fxc ? X_MISAL_FE : (EN_TLB && fxm) ? X_TLB_FE : X_ACC_FE);
+         d.fx2 = fx2 && !fxc;  d.fxg = fxg && !fxc;  d.fxl = EN_TLB && fxl && !fxc;
       end
       return d;
    endfunction
 
    // MMU stage 1: the ID op's fetch fault, registered at the IF->ID latch;
    // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
-   logic id_fx, id_fxc, id_mfsr, id_fx2, id_fxg;
+   logic id_fx, id_fxc, id_mfsr, id_fx2, id_fxg, id_fxm, id_fxl;
    logic [63:0] id_srv;           // mmu_sr's read port, at id_op[15:12]
    dec_t dec;
-   assign dec = f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg);
+   assign dec = f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl);
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
@@ -1157,11 +1194,27 @@ module pipeline_core
                          (w_op[31:30] == 2'b11 && pc[4:3] == 2'b11);
    wire        w_s1a = fe_um && pc[31:28] == 4'hF;
    wire        w_s1b = fe_um && w_last_pc[31:28] == 4'hF;
-   wire        w_p1  = w_s1a || (EN_MPU && mpu_f1);
-   wire        w_p2  = w_s1b || (EN_MPU && w_cross && mpu_f2);
+   // (stage 3, TE = 1: the MPU is off; the segment rule of §11.2 — user at
+   // 0x8000_0000+, supervisor in the 0x88-0xBF hole — from pc (ts*), then
+   // the window slot's fault tag (tf*, tm* = a TLB miss).  An instruction
+   // whose second dword faults spans into the next page, so its EADDR is
+   // that page's start = the next granule's start, as for the MPU.)
+   wire        w_te  = EN_TLB && te;
+   wire        w_tsa = w_te && (fe_um ? pc[31] : (pc[31:30] == 2'b10 && pc[31:27] != 5'b10000));
+   wire        w_tsb = w_te && (fe_um ? w_last_pc[31]
+                                      : (w_last_pc[31:30] == 2'b10 && w_last_pc[31:27] != 5'b10000));
+   wire        w_tf1 = w_te && (in0 ? ifb_ft[0] : ifb_ft[1]);
+   wire        w_tm1 = w_te && (in0 ? ifb_fm[0] : ifb_fm[1]);
+   wire        w_tf2 = w_te && in0 && w_span && ifb_ft[1];
+   wire        w_tm2 = w_te && in0 && w_span && ifb_fm[1];
+   wire        w_mpu = EN_MPU && !w_te;
+   wire        w_p1  = w_s1a || (w_mpu && mpu_f1) || w_tsa || w_tf1;
+   wire        w_p2  = w_s1b || (w_mpu && w_cross && mpu_f2) || w_tsb || w_tf2;
    wire        w_fx  = EN_EXC && (w_fxc || w_p1 || w_p2);
    wire        w_fx2 = !w_p1 && w_p2;                       // EADDR: the next granule's start
-   wire        w_fxg = EN_MPU && (w_p1 ? (!w_s1a && mpu_fg1) : (!w_s1b && w_cross && mpu_fg2));
+   wire        w_fxg = w_mpu && (w_p1 ? (!w_s1a && mpu_fg1) : (!w_s1b && w_cross && mpu_fg2));
+   wire        w_fxl = w_p1 ? (!w_s1a && !w_tsa && w_tf1) : (!w_s1b && !w_tsb && w_tf2);
+   wire        w_fxm = w_p1 ? (!w_s1a && !w_tsa && w_tm1) : (!w_s1b && !w_tsb && w_tm2);
    assign w_decf = f_decode(w_op, 1'b0, 1'b0, 1'b0);
    // (timing: the latch-time predecode — id_ser, the branch / return
    // predictor bits — reads the decode WITHOUT the MMU overrides; a fetch
@@ -2018,6 +2071,8 @@ module pipeline_core
    // MMU stage 1: the fill in flight is a fake one (user fetch from 0xF...)
    logic        if_fake;
    logic        if_drop;      // MMU stage 3: the fill in flight must not reach the window
+   logic        if_fflt, if_fmiss;   // (stage 3) the fake fill is a refused page / a TLB miss
+   logic [15:0] if_tghi;             // (stage 3) the fill's I-cache tag [18:3] (PA[31:16] with TE)
    wire         w_ufz = EN_EXC && fe_um && miss_dw[28:25] == 4'hF;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
@@ -2457,7 +2512,9 @@ module pipeline_core
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
-         id_fx2 <= 1'b0; id_fxg <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
+         ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
+         ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
+         id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
          ex_mph2 <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
@@ -2512,6 +2569,7 @@ module pipeline_core
             ifb_val <= 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
+            ut_v <= 1'b0;  it_ref <= 1'b0;    // (stage 3: the micro-ITLB)
             // invalidate-all: a fresh program image may reuse code addresses
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
             if (DEBUG_EN) begin
@@ -3033,8 +3091,10 @@ module pipeline_core
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= 64'b0;  ifb_val[0] <= 1'b1;
                   ifb_val[1] <= 1'b0;
+                  ifb_ft[0] <= if_fflt;  ifb_fm[0] <= if_fmiss;
                end else begin
                   ifb_dw[1] <= 64'b0;  ifb_val[1] <= 1'b1;
+                  ifb_ft[1] <= if_fflt;  ifb_fm[1] <= if_fmiss;
                end
                if_xc   <= 1'b0;
                if_fake <= 1'b0;
@@ -3048,8 +3108,10 @@ module pipeline_core
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
                   ifb_dw[1] <= m_rdata_next;  ifb_val[1] <= m_next_valid;
+                  ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                end else begin
                   ifb_dw[1] <= m_rdata;       ifb_val[1] <= 1'b1;
+                  ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                end
                m_read_DV <= 1'b0;
                if_xc     <= 1'b0;
@@ -3067,7 +3129,7 @@ module pipeline_core
                   logic [IC_IDXW-1:0] wi;
                   logic [18:0]        wt;
                   wi = if_req_dw[IC_IDXW:1];
-                  wt = if_req_dw[28:IC_IDXW+1];
+                  wt = {if_tghi, if_req_dw[12:IC_IDXW+1]};   // (stage 3: PA tag)
                   ev_icinst = 1'b1;  ev_icinst_idx = wi;   // 2a: BTIC entries of this line die
                   ic_tag[wi]   <= wt;
                   ic_tagff[wi] <= wt;   // M7b snoop shadow
@@ -3094,10 +3156,16 @@ module pipeline_core
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
                      ifb_dw[0] <= ifr_rdata;       ifb_val[0] <= 1'b1;
                      ifb_dw[1] <= ifr_rdata_next;  ifb_val[1] <= ifr_next_valid;
+                     ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                   if_look <= 1'b0;
+               end else if (EN_TLB && te && !lk_cov) begin
+                  // MMU stage 3: the micro-ITLB does not cover this page (in
+                  // this fetch mode): refill it, then look again
+                  if (!it_ref) begin it_ref <= 1'b1;  it_vpn <= miss_dw[28:13]; end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
@@ -3110,14 +3178,21 @@ module pipeline_core
                   // Hit-serves stay allowed during entry (no port; warms the window
                   // the IRET returns to). irq_xc ⊆ irq_active, so this covers the
                   // whole entry window; if_look simply holds and re-evaluates.
-                  m_addr    <= {miss_dw, 3'b000};   // miss: issue the shared-port fill
+                  // (stage 3, TE = 1: the PA from the micro-ITLB; a refused
+                  // page — segment, TLB miss, no X — is a fake fill with a
+                  // fault tag, nothing on the port)
+                  m_addr    <= (EN_TLB && te) ? {r_look_pa, miss_dw[12:0], 3'b000}
+                                              : {miss_dw, 3'b000};   // miss: issue the shared-port fill
+                  if_tghi   <= (EN_TLB && te) ? r_look_pa : miss_dw[28:13];
+                  if_fflt   <= EN_TLB && te && !r_look_ok;
+                  if_fmiss  <= EN_TLB && te && r_look_miss;
                   // MMU stage 1: in user mode a 0xF... dword is a FAKE fill —
                   // no DV on the port; it completes next cycle with zeros and
                   // no I-cache install, and the ID fetch check makes the op
                   // ACCESS_FETCH.  (Steers only these D inputs: off the
                   // ic_hit serve chain.)
-                  m_read_DV <= !w_ufz;
-                  if_fake   <= w_ufz;
+                  m_read_DV <= !(w_ufz || (EN_TLB && te && !r_look_ok));
+                  if_fake   <= w_ufz || (EN_TLB && te && !r_look_ok);
                   rdy_armed <= !m_ready;
                   if_req_dw <= miss_dw;             // old base+data captured together
                   r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
@@ -3137,8 +3212,10 @@ module pipeline_core
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
                      ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
                      ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+                     ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
                      ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                end else if (w_slide) begin
                   // M9+: slot-1 straddle (in1 && w_span at an even base): the op
@@ -3148,6 +3225,7 @@ module pipeline_core
                   ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
                   ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
                   ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+                  ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
                end else begin
                   if_look   <= 1'b1;              // begin lookup (no port access)
                end
@@ -3158,6 +3236,7 @@ module pipeline_core
                ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
                ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
                ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+               ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
             end
          end
 
@@ -3236,6 +3315,7 @@ module pipeline_core
                ifb_dw[0]  <= id_bt_d0;
                ifb_dw[1]  <= id_bt_d1;
                ifb_val    <= {id_bt_v1, 1'b1};
+               ifb_ft     <= 2'b00;  ifb_fm <= 2'b00;
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
                r_bt_pend   <= 1'b1;
@@ -3335,14 +3415,14 @@ module pipeline_core
                         : mem_xsq ? (mem_xs2 ? {mem_ea_raw[31:3] + 29'd1, 3'b000} : mem_ea_raw)
                         : (mem_d.uop == U_EXC && mem_d.sub == X_SYSCALL) ? 32'b0
                         : (mem_d.uop == U_EXC && mem_d.sub == X_MISAL_FE) ? mem_pc
-                        : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE)
+                        : (mem_d.uop == U_EXC && (mem_d.sub == X_ACC_FE || (EN_TLB && mem_d.sub == X_TLB_FE)))
                           ? (mem_d.fx2 ? {mem_pc[31:5] + 27'd1, 5'b0} : mem_pc)
                         : mem_op;
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
             wb_tlbi    <= EN_TLB && mem_valid && mem_d.tlbi;
             wb_va_dw   <= mem_eaddr[31:3];        // (the reservation holds a VA)
-            wb_xtlb    <= EN_TLB && mem_xsq && mem_xs_tlb;
+            wb_xtlb    <= EN_TLB && (mem_xsq ? mem_xs_tlb : (mem_valid && mem_d.uop == U_EXC && mem_d.fxl));
             wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
                                      : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE && mem_d.fxg));
             wb_lr      <= EN_EXC && mem_valid && mem_d.uop == U_LR && !mem_xsq;
@@ -3626,6 +3706,7 @@ module pipeline_core
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
                      id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
+                     id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
@@ -3719,9 +3800,30 @@ module pipeline_core
                nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             end
          end
+         // MMU stage 3: the micro-ITLB refill, through the main TLB's fetch
+         // port (a TLBP committing this cycle owns that port).  The verdict
+         // is for the fetch mode now (ut_um): user at 0x8000_0000+ and the
+         // supervisor hole are segment faults; useg / kmap go through the
+         // TLB and need X; kseg is direct; MMIO is identity.
+         if (EN_TLB && it_ref && !tlbi_commit) begin : ut_refill
+            logic f_useg, f_kseg, f_kmap, f_seg, f_tlbs;
+            f_useg = !it_vpn[15];
+            f_kseg = it_vpn[15:11] == 5'b10000;
+            f_kmap = it_vpn[15:14] == 2'b11 && it_vpn[15:12] != 4'hF;
+            f_seg  = fe_um ? it_vpn[15] : (it_vpn[15:14] == 2'b10 && !f_kseg);
+            f_tlbs = f_useg || f_kmap;
+            ut_v    <= 1'b1;
+            ut_vpn  <= it_vpn;
+            ut_um   <= fe_um;
+            ut_ok   <= !f_seg && (!f_tlbs || (tlb_f_hit && tlb_f_xwr[2]));
+            ut_miss <= !f_seg && f_tlbs && !tlb_f_hit;
+            ut_pa   <= f_tlbs ? {5'b0, tlb_f_pfn} : f_kseg ? {5'b0, it_vpn[10:0]} : it_vpn;
+            it_ref  <= 1'b0;
+         end
          // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
          // virtual copies (the I-cache, physically tagged, is kept)
          if (tlb_discard) begin
+            ut_v <= 1'b0;  it_ref <= 1'b0;
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
@@ -3833,6 +3935,7 @@ module pipeline_core
          // zero-served window, not a copy of an I-cache line)
          if (EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
              !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
+             !(EN_TLB && (ifb_ft[0] || (ifb_val[1] && ifb_ft[1]))) &&   // (stage 3: a refused page)
              pc_dw == r_bt_wbase && !sq_spec &&
              !(snoop_q && (r_bt_wbase[IC_IDXW:1] == snoop_idx_q || r_bt_wblidx == snoop_idx_q))) begin
             bt_v[r_bt_widx]    <= 1'b1;
@@ -4013,7 +4116,7 @@ module pipeline_core
    // (data / fetch translation is wired in the following steps)
    assign tlb_hi_load = sr_ent_we && exc_tlb_q;
    assign tlb_hi_vpn  = exc_addr_q[31:16];
-   assign tlb_f_vpn   = '0;
+   assign tlb_f_vpn   = it_vpn;   // the micro-ITLB refill
    generate if (EN_TLB) begin : g_tlb
       mmu_tlb tlb_i (
          .clk, .rst, .ce,
