@@ -731,7 +731,27 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | 0x0028  | `INT_VEC3`     | RW | 32    | Handler for source 3 (VGA vsync). A vector of 0 disables the source. |
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
 | 0x0038  | `TIMER_COUNT`  | R  | 32    | Live cycle counter — useful for profiling. |
+| 0x0048  | `CPU_FEATURES` | R  | 64    | Build features (MMU_PLAN.md §6.3), table below. Reads 0 on bitstreams older than the MMU work. |
 | 0x0040  | `CLOCK_MS`     | R  | 64    | Free-running millisecond counter since FPGA power-on. Increments every 100 000 cycles at the 100 MHz `i_Clk` (constrained in `nexys_ddr.xdc`). 64-bit so it takes ~5.8 × 10⁸ years to wrap. Not reset by `CPU_RESETN` or by program load — programs that need a "time since started" value should snapshot it on entry. |
+
+**`CPU_FEATURES` (0x0048)**, 1 = present:
+
+| Bits | Meaning |
+|---|---|
+| `[0]` | MMU stage 1: exceptions, user mode, SYSCALL, MFSR/MTSR, TP, CYCLE |
+| `[1]`, `[7:4]` | the MPU; its region count − 1 (optional; off on the Nexys A7) |
+| `[2]`, `[15:8]` | the TLB; its entry count (16 on the Nexys A7) |
+| `[3]` | LR/SC |
+| `[16]` | AES-128 (`0xF00A_0000`) |
+| `[17]` | AES-GCM / GHASH (`0xF00A_0080`; only with AES) |
+| `[18]` | SHA-256 (`0xF00B_0000`) |
+| `[19]` | HMAC-SHA-256 (`0xF00B_0080`; only with SHA-256) |
+| `[20]` | TRNG (`0xF00C_0000`; always built, so always 1) |
+
+The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
+16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
+`0x001F_100D`. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
 0x000F_FFFF` (≈ 10.5 ms at 100 MHz), `CLOCK_MS = 0` (at FPGA power-on only).
@@ -946,6 +966,8 @@ buffer, first priority among the DMA masters. RTL: `vga_ctrl.sv`,
 
 ### Crypto: AES-128 — base `0xF00A_0000`
 
+> **Optional build feature** (`CRYPTO_AES_EN`), reported in `CPU_FEATURES[16]` (`0xF00F_0048`). **Not built in the lean Nexys A7 MMU bitstream.** When absent, this window reads 0 and ignores writes, completing in the normal MMIO time. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.)
+
 Hardware AES-128 encrypt/decrypt block. See
 [CRYPTO_PLAN.md §4](CRYPTO_PLAN.md) for the architecture and the rationale
 for putting bulk crypto in fabric. Implemented in
@@ -995,6 +1017,8 @@ to `AES_KEY0/1` followed by KEY_LOAD) at the end of each session to
 avoid leaving residue in fabric.
 
 ### AES-GCM / GHASH — base `0xF00A_0080`
+
+> **Optional build feature** (`CRYPTO_GCM_EN, only with AES`), reported in `CPU_FEATURES[17]` (`0xF00F_0048`). **Not built in the lean Nexys A7 MMU bitstream.** When absent, this window reads 0 and ignores writes, completing in the normal MMIO time. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.)
 
 Shares the AES-128 device window (offsets `0x080..0x0BC`).  Implements
 the GHASH multiplier (GF(2^128)) plus a tag-accumulating wrapper, so the
@@ -1065,6 +1089,8 @@ emit_tag(tag0, tag1);
 
 ### Crypto: SHA-256 — base `0xF00B_0000`
 
+> **Optional build feature** (`CRYPTO_SHA_EN`), reported in `CPU_FEATURES[18]` (`0xF00F_0048`). **Not built in the lean Nexys A7 MMU bitstream.** When absent, this window reads 0 and ignores writes, completing in the normal MMIO time. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.)
+
 Bare SHA-256 compression engine (FIPS 180-4).  Padding and length
 encoding are software's job; hardware compresses one 512-bit block per
 `START`.  See [CRYPTO_PLAN.md §6](CRYPTO_PLAN.md).  Implemented in
@@ -1116,6 +1142,8 @@ See `sha256()` in `CRYPTO_PLAN.md` §6 for the canonical software loop.
 
 ### HMAC-SHA-256 wrapper — base `0xF00B_0080`
 
+> **Optional build feature** (`CRYPTO_HMAC_EN, only with SHA-256`), reported in `CPU_FEATURES[19]` (`0xF00F_0048`). **Not built in the lean Nexys A7 MMU bitstream.** When absent, this window reads 0 and ignores writes, completing in the normal MMIO time. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.)
+
 Shares the SHA-256 device window (offsets `0x080..0x0AC`).  Caches the
 inner/outer hash midstates derived from a 256-bit key so per-MAC overhead
 collapses to a single H reload at the start and end of each authentication.
@@ -1161,6 +1189,9 @@ engine.  Wipe the key with `KEY_ZERO` at the end of each session so
 fabric state doesn't outlive the session.
 
 ### Crypto: TRNG — base `0xF00C_0000`
+
+> Always built (`CPU_FEATURES[20]` = 1 on every bitstream with the crypto
+> presence bits).
 
 Ring-oscillator-based true random number generator with Von Neumann
 debiasing and a NIST SP 800-90B repetition-count health monitor.  See

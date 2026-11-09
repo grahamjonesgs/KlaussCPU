@@ -448,9 +448,18 @@ bitstream.
 | `[1]` | stage 2 MPU present; `[7:4]` = region count − 1 (§10.1). An optional build feature, **off on the Nexys A7** (timing margin, Graham 2026-11-09): `[1]` = 0, `[7:4]` = 0 |
 | `[2]` | stage 3 TLB present (`[15:8]` = entry count) |
 | `[3]` | LR/SC (§5.1). Set together with `[0]` in stage 1, but kept separate so software tests for atomics by name. |
+| `[16]` | AES-128 present (optional build feature) |
+| `[17]` | AES-GCM / GHASH present (only with AES) |
+| `[18]` | SHA-256 present |
+| `[19]` | HMAC-SHA-256 present (only with SHA-256) |
+| `[20]` | TRNG present (always built: always 1) |
 
-The Nexys A7 bitstream reads **`0x100D`**: stage 1, LR/SC, and a 16-entry
-TLB, with no MPU.
+If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's MMIO window reads 0, ignores writes and
+completes in the normal MMIO time (MMIO_MAP.md).
+
+The lean Nexys A7 MMU bitstream reads **`0x0010_100D`**: stage 1, LR/SC, a
+16-entry TLB, no MPU, and the TRNG as the only crypto block. The full
+crypto configuration reads `0x001F_100D`.
 
 ---
 
@@ -1225,7 +1234,8 @@ base in EX, with the MEM replay above".
 - **Build switches**: the module parameter `TLB_EN` (on; off on core 2) and
   `EN_TLB = EXC_EN && TLB_EN`. KlaussCPU's `CORE1_TLB_EN` drives
   CPU_FEATURES[2] and [15:8] = the entry count; `TLB_N` / `CORE1_TLB_N`
-  = 16 here. With the MPU off on the A7 (§10), CPU_FEATURES = 0x100D.
+  = 16 here. With the MPU off on the A7 (§10) and lean crypto, CPU_FEATURES =
+  0x0010_100D.
 - **MPU off on the Nexys A7** (Graham, 2026-11-09): core 1 builds the TLB
   and not the MPU, for timing margin; Zephyr runs in supervisor mode. The
   MPU is a build option (`CORE1_MPU_EN`), simulated in an `MPU_EN = 1`
