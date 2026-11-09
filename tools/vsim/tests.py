@@ -2626,3 +2626,35 @@ def mmio_fetch_no_device_read():
             e.update({'r8': X_ILL, 'r11': 0})                 # (EADDR = the op word)
         out.append((a, e, ['+LAT=3', '+MAXC=20000']))
     return out
+
+
+@test
+def tlb_stlf_alias():
+    """TE = 1 store-to-load forwarding: a load right after a store to the
+    same PA through another VA (kseg vs useg alias) sees the store; a
+    store, a TLBWI remapping its VA to another frame, then a load of that
+    VA reads the new frame, not the store; a load at the same page offset
+    but another PA right after a store is not forwarded; same-VA push/pop
+    through the kseg stack (the values)"""
+    out = []
+    for plus in ([], ['+HIT=100'], ['+HIT=70', '+LAT=1']):
+        def setup(a):
+            _tlb_set(a, 2, 0x0050, 0x001, TLB_V | TLB_R | TLB_W)      # 0x0050xxxx -> PA 0x1xxxx
+        def body(a):
+            a.setr(9, 0x80000000 | DATA); a.setr(10, 0x00500000 | DATA & 0xFFFF)
+            a.setr(3, 0x1111); a.st(64, 3, 9, 8); a.ld(64, 4, 10, 8)        # kseg store, useg load
+            a.setr(3, 0x2222); a.st(64, 3, 10, 16); a.ld(64, 5, 9, 16)      # useg store, kseg load
+            a.setr(13, 0x80020000)                                          # kseg -> PA 0x20000
+            a.setr(3, 0x6666); a.st(64, 3, 10, 32); a.ld(64, 11, 13, 32)   # same offset, other PA
+            a.setr(3, 0x3333); a.st(64, 3, 10, 24)
+            _tlb_set(a, 2, 0x0050, 0x002, TLB_V | TLB_R | TLB_W)            # remap -> PA 0x2xxxx
+            a.ld(64, 6, 10, 24)                                              # PA 0x20018: 0x7777
+            a.setr(3, 0x4444); a.push(3); a.pop(7)
+            a.setr(3, 0x5555); a.push(3); a.alu('add', 1, 1, 1); a.pop(8)
+        a, e, p = _te_prog(body, False, {'r4': 0x1111, 'r5': 0x2222, 'r6': 0x7777, 'r7': 0x4444,
+                                         'r8': 0x5555, 'r11': 0x8888, m(DATA + 24): 0x3333,
+                                         m(DATA + 32): 0x6666},
+                           setup=setup, plus=plus)
+        a.dword(0x20018, 0x7777); a.dword(0x20020, 0x8888)
+        out.append((a, e, p))
+    return out

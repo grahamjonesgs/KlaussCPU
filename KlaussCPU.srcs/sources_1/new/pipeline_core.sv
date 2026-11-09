@@ -2061,6 +2061,9 @@ module pipeline_core
    logic [31:0] sq_addr;
    logic [63:0] sq_wdata;
    logic [7:0]  sq_be;
+   // (stage 3) the VA page of the store on the port / in sq_*, for STLF with TE = 1
+   logic [15:0] m_vahi, sq_vahi;
+   logic        m_vav, sq_vav;
    // EN_ST1: st_spec = the store that left MEM last edge posted
    // speculatively (st_post_ok is its verdict this cycle); st_spec_nx = its
    // fall-through, the refetch pc if it was not postable
@@ -2214,16 +2217,27 @@ module pipeline_core
                           : (ex_d.msz == 2'd2) ? (exo_iaddr[2] ? 8'hF0 : 8'h0F)
                           : (ex_d.msz == 2'd1) ? (8'h03 << {exo_iaddr[2:1], 1'b0})
                           :                      (8'h01 << exo_iaddr[2:0]);
-   // (stage 3: with TE = 1 a store's address is a PA and the load's a VA —
-   // only the page offset is comparable: a conservative block, no forward)
+   // (stage 3, TE = 1: a store's port address is a PA and the load's a VA.
+   // The block compares the page offset only — conservative for aliases.
+   // A forward needs the youngest such store's VA page to equal the
+   // load's: the MEM store's from mem_eaddr; the port's / queued one's from
+   // m_vahi / sq_vahi, valid (m_vav / sq_vav) only for stores issued from
+   // MEM and dropped by a TLB / ASID / TE change, which may remap the VA.)
    wire        sf_te      = EN_TLB && te;
+   wire        sf_hia     = sf_te ? (mem_eaddr[31:16] == exo_iaddr[31:16])
+                                  : (mem_iaddr[31:16] == exo_iaddr[31:16]);
+   wire        sf_hib     = sf_te ? (m_vav && m_vahi == exo_iaddr[31:16])
+                                  : (m_addr[31:16] == exo_iaddr[31:16]);
+   wire        sf_hic     = sf_te ? (sq_vav && sq_vahi == exo_iaddr[31:16])
+                                  : (sq_addr[31:16] == exo_iaddr[31:16]);
    wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || mem_iaddr[31:16] == exo_iaddr[31:16]);
+                            (sf_te || sf_hia);
    wire        sf_b       = m_write_DV && m_addr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || m_addr[31:16] == exo_iaddr[31:16]);
+                            (sf_te || sf_hib);
    // EN_SQ: the queued store (younger than the posted one on the port)
    wire        sf_c       = EN_SQ && sq_v && sq_addr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
+                            (sf_te || sf_hic);
+   wire        sf_vok     = !sf_te || (sf_a ? sf_hia : sf_c ? sf_hic : sf_hib);
    wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
                           : sf_c ? ((sq_be  & ex_ldmask) == ex_ldmask)
                                  : ((m_be & ex_ldmask) == ex_ldmask);
@@ -2232,7 +2246,7 @@ module pipeline_core
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                             !(DEBUG_EN && dbg_mx);
-   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov && !sf_te;
+   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov && sf_vok;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    // (stage 3: with TE = 1 the tag bits [31:16] are the PA — the cache
    // indexes with the VA bits [14:5] it always used: VIPT, 64 KiB pages)
@@ -2522,6 +2536,7 @@ module pipeline_core
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
+         m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
          ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
@@ -2685,6 +2700,7 @@ module pipeline_core
                                     (EN_EXC && exc_ent) ? exc_epc_q : pc};
                      m_be       <= 8'hFF;
                      m_write_DV <= 1'b1;
+                     m_vav      <= 1'b0;
                      rdy_armed  <= !m_ready;
                      irq_xc     <= 1'b1;
                   end
@@ -2885,6 +2901,7 @@ module pipeline_core
                m_wdata    <= sq_wdata;
                m_be       <= sq_be;
                m_write_DV <= 1'b1;
+               m_vahi     <= sq_vahi;  m_vav <= sq_vav;
                rdy_armed  <= !m_ready;
                st_post    <= 1'b1;
                sq_v       <= 1'b0;
@@ -2896,6 +2913,7 @@ module pipeline_core
             m_wdata    <= sq_wdata;
             m_be       <= sq_be;
             m_write_DV <= 1'b1;
+            m_vahi     <= sq_vahi;  m_vav <= sq_vav;
             rdy_armed  <= !m_ready;
             st_post    <= 1'b1;
             sq_v       <= 1'b0;
@@ -2954,10 +2972,12 @@ module pipeline_core
                      m_be       <= mem_be;
                      m_read_DV  <= mem_port_rd;
                      m_write_DV <= mem_port_wr;
+                     m_vahi     <= mem_eaddr[31:16];  m_vav <= 1'b1;
                      rdy_armed  <= !m_ready;
                   end else begin
                      sq_v       <= 1'b1;
                      sq_addr    <= mem_iaddr;
+                     sq_vahi    <= mem_eaddr[31:16];  sq_vav <= 1'b1;
                      sq_wdata   <= mem_wdata;
                      sq_be      <= mem_be;
                   end
@@ -3074,6 +3094,7 @@ module pipeline_core
                   m_be       <= dbg_i.mem_be;
                   m_read_DV  <= !dbg_i.mem_we;
                   m_write_DV <= dbg_i.mem_we;
+                  m_vav      <= 1'b0;
                   rdy_armed  <= !m_ready;
                   dbg_mx     <= 1'b1;
                end
@@ -3836,6 +3857,7 @@ module pipeline_core
          // virtual copies (the I-cache, physically tagged, is kept)
          if (tlb_discard) begin
             ut_v <= 1'b0;  it_ref <= 1'b0;
+            m_vav <= 1'b0;  sq_vav <= 1'b0;   // (STLF: their VAs may now map elsewhere)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;

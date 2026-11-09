@@ -214,6 +214,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
    longint pst [0:7];
    longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0, n_ic_fill = 0;
    integer trace_f = 0;
+   bit     trace_cyc = 0;      // +TRACECYC: stamp each retire with its cycle
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -249,6 +250,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       if (!rst && ret_valid) begin
          icount++;
          if (trace_f != 0) begin
+            if (trace_cyc) $fwrite(trace_f, "t=%0d ", cyc);
             $fwrite(trace_f, "pc=%08x op=%08x", ret_pc, ret_op);
             for (int i = 0; i < 16; i++) $fwrite(trace_f, " %016x", dbg_r[i]);
             $fwrite(trace_f, " sp=%08x f=%b%b%b%b", dbg_sp, dbg_flags.zero, dbg_flags.sign,
@@ -299,6 +301,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       if (!$value$plusargs("IMAGE=%s", img)) begin $display("TB: need +IMAGE"); $finish; end
       if (!$value$plusargs("OUT=%s", out_name)) out_name = "tb_vsim.out";
       if ($value$plusargs("TRACE=%s", trace_name)) trace_f = $fopen(trace_name, "w");
+      trace_cyc = $test$plusargs("TRACECYC");
       void'($value$plusargs("LAT=%d", lat_fix));
       void'($value$plusargs("LATR=%d", lat_rand));
       void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
