@@ -2,7 +2,7 @@
 final-state dict, plusargs) or a list of them.  Expected keys: r0..r15 (int),
 m<addr8hex> (int, dword at addr), kind / end / pc (park), any `key=value`
 token the testbench writes to its .out file."""
-from kasm import Asm
+from kasm import Asm, H
 
 DATA = 0x10000          # the TB dumps 0x10000..0x10800
 ALL = {}
@@ -2504,3 +2504,33 @@ def tlb_te_on_refill():
     a.iret()
     return a, {'end': 'park', 'kind': '0', 'r4': 0x5A, m(DATA): 0x5A, m(CNT): 2,
                'r5': X_TLB_ST, 'r6': DATA}, []
+
+
+@test
+def lcd_sq_spec_once():
+    """review 2 #3: an LCD op in EX on the EN_ST1 squash edge (a store that
+    posted speculatively overlaps code) is squashed and refetched; it must
+    send its byte once, not twice (a plain-data store: once too)"""
+    out = []
+    for smc in (True, False):
+        for lat in (1, 3):
+            a = Asm()
+            while a.pc % 16:
+                a.nop()
+            a.label('L'); a.nop(); a.nop()               # an executed code dword
+            a.setr(3, 0x41)
+            a.setr64(1, (0x6C000000 << 32) | 0x6C000000)  # the same two NOPs
+            if smc:
+                a.leapc(2, 'L')
+            else:
+                a.setr(2, DATA)
+            for _ in range(3):
+                a.nop()
+            a.st(64, 1, 2)                                # posts; overlaps code -> sq_spec
+            a.nop()                                       # MEM on the squash edge
+            a.emit(H(1, 0xC) | 1 << 24 | 3 << 4)          # LCD data r3: EX on the squash edge
+            for _ in range(4):
+                a.nop()
+            a.halt()
+            out.append((a, {'end': 'park', 'kind': '0', 'lcd_n': '1'}, [f'+LAT={lat}']))
+    return out

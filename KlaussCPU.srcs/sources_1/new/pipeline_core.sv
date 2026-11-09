@@ -2490,9 +2490,10 @@ module pipeline_core
    // Strobe only on the edge the LCD op leaves EX, as LCDRST does: while MEM
    // is busy EX holds, and a strobe then (with lcd_ready dropping behind it,
    // so ex_busy keeps the op in EX) sent the byte twice; a taken fused branch
-   // or an EX squash kills the op, so it must not send.
+   // or an EX squash kills the op, so it must not send.  (Nor the EN_ST1
+   // squash: the op is refetched and would send again.)
    assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
-                     !mem_xsq_go;
+                     !mem_xsq_go && !sq_spec;
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -2850,7 +2851,7 @@ module pipeline_core
 
          lcd_rst_wr <= 1'b0;
          if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
-             !mem_xsq_go) begin
+             !mem_xsq_go && !sq_spec) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end

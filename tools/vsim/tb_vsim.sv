@@ -208,6 +208,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
 `ifdef HAS_EXC
    always @(posedge clk) if (!rst && dut.sr_ent_we) exc_n++;
 `endif
+   // LCD strobes (a wrong-path LCD op must not send)
+   longint lcd_n = 0, lcdrst_n = 0;
+   always @(posedge clk) if (!rst) begin if (lcd_dv) lcd_n++; if (lcd_rst_wr) lcdrst_n++; end
    longint pst [0:7];
    longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0, n_ic_fill = 0;
    integer trace_f = 0;
@@ -264,6 +267,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       integer f;
       f = $fopen(out_name, "w");
       $fdisplay(f, "end=%s kind=%0d pc=%08x op=%08x", why, park_kind, park_pc, park_op);
+      $fdisplay(f, "dbg_cause=%0d watch_addr=%08x", dbg_o.cause, dbg_o.watch_addr);
       $fdisplay(f, "cycles=%0d instrs=%0d irqs=%0d", cyc, icount, irq_acks);
       for (int i = 0; i < 16; i++) $fdisplay(f, "r%0d=%016x", i, dbg_r[i]);
       $fdisplay(f, "sp=%08x", dbg_sp);
@@ -275,7 +279,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d mmio_rd=%0d", n_rd, n_wr, n_mmio_wr, n_mmio_rd);
       $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
-      $fdisplay(f, "uart_n=%0d", uart_n);
+      $fdisplay(f, "uart_n=%0d lcd_n=%0d lcdrst_n=%0d", uart_n, lcd_n, lcdrst_n);
 `ifdef HAS_EXC
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
@@ -303,6 +307,16 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       void'($value$plusargs("HIT=%d", hit_pct));
       // debugger state without a debugger driver (DEBUG_EN builds only)
       if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
+      // watchpoint 0 on a dword (read / write), without a debugger driver
+      begin
+         logic [31:0] wpa;
+         if ($value$plusargs("WP0RD=%h", wpa)) begin
+            dbg_i.wp_en[0] = 1'b1; dbg_i.wp_rd[0] = 1'b1; dbg_i.wp_dw[0] = wpa[31:3]; dbg_i.wp_be[0] = 8'hFF;
+         end
+         if ($value$plusargs("WP0WR=%h", wpa)) begin
+            dbg_i.wp_en[0] = 1'b1; dbg_i.wp_wr[0] = 1'b1; dbg_i.wp_dw[0] = wpa[31:3]; dbg_i.wp_be[0] = 8'hFF;
+         end
+      end
 `ifdef HAS_EXC
       if ($test$plusargs("DBG_EXCPASS")) dbg_i.exc_pass = 1'b1;
 `endif
