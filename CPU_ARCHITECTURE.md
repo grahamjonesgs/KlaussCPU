@@ -1,8 +1,9 @@
 # CPU Architecture Reference — for C Compiler / Assembly Writers
 
 > **Currency (2026-11, branch `mmu`).** §13.2 (exceptions, user mode,
-> SYSCALL, system registers) and §8.4 (LR/SC) describe MMU stage 1
-> ([MMU_PLAN.md](MMU_PLAN.md)), which is on the `mmu` branch only.
+> SYSCALL, system registers), §8.4 (LR/SC) and §13.3 (the MPU) describe MMU
+> stages 1 and 2 ([MMU_PLAN.md](MMU_PLAN.md)), which are on the `mmu` branch
+> only.
 > This document describes the CPU as executed by
 > `pipeline_core.sv` (5-stage in-order pipeline) with ISA encoding v2 + the
 > v3 additions. It is the *programmer's model*: semantics, flags, alignment,
@@ -504,7 +505,8 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   with the exception vector `EVEC = 0`. In that state every fault parks
   exactly as described above, so code that never sets `EVEC` sees no
   change. Probe `CPU_FEATURES` (`0xF00F_0048`, reads 0 on older bitstreams):
-  bit 0 = this section, bit 3 = LR/SC.
+  bit 0 = this section, bit 3 = LR/SC, bit 1 = the MPU (§13.3) and
+  `[7:4]` = its region count − 1 (15).
 - **Exceptions are precise.** The faulting instruction commits nothing:
   no register, flag, SP, R15 or PC change, and no memory or device access.
   That includes PUSH/POP/CALL/RET/ENTER/LEAVE/LEAVERET. The core then takes
@@ -534,9 +536,9 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
 
 | SR | Name | Notes |
 |---|---|---|
-| 0 | `STATUS` | `[0]` UM, `[1]` DI; readable in user mode; no writable bits in stage 1 |
+| 0 | `STATUS` | `[0]` UM, `[1]` DI (read-only), `[8]` MPU_EN (§13.3; write in supervisor mode); readable in user mode |
 | 1 | `EVEC` | exception vector (`[1:0]` read 0); 0 = exceptions park |
-| 2 | `ECAUSE` | `[7:0]` |
+| 2 | `ECAUSE` | `[7:0]` cause, `[8]` GUARD (an MPU GUARD region denied the access) |
 | 3 | `EADDR` | `[31:0]` |
 | 4 | `USP` | the user SP (while in supervisor mode) |
 | 5, 6 | `SCRATCH0/1` | 64-bit, for the kernel |
@@ -547,6 +549,43 @@ Encodings: `SYSCALL` `0x6C08_0000`; `MFSR rd, sr` `0x6C40_0000 | sr<<12 |
 rd<<8`; `MTSR sr, rs1` `0x6C60_0000 | sr<<12 | rs1<<4` (ISA_ENCODING_V2_MAP.md
 §9). An unimplemented SR number, or MTSR to `CYCLE`, is ILLEGAL in either
 mode.
+
+### 13.3 MPU (MMU stage 2)
+
+16 regions, 32-byte granularity (MMU_PLAN.md §10). All registers are
+supervisor-only; MTSR to them serializes, so a change applies from the
+next instruction, including its fetch.
+
+| SR | Name | Contents |
+|---|---|---|
+| `0x10 + 2n` | `MPU_BASEn` | `[31:5]` first granule, `[4]` GUARD, `[3]` X, `[2]` W, `[1]` R, `[0]` EN |
+| `0x11 + 2n` | `MPU_LIMITn` | `[31:5]` **last** granule (inclusive); `[4:0]` read 0 |
+| `0x00` | `STATUS` | `[8]` MPU_EN |
+
+Region *n* covers address *a* when EN and `BASE[31:5] ≤ a[31:5] ≤
+LIMIT[31:5]`. With MPU_EN = 1, every checked access is decided like this:
+
+1. A covering **GUARD** region denies it, in either mode (stack guards).
+2. Otherwise supervisor mode is allowed.
+3. Otherwise user mode needs some covering non-GUARD region with the
+   permission (load R, store W, fetch X). This is a union: user mode is
+   default-deny.
+
+A denial raises ACCESS_LOAD / ACCESS_STORE / ACCESS_FETCH (`ECAUSE[8]` =
+1 for a GUARD denial). `EADDR` is the raw EA, or the start of the 2nd
+doubleword / the first denied instruction word. What is checked: every data
+access by an instruction, including stack operations (by direction), LR
+(load) and SC (store). The two doublewords of a spanning MEMGET32 or a
+LEAVERET are both checked before either access. Every instruction is
+checked at every granule it occupies. What is not checked: entry's frame
+push (leave one frame of slack below a guard; a guard-safe vector must not
+touch memory before it knows SP is safe; MMU_PLAN.md §10.2), debugger
+accesses, and I-cache fills. The stage 1 user-mode MMIO rule applies first;
+in supervisor mode a GUARD over MMIO also denies. Reset clears every region
+and MPU_EN.
+
+Cost while MPU_EN = 1: MEMGET32, LEAVERET and IRET lose their early issue
+(about one cycle each). With MPU_EN = 0, timing is as before.
 
 ---
 
@@ -672,6 +711,9 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
   switch (frame bit 44), SYSCALL, MFSR/MTSR with the TP and CYCLE registers,
   LR/SC, and `CPU_FEATURES`. Off on core 2. Compatible: with `EVEC = 0`,
   random-program retire traces are identical to master's (MMU_PLAN.md).
+- **MMU stage 2 (2026-11, branch `mmu`):** the 16-region MPU (§13.3) and
+  `ECAUSE[8]` GUARD. Off on core 2. With MPU_EN = 0, cycle-identical to
+  stage 1.
 - **Little-endian conversion fixes (April 2026, FSM era):** SETR64/PUSHV64
   high-word selection, LDIDX/STIDX 8/16/32 lane and byte-enable inversions,
   and null-terminated TXSTRMEM. The `.vh` task files they referred to are

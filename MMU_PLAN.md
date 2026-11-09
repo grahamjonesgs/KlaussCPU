@@ -857,17 +857,51 @@ The stage 1 user-mode MMIO rule (§3.6) still applies first. In supervisor
 mode, GUARD regions also cover MMIO. Cause priority stays as in §4.1: an
 MPU denial is an ACCESS_* fault.
 
-### 10.3 Pipeline
+### 10.3 Pipeline (as built, `d546911`)
 
-- **Data:** in EX, 16 base/limit comparisons on the EA (and on the second
-  doubleword's address for two-access ops), registered into MEM. The fault
-  is acted on in the MEM-cycle-1 slot (§7.1), the same as the user-MMIO
-  fault.
-- **Fetch:** the comparisons run on `pc` (and on the instruction's last
-  doubleword) at the IF→ID latch. The result is registered into the §7.5
-  fetch-fault override.
-- **Cost:** 16 regions × 2 comparators × 2 (data, fetch), plus about 950
-  FFs.
+- **State**: `mmu_mpu` (in `pipeline_core.sv`) holds 16 × {BASE[31:5],
+  GUARD/X/W/R/EN, LIMIT[31:5]} and MPU_EN in flops (944 + 1). It is written
+  by an MTSR to 0x10–0x2F or STATUS as it commits at WB. MTSR serializes,
+  so the next instruction, including its fetch, sees the change. MFSR
+  reads it at dispatch. The MFSR value is selected between `mmu_sr` and
+  `mmu_mpu` by SR[7:4]. `mmu_sr`'s writes (and USP's) are gated on
+  SR[7:4] = 0, because its low-nibble decode would alias 0x13 to EADDR.
+- **Data**: 16 × 2 magnitude compares on the EA's granule (EA[31:5]) in
+  EX. For a two-access op (MEMGET32 spanning two doublewords, LEAVERET;
+  both have EA = `ex_a`) whose 2nd doubleword is in the next granule
+  (`ex_a[4:3] = 11`), that granule g+1 is decided from the same compares
+  plus two equalities per region: BASE ≤ g+1 ⇔ BASE ≤ g ∨ BASE = g+1, and
+  g+1 ≤ LIMIT ⇔ g ≤ LIMIT ∧ g ≠ LIMIT. Here g+1 comes from an incrementer
+  on `ex_a`, not on the EA adder. Per doubleword the stage 1 user-MMIO
+  rule applies first, then the MPU. The result is only the registered
+  access-fault bit of §7.1, plus "2nd doubleword only" (EADDR) and GUARD.
+  Since `081952c` that bit is the only thing an access fault changes at
+  EX→MEM: the op enters MEM as it is, and MEM gates its port access, WB
+  commit, RET redirect and RAS check, and never holds it (§7.1).
+- **Fetch**: the same compares on `pc`'s granule. For an instruction
+  crossing into the next granule (from `pc[4:2]` and the window's LEN
+  bits), g+1 is decided by the same equality trick. This runs at the IF→ID
+  latch and is registered into the §7.5 fetch-fault override, with
+  `id_fx2` (EADDR = the next granule's start) and `id_fxg` (GUARD). The
+  stage 1 user `0xF…` rule applies first per part.
+- **ECAUSE[8] (GUARD)** describes the reported (first denied) doubleword
+  or fetch part: 1 when an MPU GUARD region denied it, 0 when the stage 1
+  MMIO rule did (that rule applies first) or a user default-deny did.
+- **Early load issue** (MEMGET32, LEAVERET, IRET) is off while MPU_EN = 1:
+  its decision is on the EX→MEM enables, which the MPU decision must not
+  reach. So with the MPU on, those loads issue from MEM, a cycle later.
+  With MPU_EN = 0 nothing changes (cycle-identical).
+- **Not checked**: entry's frame push; debugger accesses; I-cache fills and
+  prefetches, which only read. A user fetch from `0xF…` is still a fake
+  fill (§7.7b).
+- **Build switches**: the module parameter `MPU_EN` (on; off on core 2),
+  and `EN_MPU = EXC_EN && MPU_EN`. KlaussCPU's `CORE1_MPU_EN` drives
+  CPU_FEATURES[1] and [7:4] = 15.
+- **Tests**: `tests.py` `mpu_*` (one per §10.2 rule, ECAUSE[8] in both
+  modes); `run.py mpudiff` runs user-mode random programs under random
+  regions, where the handler turns the MPU off and retries on a fault and
+  turns it back on at an injected SYSCALL, and the final state must equal
+  the plain program's; `socmmio` also checks CPU_FEATURES.
 
 ---
 
