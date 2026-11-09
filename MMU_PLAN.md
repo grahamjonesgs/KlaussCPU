@@ -1,7 +1,15 @@
 # MMU plan: exceptions, user mode, MPU, TLB
 
-Branch `mmu` (klaussCPU, with klausscpu-runtime and klausscpu-llvm on their
-own `mmu` branches). Status: **design note for review, no RTL yet.**
+Branch `mmu` (klaussCPU, with klausscpu-runtime, klausscpu-llvm and klausscc
+on their own `mmu` branches). Status: **stage 1 interface (§3–§6) frozen
+2026-11-09** after review by the runtime session, which approved it with
+two additions: the TP and CYCLE SRs, and LR/SC moved into stage 1. No RTL
+yet. Any change to §3–§6 from here on is agreed with the runtime session
+first.
+
+Who does what: RTL, kasm.py and the klausscpu-llvm MC layer are done here.
+klausscc (assembler, emulator, GDB server) and all runtime and OS software
+are done by the klausscpu-runtime session.
 
 Goal: a path to xv6 and then Linux (arch/klausscpu + musl), with Zephyr
 USERSPACE and NuttX protected and kernel builds along the way. Today there
@@ -10,9 +18,9 @@ accesses park the core.
 
 | Stage | Contents | Detail here |
 |---|---|---|
-| 1 | Precise restartable exceptions, user and supervisor modes, SYSCALL, kernel stack switch | full (§2–§9) |
-| 2 | MPU: 8 base/limit/permission regions (Zephyr USERSPACE, NuttX protected) | outline (§10) |
-| 3 | Software-refilled TLB with ASIDs, 64 KiB pages, LR/SC | outline (§11) |
+| 1 | Precise restartable exceptions, user and supervisor modes, SYSCALL, kernel stack switch, TP/CYCLE SRs, LR/SC | full (§2–§9) |
+| 2 | MPU: 16 base/limit/permission regions, if the LUTs allow (8 at minimum), for Zephyr USERSPACE and NuttX protected | outline (§10) |
+| 3 | Software-refilled TLB with ASIDs, 64 KiB pages | outline (§11) |
 
 Section numbers in `CPU_ARCHITECTURE.md` are written as "arch §n".
 
@@ -61,6 +69,9 @@ Four things are added:
 4. **Kernel stack switch** (m68k model). There are two stack pointers. An
    exception or interrupt taken from user mode pushes its frame on the
    kernel SP. IRET back to user mode switches back to the user SP.
+5. **User-mode atomics and TLS.** LR/SC (§5.1), because DI/EI, which
+   `src/atomic.c` uses today, are privileged in user mode. A thread-pointer
+   SR (TP) and a cycle counter SR (CYCLE), both usable from user mode.
 
 What stage 1 does **not** give: memory protection between user programs,
 or between user and kernel *DDR*. That is stage 2 (MPU) or stage 3 (TLB).
@@ -80,14 +91,17 @@ Stage 1 protects only the CPU control state and the devices.
 | `ECAUSE` | 8 | 0 | cause of the last exception (§4.1) |
 | `EADDR` | 32 | 0 | fault address or instruction word of the last exception |
 | `SCRATCH0/1` | 64 each | 0 | free for the kernel (per-CPU / current-thread pointer) |
+| `TP` | 64 | 0 | thread pointer, no hardware meaning; read and write in either mode. The kernel context-switches it. |
+| `CYCLE` | 64 | 0 at `rst` only | core cycles since reset, read-only, readable in either mode. It counts every core clock (`ce`), including while parked or debug-halted. `start` does not clear it. |
+| reservation | 32 + 1 | invalid | LR/SC reservation (§5.1) |
 
 The architectural `SP` (GETSP/SETSP/PUSH/…) is always the current mode's
 stack pointer. The hardware never touches `SP_ALT` except on a mode change,
 so a supervisor-only system never sees it.
 
-`start` (program load) clears `UM`, `EVEC`, `ECAUSE` and `EADDR`, so a newly
-loaded program cannot inherit a user mode or a vector into the old image.
-Debugger resume does not clear them.
+`start` (program load) clears `UM`, `EVEC`, `ECAUSE`, `EADDR` and the
+reservation, so a newly loaded program cannot inherit a user mode or a
+vector into the old image. Debugger resume does not clear them.
 
 ### 3.2 Frame format (extends arch §13.1)
 
@@ -120,6 +134,7 @@ posted store has drained, as for IRQ entry today.
    apart from steps 1–2.
    **Exception:** write `ECAUSE` and `EADDR`, set the **DI bit**
    (interrupts disabled), and jump to `EVEC`. `INT_MASK` is unchanged.
+4. Both kinds clear the LR/SC reservation.
 
 Exceptions disable interrupts so that a nested interrupt handler cannot take
 a fault (stage 3: a TLB miss) and overwrite `ECAUSE`/`EADDR` before the
@@ -133,7 +148,8 @@ Exceptions are synchronous: they are taken whatever DI and `INT_MASK` say.
 ### 3.4 IRET
 
 IRET pops the frame from the current SP (it is privileged, so this is the
-kernel SP) and restores PC, Z/S/C/V, INT_MASK, DI and **`UM = PM`**. If
+kernel SP) and restores PC, Z/S/C/V, INT_MASK, DI and **`UM = PM`**. It
+also clears the LR/SC reservation. If
 `PM = 1`, after the pop the stack pointers swap: `SP` becomes the user SP,
 and `SP_ALT` becomes the kernel SP after the pop (8 above the frame).
 
@@ -150,10 +166,11 @@ In user mode these raise **PRIVILEGED** and do not execute:
 
 `DI`, `EI`, `IRET`, `HALT`, `WAIT`, `RESET`, `DELAYR`/`DELAYV` (a long DELAY
 holds EX and so delays interrupt entry), `LCDCMD`/`LCDDATA`/`LCDRST`, `MFSR`
-(except SR `STATUS`), `MTSR`.
+of any SR except `STATUS`, `TP` and `CYCLE`, and `MTSR` of any SR except
+`TP`.
 
-Everything else is allowed. `TRAP` raises TRAP in either mode, and `SYSCALL`
-raises SYSCALL in either mode.
+Everything else is allowed, including LR/SC. `TRAP` raises TRAP in either
+mode, and `SYSCALL` raises SYSCALL in either mode.
 
 ### 3.6 User-mode memory rules (stage 1)
 
@@ -187,10 +204,10 @@ MEMGET32, byte, 64-bit and stack accesses never raise MISALIGNED.
 | 2 | PRIVILEGED | §3.5 in user mode | the instruction | instruction word 0 |
 | 3 | TRAP | `TRAP` | the TRAP itself | instruction word 0 |
 | 4 | SYSCALL | `SYSCALL` | **the next instruction** | 0 |
-| 5 | MISALIGNED_LOAD | arch §8.3 trap rows, loads | the instruction | effective address |
-| 6 | MISALIGNED_STORE | same, stores | the instruction | effective address |
-| 7 | ACCESS_LOAD | user MMIO read (§3.6); stage 2/3 read permission | the instruction | effective address |
-| 8 | ACCESS_STORE | user MMIO write; stage 2/3 write permission | the instruction | effective address |
+| 5 | MISALIGNED_LOAD | arch §8.3 trap rows, loads; LR not naturally aligned | the instruction | effective address |
+| 6 | MISALIGNED_STORE | same, stores; SC not naturally aligned | the instruction | effective address |
+| 7 | ACCESS_LOAD | user MMIO read (§3.6); LR to MMIO in either mode; stage 2/3 read permission | the instruction | effective address |
+| 8 | ACCESS_STORE | user MMIO write; SC to MMIO in either mode; stage 2/3 write permission | the instruction | effective address |
 | 9 | ACCESS_FETCH | user fetch from `0xF…` (§3.6); stage 2/3 execute permission | the instruction | address of its first faulting word |
 | 10 | MISALIGNED_FETCH | user-mode PC with `[1:0] != 0` | the PC | the PC |
 | 11–13 | TLB_MISS_LOAD / _STORE / _FETCH | stage 3 | the instruction | faulting VA |
@@ -229,6 +246,8 @@ of it or none of it.
 | IRET | load, SP, flags, mask, DI, UM, PC | in user mode: PRIVILEGED. In supervisor mode in stage 1 it cannot fault (supervisor may touch MMIO) |
 | MEMGET32 (spanning) | one or two loads, rd | none; both addresses are checked first |
 | DI | rd, DI bit | PRIVILEGED in user mode; cannot fault in supervisor |
+| SC | store (only on success), rd, reservation cleared | none: no store, rd unchanged, and the reservation is **kept**, so the retry after the handler can still succeed |
+| LR | load, rd, reservation set | none; the reservation is not set |
 
 A fault on the *target* of a CALL, RET or IRET (ACCESS_FETCH or
 MISALIGNED_FETCH at the new PC) belongs to the next instruction. The
@@ -252,8 +271,14 @@ because every predicted return is checked in MEM.
 
 The order of checks when an exception reaches WB:
 
-1. **Debugger attached** and cause ILLEGAL, TRAP or MISALIGNED_*: debug halt
-   with today's `dbg_cause` (TRAP/ILL). This is unchanged, in either mode.
+1. **Debugger attached** (`DMCONTROL[3]`), **`DMCONTROL[5]` EXC_PASS = 0**,
+   and cause ILLEGAL, TRAP or MISALIGNED_*: debug halt with today's
+   `dbg_cause` (TRAP/ILL), in either mode. This is unchanged and is the
+   default. With EXC_PASS = 1 these causes skip this step and go to step 2.
+   EXC_PASS is cleared on program load like `attached`, unless
+   `halt_on_load` is set. The debug module's `DMSTATUS` version goes from 1
+   to 2, so a GDB server can tell that EXC_PASS and register indices 20/21
+   (§6.2) exist.
 2. **`EVEC = 0`**: park as today. ILLEGAL → `park_kind` 2, TRAP → 1,
    MISALIGNED_* → 5. Any new cause (PRIVILEGED, SYSCALL, ACCESS_*,
    MISALIGNED_FETCH) → 2, the same crash an old bitstream gives for an
@@ -287,18 +312,76 @@ instruction is ILLEGAL.
 `0x6C402300`. `MTSR EVEC, r1` = `0x6C601010`. `SYSCALL` = `0x6C080000`.
 
 Behaviour:
-- **MTSR serializes.** Fetch stops behind it and restarts at the next
-  instruction once it has committed, so a changed SR is seen by everything
-  after it, including fetch (this matters from stage 2 on).
+- **MTSR serializes**, for every SR including TP. Fetch stops behind it and
+  restarts at the next instruction once it has committed, so a changed SR is
+  seen by everything after it, including fetch (this matters from stage 2
+  on). The cost is roughly one pipeline refill (about 5 cycles), paid only
+  at context switch and thread setup.
 - **MFSR** reads the committed SR. No forwarding is needed: every SR writer
   is either serializing (MTSR) or happens with the pipe drained (entry,
-  IRET).
+  IRET). `MFSR rd, TP` is an ordinary 1-issue-slot instruction, so TLS
+  access costs one instruction.
+- **MFSR CYCLE is not serializing.** It reads the counter in its EX cycle.
+  Older instructions may still be finishing in MEM/WB (for example a load
+  miss waiting for DDR), and younger ones have not started. It is not
+  ordered against memory. For timing an interval, the error is a few cycles
+  plus any outstanding miss. Software that needs a hard order puts a
+  serializing instruction (for example `MTSR TP, rX` with its own value)
+  before it.
 - MFSR or MTSR with an SR number not in §6 is ILLEGAL. Software can trust
   that an SR it reads exists.
 - With the debugger attached, SYSCALL behaves as SYSCALL (no halt).
 
-Assembler syntax proposal: SR operands by name (`status`, `evec`, `ecause`,
-`eaddr`, `usp`, `scratch0`, `scratch1`) or number.
+Assembler syntax: SR operands by name (`status`, `evec`, `ecause`,
+`eaddr`, `usp`, `scratch0`, `scratch1`, `tp`, `cycle`) or number.
+
+### 5.1 LR/SC
+
+| Mnemonic | Template | Fields | Semantics |
+|---|---|---|---|
+| `LR.D rd, [rs1]` | `0x5B00_1000` | class 6, LEN = 01, SIZE `[25:24]` = 11, SGN `[23]` = 0, MODE `[22:21]` = 00, A `[20]` = 0, **`[12]` = 1**, rd `[11:8]`, rs1 `[7:4]`, `[3:0]` = 0 | rd = mem64[rs1]; reserve |
+| `LR.W rd, [rs1]` | `0x5A00_1000` | as LR.D with SIZE = 10, SGN = 0 | rd = zext(mem32[rs1]); reserve |
+| `LR.W.S rd, [rs1]` | `0x5A80_1000` | as LR.W with SGN = 1 | rd = sext(mem32[rs1]); reserve |
+| `SC.D rd, rs2, [rs1]` | `0x5F00_1000` | class 7, LEN = 01, SIZE = 11, SGN = 0, MODE = 00, A = 0, **`[12]` = 1**, rd `[11:8]` = **result**, rs1 `[7:4]` = address, rs2 `[3:0]` = **data** | if reserved: mem64[rs1] = rs2, rd = 0; else rd = 1, no store. Always clears the reservation. |
+| `SC.W rd, rs2, [rs1]` | `0x5E00_1000` | as SC.D with SIZE = 10 | 32-bit store of rs2[31:0] |
+
+These encodings are illegal today. In MODE = 00, `[19:12]` must be 0. The
+short MODE = 01 form uses those bits as its imm8, so they are only free in
+MODE = 00. **SC's register fields differ from the other stores:** rd is the
+result, and the data comes from rs2. Other bit combinations with `[12]` = 1
+(8/16-bit size, A = 1, SGN = 1 on LR.D or on SC, other modes) are ILLEGAL.
+
+Rules:
+- The address must be naturally aligned (4 or 8), or the instruction
+  raises MISALIGNED_LOAD / MISALIGNED_STORE. This applies to 64-bit too,
+  unlike ordinary 64-bit accesses.
+- LR or SC to MMIO (`0xF…`) raises ACCESS_LOAD / ACCESS_STORE in **either**
+  mode. These are new instructions, so this is no compatibility change.
+- There is **one reservation**: a doubleword address `EA[31:3]` plus a valid
+  bit. LR sets it when it commits. SC succeeds only if it is valid and
+  `EA[31:3]` matches. LR.W/SC.W use the doubleword that contains the word,
+  so an SC.W to the other half of the reserved doubleword also succeeds. Do
+  not rely on that.
+- The reservation is cleared by every SC (success or failure, but not a
+  faulting SC), by interrupt and exception entry, by IRET, and by `start`.
+  Ordinary stores do not clear it.
+- It is atomic only against this core. DMA, the blitter, the debugger's
+  memory writes and core 2 are not tracked, as with the I-cache today.
+- An interrupt between LR and SC makes the SC fail, so the loop retries.
+  There is no forward-progress guarantee beyond "the loop is shorter than
+  the interrupt interval".
+- The SC result is architectural: 0 = success, 1 = failure. Other values
+  are reserved.
+
+Typical compare-and-swap (64-bit):
+
+```
+retry:  LR.D   r3, [r1]          ; r1 = address
+        FBR.NE r3, r4, fail      ; r4 = expected
+        SC.D   r6, r5, [r1]      ; r5 = new value, r6 = status
+        FBR.NE r6, #0, retry
+fail:
+```
 
 ---
 
@@ -315,16 +398,22 @@ Assembler syntax proposal: SR operands by name (`status`, `evec`, `ecause`,
 | 0x04 | `USP` | RW | `SP_ALT`, which is the user SP while in supervisor mode |
 | 0x05 | `SCRATCH0` | RW | 64-bit |
 | 0x06 | `SCRATCH1` | RW | 64-bit |
-| 0x10–0x1F | MPU | | stage 2 (§10) |
-| 0x20–0x2F | TLB / ASID | | stage 3 (§11) |
+| 0x07 | `TP` | RW **in user mode too** | 64-bit thread pointer, no hardware meaning |
+| 0x08 | `CYCLE` | R **in user mode too** | 64-bit core-cycle counter (§3.1, §5); MTSR to it is ILLEGAL |
+| 0x10–0x2F | MPU | | stage 2 (§10); room for 16 regions × 2 |
+| 0x30–0x3F | TLB / ASID | | stage 3 (§11) |
 
 `STATUS` is readable in user mode so that code like Zephyr's
-`arch_is_user_context()` can test the mode without a syscall.
+`arch_is_user_context()` can test the mode without a syscall. `TP` serves
+musl/Linux TLS, Zephyr `THREAD_LOCAL_STORAGE` and Rust `thread_local`; the
+ABI has no free register for it. In user mode, MFSR is allowed only for
+{STATUS, TP, CYCLE} and MTSR only for {TP}.
 
 ### 6.2 Debugger
 
 The debug module gets two more register indices: 20 = `SP_ALT`, 21 =
-`{UM, DI}` (read; write allowed while halted). It needs nothing else.
+`{UM, DI}` in `[1:0]` (read; write allowed while halted). It also gets
+`DMCONTROL[5]` EXC_PASS (§4.4), and its `DMSTATUS` version becomes 2.
 
 ### 6.3 `CPU_FEATURES` (MMIO, read-only)
 
@@ -333,10 +422,10 @@ bitstream.
 
 | Bits | Meaning |
 |---|---|
-| `[0]` | stage 1: exceptions, user mode, SYSCALL, MFSR/MTSR |
+| `[0]` | stage 1: exceptions, user mode, SYSCALL, MFSR/MTSR, TP, CYCLE |
 | `[1]` | stage 2 MPU present (`[7:4]` = region count / 2 or similar, defined then) |
 | `[2]` | stage 3 TLB present (`[15:8]` = entry count) |
-| `[3]` | LR/SC |
+| `[3]` | LR/SC (§5.1). Set together with `[0]` in stage 1, but kept separate so software tests for atomics by name. |
 
 ---
 
@@ -442,6 +531,29 @@ holds copies of I-cache lines. Supervisor fetch is unchanged.
   Both touch timing-sensitive muxes. I'll pick by building both. This is an
   RTL detail with no software impact.
 
+CYCLE is a 64-bit free-running counter in the core. MFSR CYCLE samples it
+in EX, the same as any other SR read, and ignores serialization (§5).
+
+### 7.7a LR/SC datapath
+
+- LR and SC take the **slow port path**: no load-hit pipe, no early issue,
+  no store posting, no queue entry. They are not performance-critical, and
+  this keeps the reservation logic off the tuned load and store paths.
+  Misaligned and MMIO checks use the §7.1 slots (EX→MEM for misaligned,
+  MEM cycle 1 for ACCESS).
+- **The reservation** is a register pair `{res_valid, res_dw}`. LR sets it
+  as it commits at WB. SC decides success in MEM, before any port access:
+  `res_valid && res_dw == EA[31:3]`, with an older LR still in WB forwarded
+  (LR is a slow-path load, so at most one can be between MEM and commit). A
+  failed SC makes no port access. A successful SC issues a normal
+  non-posted store, and writes rd = 0 / 1 and clears the reservation at WB.
+  Entry, IRET and `start` clear it.
+- SC reads its data from rs2 (`ex_b`), not from the rd-data operand that
+  other stores use (`ex_c`). The rd write is the success bit. The decoder
+  marks SC as `use_rs2`, `wreg` and `is_mem`.
+- SC's store goes through the normal self-modifying-code and store-snoop
+  checks, so an SC that overwrites code behaves like any other store.
+
 ### 7.8 Build switches and core 2
 
 `EN_EXC` (stage 1), `EN_MPU`, `EN_TLB`, as localparams in the existing
@@ -451,7 +563,8 @@ encodings are illegal and nothing else changes.
 
 ### 7.9 Cost estimate
 
-Stage 1: about 250 FFs (SP_ALT, EVEC, ECAUSE, EADDR, 2×SCRATCH, pipe tags)
+Stage 1: about 500 FFs (SP_ALT, EVEC, ECAUSE, EADDR, 2×SCRATCH, TP, CYCLE,
+the reservation, pipe tags)
 and well under 1k LUTs. No BRAM. The timing exposure is the `UM` term on
 the decode/serialize predecode, the MEM-cycle-1 squash term (it joins the
 `fbr_taken` squash family, all registered), and MFSR's result leg.
@@ -482,7 +595,15 @@ RTL side, done by me before anything reaches the board:
    - user fetch toward `0xF…`, including a predicted-taken direct branch on a
      wrong path: no MMIO read reaches the bus model;
    - a fault in MEM with a fast load waiting in WB, a posted store draining,
-     a DIV in EX, and an LCD op in EX.
+     a DIV in EX, and an LCD op in EX;
+   - LR/SC: success; failure after an interrupt, after an exception, after
+     IRET, and after an intervening SC; a mismatched address; LR or SC
+     faulting (misaligned, MMIO) with the reservation unchanged and rd
+     unchanged; an SC immediately behind its LR (the WB forward); SC in user
+     mode;
+   - TP read and write in both modes; CYCLE monotonic; the user-mode
+     MFSR/MTSR allow-list, with every other SR PRIVILEGED;
+   - the debugger's EXC_PASS bit.
 3. **Random programs with faults.** randprog gains a user-mode variant that
    inserts faulting ops with a fix-up-and-retry handler. The final state
    must equal the same program without faults.
@@ -497,17 +618,20 @@ Zephyr handlers.
 
 ## 9. Implementation order (stage 1)
 
-1. This note reviewed and the interface frozen (§3–§6). Encodings are
-   added to `ISA_ENCODING_V2_MAP.md` §9 and `CPU_ARCHITECTURE.md` gets an
-   exceptions section, both on `mmu`.
-2. Toolchain: MC-layer support for SYSCALL/MFSR/MTSR in klausscpu-llvm (on
-   its `mmu` branch) and kasm.py. Until then, `.word` works.
+1. Done: this note was reviewed and §3–§6 frozen. The encodings are in
+   `ISA_ENCODING_V2_MAP.md` §9. `CPU_ARCHITECTURE.md` gets its exceptions
+   section when the RTL lands.
+2. Toolchain: MC-layer support for SYSCALL, MFSR, MTSR (named SRs) and
+   LR/SC in klausscpu-llvm (on its `mmu` branch) and kasm.py, done here.
+   klausscc is done by the runtime session. Until then, `.word` works.
 3. RTL in steps, each passing the compatibility diff:
    (a) XOP plumbing and WB→entry with `EVEC`, `ECAUSE`, `EADDR`,
-   MFSR/MTSR, SYSCALL (supervisor only);
+   MFSR/MTSR (including TP, CYCLE), SYSCALL (supervisor only);
    (b) `UM`, `SP_ALT`, IRET/entry stack switch, the privileged decode;
    (c) user MMIO data faults (the MEM-cycle-1 slot), then the fetch checks;
-   (d) `CPU_FEATURES`, the debug register indices, core-2 parameter.
+   (d) `CPU_FEATURES`, the debug register indices and EXC_PASS, core-2
+   parameter;
+   (e) LR/SC.
 4. Timing build, board run of the existing suites, then hand the bitstream
    to the runtime session.
 
@@ -517,9 +641,12 @@ Zephyr handlers.
 
 For Zephyr USERSPACE and NuttX protected builds, with translation off.
 
-- **8 regions**, each a base/limit pair at 32-byte granularity (cache-line
-  sized), with attributes R, W, X (for user mode) and GUARD. SRs
-  `0x10–0x1F`: `MPU_BASEn` = `{base[31:5], attrs}`, `MPU_LIMITn` = the last
+- **16 regions if the LUTs allow, 8 at minimum.** The runtime review says 8
+  is tight for Zephyr memory domains (text, rodata, stack and partitions
+  per thread). Each region is a base/limit pair at 32-byte granularity
+  (cache-line sized, the same as ARMv8-M, so Zephyr's base/limit MPU code
+  maps over), with attributes R, W, X (for user mode) and GUARD. SRs
+  `0x10–0x2F`: `MPU_BASEn` = `{base[31:5], attrs}`, `MPU_LIMITn` = the last
   byte, `[31:5]`. Direct access to every region (no index register), so a
   context switch can reprogram the per-thread partitions with plain MTSRs.
   `STATUS.MPU_EN` enables the MPU.
@@ -532,13 +659,11 @@ For Zephyr USERSPACE and NuttX protected builds, with translation off.
   `HW_STACK_PROTECTION`).
 - **Checks:** data in EX on the EA, registered, and acted on in MEM cycle 1
   (the §7.1 slot). Fetch on the PC at the IF→ID latch, registered (the
-  §7.5 override). That is 16 data and 16 fetch 27-bit comparators, about
-  1k LUTs. Faults are ACCESS_LOAD / ACCESS_STORE / ACCESS_FETCH with
+  §7.5 override). With 8 regions that is 16 data and 16 fetch
+  27-bit comparators, about 1k LUTs; with 16 regions, about 2k. Faults are ACCESS_LOAD / ACCESS_STORE / ACCESS_FETCH with
   `EADDR` = the address.
 - The user-mode MMIO rule (§3.6) still applies on top.
 - When `TE = 1` (stage 3) the MPU is ignored.
-- Open: should 32-byte granularity be 64 bytes to save comparator bits?
-  Zephyr only needs a declared granularity.
 
 ---
 
@@ -593,7 +718,7 @@ mapping DDR such as a framebuffer is.
   _FETCH with `EADDR` = VA. A permission failure raises ACCESS_*. A
   separate `TLBVEC` (0 = use `EVEC`) gives the refill handler its own
   entry point. That is an SR, so it needs no new encoding.
-- SRs `0x20+`: `ASID`, `TLB_INDEX`, `TLB_HI` {VPN, ASID, G}, `TLB_LO` {PFN,
+- SRs `0x30+`: `ASID`, `TLB_INDEX`, `TLB_HI` {VPN, ASID, G}, `TLB_LO` {PFN,
   V, R, W, X}, `TLB_RANDOM`, `TLBVEC`. Instructions (class B OPs 9–12,
   proposed): `TLBWI`, `TLBWR`, `TLBP`, `TLBR`, and a flush (all / non-global
   / by ASID). All serialize. Writing `ASID` or the TLB also discards the
@@ -632,35 +757,32 @@ mapping DDR such as a framebuffer is.
 
 ### 11.4 LR/SC
 
-`LR.D rd, [rs1]` and `SC.D rd, rs2, [rs1]` (rd = 0 on success, 1 on
-failure), with 64-bit and 32-bit forms. There is one reservation (address +
-valid). It is cleared by SC, by any interrupt or exception entry, and by
-IRET. It is atomic only against this core. DMA, the blitter and core 2 are
-not snooped, as with the I-cache today. Proposed encodings use bits that are
-illegal today: SC = class 7 with SGN `[23]` = 1 (reserved for stores), and
-LR = class 6, LEN = 01, MODE = 00 with `[12]` = 1 (in MODE = 00, `[19:12]`
-must be 0 today; in the short MODE = 01 form those bits are the imm8, so
-they are not free there). They will be fixed in the stage 3 note.
+Moved into stage 1 (§5.1). With translation on, the reservation will hold the
+physical doubleword address.
 
 ---
 
-## 12. Open questions for the runtime/OS side
+## 12. Review outcome (runtime session, 2026-11-09)
 
-1. SYSCALL frame PC = **next** instruction (no `+4` in the kernel). Or do you
-   prefer RISC-V style (the SYSCALL's own PC)?
-2. Exceptions set DI, interrupts don't (§3.3). Does that work for the
-   Zephyr port's locking? Note that IRET restores `INT_MASK` from the frame,
-   so a handler's `INT_MASK` change is undone by its IRET, exactly as for
-   interrupts today.
-3. With the JTAG debugger attached, ILLEGAL, TRAP and MISALIGNED halt into
-   the debugger even when an OS would handle them (for example misaligned
-   emulation). Keep that, or add a debug-module control bit that passes
-   them to `EVEC`?
-4. User mode has no clock. Do you want a user-readable cycle or ms counter
-   as an SR (like `STATUS`, unprivileged), or is a syscall fine?
-5. Is all MMIO privileged in user mode (§3.6) right for Zephyr and NuttX
-   user threads?
-6. Are 64 KiB pages acceptable for your xv6 and Linux plans (§11.1)?
-7. klausscc (assembler and emulator, used for the xsim goldens) also needs
-   SYSCALL/MFSR/MTSR and the exception model. Who takes it: you, me, or
-   later?
+1. SYSCALL frame PC = the next instruction: agreed.
+2. DI on exception entry: agreed. Zephyr keeps `INT_MASK = 0xF`
+   permanently, uses `INT_VECn` for per-source enable and DI/EI for
+   irq_lock. So IRET restoring `INT_MASK` is harmless. xv6 and Linux will
+   use the same constant-mask rule. Handlers EI after reading
+   ECAUSE/EADDR.
+3. The debugger halt stays the default; `DMCONTROL[5]` EXC_PASS was added
+   (§4.4), in step (d).
+4. A user-readable clock: SR `CYCLE` (§6.1).
+5. All MMIO privileged in user mode: agreed for Zephyr, NuttX, xv6 and
+   Linux. Zephyr cannot grant a user thread a device-register partition,
+   and that is accepted.
+6. 64 KiB pages: agreed. User programs link with `-z
+   max-page-size=0x10000`. The page-table format is software's.
+7. klausscc (assembler, emulator, GDB server, regs 20/21) and
+   `debug/klausscpu_rtos.py` (frame bit 44): runtime session, on klausscc
+   `mmu`.
+8. Added: SR `TP` (user RW) and SR `CYCLE` (user R); LR/SC moved into
+   stage 1, because `src/atomic.c`'s DI/EI is privileged in user mode. The
+   runtime will reimplement it with LR/SC loops, probing `CPU_FEATURES[3]`
+   with a DI/EI fallback.
+9. MPU: 16 regions preferred (§10).

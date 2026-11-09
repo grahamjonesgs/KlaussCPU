@@ -724,3 +724,57 @@ CMPRVW_S,0x4C500000,1,3,rs1,simm8[19:12],ZSCV,short W compare (hw-proposals 9)
 MULV_S,0x6B800000,1,10,"rd,rs1",imm8[19:12] (SGN[23]),ZSV,short MULV (hw-proposals 9)
 LEAPC_S,0x4BA00000,1,2,rd,"simm16 {[19:12],[7:0]}",,PC-relative +-32 KiB (hw-proposals 9)
 ```
+
+## 9. MMU stage 1 additions (2026-11-09, branch `mmu`)
+
+From [MMU_PLAN.md](MMU_PLAN.md) §5 (frozen interface; semantics, privilege
+rules and exceptions are there). All of these trap as illegal on earlier
+bitstreams; probe `CPU_FEATURES` (`0xF00F_0048`) bits 0 and 3 first. **Not
+yet in the RTL, klausscc or LLVM.**
+
+### 9.1 System (class B, LEN=01)
+
+| Symbol | Template | Fields | Semantics |
+|---|---|---|---|
+| SYSCALL | `0x6C080000` | OP `[21:16]` = 8, everything else 0 | raise SYSCALL; frame PC = next instruction |
+| MFSR | `0x6C400000` | `[25:22]` = 1, `[21]` = 0, `[20]` = 0, sr `[19:12]`, rd `[11:8]`, `[7:0]` = 0 | rd = SR[sr] (zero-extended) |
+| MTSR | `0x6C600000` | `[25:22]` = 1, `[21]` = 1, `[20]` = 0, sr `[19:12]`, `[11:8]` = 0, rs1 `[7:4]`, `[3:0]` = 0 | SR[sr] = rs1; serializing |
+
+SR numbers: 0 `status`, 1 `evec`, 2 `ecause`, 3 `eaddr`, 4 `usp`,
+5 `scratch0`, 6 `scratch1`, 7 `tp`, 8 `cycle` (read-only). Any other number
+is illegal. In user mode, MFSR is allowed only for status/tp/cycle and MTSR
+only for tp.
+
+Examples: `MFSR r3, ecause` = `0x6C402300`; `MTSR evec, r1` = `0x6C601010`;
+`MFSR r2, tp` = `0x6C407200`.
+
+### 9.2 LR/SC (class 6/7, LEN=01, MODE=00, `[12]` = 1)
+
+| Symbol | Template | Regs | Semantics |
+|---|---|---|---|
+| LR_D | `0x5B001000` | rd, rs1 | rd = mem64[rs1]; reserve |
+| LR_W | `0x5A001000` | rd, rs1 | rd = zext(mem32[rs1]); reserve |
+| LR_W_S | `0x5A801000` | rd, rs1 | rd = sext(mem32[rs1]); reserve |
+| SC_D | `0x5F001000` | rd (result), rs1 (address), rs2 (data) | if reserved: mem64[rs1] = rs2, rd = 0; else rd = 1 |
+| SC_W | `0x5E001000` | rd (result), rs1 (address), rs2 (data) | 32-bit form |
+
+**SC's register fields differ from other stores**: rd is the 0/1 result,
+and the data comes from rs2. Naturally aligned addresses only (misaligned
+raises an exception, even for 64-bit). `[20]` (A) = 0. SGN `[23]` = 1 only
+on LR_W_S.
+
+Example: `SC.D r6, r5, [r1]` = `0x5F001615`.
+
+### 9.3 Machine-readable additions
+
+```csv
+symbol,template,words,class,regs,imm,flags,notes
+SYSCALL,0x6C080000,1,11,,,,raise SYSCALL (mmu stage 1)
+MFSR,0x6C400000,1,11,rd,sr[19:12],,rd = SR[sr] (mmu stage 1)
+MTSR,0x6C600000,1,11,rs1,sr[19:12],,SR[sr] = rs1; serializing (mmu stage 1)
+LR_D,0x5B001000,1,6,"rd,rs1",,,load-reserved 64 (mmu stage 1)
+LR_W,0x5A001000,1,6,"rd,rs1",,,load-reserved 32 zext (mmu stage 1)
+LR_W_S,0x5A801000,1,6,"rd,rs1",,,load-reserved 32 sext (mmu stage 1)
+SC_D,0x5F001000,1,7,"rd,rs1,rs2",,,store-conditional 64; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
+SC_W,0x5E001000,1,7,"rd,rs1,rs2",,,store-conditional 32; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
+```
