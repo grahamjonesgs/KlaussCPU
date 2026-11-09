@@ -47,7 +47,12 @@
 // 100 Mbps line rate.
 //////////////////////////////////////////////////////////////////////////////////
 
-module crypto_sha (
+module crypto_sha #(
+    // HMAC (0x80-0xA8), an optional build feature.  0 = its registers
+    // read 0 and ignore writes; nothing starts the HMAC FSM, so its state
+    // stays 0 and synthesis removes it.
+    parameter bit HMAC_EN = 1'b1
+) (
     input             i_Clk,
     input             i_Rst_L,
 
@@ -358,7 +363,7 @@ module crypto_sha (
                     OFF_BLOCK0 + 16'h28: r_block_mmio[5] <= mmio.write_data;
                     OFF_BLOCK0 + 16'h30: r_block_mmio[6] <= mmio.write_data;
                     OFF_BLOCK0 + 16'h38: r_block_mmio[7] <= mmio.write_data;
-                    OFF_HMAC_CTRL: begin
+                    OFF_HMAC_CTRL: if (HMAC_EN) begin
                         // [0] KEY_LOAD: kick the HMAC FSM to compute midstates.
                         //               Ignored if the FSM is already running.
                         // [1] START   : H ← inner_state (single i_h_load pulse).
@@ -381,10 +386,10 @@ module crypto_sha (
                             r_h_load_sel   <= 2'd1;   // outer
                         end
                     end
-                    OFF_HMAC_KEY0: r_hmac_key[63:0]    <= mmio.write_data;
-                    OFF_HMAC_KEY1: r_hmac_key[127:64]  <= mmio.write_data;
-                    OFF_HMAC_KEY2: r_hmac_key[191:128] <= mmio.write_data;
-                    OFF_HMAC_KEY3: r_hmac_key[255:192] <= mmio.write_data;
+                    OFF_HMAC_KEY0: if (HMAC_EN) r_hmac_key[63:0]    <= mmio.write_data;
+                    OFF_HMAC_KEY1: if (HMAC_EN) r_hmac_key[127:64]  <= mmio.write_data;
+                    OFF_HMAC_KEY2: if (HMAC_EN) r_hmac_key[191:128] <= mmio.write_data;
+                    OFF_HMAC_KEY3: if (HMAC_EN) r_hmac_key[255:192] <= mmio.write_data;
                     default: ;  // ignored
                 endcase
             end

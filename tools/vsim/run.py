@@ -109,10 +109,12 @@ def patch_core(core):
     return core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
 
 
-def build_soc(rev=None):
+def build_soc(rev=None, crypto_full=False):
     """full SoC (sim_1/new/tb_soc.sv: behavioural DDR, real cache / bus /
-    MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd."""
-    tag = rev or 'wt'
+    MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
+    crypto_full: KlaussCPU with every optional crypto block (the default
+    build is the lean A7 one)."""
+    tag = (rev or 'wt') + ('_cfull' if crypto_full else '')
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -141,6 +143,10 @@ def build_soc(rev=None):
                     '$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes, t=%0d", icount, uart_n, runcyc);')
     tb = tb.replace('   longint last_i = -1;', '   longint last_i = -1;\n   longint runcyc = 0;\n'
                     '   always @(posedge dut.i_Clk) if (dut.st.SM == PIPE_RUN) runcyc++;')
+    if crypto_full:
+        assert tb.count('KlaussCPU dut (') == 1
+        tb = tb.replace('KlaussCPU dut (', "KlaussCPU #(.CRYPTO_AES_EN(1'b1), .CRYPTO_GCM_EN(1'b1), "
+                        ".CRYPTO_SHA_EN(1'b1), .CRYPTO_HMAC_EN(1'b1)) dut (")
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -667,16 +673,63 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x100D = stage 1 +
-    # LR/SC + the 16-entry TLB, no MPU (the Nexys A7 build)
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x0010_100D = stage 1
+    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only): the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=000000000000100d' not in last:
+    if 'r2=000000000010100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
+    return 1 if fails else 0
+
+
+def _crypto_prog():
+    """the optional crypto windows: AES CTR0 and GCM_H0 read back what was
+    written, AES_CAP / SHA_CAP, HMAC_STATUS after a KEY_LOAD (KEY_VALID),
+    CPU_FEATURES; an absent block reads 0 and ignores writes, without
+    stalling the bus (the program must reach its HALT)"""
+    from kasm import Asm
+    a = Asm()
+    a.setr(10, 0xF00A0000); a.setr(11, 0xF00B0000)
+    a.setr64(1, 0x1122334455667788); a.st(64, 1, 10, 0xC0); a.ld(64, 1, 10, 0xC0)   # AES CTR0
+    a.setr(2, 0x99); a.st(64, 2, 10, 0x90); a.ld(64, 2, 10, 0x90)                   # GCM_H0
+    a.ld(64, 3, 10, 0xF8)                                                            # AES_CAP
+    a.ld(64, 4, 11, 0xF8)                                                            # SHA_CAP
+    a.setr(5, 0x5A); a.st(64, 5, 11, 0x90)                                           # HMAC_KEY0
+    a.setr(5, 1); a.st(64, 5, 11, 0x80)                                              # KEY_LOAD
+    a.setr(7, 400)
+    a.label('w'); a.ld(64, 5, 11, 0x88); a.dec(7); a.fbr('ne', 7, 0, 'w', imm=True)  # HMAC_STATUS
+    a.setr(12, 0xF00F0048); a.ld(64, 6, 12)                                          # CPU_FEATURES
+    for i in range(16):                                                              # more traffic
+        a.st(64, 1, 10 + (i & 1), 8 * i); a.ld(64, 8, 10 + (i & 1), 8 * i)
+    a.halt()
+    return a
+
+
+def cmd_soccrypto(a):
+    """lean (the A7 default) and full crypto configurations: absent windows
+    read 0 and ignore writes, present ones work, CPU_FEATURES[20:16]"""
+    fails = 0
+    for full in (False, True):
+        exe = build_soc(None, crypto_full=full)
+        r = run_soc(exe, _crypto_prog(), 'crypto_' + ('full' if full else 'lean'), trace=True)
+        last = open(r['trace']).read().strip().splitlines()[-1]
+        regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
+        got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
+        if full:
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x001F100D}
+            ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
+        else:
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x0010100D}
+            ok = all(got[k] == v for k, v in want.items())
+        ok = ok and 'HALTED' in r['log']
+        fails += not ok
+        print(f'{"pass" if ok else "FAIL"} {"full" if full else "lean"}: ' +
+              ' '.join(f'{k}={v:x}' for k, v in got.items()))
+    print(f'{fails} failing')
     return 1 if fails else 0
 
 
@@ -726,6 +779,7 @@ def main():
     tl.add_argument('--seed0', type=int, default=1); tl.add_argument('--lats', type=int, nargs='+', default=[3])
     tl.add_argument('--irq', action='store_true'); tl.add_argument('-v', '--verbose', action='store_true')
     tl.add_argument('--plus', nargs='*', default=[])
+    sub.add_parser('soccrypto')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -751,6 +805,8 @@ def main():
         sys.exit(cmd_dmtest(a))
     elif a.cmd == 'mpudiff':
         sys.exit(cmd_mpudiff(a))
+    elif a.cmd == 'soccrypto':
+        sys.exit(cmd_soccrypto(a))
     elif a.cmd == 'tlbdiff':
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':

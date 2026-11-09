@@ -37,7 +37,11 @@
 // device on this CPU).
 //////////////////////////////////////////////////////////////////////////////////
 
-module crypto_aes (
+module crypto_aes #(
+    // GCM / GHASH (0x80-0xB8), an optional build feature.  0 = its
+    // registers read 0 and ignore writes; no GHASH logic is built.
+    parameter bit GCM_EN = 1'b1
+) (
     input             i_Clk,
     input             i_Rst_L,
 
@@ -231,6 +235,7 @@ module crypto_aes (
     wire         w_ghash_busy;
     wire         w_ghash_done;
 
+    generate if (GCM_EN) begin : g_ghash
     (* KEEP_HIERARCHY = "yes" *)
     ghash u_ghash (
         .i_clk   (i_Clk),
@@ -242,6 +247,11 @@ module crypto_aes (
         .o_busy  (w_ghash_busy),
         .o_done  (w_ghash_done)
     );
+    end else begin : g_no_ghash
+    // (no GCM: nothing writes its registers, so its FSM never leaves IDLE
+    // and every GCM register stays 0 — synthesis removes them)
+    assign w_ghash_Z_out = 128'h0;  assign w_ghash_busy = 1'b0;  assign w_ghash_done = 1'b0;
+    end endgenerate
 
     // -------------------------------------------------------------------------
     // Write path — software MMIO interface
@@ -352,7 +362,7 @@ module crypto_aes (
                         r_mode_ctr   <= mmio.write_data[0];
                         r_mode_inc32 <= mmio.write_data[3];
                     end
-                    OFF_GCM_CTRL: begin
+                    OFF_GCM_CTRL: if (GCM_EN) begin
                         // [0] GO    : kick (tag XOR X) • H accumulation
                         // [1] RESET : tag <= 0  (handed to FSM via pulse)
                         if (mmio.write_data[0] && !w_gcm_busy)
@@ -360,10 +370,10 @@ module crypto_aes (
                         if (mmio.write_data[1])
                             r_gcm_reset_pulse <= 1'b1;
                     end
-                    OFF_GCM_H0: r_gcm_H[63:0]    <= mmio.write_data;
-                    OFF_GCM_H1: r_gcm_H[127:64]  <= mmio.write_data;
-                    OFF_GCM_X0: r_gcm_X[63:0]    <= mmio.write_data;
-                    OFF_GCM_X1: r_gcm_X[127:64]  <= mmio.write_data;
+                    OFF_GCM_H0: if (GCM_EN) r_gcm_H[63:0]    <= mmio.write_data;
+                    OFF_GCM_H1: if (GCM_EN) r_gcm_H[127:64]  <= mmio.write_data;
+                    OFF_GCM_X0: if (GCM_EN) r_gcm_X[63:0]    <= mmio.write_data;
+                    OFF_GCM_X1: if (GCM_EN) r_gcm_X[127:64]  <= mmio.write_data;
                     default: ;  // ignored
                 endcase
             end

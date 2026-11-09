@@ -39,7 +39,16 @@ module KlaussCPU #(
     // MMU stage 3 (the TLB, TE) on core 1.  CPU_FEATURES[2], [15:8].
     parameter bit CORE1_TLB_EN = 1'b1,
     // its entry count: 16 on this part (MMU_PLAN.md §11.5)
-    parameter int CORE1_TLB_N = 16
+    parameter int CORE1_TLB_N = 16,
+    // Crypto blocks (CRYPTO_PLAN.md), optional build features; the TRNG is
+    // always built.  An absent block's window reads 0 and ignores writes in
+    // the normal MMIO time, and contributes no logic.  GCM needs AES, HMAC
+    // needs SHA (each is ANDed with its parent).  CPU_FEATURES[20:16]
+    // report them.  The lean A7 MMU build has none of the four.
+    parameter bit CRYPTO_AES_EN  = 1'b0,
+    parameter bit CRYPTO_GCM_EN  = 1'b0,
+    parameter bit CRYPTO_SHA_EN  = 1'b0,
+    parameter bit CRYPTO_HMAC_EN = 1'b0
 ) (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
@@ -848,12 +857,23 @@ module KlaussCPU #(
    assign aes_bus.addr       = w_mmio_addr;
    assign aes_bus.write_data = w_mmio_write_data;
    assign aes_bus.byte_en    = w_mmio_byte_en;
+   localparam bit EN_AES  = CRYPTO_AES_EN;
+   localparam bit EN_GCM  = CRYPTO_AES_EN && CRYPTO_GCM_EN;
+   localparam bit EN_SHA  = CRYPTO_SHA_EN;
+   localparam bit EN_HMAC = CRYPTO_SHA_EN && CRYPTO_HMAC_EN;
+   generate if (EN_AES) begin : g_aes
    (* KEEP_HIERARCHY = "yes" *)
-   crypto_aes crypto_aes_i (
+   crypto_aes #(.GCM_EN(EN_GCM)) crypto_aes_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
        .mmio(aes_bus)
    );
+   end else begin : g_no_aes
+   // (absent: the window reads 0, writes are ignored; the MMIO handshake
+   // is the generic one, so it completes in the normal time)
+   assign aes_bus.read_data = 64'h0;
+   assign aes_bus.ready     = 1'b1;
+   end endgenerate
    assign w_aes_read_data = aes_bus.read_data;
 
    // -------------------------------------------------------------------------
@@ -870,12 +890,17 @@ module KlaussCPU #(
    assign sha_bus.addr       = w_mmio_addr;
    assign sha_bus.write_data = w_mmio_write_data;
    assign sha_bus.byte_en    = w_mmio_byte_en;
+   generate if (EN_SHA) begin : g_sha
    (* KEEP_HIERARCHY = "yes" *)
-   crypto_sha crypto_sha_i (
+   crypto_sha #(.HMAC_EN(EN_HMAC)) crypto_sha_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
        .mmio(sha_bus)
    );
+   end else begin : g_no_sha
+   assign sha_bus.read_data = 64'h0;   // (absent: as for AES above)
+   assign sha_bus.ready     = 1'b1;
+   end endgenerate
    assign w_sha_read_data = sha_bus.read_data;
 
    // -------------------------------------------------------------------------
@@ -1172,9 +1197,12 @@ module KlaussCPU #(
                // CPU_FEATURES (MMU_PLAN.md §6.3): [0] stage 1 exceptions /
                // user mode / SYSCALL / MFSR / MTSR / TP / CYCLE, [3] LR/SC,
                // [1] the MPU and [7:4] its region count - 1 (stage 2),
-               // [2] the TLB and [15:8] its entry count (stage 3).
+               // [2] the TLB and [15:8] its entry count (stage 3),
+               // [16] AES, [17] GCM / GHASH, [18] SHA-256, [19] HMAC, [20]
+               // the TRNG (always 1: [20] = 0 means a bitstream older than
+               // these bits, where every crypto block is present).
                // Reads 0 on earlier bitstreams (a reserved offset).
-               16'h0048: r_mmio_read_data_comb = {48'b0,
+               16'h0048: r_mmio_read_data_comb = {43'b0, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
                                                   (CORE1_EXC_EN && CORE1_TLB_EN) ? 8'(CORE1_TLB_N) : 8'd0,
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
