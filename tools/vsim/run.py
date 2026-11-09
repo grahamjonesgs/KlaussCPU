@@ -397,6 +397,58 @@ def cmd_dmtest(a):
     return 0 if '0 failing' in r.stdout else 1
 
 
+def _mmio_prog(seed):
+    """MMIO reads/writes (INT_VEC0..3, read back) interleaved with DRAM
+    loads, stores and push/pop: back-to-back MMIO <-> DRAM responses"""
+    import random
+    from kasm import Asm
+    rnd = random.Random(seed)
+    a = Asm()
+    a.setr(12, 0x10000); a.setr(11, 0xF00F0010)
+    for i in range(4):
+        a.setr(1, 0x1000 + 0x40 * i + seed); a.st(32, 1, 11, 8 * i)
+    for i in range(8):
+        a.setr64(2, rnd.getrandbits(64)); a.st(64, 2, 12, 8 * i)
+    for _ in range(120):
+        c = rnd.random()
+        r = rnd.randrange(1, 10)
+        if c < 0.35:
+            a.ld(32, r, 11, 8 * rnd.randrange(4))
+        elif c < 0.65:
+            a.ld(64, r, 12, 8 * rnd.randrange(8))
+        elif c < 0.75:
+            a.st(64, r, 12, 8 * rnd.randrange(8))
+        elif c < 0.85:
+            a.setr(13, 0x1000 + rnd.randrange(64)); a.st(32, 13, 11, 8 * rnd.randrange(4))
+        elif c < 0.92:
+            a.push(r); a.pop(rnd.randrange(1, 10))
+        else:
+            a.alu('add', r, r, rnd.randrange(1, 10))
+    for i in range(4):
+        a.ld(32, 1 + i, 11, 8 * i)
+    a.halt()
+    return a
+
+
+def cmd_socmmio(a):
+    """full SoC, base rev vs working tree: MMIO / DRAM interleavings must
+    give identical retire traces (the bus_splitter response paths)"""
+    base = build_soc(a.base)
+    new = build_soc(None)
+    fails = 0
+    for sd in range(a.seed0, a.seed0 + a.seeds):
+        asm = _mmio_prog(sd)
+        rb = run_soc(base, asm, f'mm_b{sd}', trace=True)
+        rn = run_soc(new, asm, f'mm_n{sd}', trace=True)
+        tb_ = open(rb['trace']).read()
+        same = 'HALTED' in rb['log'] and 'HALTED' in rn['log'] and tb_ == open(rn['trace']).read()
+        if not same:
+            fails += 1
+            print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
+    print(f'{fails} differing')
+    return 1 if fails else 0
+
+
 def cmd_socdiff(a):
     """random programs through the full SoC (real cache / bus splitter):
     base rev vs working tree, retire traces must be identical"""
@@ -435,6 +487,8 @@ def main():
     d.add_argument('--irq', action='store_true'); d.add_argument('-v', '--verbose', action='store_true')
     d.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('dmtest')
+    sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
+    sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
     x.add_argument('--seed0', type=int, default=1); x.add_argument('--lats', type=int, nargs='+', default=[3])
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
@@ -456,6 +510,8 @@ def main():
         sys.exit(cmd_excdiff(a))
     elif a.cmd == 'dmtest':
         sys.exit(cmd_dmtest(a))
+    elif a.cmd == 'socmmio':
+        sys.exit(cmd_socmmio(a))
     else:
         sys.exit(cmd_diff(a))
 

@@ -107,18 +107,30 @@ module bus_splitter #(
         r_next_valid     <= mem_next_valid_comb;
         r_ready          <= COMB_DRAM_RET ? (is_mmio && mem_ready_comb) : mem_ready_comb;
     end
+    // Response DATA select (timing): from the request address REGISTERED,
+    // not live.  Data is only consumed together with a ready, and every
+    // responder's ready is a flop set at least one cycle after its request
+    // appears (the cache's cpu.ready from its FSM; MMIO ready is
+    // r_mmio_*_dv_d2), with the address stable from request to response —
+    // so r_is_mmio equals is_mmio whenever the data is used.  This takes
+    // the cpu.addr -> decode -> select cone off the read-data paths into
+    // the core (the RET target / RAS check -> pc, a forwarded load -> ex_a).
+    // READY keeps the live select: the MMIO ready (a delayed copy of the
+    // request strobe) stays high for cycles after an access, and a
+    // registered select would show it for one cycle against the next,
+    // non-MMIO request.
+    logic r_is_mmio = 1'b0;
+    always_ff @(posedge i_clk) r_is_mmio <= is_mmio;
     always_comb begin
-        if (COMB_DRAM_RET && !is_mmio) begin
+        if (COMB_DRAM_RET && !r_is_mmio) begin
             cpu.read_data      = dram.read_data;
             cpu.read_data_next = dram.read_data_next;
             cpu.next_valid     = dram.next_valid;
-            cpu.ready          = dram.ready;
         end else begin
             cpu.read_data      = r_read_data;
             cpu.read_data_next = r_read_data_next;
             cpu.next_valid     = r_next_valid;
-            cpu.ready          = r_ready;
         end
+        cpu.ready = (COMB_DRAM_RET && !is_mmio) ? dram.ready : r_ready;
     end
-
 endmodule
