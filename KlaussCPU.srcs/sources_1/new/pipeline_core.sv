@@ -1575,6 +1575,15 @@ module pipeline_core
    // WB, with the W-compare shift applied as at dispatch)
    wire [63:0] opa = (EN_LDBYP && ex_lb_a) ? (ex_w ? {wb_hext[31:0], 32'b0} : wb_hext) : ex_a;
    wire [63:0] opb = (EN_LDBYP && ex_lb_b) ? (ex_w ? {wb_hext[31:0], 32'b0} : wb_hext) : ex_b;
+   // MIN/MAX in EX: only which operand wins (registered as mem_mmpick); the
+   // select is in MEM (see mem_result_eff)
+   wire ex_is_mm  = (ex_d.uop == U_BOOL) &&
+                    (cmp_op_e'(ex_d.sub) == CMP_MIN || cmp_op_e'(ex_d.sub) == CMP_MAX ||
+                     cmp_op_e'(ex_d.sub) == CMP_MINU || cmp_op_e'(ex_d.sub) == CMP_MAXU);
+   wire ex_mmpick = (cmp_op_e'(ex_d.sub) == CMP_MIN)  ? ($signed(opa) < $signed(opb))
+                  : (cmp_op_e'(ex_d.sub) == CMP_MAX)  ? ($signed(opa) > $signed(opb))
+                  : (cmp_op_e'(ex_d.sub) == CMP_MINU) ? (opa < opb)
+                  :                                     (opa > opb);      // MAXU
    always_comb begin : ex_logic
       logic [64:0]        sum;
       logic               is_sub, cin;
@@ -1629,10 +1638,11 @@ module pipeline_core
                CMP_ULE:  exo_result = (opa <= opb) ? 64'b1 : 64'b0;
                CMP_UGT:  exo_result = (opa > opb)  ? 64'b1 : 64'b0;
                CMP_UGE:  exo_result = (opa >= opb) ? 64'b1 : 64'b0;
-               CMP_MIN:  exo_result = (sa < sb) ? opa : opb;
-               CMP_MAX:  exo_result = (sa > sb) ? opa : opb;
-               CMP_MINU: exo_result = (opa < opb) ? opa : opb;
-               default:  exo_result = (opa > opb) ? opa : opb; // MAXU
+               // MIN/MAX/MINU/MAXU (timing): the 64-bit select moved to MEM
+               // (mem_result_eff, M12 Stage D style).  EX hands on opa (as
+               // the result), opb (in the store-data register, unused by ALU
+               // ops) and the 1-bit pick (ex_mmpick, registered).
+               default:  begin exo_result = opa; exo_wdata = opb; end
             endcase
             // 2b-lite: an equality FBR redirects from EX (exo_taken), and
             // goes down the pipe as not-taken so MEM does not redirect again
@@ -2190,7 +2200,12 @@ module pipeline_core
    // v3 D3: a W op's result is its low 32 bits sign-extended — applied here,
    // on the registered MEM value both forwarding and WB read (only the
    // upper-half select changes; EX is untouched).
+   // (timing: MIN/MAX's select is here — opa in mem_result, opb in
+   // mem_wdata, the pick registered in EX; CPI-free like the shifter's 2nd
+   // stage: a producer in EX already gives its consumer one bubble)
+   logic mem_mmq, mem_mmpick;
    wire [63:0] mem_result_eff = mem_is_sh ? w_sh2
+                              : mem_mmq ? (mem_mmpick ? mem_result : mem_wdata)
                               : mem_d.w32 ? {{32{mem_result[31]}}, mem_result[31:0]}
                               : mem_result;
 
@@ -2319,7 +2334,7 @@ module pipeline_core
          scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
-         wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0;
+         wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -3260,6 +3275,7 @@ module pipeline_core
                mem_zval   <= (ex_d.uop != U_BTSTN);   // Z from (value==0) at WB
                mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
+               mem_mmq    <= ex_is_mm;   mem_mmpick <= ex_mmpick;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
                mem_misal  <= ex_misal;
                mem_misal_st <= (ex_d.uop == U_STORE || ex_d.uop == U_SC);

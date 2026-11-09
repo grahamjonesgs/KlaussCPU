@@ -86,7 +86,10 @@ def gen(seed, n_blocks=40, irq=False, span=0x800):
             elif k < 0.90 and funcs:
                 a.call(rnd.choice(funcs))
             elif k < 0.93:
-                a.mov(rd, r1)
+                if rnd.random() < 0.5:
+                    a.mov(rd, r1)
+                else:
+                    a.minmax(rnd.choice(['min', 'max', 'minu', 'maxu']), rd, r1, r2)
             else:
                 a.nop()
 

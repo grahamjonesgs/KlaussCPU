@@ -139,6 +139,10 @@ class Asm:
         f = 1 if o <= 3 else 0
         return self.emit(H(1, 1) | o << 22 | f << 21 | (w << 19) | rd << 8 | rs1 << 4 | rs2)
 
+    def minmax(self, op, rd, rs1, rs2):          # class 1 OP 7-10, reg-reg only
+        o = {'min': 7, 'max': 8, 'minu': 9, 'maxu': 10}[op]
+        return self.emit(H(1, 1) | o << 22 | rd << 8 | rs1 << 4 | rs2)
+
     def alui(self, op, rd, rs1, imm, sgn=True, w=False):
         o = ALU[op]
         f = 1 if o <= 3 else 0

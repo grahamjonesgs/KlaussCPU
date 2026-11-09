@@ -1651,3 +1651,38 @@ def iret_user_mmio_target():
                 out.append((a, {'end': 'park', 'kind': '0', 'mmio_rd': '0', 'um': '0',
                                 m(XD): X_ACC_FE, m(XD + 8): T}, [f'+LAT={lat}']))
     return out
+
+
+# ------------------- MIN/MAX select in MEM (timing): values and forwarding
+@test
+def minmax_fwd():
+    """MIN/MAX/MINU/MAXU with consumers at distance 1, 2 and 3 (forwarded
+    from MEM / WB / the register file) and a store of the result"""
+    def s64(v):
+        return v - (1 << 64) if v >> 63 else v
+    vals = [(5, 7), (7, 5), (0xFFFFFFFFFFFFFFFF, 1), (1, 0xFFFFFFFFFFFFFFFF),
+            (0x8000000000000000, 0x7FFFFFFFFFFFFFFF), (3, 3)]
+    out = []
+    for lat in (1, 3):
+        a = Asm()
+        a.setr(12, DATA)
+        exp = {'end': 'park', 'kind': '0'}
+        i = 0
+        for x, y in vals:
+            for op in ('min', 'max', 'minu', 'maxu'):
+                f = {'min': lambda: x if s64(x) < s64(y) else y, 'max': lambda: x if s64(x) > s64(y) else y,
+                     'minu': lambda: min(x, y), 'maxu': lambda: max(x, y)}[op]
+                r = f()
+                for dist in (1, 2, 3):
+                    a.setr64(1, x); a.setr64(2, y)
+                    a.minmax(op, 3, 1, 2)
+                    for _ in range(dist - 1):
+                        a.nop()
+                    a.alu('xor', 4, 3, 3)          # 0, consumes r3 twice
+                    a.alu('add', 4, 4, 3)          # r4 = r3
+                    a.st(64, 4, 12, 8 * i)
+                    exp[m(DATA + 8 * i)] = r
+                    i += 1
+        a.halt()
+        out.append((a, exp, [f'+LAT={lat}']))
+    return out
