@@ -129,7 +129,8 @@ module core2_subsys
    logic [31:0] c2_dbg_sp;
    flags_t      c2_dbg_flags;
 
-   pipeline_core #(.SP_RESET(32'h0002_0000), .BTIC_EN(1'b0)) c2_core_i (   // SP = top of local BRAM
+   // (no MMU stage 1 on core 2: EXC_EN = 0, the new encodings trap)
+   pipeline_core #(.SP_RESET(32'h0002_0000), .BTIC_EN(1'b0), .EXC_EN(1'b0)) c2_core_i (   // SP = top of local BRAM
       .clk        (i_Clk),
       .ce         (r_ce),
       .rst        (!i_Rst_L || !r_run),

@@ -388,7 +388,8 @@ package klauss_pkg;
    // --- Debug interface (pipeline_core DEBUG_EN; DEBUG_PLAN.md Phase 5) -----
    // Driven by debug_module.sv; tied off ('0) when no debugger is built in.
    // Register numbers (reg_idx / debugger view, = klausscc gdbserver regnums):
-   // 0-15 R0-R15, 16 SP, 17 PC, 18 FLAGS {Z,S,C,V} in [3:0], 19 INT_MASK.
+   // 0-15 R0-R15, 16 SP, 17 PC, 18 FLAGS {Z,S,C,V} in [3:0], 19 INT_MASK,
+   // (MMU stage 1) 20 SP_ALT, 21 {DI, UM} in [1:0].
    typedef struct packed {
       logic             halt_req;   // level: halt at the next dispatch boundary
       logic             resume;     // pulse, while debug-halted: run from PC
@@ -429,6 +430,10 @@ package klauss_pkg;
       logic [31:0] watch_addr;      // byte address of the access that fired
       logic        mem_done;        // pulse: mem_req finished
       logic [63:0] mem_rdata;
+      // MMU stage 1: debugger registers 20 (SP_ALT) and 21 ({DI, UM})
+      logic [31:0] sp_alt;
+      logic        um;
+      logic        dis;
    } dbg_out_t;
 
 endpackage : klauss_pkg

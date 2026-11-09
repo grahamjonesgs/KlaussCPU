@@ -28,7 +28,8 @@ def git_show(rev, path):
 
 def build(rev=None, quiet=True):
     dbg = os.environ.get('VSIM_DEBUG_EN') == '1'     # elaborate DEBUG_EN=1
-    tag = (rev or 'wt') + ('_dbg' if dbg else '')
+    noexc = os.environ.get('VSIM_EXC_EN') == '0'     # elaborate EXC_EN=0 (core 2's MMU-less core)
+    tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -43,7 +44,7 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg)).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -51,6 +52,10 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = ['-GDEBUG_EN=1'] if dbg else []
+    if 'parameter bit EXC_EN' in core:
+        defs.append('+define+HAS_EXC')
+        if noexc:
+            defs.append('-GEXC_EN=0')
     if 'm_rdata_dram' in core:
         defs.append('+define+HAS_RDATA_DRAM')
     if 'input  logic [63:0]  h_dword' in core:

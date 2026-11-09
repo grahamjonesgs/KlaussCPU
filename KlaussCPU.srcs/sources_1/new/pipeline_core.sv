@@ -442,6 +442,9 @@ module pipeline_core
    assign dbg_o.watch_addr = dbg_watch_addr;
    assign dbg_o.mem_done   = dbg_mem_done;
    assign dbg_o.mem_rdata  = dbg_mem_rdata;
+   assign dbg_o.sp_alt     = sp_alt;
+   assign dbg_o.um         = umode;
+   assign dbg_o.dis        = irq_dis;
    // TRAP / ILLEGAL / HALT -> debug-halt cause
    function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
       return (kind == 3'd1 || kind == 3'd5) ? DBG_CAUSE_TRAP
@@ -3543,6 +3546,9 @@ module pipeline_core
                5'd18:   flags   <= '{zero: dbg_i.reg_wdata[3], sign: dbg_i.reg_wdata[2],
                                      carry: dbg_i.reg_wdata[1], overflow: dbg_i.reg_wdata[0]};
                5'd19:   int_mask <= dbg_i.reg_wdata[3:0];
+               // MMU stage 1: SP_ALT, {DI, UM}
+               5'd20:   if (EN_EXC) sp_alt <= dbg_i.reg_wdata[31:0];
+               5'd21:   if (EN_EXC) begin umode <= dbg_i.reg_wdata[0]; irq_dis <= dbg_i.reg_wdata[1]; end
                default: if (dbg_i.reg_idx < 5'd16) rf[dbg_i.reg_idx[3:0]] <= dbg_i.reg_wdata;
             endcase
          end

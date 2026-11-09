@@ -15,6 +15,9 @@
 //                      [2] step: with resumereq, halt after one instruction
 //                      [3] attached: TRAP / ILLEGAL / HALT enter a debug halt
 //                      [4] halt_on_load: halt at the entry of the next program
+//                      [5] exc_pass (MMU stage 1): with attached, ILLEGAL /
+//                      TRAP / MISALIGNED go to the core's exception vector
+//                      (when set) instead of a debug halt
 //                      (a load without it clears haltreq, attached and every
 //                      BP/WP enable: no stale debugger state in a normal run)
 //   0x01 DMSTATUS   RO [0] halted   [1] running   [2] busy (memory command)
@@ -23,10 +26,11 @@
 //                      [6:4] cause (klauss_pkg DBG_CAUSE_*)
 //                      [7] parked (any park)   [10:8] park_kind
 //                      [11] halted since this bit was last read (sticky)
-//                      [15:12] version = 1   [19:16] breakpoints = 4
+//                      [15:12] version = 2 (2: EXC_PASS, registers 20/21)
+//                      [19:16] breakpoints = 4
 //                      [23:20] watchpoints = 2   [31:24] 0x4B ('K')
 //   0x02 REG_CMD    W  [4:0] register (0-15 R, 16 SP, 17 PC, 18 FLAGS
-//                      {Z,S,C,V}, 19 INT_MASK), [8] write.  Read: DATA0 =
+//                      {Z,S,C,V}, 19 INT_MASK, 20 SP_ALT, 21 {DI, UM}), [8] write.  Read: DATA0 =
 //                      register; write: register = DATA0.  Halted only.
 //   0x03 DATA0      RW data for REG_CMD / MEM_CMD
 //   0x04 MEM_ADDR   RW byte address (doubleword-aligned for MEM_CMD)
@@ -67,6 +71,7 @@ module debug_module
    input  logic         prog_start    // pulse: the loader started a program
 );
    logic        haltreq, attached, halt_on_load, error, halted_seen;
+   logic        exc_pass;    // DMCONTROL[5] (MMU stage 1)
    logic [63:0] data0;
    logic [31:0] mem_addr;
    logic        mem_busy, mem_inc;
@@ -88,11 +93,13 @@ module debug_module
          5'd17:   return {32'b0, park_pc};
          5'd18:   return {60'b0, core_flags.zero, core_flags.sign, core_flags.carry, core_flags.overflow};
          5'd19:   return {60'b0, core_int_mask};
+         5'd20:   return {32'b0, dbg_o.sp_alt};
+         5'd21:   return {62'b0, dbg_o.dis, dbg_o.um};
          default: return (idx < 5'd16) ? core_r[idx[3:0]] : 64'b0;
       endcase
    endfunction
 
-   wire [63:0] dmstatus = {32'b0, 8'h4B, 4'd2, 4'd4, 4'd1, halted_seen,
+   wire [63:0] dmstatus = {32'b0, 8'h4B, 4'd2, 4'd4, 4'd2, halted_seen,
                            park_kind, parked, dbg_o.cause, error, mem_busy,
                            !parked, halted};
 
@@ -100,6 +107,7 @@ module debug_module
       dbg_i           = '0;
       dbg_i.halt_req  = haltreq;
       dbg_i.attached  = attached;
+      dbg_i.exc_pass  = exc_pass;
       dbg_i.bp_en     = bp_en;
       dbg_i.bp_addr   = bp_addr;
       dbg_i.wp_en     = wp_en;
@@ -122,6 +130,7 @@ module debug_module
    always_ff @(posedge clk) begin
       if (rst) begin
          haltreq <= 1'b0;  attached <= 1'b0;  halt_on_load <= 1'b0;  error <= 1'b0;
+         exc_pass <= 1'b0;
          halted_seen <= 1'b0;  halted_q <= 1'b0;
          data0 <= '0;  mem_addr <= '0;  mem_busy <= 1'b0;  mem_inc <= 1'b0;
          bp_en <= '0;  bp_addr <= '0;
@@ -146,6 +155,7 @@ module debug_module
          // instruction).
          if (prog_start && !halt_on_load) begin
             haltreq <= 1'b0;  attached <= 1'b0;  bp_en <= '0;  wp_en <= '0;
+            exc_pass <= 1'b0;
          end
 
          if (mem_busy && dbg_o.mem_done) begin
@@ -158,7 +168,7 @@ module debug_module
             dmi_rsp <= 1'b1;
             if (dmi_op == 2'd1) begin
                case (dmi_addr)
-                  8'h00: dmi_rdata <= {59'b0, halt_on_load, attached, 2'b00, haltreq};
+                  8'h00: dmi_rdata <= {58'b0, exc_pass, halt_on_load, attached, 2'b00, haltreq};
                   8'h01: begin dmi_rdata <= dmstatus; halted_seen <= 1'b0; end
                   8'h03: dmi_rdata <= data0;
                   8'h04: dmi_rdata <= {32'b0, mem_addr};
@@ -180,6 +190,7 @@ module debug_module
                      if (!dmi_wdata[0]) haltreq <= 1'b0;
                      attached     <= dmi_wdata[3];
                      halt_on_load <= dmi_wdata[4];
+                     exc_pass     <= dmi_wdata[5];
                      if (dmi_wdata[1]) begin
                         if (halted && !mem_busy) begin
                            resume_p <= 1'b1;  step_p <= dmi_wdata[2];

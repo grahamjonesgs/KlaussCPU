@@ -16,7 +16,7 @@
 //   +MAXC=<n>       cycle cap (default 2,000,000)
 //===========================================================================
 `timescale 1ns/1ps
-module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
+module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -51,7 +51,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    klauss_pkg::dbg_in_t  dbg_i = '0;
    klauss_pkg::dbg_out_t dbg_o;
 
-   pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (
+   pipeline_core #(.DEBUG_EN(DEBUG_EN)
+`ifdef HAS_EXC
+      , .EXC_EN(EXC_EN)
+`endif
+   ) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
       .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be,
       .m_rdata,
@@ -275,6 +279,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
       void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
       void'($value$plusargs("MAXC=%d", maxc));
       void'($value$plusargs("EDW=%h", edw));
+      // debugger state without a debugger driver (DEBUG_EN builds only)
+      if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
+`ifdef HAS_EXC
+      if ($test$plusargs("DBG_EXCPASS")) dbg_i.exc_pass = 1'b1;
+`endif
       $readmemh(img, mem_lo);
       install_handler();
       repeat (4) @(posedge clk);

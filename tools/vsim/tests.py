@@ -1294,3 +1294,34 @@ def user_early_fetch():
             exp = {'end': 'park', 'kind': '2', 'r3': 333333, 'mmio_rd': 'nonzero'}
         out.append((a, exp, ['+LAT=3']))
     return out
+
+
+# --------------------------------------------- (d) the debugger and EVEC
+import os as _os
+_DBG = _os.environ.get('VSIM_DEBUG_EN') == '1'
+
+
+@test
+def exc_debugger():
+    """attached: ILLEGAL / TRAP / MISALIGNED debug-halt (park 4) even with
+    EVEC set, unless EXC_PASS; SYSCALL and PRIVILEGED always reach EVEC.
+    (Without a DEBUG_EN core the debugger inputs are ignored.)"""
+    out = []
+    for word, cause, dbgable in ((0x6C040000, X_TRAP, True), (0x7C000000, X_ILL, True),
+                                 (0x6C080000, X_SYSCALL, False)):
+        for plus in (['+DBG_ATTACHED'], ['+DBG_ATTACHED', '+DBG_EXCPASS']):
+            a = Asm()
+            _xsetup(a)
+            a.setr(5, 1)
+            at = a.raw(word)
+            a.setr(5, 2)
+            a.halt()
+            _xhandler(a)
+            if _DBG and dbgable and '+DBG_EXCPASS' not in plus:
+                exp = {'end': 'park', 'kind': '4', 'pc': at, 'r5': 1}
+            elif _DBG:                       # the final HALT is a debug halt too
+                exp = {'end': 'park', 'kind': '4', 'r5': 2, m(XD): cause}
+            else:
+                exp = {'end': 'park', 'kind': '0', 'r5': 2, m(XD): cause}
+            out.append((a, exp, plus))
+    return out

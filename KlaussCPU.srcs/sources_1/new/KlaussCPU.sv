@@ -28,7 +28,10 @@ module KlaussCPU #(
     // AMP core 2 (core2_subsys.sv, AMP_CORE2_PLAN.md).  0 = not built in:
     // its 0xF0100000 register block stays decoded (reads 0, writes ignored),
     // it never requests DDR and LiteEth belongs to core 1.
-    parameter bit EN_CORE2 = 1'b0
+    parameter bit EN_CORE2 = 1'b0,
+    // MMU stage 1 on core 1 (MMU_PLAN.md): exceptions, user mode, SYSCALL,
+    // MFSR/MTSR, LR/SC.  Reported in CPU_FEATURES (0xF00F_0048).
+    parameter bit CORE1_EXC_EN = 1'b1
 ) (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
@@ -657,7 +660,7 @@ module KlaussCPU #(
       assign w_dbg_i = '0;
    end endgenerate
 
-   pipeline_core #(.DEBUG_EN(DEBUG_EN)) pipeline_core_i (
+   pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -1157,6 +1160,10 @@ module KlaussCPU #(
                16'h0030: r_mmio_read_data_comb = {32'b0, r_timer_period};
                16'h0038: r_mmio_read_data_comb = {32'b0, r_timer_interrupt_counter};
                16'h0040: r_mmio_read_data_comb = r_clock_ms;
+               // CPU_FEATURES (MMU_PLAN.md §6.3): [0] stage 1 exceptions /
+               // user mode / SYSCALL / MFSR / MTSR / TP / CYCLE.  Reads 0 on
+               // earlier bitstreams (a reserved offset).
+               16'h0048: r_mmio_read_data_comb = {63'b0, CORE1_EXC_EN};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
