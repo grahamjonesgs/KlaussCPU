@@ -2600,6 +2600,16 @@ module pipeline_core
    logic       ev_bp;   // a breakpoint was taken in ID this edge (debug)
    logic [1:0] ev_adv;
    logic [28:0] r_ifq_p1;
+   // (timing) the base+K candidates, each its own adder from registers:
+   // kept, so synthesis cannot share one adder behind a mux of the operands
+   // (that put a 29-bit carry chain after the I-cache hit -> ev_rebase select)
+   (* keep = "true" *) wire [28:0] k_pc_p1  = pc_dw + 29'd1;
+   (* keep = "true" *) wire [28:0] k_pc_p2  = pc_dw + 29'd2;
+   (* keep = "true" *) wire [27:0] k_pc_wl  = pc_dw[28:1] + 28'd1;
+   (* keep = "true" *) wire [28:0] k_ifq_p2 = r_ifq_p1 + 29'd1;
+   (* keep = "true" *) wire [27:0] k_ifq_wl = if_req_dw[28:1] + 28'd1;
+   (* keep = "true" *) wire [28:0] k_bp_p3  = r_base_p2 + 29'd1;
+   (* keep = "true" *) wire [27:0] k_bp1_wl = r_base_p1[28:1] + 28'd1;
 
    // ================================================================== clocked
    always_ff @(posedge clk) begin
@@ -4160,17 +4170,17 @@ module pipeline_core
                r_base_p2   <= id_bt_bp2;
                r_want_line <= id_bt_want;
             end else if (ev_rebase) begin
-               r_base_p1   <= pc_dw + 29'd1;        // base' = miss_dw = pc_dw (!in0)
-               r_base_p2   <= pc_dw + 29'd2;
-               r_want_line <= pc_dw[28:1] + 28'd1;
+               r_base_p1   <= k_pc_p1;              // base' = miss_dw = pc_dw (!in0)
+               r_base_p2   <= k_pc_p2;
+               r_want_line <= k_pc_wl;
             end else if (ev_fill) begin
                r_base_p1   <= r_ifq_p1;             // base' = if_req_dw
-               r_base_p2   <= r_ifq_p1 + 29'd1;
-               r_want_line <= if_req_dw[28:1] + 28'd1;
+               r_base_p2   <= k_ifq_p2;
+               r_want_line <= k_ifq_wl;
             end else if (ev_slide) begin
                r_base_p1   <= r_base_p2;            // base' = base + 1
-               r_base_p2   <= r_base_p2 + 29'd1;
-               r_want_line <= r_base_p1[28:1] + 28'd1;
+               r_base_p2   <= k_bp_p3;
+               r_want_line <= k_bp1_wl;
             end
          end
       end
