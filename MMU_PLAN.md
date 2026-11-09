@@ -414,7 +414,7 @@ fail:
 |---|---|---|---|
 | 0x00 | `STATUS` | R (**user mode too**), W (supervisor) | `[0]` UM (read-only), `[1]` DI (read-only, the committed bit), `[8]` MPU_EN (stage 2), `[9]` TE (stage 3). Other bits read 0. Writes to UM and DI are ignored; use IRET / DI / EI. |
 | 0x01 | `EVEC` | RW | exception vector, `[1:0]` read 0 |
-| 0x02 | `ECAUSE` | RW | §4.1 code in `[7:0]` |
+| 0x02 | `ECAUSE` | RW | §4.1 code in `[7:0]`; `[8]` GUARD = this ACCESS_* fault was a denial by an MPU GUARD region (stage 2, §10.2), else 0 |
 | 0x03 | `EADDR` | RW | `[31:0]` |
 | 0x04 | `USP` | RW | `SP_ALT`, which is the user SP while in supervisor mode |
 | 0x05 | `SCRATCH0` | RW | 64-bit |
@@ -802,7 +802,9 @@ unaffected.
 
 - 16 regions. `CPU_FEATURES[1]` = 1 and `CPU_FEATURES[7:4]` = region count
   − 1 (15).
-- Reset clears every region and `MPU_EN`. All MPU SRs are supervisor-only.
+- Reset clears every region and `MPU_EN`. The SoC resets the core on
+  every program load, so a newly loaded program always starts with the MPU
+  off. All MPU SRs are supervisor-only.
   MTSR to them serializes, so the change applies from the next instruction,
   including its fetch.
 - Region *n* **covers** address *a* when `EN` and `BASE[31:5] ≤ a[31:5] ≤
@@ -836,6 +838,20 @@ What is checked:
   below a guard); debugger memory accesses; speculative I-cache fills and
   prefetches (DDR reads have no side effects, and the decision is made when
   the instruction is decoded).
+
+**Stack guards need a careful vector (required for any MPU-guarded
+kernel).** A supervisor PUSH into a GUARD region faults with SP unchanged.
+Entry then pushes its frame, unchecked, at SP − 8, which is inside the
+guard. A vector whose first instruction pushes would fault again, and every
+nested entry pushes another frame lower: an unbounded descent through the
+guard. So the vector must not touch memory until it knows SP is safe.
+- Free registers with `MTSR scratch0/scratch1` (no memory access).
+- Read `ECAUSE`. **`ECAUSE[8]` (GUARD)** says the fault was a GUARD denial;
+  for Zephyr that is directly the "stack overflow" reason.
+- If GUARD is set, or SP is near a guard, switch to an emergency stack
+  before any push.
+There is no hardware backstop for this recursion in stage 2. It is a
+software rule.
 
 The stage 1 user-mode MMIO rule (§3.6) still applies first. In supervisor
 mode, GUARD regions also cover MMIO. Cause priority stays as in §4.1: an
@@ -894,6 +910,14 @@ segment). The page-table format is entirely software's choice (soft TLB).
 - `TE` is `STATUS[9]` and is set by MTSR STATUS, which serializes. The
   kernel boots with `TE = 0` at its physical address, sets up, then sets
   `TE` and jumps to its `0x8000_0000` alias.
+- **What must be in kseg while `TE = 1`** (software rule): the targets of
+  `EVEC` and `TLBVEC` (the vector fetch is translated like any other), the
+  TLB refill handler and every page table it reads, and every kernel
+  stack (§11.3). Then the refill path can never miss. A TLB miss inside the
+  refill handler would re-enter `TLBVEC` and overwrite `EADDR`, `TLB_HI` and
+  `ECAUSE` before the outer handler had used them; there is no hardware
+  "exception level" guard against that. Linux and xv6 lay memory out this
+  way anyway.
 - TLB entries map DDR frames only (PFN = PA[26:16], 11 bits). So "is MMIO"
   stays a function of VA[31:28], with no translation in front of any MMIO
   decision. Mapping device registers into a user process is not supported;
@@ -935,6 +959,11 @@ Instructions (class B, LEN = 01, no operands, privileged, serializing):
 | `TLBP` | `0x6C0B_0000` | search for `TLB_HI`'s VPN with `TLB_HI.ASID` (G-aware). Hit: `TLB_INDEX` ← {P = 0, index}; miss: `TLB_INDEX[31]` ← 1 |
 | `TLBINV` | `0x6C0C_0000` | V ← 0 in every entry |
 
+After a TLBP miss, `TLB_INDEX[4:0]` is unchanged and only bit 31 is set.
+
+Reset (and so every program load) clears `TE`, `ASID` and `TLBVEC`, and
+sets V = 0 in every entry.
+
 Replacement is software's choice: `TLB_INDEX` is plain software state,
 typically a round-robin counter. To invalidate a single ASID, software
 walks the entries with TLBR/TLBWI.
@@ -971,6 +1000,27 @@ kernel writing user text through kseg) needs ICACHE_INV, which Linux's
 today. Debugger memory accesses use physical addresses.
 
 ### 11.4 Pipeline approach
+
+**Decision (2026-11-09): look up the base register, not the EA.** In an
+out-of-context Vivado experiment on xc7a100t at 10 ns (32 entries; VPN,
+ASID and G compare; PFN and permission mux into flops):
+- **EA-based:** EA adder → CAM → mux → flops: 8.9 ns data path, 13 levels,
+  slack +1.06 ns. That is on an empty chip. In context the operand fanout
+  and congestion would eat that, because the core already runs at about 0
+  margin.
+- **Base-register:** base register → CAM → mux → flops: 7.6 ns, 7 levels,
+  slack +2.37 ns.
+
+So the data-side lookup uses the **base**: rs1 (modes 00/01/11), the
+immediate (mode 10), SP for stack ops, and R15 for LEAVE/LEAVERET. In MEM
+cycle 1, a registered compare of EA[31:16] against the base's VPN detects a
+page crossing. A crossing access (a large offset, `rs1 + rs2` spanning
+pages, a PUSH at exactly a page boundary) is replayed: one more lookup on
+the registered EA while it holds MEM, before any access. That costs one or
+two cycles, only on crossings. The compiler should keep the pointer in rs1
+for reg+reg addressing (ABI note for klausscpu-llvm). The paragraphs below
+are the original sketch; where they say "on the EA in EX", read "on the
+base in EX, with the MEM replay above".
 
 - **Data-side lookup** on the EA in EX, with the result **registered** into
   MEM (frame number, hit, permissions). The cache keeps reading its BRAMs
