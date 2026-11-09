@@ -2049,6 +2049,7 @@ module pipeline_core
    logic        wb_xguard;            // ECAUSE[8]: a GUARD denial (stage 2)
    logic        wb_mtsr;
    logic        wb_tlbi;              // a TLB instruction (MMU stage 3)
+   logic        wb_rfch;              // MTSR or a TLB instruction: refetch behind it (timing: one register)
    logic        wb_xtlb;              // a TLB-related fault: TLB_HI auto-load
    logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
    logic [31:0] wb_spalt_new;
@@ -2554,7 +2555,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          umode <= 1'b0; sp_alt <= '0;
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
-         id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
+         id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0; wb_rfch <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
          ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
@@ -2825,7 +2826,7 @@ module pipeline_core
             end else begin
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
-               if (EN_EXC && (wb_mtsr || wb_tlbi)) begin
+               if (EN_EXC && wb_rfch) begin
                   // (USP here; every other SR is written by mmu_sr / mmu_mpu /
                   // mmu_tlb; a TLB instruction runs in mmu_tlb)
                   if (wb_mtsr && wb_op[19:12] == 8'd4) sp_alt <= wb_value[31:0];
@@ -3478,6 +3479,7 @@ module pipeline_core
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
             wb_tlbi    <= EN_TLB && mem_valid && mem_d.tlbi;
+            wb_rfch    <= EN_EXC && mem_valid && (mem_d.mtsr || (EN_TLB && mem_d.tlbi));
             wb_va_dw   <= mem_eaddr[31:3];        // (the reservation holds a VA)
             wb_xtlb    <= EN_TLB && (mem_xsq ? mem_xs_tlb : (mem_valid && mem_d.uop == U_EXC && mem_d.fxl));
             wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
