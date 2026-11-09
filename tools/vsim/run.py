@@ -662,13 +662,13 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0xFB = stage 1 + LR/SC
-    # + the 16-region MPU
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x20FF = stage 1 +
+    # LR/SC + the 16-region MPU + the 32-entry TLB
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=00000000000000fb' not in last:
+    if 'r2=00000000000020ff' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')

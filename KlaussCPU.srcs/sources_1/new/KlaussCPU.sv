@@ -33,7 +33,9 @@ module KlaussCPU #(
     // MFSR/MTSR, LR/SC.  Reported in CPU_FEATURES (0xF00F_0048).
     parameter bit CORE1_EXC_EN = 1'b1,
     // MMU stage 2 (the 16-region MPU) on core 1.  CPU_FEATURES[1], [7:4].
-    parameter bit CORE1_MPU_EN = 1'b1
+    parameter bit CORE1_MPU_EN = 1'b1,
+    // MMU stage 3 (the 32-entry TLB, TE) on core 1.  CPU_FEATURES[2], [15:8].
+    parameter bit CORE1_TLB_EN = 1'b1
 ) (
     input             CPU_RESETN,        // CPU reset button
     input             i_Clk_board,       // 100 MHz board oscillator (feeds the MIG 200MHz ref)
@@ -662,7 +664,8 @@ module KlaussCPU #(
       assign w_dbg_i = '0;
    end endgenerate
 
-   pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN)) pipeline_core_i (
+   pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
+                   .TLB_EN(CORE1_TLB_EN)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -1164,11 +1167,13 @@ module KlaussCPU #(
                16'h0040: r_mmio_read_data_comb = r_clock_ms;
                // CPU_FEATURES (MMU_PLAN.md §6.3): [0] stage 1 exceptions /
                // user mode / SYSCALL / MFSR / MTSR / TP / CYCLE, [3] LR/SC,
-               // [1] the MPU and [7:4] its region count - 1 (stage 2).
+               // [1] the MPU and [7:4] its region count - 1 (stage 2),
+               // [2] the TLB and [15:8] its entry count (stage 3).
                // Reads 0 on earlier bitstreams (a reserved offset).
-               16'h0048: r_mmio_read_data_comb = {56'b0,
+               16'h0048: r_mmio_read_data_comb = {48'b0,
+                                                  (CORE1_EXC_EN && CORE1_TLB_EN) ? 8'd32 : 8'd0,
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
-                                                  CORE1_EXC_EN, 1'b0,
+                                                  CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
                                                   CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
