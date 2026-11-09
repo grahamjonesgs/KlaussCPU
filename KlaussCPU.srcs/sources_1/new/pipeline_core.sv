@@ -1503,8 +1503,15 @@ module pipeline_core
    // EN_LDBYP: a bypass consumer whose load is not a hit-pipe answer in WB
    // (it missed) waits in EX for the load's response (captured into ex_a/b)
    wire ex_lbhold  = EN_LDBYP && ex_valid && (ex_lb_a || ex_lb_b) && !(wb_valid && wb_h && wb_hok);
+   // MMU stage 2 (timing): with the MPU on, a memory op spends one extra
+   // cycle in EX — its EA is registered (ex_ea_q) in the first, and the
+   // region compares run from that register in the second, so the EA adder
+   // and the compares are never in series.  Registered terms only.
+   logic        ex_mph;           // the op in EX has had its MPU cycle
+   logic [31:0] ex_ea_q;          // exo_eaddr, registered every cycle
+   wire ex_mpu_hold = EN_MPU && mpu_en && ex_valid && ex_d.is_mem && !ex_mph;
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
-                  || (ex_is_lcd && !lcd_ready) || ex_lbhold;
+                  || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
 
    wire [63:0] w_div_abs_a   = (ex_d.sgn && ex_a[63]) ? (~ex_a + 64'd1) : ex_a;
@@ -2370,7 +2377,7 @@ module pipeline_core
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
-         id_fx2 <= 1'b0; id_fxg <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0;
+         id_fx2 <= 1'b0; id_fxg <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2623,6 +2630,7 @@ module pipeline_core
          end
 
          // ---------------- EX free-running units ----------------
+         ex_ea_q <= exo_eaddr;             // (MMU stage 2: the MPU's data input)
          // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
@@ -3239,7 +3247,9 @@ module pipeline_core
             if (ex_busy) begin
                mem_valid <= 1'b0;
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
+               if (ex_mpu_hold) ex_mph <= 1'b1;
             end else begin
+               ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                // early load issue (see EN_EARLY_LD): the MEM engine then
                // starts in its wait-ready state
@@ -3833,7 +3843,7 @@ module pipeline_core
          .ridx     (id_op[16:12] - 5'h10),
          .rdata    (mpu_rdata),
          .mpu_en,
-         .d_g      (exo_eaddr[31:5]),
+         .d_g      (ex_ea_q[31:5]),
          .d_gx     (ex_a[31:5]),
          .d_st     (ex_mst),
          .d_um     (umode),
@@ -4087,7 +4097,14 @@ module mmu_mpu (
          if (clr)   mpu_en <= 1'b0;
       end
    end
-   assign rdata = ridx[0] ? {limit[ridx[4:1]], 5'b0} : {base[ridx[4:1]], attr[ridx[4:1]]};
+   // MFSR (timing / area): a LUTRAM copy written alongside the flops, with
+   // a valid flop per SR (LUTRAM has no reset; reset reads 0) — not a 32:1
+   // mux of the flops
+   (* ram_style = "distributed" *) logic [31:0] shadow [0:2*N-1];
+   logic [2*N-1:0] sv;
+   always_ff @(posedge clk) if (ce && we) shadow[widx] <= widx[0] ? {wdata[31:5], 5'b0} : wdata;
+   always_ff @(posedge clk) if (rst) sv <= '0; else if (ce && we) sv[widx] <= 1'b1;
+   assign rdata = sv[ridx] ? shadow[ridx] : 32'b0;
 
    wire [26:0] d_g1 = d_gx + 27'd1;
    wire [26:0] f_g1 = f_g + 27'd1;
