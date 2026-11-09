@@ -800,6 +800,12 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 - **MMU stage 2 (2026-11, branch `mmu`):** the 16-region MPU (§13.3) and
   `ECAUSE[8]` GUARD. Off on core 2. With MPU_EN = 0, cycle-identical to
   stage 1.
+- **Stage 3 release bitstream (2026-11-09):** `52bece8`, closed with
+  alt-place ExtraPostPlacementOpt (fully met: WNS +0.008, WHS +0.015), LEAN
+  (MPU off, TRNG-only crypto, `CPU_FEATURES` = `0x0010_100D`). Board:
+  test_tlb 26/26, test_exc 53/53, test_mpu SKIP, board_suite with only the
+  expected crypto_selftest SKIPs, performance equal to master, ssh_shell /
+  HTTPS on software AES (MMU_PLAN.md §11.6).
 - **Nexys A7 build (2026-11-09):** core 1 has the TLB and no MPU
   (`CORE1_MPU_EN` = 0, timing margin) and, lean, the TRNG as its only
   crypto block; `CPU_FEATURES` = `0x0010_100D`.

@@ -1284,6 +1284,11 @@ the shipped bitstream.
 | `mmu3f` | `8f4ad33` | SMC hit-latch test without the pc adder | −0.048 | −0.013 / −0.01 | −0.184 | 44,619 | 30,657 |
 | `mmu3g` | `f9d4aac` | RAS miss as compare-then-select | −0.417 | −0.398 / −34.6 | −0.165 | 44,743 | 30,710 |
 | `mmu3i` | `875296e` | + `keep_hierarchy` on `mmu_mpu`; registered `ex_b_zero` | −0.200 | −0.106 / −1.4 | −0.021 | 43,828 | 30,302 |
+| `mmu3j` | `5a615e8` | STLF VA check folded into each candidate's coverage bit | −0.744 | −0.467 / — | | 43,626 | 30,497 |
+| `mmu3k` | `e82a4a1` | **MPU off** on the A7 | −0.204 | −0.115 / — | −0.050 | 42,442 | 29,498 |
+| `mmu3l` | `52bece8` | **lean crypto** (TRNG only); review 3 fixes | −0.127 | −0.016 / — | −0.014 | 34,516 | 22,562 |
+| `mmu3m` | `10413af` | `ex_b_zero`'s WB leg from byte-zero flags | −0.422 | −0.108 / −1.3 | −0.122 | 34,221 | 22,715 |
+| `mmu3n` | `98fe470` | base+K candidates as separate kept adders | **+0.011** | **+0.011** / 0 (tier 1) | | 34,445 | 22,757 |
 
 - **What failed and why.** The first build's worst paths ran through new
   stage 3 legs on old near-critical cones: TLBVEC in the `pc` mux behind
@@ -1298,11 +1303,22 @@ the shipped bitstream.
   entry count went to 16 (§11.5) and why the later steps are stage 2
   walls. They are fixed exactly and CPI-neutrally, and also buy margin for
   master.
-- **Interim board bitstream (an exception).** `875296e`'s ExtraTimingOpt
-  alt-place met (WNS +0.014, WHS +0.024, all clocks), and was saved as
-  `mmu_875296e_altplace.bit` for SRAM-only board validation of stage 3 in
-  parallel. It is never written to QSPI and is not the release bitstream,
-  which must close with the standard flow.
+- **Release bitstream: `52bece8`** (`~/.cache/kbuild/mmu_stage3_release_52bece8.bit`,
+  md5 `c75aa83d…`). Closed by `build_alt_place` with ExtraPostPlacementOpt
+  from the standard flow's opt checkpoint: fully met, WNS +0.008 / TNS 0,
+  WHS +0.015 / THS 0. **LEAN**: MPU off, TRNG-only crypto, CPU_FEATURES
+  `0x0010_100D`. Board validation (2026-11-09): test_tlb 26/26 (with T11),
+  test_exc 53/53, test_mpu SKIP (no MPU), board_suite with only the
+  expected crypto_selftest SKIPs, performance equal to master, and
+  ssh_shell / HTTPS working on software AES. Graham's aim for the
+  "standard placement" rule was fast builds, not a ban on alt-place
+  (master's own bitstream is an ExtraPostPlacementOpt closure too).
+  (`875296e`'s alt-place bitstream was an earlier SRAM-only interim, without
+  the review 3 CRITICAL fix; superseded.)
+- **After the release**, `10413af` and `98fe470` are exact and stay on the
+  branch as measurements. `98fe470` happened to meet in the standard flow's
+  tier 1 (+0.011, 12 min 40 s; kept as `mmu_98fe470_LEAN.bit`), but it is
+  not the release.
 - **Synthesis folding.** Without `keep_hierarchy`, synthesis placed core
   logic inside `mmu_tlb` (`pc`-mux LUTs) and `mmu_mpu` (`id_ser`, the
   multiplier). Both are kept now, like `mmu_sr`.
