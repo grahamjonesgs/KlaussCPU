@@ -2282,16 +2282,20 @@ module pipeline_core
    wire        sf_vaa     = mem_eaddr[31:16] == ex_ea_q[31:16];
    wire        sf_vab     = m_vav && m_vahi == ex_ea_q[31:16];
    wire        sf_vac     = sq_vav && sq_vahi == ex_ea_q[31:16];
-   wire        sf_vok     = !sf_te || (!ex_xpg_q && (sf_a ? sf_vaa : sf_c ? sf_vac : sf_vab));
-   wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
-                          : sf_c ? ((sq_be  & ex_ldmask) == ex_ldmask)
-                                 : ((m_be & ex_ldmask) == ex_ldmask);
+   // a candidate may forward: its bytes cover the load's and (TE = 1) its VA
+   // page is the load's (timing: folded per candidate, so the late sf_a /
+   // sf_c select one bit, as at stage 2)
+   wire        sf_vte     = !sf_te || !ex_xpg_q;
+   wire        sf_cova    = ((mem_be & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vaa));
+   wire        sf_covc    = ((sq_be  & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vac));
+   wire        sf_covb    = ((m_be   & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vab));
+   wire        sf_cov     = sf_a ? sf_cova : sf_c ? sf_covc : sf_covb;
    wire        h_line_blk = EN_STLF ? (sf_a || sf_b || sf_c)
                                     : ((m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) ||
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                             !(DEBUG_EN && dbg_mx);
-   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov && sf_vok;
+   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    // (stage 3: with TE = 1 the tag bits [31:16] are the PA — the cache
    // indexes with the VA bits [14:5] it always used: VIPT, 64 KiB pages)
