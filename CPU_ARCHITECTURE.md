@@ -557,8 +557,8 @@ mode.
 > **Optional build feature** (`CORE1_MPU_EN`), **off in the Nexys A7
 > bitstream** for timing margin (Graham, 2026-11-09); Zephyr runs in
 > supervisor mode. With it off, MFSR/MTSR of SRs 0x10–0x2F is ILLEGAL,
-> `STATUS[8]` reads 0 and ignores writes, nothing is checked, `ECAUSE[8]`
-> is 0, and `CPU_FEATURES[1]` / `[7:4]` read 0. The A7 reads
+> `STATUS[8]` reads 0 and ignores writes, nothing is checked, hardware
+> never sets `ECAUSE[8]`, and `CPU_FEATURES[1]` / `[7:4]` read 0. The A7 reads
 > `CPU_FEATURES` = `0x100D`.
 
 16 regions, 32-byte granularity (MMU_PLAN.md §10). All registers are
@@ -799,7 +799,8 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
   (`CORE1_MPU_EN` = 0, timing margin); `CPU_FEATURES` = `0x100D`.
 - **MMU stage 3 (2026-11, branch `mmu`):** the 16-entry software-refilled
   TLB with 64 KiB pages, kseg / kmap / useg, ASIDs and `TLBVEC` (§13.4).
-  Off on core 2. With TE = 0, cycle-identical to stage 2.
+  Off on core 2. With TE = 0, cycle-identical to stage 2 for code that does
+  not write STATUS / ASID or execute TLB ops.
 - **Little-endian conversion fixes (April 2026, FSM era):** SETR64/PUSHV64
   high-word selection, LDIDX/STIDX 8/16/32 lane and byte-enable inversions,
   and null-terminated TXSTRMEM. The `.vh` task files they referred to are

@@ -794,7 +794,8 @@ Zephyr handlers.
 > `CORE1_MPU_EN`). **Off in the Nexys A7 bitstream for timing margin**
 > (Graham, 2026-11-09); Zephyr runs in supervisor mode. With it off,
 > MFSR/MTSR of SRs 0x10–0x2F is ILLEGAL (§6.1), `STATUS[8]` reads 0 and
-> ignores writes, nothing is checked, and `ECAUSE[8]` is always 0. The RTL
+> ignores writes, nothing is checked, and hardware never sets `ECAUSE[8]`
+> (MTSR ECAUSE can still write it). The RTL
 > stays and is simulated in an `MPU_EN = 1` build.
 
 Interface written 2026-11-09 (Graham: carry on through all stages). For
@@ -1230,8 +1231,12 @@ base in EX, with the MEM replay above".
   MPU is a build option (`CORE1_MPU_EN`), simulated in an `MPU_EN = 1`
   build (`VSIM_MPU_EN=1`: its tests, `mpudiff`, and a diff against
   `7893230`).
-- **Compatibility**: with TE = 0 the core is cycle-identical to the stage 2
-  head `7893230` (diff, --irq, +HIT, EXC_EN = 0, socdiff).
+- **Compatibility**: TE = 0 is cycle-identical to `7893230` for code that
+  does not write STATUS / ASID or execute TLB ops (diff, --irq, +HIT,
+  EXC_EN = 0, socdiff). MTSR STATUS / ASID and the TLB ops discard the
+  fetch side and clear the reservation even with TE = 0 (about 4 cycles
+  each), as §11.3 specifies; MTSR is new in stage 1, so nothing older is
+  affected.
 - **Cost** (60 randprog seeds, every page mapped; STATUS the only
   difference): TE = 1 +1.52 % supervisor, +1.87 % user; +2.17 % / +2.42 %
   with the hit-pipe model. MPU_EN = 1 on the same programs: +1.36 %.
