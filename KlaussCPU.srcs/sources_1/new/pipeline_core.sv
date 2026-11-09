@@ -384,9 +384,10 @@ module pipeline_core
    // Registers only.  Used by the fill engine and the IF->ID latch checks.
    logic        fe_um;
    logic [31:0] sp_alt;
+   // EVEC / ECAUSE / EADDR / SCRATCH0-1 / TP / CYCLE live in mmu_sr (a
+   // kept hierarchy, timing); these are its outputs (names kept for tb_vsim)
    logic [31:0] evec, eaddr;
    logic [7:0]  ecause;
-   logic [63:0] scratch0, scratch1, tp, cycle;
    logic        res_valid;
    logic [28:0] res_dw;
    // exception entry: the IRQ entry sequencer runs with exc_ent set
@@ -1081,20 +1082,7 @@ module pipeline_core
    // MMU stage 1: the ID op's fetch fault, registered at the IF->ID latch;
    // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
    logic id_fx, id_fxc, id_mfsr;
-   logic [63:0] id_srv;
-   always_comb begin
-      case (id_op[15:12])
-         4'd1:    id_srv = {32'b0, evec};
-         4'd2:    id_srv = {56'b0, ecause};
-         4'd3:    id_srv = {32'b0, eaddr};
-         4'd4:    id_srv = {32'b0, sp_alt};
-         4'd5:    id_srv = scratch0;
-         4'd6:    id_srv = scratch1;
-         4'd7:    id_srv = tp;
-         4'd8:    id_srv = cycle;
-         default: id_srv = 64'b0;
-      endcase
-   end
+   logic [63:0] id_srv;           // mmu_sr's read port, at id_op[15:12]
    dec_t dec;
    assign dec = f_decode(id_op, umode, id_fx, id_fxc);
    // M12 hazard predecode: the operand-use flags the interlock needs are
@@ -2330,8 +2318,7 @@ module pipeline_core
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
-         umode <= 1'b0; sp_alt <= '0; evec <= '0; eaddr <= '0; ecause <= '0;
-         scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
+         umode <= 1'b0; sp_alt <= '0;
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
@@ -2374,12 +2361,10 @@ module pipeline_core
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
          ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
 
-         // MMU stage 1: CYCLE counts every core clock from reset
-         if (EN_EXC) cycle <= cycle + 64'd1;
          // MMU stage 1: a program load starts in supervisor mode with no
          // vector (MMU_PLAN.md §3.1); a debugger resume keeps them
          if (EN_EXC && start) begin
-            umode <= 1'b0; evec <= '0; ecause <= '0; eaddr <= '0;
+            umode <= 1'b0;                 // (EVEC / ECAUSE / EADDR: mmu_sr)
             res_valid <= 1'b0; exc_ent <= 1'b0;
          end
          if (start || (dbg_halted && dbg_i.resume)) begin
@@ -2499,8 +2484,7 @@ module pipeline_core
                   // exception: interrupts off (the old DI is in the frame)
                   pc          <= evec;
                   irq_dis     <= 1'b1;
-                  ecause      <= {4'b0, exc_cause_q};
-                  eaddr       <= exc_addr_q;
+                  // (ECAUSE / EADDR written by mmu_sr: sr_ent_we)
                   fetch_halt  <= 1'b0;
                   exc_ent     <= 1'b0;
                end else begin
@@ -2577,16 +2561,8 @@ module pipeline_core
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
                if (EN_EXC && wb_mtsr) begin
-                  case (wb_op[15:12])
-                     4'd1: evec     <= {wb_value[31:2], 2'b00};
-                     4'd2: ecause   <= wb_value[7:0];
-                     4'd3: eaddr    <= wb_value[31:0];
-                     4'd4: sp_alt   <= wb_value[31:0];
-                     4'd5: scratch0 <= wb_value;
-                     4'd6: scratch1 <= wb_value;
-                     4'd7: tp       <= wb_value;
-                     default: ;     // STATUS: no writable bits in stage 1
-                  endcase
+                  // (USP here; every other SR is written by mmu_sr, sr_mtsr_we)
+                  if (wb_op[15:12] == 4'd4) sp_alt <= wb_value[31:0];
                   ev_pcz     = 1'b1;
                   pc         <= wb_pc + 32'd4;
                   fetch_halt <= 1'b0;
@@ -3763,6 +3739,32 @@ module pipeline_core
       end
    end
 
+   // ------------------------------------------------ MMU stage 1: mmu_sr
+   // The system-register file, in a kept hierarchy so synthesis does not
+   // fold its read mux / write decode into the dispatch and WB cones.
+   // Written by MTSR as it commits at WB and by exception entry as it
+   // completes; read at dispatch (MFSR, id_srv).
+   wire sr_mtsr_we = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
+   wire sr_ent_we  = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
+   generate if (EN_EXC) begin : g_sr
+      (* keep_hierarchy = "yes" *)
+      mmu_sr sr_i (
+         .clk, .rst, .ce,
+         .clr        (start),
+         .mtsr_we    (sr_mtsr_we),
+         .mtsr_idx   (wb_op[15:12]),
+         .mtsr_wdata (wb_value),
+         .ent_we     (sr_ent_we),
+         .ent_cause  (exc_cause_q),
+         .ent_addr   (exc_addr_q),
+         .ridx       (id_op[15:12]),
+         .sp_alt,
+         .rdata      (id_srv),
+         .evec, .ecause, .eaddr);
+   end else begin : g_nosr
+      assign id_srv = '0;  assign evec = '0;  assign ecause = '0;  assign eaddr = '0;
+   end endgenerate
+
 `ifndef SYNTHESIS
    // Load-hit pipe coverage (sim only, +HCOV): loads that left MEM through
    // the hit pipe as hits / misses, and loads kept off it by a same-line
@@ -3864,4 +3866,68 @@ module pipeline_core
    end
 `endif
 
+endmodule
+
+
+//===========================================================================
+// mmu_sr — MMU stage 1 system registers (MMU_PLAN.md §6.1): EVEC, ECAUSE,
+// EADDR, SCRATCH0/1, TP and the CYCLE counter, plus the MFSR read mux
+// (USP / SP_ALT stays in the core: the stack swaps write it).
+//===========================================================================
+module mmu_sr (
+   input  logic        clk,
+   input  logic        rst,
+   input  logic        ce,
+   input  logic        clr,          // program load: EVEC / ECAUSE / EADDR <- 0
+   input  logic        mtsr_we,      // an MTSR commits (WB)
+   input  logic [3:0]  mtsr_idx,
+   input  logic [63:0] mtsr_wdata,
+   input  logic        ent_we,       // an exception entry completes
+   input  logic [3:0]  ent_cause,
+   input  logic [31:0] ent_addr,
+   input  logic [3:0]  ridx,         // MFSR SR number (low 4 bits; 0-8 decode)
+   input  logic [31:0] sp_alt,
+   output logic [63:0] rdata,
+   output logic [31:0] evec,
+   output logic [7:0]  ecause,
+   output logic [31:0] eaddr
+);
+   logic [63:0] scratch0, scratch1, tp, cycle;
+   always_ff @(posedge clk) begin
+      if (rst) begin
+         evec <= '0;  ecause <= '0;  eaddr <= '0;
+         scratch0 <= '0;  scratch1 <= '0;  tp <= '0;  cycle <= '0;
+      end else if (ce) begin
+         cycle <= cycle + 64'd1;          // every core clock from reset
+         if (mtsr_we) case (mtsr_idx)
+            4'd1: evec     <= {mtsr_wdata[31:2], 2'b00};
+            4'd2: ecause   <= mtsr_wdata[7:0];
+            4'd3: eaddr    <= mtsr_wdata[31:0];
+            4'd5: scratch0 <= mtsr_wdata;
+            4'd6: scratch1 <= mtsr_wdata;
+            4'd7: tp       <= mtsr_wdata;
+            default: ;                    // STATUS: no writable bits; USP: core
+         endcase
+         if (ent_we) begin
+            ecause <= {4'b0, ent_cause};
+            eaddr  <= ent_addr;
+         end
+         if (clr) begin
+            evec <= '0;  ecause <= '0;  eaddr <= '0;
+         end
+      end
+   end
+   always_comb begin
+      case (ridx)
+         4'd1:    rdata = {32'b0, evec};
+         4'd2:    rdata = {56'b0, ecause};
+         4'd3:    rdata = {32'b0, eaddr};
+         4'd4:    rdata = {32'b0, sp_alt};
+         4'd5:    rdata = scratch0;
+         4'd6:    rdata = scratch1;
+         4'd7:    rdata = tp;
+         4'd8:    rdata = cycle;
+         default: rdata = 64'b0;
+      endcase
+   end
 endmodule
