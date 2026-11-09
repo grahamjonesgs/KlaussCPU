@@ -1616,3 +1616,38 @@ def sq_spec_squashed_store():
                 a.halt()
                 out.append((a, {'end': 'park', 'kind': '0', m(DATA): 0, 'r10': 0}, [f'+LAT={lat}']))
     return out
+
+
+# ------------------------------ review finding: IRET to a user 0xF... target
+@test
+def iret_user_mmio_target():
+    """IRET to user mode at T in 0xF...: a lookup pending from before the
+    IRET, whose index matches T's, must not issue a real fill at T in the
+    cycle the IRET sits in WB (UM not yet committed).  ACCESS_FETCH at T and
+    no MMIO read.  (From the independent review's t_iret.py; the
+    non-matching index is the control.)"""
+    out = []
+    FR = DATA + 0x200
+    for match in (True, False):
+        for pad in range(0, 4):
+            for lat in (1, 3, 6):
+                a = Asm()
+                a.leapc(1, 'h'); a.mtsr('evec', 1)
+                a.setr(1, USP); a.mtsr('usp', 1)
+                a.setr(4, FR); a.setsp(4)
+                for _ in range(pad):
+                    a.nop()
+                while (a.pc & 0xF) != 0xC:     # IRET at offset 0xC of a 16 B line
+                    a.nop()
+                A = a.pc
+                T = 0xF0000000 | (((A + 4) & 0x1FF0) if match else (((A + 4) ^ 0x800) & 0x1FF0))
+                a.iret()
+                a.label('h')
+                a.setr(14, XD)
+                a.mfsr(13, 'ecause'); a.st(64, 13, 14, 0)
+                a.mfsr(13, 'eaddr');  a.st(64, 13, 14, 8)
+                a.halt()
+                a.dword(FR, (1 << 44) | T)
+                out.append((a, {'end': 'park', 'kind': '0', 'mmio_rd': '0', 'um': '0',
+                                m(XD): X_ACC_FE, m(XD + 8): T}, [f'+LAT={lat}']))
+    return out

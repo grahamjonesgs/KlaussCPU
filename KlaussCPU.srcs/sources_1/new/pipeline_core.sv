@@ -378,6 +378,11 @@ module pipeline_core
    // in user mode; SR USP).  System registers EVEC / ECAUSE / EADDR /
    // SCRATCH0-1 / TP / CYCLE.  res_* = the LR/SC reservation.
    logic        umode;
+   // fetch-side user mode: UM, or an IRET returning to user mode sitting in
+   // WB (UM commits there a cycle after the IRET redirected fetch from MEM;
+   // a lookup pending from before the IRET can issue in that cycle).
+   // Registers only.  Used by the fill engine and the IF->ID latch checks.
+   logic        fe_um;
    logic [31:0] sp_alt;
    logic [31:0] evec, eaddr;
    logic [7:0]  ecause;
@@ -1110,8 +1115,8 @@ module pipeline_core
    // (MISALIGNED_FETCH / ACCESS_FETCH) — decided here at the IF->ID latch
    // from pc and the window's LEN bits, registered into id_fx / id_fxc.
    wire [31:0] w_last_pc = (w_op[31:30] == 2'b11) ? w_pc_p8 : (w_op[31:30] == 2'b10) ? w_pc_p4 : pc;
-   wire        w_fxc = EN_EXC && umode && (pc[1:0] != 2'b00);
-   wire        w_fx  = EN_EXC && umode && ((pc[1:0] != 2'b00) || pc[31:28] == 4'hF ||
+   wire        w_fxc = EN_EXC && fe_um && (pc[1:0] != 2'b00);
+   wire        w_fx  = EN_EXC && fe_um && ((pc[1:0] != 2'b00) || pc[31:28] == 4'hF ||
                                            w_last_pc[31:28] == 4'hF);
    assign w_decf = f_decode(w_op, 1'b0, 1'b0, 1'b0);
    // (timing: the latch-time predecode — id_ser, the branch / return
@@ -1119,7 +1124,7 @@ module pipeline_core
    // fault gates the predictor bits at their uses (id_fx), and the
    // overrides' serialize is ORed in as a parallel term, w_xser.  A
    // privileged op is never a branch or return.)
-   wire w_xser = EN_EXC && (w_fx || (umode && f_priv(w_dec, w_op)));
+   wire w_xser = EN_EXC && (w_fx || (fe_um && f_priv(w_dec, w_op)));
    logic id_ser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
@@ -1857,6 +1862,7 @@ module pipeline_core
    logic        wb_mtsr;
    logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
    logic [31:0] wb_spalt_new;
+   assign fe_um = umode || (wb_valid && wb_um_we && wb_um_new);
    // the WB exception op enters the handler (else it parks / debug-halts as
    // before): EVEC set, and not a debugger-attached ILLEGAL / TRAP /
    // MISALIGNED unless the debugger passes them on (EXC_PASS)
@@ -1894,7 +1900,7 @@ module pipeline_core
    logic        if_rebase;
    // MMU stage 1: the fill in flight is a fake one (user fetch from 0xF...)
    logic        if_fake;
-   wire         w_ufz = EN_EXC && umode && miss_dw[28:25] == 4'hF;
+   wire         w_ufz = EN_EXC && fe_um && miss_dw[28:25] == 4'hF;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
 

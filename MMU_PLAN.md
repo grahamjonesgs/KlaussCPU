@@ -83,7 +83,7 @@ Stage 1 protects only the CPU control state and the devices.
 
 ### 3.1 New state
 
-| State | Width | Reset / `start` | Notes |
+| State | Width | After reset | Notes |
 |---|---|---|---|
 | `UM` | 1 | 0 | current mode: 1 = user |
 | `SP_ALT` | 32 | 0 | the inactive stack pointer. In supervisor mode it holds the **user** SP. In user mode it holds the **kernel** SP. Accessed as SR `USP` from supervisor mode. |
@@ -92,16 +92,20 @@ Stage 1 protects only the CPU control state and the devices.
 | `EADDR` | 32 | 0 | fault address or instruction word of the last exception |
 | `SCRATCH0/1` | 64 each | 0 | free for the kernel (per-CPU / current-thread pointer) |
 | `TP` | 64 | 0 | thread pointer, no hardware meaning; read and write in either mode. The kernel context-switches it. |
-| `CYCLE` | 64 | 0 at `rst` only | core cycles since reset, read-only, readable in either mode. It counts every core clock (`ce`), including while parked or debug-halted. `start` does not clear it. |
+| `CYCLE` | 64 | 0 | core cycles since the last reset, read-only, readable in either mode. Every program load resets the core, so in practice this is cycles since the program was loaded. It counts every core clock (`ce`), including while parked or debug-halted. |
 | reservation | 32 + 1 | invalid | LR/SC reservation (§5.1) |
 
 The architectural `SP` (GETSP/SETSP/PUSH/…) is always the current mode's
 stack pointer. The hardware never touches `SP_ALT` except on a mode change,
 so a supervisor-only system never sees it.
 
-`start` (program load) clears `UM`, `EVEC`, `ECAUSE`, `EADDR` and the
-reservation, so a newly loaded program cannot inherit a user mode or a
-vector into the old image. Debugger resume does not clear them.
+Every row above is reset with the core. On core 1 the SoC holds the core
+in reset through every program load (`w_pip_hold_rst` in KlaussCPU.sv), so
+`start` always follows a reset and each program starts with all of this
+state at its reset value. `start` on its own also clears `UM`, `EVEC`,
+`ECAUSE`, `EADDR` and the reservation; it does not clear `SP_ALT`,
+`SCRATCH0/1`, `TP` or `CYCLE`, but on core 1 it never comes alone.
+Debugger resume clears nothing.
 
 ### 3.2 Frame format (extends arch §13.1)
 
@@ -591,9 +595,20 @@ holds copies of I-cache lines. Supervisor fetch is unchanged.
   the RAS push, early load issue and PHT training; DIV and DELAY are reset.
   The squash runs before the SMC and `EN_ST1` squashes, so an older store's
   squash still wins.
-- **User fetch from 0xF…**: the I-cache fill path serves a zero window
-  (no port, no install), and the BTIC never captures a window whose base is
-  in 0xF…, so a zero window can never become a BTIC entry.
+- **User fetch from 0xF…** is a **fake fill**. The miss-issue branch issues
+  it with no DV on the port (`if_fake`). It completes on the next cycle in
+  a branch of its own: zeros into the window, no I-cache install. The
+  0xF… test (`w_ufz`) only steers `m_read_DV`/`if_fake`, which keeps it off
+  the `ic_hit` serve chain. The first build's zero-serve there was its worst
+  path. The BTIC never captures a window whose base is in 0xF…, so a zero
+  window can never become a BTIC entry.
+- **Latch-time predecode** (`w_decf`: `id_ser` and the branch / return
+  predictor bits) is the plain decode, without the MMU overrides. A fetch
+  fault gates the predictor bits where they are used (`id_bp_tk` and the
+  RAS dispatch) with the registered `id_fx`. The overrides' serialize is a
+  parallel OR term (`w_xser`) into `id_ser`. A privileged op is never a
+  branch or a return. The overrides on that predecode cone were the first
+  build's second-worst path.
 - **Wrong-path fetch toward MMIO** could not be constructed in this
   pipeline. While EX is busy nothing new latches into ID, so a wrong-path
   JMP's early redirect only fires on the edge its older branch resolves,
@@ -602,6 +617,18 @@ holds copies of I-cache lines. Supervisor fetch is unchanged.
   unconditional on the fill path. It is tested with a correct-path jump
   and with early fetch behind a DIV (`user_early_fetch`, with a supervisor
   control that does read MMIO).
+- **Fetch-side user mode** (`fe_um`) is `UM`, or an IRET returning to user
+  mode sitting in WB. UM commits at WB, a cycle after the IRET redirected
+  fetch from MEM, and a lookup pending from before the IRET can issue its
+  fill in that cycle. The independent review found that it issued a real
+  fill at a user-mode MMIO target there (test `iret_user_mmio_target`).
+  `fe_um` drives the fill engine's fake-fill decision and the IF→ID latch
+  checks. The EX-side and sequencer uses keep `umode`: nothing is in flight
+  behind a committing IRET (asserted).
+- **BTIC**: capture refuses a window whose base is in 0xF… in supervisor
+  mode too. That is performance-only; no code runs from 0xF….
+- **`start` with an exception entry in progress** (`exc_ent`) is
+  unreachable on core 1: the SoC resets the core before every `start`.
 - **Exception entry** reuses the IRQ sequencer. `exc_ent` marks an
   exception: no abandon, EPC in the frame, EVEC, DI, ECAUSE/EADDR on
   completion.
@@ -618,13 +645,32 @@ holds copies of I-cache lines. Supervisor fetch is unchanged.
 has no use for user mode and its area matters. With `EN_EXC = 0`, the new
 encodings are illegal and nothing else changes.
 
-### 7.9 Cost estimate
+### 7.9 Cost (measured)
 
-Stage 1: about 500 FFs (SP_ALT, EVEC, ECAUSE, EADDR, 2×SCRATCH, TP, CYCLE,
-the reservation, pipe tags)
-and well under 1k LUTs. No BRAM. The timing exposure is the `UM` term on
-the decode/serialize predecode, the MEM-cycle-1 squash term (it joins the
-`fbr_taken` squash family, all registered), and MFSR's result leg.
+The plan estimated about 500 FFs and well under 1k LUTs. Measured:
+
+| Measure | LUTs | FFs |
+|---|---|---|
+| Placed, whole design, vs master (`qspi2` build) | **+2,214** (39,285 → 41,499) | +655 (27,903 → 28,558) |
+| Post-synthesis, `pipeline_core_i` in the design | +1,744 (15,077 → 16,821) | +735 |
+| Out-of-context `pipeline_core`, `EXC_EN` 0 → 1 | **+757** (15,338 → 16,095) | +619 |
+
+The features themselves cost about 760 LUTs, in line with the estimate.
+The rest of the in-design increase is not attributable to a feature: the
+same RTL synthesized in context restructures the timing-critical cones
+(LUT-name families shift by hundreds in both directions, e.g. `ex_c` +664,
+`wb_value` −499), and placement adds timing-driven replication.
+Out-of-context split of the +757 LUTs:
+
+| Feature | LUTs | FFs |
+|---|---|---|
+| User-mode checks: privileged decode, fetch and data access faults | ~216 | ~59 |
+| TP, SCRATCH0/1, CYCLE (registers, MFSR mux, 64-bit counter) | ~111 | ~246 |
+| LR/SC | ~76 | ~0 |
+| The rest: exception ops and records, entry/IRET stack switch, EVEC/ECAUSE/EADDR/USP, MFSR/MTSR | ~354 | ~314 |
+
+No BRAM or DSP. The timing exposure was the fill-serve chain and the
+latch-time predecode (§7.7b). Both are now off the new logic.
 
 ---
 

@@ -30,6 +30,15 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
 `ifdef HAS_PERF_IC
    logic [1:0]   perf_ic;
 `endif
+   // load-hit pipe model (+HIT=<percent>, default 0 = every load takes the
+   // slow path): the address the core presents is answered the cycle after
+   // with the CURRENT memory doubleword.  A store reaches the model's memory
+   // on its ready edge; until then it is on the port, where the core's own
+   // same-line block / store forwarding covers it, as with the real cache.
+   logic [31:0]  h_addr, h_addr_q = '0;
+   logic         h_ok = 1'b0;
+   logic [63:0]  h_dword;
+   int           hit_pct = 0;
    logic         irq_ready;
    logic [1:0]   irq_sel = 2'd0;
    logic [31:0]  irq_vector = 32'h0010_0000;
@@ -63,7 +72,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       .m_rdata_dram(m_rdata),
 `endif
 `ifdef HAS_DCH
-      .h_addr(), .h_ok(1'b0), .h_dword(64'b0),   // no hit pipe: every load takes the slow path
+      .h_addr(h_addr), .h_ok(h_ok), .h_dword(h_dword),   // +HIT=<pct> models hits (default: none)
 `endif
       .m_rdata_next, .m_next_valid, .m_ready,
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
@@ -100,6 +109,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
    endfunction
 
    int lat_fix = 3, lat_rand = 0;
+   assign h_dword = rd_dw({h_addr_q[31:3], 3'b000});
+   always @(posedge clk) begin
+      h_addr_q <= h_addr;
+      h_ok     <= (hit_pct > 0) && (h_addr[31:28] != 4'hF) && (($urandom % 100) < hit_pct);
+   end
    logic        in_flight = 0;
    logic [31:0] q_addr;
    logic        q_wr;
@@ -282,6 +296,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
       void'($value$plusargs("MAXC=%d", maxc));
       void'($value$plusargs("EDW=%h", edw));
+      void'($value$plusargs("HIT=%d", hit_pct));
       // debugger state without a debugger driver (DEBUG_EN builds only)
       if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
 `ifdef HAS_EXC

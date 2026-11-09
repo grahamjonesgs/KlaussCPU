@@ -244,7 +244,7 @@ def cmd_test(a):
             variants = [variants]
         for i, (asm, exp, plus) in enumerate(variants):
             tn = n if len(variants) == 1 else f'{n}.{i}'
-            st, _ = run(exe, asm, tn, plus)
+            st, _ = run(exe, asm, tn, list(plus) + a.plus)
             bad = check(st, exp)
             if 'fatal' in st.get('log', '').lower() or 'assert' in st.get('log', '').lower():
                 bad.append('simulator assertion: ' + st['log'][-500:])
@@ -266,7 +266,7 @@ def cmd_diff(a):
     for s in range(a.seed0, a.seed0 + a.seeds):
         for lat in a.lats:
             asm = randprog.gen(s, **({'irq': True} if a.irq else {}))
-            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={97 + s % 50}'] if a.irq else [])
+            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={97 + s % 50}'] if a.irq else []) + a.plus
             sb, tb = run(base, asm, f'rb{s}_{lat}', plus, trace=True)
             sn, tn = run(new, asm, f'rn{s}_{lat}', plus, trace=True)
             same = sb.get('end') == 'park' and sb.get('kind') == '0' and open(tb).read() == open(tn).read()
@@ -359,7 +359,7 @@ def cmd_excdiff(a):
     fails = n_tot = 0
     for s in range(a.seed0, a.seed0 + a.seeds):
         for lat in a.lats:
-            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else [])
+            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
             sa, _ = run(exe, randprog.gen(s, **({'irq': True} if a.irq else {})), f'xa{s}_{lat}', plus)
             for user in (True, False):
                 asm, n = _exc_variant(s, user, a.p, irq=a.irq)
@@ -426,15 +426,20 @@ def main():
     sub = p.add_subparsers(dest='cmd', required=True)
     b = sub.add_parser('build'); b.add_argument('--rev')
     t = sub.add_parser('test'); t.add_argument('names', nargs='*'); t.add_argument('--rev')
+    # extra plusargs for every run, e.g. --plus +HIT=70 (tb_vsim's hit-pipe model)
+    for sp in (t,):
+        sp.add_argument('--plus', nargs='*', default=[])
     d = sub.add_parser('diff'); d.add_argument('--base', required=True)
     d.add_argument('--seeds', type=int, default=20); d.add_argument('--seed0', type=int, default=1)
     d.add_argument('--lats', type=int, nargs='+', default=[3])
     d.add_argument('--irq', action='store_true'); d.add_argument('-v', '--verbose', action='store_true')
+    d.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('dmtest')
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
     x.add_argument('--seed0', type=int, default=1); x.add_argument('--lats', type=int, nargs='+', default=[3])
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
     x.add_argument('-v', '--verbose', action='store_true')
+    x.add_argument('--plus', nargs='*', default=[])
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
