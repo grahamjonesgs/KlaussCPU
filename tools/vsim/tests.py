@@ -2067,3 +2067,31 @@ def mpu_debugger():
             e['kind'] = '4'          # the closing supervisor HALT is a debug halt
         out.append((a, e, p))
     return out
+
+
+@test
+def mpu_two_access_precedence():
+    """both doublewords of a spanning MEMGET32 / LEAVERET fault for
+    different reasons: the lower one is reported (EADDR = the EA, its
+    GUARD bit), whatever the upper one's cause (MMU_PLAN §10.2 / 424e236)"""
+    E = DATA + 0x100
+    out = []
+    # A: lower dword user-denied (no region), upper = 0xF000_0000 (MMIO rule)
+    def bA(a):
+        a.setr(9, 0xEFFFFFFD); a.setr(3, 0x33); a.ld(32, 3, 9)
+        a.setr(15, 0xEFFFFFF8); a.leaveret()
+    out.append(_mpu(bA, [CODE_RX], True, {'r3': 0x33},
+                    logs=[(X_ACC_LD, 0xEFFFFFFD), (X_ACC_LD, 0xEFFFFFF8)]))
+    # B: lower dword user-denied (granule E has no region), upper a GUARD
+    def bB(a):
+        a.setr(9, E + 0x1D); a.ld(32, 3, 9)
+        a.setr(15, E + 0x18); a.leaveret()
+    out.append(_mpu(bB, [CODE_RX, (1, E + 0x20, E + 0x3F, A_EN | A_G)], True,
+                    logs=[(X_ACC_LD, E + 0x1D), (X_ACC_LD, E + 0x18)]))
+    # C: lower dword a GUARD, upper user-denied
+    out.append(_mpu(bB, [CODE_RX, (1, E, E + 0x1F, A_EN | A_G)], True,
+                    logs=[(G_ | X_ACC_LD, E + 0x1D), (G_ | X_ACC_LD, E + 0x18)]))
+    # D: lower dword fine (R), upper a GUARD: the upper one is reported
+    out.append(_mpu(bB, [CODE_RX, (1, E, E + 0x1F, A_EN | A_R), (2, E + 0x20, E + 0x3F, A_EN | A_G)], True,
+                    logs=[(G_ | X_ACC_LD, E + 0x20), (G_ | X_ACC_LD, E + 0x20)]))
+    return out
