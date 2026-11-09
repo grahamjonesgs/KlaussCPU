@@ -29,7 +29,8 @@ def git_show(rev, path):
 def build(rev=None, quiet=True):
     dbg = os.environ.get('VSIM_DEBUG_EN') == '1'     # elaborate DEBUG_EN=1
     noexc = os.environ.get('VSIM_EXC_EN') == '0'     # elaborate EXC_EN=0 (core 2's MMU-less core)
-    tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '')
+    mpu = os.environ.get('VSIM_MPU_EN') == '1'       # elaborate MPU_EN=1 (off on the A7)
+    tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -44,7 +45,7 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc)).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -56,6 +57,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_EXC')
         if noexc:
             defs.append('-GEXC_EN=0')
+    if mpu and 'parameter bit MPU_EN' in core:
+        defs += ['+define+HAS_MPU', '-GMPU_EN=1']
     if 'm_rdata_dram' in core:
         defs.append('+define+HAS_RDATA_DRAM')
     if 'input  logic [63:0]  h_dword' in core:
@@ -664,13 +667,13 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x10FF = stage 1 +
-    # LR/SC + the 16-region MPU + the 16-entry TLB
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x100D = stage 1 +
+    # LR/SC + the 16-entry TLB, no MPU (the Nexys A7 build)
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=00000000000010ff' not in last:
+    if 'r2=000000000000100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')

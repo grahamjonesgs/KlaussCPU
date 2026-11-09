@@ -33,7 +33,9 @@ module KlaussCPU #(
     // MFSR/MTSR, LR/SC.  Reported in CPU_FEATURES (0xF00F_0048).
     parameter bit CORE1_EXC_EN = 1'b1,
     // MMU stage 2 (the 16-region MPU) on core 1.  CPU_FEATURES[1], [7:4].
-    parameter bit CORE1_MPU_EN = 1'b1,
+    // An optional build feature: off on the Nexys A7 for timing margin
+    // (Graham, 2026-11-09; Zephyr runs in supervisor mode).
+    parameter bit CORE1_MPU_EN = 1'b0,
     // MMU stage 3 (the TLB, TE) on core 1.  CPU_FEATURES[2], [15:8].
     parameter bit CORE1_TLB_EN = 1'b1,
     // its entry count: 16 on this part (MMU_PLAN.md §11.5)

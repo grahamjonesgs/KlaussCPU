@@ -43,9 +43,11 @@ module pipeline_core
    // MTSR, LR/SC.  0 = the new encodings trap as illegal and nothing else
    // changes (core 2 builds it off).
    parameter bit EXC_EN = 1'b1,
-   // MMU_PLAN.md stage 2: the 16-region MPU (needs EXC_EN).  0 = its SRs
-   // are illegal and nothing else changes (core 2 builds it off).
-   parameter bit MPU_EN = 1'b1,
+   // MMU_PLAN.md stage 2: the 16-region MPU (needs EXC_EN), an optional
+   // build feature.  0 = its SRs are illegal, STATUS[8] reads 0, no MPU
+   // checks or extra EX cycle, ECAUSE[8] = 0.  Off on the Nexys A7 (timing
+   // margin; Graham, 2026-11-09) and on core 2.
+   parameter bit MPU_EN = 1'b0,
    // MMU_PLAN.md stage 3: the 32-entry software-refilled TLB, TE (needs
    // EXC_EN).  0 = its SRs and instructions are illegal (core 2: off).
    parameter bit TLB_EN = 1'b1,

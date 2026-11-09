@@ -13,6 +13,18 @@ def test(fn):
     return fn
 
 
+# the MPU is an optional build feature, off on the Nexys A7: its tests run
+# only in a VSIM_MPU_EN=1 build (run.py elaborates MPU_EN=1 then)
+import os as _os0
+MPU = _os0.environ.get('VSIM_MPU_EN') == '1'
+
+
+def mpu_test(fn):
+    if MPU:
+        ALL[fn.__name__] = fn
+    return fn
+
+
 def m(addr):
     return f'm{addr:08x}'
 
@@ -838,7 +850,9 @@ def sr_roundtrip():
     a.mtsr('status', 1)              # [8] MPU_EN only ([9] TE would translate the next fetch)
     a.mfsr(10, 'status')
     a.halt()
-    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0x100, 'r9': 'nonzero'}
+    # (STATUS[8] reads 0 and ignores writes in an MPU-less build)
+    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0x100 if MPU else 0,
+           'r9': 'nonzero'}
     # (ECAUSE is 9 bits: [8] GUARD, stage 2)
     want = {'evec': 0x12345674, 'ecause': 0x1A5, 'eaddr': 0xDEADBEEF, 'usp': 0x07F00010,
             'scratch0': 0x0123456789ABCDEF, 'scratch1': 0xFEDCBA9876543210, 'tp': 0x1122334455667788}
@@ -1789,7 +1803,7 @@ def _mpu(body, regions, user=True, exp=None, plus=(), mpu=True, logs=()):
     return a, e, list(plus)
 
 
-@test
+@mpu_test
 def mpu_sr_access():
     """reset values, BASE/LIMIT read-back (LIMIT[4:0] read 0), STATUS[8],
     and the MPU SRs are privileged in user mode"""
@@ -1820,7 +1834,7 @@ def mpu_sr_access():
     return a, exp, []
 
 
-@test
+@mpu_test
 def mpu_guard_both_modes():
     """a GUARD region denies loads and stores in either mode and sets
     ECAUSE[8]; neighbouring granules are fine; in supervisor mode a GUARD
@@ -1845,7 +1859,7 @@ def mpu_guard_both_modes():
     return out
 
 
-@test
+@mpu_test
 def mpu_user_default_deny_union():
     """user mode: no covering grant = deny (ECAUSE[8] = 0); regions combine
     as a union (an R-only and a W-only region over the same bytes = RW); a
@@ -1864,7 +1878,7 @@ def mpu_user_default_deny_union():
     return _mpu(body, regs, True, {'r4': 0x5A, m(DATA): 0x5A, 'r5': 0, 'r7': 0}, logs=logs)
 
 
-@test
+@mpu_test
 def mpu_access_types():
     """per access type: R / W for loads / stores incl. stack ops by
     direction, LR (R) and SC (W); X does not grant data"""
@@ -1898,7 +1912,7 @@ def mpu_access_types():
     return _mpu(body, regs, True, {'r5': 0, 'r6': 0, 'r8': RO + 0x38, m(WO + 0x20): 0x77}, logs=logs)
 
 
-@test
+@mpu_test
 def mpu_two_access_edge():
     """MEMGET32 spanning two doublewords and LEAVERET at a region edge:
     both doublewords are checked; a denial of only the 2nd reports its
@@ -1924,7 +1938,7 @@ def mpu_two_access_edge():
     return out
 
 
-@test
+@mpu_test
 def mpu_fetch():
     """X for fetch: an instruction straddling the end of the X region faults
     at the 2nd granule's start; a jump into a non-X region faults at the
@@ -1957,7 +1971,7 @@ def mpu_fetch():
     return out
 
 
-@test
+@mpu_test
 def mpu_fetch_guard_super():
     """supervisor mode: a GUARD over the next instruction faults its fetch
     (ACCESS_FETCH, ECAUSE[8]); MTSR STATUS takes effect from the very next
@@ -1989,7 +2003,7 @@ def mpu_fetch_guard_super():
                m(FLOG + 0x30): G_ | X_ACC_LD, m(FLOG + 0x38): DATA, m(XD + 32): 2}, []
 
 
-@test
+@mpu_test
 def mpu_frame_push_unchecked():
     """entry's frame push is not checked: a SYSCALL with SP just above a
     GUARD pushes its frame into the guard; the vector (which must not touch
@@ -2008,7 +2022,7 @@ def mpu_frame_push_unchecked():
                m(GOOD - 8): at + 4}, []
 
 
-@test
+@mpu_test
 def mpu_mtsr_region_next():
     """an MTSR to a region applies to the very next instruction's access"""
     a = Asm()
@@ -2026,7 +2040,7 @@ def mpu_mtsr_region_next():
                m(FLOG): G_ | X_ACC_LD, m(XD + 32): 1}, []
 
 
-@test
+@mpu_test
 def mpu_limit_edges():
     """LIMIT is the last granule, inclusive; [4:0] of BASE/LIMIT do not
     move the edges; LIMIT < BASE covers nothing"""
@@ -2045,7 +2059,7 @@ def mpu_limit_edges():
     return _mpu(body, regs, True, logs=logs)
 
 
-@test
+@mpu_test
 def mpu_off():
     """regions set but MPU_EN = 0: no MPU decision in either mode"""
     def body(a):
@@ -2055,7 +2069,7 @@ def mpu_off():
     return _mpu(body, regs, True, {'r4': 0x5A}, mpu=False)
 
 
-@test
+@mpu_test
 def mpu_debugger():
     """with the debugger attached, an MPU ACCESS fault goes to EVEC with or
     without EXC_PASS (only ILLEGAL / TRAP / MISALIGNED debug-halt)"""
@@ -2071,7 +2085,7 @@ def mpu_debugger():
     return out
 
 
-@test
+@mpu_test
 def mpu_two_access_precedence():
     """both doublewords of a spanning MEMGET32 / LEAVERET fault for
     different reasons: the lower one is reported (EADDR = the EA, its
@@ -2536,7 +2550,7 @@ def lcd_sq_spec_once():
     return out
 
 
-@test
+@mpu_test
 def wp_mpu_denied_load():
     """review 2 #2: a read watchpoint on a dword whose load the MPU denies
     (GUARD) must not fire: the load takes ACCESS_LOAD|GUARD and the program
@@ -2602,7 +2616,7 @@ def mmio_fetch_no_device_read():
     ACCESS_FETCH|GUARD; MPU on, no region there: zeros (ILLEGAL); TE = 1:
     zeros (ILLEGAL).  MPU and TE off: the fill reads the device, as before."""
     out = []
-    for mode in ('guard', 'mpu', 'te', 'off'):
+    for mode in (('guard', 'mpu') if MPU else ()) + ('te', 'off'):
         a = Asm()
         _xsetup(a)
         if mode == 'guard':
@@ -2702,3 +2716,28 @@ def div_by_zero_operand_paths():
                         'r7': 0xFFFFFFFFFFFFFFFF, 'r8': 100, 'r9': 0xFFFFFFFFFFFFFFFF,
                         'r10': 0, 'r11': 14}, plus))
     return out
+
+
+
+@test
+def mpu_absent():
+    """MPU-less build (the Nexys A7): MFSR / MTSR of SRs 0x10-0x2F are
+    ILLEGAL (unimplemented SRs, §6.1), STATUS[8] reads 0 and ignores writes
+    (MFSR STATUS and GETST), and no MPU check happens.  In an MPU build:
+    the SRs work"""
+    a = Asm()
+    _xsetup(a)
+    a.setr(1, DATA | 0x0E); a.setr(3, 0)     # (X W R, not EN)
+    a.mtsr('mpu_base0', 1)                   # ILLEGAL without the MPU
+    a.mfsr(3, 'mpu_base0')                   # ILLEGAL
+    a.mfsr(4, 'mpu_limit15')                 # ILLEGAL (0x2F)
+    a.setr(1, 0x100); a.mtsr('status', 1); a.mfsr(5, 'status')
+    a.setr(12, DATA); a.setr(6, 0x66); a.st(64, 6, 12); a.ld(64, 7, 12)   # unchecked
+    a.halt()
+    _xhandler(a)
+    if MPU:
+        exp = {'end': 'park', 'kind': '0', 'r3': DATA | 0x0E, 'r4': 0, 'r5': 0x100, 'r7': 0x66}
+    else:
+        exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 0, 'r7': 0x66,
+               m(XD): X_ILL, m(XD + 32): 3}
+    return a, exp, []
