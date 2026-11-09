@@ -584,8 +584,10 @@ accesses, and I-cache fills. The stage 1 user-mode MMIO rule applies first;
 in supervisor mode a GUARD over MMIO also denies. Reset clears every region
 and MPU_EN.
 
-Cost while MPU_EN = 1: MEMGET32, LEAVERET and IRET lose their early issue
-(about one cycle each). With MPU_EN = 0, timing is as before.
+Cost while MPU_EN = 1: every memory instruction (loads, stores, stack
+ops, CALL, LR/SC) spends one extra cycle in EX for the region check, and
+MEMGET32, LEAVERET and IRET lose their early issue. That measured +2.7 %
+cycles on random user-mode code. With MPU_EN = 0, timing is as before.
 
 ---
 

@@ -857,17 +857,24 @@ The stage 1 user-mode MMIO rule (§3.6) still applies first. In supervisor
 mode, GUARD regions also cover MMIO. Cause priority stays as in §4.1: an
 MPU denial is an ACCESS_* fault.
 
-### 10.3 Pipeline (as built, `d546911`)
+### 10.3 Pipeline (as built, `d546911` + `da8c085`)
 
 - **State**: `mmu_mpu` (in `pipeline_core.sv`) holds 16 × {BASE[31:5],
   GUARD/X/W/R/EN, LIMIT[31:5]} and MPU_EN in flops (944 + 1). It is written
   by an MTSR to 0x10–0x2F or STATUS as it commits at WB. MTSR serializes,
   so the next instruction, including its fetch, sees the change. MFSR
-  reads it at dispatch. The MFSR value is selected between `mmu_sr` and
+  reads it at dispatch, from a LUTRAM copy with a valid flop per SR (area:
+  not a 32:1 mux of the flops). The MFSR value is selected between `mmu_sr` and
   `mmu_mpu` by SR[7:4]. `mmu_sr`'s writes (and USP's) are gated on
   SR[7:4] = 0, because its low-nibble decode would alias 0x13 to EADDR.
 - **Data**: 16 × 2 magnitude compares on the EA's granule (EA[31:5]) in
-  EX. For a two-access op (MEMGET32 spanning two doublewords, LEAVERET;
+  EX. **While MPU_EN = 1, a memory op (`dec.is_mem`) spends one extra cycle
+  in EX** (`ex_busy`, from registered terms only). The EA is registered
+  (`ex_ea_q`) in the first cycle, and the compares run from that register
+  in the second. So the EA adder and the compares are never in series: the
+  first build with them in series (`d546911`) missed by 0.76 ns on exactly
+  that path. Cost: +2.7 % cycles on user-mode random programs with the MPU
+  on; with MPU_EN = 0, nothing changes. For a two-access op (MEMGET32 spanning two doublewords, LEAVERET;
   both have EA = `ex_a`) whose 2nd doubleword is in the next granule
   (`ex_a[4:3] = 11`), that granule g+1 is decided from the same compares
   plus two equalities per region: BASE ≤ g+1 ⇔ BASE ≤ g ∨ BASE = g+1, and
@@ -889,8 +896,7 @@ MPU denial is an ACCESS_* fault.
   MMIO rule did (that rule applies first) or a user default-deny did.
 - **Early load issue** (MEMGET32, LEAVERET, IRET) is off while MPU_EN = 1:
   its decision is on the EX→MEM enables, which the MPU decision must not
-  reach. So with the MPU on, those loads issue from MEM, a cycle later.
-  With MPU_EN = 0 nothing changes (cycle-identical).
+  reach. With MPU_EN = 0 nothing changes (cycle-identical).
 - **Not checked**: entry's frame push; debugger accesses; I-cache fills and
   prefetches, which only read. A user fetch from `0xF…` is still a fake
   fill (§7.7b).
