@@ -85,6 +85,7 @@ localparams).
 | 08  | `ERR_SEG_EXEC_DATA`    | Execute from the data segment. |
 | 09  | `ERR_TRAP`             | Software `TRAP` opcode (`0xF014`). |
 | 0A  | `ERR_MISALIGN`         | Misaligned 16-bit (odd address) or 32-bit (not 4-aligned) load/store; `MEMGET32`, byte, 64-bit and stack accesses are exempt (pipeline park kind 5). `PC`/`OPC` are the faulting access; it did not execute, so `T0` is the instruction before it. |
+| 0B  | `ERR_DFAULT`           | DOUBLE_FAULT (MMU stage 3, pipeline park kind 6): with `STATUS.TE` = 1 an exception or interrupt entry found SP − 8 outside kseg (`0x8000_0000–0x87FF_FFFF`), so its frame could not be pushed. `PC` is the faulting instruction (the exception's EPC) or the interrupted one; `ECAUSE` / `EADDR` / `TLB_HI` were not written. |
 
 ## Reading a dump
 

@@ -903,7 +903,8 @@ before).
   reach. With MPU_EN = 0 nothing changes (cycle-identical).
 - **Not checked**: entry's frame push; debugger accesses; I-cache fills and
   prefetches, which only read. A user fetch from `0xF…` is still a fake
-  fill (§7.7b).
+  fill (§7.7b), and so, with MPU_EN = 1, is a supervisor one (review 2:
+  no fetch may read a device the MPU would deny; the cheap rule).
 - **Build switches**: the module parameter `MPU_EN` (on; off on core 2),
   and `EN_MPU = EXC_EN && MPU_EN`. KlaussCPU's `CORE1_MPU_EN` drives
   CPU_FEATURES[1] and [7:4] = 15.
@@ -931,7 +932,7 @@ address.
 | C. **64 KiB pages**, virtually indexed and physically tagged | **none**: every index bit is inside the page offset, so the cache is indexed exactly as now and only the tag compare uses the translated frame | 64 KiB allocation granularity: 2048 frames in 128 MiB; each xv6 process needs at least ~4 pages (256 KiB); Linux page cache in 64 KiB units | **chosen** |
 | D. 32 KiB pages | none | Linux supports 32 KiB only on MIPS. 64 KiB is mainstream (arm64, ppc64, LoongArch) | no; 64 KiB also leaves room for a D-cache with larger ways |
 
-Side benefit: 32 entries × 64 KiB = 2 MiB TLB reach.
+Side benefit: 16 entries × 64 KiB = 1 MiB TLB reach (32 entries: 2 MiB).
 
 Linux implications: `PAGE_SIZE` 64 KiB, `PAGE_OFFSET` `0x8000_0000`,
 `TASK_SIZE` `0x8000_0000`, no highmem (128 MiB fits in the 1 GiB direct
@@ -974,8 +975,12 @@ segment). The page-table format is entirely software's choice (soft TLB).
 
 ### 11.3 TLB programmer's model
 
-- **Size:** 32 entries, fully associative. `CPU_FEATURES[2]` = 1, and
-  `CPU_FEATURES[15:8]` = 32.
+- **Size:** fully associative; the entry count N is a build parameter:
+  **16 on the xc7a100t** (§11.5, area), 32 or 64 on a bigger part.
+  `CPU_FEATURES[2]` = 1, and `CPU_FEATURES[15:8]` = N (16).
+- **TLB_INDEX width:** log2 N bits, `[3:0]` with 16 entries. The bits above
+  them (`[4]` with 16 entries) are ignored on write and read 0. Below,
+  `TLB_INDEX[4:0]` means those log2 N bits.
 - **Entry:** VPN `[15:0]` (= VA[31:16]), ASID `[7:0]`, G, PFN `[10:0]`, V, R,
   W, X.
 - **Match:** an entry matches VA when V = 1, its VPN = VA[31:16], and (G = 1
@@ -994,7 +999,7 @@ System registers (supervisor only):
 |---|---|---|
 | `0x30` | `TLB_HI` | `[31:16]` VPN, `[8]` G, `[7:0]` ASID |
 | `0x31` | `TLB_LO` | `[26:16]` PFN, `[3]` X, `[2]` W, `[1]` R, `[0]` V |
-| `0x32` | `TLB_INDEX` | `[4:0]` entry index; `[31]` P = the last TLBP found no match |
+| `0x32` | `TLB_INDEX` | `[4:0]` entry index (`[3:0]` with 16 entries; `[4]` ignored, reads 0); `[31]` P = the last TLBP found no match |
 | `0x33` | `ASID` | `[7:0]` current address-space ID |
 | `0x34` | `TLBVEC` | vector for TLB_MISS_* exceptions; 0 = use `EVEC` |
 | `0x00` | `STATUS` | `[9]` TE |
@@ -1070,6 +1075,10 @@ today. Debugger memory accesses use physical addresses.
 
 ### 11.4 Pipeline approach
 
+*As built (§11.5), the data lookup runs off the registered EA in the MPU's
+extra EX cycle instead of the base-register lookup with a MEM replay below;
+§11.5 says why.*
+
 **Decision (2026-11-09): look up the base register, not the EA.** In an
 out-of-context Vivado experiment on xc7a100t at 10 ns (32 entries; VPN,
 ASID and G compare; PFN and permission mux into flops):
@@ -1122,6 +1131,146 @@ base in EX, with the MEM replay above".
 - **Frame pushes are not translated.** With `TE = 1` the kernel SP must be
   in the direct segment. Otherwise the core takes a double fault and parks
   with `park_kind` 6. Linux: no `VMAP_STACK`.
+
+### 11.5 Pipeline (as built, stage 3: `7670218` onwards)
+
+- **Data lookup: the MPU's extra EX cycle, not the base-register replay.**
+  §11.4 chose a base-register lookup with a MEM replay on a page crossing.
+  Stage 2 then built the extra EX cycle (`ex_mpu_hold`): the EA is
+  registered (`ex_ea_q`) in the first cycle and the checks run from that
+  register in the second, so the EA adder and the CAM are never in series
+  — exactly the path the replay was meant to avoid, closed by a pattern
+  that already met timing. With TE = 1 the TLB's data CAM runs in that same
+  cycle, off `ex_ea_q`. That was the cheaper choice: no replay state in MEM
+  (the port engine, hit pipe, posted stores and STLF all live there and
+  are the tightest logic in the core), the access-fault bit of §7.1 is
+  reused as is, and there is no compiler ABI rule (pointer in rs1). Cost:
+  one cycle per memory instruction while TE = 1, as for the MPU. A
+  two-access op whose 2nd doubleword is in the next page (`ex_xpg`:
+  LEAVERET, or a spanning MEMGET32, with `ex_a[15:3]` all ones) takes a
+  third EX cycle with `ex_ea_q` stepped to the next page, translating both
+  pages before either access; the 2nd read uses the registered `mem_pa2hi`.
+- **Data side, VIPT.** MEM gets the PA (`mem_iaddr` = {PFN, VA[15:0]}); the
+  D-cache indexes with VA bits as before and the hit pipe compares
+  `h_addr` (the PA). Stores and MMIO decisions use VA[31:28]. Self-modifying
+  -code squashes compare VAs (`mem_eaddr`); the I-cache store snoop compares
+  PA tags. The LR/SC reservation holds the VA (`wb_va_dw`); every TLB / ASID
+  / TE change clears it.
+- **STLF with TE = 1.** The in-flight-store *block* compares the page offset
+  only (conservative for aliases). A *forward* needs the youngest
+  offset-matching store's VA page to equal the load's (`mem_eaddr`, or
+  `m_vahi` / `sq_vahi` for the store on the port / queued, valid only for
+  stores issued from MEM and dropped on a TLB / ASID / TE change). Without
+  it, STLF was off with TE and every POP / LEAVE behind a PUSH / ENTER on a
+  kseg stack (always VA ≠ PA) waited for the store: +5.1 % instead of
+  +1.5 %.
+- **Fetch: a one-entry micro-ITLB.** {VPN, fetch mode, PA[31:16], verdict,
+  miss}. It is read alongside the I-cache BRAM into `r_look_*`, so the
+  I-cache tag compare ({`r_look_pa`, VA[15:13]} against the stored PA tag)
+  reads registers only; the prefetch's compare too. A lookup whose page it
+  does not cover (in the current fetch mode) stalls while `it_ref` refills
+  it from the TLB's second (fetch) port in one cycle — a TLBP committing
+  that cycle owns the port. The verdict applies §11.2 for the fetch mode:
+  user at `0x8000_0000+` and the supervisor hole are segment faults; useg /
+  kmap need a matching entry with X; kseg is direct; MMIO is identity. A
+  refused page is a **fake fill** (zeros, nothing on the port) with a
+  per-slot fault tag (`ifb_ft` / `ifb_fm`). So fetch never puts an
+  untranslated or faulting useg / kmap address on the port, speculatively
+  or not. The IF→ID latch decides the fetch fault from the pc segment rule
+  (first) and the tags: TLB_MISS_FETCH or ACCESS_FETCH, `EADDR` = pc, or the
+  next page's start for an instruction straddling into a refused page; a
+  TLB-related one loads `TLB_HI`. The NLB is only filled from translated
+  hits and the BTIC never captures a tagged window. The micro-ITLB is
+  dropped by a TLB / ASID / TE change, program load and debugger resume.
+  With TE = 1, as with MPU_EN = 1, a fetch fill to `0xF…` is always a fake
+  fill: supervisor code at MMIO runs as zeros (ILLEGAL). Fetching from a
+  device is meaningless, and a stray or wrong-path fetch must not pop a
+  device FIFO (review 2 #1).
+- **Discard.** TLBWI, TLBINV, MTSR ASID and MTSR STATUS clear the window,
+  NLB, prefetch, BTIC, micro-ITLB and the reservation, and drop a fill in
+  flight from the window (`if_drop`; it still installs, physically
+  tagged). They serialize, so the next instruction is fetched under the
+  new state.
+- **Frame push** (§11.3): PA = SP − 8 − `0x8000_0000`; SP − 8 not in kseg
+  parks with kind 6 (HCF `ERR_DFAULT` 0x0B; a debug halt, cause TRAP, when a
+  debugger is attached). Neither writes ECAUSE / EADDR / TLB_HI.
+- **Watchpoints** compare PAs (`mem_iaddr`, `h_addr`), like debugger memory
+  accesses.
+- **Entry count: 16 on the xc7a100t** (decision 2026-11-09, with the
+  runtime). With 32 entries the core missed timing by about 0.3 ns after
+  every design-level fix: the stage 3 area (+2.7k LUTs over stage 2, the
+  TLB 1.4k of it) tipped long-standing stage 2 paths, and the data CAM
+  path itself, over the edge (§11.6). 16 entries was chosen over sharing
+  one CAM between the data and fetch ports, because:
+  - the kernel runs in untranslated kseg, so the TLB maps only user pages
+    and kmap, and 16 × 64 KiB = 1 MiB of reach is ample (four times an
+    R3000's);
+  - it saves about twice the area of sharing, and congestion is what
+    failed;
+  - it is a parameter change, with no new EX hold or stall logic.
+  The count is the parameter `TLB_N` (`CORE1_TLB_N` in KlaussCPU); 32 or 64
+  fit a bigger part. CPU_FEATURES[15:8] reports it, and TLB_INDEX uses
+  log2 N bits (§11.3).
+- **Build switches**: the module parameter `TLB_EN` (on; off on core 2) and
+  `EN_TLB = EXC_EN && TLB_EN`. KlaussCPU's `CORE1_TLB_EN` drives
+  CPU_FEATURES[2] and [15:8] = the entry count; `TLB_N` / `CORE1_TLB_N`
+  = 16 here, so CPU_FEATURES = 0x10FF.
+- **Compatibility**: with TE = 0 the core is cycle-identical to the stage 2
+  head `7893230` (diff, --irq, +HIT, EXC_EN = 0, socdiff).
+- **Cost** (60 randprog seeds, every page mapped; STATUS the only
+  difference): TE = 1 +1.52 % supervisor, +1.87 % user; +2.17 % / +2.42 %
+  with the hit-pipe model. MPU_EN = 1 on the same programs: +1.36 %.
+- **Tests**: `tests.py` `tlb_*` (SRs and ops, privilege, each segment,
+  misses / permissions / ASID / G, TLBVEC, TLB_HI auto-load, two-access
+  ops across pages, DOUBLE_FAULT, fetch through kseg / kmap / useg and its
+  faults, a straddle into an unmapped page, user fetch rules, code written
+  through kseg and run through a useg alias after ICACHE_INV, TE turned on
+  with no entry and refilled by a handler, STLF across aliases);
+  `run.py tlbdiff` runs random user programs translated (code at a
+  non-identity VA, an empty TLB, a kseg refill handler over K entries,
+  injected SYSCALLs bumping ASID / TLBINV, optional IRQs) and the final
+  state must equal the physical run's. K = 1 would livelock by design (a
+  load needs its code and data pages at once); with IRQs K ≥ 4, since K = 2
+  starves at the TB's IRQ rate (it completes at a 1500-cycle period).
+
+### 11.6 Timing closure (stage 3, 2026-11-09)
+
+Goal: WNS ≥ 0 with the standard `build_fast` flow by design changes,
+CPI-neutral, with TE = 0 cycle-identical to the stage 2 head `7893230`.
+Every change below passed the full sim set. "Median" is over three
+placements of the same netlist: the standard flow plus `build_alt_place`
+with ExtraPostPlacementOpt and ExtraTimingOpt. It is used only to judge a
+change (the spread between placements is about ±0.2 ns), never to pick
+the shipped bitstream.
+
+| Build | Commit | Change | Tier 1 WNS | Final WNS / TNS | Median | LUTs | FFs |
+|---|---|---|---|---|---|---|---|
+| stage 2 (`mmu-m2`) | `da8c085` | — | −0.128 | **+0.016** / 0 | | 42,449 | 29,486 |
+| `mmu3` | `16bfb10` | stage 3, 32 entries | −0.646 | −0.621 / −76.2 | | 45,302 | 31,115 |
+| `mmu3b` | `534794f` | registered exception vector; one fetch-port CAM on registers; `xlt_q`; I-cache reference-tag mux; `keep_hierarchy` on `mmu_tlb` | −0.316 | −0.305 / −8.1 | | 45,116 | 31,146 |
+| `mmu3c` | `48e9b47` | TLB writes a cycle after commit; `ex_xpg_q` | −0.427 | −0.347 / −16.9 | | 44,638 | 31,068 |
+| `mmu3d` | `daee899` | + `wb_rfch`; **16 entries** | −0.173 | −0.161 / −2.3 | | 43,743 | 30,475 |
+| `mmu3e` | `1b87316` | STLF page compare from `ex_ea_q`; `ex_mok` | −0.392 | −0.262 / −5.9 | −0.262 | 43,603 | 30,549 |
+| `mmu3f` | `8f4ad33` | SMC hit-latch test without the pc adder | −0.048 | −0.013 / −0.01 | −0.184 | 44,619 | 30,657 |
+| `mmu3g` | `f9d4aac` | RAS miss as compare-then-select | −0.417 | −0.398 / −34.6 | −0.165 | 44,743 | 30,710 |
+| `mmu3i` | `875296e` | + `keep_hierarchy` on `mmu_mpu`; registered `ex_b_zero` | −0.200 | −0.106 / −1.4 | | 43,828 | 30,302 |
+
+- **What failed and why.** The first build's worst paths ran through new
+  stage 3 legs on old near-critical cones: TLBVEC in the `pc` mux behind
+  the RAS-miss compare, the TLBP probe select from the WB commit (which
+  waits on the bus) in front of the fetch-port CAM, the TLBWI enable fanned
+  out to every entry, `MPU_EN ∨ TE` and the page-crossing term in
+  `ex_busy` / the early-issue enable, and the exact-VA STLF check on the
+  EA adder. Each was taken back to the inputs it had at stage 2. What was
+  left were stage 2 paths (the `pc` next-value mux, the SMC hit latch, the
+  RAS-miss compare, DIV's zero test → the fill-issue enable, the `pos`
+  tracker, the hit pipe), tipped over by stage 3's area. That is why the
+  entry count went to 16 (§11.5) and why the later steps are stage 2
+  walls. They are fixed exactly and CPI-neutrally, and also buy margin for
+  master.
+- **Synthesis folding.** Without `keep_hierarchy`, synthesis placed core
+  logic inside `mmu_tlb` (`pc`-mux LUTs) and `mmu_mpu` (`id_ser`, the
+  multiplier). Both are kept now, like `mmu_sr`.
 
 ---
 

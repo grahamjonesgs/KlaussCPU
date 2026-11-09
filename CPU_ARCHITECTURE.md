@@ -581,13 +581,83 @@ checked at every granule it occupies. What is not checked: entry's frame
 push (leave one frame of slack below a guard; a guard-safe vector must not
 touch memory before it knows SP is safe; MMU_PLAN.md §10.2), debugger
 accesses, and I-cache fills. The stage 1 user-mode MMIO rule applies first;
-in supervisor mode a GUARD over MMIO also denies. Reset clears every region
-and MPU_EN.
+in supervisor mode a GUARD over MMIO also denies. With MPU_EN = 1 an
+instruction fetch never reads MMIO, even in supervisor mode: code at
+`0xF…` runs as zeros (ILLEGAL), or raises ACCESS_FETCH with GUARD where a
+GUARD region covers it. Reset clears every region and MPU_EN.
 
 Cost while MPU_EN = 1: every memory instruction (loads, stores, stack
 ops, CALL, LR/SC) spends one extra cycle in EX for the region check, and
 MEMGET32, LEAVERET and IRET lose their early issue. That measured +2.7 %
 cycles on random user-mode code. With MPU_EN = 0, timing is as before.
+
+### 13.4 TLB and paging (MMU stage 3)
+
+A 16-entry (a build parameter; 16 on this part), fully associative,
+software-refilled TLB with **64 KiB
+pages** (MMU_PLAN.md §11). `STATUS[9]` TE turns translation on. With TE =
+0 every address is physical and the MPU applies; with TE = 1 the MPU is
+ignored and the address map is:
+
+| VA | Mode | Translation |
+|---|---|---|
+| `0x0000_0000–0x7FFF_FFFF` useg | user + supervisor | TLB |
+| `0x8000_0000–0x87FF_FFFF` kseg | supervisor | direct: PA = VA − `0x8000_0000` |
+| `0x8800_0000–0xBFFF_FFFF` | — | ACCESS_* fault |
+| `0xC000_0000–0xEFFF_FFFF` kmap | supervisor | TLB |
+| `0xF000_0000–0xFFFF_FFFF` MMIO | supervisor | identity, uncached |
+
+Any user access at or above `0x8000_0000` raises ACCESS_*. A TLB entry
+is {VPN = VA[31:16], ASID, G, PFN = PA[26:16], V, R, W, X}. It matches
+when V = 1, VPN matches, and G = 1 or its ASID equals SR `ASID`. R / W / X
+gate loads / stores / fetches in both modes. TLB entries map DDR only, so
+"is MMIO" is always decided from VA[31:28].
+
+| SR | Name | Contents |
+|---|---|---|
+| `0x30` | `TLB_HI` | `[31:16]` VPN, `[8]` G, `[7:0]` ASID |
+| `0x31` | `TLB_LO` | `[26:16]` PFN, `[3]` X, `[2]` W, `[1]` R, `[0]` V |
+| `0x32` | `TLB_INDEX` | `[3:0]` index (16 entries; `[4]` ignored, reads 0); `[31]` P = the last TLBP missed |
+| `0x33` | `ASID` | `[7:0]` |
+| `0x34` | `TLBVEC` | vector for TLB_MISS_*; 0 = use `EVEC` |
+
+Instructions (privileged, serializing): `TLBWI` (entry[INDEX] ← HI/LO),
+`TLBR` (HI/LO ← entry[INDEX]), `TLBP` (search for HI's VPN/ASID: INDEX
+← hit index, or P = 1), `TLBINV` (V ← 0 everywhere).
+
+Faults: no matching entry raises TLB_MISS_LOAD / _STORE / _FETCH (11 /
+12 / 13), vectored to `TLBVEC` when it is nonzero, else `EVEC`. A matching
+entry without the permission raises ACCESS_*. Both set `EADDR` to the VA
+and load `TLB_HI` ← {VPN, G = 0, ASID}, so a refill handler only writes
+`TLB_LO`, picks an index and runs `TLBWI`. Priority per access:
+MISALIGNED > segment ACCESS > TLB_MISS > TLB permission ACCESS; a
+two-access instruction reports its lower doubleword first. The refill
+handler, `EVEC` / `TLBVEC` targets, every page table the handler reads, and
+every kernel stack must be in kseg, so the refill path never misses
+(there is no hardware guard against a nested miss).
+
+Exception entry pushes its frame **untranslated** at PA = SP − 8 −
+`0x8000_0000`: SP − 8 must be in kseg, or the core parks with
+`park_kind` 6, DOUBLE_FAULT (HCF `ERR=0B`; a debug halt when a debugger
+is attached). `TLBWI`, `TLBINV`, MTSR `ASID` and MTSR `STATUS` discard the
+fetch side's virtual copies (window, next-line buffer, BTIC, the
+micro-ITLB) and clear the LR/SC reservation; the caches are physically
+tagged and stay. Code written through a different mapping than it runs
+from (a kernel writing user text through kseg) needs ICACHE_INV.
+Debugger memory accesses and watchpoints use physical addresses.
+
+Implementation (MMU_PLAN.md §11.4): the I-cache and D-cache are VIPT (64
+KiB pages keep every index bit untranslated). Data accesses are
+translated in the same extra EX cycle the MPU uses (a third for a
+two-access op crossing a page); fetch goes through a one-entry micro-ITLB
+refilled from the TLB in one cycle, and a refused page is served as a
+fault-tagged window, so no untranslated or faulting address ever reaches
+memory. With TE = 1 a fetch never reads MMIO. Cost while TE = 1: about
++1.5–2.5 % cycles on random code with every page mapped (the extra EX
+cycle, no early load issue), plus the refills software does. With TE = 0,
+timing is as before. `CPU_FEATURES[2]` = 1, `[15:8]` = 16 (the entry
+count). Reset clears TE,
+ASID, TLBVEC and every V.
 
 ---
 
@@ -716,6 +786,9 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 - **MMU stage 2 (2026-11, branch `mmu`):** the 16-region MPU (§13.3) and
   `ECAUSE[8]` GUARD. Off on core 2. With MPU_EN = 0, cycle-identical to
   stage 1.
+- **MMU stage 3 (2026-11, branch `mmu`):** the 16-entry software-refilled
+  TLB with 64 KiB pages, kseg / kmap / useg, ASIDs and `TLBVEC` (§13.4).
+  Off on core 2. With TE = 0, cycle-identical to stage 2.
 - **Little-endian conversion fixes (April 2026, FSM era):** SETR64/PUSHV64
   high-word selection, LDIDX/STIDX 8/16/32 lane and byte-enable inversions,
   and null-terminated TXSTRMEM. The `.vh` task files they referred to are
