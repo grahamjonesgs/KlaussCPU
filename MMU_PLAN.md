@@ -943,7 +943,12 @@ segment). The page-table format is entirely software's choice (soft TLB).
   `TE = 1`, the MPU is ignored.
 - `TE` is `STATUS[9]` and is set by MTSR STATUS, which serializes. The
   kernel boots with `TE = 0` at its physical address, sets up, then sets
-  `TE` and jumps to its `0x8000_0000` alias.
+  `TE` and jumps to its `0x8000_0000` alias. **The instruction after the
+  MTSR that sets TE is fetched translated.** Code running at a physical
+  (useg) address must first install a TLB entry covering its own page,
+  typically a global identity entry, or the very next fetch misses. After
+  the jump to kseg it can remove that entry. Alternatively, run the
+  enabling MTSR from code that is already at an address valid both ways.
 - **What must be in kseg while `TE = 1`** (software rule): the targets of
   `EVEC` and `TLBVEC` (the vector fetch is translated like any other), the
   TLB refill handler and every page table it reads, and every kernel
@@ -995,6 +1000,24 @@ Instructions (class B, LEN = 01, no operands, privileged, serializing):
 
 After a TLBP miss, `TLB_INDEX[4:0]` is unchanged and only bit 31 is set.
 
+Clarifications (klausscc emulator questions, 2026-11-09):
+- **`EVEC = 0` parks every exception**, TLB misses included. `TLBVEC` is
+  only consulted when exceptions are enabled (`EVEC ≠ 0`).
+- **Parking and DOUBLE_FAULT** write none of `ECAUSE`, `EADDR` or `TLB_HI`.
+- **`TLBVEC[1:0]`** read 0, as for `EVEC`.
+- **MTSR `ASID` and MTSR `STATUS`** clear the LR/SC reservation even when
+  the value written is unchanged.
+- **TLB R/W/X apply in supervisor mode too**, in useg and kmap: the kernel
+  needs W on a user page it writes. `copy_to_user` into a page with
+  `W = 0` faults, and the kernel handles it, as on MIPS/Linux.
+- **A two-access instruction checks the lower doubleword first.** If that
+  doubleword faults, its fault is reported, whatever the second doubleword
+  would have raised. The second doubleword's fault is reported only when
+  the first is clean. This holds for MMIO, MPU and TLB faults alike.
+- **A user MMIO access inside a GUARD region** reports the stage 1 MMIO
+  ACCESS fault with `ECAUSE[8]` = 0: the MMIO rule comes first.
+- **MTSR `ECAUSE`** may set or clear bit 8.
+
 Reset (and so every program load) clears `TE`, `ASID` and `TLBVEC`, and
 sets V = 0 in every entry.
 
@@ -1024,7 +1047,9 @@ Because every TLB or ASID change clears it, a VA is enough.
 
 **Frame pushes are not translated.** With `TE = 1`, the stack an entry
 pushes on (the kernel SP) must be a kseg address, and the push writes PA =
-SP − 8 − `0x8000_0000`. If it is not in kseg, the core parks with
+SP − 8 − `0x8000_0000`. The check is on the push address SP − 8: SP = `0x8800_0000` works, but SP =
+`0x8000_0000` (push to `0x7FFF_FFF8`) does not. If SP − 8 is not in kseg,
+the core parks with
 `park_kind` 6 (DOUBLE_FAULT), or debug-halts if a debugger is attached. For
 Linux: no `VMAP_STACK`.
 
