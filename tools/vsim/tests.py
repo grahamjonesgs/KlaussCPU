@@ -1686,3 +1686,21 @@ def minmax_fwd():
         a.halt()
         out.append((a, exp, [f'+LAT={lat}']))
     return out
+
+
+@test
+def sr_reset_values():
+    """after reset every SR except CYCLE reads 0 (the LUTRAM-backed ones via
+    their valid flops), and a written SR reads back"""
+    a = Asm()
+    a.setr(12, DATA)
+    for i, sr in enumerate(('status', 'evec', 'ecause', 'eaddr', 'usp', 'scratch0', 'scratch1', 'tp')):
+        a.mfsr(1, sr); a.st(64, 1, 12, 8 * i)
+    a.setr64(2, 0x123456789ABCDEF0)
+    a.mtsr('scratch1', 2); a.mfsr(3, 'scratch1')
+    a.mfsr(4, 'scratch0'); a.mfsr(5, 'eaddr')      # still 0
+    a.mfsr(6, 'cycle')
+    a.halt()
+    exp = {'end': 'park', 'kind': '0', 'r3': 0x123456789ABCDEF0, 'r4': 0, 'r5': 0, 'r6': 'nonzero'}
+    exp.update({m(DATA + 8 * i): 0 for i in range(8)})
+    return a, exp, []

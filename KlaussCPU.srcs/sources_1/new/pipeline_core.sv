@@ -3870,9 +3870,15 @@ endmodule
 
 
 //===========================================================================
-// mmu_sr — MMU stage 1 system registers (MMU_PLAN.md §6.1): EVEC, ECAUSE,
-// EADDR, SCRATCH0/1, TP and the CYCLE counter, plus the MFSR read mux
-// (USP / SP_ALT stays in the core: the stack swaps write it).
+// mmu_sr — MMU stage 1 system registers (MMU_PLAN.md §6.1) and the MFSR
+// read mux.  EADDR, SCRATCH0/1 and TP are a 4 x 64 distributed RAM (one
+// write port: an MTSR committing at WB, or exception entry writing EADDR;
+// read asynchronously at dispatch).  LUTRAM has no reset, so each entry has
+// a valid flop, cleared by reset (and, for EADDR, by a program load), and
+// reads as 0 until written — §3.1's "0 after reset".  EVEC (read every
+// cycle: the vector and its != 0 test), ECAUSE (written with EADDR at
+// entry; one RAM write port) and the CYCLE counter stay in flops.  USP /
+// SP_ALT stays in the core (the stack swaps write it).
 //===========================================================================
 module mmu_sr (
    input  logic        clk,
@@ -3892,42 +3898,52 @@ module mmu_sr (
    output logic [7:0]  ecause,
    output logic [31:0] eaddr
 );
-   logic [63:0] scratch0, scratch1, tp, cycle;
+   // SR -> RAM slot: EADDR (3) 0, SCRATCH0 (5) 1, SCRATCH1 (6) 2, TP (7) 3
+   function automatic logic [2:0] f_slot(logic [3:0] sr);   // {in RAM, slot}
+      case (sr)
+         4'd3:    return 3'b100;
+         4'd5:    return 3'b101;
+         4'd6:    return 3'b110;
+         4'd7:    return 3'b111;
+         default: return 3'b000;
+      endcase
+   endfunction
+   (* ram_style = "distributed" *) logic [63:0] sram [0:3];
+   logic [3:0]  sv;                        // slot written since reset
+   logic [63:0] cycle;
+   wire  [2:0]  ws  = f_slot(mtsr_idx);
+   wire         rwe = ce && (ent_we || (mtsr_we && ws[2]));
+   wire  [1:0]  wa  = ent_we ? 2'd0 : ws[1:0];
+   wire  [63:0] wd  = ent_we ? {32'b0, ent_addr}
+                    : (mtsr_idx == 4'd3) ? {32'b0, mtsr_wdata[31:0]} : mtsr_wdata;
+   always_ff @(posedge clk) if (rwe) sram[wa] <= wd;
    always_ff @(posedge clk) begin
       if (rst) begin
-         evec <= '0;  ecause <= '0;  eaddr <= '0;
-         scratch0 <= '0;  scratch1 <= '0;  tp <= '0;  cycle <= '0;
+         evec <= '0;  ecause <= '0;  cycle <= '0;  sv <= '0;
       end else if (ce) begin
          cycle <= cycle + 64'd1;          // every core clock from reset
+         if (rwe) sv[wa] <= 1'b1;
          if (mtsr_we) case (mtsr_idx)
-            4'd1: evec     <= {mtsr_wdata[31:2], 2'b00};
-            4'd2: ecause   <= mtsr_wdata[7:0];
-            4'd3: eaddr    <= mtsr_wdata[31:0];
-            4'd5: scratch0 <= mtsr_wdata;
-            4'd6: scratch1 <= mtsr_wdata;
-            4'd7: tp       <= mtsr_wdata;
+            4'd1: evec   <= {mtsr_wdata[31:2], 2'b00};
+            4'd2: ecause <= mtsr_wdata[7:0];
             default: ;                    // STATUS: no writable bits; USP: core
          endcase
-         if (ent_we) begin
-            ecause <= {4'b0, ent_cause};
-            eaddr  <= ent_addr;
-         end
+         if (ent_we) ecause <= {4'b0, ent_cause};
          if (clr) begin
-            evec <= '0;  ecause <= '0;  eaddr <= '0;
+            evec <= '0;  ecause <= '0;  sv[0] <= 1'b0;
          end
       end
    end
+   wire [2:0]  rs = f_slot(ridx);
+   wire [63:0] rram = sv[rs[1:0]] ? sram[rs[1:0]] : 64'b0;
    always_comb begin
       case (ridx)
          4'd1:    rdata = {32'b0, evec};
          4'd2:    rdata = {56'b0, ecause};
-         4'd3:    rdata = {32'b0, eaddr};
          4'd4:    rdata = {32'b0, sp_alt};
-         4'd5:    rdata = scratch0;
-         4'd6:    rdata = scratch1;
-         4'd7:    rdata = tp;
          4'd8:    rdata = cycle;
-         default: rdata = 64'b0;
+         default: rdata = rs[2] ? rram : 64'b0;   // EADDR / SCRATCH0-1 / TP
       endcase
    end
+   assign eaddr = sv[0] ? sram[0][31:0] : 32'b0;   // (tb_vsim's view)
 endmodule
