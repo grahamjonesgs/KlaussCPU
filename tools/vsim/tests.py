@@ -834,11 +834,12 @@ def sr_roundtrip():
     a.nop(); a.nop()
     a.mfsr(8, 'cycle')
     a.alu('sub', 9, 8, 7)
-    a.mtsr('status', 1)              # no writable bits: ignored
+    a.mtsr('status', 1)              # stage 2: only [8] MPU_EN is writable (r1 has it set)
     a.mfsr(10, 'status')
     a.halt()
-    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0, 'r9': 'nonzero'}
-    want = {'evec': 0x12345674, 'ecause': 0xA5, 'eaddr': 0xDEADBEEF, 'usp': 0x07F00010,
+    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0x100, 'r9': 'nonzero'}
+    # (ECAUSE is 9 bits: [8] GUARD, stage 2)
+    want = {'evec': 0x12345674, 'ecause': 0x1A5, 'eaddr': 0xDEADBEEF, 'usp': 0x07F00010,
             'scratch0': 0x0123456789ABCDEF, 'scratch1': 0xFEDCBA9876543210, 'tp': 0x1122334455667788}
     for i, sr in enumerate(vals):
         exp[m(DATA + 8 * i)] = want[sr]
@@ -1479,7 +1480,7 @@ def clar_park_keeps_srs():
         a.setr(1, 0x1234); a.mtsr('eaddr', 1)
         emit(a)
         a.halt()
-        out.append((a, {'end': 'park', 'kind': kind, 'ecause': '55', 'eaddr': '00001234'}, []))
+        out.append((a, {'end': 'park', 'kind': kind, 'ecause': '055', 'eaddr': '00001234'}, []))
     return out
 
 
@@ -1704,3 +1705,365 @@ def sr_reset_values():
     exp = {'end': 'park', 'kind': '0', 'r3': 0x123456789ABCDEF0, 'r4': 0, 'r5': 0, 'r6': 'nonzero'}
     exp.update({m(DATA + 8 * i): 0 for i in range(8)})
     return a, exp, []
+
+
+# =========================================== MMU stage 2: MPU (MMU_PLAN §10)
+from kasm import MPU_EN as A_EN, MPU_R as A_R, MPU_W as A_W, MPU_X as A_X, MPU_G as A_G
+G_ = 0x100          # ECAUSE[8] GUARD
+
+
+def _mpu_reg(a, n, base, limit, attr):
+    """region n covers [base, limit] by 32-byte granule (low bits ignored)"""
+    a.setr(1, (base & ~0x1F) | attr); a.mtsr(0x10 + 2 * n, 1)
+    a.setr(1, limit); a.mtsr(0x11 + 2 * n, 1)
+
+
+def _mpu_on(a, on=True):
+    a.setr(1, 0x100 if on else 0); a.mtsr('status', 1)
+
+
+def _mpuhandler(a, name='h'):
+    """logs like _fixhandler (FLOG + 0x30*i: ECAUSE incl. GUARD, EADDR,
+    USP, r15, r9, frame); a user HALT halts; a fetch fault resumes at r10;
+    anything else steps over its (1-word) instruction"""
+    a.label(name)
+    a.push(13); a.push(14)
+    a.setr(14, XD)
+    a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)
+    a.mulv_s(13, 13, 0x30); a.alu('add', 13, 13, 14); a.addi_s(13, 13, 0x100 - 0x30 - 128)
+    a.addi_s(13, 13, 127); a.addi_s(13, 13, 1)
+    a.mfsr(14, 'ecause'); a.st(64, 14, 13, 0)
+    a.mfsr(14, 'eaddr');  a.st(64, 14, 13, 8)
+    a.mfsr(14, 'usp');    a.st(64, 14, 13, 16)
+    a.st(64, 15, 13, 24); a.st(64, 9, 13, 32)
+    a.getsp(14); a.ld(64, 14, 14, 16); a.st(64, 14, 13, 40)
+    a.mfsr(13, 'eaddr'); a.setr(14, HALT_W)
+    a.fbr('ne', 13, 14, name + '_nh'); a.halt()
+    a.label(name + '_nh')
+    a.mfsr(13, 'ecause'); a.alui('and', 13, 13, 0xFF, sgn=False)
+    a.fbr('eq', 13, X_SYSCALL, name + '_ret', imm=True)
+    a.addi_s(14, 13, -X_ACC_FE); a.fbr('ule', 14, 1, name + '_fe', imm=True)    # 9 / 10
+    a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
+    a.jmp(name + '_ret')
+    a.label(name + '_fe')
+    a.getsp(13); a.ld(64, 14, 13, 16)
+    a.shift_n('shr', 14, 14, 32); a.shift_n('shl', 14, 14, 32); a.alu('or', 14, 14, 10)
+    a.st(64, 14, 13, 16)
+    a.label(name + '_ret')
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+CODE_RX = (0, 0, 0xFFFF, A_EN | A_R | A_X)          # region 0: the program (user code)
+
+
+def _mpu(body, regions, user=True, exp=None, plus=(), mpu=True, logs=()):
+    """regions: (n, base, limit, attr); logs: expected FLOG entries
+    (ECAUSE incl. GUARD, EADDR) in order; the closing user HALT adds one"""
+    a = Asm()
+    _xsetup(a)
+    for (n, b, l, at) in regions:
+        _mpu_reg(a, n, b, l, at)
+    if mpu:
+        _mpu_on(a)
+    if user:
+        _to_user(a, 'u')
+    a.label('u')
+    a.setr(12, GOOD)
+    body(a)
+    a.halt()
+    _mpuhandler(a)
+    e = {'end': 'park', 'kind': '0'}
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        if ea is not None:
+            e[m(FLOG + 0x30 * i + 8)] = ea
+    if user:
+        e[m(FLOG + 0x30 * len(logs))] = X_PRIV
+        e[m(XD + 32)] = len(logs) + 1
+    else:
+        e[m(XD + 32)] = len(logs)
+    e.update(exp or {})
+    return a, e, list(plus)
+
+
+@test
+def mpu_sr_access():
+    """reset values, BASE/LIMIT read-back (LIMIT[4:0] read 0), STATUS[8],
+    and the MPU SRs are privileged in user mode"""
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, DATA); a.setr(3, 0)
+    for sr in range(0x10, 0x30):
+        a.mfsr(2, sr); a.alu('or', 3, 3, 2)            # all 0 after reset
+    a.mfsr(4, 'status')
+    a.setr(1, 0x1234567F); a.mtsr('mpu_base0', 1); a.mfsr(5, 'mpu_base0')
+    a.setr(1, 0xABCDEF7F); a.mtsr('mpu_limit0', 1); a.mfsr(6, 'mpu_limit0')
+    a.setr(1, 0xFFFFFFE1); a.mtsr('mpu_base15', 1); a.mfsr(7, 'mpu_base15')
+    a.setr(1, 0x00000020); a.mtsr('mpu_limit15', 1); a.mfsr(8, 'mpu_limit15')
+    a.mfsr(9, 'mpu_base1')                              # untouched: 0
+    _mpu_on(a); a.mfsr(10, 'status'); _mpu_on(a, False); a.mfsr(11, 'status')
+    a.st(64, 3, 12)                                     # (_to_user reuses r1-r3)
+    _to_user(a, 'u')
+    a.label('u')
+    a.mfsr(1, 'mpu_base0'); a.raw(0x6C611010)          # MTSR mpu_base0 / mpu_limit0? (0x11)
+    a.mtsr('status', 1); a.mfsr(1, 'status')
+    a.halt()
+    _uhandler(a)
+    # (r1: MFSR STATUS is allowed in user mode and returns UM = 1)
+    exp = {'end': 'park', 'kind': '0', m(DATA): 0, 'r4': 0, 'r5': 0x1234567F, 'r6': 0xABCDEF60,
+           'r7': 0xFFFFFFE1, 'r8': 0x20, 'r9': 0, 'r10': 0x100, 'r11': 0, 'r1': 1,
+           m(XLOG): X_PRIV, m(XLOG + 8): X_PRIV, m(XLOG + 16): X_PRIV, m(XLOG + 24): X_PRIV,
+           m(XD + 32): 4}
+    return a, exp, []
+
+
+@test
+def mpu_guard_both_modes():
+    """a GUARD region denies loads and stores in either mode and sets
+    ECAUSE[8]; neighbouring granules are fine; in supervisor mode a GUARD
+    over MMIO denies too (no device access).  In user mode an MMIO access
+    under a GUARD is the stage 1 MMIO fault (GUARD = 0)."""
+    GA = DATA + 0x100
+    out = []
+    for user in (False, True):
+        def body(a):
+            a.setr(9, GA); a.setr(3, 0x33); a.setr(4, 0x44)
+            a.ld(64, 3, 9, 8)                 # denied
+            a.st(64, 4, 9, 16)                # denied
+            a.ld(64, 5, 9, 0x20)              # next granule: fine
+            a.ld(64, 6, 9, -8)                # previous granule: fine
+            a.setr(9, 0xF0010010)
+            a.ld(64, 7, 9)                    # MMIO under a GUARD
+        regs = [(0, 0, 0x7FFFFFFF, A_EN | A_R | A_W | A_X), (1, GA, GA + 0x1F, A_EN | A_G),
+                (2, 0xF0010000, 0xF001001F, A_EN | A_G)]
+        logs = [(G_ | X_ACC_LD, GA + 8), (G_ | X_ACC_ST, GA + 16),
+                ((X_ACC_LD) if user else (G_ | X_ACC_LD), 0xF0010010)]
+        out.append(_mpu(body, regs, user, {'r3': 0x33, 'mmio_rd': '0', m(GA + 16): 0}, logs=logs))
+    return out
+
+
+@test
+def mpu_user_default_deny_union():
+    """user mode: no covering grant = deny (ECAUSE[8] = 0); regions combine
+    as a union (an R-only and a W-only region over the same bytes = RW); a
+    covering region without the permission does not grant"""
+    def body(a):
+        a.setr(9, DATA); a.setr(3, 0x5A)
+        a.st(64, 3, 9)                        # W from region 2: ok
+        a.ld(64, 4, 9)                        # R from region 1: ok
+        a.ld(64, 5, 9, 0x100)                 # region 3 (EN only): denied
+        a.st(64, 3, 9, 0x200 - 8)             # no region: denied
+        a.setr(9, 0x40); a.ld(64, 6, 9)       # code: R+X region 0: ok
+        a.setr(9, 0x08000000 - 0x100); a.ld(64, 7, 9)    # uncovered: denied
+    regs = [CODE_RX, (1, DATA, DATA + 0xFF, A_EN | A_R), (2, DATA, DATA + 0xFF, A_EN | A_W),
+            (3, DATA + 0x100, DATA + 0x1FF, A_EN)]
+    logs = [(X_ACC_LD, DATA + 0x100), (X_ACC_ST, DATA + 0x1F8), (X_ACC_LD, 0x08000000 - 0x100)]
+    return _mpu(body, regs, True, {'r4': 0x5A, m(DATA): 0x5A, 'r5': 0, 'r7': 0}, logs=logs)
+
+
+@test
+def mpu_access_types():
+    """per access type: R / W for loads / stores incl. stack ops by
+    direction, LR (R) and SC (W); X does not grant data"""
+    RO, WO = DATA + 0x100, DATA + 0x200            # R-only, W-only granules (0x40 each)
+    def body(a):
+        a.setr(3, 0x77); a.setr(9, RO + 0x20)
+        a.st(64, 3, 9)                         # ACC_ST (R-only)
+        a.lr(64, 4, 9)                         # ok
+        a.sc(64, 5, 3, 9)                      # ACC_ST (SC needs W); r5 unchanged
+        a.setr(9, WO + 0x20)
+        a.lr(64, 6, 9)                         # ACC_LD (LR needs R)
+        a.st(64, 3, 9)                         # ok
+        a.setr(2, RO + 0x30); a.setsp(2)
+        a.push(3)                              # ACC_ST, SP unchanged
+        a.call('f')                            # ACC_ST
+        a.enter(1)                             # ACC_ST
+        a.pop(7)                               # ok (R)
+        a.getsp(8)                             # RO + 0x38
+        a.setr(2, WO + 0x30); a.setsp(2)
+        a.pop(7)                               # ACC_LD
+        a.ret()                                # ACC_LD
+        a.setr(15, WO + 0x18); a.leave()       # ACC_LD (R15 in W-only)
+        a.setr(9, 0x40); a.st(64, 3, 9)        # code is R+X: ACC_ST
+        a.jmp('e')
+        a.label('f'); a.ret()
+        a.label('e')
+    regs = [CODE_RX, (1, RO, RO + 0x3F, A_EN | A_R), (2, WO, WO + 0x3F, A_EN | A_W)]
+    logs = [(X_ACC_ST, RO + 0x20), (X_ACC_ST, RO + 0x20), (X_ACC_LD, WO + 0x20),
+            (X_ACC_ST, RO + 0x28), (X_ACC_ST, RO + 0x28), (X_ACC_ST, RO + 0x28),
+            (X_ACC_LD, WO + 0x30), (X_ACC_LD, WO + 0x30), (X_ACC_LD, WO + 0x18), (X_ACC_ST, 0x40)]
+    return _mpu(body, regs, True, {'r5': 0, 'r6': 0, 'r8': RO + 0x38, m(WO + 0x20): 0x77}, logs=logs)
+
+
+@test
+def mpu_two_access_edge():
+    """MEMGET32 spanning two doublewords and LEAVERET at a region edge:
+    both doublewords are checked; a denial of only the 2nd reports its
+    start (ECAUSE[8] per that doubleword); a denied 1st reports the EA"""
+    E = DATA + 0x100                               # region 1: one granule [E, E+0x1F], R
+    out = []
+    for guard in (False, True):
+        def body(a):
+            a.setr(9, E + 0x1D); a.setr(3, 0x33)
+            a.ld(32, 3, 9)                         # MEMGET32 [E+0x1D]: 2nd dword E+0x20 denied
+            a.setr(9, E + 0x1C); a.ld(32, 4, 9)    # within the dword: fine
+            a.setr(15, E + 0x18); a.leaveret()     # [E+0x18] ok, [E+0x20] denied
+            a.setr(9, E - 3); a.ld(32, 5, 9)       # 1st dword (E-8) denied: EADDR = EA
+        if guard:      # everything RWX, a GUARD on the next granule
+            regs = [(0, 0, 0x7FFFFFFF, A_EN | A_R | A_W | A_X), (1, E + 0x20, E + 0x3F, A_EN | A_G),
+                    (2, E - 0x20, E - 1, A_EN | A_G)]
+            g = G_
+        else:
+            regs = [CODE_RX, (1, E, E + 0x1F, A_EN | A_R)]
+            g = 0
+        logs = [(g | X_ACC_LD, E + 0x20), (g | X_ACC_LD, E + 0x20), (g | X_ACC_LD, E - 3)]
+        out.append(_mpu(body, regs, True, {'r3': 0x33, 'r5': 0}, logs=logs))
+    return out
+
+
+@test
+def mpu_fetch():
+    """X for fetch: an instruction straddling the end of the X region faults
+    at the 2nd granule's start; a jump into a non-X region faults at the
+    target; a GUARD over code faults in supervisor mode (ECAUSE[8])"""
+    out = []
+
+    def body(a):
+        a.leapc(10, 'ok')
+        while (a.pc & 0x1F) != 0x1C:
+            a.nop()
+        a.label('st')
+        a.setr(6, 0x66)                            # 2-word: word 2 in the next granule
+        while (a.pc & 0x1F) != 0:                  # (the rest of that granule: no X)
+            a.nop()
+        a.label('ok'); a.setr(7, 0x77)
+        a.leapc(10, 'ok2'); a.setr(5, DATA); a.jmpr(5)
+        a.label('ok2'); a.setr(8, 0x88)
+    # region 0: code X up to the granule holding 'st' — found by assembling once
+    probe = Asm(); _xsetup(probe)
+    for (n, b, l, at) in [CODE_RX, (1, DATA, DATA + 0xFF, A_EN | A_R)]:
+        _mpu_reg(probe, n, b, l, at)
+    _mpu_on(probe); _to_user(probe, 'u'); probe.label('u'); probe.setr(12, GOOD); body(probe)
+    st = probe.labels['st']
+    regs = [(0, 0, st | 0x1F, A_EN | A_X), (1, DATA, DATA + 0xFF, A_EN | A_R),
+            (3, (st | 0x1F) + 1, 0xFFFF, A_EN | A_X)]
+    # region 3 covers the code after the gap granule; the gap granule (st+4's) has no X
+    regs[2] = (3, (st | 0x1F) + 0x21, 0xFFFF, A_EN | A_X)
+    out.append(_mpu(body, regs, True, {'r6': 0, 'r7': 0x77, 'r8': 0x88},
+                    logs=[(X_ACC_FE, (st | 0x1F) + 1), (X_ACC_FE, DATA)]))
+    return out
+
+
+@test
+def mpu_fetch_guard_super():
+    """supervisor mode: a GUARD over the next instruction faults its fetch
+    (ACCESS_FETCH, ECAUSE[8]); MTSR STATUS takes effect from the very next
+    instruction, including its fetch"""
+    a = Asm()
+    _xsetup(a)
+    a.leapc(10, 'ok')
+    a.leapc(1, 'nx'); a.alui('or', 1, 1, A_EN | A_G, sgn=False); a.mtsr('mpu_base0', 1)
+    a.leapc(1, 'nx'); a.mtsr('mpu_limit0', 1)
+    a.setr(2, 0x100)
+    while (a.pc & 0x1F) != 0x1C:
+        a.nop()
+    a.mtsr('status', 2)                    # enable: the next fetch is checked
+    a.label('nx'); a.setr(5, 0xBAD)
+    for _ in range(7):
+        a.nop()
+    a.label('ok')
+    a.setr(12, DATA); a.setr(3, 0x31); a.st(64, 3, 12)
+    # region 1: GUARD over DATA; then MPU off on the very next instruction
+    a.setr(1, DATA | A_EN | A_G); a.mtsr('mpu_base1', 1); a.setr(1, DATA); a.mtsr('mpu_limit1', 1)
+    a.ld(64, 6, 12)                        # denied (GUARD, supervisor)
+    a.setr(2, 0); a.mtsr('status', 2)
+    a.ld(64, 7, 12)                        # MPU off: fine
+    a.halt()
+    _mpuhandler(a)
+    nx = a.labels['nx']
+    return a, {'end': 'park', 'kind': '0', 'r5': 0, 'r6': 0, 'r7': 0x31,
+               m(FLOG): G_ | X_ACC_FE, m(FLOG + 8): nx,
+               m(FLOG + 0x30): G_ | X_ACC_LD, m(FLOG + 0x38): DATA, m(XD + 32): 2}, []
+
+
+@test
+def mpu_frame_push_unchecked():
+    """entry's frame push is not checked: a SYSCALL with SP just above a
+    GUARD pushes its frame into the guard; the vector (which must not touch
+    memory) runs and halts"""
+    a = Asm()
+    a.leapc(1, 'v'); a.mtsr('evec', 1)
+    _mpu_reg(a, 0, GOOD - 0x20, GOOD - 1, A_EN | A_G)
+    _mpu_on(a)
+    a.setr(2, GOOD); a.setsp(2)
+    at = a.syscall()
+    a.halt()
+    a.label('v')
+    a.mfsr(5, 'ecause'); a.getsp(6)
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r5': X_SYSCALL, 'r6': GOOD - 8,
+               m(GOOD - 8): at + 4}, []
+
+
+@test
+def mpu_mtsr_region_next():
+    """an MTSR to a region applies to the very next instruction's access"""
+    a = Asm()
+    _xsetup(a)
+    _mpu_on(a)
+    a.setr(12, DATA); a.setr(3, 0x31); a.st(64, 3, 12)
+    a.setr(1, DATA); a.mtsr('mpu_limit2', 1)
+    a.setr(1, DATA | A_EN | A_G); a.mtsr('mpu_base2', 1)
+    a.ld(64, 6, 12)                        # denied
+    a.setr(1, 0); a.mtsr('mpu_base2', 1)
+    a.ld(64, 7, 12)                        # region off: fine
+    a.halt()
+    _mpuhandler(a)
+    return a, {'end': 'park', 'kind': '0', 'r6': 0, 'r7': 0x31,
+               m(FLOG): G_ | X_ACC_LD, m(XD + 32): 1}, []
+
+
+@test
+def mpu_limit_edges():
+    """LIMIT is the last granule, inclusive; [4:0] of BASE/LIMIT do not
+    move the edges; LIMIT < BASE covers nothing"""
+    B = DATA + 0x40
+    def body(a):
+        a.setr(9, B)
+        a.ld(8, 3, 9, -1)                      # B-1: denied
+        a.ld(8, 4, 9, 0)                       # ok
+        a.ld(8, 5, 9, 0x3F)                    # last byte of the last granule: ok
+        a.ld(8, 6, 9, 0x40)                    # denied
+        a.setr(9, DATA + 0x200); a.ld(8, 7, 9) # region 2 has LIMIT < BASE: denied
+    regs = [CODE_RX, (1, B + 0x1F, B + 0x3F - 0x1F, A_EN | A_R),     # BASE/LIMIT low bits set
+            (2, DATA + 0x200, DATA + 0x100, A_EN | A_R)]
+    regs[1] = (1, B, (B + 0x3F) | 0x1F, A_EN | A_R)
+    logs = [(X_ACC_LD, B - 1), (X_ACC_LD, B + 0x40), (X_ACC_LD, DATA + 0x200)]
+    return _mpu(body, regs, True, logs=logs)
+
+
+@test
+def mpu_off():
+    """regions set but MPU_EN = 0: no MPU decision in either mode"""
+    def body(a):
+        a.setr(9, DATA); a.setr(3, 0x5A); a.st(64, 3, 9); a.ld(64, 4, 9)
+        a.setr(9, 0x08000000 - 0x100); a.ld(64, 5, 9)
+    regs = [(1, DATA, DATA + 0xFF, A_EN | A_G)]
+    return _mpu(body, regs, True, {'r4': 0x5A}, mpu=False)
+
+
+@test
+def mpu_debugger():
+    """with the debugger attached, an MPU ACCESS fault goes to EVEC with or
+    without EXC_PASS (only ILLEGAL / TRAP / MISALIGNED debug-halt)"""
+    out = []
+    for plus in (['+DBG_ATTACHED'], ['+DBG_ATTACHED', '+DBG_EXCPASS']):
+        def body(a):
+            a.setr(9, DATA); a.ld(64, 3, 9)
+        a, e, p = _mpu(body, [(1, DATA, DATA + 0x1F, A_EN | A_G)], False, plus=plus,
+                       logs=[(G_ | X_ACC_LD, DATA)])
+        if _DBG:
+            e['kind'] = '4'          # the closing supervisor HALT is a debug halt
+        out.append((a, e, p))
+    return out

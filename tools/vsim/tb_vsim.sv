@@ -204,6 +204,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
 
    // ---------------- counters / trace ----------------------------------------
    longint icount = 0;
+   longint exc_n = 0;          // exception entries completed (MMU)
+`ifdef HAS_EXC
+   always @(posedge clk) if (!rst && dut.sr_ent_we) exc_n++;
+`endif
    longint pst [0:7];
    longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0, n_ic_fill = 0;
    integer trace_f = 0;
@@ -273,7 +277,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d", uart_n);
 `ifdef HAS_EXC
-      $fdisplay(f, "ecause=%02x eaddr=%08x um=%0d", dut.ecause, dut.eaddr, dut.umode);
+      $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)

@@ -42,7 +42,10 @@ module pipeline_core
    // MMU_PLAN.md stage 1: precise exceptions, user mode, SYSCALL, MFSR /
    // MTSR, LR/SC.  0 = the new encodings trap as illegal and nothing else
    // changes (core 2 builds it off).
-   parameter bit EXC_EN = 1'b1
+   parameter bit EXC_EN = 1'b1,
+   // MMU_PLAN.md stage 2: the 16-region MPU (needs EXC_EN).  0 = its SRs
+   // are illegal and nothing else changes (core 2 builds it off).
+   parameter bit MPU_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -300,6 +303,7 @@ module pipeline_core
    // MMU_PLAN.md stage 1 (see EXC_EN).  With EVEC = 0 (reset / start) every
    // exception parks exactly as before, so existing images are unaffected.
    localparam bit EN_EXC = EXC_EN;
+   localparam bit EN_MPU = EXC_EN && MPU_EN;   // MMU stage 2 (MPU)
    // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
    localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
                           X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
@@ -361,6 +365,7 @@ module pipeline_core
       logic [1:0] len;          // instruction words
       logic       w32;          // ISA v3 D3: result = sext of its low 32 bits (in MEM)
       logic       mtsr;         // MMU stage 1: MTSR (SR written at WB, then refetch)
+      logic       fx2, fxg;     // a fetch fault: on the instruction's 2nd granule only / a GUARD denial
    } dec_t;
 
    // ----------------------------------------------------- architectural state
@@ -387,12 +392,18 @@ module pipeline_core
    // EVEC / ECAUSE / EADDR / SCRATCH0-1 / TP / CYCLE live in mmu_sr (a
    // kept hierarchy, timing); these are its outputs (names kept for tb_vsim)
    logic [31:0] evec, eaddr;
-   logic [7:0]  ecause;
+   logic [8:0]  ecause;          // [8] GUARD (stage 2)
+   // MMU stage 2: mmu_mpu's outputs (see its instance at the end)
+   logic        mpu_en;          // STATUS[8]
+   logic [31:0] mpu_rdata;       // MFSR of an MPU SR
+   logic        mpu_d1, mpu_dg1, mpu_d2, mpu_dg2;   // data: deny / GUARD, 1st and 2nd granule
+   logic        mpu_f1, mpu_fg1, mpu_f2, mpu_fg2;   // fetch: the same at pc's granule and the next
    logic        res_valid;
    logic [28:0] res_dw;
    // exception entry: the IRQ entry sequencer runs with exc_ent set
    logic        exc_ent;
    logic [3:0]  exc_cause_q;
+   logic        exc_guard_q;     // ECAUSE[8]
    logic [31:0] exc_addr_q, exc_epc_q;
    logic [31:0] pc;
    logic        running;        // fetch enabled
@@ -1000,10 +1011,12 @@ module pipeline_core
                // other MFSR is a MOV64 whose value is loaded at dispatch
                // (id_mfsr).  MTSR is a flag-less COPY of rs1, committed to
                // the SR at WB, serializing.
-               if (!op[21] && op[7:4] == 4'h0 && op[19:12] <= 8'd8) begin
+               if (!op[21] && op[7:4] == 4'h0 &&
+                   (op[19:12] <= 8'd8 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F))) begin
                   d.legal = 1'b1; d.wreg = 1'b1;
                   d.uop = (op[19:12] == 8'd0) ? U_GETST : U_MOV64;
-               end else if (op[21] && op[11:8] == 4'h0 && op[19:12] <= 8'd7) begin
+               end else if (op[21] && op[11:8] == 4'h0 &&
+                            (op[19:12] <= 8'd7 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F))) begin
                   d.legal = 1'b1; d.uop = U_UNARY; d.sub = 4'd0; d.use_rs1 = 1'b1;
                   d.mtsr = 1'b1; d.serialize = 1'b1;
                end
@@ -1065,7 +1078,8 @@ module pipeline_core
    // um = user mode; fx / fxc = a fetch fault on this instruction (MMU
    // stage 1: user fetch from 0xF... (0) or a misaligned user PC (1)),
    // which wins over ILLEGAL and PRIVILEGED
-   function automatic dec_t f_decode(logic [31:0] op, logic um, logic fx, logic fxc);
+   function automatic dec_t f_decode(logic [31:0] op, logic um, logic fx, logic fxc,
+                                     logic fx2 = 1'b0, logic fxg = 1'b0);
       dec_t d;
       d = f_decode_raw(op);
       if (!d.legal) begin
@@ -1075,16 +1089,19 @@ module pipeline_core
       end else if (EN_EXC && um && f_priv(d, op)) begin
          d = f_mkx(d, X_PRIV);
       end
-      if (EN_EXC && fx) d = f_mkx(d, fxc ? X_MISAL_FE : X_ACC_FE);
+      if (EN_EXC && fx) begin
+         d = f_mkx(d, fxc ? X_MISAL_FE : X_ACC_FE);
+         d.fx2 = fx2 && !fxc;  d.fxg = fxg && !fxc;
+      end
       return d;
    endfunction
 
    // MMU stage 1: the ID op's fetch fault, registered at the IF->ID latch;
    // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
-   logic id_fx, id_fxc, id_mfsr;
+   logic id_fx, id_fxc, id_mfsr, id_fx2, id_fxg;
    logic [63:0] id_srv;           // mmu_sr's read port, at id_op[15:12]
    dec_t dec;
-   assign dec = f_decode(id_op, umode, id_fx, id_fxc);
+   assign dec = f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg);
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
@@ -1104,8 +1121,19 @@ module pipeline_core
    // from pc and the window's LEN bits, registered into id_fx / id_fxc.
    wire [31:0] w_last_pc = (w_op[31:30] == 2'b11) ? w_pc_p8 : (w_op[31:30] == 2'b10) ? w_pc_p4 : pc;
    wire        w_fxc = EN_EXC && fe_um && (pc[1:0] != 2'b00);
-   wire        w_fx  = EN_EXC && fe_um && ((pc[1:0] != 2'b00) || pc[31:28] == 4'hF ||
-                                           w_last_pc[31:28] == 4'hF);
+   // (stage 2) the MPU's fetch decision at pc's 32-byte granule (p1) and,
+   // for an instruction crossing into the next granule, at that one (p2);
+   // the stage 1 user 0xF... rule applies first in each.  Computed from pc
+   // and the window's LEN bits, registered into id_fx / id_fx2 / id_fxg.
+   wire        w_cross = (w_op[31:30] == 2'b10 && pc[4:2] == 3'd7) ||
+                         (w_op[31:30] == 2'b11 && pc[4:3] == 2'b11);
+   wire        w_s1a = fe_um && pc[31:28] == 4'hF;
+   wire        w_s1b = fe_um && w_last_pc[31:28] == 4'hF;
+   wire        w_p1  = w_s1a || (EN_MPU && mpu_f1);
+   wire        w_p2  = w_s1b || (EN_MPU && w_cross && mpu_f2);
+   wire        w_fx  = EN_EXC && (w_fxc || w_p1 || w_p2);
+   wire        w_fx2 = !w_p1 && w_p2;                       // EADDR: the next granule's start
+   wire        w_fxg = EN_MPU && (w_p1 ? (!w_s1a && mpu_fg1) : (!w_s1b && w_cross && mpu_fg2));
    assign w_decf = f_decode(w_op, 1'b0, 1'b0, 1'b0);
    // (timing: the latch-time predecode — id_ser, the branch / return
    // predictor bits — reads the decode WITHOUT the MMU overrides; a fetch
@@ -1790,7 +1818,7 @@ module pipeline_core
          // MMU stage 1: MFSR STATUS = {DI, UM}; DI forwarded from an older
          // DI / EI in MEM / WB (program order), UM is stable (it only
          // changes with the pipe drained or behind a serializing IRET)
-         U_GETST: exo_result = {62'b0, ex_dis_eff, umode};
+         U_GETST: exo_result = {55'b0, EN_MPU && mpu_en, 6'b0, ex_dis_eff, umode};
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1846,8 +1874,19 @@ module pipeline_core
    wire ex_ea_f   = exo_eaddr[31:28] == 4'hF;
    wire ex_ea_xf  = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && exo_eaddr[2:0] > 3'd4)) &&
                     exo_eaddr[31:3] == 29'h1DFF_FFFF;     // the 2nd dword is 0xF000_0000
-   wire ex_ufault = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc) &&
-                    (ex_ea_f || ex_ea_xf);
+   // per doubleword: the stage 1 rule (u1 / u2) first, then the MPU (stage
+   // 2) at the EA's granule and — for a two-access op whose 2nd dword is in
+   // the next granule (EA = ex_a for both) — at that granule
+   wire ex_s1    = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc);
+   wire ex_u1    = ex_s1 && ex_ea_f;
+   wire ex_u2    = ex_s1 && ex_ea_xf;
+   wire ex_mchk  = EN_MPU && ex_valid && ex_memop && !ex_misal;
+   wire ex_x2c   = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
+                   ex_a[4:3] == 2'b11;
+   wire ex_dn1   = ex_u1 || (ex_mchk && mpu_d1);
+   wire ex_dn2   = ex_u2 || (ex_mchk && ex_x2c && mpu_d2);
+   wire ex_ufault = ex_dn1 || ex_dn2;
+   wire ex_xg    = ex_dn1 ? (!ex_u1 && ex_mchk && mpu_dg1) : (!ex_u2 && ex_mchk && ex_x2c && mpu_dg2);
    // (for the early-issue ops — MEMGET32 [rs1], LEAVERET: EA = ex_a — the
    // same test from the register alone, off the EA adder)
    wire ex_uf_early = EN_EXC && umode && (ex_a[31:28] == 4'hF || ex_a[31:3] == 29'h1DFF_FFFF);
@@ -1858,6 +1897,7 @@ module pipeline_core
    logic        wb_xc;
    logic [3:0]  wb_xcause;
    logic [31:0] wb_xaddr, wb_pc_next;
+   logic        wb_xguard;            // ECAUSE[8]: a GUARD denial (stage 2)
    logic        wb_mtsr;
    logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
    logic [31:0] wb_spalt_new;
@@ -2005,7 +2045,9 @@ module pipeline_core
    wire mem_port_wait = mem_port_op && !mem_done_now;
    // EN_HRET: a hit-pipe RET holds MEM for its first cycle (its return
    // address is checked from the captured answer, a register, the cycle after)
-   wire ret_h_wait   = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && mem_h1;
+   // (not for an access-faulted op: nothing may hold MEM for it — its
+   // squash, mem_xsq_go, acts on the edge it leaves MEM)
+   wire ret_h_wait   = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && mem_h1 && !mem_xsq;
    wire mem_busy     = mem_port_wait || wb_wait || ret_h_wait;
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && (ret_actual != mem_pred_tgt);
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
@@ -2051,7 +2093,10 @@ module pipeline_core
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
-                       !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx);
+                       !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx) &&
+                       // (stage 2: no early issue with the MPU on — its
+                       // decision must not reach the EX->MEM enables)
+                       !(EN_MPU && mpu_en);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -2325,6 +2370,7 @@ module pipeline_core
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
+         id_fx2 <= 1'b0; id_fxg <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2545,6 +2591,7 @@ module pipeline_core
                irq_active  <= 1'b1;
                exc_ent     <= 1'b1;
                exc_cause_q <= wb_xcause;
+               exc_guard_q <= wb_xguard;
                exc_addr_q  <= wb_xaddr;
                exc_epc_q   <= (wb_xcause == X_SYSCALL) ? wb_pc_next : wb_pc;
             end else if (wb_park) begin
@@ -2565,7 +2612,7 @@ module pipeline_core
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
                if (EN_EXC && wb_mtsr) begin
                   // (USP here; every other SR is written by mmu_sr, sr_mtsr_we)
-                  if (wb_op[15:12] == 4'd4) sp_alt <= wb_value[31:0];
+                  if (wb_op[19:12] == 8'd4) sp_alt <= wb_value[31:0];
                   ev_pcz     = 1'b1;
                   pc         <= wb_pc + 32'd4;
                   fetch_halt <= 1'b0;
@@ -3166,10 +3213,12 @@ module pipeline_core
                         : (mem_d.uop == U_EXC && mem_d.sub == X_SYSCALL) ? 32'b0
                         : (mem_d.uop == U_EXC && mem_d.sub == X_MISAL_FE) ? mem_pc
                         : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE)
-                          ? ((mem_pc[31:28] == 4'hF) ? mem_pc : 32'hF000_0000)
+                          ? (mem_d.fx2 ? {mem_pc[31:5] + 27'd1, 5'b0} : mem_pc)
                         : mem_op;
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
+            wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
+                                     : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE && mem_d.fxg));
             wb_lr      <= EN_EXC && mem_valid && mem_d.uop == U_LR && !mem_xsq;
             wb_sc      <= EN_EXC && mem_valid && mem_d.uop == U_SC && !mem_xsq;
             wb_wr      <= mem_is_write;
@@ -3267,8 +3316,8 @@ module pipeline_core
                // first MEM cycle it squashes EX / ID (mem_xsq_go).
                mem_xsq    <= ex_ufault;
                mem_xs_st  <= ex_mst;               // direction (cause)
-               mem_xs2    <= !ex_ea_f;             // only the 2nd dword faulted
-               mem_xs_g   <= 1'b0;                 // GUARD denial (stage 2)
+               mem_xs2    <= !ex_dn1;              // only the 2nd dword faulted
+               mem_xs_g   <= ex_xg;                // GUARD denial (stage 2, ECAUSE[8])
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -3432,7 +3481,7 @@ module pipeline_core
                                   // HW proposal 6: FBR PRED 5-7 (EQW/LTW/ULTW)
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
-                     id_fx      <= w_fx;  id_fxc <= w_fxc;
+                     id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
@@ -3740,8 +3789,13 @@ module pipeline_core
    // fold its read mux / write decode into the dispatch and WB cones.
    // Written by MTSR as it commits at WB and by exception entry as it
    // completes; read at dispatch (MFSR, id_srv).
-   wire sr_mtsr_we = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
+   wire mtsr_commit = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
+   wire sr_mtsr_we  = mtsr_commit && wb_op[19:16] == 4'h0;     // SRs 0-8 (mmu_sr)
    wire sr_ent_we  = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
+   logic [63:0] sr_rdata;
+   // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
+   // would alias 0-8)
+   assign id_srv = (EN_MPU && id_op[19:16] != 4'h0) ? {32'b0, mpu_rdata} : sr_rdata;
    generate if (EN_EXC) begin : g_sr
       (* keep_hierarchy = "yes" *)
       mmu_sr sr_i (
@@ -3751,14 +3805,46 @@ module pipeline_core
          .mtsr_idx   (wb_op[15:12]),
          .mtsr_wdata (wb_value),
          .ent_we     (sr_ent_we),
-         .ent_cause  (exc_cause_q),
+         .ent_cause  ({exc_guard_q, 4'b0, exc_cause_q}),
          .ent_addr   (exc_addr_q),
          .ridx       (id_op[15:12]),
          .sp_alt,
-         .rdata      (id_srv),
+         .rdata      (sr_rdata),
          .evec, .ecause, .eaddr);
    end else begin : g_nosr
-      assign id_srv = '0;  assign evec = '0;  assign ecause = '0;  assign eaddr = '0;
+      assign sr_rdata = '0;  assign evec = '0;  assign ecause = '0;  assign eaddr = '0;
+   end endgenerate
+
+   // ----------------------------------------------- MMU stage 2: mmu_mpu
+   // 16 regions (MMU_PLAN.md §10).  Written by an MTSR to 0x10-0x2F / STATUS
+   // committing at WB; read at dispatch (MFSR).  Its data decision is on the
+   // EA's granule (and the next one for a two-access op), its fetch
+   // decision on pc's granule (and the next one): both only REGISTERED
+   // (mem_xsq / id_fx), never on an EX->MEM or dispatch enable.
+   generate if (EN_MPU) begin : g_mpu
+      mmu_mpu mpu_i (
+         .clk, .rst, .ce,
+         .clr      (start),
+         .we       (mtsr_commit && (wb_op[19:16] == 4'h1 || wb_op[19:16] == 4'h2)),
+         .widx     (wb_op[16:12] - 5'h10),
+         .wdata    (wb_value[31:0]),
+         .en_we    (mtsr_commit && wb_op[19:12] == 8'd0),
+         .en_wd    (wb_value[8]),
+         .ridx     (id_op[16:12] - 5'h10),
+         .rdata    (mpu_rdata),
+         .mpu_en,
+         .d_g      (exo_eaddr[31:5]),
+         .d_gx     (ex_a[31:5]),
+         .d_st     (ex_mst),
+         .d_um     (umode),
+         .d_deny1  (mpu_d1), .d_guard1 (mpu_dg1), .d_deny2 (mpu_d2), .d_guard2 (mpu_dg2),
+         .f_g      (pc[31:5]),
+         .f_um     (fe_um),
+         .f_deny1  (mpu_f1), .f_guard1 (mpu_fg1), .f_deny2 (mpu_f2), .f_guard2 (mpu_fg2));
+   end else begin : g_nompu
+      assign mpu_en = 1'b0;  assign mpu_rdata = '0;
+      assign mpu_d1 = 1'b0;  assign mpu_dg1 = 1'b0;  assign mpu_d2 = 1'b0;  assign mpu_dg2 = 1'b0;
+      assign mpu_f1 = 1'b0;  assign mpu_fg1 = 1'b0;  assign mpu_f2 = 1'b0;  assign mpu_fg2 = 1'b0;
    end endgenerate
 
 `ifndef SYNTHESIS
@@ -3885,13 +3971,13 @@ module mmu_sr (
    input  logic [3:0]  mtsr_idx,
    input  logic [63:0] mtsr_wdata,
    input  logic        ent_we,       // an exception entry completes
-   input  logic [3:0]  ent_cause,
+   input  logic [8:0]  ent_cause,    // {GUARD, 4'b0, cause}
    input  logic [31:0] ent_addr,
    input  logic [3:0]  ridx,         // MFSR SR number (low 4 bits; 0-8 decode)
    input  logic [31:0] sp_alt,
    output logic [63:0] rdata,
    output logic [31:0] evec,
-   output logic [7:0]  ecause,
+   output logic [8:0]  ecause,
    output logic [31:0] eaddr
 );
    // SR -> RAM slot: EADDR (3) 0, SCRATCH0 (5) 1, SCRATCH1 (6) 2, TP (7) 3
@@ -3921,10 +4007,10 @@ module mmu_sr (
          if (rwe) sv[wa] <= 1'b1;
          if (mtsr_we) case (mtsr_idx)
             4'd1: evec   <= {mtsr_wdata[31:2], 2'b00};
-            4'd2: ecause <= mtsr_wdata[7:0];
+            4'd2: ecause <= mtsr_wdata[8:0];
             default: ;                    // STATUS: no writable bits; USP: core
          endcase
-         if (ent_we) ecause <= {4'b0, ent_cause};
+         if (ent_we) ecause <= ent_cause;
          if (clr) begin
             evec <= '0;  ecause <= '0;  sv[0] <= 1'b0;
          end
@@ -3935,11 +4021,97 @@ module mmu_sr (
    always_comb begin
       case (ridx)
          4'd1:    rdata = {32'b0, evec};
-         4'd2:    rdata = {56'b0, ecause};
+         4'd2:    rdata = {55'b0, ecause};
          4'd4:    rdata = {32'b0, sp_alt};
          4'd8:    rdata = cycle;
          default: rdata = rs[2] ? rram : 64'b0;   // EADDR / SCRATCH0-1 / TP
       endcase
    end
    assign eaddr = sv[0] ? sram[0][31:0] : 32'b0;   // (tb_vsim's view)
+endmodule
+
+
+//===========================================================================
+// mmu_mpu — MMU stage 2 MPU (MMU_PLAN.md §10): 16 base / limit / permission
+// regions at 32-byte granularity, MPU_EN, and the decision for one data
+// access and one instruction fetch per cycle.
+//
+// A region covers granule g when EN and BASE <= g <= LIMIT.  Decision (with
+// MPU_EN): any covering GUARD region denies (either mode); else supervisor
+// is allowed; else user needs a covering non-GUARD region with the
+// permission (data: R or W by direction; fetch: X).
+//
+// The 2nd granule (g + 1, for a two-access op or an instruction crossing a
+// granule edge) reuses the first granule's magnitude compares:
+//   BASE <= g+1  <=>  BASE <= g  or  BASE == g+1
+//   g+1 <= LIMIT <=>  g <= LIMIT and g != LIMIT
+// with g+1 from an incrementer on a register (d_gx = ex_a, f_g = pc), not
+// on the EA adder.  (For the two-access ops d_g == d_gx: their EA is ex_a.)
+//===========================================================================
+module mmu_mpu (
+   input  logic        clk,
+   input  logic        rst,
+   input  logic        ce,
+   input  logic        clr,           // program load: MPU_EN <- 0
+   input  logic        we,            // MTSR to an MPU SR commits
+   input  logic [4:0]  widx,          // SR - 0x10: [4:1] region, [0] 0 = BASE / 1 = LIMIT
+   input  logic [31:0] wdata,
+   input  logic        en_we,         // MTSR STATUS commits
+   input  logic        en_wd,         //   its [8]
+   input  logic [4:0]  ridx,          // MFSR SR - 0x10
+   output logic [31:0] rdata,
+   output logic        mpu_en,
+   input  logic [26:0] d_g,           // the EA's granule (EA[31:5])
+   input  logic [26:0] d_gx,          // ex_a[31:5] (= d_g for two-access ops)
+   input  logic        d_st,          // a store (needs W), else a load (R)
+   input  logic        d_um,          // user mode
+   output logic        d_deny1, d_guard1, d_deny2, d_guard2,
+   input  logic [26:0] f_g,           // pc[31:5]
+   input  logic        f_um,
+   output logic        f_deny1, f_guard1, f_deny2, f_guard2
+);
+   localparam int N = 16;
+   logic [26:0] base  [0:N-1];
+   logic [26:0] limit [0:N-1];
+   logic [4:0]  attr  [0:N-1];        // {GUARD, X, W, R, EN}
+   always_ff @(posedge clk) begin
+      if (rst) begin
+         mpu_en <= 1'b0;
+         for (int n = 0; n < N; n++) begin base[n] <= '0; limit[n] <= '0; attr[n] <= '0; end
+      end else if (ce) begin
+         if (we) begin
+            if (!widx[0]) begin base[widx[4:1]] <= wdata[31:5];  attr[widx[4:1]] <= wdata[4:0]; end
+            else                limit[widx[4:1]] <= wdata[31:5];
+         end
+         if (en_we) mpu_en <= en_wd;
+         if (clr)   mpu_en <= 1'b0;
+      end
+   end
+   assign rdata = ridx[0] ? {limit[ridx[4:1]], 5'b0} : {base[ridx[4:1]], attr[ridx[4:1]]};
+
+   wire [26:0] d_g1 = d_gx + 27'd1;
+   wire [26:0] f_g1 = f_g + 27'd1;
+   logic [N-1:0] dc1, dc2, fc1, fc2, gd, pr, pw, px;
+   always_comb begin
+      for (int n = 0; n < N; n++) begin
+         logic dge, dle, fge, fle;
+         dge = d_g >= base[n];  dle = d_g <= limit[n];
+         fge = f_g >= base[n];  fle = f_g <= limit[n];
+         dc1[n] = attr[n][0] && dge && dle;
+         dc2[n] = attr[n][0] && (dge || d_g1 == base[n]) && dle && (d_gx != limit[n]);
+         fc1[n] = attr[n][0] && fge && fle;
+         fc2[n] = attr[n][0] && (fge || f_g1 == base[n]) && fle && (f_g != limit[n]);
+         gd[n]  = attr[n][4];
+         pr[n]  = attr[n][1];  pw[n] = attr[n][2];  px[n] = attr[n][3];
+      end
+   end
+   wire [N-1:0] pd = d_st ? pw : pr;
+   assign d_guard1 = mpu_en && |(dc1 & gd);
+   assign d_guard2 = mpu_en && |(dc2 & gd);
+   assign d_deny1  = d_guard1 || (mpu_en && d_um && !(|(dc1 & ~gd & pd)));
+   assign d_deny2  = d_guard2 || (mpu_en && d_um && !(|(dc2 & ~gd & pd)));
+   assign f_guard1 = mpu_en && |(fc1 & gd);
+   assign f_guard2 = mpu_en && |(fc2 & gd);
+   assign f_deny1  = f_guard1 || (mpu_en && f_um && !(|(fc1 & ~gd & px)));
+   assign f_deny2  = f_guard2 || (mpu_en && f_um && !(|(fc2 & ~gd & px)));
 endmodule

@@ -26,6 +26,10 @@ SHIFT = {'shl': 0, 'shr': 1, 'sar': 2, 'rol': 3, 'ror': 4}
 SZ = {8: 0, 16: 1, 32: 2, 64: 3}
 SR = {'status': 0, 'evec': 1, 'ecause': 2, 'eaddr': 3, 'usp': 4, 'scratch0': 5,
       'scratch1': 6, 'tp': 7, 'cycle': 8}
+# MMU stage 2: MPU_BASEn = 0x10 + 2n, MPU_LIMITn = 0x11 + 2n
+SR.update({f'mpu_base{n}': 0x10 + 2 * n for n in range(16)})
+SR.update({f'mpu_limit{n}': 0x11 + 2 * n for n in range(16)})
+MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G = 1, 2, 4, 8, 16     # MPU_BASEn [4:0]
 
 
 def H(length, cls):

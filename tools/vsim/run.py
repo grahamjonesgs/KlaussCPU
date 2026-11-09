@@ -430,6 +430,103 @@ def _mmio_prog(seed):
     return a
 
 
+def _mpu_variant(seed, p_sys=0.05, irq=False):
+    """MMU stage 2: randprog `seed` in user mode under random MPU regions,
+    with SYSCALLs injected.  The handler (no memory access: SCRATCH0/1 hold
+    r13/r14) turns the MPU off on an ACCESS fault and retries the faulting
+    instruction, and turns it on again on a SYSCALL.  So every instruction
+    runs exactly once with its full effect, after faults at arbitrary
+    points: the final state must equal the plain program's."""
+    import random, randprog
+    from kasm import Asm, MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G
+    from tests import _xsetup, _to_user, _mpu_reg, _mpu_on, HALT_W
+    rnd = random.Random(seed * 104729 + 7)
+    areas = [(0x0, 0x4000, False), (0x10000, 0x10800, True), (0x07F7F000, 0x07F80000, True)]
+
+    class MpuAsm(Asm):
+        def __init__(self, *aa, **kk):
+            super().__init__(*aa, **kk)
+            self.inj = False
+            self.n_inj = 0
+            _xsetup(self)
+            for n in range(16):
+                if rnd.random() < 0.75:
+                    lo, hi, guard_ok = rnd.choice(areas)
+                    b = rnd.randrange(lo, hi, 32)
+                    l = min(hi - 1, b + rnd.choice([0, 32, 64, 256, 1024, 4096]) + rnd.randrange(32))
+                    at = MPU_EN | (rnd.random() < 0.7) * MPU_R | (rnd.random() < 0.6) * MPU_W | \
+                         (rnd.random() < 0.6) * MPU_X
+                    if guard_ok and rnd.random() < 0.15:
+                        at |= MPU_G
+                    _mpu_reg(self, n, b, l, at)
+            _mpu_on(self)
+            _to_user(self, 'u', mask=1 if irq else 0)
+            self.label('u')
+            self.inj = True
+
+        def emit(self, *ws):
+            if self.inj and rnd.random() < p_sys:
+                self.n_inj += 1
+                super().emit(0x6C080000)                  # SYSCALL
+            return super().emit(*ws)
+
+    old = randprog.Asm
+    randprog.Asm = MpuAsm
+    try:
+        asm = randprog.gen(seed, irq=irq)
+    finally:
+        randprog.Asm = old
+    asm.inj = False
+    asm.label('h')
+    asm.mtsr('scratch0', 13); asm.mtsr('scratch1', 14)
+    asm.mfsr(13, 'eaddr'); asm.setr(14, HALT_W)
+    asm.fbr('ne', 13, 14, 'h_nh'); asm.halt()
+    asm.label('h_nh')
+    asm.mfsr(13, 'ecause'); asm.alui('and', 13, 13, 0xFF, sgn=False)
+    asm.setr(14, 0x100)
+    asm.fbr('eq', 13, 4, 'h_set', imm=True)               # SYSCALL: MPU on
+    # ACCESS_* on MMIO is the stage 1 user rule (with IRQs, randprog's
+    # INT_MASK store): step over it; any other ACCESS_*: MPU off, retry
+    asm.mfsr(13, 'eaddr'); asm.shift_n('shr', 13, 13, 28); asm.setr(14, 15)
+    asm.fbr('ne', 13, 14, 'h_off')
+    asm.getsp(13); asm.ld(64, 14, 13); asm.addi_s(14, 14, 4); asm.st(64, 14, 13)
+    asm.jmp('h_ret')
+    asm.label('h_off')
+    asm.setr(14, 0)
+    asm.label('h_set')
+    asm.mtsr('status', 14)
+    asm.label('h_ret')
+    asm.mfsr(13, 'scratch0'); asm.mfsr(14, 'scratch1')
+    asm.iret()
+    return asm, asm.n_inj
+
+
+def cmd_mpudiff(a):
+    import randprog
+    exe = build(None)
+    fails = n_exc = 0
+    for s in range(a.seed0, a.seed0 + a.seeds):
+        for lat in a.lats:
+            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
+            sa, _ = run(exe, randprog.gen(s, irq=a.irq), f'pa{s}_{lat}', plus)
+            asm, n = _mpu_variant(s, irq=a.irq)
+            sb, _ = run(exe, asm, f'pb{s}_{lat}', plus)
+            n_exc += int(sb.get('exc_n', 0))
+            keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
+                   sorted({k for k in list(sa) + list(sb) if re.fullmatch(r'm[0-9a-f]{8}', k) and k != 'm00180000'})
+            bad = [k for k in keys if sa.get(k) != sb.get(k)]
+            ok = sa.get('end') == 'park' and sb.get('end') == 'park' and sb.get('kind') == '0' and not bad
+            if 'fatal' in (sa['log'] + sb['log']).lower():
+                ok = False
+            if not ok:
+                fails += 1
+            if not ok or a.verbose:
+                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} exc={sb.get("exc_n")} '
+                      f'end {sa.get("end")}/{sb.get("end")} kind {sb.get("kind")} {bad[:4]}')
+    print(f'{fails} differing; {n_exc} exception entries')
+    return 1 if fails else 0
+
+
 def cmd_socmmio(a):
     """full SoC, base rev vs working tree: MMIO / DRAM interleavings must
     give identical retire traces (the bus_splitter response paths)"""
@@ -445,6 +542,15 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0xFB = stage 1 + LR/SC
+    # + the 16-region MPU
+    from kasm import Asm
+    f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
+    rf = run_soc(new, f, 'cpufeat', trace=True)
+    last = open(rf['trace']).read().strip().splitlines()[-1]
+    if 'r2=00000000000000fb' not in last:
+        fails += 1
+        print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
     return 1 if fails else 0
 
@@ -487,6 +593,10 @@ def main():
     d.add_argument('--irq', action='store_true'); d.add_argument('-v', '--verbose', action='store_true')
     d.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('dmtest')
+    mp = sub.add_parser('mpudiff'); mp.add_argument('--seeds', type=int, default=20)
+    mp.add_argument('--seed0', type=int, default=1); mp.add_argument('--lats', type=int, nargs='+', default=[3])
+    mp.add_argument('--irq', action='store_true'); mp.add_argument('-v', '--verbose', action='store_true')
+    mp.add_argument('--plus', nargs='*', default=[])
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -510,6 +620,8 @@ def main():
         sys.exit(cmd_excdiff(a))
     elif a.cmd == 'dmtest':
         sys.exit(cmd_dmtest(a))
+    elif a.cmd == 'mpudiff':
+        sys.exit(cmd_mpudiff(a))
     elif a.cmd == 'socmmio':
         sys.exit(cmd_socmmio(a))
     else:
