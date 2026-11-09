@@ -779,6 +779,10 @@ def main():
     tl.add_argument('--seed0', type=int, default=1); tl.add_argument('--lats', type=int, nargs='+', default=[3])
     tl.add_argument('--irq', action='store_true'); tl.add_argument('-v', '--verbose', action='store_true')
     tl.add_argument('--plus', nargs='*', default=[])
+    tp = sub.add_parser('tlbpage'); tp.add_argument('--seeds', type=int, default=30)
+    tp.add_argument('--seed0', type=int, default=1); tp.add_argument('--lats', type=int, nargs='+', default=[3])
+    tp.add_argument('--irq', action='store_true'); tp.add_argument('--hit', type=int)
+    tp.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('soccrypto')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
@@ -805,6 +809,9 @@ def main():
         sys.exit(cmd_dmtest(a))
     elif a.cmd == 'mpudiff':
         sys.exit(cmd_mpudiff(a))
+    elif a.cmd == 'tlbpage':
+        import tlbpage
+        sys.exit(tlbpage.main(a.seed0, a.seeds, a.lats, a.hit, a.irq, a.plus))
     elif a.cmd == 'soccrypto':
         sys.exit(cmd_soccrypto(a))
     elif a.cmd == 'tlbdiff':
