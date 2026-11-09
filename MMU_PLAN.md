@@ -169,6 +169,10 @@ holds EX and so delays interrupt entry), `LCDCMD`/`LCDDATA`/`LCDRST`, `MFSR`
 of any SR except `STATUS`, `TP` and `CYCLE`, and `MTSR` of any SR except
 `TP`.
 
+Legality is checked before privilege: an encoding that is ILLEGAL in
+supervisor mode (an SR number above 8, MTSR to CYCLE) is ILLEGAL in user
+mode too, not PRIVILEGED.
+
 Everything else is allowed, including LR/SC. `TRAP` raises TRAP in either
 mode, and `SYSCALL` raises SYSCALL in either mode.
 
@@ -213,6 +217,16 @@ MEMGET32, byte, 64-bit and stack accesses never raise MISALIGNED.
 | 11–13 | TLB_MISS_LOAD / _STORE / _FETCH | stage 3 | the instruction | faulting VA |
 | 14–255 | reserved | | | |
 
+- **Priority** when several causes apply to one instruction:
+  MISALIGNED_FETCH > ACCESS_FETCH > ILLEGAL > PRIVILEGED > (TRAP, SYSCALL)
+  > MISALIGNED_LOAD/STORE > ACCESS_LOAD/STORE. So a misaligned user access
+  to MMIO is MISALIGNED, and an LR/SC is checked for alignment before MMIO.
+- **EADDR for data faults** is the effective address as computed (base +
+  offset), before any alignment: a 64-bit A=1 access and a sub-word store
+  report the raw address, not the aligned-down one. The exception is a
+  two-access instruction whose first doubleword is fine and whose second
+  faults: it reports the start of the second doubleword (the lowest
+  faulting byte).
 - **Restartable:** for every cause except SYSCALL, the frame PC is the
   faulting instruction and **nothing of it has happened**: no register, flag,
   SP, R15 or PC change, and no memory or device access. IRET re-executes it.
@@ -272,7 +286,8 @@ because every predicted return is checked in MEM.
 The order of checks when an exception reaches WB:
 
 1. **Debugger attached** (`DMCONTROL[3]`), **`DMCONTROL[5]` EXC_PASS = 0**,
-   and cause ILLEGAL, TRAP or MISALIGNED_*: debug halt with today's
+   and cause ILLEGAL, TRAP, MISALIGNED_LOAD or MISALIGNED_STORE (not
+   MISALIGNED_FETCH, which is new and user-mode-only): debug halt with today's
    `dbg_cause` (TRAP/ILL), in either mode. This is unchanged and is the
    default. With EXC_PASS = 1 these causes skip this step and go to step 2.
    EXC_PASS is cleared on program load like `attached`, unless
@@ -283,6 +298,8 @@ The order of checks when an exception reaches WB:
    MISALIGNED_* → 5. Any new cause (PRIVILEGED, SYSCALL, ACCESS_*,
    MISALIGNED_FETCH) → 2, the same crash an old bitstream gives for an
    undefined opcode. A debugger, if attached, halts on these too.
+   Parking does **not** write `ECAUSE` or `EADDR`; only exception entry
+   does.
 3. Otherwise: exception entry (§3.3).
 
 HALT in supervisor mode parks or debug-halts as today. WAIT in supervisor
@@ -412,7 +429,8 @@ ABI has no free register for it. In user mode, MFSR is allowed only for
 ### 6.2 Debugger
 
 The debug module gets two more register indices: 20 = `SP_ALT`, 21 =
-`{UM, DI}` in `[1:0]` (read; write allowed while halted). It also gets
+`UM` in bit 0 and `DI` in bit 1, the same layout as `STATUS` (read;
+write allowed while halted). It also gets
 `DMCONTROL[5]` EXC_PASS (§4.4), and its `DMSTATUS` version becomes 2.
 
 ### 6.3 `CPU_FEATURES` (MMIO, read-only)
@@ -786,3 +804,9 @@ physical doubleword address.
    runtime will reimplement it with LR/SC loops, probing `CPU_FEATURES[3]`
    with a DI/EI fallback.
 9. MPU: 16 regions preferred (§10).
+10. Spec clarifications from the klausscc emulator (2026-11-09), all
+    matching the RTL as built: reg 21 bit order (§6.2); MISALIGNED_FETCH
+    does not debug-halt (§4.4); legality before privilege (§3.5); cause
+    priority and EADDR (§4.1); parking does not write ECAUSE/EADDR (§4.4).
+    The emulator first proposed the aligned-down EADDR for A=1 accesses;
+    the raw EA was kept.
