@@ -2534,3 +2534,62 @@ def lcd_sq_spec_once():
             a.halt()
             out.append((a, {'end': 'park', 'kind': '0', 'lcd_n': '1'}, [f'+LAT={lat}']))
     return out
+
+
+@test
+def wp_mpu_denied_load():
+    """review 2 #2: a read watchpoint on a dword whose load the MPU denies
+    (GUARD) must not fire: the load takes ACCESS_LOAD|GUARD and the program
+    completes.  Control, MPU off: the same load fires the watchpoint
+    (DEBUG_EN builds; without the debug module it just completes)"""
+    dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
+    out = []
+    for mpu in (True, False):
+        a = Asm()
+        _xsetup(a)
+        a.setr(12, DATA); a.setr(3, 0x31); a.st(64, 3, 12)
+        _mpu_reg(a, 1, DATA, DATA, A_EN | A_G)
+        if mpu:
+            _mpu_on(a)
+        for _ in range(4):
+            a.nop()
+        a.ld(64, 6, 12)                       # MPU on: denied -> never reads DATA
+        a.setr(7, 0x77)
+        a.halt()
+        a.label('h')                          # record, step over, return
+        a.mfsr(8, 'ecause'); a.mfsr(9, 'eaddr')
+        a.getsp(13); a.ld(64, 14, 13); a.addi_s(14, 14, 4); a.st(64, 14, 13)
+        a.nop(); a.nop()
+        a.iret()
+        if mpu:
+            e = {'end': 'park', 'kind': '0', 'r6': 0, 'r7': 0x77, 'r8': G_ | X_ACC_LD, 'r9': DATA}
+        elif dbg:
+            e = {'end': 'park', 'kind': '4', 'dbg_cause': '3', 'watch_addr': '00010000', 'r6': 0x31}
+        else:
+            e = {'end': 'park', 'kind': '0', 'r6': 0x31, 'r7': 0x77}
+        out.append((a, e, ['+WP0RD=%x' % DATA, '+LAT=3']))
+    return out
+
+
+@test
+def wp_te_physical():
+    """watchpoints compare physical addresses: with TE = 1 a load through
+    DATA's kseg alias fires a read watchpoint set on PA DATA (port path,
+    and the hit pipe with +HIT=100); DEBUG_EN builds only"""
+    dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
+    out = []
+    for plus in ([], ['+HIT=100']):
+        a = Asm()
+        _xsetup(a)
+        _te_on(a)
+        a.setr(12, 0x80000000 | DATA); a.setr(3, 0x31); a.st(64, 3, 12)
+        for _ in range(4):
+            a.nop()
+        a.ld(64, 6, 12)
+        a.setr(7, 0x77)
+        a.halt()
+        _mpuhandler(a)
+        e = ({'end': 'park', 'kind': '4', 'dbg_cause': '3', 'watch_addr': '00010000', 'r6': 0x31}
+             if dbg else {'end': 'park', 'kind': '0', 'r6': 0x31, 'r7': 0x77})
+        out.append((a, e, ['+WP0RD=%x' % DATA, '+LAT=3'] + plus))
+    return out

@@ -2494,6 +2494,10 @@ module pipeline_core
    // squash: the op is refetched and would send again.)
    assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
                      !mem_xsq_go && !sq_spec;
+   // A load's EX-side watchpoint compares (hit pipe, early issue) fire only
+   // for a load that really leaves EX: not one an older op kills this edge,
+   // nor one with an access fault (it never reads)
+   wire ex_wp_ok   = !fbr_taken && !ras_miss && !sq_ex && !mem_xsq_go && !sq_spec && !ex_ufault;
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -3467,7 +3471,7 @@ module pipeline_core
                   m_read_DV  <= 1'b1;
                   rdy_armed  <= !m_ready;
                   mem_xc     <= 2'd1;
-                  if (DEBUG_EN) begin
+                  if (DEBUG_EN && ex_wp_ok) begin
                      for (int w = 0; w < 2; w++)
                         if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
                             (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
@@ -3493,12 +3497,14 @@ module pipeline_core
                mem_fwb  <= m_wdata;
                mem_fwc  <= sq_wdata;
                if (h_fwd) mem_hok <= 1'b1;
-               if (DEBUG_EN && h_elig) begin
+               // (watchpoints compare physical addresses, as the MEM-issue
+               // compare on mem_iaddr: h_addr is the PA with TE = 1)
+               if (DEBUG_EN && h_elig && ex_wp_ok) begin
                   for (int w = 0; w < 2; w++)
-                     if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
+                     if (dbg_i.wp_en[w] && h_addr[31:3] == dbg_i.wp_dw[w] &&
                          (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
                         dbg_watch_req  <= 1'b1;
-                        dbg_watch_addr <= exo_iaddr;
+                        dbg_watch_addr <= h_addr;
                      end
                end
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
