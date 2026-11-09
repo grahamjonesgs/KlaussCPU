@@ -870,3 +870,118 @@ def exc_di_irq():
     a.pop(14); a.pop(13)
     a.iret()
     return a, {'end': 'park', 'kind': '0', m(XD + 0x40): 0, 'm00180000': 'nonzero'}, ['+IRQ_PERIOD=60']
+
+
+USP = 0x07F80000           # user stack (in the TB's high memory window)
+HALT_W = 0x6C010000
+XLOG = XD + 0x100          # the user handler's cause log (8 bytes per entry)
+
+
+def _to_user(a, ucode, usp=USP, mask=0):
+    """supervisor -> user: set USP, build a PM = 1 frame, IRET"""
+    a.setr(1, usp); a.mtsr('usp', 1)
+    a.leapc(2, ucode)
+    a.setr64(3, (1 << 44) | (mask << 39)); a.alu('or', 2, 2, 3)
+    a.push(2)
+    a.iret()
+
+
+def _uhandler(a, name='h'):
+    """records like _xhandler plus: XD+40 = USP at entry, XD+48 = SP after
+    the two pushes, XLOG[count-1] = ECAUSE; a user-mode HALT (PRIVILEGED with
+    EADDR = the HALT word) halts in supervisor mode; otherwise it steps over
+    the faulting 1-word op (not SYSCALL) and returns"""
+    a.label(name)
+    a.push(13); a.push(14)
+    a.setr(14, XD)
+    a.mfsr(13, 'ecause'); a.st(64, 13, 14, 0)
+    a.mfsr(13, 'eaddr');  a.st(64, 13, 14, 8)
+    a.getsp(13); a.st(64, 13, 14, 48); a.ld(64, 13, 13, 16); a.st(64, 13, 14, 16)
+    a.mfsr(13, 'status'); a.st(64, 13, 14, 24)
+    a.mfsr(13, 'usp');    a.st(64, 13, 14, 40)
+    a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)
+    a.shift_n('shl', 13, 13, 3); a.alu('add', 13, 13, 14)
+    a.mfsr(14, 'ecause'); a.st(64, 14, 13, 0x100 - 8)
+    a.mfsr(13, 'eaddr'); a.setr(14, HALT_W)
+    a.fbr('ne', 13, 14, name + '_nh')
+    a.halt()
+    a.label(name + '_nh')
+    a.mfsr(13, 'ecause')
+    a.fbr('eq', 13, X_SYSCALL, name + '_s', imm=True)
+    a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
+    a.label(name + '_s')
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+@test
+def user_syscall_stacks():
+    a = Asm()
+    _xsetup(a)
+    _to_user(a, 'u')
+    a.label('u')
+    a.getsp(5)                     # the user SP
+    a.mfsr(6, 'status')            # UM = 1, DI = 0
+    a.push(5)                      # user stack in use: USP - 8
+    at = a.syscall()
+    a.pop(7)
+    a.getsp(8)
+    a.mfsr(9, 'status')
+    a.halt()                       # PRIVILEGED -> the handler halts
+    _uhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'r5': USP, 'r6': 1, 'r7': USP, 'r8': USP, 'r9': 1,
+           m(XLOG): X_SYSCALL, m(XLOG + 8): X_PRIV,
+           m(XD): X_PRIV, m(XD + 8): HALT_W, m(XD + 24): 2, m(XD + 32): 2,
+           m(XD + 40): USP,                       # USP seen by the handler
+           m(XD + 48): 0x08000000 - 8 - 16}       # kernel SP: frame + 2 pushes
+    return a, exp, []
+
+
+@test
+def user_priv_ops():
+    """every privileged op traps in user mode; the allowed SRs do not"""
+    a = Asm()
+    _xsetup(a)
+    a.setr64(10, 0x5566778899AABBCC)
+    _to_user(a, 'u')
+    a.label('u')
+    priv = [lambda: a.di(1), lambda: a.ei(1), lambda: a.iret(), lambda: a.wait(),
+            lambda: a.sys(3), lambda: a.sys(5, 1), lambda: a.raw(0x70000010),   # RESET, DELAYR, LCDCMD
+            lambda: a.mfsr(1, 'evec'), lambda: a.mfsr(1, 'usp'), lambda: a.mfsr(1, 'scratch0'),
+            lambda: a.mtsr('evec', 1), lambda: a.mtsr('status', 1), lambda: a.mtsr('ecause', 1)]
+    for f in priv:
+        f()
+    a.mtsr('tp', 10); a.mfsr(11, 'tp')          # allowed
+    a.mfsr(12, 'cycle'); a.mfsr(4, 'status')
+    a.halt()
+    _uhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'r11': 0x5566778899AABBCC, 'r12': 'nonzero', 'r4': 1,
+           m(XD + 32): len(priv) + 1}
+    for i in range(len(priv) + 1):
+        exp[m(XLOG + 8 * i)] = X_PRIV
+    return a, exp, []
+
+
+@test
+def user_irq():
+    """a timer IRQ taken in user mode runs its handler on the kernel stack
+    and returns to user mode with the user SP intact"""
+    a = Asm()
+    _xsetup(a)
+    _to_user(a, 'u', mask=1)
+    a.label('u')
+    # canaries below the user SP: an IRQ frame / handler push on the user
+    # stack would overwrite them
+    a.setr64(7, 0xC0FFEE0011223344); a.setr(4, USP)
+    a.st(64, 7, 4, -16); a.st(64, 7, 4, -24); a.st(64, 7, 4, -32)
+    a.setr(1, 0); a.setr(2, 2000)
+    a.label('l'); a.alu('add', 1, 1, 2); a.push(1); a.pop(3); a.dec(2)
+    a.fbr('ne', 2, 0, 'l', imm=True)
+    a.getsp(5); a.mfsr(6, 'status')
+    a.ld(64, 8, 4, -16); a.ld(64, 9, 4, -24); a.ld(64, 10, 4, -32)
+    a.halt()
+    _uhandler(a)
+    # sum 1..2000 = 2001000
+    c = 0xC0FFEE0011223344
+    return a, {'end': 'park', 'kind': '0', 'r1': 2001000, 'r3': 2001000, 'r5': USP, 'r6': 1,
+               'r8': c, 'r9': c, 'r10': c, 'm00180000': 'nonzero', m(XD): X_PRIV}, ['+IRQ_PERIOD=97']

@@ -1787,6 +1787,8 @@ module pipeline_core
    logic [3:0]  wb_xcause;
    logic [31:0] wb_xaddr, wb_pc_next;
    logic        wb_mtsr;
+   logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
+   logic [31:0] wb_spalt_new;
    // the WB exception op enters the handler (else it parks / debug-halts as
    // before): EVEC set, and not a debugger-attached ILLEGAL / TRAP /
    // MISALIGNED unless the debugger passes them on (EXC_PASS)
@@ -2228,6 +2230,7 @@ module pipeline_core
          scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
          res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
+         wb_um_we <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2435,6 +2438,11 @@ module pipeline_core
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
             if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
+            if (EN_EXC && wb_um_we) begin          // IRET (MMU stage 1)
+               umode     <= wb_um_new;
+               if (wb_um_new) sp_alt <= wb_spalt_new;
+               res_valid <= 1'b0;
+            end
             if (wb_park && wb_exc_go) begin
                // MMU stage 1: the exception op commits nothing and retires
                // no trace line; everything younger is already gone (it
@@ -3017,6 +3025,15 @@ module pipeline_core
             end
             wb_fmask   <= mem_fmask;
             wb_sp_new  <= mem_sp_new;  wb_sp_we <= mem_valid && mem_sp_we;
+            // MMU stage 1: IRET restores UM from frame bit 44; returning to
+            // user mode it swaps the stacks (sp = the user SP, sp_alt = the
+            // kernel SP above the popped frame).  Computed here, so SP
+            // forwarding to a younger op carries the right value.
+            wb_um_we   <= EN_EXC && mem_valid && mem_d.uop == U_IRET;
+            wb_um_new  <= m_rdata[44];
+            wb_spalt_new <= mem_sp_new;
+            if (EN_EXC && mem_valid && mem_d.uop == U_IRET && m_rdata[44])
+               wb_sp_new <= sp_alt;
             wb_mask_we <= mem_valid && (mem_d.uop == U_IRET);
             wb_mask_new<= m_rdata[42:39];
             wb_dis_we  <= mem_valid && (mem_dis_we || mem_d.uop == U_IRET);
@@ -3662,6 +3679,11 @@ module pipeline_core
       // 2a: a BTIC hit's window is at the predicted target
       if (EN_BTIC && id_valid && id_bp_tk && bt_hit)
          assert (id_bt_base == id_bp_tgt[31:3]) else $fatal(1, "BTIC base != target: pc=%h", id_pc);
+      // MMU stage 1: nothing younger than an IRET can have been decoded
+      // under the old UM (IRET serializes; fetch rebases after its MEM edge)
+      if (EN_EXC && wb_valid && wb_um_we)
+         assert (!id_valid && !ex_valid && !mem_valid)
+            else $fatal(1, "MMU: op in flight behind a committing IRET: pc=%h", wb_pc);
       if (id_valid)
          assert (id_ser == dec.serialize)
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
