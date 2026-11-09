@@ -2025,6 +2025,7 @@ rams_sp_nc rams_sp_nc1 (
                      3'd1: begin st.SM <= HCF_1; st.error_code <= ERR_TRAP; end    // TRAP
                      3'd2: begin st.SM <= HCF_1; st.error_code <= ERR_INV_OPCODE; end
                      3'd5: begin st.SM <= HCF_1; st.error_code <= ERR_MISALIGN; end  // §3.3
+                     3'd6: begin st.SM <= HCF_1; st.error_code <= ERR_DFAULT; end    // MMU stage 3 DOUBLE_FAULT
                      default: ;   // WAIT parks wake inside the pipeline
                   endcase
                end
@@ -2276,7 +2277,7 @@ rams_sp_nc rams_sp_nc1 (
             end
             HCF_4: begin
                if (r_error_display_type) begin
-                  // Error codes 0x1..0xA — see ERR_* localparams (ERR_INV_OPCODE .. ERR_MISALIGN).
+                  // Error codes 0x1..0xB — see ERR_* localparams (ERR_INV_OPCODE .. ERR_DFAULT).
 
                   case (st.error_code)
                      ERR_CHECKSUM_LOAD:

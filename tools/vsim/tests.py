@@ -2182,3 +2182,169 @@ def tlb_reservation_clears():
     for k, want in enumerate([1, 1, 1, 1, 0, 0, 0]):
         exp[m(DATA + 8 + 8 * k)] = want
     return a, exp, []
+
+
+TLB_RWX = TLB_V | TLB_R | TLB_W | TLB_X
+KSP = 0x88000000        # kernel SP in kseg (PA 0x0800_0000, the top of DDR)
+
+
+def _te_on(a, ksp=KSP):
+    """global identity entries for page 0 (code, handlers) and page 1 (the
+    data window), the kernel SP into kseg, then TE (the next fetch is
+    translated: through the page-0 entry)"""
+    _tlb_set(a, 0, 0x0000, 0x000, TLB_RWX, g=1)
+    _tlb_set(a, 1, 0x0001, 0x001, TLB_RWX, g=1)
+    a.setr(1, ksp); a.setsp(1)
+    a.setr(1, 0x200); a.mtsr('status', 1)
+
+
+def _te_prog(body, user=False, exp=None, logs=(), plus=(), tlbvec=False, setup=None):
+    a = Asm()
+    _xsetup(a)
+    if tlbvec:
+        a.leapc(1, 'ht'); a.mtsr('tlbvec', 1)
+    if setup:
+        setup(a)
+    _te_on(a)
+    if user:
+        _to_user(a, 'u')
+    a.label('u')
+    a.setr(12, GOOD)
+    body(a)
+    a.halt()
+    _mpuhandler(a)
+    if tlbvec:          # the TLBVEC entry: counts at XD+0x58, then the common handler
+        a.label('ht')
+        a.push(13); a.push(14)
+        a.setr(14, XD + 0x58); a.ld(64, 13, 14); a.inc(13); a.st(64, 13, 14)
+        a.pop(14); a.pop(13)
+        a.jmp('h')
+    e = {'end': 'park', 'kind': '0'}
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        if ea is not None:
+            e[m(FLOG + 0x30 * i + 8)] = ea
+    n = len(logs) + (1 if user else 0)
+    if user:
+        e[m(FLOG + 0x30 * len(logs))] = X_PRIV
+    e[m(XD + 32)] = n
+    e.update(exp or {})
+    return a, e, list(plus)
+
+
+@test
+def tlb_data_segments():
+    """TE = 1, supervisor: useg through the TLB, kseg direct (VA - 0x8000_0000),
+    kmap through the TLB, MMIO identity, the 0x8800_0000-0xBFFF_FFFF hole
+    faults; a miss raises TLB_MISS_LOAD / _STORE and loads TLB_HI; a
+    permission failure is ACCESS_* (TLB_HI loaded too); TLBVEC takes the
+    misses only"""
+    def setup(a):
+        _tlb_set(a, 2, 0x0100, 0x001, TLB_V | TLB_R | TLB_W)        # 0x0100_0000 -> PA 0x10000
+        _tlb_set(a, 3, 0x0300, 0x001, TLB_V | TLB_R)                # read-only alias
+        _tlb_set(a, 4, 0xC000, 0x001, TLB_V | TLB_R, g=1)           # kmap
+    def body(a):
+        a.setr(9, 0x01000008); a.setr(3, 0x1111); a.st(64, 3, 9); a.ld(64, 4, 9)
+        a.setr(9, 0x80010010); a.setr(3, 0x2222); a.st(64, 3, 9); a.ld(64, 5, 9)
+        a.setr(9, 0xF0010010); a.ld(64, 6, 9)                       # MMIO identity (UART status 2)
+        a.setr(9, 0xC0000008); a.ld(64, 7, 9)                       # kmap -> PA 0x10008
+        a.setr(9, 0x88000000); a.ld(64, 8, 9)                       # hole: ACC_LD
+        a.setr(9, 0x02000010); a.ld(64, 8, 9)                       # miss: TLB_MISS_LD
+        a.st(64, 3, 9, 8)                                           # TLB_MISS_ST
+        a.setr(9, 0x03000020); a.st(64, 3, 9)                       # R-only: ACC_ST
+        a.mfsr(11, 'tlb_hi')
+    logs = [(X_ACC_LD, 0x88000000), (X_TLB_LD, 0x02000010), (X_TLB_ST, 0x02000018),
+            (X_ACC_ST, 0x03000020)]
+    return _te_prog(body, False, {'r4': 0x1111, 'r5': 0x2222, 'r6': 2, 'r7': 0x1111,
+                                  m(DATA + 8): 0x1111, m(DATA + 0x10): 0x2222, m(DATA + 0x20): 0,
+                                  'r11': 0x03000000, m(XD + 0x58): 2},
+                    logs=logs, tlbvec=True, setup=setup)
+
+
+@test
+def tlb_data_user_asid():
+    """TE = 1, user mode: useg through the TLB; kseg and kmap are ACCESS_*;
+    an entry of another ASID misses, a global one hits; MTSR ASID makes the
+    ASID entry hit (from supervisor)"""
+    def setup(a):
+        _tlb_set(a, 2, 0x0100, 0x001, TLB_V | TLB_R | TLB_W, asid=0)
+        _tlb_set(a, 3, 0x0200, 0x001, TLB_V | TLB_R, asid=5)
+        _tlb_set(a, 4, 0x0400, 0x001, TLB_V | TLB_R, g=1, asid=9)
+    def body(a):
+        a.setr(9, 0x01000008); a.setr(3, 0x33); a.st(64, 3, 9); a.ld(64, 4, 9)
+        a.setr(9, 0x80010008); a.ld(64, 5, 9)                       # kseg: ACC_LD
+        a.setr(9, 0xC0000008); a.ld(64, 5, 9)                       # kmap: ACC_LD
+        a.setr(9, 0x02000008); a.ld(64, 6, 9)                       # ASID 5 != 0: TLB_MISS_LD
+        a.setr(9, 0x04000008); a.ld(64, 7, 9)                       # global: ok
+    logs = [(X_ACC_LD, 0x80010008), (X_ACC_LD, 0xC0000008), (X_TLB_LD, 0x02000008)]
+    return _te_prog(body, True, {'r4': 0x33, 'r5': 0, 'r6': 0, 'r7': 0x33}, logs=logs, setup=setup)
+
+
+@test
+def tlb_data_asid_switch():
+    """MTSR ASID selects which non-global entries match"""
+    return _te_asid()
+
+
+def _te_asid():
+    def setup(a):
+        _tlb_set(a, 3, 0x0200, 0x001, TLB_V | TLB_R, asid=5)
+    def body(a):
+        a.setr(9, DATA + 8); a.setr(3, 0x44); a.st(64, 3, 9)       # PA 0x10008 (identity page 1)
+        a.setr(9, 0x02000008)
+        a.ld(64, 6, 9)                                              # ASID 0: miss
+        a.setr(1, 5); a.mtsr('asid', 1)
+        a.ld(64, 7, 9)                                              # ASID 5: hit
+        a.setr(1, 0); a.mtsr('asid', 1)
+    return _te_prog(body, False, {'r6': 0, 'r7': 0x44}, logs=[(X_TLB_LD, 0x02000008)], setup=setup)
+
+
+@test
+def tlb_two_access_pages():
+    """a LEAVERET / spanning MEMGET32 crossing a page: both pages translated
+    (different frames); the 2nd page unmapped reports its start; the 1st
+    unmapped reports the EA even though the 2nd is mapped"""
+    def setup(a):
+        _tlb_set(a, 2, 0x0101, 0x002, TLB_V | TLB_R | TLB_W)        # -> PA 0x20000
+        _tlb_set(a, 3, 0x0102, 0x003, TLB_V | TLB_R | TLB_W)        # -> PA 0x30000
+        _tlb_set(a, 4, 0x0104, 0x004, TLB_V | TLB_R)                # 0x0105 unmapped
+        _tlb_set(a, 5, 0x0107, 0x005, TLB_V | TLB_R)                # 0x0106 unmapped
+    def body(a):
+        a.setr(9, 0x8002FFF8); a.setr64(3, 0x1122334455667788); a.st(64, 3, 9)   # via kseg
+        a.leapc(3, 'back'); a.setr(9, 0x80030000); a.st(64, 3, 9)
+        a.setr(15, 0x0101FFF8); a.leaveret()                        # R15 <- [p2 + FFF8], PC <- [p3 + 0]
+        a.setr(4, 0xBAD)
+        a.label('back')
+        a.mov(5, 15); a.getsp(6)
+        a.setr(1, KSP); a.setsp(1)
+        a.setr(9, 0x0101FFFD); a.ld(32, 7, 9)                       # bytes 11 22 33 of p2 end + low byte of p3's
+        a.setr(15, 0x0104FFF8); a.leaveret()                        # 2nd page unmapped
+        a.setr(9, 0x0106FFFD); a.ld(32, 8, 9)                       # 1st page unmapped
+    back = None
+    logs = [(X_TLB_LD, 0x01050000), (X_TLB_LD, 0x0106FFFD)]
+    a, e, p = _te_prog(body, False, {'r5': 0x1122334455667788, 'r6': 0x01020008, 'r4': 0},
+                       logs=logs, setup=setup)
+    back = a.labels['back']
+    e['r7'] = ((back & 0xFF) << 24) | 0x112233
+    return a, e, p
+
+
+@test
+def tlb_double_fault():
+    """TE = 1: an entry whose frame push (SP - 8) is not in kseg parks with
+    kind 6 and writes none of ECAUSE / EADDR / TLB_HI; SP = 0x8800_0000 is
+    fine; SP = 0x8000_0000 (push at 0x7FFF_FFF8) is not"""
+    out = []
+    for ksp, kind in ((0x08000000, '6'), (0x80000000, '6'), (0x88000000, '0')):
+        a = Asm()
+        _xsetup(a)
+        a.setr(1, 0x55); a.mtsr('ecause', 1)
+        _te_on(a, ksp)
+        at = a.syscall()
+        a.halt()
+        _mpuhandler(a)
+        e = {'end': 'park', 'kind': kind}
+        if kind == '6':
+            e.update({'pc': at + 4, 'ecause': '055', 'eaddr': '00000000'})
+        out.append((a, e, []))
+    return out

@@ -311,7 +311,8 @@ module pipeline_core
    // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
    localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
                           X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
-                          X_ACC_ST = 4'd8, X_ACC_FE = 4'd9, X_MISAL_FE = 4'd10;
+                          X_ACC_ST = 4'd8, X_ACC_FE = 4'd9, X_MISAL_FE = 4'd10,
+                          X_TLB_LD = 4'd11, X_TLB_ST = 4'd12, X_TLB_FE = 4'd13;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -405,6 +406,14 @@ module pipeline_core
    logic [7:0]  tlb_asid;
    logic [31:0] tlb_vec;         // TLBVEC
    logic [31:0] tlb_rdata;       // MFSR of a TLB SR
+   logic        tlb_hi_load;     // exception entry: TLB_HI <- {VPN(EADDR), 0, ASID}
+   logic [15:0] tlb_hi_vpn;
+   logic [15:0] tlb_d_vpn, tlb_f_vpn;   // lookup ports: data / fetch (+ TLBP)
+   logic        tlb_d_hit, tlb_f_hit;
+   logic [10:0] tlb_d_pfn, tlb_f_pfn;
+   logic [2:0]  tlb_d_xwr, tlb_f_xwr;   // {X, W, R}
+   logic        mtsr_commit, tlbi_commit, tlb_discard, sr_ent_we;   // (assigned at the end)
+   logic [28:0] wb_va_dw;        // the WB op's VA doubleword (LR/SC reservation)
    logic [31:0] mpu_rdata;       // MFSR of an MPU SR
    logic        mpu_d1, mpu_dg1, mpu_d2, mpu_dg2;   // data: deny / GUARD, 1st and 2nd granule
    logic        mpu_f1, mpu_fg1, mpu_f2, mpu_fg2;   // fetch: the same at pc's granule and the next
@@ -414,6 +423,9 @@ module pipeline_core
    logic        exc_ent;
    logic [3:0]  exc_cause_q;
    logic        exc_guard_q;     // ECAUSE[8]
+   logic        exc_tlb_q;       // (stage 3) TLB-related: TLB_HI auto-load
+   // the frame push address of an entry (the kernel SP after any swap)
+   wire [31:0]  push_va = ((EN_EXC && umode) ? sp_alt : sp) - 32'd8;
    logic [31:0] exc_addr_q, exc_epc_q;
    logic [31:0] pc;
    logic        running;        // fetch enabled
@@ -474,7 +486,7 @@ module pipeline_core
    assign dbg_o.dis        = irq_dis;
    // TRAP / ILLEGAL / HALT -> debug-halt cause
    function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
-      return (kind == 3'd1 || kind == 3'd5) ? DBG_CAUSE_TRAP
+      return (kind == 3'd1 || kind == 3'd5 || kind == 3'd6) ? DBG_CAUSE_TRAP
            : (kind == 3'd2) ? DBG_CAUSE_ILL : DBG_CAUSE_HALT;
    endfunction
 
@@ -1524,8 +1536,17 @@ module pipeline_core
    // region compares run from that register in the second, so the EA adder
    // and the compares are never in series.  Registered terms only.
    logic        ex_mph;           // the op in EX has had its MPU cycle
+   logic        ex_mph2;          // ... and (TE, two-access op crossing a page) its 2nd-page cycle
+   // MMU stage 3: a spanning MEMGET32 / LEAVERET (EA = ex_a) whose 2nd
+   // doubleword is in the next 64 KiB page
+   wire ex_xpg = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
+                 ex_a[15:3] == 13'h1FFF;
    logic [31:0] ex_ea_q;          // exo_eaddr, registered every cycle
-   wire ex_mpu_hold = EN_MPU && mpu_en && ex_valid && ex_d.is_mem && !ex_mph;
+   // (stage 3: the same EX cycle carries the TLB lookup while TE = 1 — the
+   // CAM reads the registered EA; a page-crossing two-access op takes a
+   // third cycle for its 2nd page)
+   wire ex_mpu_hold = ((EN_MPU && mpu_en) || (EN_TLB && te)) && ex_valid && ex_d.is_mem &&
+                      (!ex_mph || (EN_TLB && te && ex_xpg && !ex_mph2));
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
@@ -1604,9 +1625,9 @@ module pipeline_core
    // faulting one is no longer an LR / SC uop, and a squash of either kills
    // this SC too).  SC is [rs1] only, so its address is ex_a (no adder).
    logic wb_lr, wb_sc;
-   wire ex_sc_ok = (mem_valid && mem_d.uop == U_LR) ? (mem_iaddr[31:3] == ex_a[31:3])
+   wire ex_sc_ok = (mem_valid && mem_d.uop == U_LR) ? (mem_eaddr[31:3] == ex_a[31:3])
                  : (mem_valid && mem_d.uop == U_SC) ? 1'b0
-                 : (wb_valid && wb_lr)              ? (wb_iaddr[31:3] == ex_a[31:3])
+                 : (wb_valid && wb_lr)              ? (wb_va_dw == ex_a[31:3])
                  : (wb_valid && wb_sc)              ? 1'b0
                  :                                    (res_valid && res_dw == ex_a[31:3]);
    wire [31:0] ex_sp_r = EN_SPFWD ? ex_sp : sp;
@@ -1903,18 +1924,50 @@ module pipeline_core
    wire ex_s1    = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc);
    wire ex_u1    = ex_s1 && ex_ea_f;
    wire ex_u2    = ex_s1 && ex_ea_xf;
-   wire ex_mchk  = EN_MPU && ex_valid && ex_memop && !ex_misal;
+   wire ex_mchk  = EN_MPU && !(EN_TLB && te) && ex_valid && ex_memop && !ex_misal;
    wire ex_x2c   = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
                    ex_a[4:3] == 2'b11;
-   wire ex_dn1   = ex_u1 || (ex_mchk && mpu_d1);
-   wire ex_dn2   = ex_u2 || (ex_mchk && ex_x2c && mpu_d2);
+   // MMU stage 3 (TE = 1): translate ex_ea_q — segment (§11.2), then the
+   // TLB's data port.  Per access: segment ACCESS > TLB_MISS > ACCESS (TLB
+   // permission).  The MPU is ignored while TE = 1.
+   wire [31:0] tva    = ex_ea_q;
+   wire        t_useg = !tva[31];
+   wire        t_kseg = tva[31:27] == 5'b10000;                 // 0x8000_0000-0x87FF_FFFF
+   wire        t_kmap = tva[31:30] == 2'b11 && tva[31:28] != 4'hF;
+   wire        t_tlbs = t_useg || t_kmap;
+   wire        t_seg  = (tva[31:30] == 2'b10 && !t_kseg) || (umode && !t_useg);
+   wire        t_miss = t_tlbs && !tlb_d_hit;
+   wire        t_perm = t_tlbs && tlb_d_hit && !(ex_mst ? tlb_d_xwr[1] : tlb_d_xwr[0]);
+   wire        t_dn   = t_seg || t_miss || t_perm;
+   wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[26:16]} : tva[31:16];
+   assign tlb_d_vpn = tva[31:16];
+   logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
+   logic [15:0] t1_pahi;
+   wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
+   wire ex_x3    = EN_TLB && te && ex_xpg;                      // leaving in its 3rd cycle
+   wire d1_dn    = ex_x3 ? t1_dn   : t_dn;
+   wire d1_seg   = ex_x3 ? t1_seg  : t_seg;
+   wire d1_miss  = ex_x3 ? t1_miss : t_miss;
+   wire d1_tlb   = ex_x3 ? t1_tlb  : (t_miss || t_perm);
+   wire [15:0] d1_pahi = ex_x3 ? t1_pahi : t_pahi;
+   wire ex_dn1   = ex_u1 || (ex_tchk ? d1_dn : (ex_mchk && mpu_d1));
+   wire ex_dn2   = ex_u2 || (ex_tchk ? (ex_x3 && t_dn) : (ex_mchk && ex_x2c && mpu_d2));
    wire ex_ufault = ex_dn1 || ex_dn2;
-   wire ex_xg    = ex_dn1 ? (!ex_u1 && ex_mchk && mpu_dg1) : (!ex_u2 && ex_mchk && ex_x2c && mpu_dg2);
+   wire ex_xg    = !ex_tchk &&
+                   (ex_dn1 ? (!ex_u1 && ex_mchk && mpu_dg1) : (!ex_u2 && ex_mchk && ex_x2c && mpu_dg2));
+   // the reported access's kind: a TLB miss (cause 11/12), and whether it
+   // is TLB-related (miss or TLB permission: TLB_HI is auto-loaded)
+   wire ex_xtm   = ex_tchk && (ex_dn1 ? (!ex_u1 && !d1_seg && d1_miss) : (!ex_u2 && !t_seg && t_miss));
+   wire ex_xtlb  = ex_tchk && (ex_dn1 ? (!ex_u1 && !d1_seg && d1_tlb)
+                                       : (!ex_u2 && !t_seg && (t_miss || t_perm)));
    // (for the early-issue ops — MEMGET32 [rs1], LEAVERET: EA = ex_a — the
    // same test from the register alone, off the EA adder)
    wire ex_uf_early = EN_EXC && umode && (ex_a[31:28] == 4'hF || ex_a[31:3] == 29'h1DFF_FFFF);
    logic mem_xsq;       // the MEM op is an access fault (no access; squash EX / ID)
    logic mem_xs_st, mem_xs2, mem_xs_g;   // ... a store / 2nd dword only / GUARD
+   logic mem_xs_tm, mem_xs_tlb;          // ... a TLB miss / TLB-related (stage 3)
+   logic [15:0] mem_pa2hi;               // (stage 3) the 2nd page's PA[31:16]
+   logic        mem_xpg;                 // ... the op crosses a page
    // MEM -> WB exception record: wb_xc = the WB op is an exception op
    // (ILLEGAL / TRAP / misaligned / U_EXC), with its cause and EADDR
    logic        wb_xc;
@@ -1923,6 +1976,7 @@ module pipeline_core
    logic        wb_xguard;            // ECAUSE[8]: a GUARD denial (stage 2)
    logic        wb_mtsr;
    logic        wb_tlbi;              // a TLB instruction (MMU stage 3)
+   logic        wb_xtlb;              // a TLB-related fault: TLB_HI auto-load
    logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
    logic [31:0] wb_spalt_new;
    assign fe_um = umode || (wb_valid && wb_um_we && wb_um_new);
@@ -2100,10 +2154,16 @@ module pipeline_core
                           : (ex_d.msz == 2'd2) ? (exo_iaddr[2] ? 8'hF0 : 8'h0F)
                           : (ex_d.msz == 2'd1) ? (8'h03 << {exo_iaddr[2:1], 1'b0})
                           :                      (8'h01 << exo_iaddr[2:0]);
-   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[31:3] == exo_iaddr[31:3];
-   wire        sf_b       = m_write_DV && m_addr[31:3] == exo_iaddr[31:3];
+   // (stage 3: with TE = 1 a store's address is a PA and the load's a VA —
+   // only the page offset is comparable: a conservative block, no forward)
+   wire        sf_te      = EN_TLB && te;
+   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:3] == exo_iaddr[15:3] &&
+                            (sf_te || mem_iaddr[31:16] == exo_iaddr[31:16]);
+   wire        sf_b       = m_write_DV && m_addr[15:3] == exo_iaddr[15:3] &&
+                            (sf_te || m_addr[31:16] == exo_iaddr[31:16]);
    // EN_SQ: the queued store (younger than the posted one on the port)
-   wire        sf_c       = EN_SQ && sq_v && sq_addr[31:3] == exo_iaddr[31:3];
+   wire        sf_c       = EN_SQ && sq_v && sq_addr[15:3] == exo_iaddr[15:3] &&
+                            (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
    wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
                           : sf_c ? ((sq_be  & ex_ldmask) == ex_ldmask)
                                  : ((m_be & ex_ldmask) == ex_ldmask);
@@ -2112,16 +2172,18 @@ module pipeline_core
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
                             !(DEBUG_EN && dbg_mx);
-   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
+   wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov && !sf_te;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
-   assign h_addr     = exo_iaddr;
+   // (stage 3: with TE = 1 the tag bits [31:16] are the PA — the cache
+   // indexes with the VA bits [14:5] it always used: VIPT, 64 KiB pages)
+   assign h_addr     = (EN_TLB && te) ? {t_pahi, exo_iaddr[15:0]} : exo_iaddr;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
                        !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx) &&
                        // (stage 2: no early issue with the MPU on — its
                        // decision must not reach the EX->MEM enables)
-                       !(EN_MPU && mpu_en);
+                       !(EN_MPU && mpu_en) && !(EN_TLB && te);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -2130,7 +2192,7 @@ module pipeline_core
    // SMC: a DRAM store overlapping the code of the younger op in EX or ID.
    wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF &&
                             !st_spec_now && !sq_enq_now;   // (EN_ST1 / EN_SQ: checked the cycle after, sq_spec)
-   wire [28:0] smc_dw     = mem_iaddr[31:3];
+   wire [28:0] smc_dw     = mem_eaddr[31:3];     // the store's VA (= mem_iaddr with TE = 0)
    wire        smc_hit_id = smc_st && id_valid &&
                             (id_pc[31:3] == smc_dw || id_last_dw == smc_dw);
    wire        smc_hit_ex = smc_st && ex_valid &&
@@ -2396,6 +2458,7 @@ module pipeline_core
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
+         ex_mph2 <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2522,6 +2585,20 @@ module pipeline_core
                   if (!(EN_EXC && exc_ent) && (!irq_ready || (EN_DIEI && irq_dis))) begin
                      // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
+                  end else if (EN_TLB && te && push_va[31:27] != 5'b10000) begin
+                     // MMU stage 3: with TE = 1 the frame push needs SP - 8 in
+                     // kseg — otherwise DOUBLE_FAULT: park 6 (debug halt when
+                     // attached), writing none of ECAUSE / EADDR / TLB_HI
+                     irq_active <= 1'b0;
+                     exc_ent    <= 1'b0;
+                     parked     <= 1'b1;
+                     park_kind  <= 3'd6;
+                     park_pc    <= exc_ent ? exc_epc_q : pc;
+                     park_op    <= 32'b0;
+                     if (DEBUG_EN && dbg_i.attached) begin
+                        park_kind <= 3'd4;  running <= 1'b0;  dbg_cause <= DBG_CAUSE_TRAP;
+                        dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
+                     end
                   end else begin
                      // Re-latch source+vector too: the drained stores may have
                      // retargeted the highest-priority pending source.
@@ -2530,7 +2607,9 @@ module pipeline_core
                      // MMU stage 1: from user mode the frame goes on the
                      // kernel SP (sp_alt); frame bit 44 = previous mode;
                      // an exception's frame PC is its EPC
-                     m_addr     <= ((EN_EXC && umode) ? sp_alt : sp) - 32'd8;
+                     // (stage 3: with TE = 1 the push is not translated: PA =
+                     // SP - 8 - 0x8000_0000, SP - 8 in kseg — checked above)
+                     m_addr     <= (EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va;
                      m_wdata    <= {19'b0, EN_EXC && umode, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
@@ -2556,7 +2635,9 @@ module pipeline_core
                ev_pcz              = 1'b1;
                if (EN_EXC && exc_ent) begin
                   // exception: interrupts off (the old DI is in the frame)
-                  pc          <= evec;
+                  // (stage 3: a TLB miss goes to TLBVEC when that is set)
+                  pc          <= (EN_TLB && exc_cause_q >= X_TLB_LD && exc_cause_q <= X_TLB_FE &&
+                                  tlb_vec != 32'b0) ? tlb_vec : evec;
                   irq_dis     <= 1'b1;
                   // (ECAUSE / EADDR written by mmu_sr: sr_ent_we)
                   fetch_halt  <= 1'b0;
@@ -2601,7 +2682,7 @@ module pipeline_core
             if (wb_mask_we) int_mask <= wb_mask_new;
             if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
             // MMU stage 1: the LR/SC reservation (LR sets it, any SC clears it)
-            if (EN_EXC && wb_lr) begin res_valid <= 1'b1; res_dw <= wb_iaddr[31:3]; end
+            if (EN_EXC && wb_lr) begin res_valid <= 1'b1; res_dw <= wb_va_dw; end
             if (EN_EXC && wb_sc) res_valid <= 1'b0;
             if (EN_EXC && wb_um_we) begin          // IRET (MMU stage 1)
                umode     <= wb_um_new;
@@ -2617,6 +2698,7 @@ module pipeline_core
                exc_ent     <= 1'b1;
                exc_cause_q <= wb_xcause;
                exc_guard_q <= wb_xguard;
+               exc_tlb_q   <= wb_xtlb;
                exc_addr_q  <= wb_xaddr;
                exc_epc_q   <= (wb_xcause == X_SYSCALL) ? wb_pc_next : wb_pc;
             end else if (wb_park) begin
@@ -2650,7 +2732,11 @@ module pipeline_core
          end
 
          // ---------------- EX free-running units ----------------
-         ex_ea_q <= exo_eaddr;             // (MMU stage 2: the MPU's data input)
+         // (MMU stage 2 / 3: the MPU's and the TLB's data input — the EA,
+         // captured in the op's first EX cycle; for a page-crossing two-
+         // access op, the next page in its 3rd)
+         if (!ex_mph)                                  ex_ea_q <= exo_eaddr;
+         else if (ex_mpu_hold && EN_TLB && te && ex_xpg) ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
          // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
@@ -2856,14 +2942,14 @@ module pipeline_core
                   // predates this store's ic_v* clear (the mem_done_now
                   // store-match below is the belt-and-braces line-granular kill).
                   if (mem_port_wr && (nlb_vhi || nlb_vlo)
-                      && nlb_line == mem_iaddr[31:4]) begin
+                      && nlb_line == mem_eaddr[31:4]) begin
                      nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
                   end
                   if (mem_port_wr && (nlb1_vhi || nlb1_vlo)
-                      && nlb1_line == mem_iaddr[31:4]) begin
+                      && nlb1_line == mem_eaddr[31:4]) begin
                      nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
                   end
-                  if (mem_port_wr && pf_look && pf_line == mem_iaddr[31:4])
+                  if (mem_port_wr && pf_look && pf_line == mem_eaddr[31:4])
                      pf_look <= 1'b0;
                   // EN_ST1: the store leaves MEM now, already posted
                   // (EN_SQ: or queued behind the posted store)
@@ -2879,7 +2965,9 @@ module pipeline_core
                2'd1: if (w_mrdy) begin
                   if (mem_need2) begin         // cross-line MEMGET32 / LEAVERET: 2nd read
                      mem_dw0   <= m_rdata;
-                     m_addr    <= {mem_eaddr[31:3], 3'b000} + 32'd8;
+                     // (stage 3: the 2nd dword's PA — next to the 1st, or
+                     // the start of the next page's frame)
+                     m_addr    <= mem_xpg ? {mem_pa2hi, 16'h0000} : {mem_iaddr[31:3], 3'b000} + 32'd8;
                      rdy_armed <= 1'b0;        // new request (DV held, addr changed)
                      mem_xc    <= 2'd2;        // settle cycle (f_memget32 shape)
                   end else begin
@@ -3238,7 +3326,8 @@ module pipeline_core
             wb_xc      <= EN_EXC && mem_valid &&
                           (mem_d.uop == U_TRAP || mem_d.uop == U_ILL || mem_d.uop == U_EXC || mem_xsq);
             wb_xcause  <= mem_misal ? (mem_misal_st ? X_MISAL_ST : X_MISAL_LD)
-                        : mem_xsq ? (mem_xs_st ? X_ACC_ST : X_ACC_LD)
+                        : mem_xsq ? (mem_xs_tm ? (mem_xs_st ? X_TLB_ST : X_TLB_LD)
+                                             : (mem_xs_st ? X_ACC_ST : X_ACC_LD))
                         : (mem_d.uop == U_TRAP) ? X_TRAP
                         : (mem_d.uop == U_ILL)  ? X_ILL : mem_d.sub;
             wb_xaddr   <= mem_misal ? mem_ea_raw
@@ -3252,6 +3341,8 @@ module pipeline_core
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
             wb_tlbi    <= EN_TLB && mem_valid && mem_d.tlbi;
+            wb_va_dw   <= mem_eaddr[31:3];        // (the reservation holds a VA)
+            wb_xtlb    <= EN_TLB && mem_xsq && mem_xs_tlb;
             wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
                                      : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE && mem_d.fxg));
             wb_lr      <= EN_EXC && mem_valid && mem_d.uop == U_LR && !mem_xsq;
@@ -3274,9 +3365,18 @@ module pipeline_core
             if (ex_busy) begin
                mem_valid <= 1'b0;
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
-               if (ex_mpu_hold) ex_mph <= 1'b1;
+               if (ex_mpu_hold) begin
+                  if (!ex_mph) ex_mph <= 1'b1;
+                  else         ex_mph2 <= 1'b1;
+               end
+               // (stage 3) the 1st page's translation, kept for the 2nd-page cycle
+               if (ex_mpu_hold && ex_mph) begin
+                  t1_dn <= t_dn;  t1_seg <= t_seg;  t1_miss <= t_miss;  t1_tlb <= t_miss || t_perm;
+                  t1_pahi <= t_pahi;
+               end
             end else begin
                ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
+               ex_mph2    <= 1'b0;
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                // early load issue (see EN_EARLY_LD): the MEM engine then
                // starts in its wait-ready state
@@ -3340,7 +3440,12 @@ module pipeline_core
                               ex_d.uop == U_CALL) ? exo_raw : exo_result;
                mem_fval   <= exo_fval; mem_fmask <= ex_valid ? exo_fmask : '0;
                mem_zval   <= (ex_d.uop != U_BTSTN);   // Z from (value==0) at WB
-               mem_eaddr  <= exo_eaddr;  mem_iaddr <= exo_iaddr;
+               mem_eaddr  <= exo_eaddr;
+               // (stage 3: with TE = 1 the port address is the PA; the page
+               // offset is the VA's)
+               mem_iaddr  <= (EN_TLB && te) ? {d1_pahi, exo_iaddr[15:0]} : exo_iaddr;
+               mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
+               mem_xpg    <= ex_x3;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_mmq    <= ex_is_mm;   mem_mmpick <= ex_mmpick;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
@@ -3355,6 +3460,8 @@ module pipeline_core
                mem_xs_st  <= ex_mst;               // direction (cause)
                mem_xs2    <= !ex_dn1;              // only the 2nd dword faulted
                mem_xs_g   <= ex_xg;                // GUARD denial (stage 2, ECAUSE[8])
+               mem_xs_tm  <= ex_xtm;               // TLB miss (stage 3)
+               mem_xs_tlb <= ex_xtlb;              // TLB-related (TLB_HI auto-load)
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -3834,15 +3941,15 @@ module pipeline_core
    // fold its read mux / write decode into the dispatch and WB cones.
    // Written by MTSR as it commits at WB and by exception entry as it
    // completes; read at dispatch (MFSR, id_srv).
-   wire mtsr_commit = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
-   wire tlbi_commit = EN_TLB && wb_valid && !wb_wait && wb_tlbi && !wb_park;
+   assign mtsr_commit = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
+   assign tlbi_commit = EN_TLB && wb_valid && !wb_wait && wb_tlbi && !wb_park;
    // MMU stage 3: TLBWI, TLBINV, MTSR ASID and MTSR STATUS discard the fetch
    // side's virtual copies (window, NLB, BTIC, the micro-ITLB) and clear the
    // LR/SC reservation (MMU_PLAN.md §11.3)
-   wire tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
+   assign tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
                                  (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)));
    wire sr_mtsr_we  = mtsr_commit && wb_op[19:16] == 4'h0;     // SRs 0-8 (mmu_sr)
-   wire sr_ent_we  = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
+   assign sr_ent_we = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
    logic [63:0] sr_rdata;
    // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
    // would alias 0-8)
@@ -3903,15 +4010,10 @@ module pipeline_core
    // 32 entries + TLB_HI / TLB_LO / TLB_INDEX / ASID / TLBVEC (0x30-0x34)
    // and TE (STATUS[9]).  SR writes and TLB instructions act as they commit
    // at WB (serializing); MFSR reads at dispatch.
-   logic        tlb_hi_load;          // exception entry: TLB_HI <- {VPN(EADDR), 0, ASID}
-   logic [15:0] tlb_hi_vpn;
-   logic [15:0] tlb_d_vpn, tlb_f_vpn;
-   logic        tlb_d_hit, tlb_f_hit;
-   logic [10:0] tlb_d_pfn, tlb_f_pfn;
-   logic [2:0]  tlb_d_xwr, tlb_f_xwr;
    // (data / fetch translation is wired in the following steps)
-   assign tlb_hi_load = 1'b0;  assign tlb_hi_vpn = '0;
-   assign tlb_d_vpn = '0;  assign tlb_f_vpn = '0;
+   assign tlb_hi_load = sr_ent_we && exc_tlb_q;
+   assign tlb_hi_vpn  = exc_addr_q[31:16];
+   assign tlb_f_vpn   = '0;
    generate if (EN_TLB) begin : g_tlb
       mmu_tlb tlb_i (
          .clk, .rst, .ce,
