@@ -2216,7 +2216,19 @@ module pipeline_core
    // squash, mem_xsq_go, acts on the edge it leaves MEM)
    wire ret_h_wait   = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && mem_h1 && !mem_xsq;
    wire mem_busy     = mem_port_wait || wb_wait || ret_h_wait;
-   wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && (ret_actual != mem_pred_tgt);
+   // (timing: compare, then select — each candidate return address is a
+   // register (the captured hit dword, the forwarded store dwords) or the
+   // port's data, compared with mem_pred_tgt in parallel; the registered
+   // selects then pick the bit.  Exactly ret_actual != mem_pred_tgt.)
+   wire ret_ne_hr    = mem_hdw_r[31:0] != mem_pred_tgt;
+   wire ret_ne_fa    = mem_fwa[31:0]   != mem_pred_tgt;
+   wire ret_ne_fb    = mem_fwb[31:0]   != mem_pred_tgt;
+   wire ret_ne_fc    = mem_fwc[31:0]   != mem_pred_tgt;
+   wire ret_ne_h     = mem_fq ? (mem_fsel ? ret_ne_fa : mem_fselc ? ret_ne_fc : ret_ne_fb) : ret_ne_hr;
+   wire ret_ne       = mem_ret_h ? ret_ne_h
+                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata[31:0] != mem_pred_tgt)
+                     : (m_rdata_next[31:0] != mem_pred_tgt);
+   wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && ret_ne;
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
                         ex_d.uop == U_RET || ex_d.uop == U_IRET);
@@ -4265,6 +4277,10 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && running)
       assert (smc_hit_lat == (smc_st && (pc_dw == smc_dw || a_last_dw == smc_dw)))
          else $fatal(1, "smc_hit_lat form: pc=%h op=%h smc_dw=%h", pc, w_op, smc_dw);
+   // ras_miss's compare-then-select form equals ret_actual != mem_pred_tgt
+   always_ff @(posedge clk) if (!rst && mem_valid && mem_pred)
+      assert (ret_ne == (ret_actual != mem_pred_tgt))
+         else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst)
       assert (ex_mok == (ex_mph && !(ex_xpg_q && !ex_mph2)))
