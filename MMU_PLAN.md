@@ -651,7 +651,8 @@ The plan estimated about 500 FFs and well under 1k LUTs. Measured:
 
 | Measure | LUTs | FFs |
 |---|---|---|
-| Placed, whole design, vs master (`qspi2` build) | **+2,214** (39,285 → 41,499) | +655 (27,903 → 28,558) |
+| Placed, whole design, vs master (`qspi2` build): first stage 1 build | +2,214 (39,285 → 41,499) | +655 (27,903 → 28,558) |
+| Placed, whole design, vs master: after the §7.10 timing work (`273bd78`) | **+1,015** (39,285 → 40,300) | +603 (27,903 → 28,506) |
 | Post-synthesis, `pipeline_core_i` in the design | +1,744 (15,077 → 16,821) | +735 |
 | Out-of-context `pipeline_core`, `EXC_EN` 0 → 1 | **+757** (15,338 → 16,095) | +619 |
 
@@ -671,6 +672,50 @@ Out-of-context split of the +757 LUTs:
 
 No BRAM or DSP. The timing exposure was the fill-serve chain and the
 latch-time predecode (§7.7b). Both are now off the new logic.
+
+### 7.10 Timing closure (2026-11-09)
+
+Goal: WNS ≥ 0 with the standard `build_fast` flow, by design changes,
+not by alternate placement. Every step keeps the sim set clean and is
+CPI-neutral: the master diffs and `socdiff` cycle totals are unchanged.
+
+| Build | Commit | Change | Tier 1 WNS | Final WNS / TNS | LUTs | FFs |
+|---|---|---|---|---|---|---|
+| master reference | (`qspi2`) | — | −0.225 | −0.015 / −0.102 | 39,285 | 27,903 |
+| first stage 1 | `cd4fcdf` | stage 1 RTL | −0.516 | −0.324 / −20.131 | 41,499 | 28,558 |
+| | `40037a6` | fake fill; plain latch predecode (§7.7b) | −0.324 | −0.252 / −7.478 | 41,397 | 28,471 |
+| | `28d09b6` | + review fixes (`fe_um`, `sq_spec`) | −0.442 | −0.180 / −4.071 | 40,435 | 28,496 |
+| step 1 | `660ecfd` | MIN/MAX select moved to MEM | −0.054 | **+0.000** / 0 (tier 2) | 40,577 | 28,543 |
+| step 2 | `5705342` | SRs in a kept-hierarchy `mmu_sr` | −0.303 | −0.298 / −10.124 | 40,808 | 28,556 |
+| step 3 | `24a6f56` | SR file in LUTRAM with valid flops | +0.008 | **+0.008** / 0 (tier 1) | 40,453 | 28,576 |
+| step 4 | `273bd78` | bus_splitter response data select registered | +0.086 | **+0.086** / 0 (tier 1) | 40,300 | 28,506 |
+| (check) | `273bd78` without `keep_hierarchy` | | +0.028 | +0.028 / 0 (tier 1) | 40,249 | 28,443 |
+
+- **Step 1** removed the three worst paths: `ex_w` → compare → a fanout-81
+  64-bit select → `mem_result`. EX now registers the MIN/MAX pick, opa and
+  opb; `mem_result_eff` selects.
+- **Step 2 on its own** showed nothing attributable: none of its worst
+  paths touch `mmu_sr`, and the build-to-build spread is about ±0.3 ns.
+  With and without `keep_hierarchy`, the final configuration is +0.086 vs
+  +0.028. It is kept; it is cheap either way.
+- **Step 3** keeps EVEC, ECAUSE and CYCLE in flops (see `mmu_sr`'s
+  header); EADDR, SCRATCH0/1 and TP are LUTRAM.
+- **Step 4** took the worst remaining tier-1 path (`m_addr` → bus_splitter
+  `is_mmio` → read-data select → `m_rdata` → RET target / RAS check →
+  `pc` / `pos`) off the live address decode. Only the DATA select is
+  registered; READY stays live (a registered ready select showed the MMIO
+  ready's tail for a cycle against the next request — caught by `run.py
+  socmmio`).
+- **Remaining near-critical** at `273bd78` (all pre-existing):
+  `ex_b` → the I-cache tag shadow address (+0.086), and `m_addr` →
+  bus_splitter's live READY select → the window load enables / `pos`
+  (+0.16–0.19).
+- **One MMU-added path** showed up as a violator in one build (`5705342`,
+  −0.298): `ex_var1` → EA adder → `[31:28] == F` → the access-fault
+  conversion of `mem_d.uop`. If it reappears, the fix is to register the
+  fault and gate the MEM-side consumers (`mem_port_rd/wr`, `wb_ld`, the
+  RET redirect) with `mem_xsq` instead of converting `mem_d.uop` at
+  EX→MEM.
 
 ---
 
