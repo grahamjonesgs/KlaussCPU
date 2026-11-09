@@ -409,6 +409,9 @@ package klauss_pkg;
       logic [31:0]      mem_addr;   //   doubleword-aligned
       logic [63:0]      mem_wdata;  //   lane-placed
       logic [7:0]       mem_be;
+      // MMU stage 1 (DMCONTROL[5] EXC_PASS): with attached, ILLEGAL / TRAP /
+      // MISALIGNED go to the exception vector instead of a debug halt
+      logic             exc_pass;
    } dbg_in_t;
 
    // Debug-halt causes (dbg_out_t.cause).

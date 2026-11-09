@@ -24,6 +24,8 @@ JCOND = {'al': (0, 0), 'z': (1, 0), 'nz': (1, 1), 'eq': (1, 0), 'ne': (1, 1),
 ALU = {'add': 0, 'sub': 1, 'adc': 2, 'sbc': 3, 'and': 4, 'or': 5, 'xor': 6}
 SHIFT = {'shl': 0, 'shr': 1, 'sar': 2, 'rol': 3, 'ror': 4}
 SZ = {8: 0, 16: 1, 32: 2, 64: 3}
+SR = {'status': 0, 'evec': 1, 'ecause': 2, 'eaddr': 3, 'usp': 4, 'scratch0': 5,
+      'scratch1': 6, 'tp': 7, 'cycle': 8}
 
 
 def H(length, cls):
@@ -328,6 +330,22 @@ class Asm:
 
     def ei(self, rs1):
         return self.emit(H(1, 0xB) | 7 << 16 | rs1 << 4)
+
+    # MMU stage 1 (MMU_PLAN.md §5, ISA_ENCODING_V2_MAP.md §9)
+    def syscall(self):
+        return self.emit(H(1, 0xB) | 8 << 16)
+
+    def mfsr(self, rd, sr):
+        return self.emit(H(1, 0xB) | 1 << 22 | SR.get(sr, sr) << 12 | rd << 8)
+
+    def mtsr(self, sr, rs1):
+        return self.emit(H(1, 0xB) | 1 << 22 | 1 << 21 | SR.get(sr, sr) << 12 | rs1 << 4)
+
+    def lr(self, size, rd, rs1, sgn=False):     # LR.D / LR.W / LR.W.S rd, [rs1]
+        return self.emit(H(1, 6) | SZ[size] << 24 | sgn << 23 | 1 << 12 | rd << 8 | rs1 << 4)
+
+    def sc(self, size, rd, rs2, rs1):           # SC.D / SC.W rd(result), rs2(data), [rs1]
+        return self.emit(H(1, 7) | SZ[size] << 24 | 1 << 12 | rd << 8 | rs1 << 4 | rs2)
 
     def nop(self):  return self.sys(0)
     def halt(self): return self.sys(1)

@@ -38,7 +38,11 @@ module pipeline_core
    parameter bit DEBUG_EN = 1'b0,
    // 2a branch-target instruction cache (see EN_BTIC).  Core 2 turns it off:
    // it is ~2k LUTs + a BRAM per instance and core 2 does not need it.
-   parameter bit BTIC_EN = 1'b1
+   parameter bit BTIC_EN = 1'b1,
+   // MMU_PLAN.md stage 1: precise exceptions, user mode, SYSCALL, MFSR /
+   // MTSR, LR/SC.  0 = the new encodings trap as illegal and nothing else
+   // changes (core 2 builds it off).
+   parameter bit EXC_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -293,6 +297,13 @@ module pipeline_core
    // at start — so every entry is a copy of a resident, snooped I-cache line
    // and the SMC completion squash covers the same window as for a serve.
    localparam bit EN_BTIC = BTIC_EN;
+   // MMU_PLAN.md stage 1 (see EXC_EN).  With EVEC = 0 (reset / start) every
+   // exception parks exactly as before, so existing images are unaffected.
+   localparam bit EN_EXC = EXC_EN;
+   // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
+   localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
+                          X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
+                          X_ACC_ST = 4'd8, X_ACC_FE = 4'd9, X_MISAL_FE = 4'd10;
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -314,7 +325,12 @@ module pipeline_core
       U_FBR,                            // ISA v3 B fused compare-and-branch
       U_JMP, U_CALL, U_MUL, U_DIV, U_MOD,
       U_NOP, U_HALT, U_WAIT, U_RESET, U_TRAP, U_DELAY, U_LCD, U_LCDRST,
-      U_DI, U_EI                        // HW proposal 7a: interrupt disable/enable
+      U_DI, U_EI,                       // HW proposal 7a: interrupt disable/enable
+      // MMU_PLAN.md stage 1: U_EXC = an exception op (cause in .sub) that
+      // never commits; U_GETST = MFSR STATUS; LR / SC.  (MFSR of any other
+      // SR executes as U_MOV64 with its value loaded at dispatch; MTSR as a
+      // flag-less COPY with .mtsr, committed at WB.)
+      U_EXC, U_GETST, U_LR, U_SC
    } uop_e;
 
    typedef struct packed {
@@ -344,6 +360,7 @@ module pipeline_core
       logic       lcd_is_data;
       logic [1:0] len;          // instruction words
       logic       w32;          // ISA v3 D3: result = sext of its low 32 bits (in MEM)
+      logic       mtsr;         // MMU stage 1: MTSR (SR written at WB, then refetch)
    } dec_t;
 
    // ----------------------------------------------------- architectural state
@@ -356,6 +373,21 @@ module pipeline_core
    // Saved at frame bit [43] on IRQ entry and restored by IRET; the
    // DISABLE sense keeps software-built frames (bit 43 = 0) enabled.
    logic        irq_dis;
+   // MMU_PLAN.md stage 1 state.  umode = UM (1 = user).  sp_alt = the
+   // inactive stack pointer (the user SP in supervisor mode, the kernel SP
+   // in user mode; SR USP).  System registers EVEC / ECAUSE / EADDR /
+   // SCRATCH0-1 / TP / CYCLE.  res_* = the LR/SC reservation.
+   logic        umode;
+   logic [31:0] sp_alt;
+   logic [31:0] evec, eaddr;
+   logic [7:0]  ecause;
+   logic [63:0] scratch0, scratch1, tp, cycle;
+   logic        res_valid;
+   logic [28:0] res_dw;
+   // exception entry: the IRQ entry sequencer runs with exc_ent set
+   logic        exc_ent;
+   logic [3:0]  exc_cause_q;
+   logic [31:0] exc_addr_q, exc_epc_q;
    logic [31:0] pc;
    logic        running;        // fetch enabled
    logic        fetch_halt;     // serialize op in flight — hold fetch
@@ -931,10 +963,29 @@ module pipeline_core
                      6'd3: if (op[7:4] == 4'h0) begin d.legal = 1'b1; d.uop = U_RESET; d.serialize = 1'b1; end
                      6'd4: if (op[7:4] == 4'h0) begin d.legal = 1'b1; d.uop = U_TRAP;  d.serialize = 1'b1; end
                      6'd5: begin d.legal = 1'b1; d.uop = U_DELAY; d.use_rs1 = 1'b1; end
+                     // MMU stage 1: SYSCALL (an exception op from decode)
+                     6'd8: if (EN_EXC && op[7:4] == 4'h0) begin
+                        d.legal = 1'b1; d.uop = U_EXC; d.sub = X_SYSCALL; d.serialize = 1'b1;
+                     end
                      default: ;
                   endcase
                end else if (len == 2'b10 && op[21:16] == 6'd5 && op[7:4] == 4'h0) begin
                   d.legal = 1'b1; d.uop = U_DELAY;   // DELAYV
+               end
+            end else if (EN_EXC && len == 2'b01 && op[25:22] == 4'h1 && op[20] == 1'b0 &&
+                         op[3:0] == 4'h0) begin
+               // MMU stage 1: MFSR rd, sr ([21]=0) / MTSR sr, rs1 ([21]=1),
+               // sr = [19:12].  SRs 0-8 exist; MTSR to CYCLE (8) is illegal.
+               // MFSR STATUS is U_GETST (its DI bit is forwarded in EX); any
+               // other MFSR is a MOV64 whose value is loaded at dispatch
+               // (id_mfsr).  MTSR is a flag-less COPY of rs1, committed to
+               // the SR at WB, serializing.
+               if (!op[21] && op[7:4] == 4'h0 && op[19:12] <= 8'd8) begin
+                  d.legal = 1'b1; d.wreg = 1'b1;
+                  d.uop = (op[19:12] == 8'd0) ? U_GETST : U_MOV64;
+               end else if (op[21] && op[11:8] == 4'h0 && op[19:12] <= 8'd7) begin
+                  d.legal = 1'b1; d.uop = U_UNARY; d.sub = 4'd0; d.use_rs1 = 1'b1;
+                  d.mtsr = 1'b1; d.serialize = 1'b1;
                end
             end
          end
@@ -971,19 +1022,62 @@ module pipeline_core
       return d;
    endfunction
 
-   function automatic dec_t f_decode(logic [31:0] op);
+   // MMU stage 1: an exception op (no effects; serializes like ILLEGAL).
+   // .legal = 0 keeps it out of the latch-predecode assertions (its raw use
+   // flags may stall conservatively, as an illegal op's do).
+   function automatic dec_t f_mkx(dec_t din, logic [3:0] cause);
+      dec_t d;
+      d = din;
+      d.legal = 1'b0; d.uop = U_EXC; d.sub = cause; d.serialize = 1'b1; d.mtsr = 1'b0;
+      d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
+      d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
+      return d;
+   endfunction
+   // privileged in user mode (MMU_PLAN.md §3.5): MFSR other than STATUS /
+   // TP / CYCLE, MTSR other than TP
+   function automatic logic f_priv(dec_t d, logic [31:0] op);
+      case (d.uop)
+         U_DI, U_EI, U_IRET, U_HALT, U_WAIT, U_RESET, U_DELAY, U_LCD, U_LCDRST: return 1'b1;
+         U_MOV64: return op[29:26] == 4'hB && op[19:12] != 8'd7 && op[19:12] != 8'd8;
+         default: return d.mtsr && op[19:12] != 8'd7;
+      endcase
+   endfunction
+   // um = user mode; fx / fxc = a fetch fault on this instruction (MMU
+   // stage 1: user fetch from 0xF... (0) or a misaligned user PC (1)),
+   // which wins over ILLEGAL and PRIVILEGED
+   function automatic dec_t f_decode(logic [31:0] op, logic um, logic fx, logic fxc);
       dec_t d;
       d = f_decode_raw(op);
       if (!d.legal) begin
-         d.uop = U_ILL; d.serialize = 1'b1;
+         d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0;
          d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
          d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
+      end else if (EN_EXC && um && f_priv(d, op)) begin
+         d = f_mkx(d, X_PRIV);
       end
+      if (EN_EXC && fx) d = f_mkx(d, fxc ? X_MISAL_FE : X_ACC_FE);
       return d;
    endfunction
 
+   // MMU stage 1: the ID op's fetch fault, registered at the IF->ID latch;
+   // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
+   logic id_fx, id_fxc, id_mfsr;
+   logic [63:0] id_srv;
+   always_comb begin
+      case (id_op[15:12])
+         4'd1:    id_srv = {32'b0, evec};
+         4'd2:    id_srv = {56'b0, ecause};
+         4'd3:    id_srv = {32'b0, eaddr};
+         4'd4:    id_srv = {32'b0, sp_alt};
+         4'd5:    id_srv = scratch0;
+         4'd6:    id_srv = scratch1;
+         4'd7:    id_srv = tp;
+         4'd8:    id_srv = cycle;
+         default: id_srv = 64'b0;
+      endcase
+   end
    dec_t dec;
-   assign dec = f_decode(id_op);
+   assign dec = f_decode(id_op, umode, id_fx, id_fxc);
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
@@ -997,7 +1091,15 @@ module pipeline_core
    // (id_ser = full decode, so illegal ops still serialize) instead of
    // f_decode(id_op) — it gated every ID-latch load (the id_op->id_* family).
    dec_t w_decf;
-   assign w_decf = f_decode(w_op);
+   // MMU stage 1 fetch checks (user mode only): a PC with [1:0] != 0, or
+   // any word of the instruction at 0xF000_0000+, makes it an exception op
+   // (MISALIGNED_FETCH / ACCESS_FETCH) — decided here at the IF->ID latch
+   // from pc and the window's LEN bits, registered into id_fx / id_fxc.
+   wire [31:0] w_last_pc = (w_op[31:30] == 2'b11) ? w_pc_p8 : (w_op[31:30] == 2'b10) ? w_pc_p4 : pc;
+   wire        w_fxc = EN_EXC && umode && (pc[1:0] != 2'b00);
+   wire        w_fx  = EN_EXC && umode && ((pc[1:0] != 2'b00) || pc[31:28] == 4'hF ||
+                                           w_last_pc[31:28] == 4'hF);
+   assign w_decf = f_decode(w_op, umode, w_fx, w_fxc);
    logic id_ser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
@@ -1641,6 +1743,10 @@ module pipeline_core
          end
          U_RESET: begin exo_taken = 1'b1; exo_target = 32'h4; end
          U_DI:    exo_result = {63'b0, !ex_dis_eff};   // old enable bit
+         // MMU stage 1: MFSR STATUS = {DI, UM}; DI forwarded from an older
+         // DI / EI in MEM / WB (program order), UM is stable (it only
+         // changes with the pipe drained or behind a serializing IRET)
+         U_GETST: exo_result = {62'b0, ex_dis_eff, umode};
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1666,6 +1772,28 @@ module pipeline_core
                     (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00));
    logic mem_misal;      // the MEM op is a converted misaligned access (parks 5)
    logic ev_misal;       // blocking event: a misaligned op entered MEM this edge
+   // MMU stage 1: the raw effective address (a sub-word store's exo_eaddr
+   // is aligned down) for EADDR; registered at EX -> MEM (D-path only)
+   wire [31:0] ex_ea_raw = (ex_d.uop != U_STORE) ? exo_eaddr
+                         : (ex_d.mmode == 2'b00) ? ex_a[31:0]
+                         : (ex_d.mmode == 2'b01) ? ex_a[31:0] + ex_var1
+                         : (ex_d.mmode == 2'b10) ? ex_var1
+                         :                         ex_a[31:0] + ex_b[31:0];
+   logic        mem_misal_st;   // the converted misaligned op was a store
+   logic [31:0] mem_ea_raw;
+   // MEM -> WB exception record: wb_xc = the WB op is an exception op
+   // (ILLEGAL / TRAP / misaligned / U_EXC), with its cause and EADDR
+   logic        wb_xc;
+   logic [3:0]  wb_xcause;
+   logic [31:0] wb_xaddr, wb_pc_next;
+   logic        wb_mtsr;
+   // the WB exception op enters the handler (else it parks / debug-halts as
+   // before): EVEC set, and not a debugger-attached ILLEGAL / TRAP /
+   // MISALIGNED unless the debugger passes them on (EXC_PASS)
+   wire wb_exc_go = EN_EXC && wb_xc && (evec != 32'b0) &&
+                    !(DEBUG_EN && dbg_i.attached && !dbg_i.exc_pass &&
+                      (wb_xcause == X_ILL || wb_xcause == X_TRAP ||
+                       wb_xcause == X_MISAL_LD || wb_xcause == X_MISAL_ST));
 
    // mul/div operand B mux happens at dispatch: ex_b holds rs2 (len1) or
    // the sign/zero-extended imm32 (len2) — see the dispatch below.
@@ -2096,6 +2224,10 @@ module pipeline_core
          pc <= '0; running <= 1'b0; fetch_halt <= 1'b0;
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
+         umode <= 1'b0; sp_alt <= '0; evec <= '0; eaddr <= '0; ecause <= '0;
+         scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
+         res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0;
+         id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2135,6 +2267,14 @@ module pipeline_core
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
          ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
 
+         // MMU stage 1: CYCLE counts every core clock from reset
+         if (EN_EXC) cycle <= cycle + 64'd1;
+         // MMU stage 1: a program load starts in supervisor mode with no
+         // vector (MMU_PLAN.md §3.1); a debugger resume keeps them
+         if (EN_EXC && start) begin
+            umode <= 1'b0; evec <= '0; ecause <= '0; eaddr <= '0;
+            res_valid <= 1'b0; exc_ent <= 1'b0;
+         end
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
             pc <= (DEBUG_EN && !start) ? park_pc : start_pc;
@@ -2212,7 +2352,8 @@ module pipeline_core
                   // inside the critical section / dispatch a spurious IRQ.
                   // All older stores have retired here (pipeline empty,
                   // mem_xc==0), so irq_ready is now final for this boundary.
-                  if (!irq_ready || (EN_DIEI && irq_dis)) begin
+                  // (MMU stage 1: an exception entry, exc_ent, never abandons)
+                  if (!(EN_EXC && exc_ent) && (!irq_ready || (EN_DIEI && irq_dis))) begin
                      // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
                   end else begin
@@ -2220,12 +2361,15 @@ module pipeline_core
                      // retargeted the highest-priority pending source.
                      irq_sel_q  <= irq_sel;
                      irq_vec_q  <= irq_vector;
-                     m_addr     <= sp - 32'd8;
-                     m_wdata    <= {20'b0, EN_DIEI && irq_dis, int_mask,
+                     // MMU stage 1: from user mode the frame goes on the
+                     // kernel SP (sp_alt); frame bit 44 = previous mode;
+                     // an exception's frame PC is its EPC
+                     m_addr     <= ((EN_EXC && umode) ? sp_alt : sp) - 32'd8;
+                     m_wdata    <= {19'b0, EN_EXC && umode, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
                                     (flags.sign ^ flags.overflow), flags.carry,
-                                    pc};
+                                    (EN_EXC && exc_ent) ? exc_epc_q : pc};
                      m_be       <= 8'hFF;
                      m_write_DV <= 1'b1;
                      rdy_armed  <= !m_ready;
@@ -2234,12 +2378,30 @@ module pipeline_core
                end
             end else if (w_mrdy) begin
                m_write_DV          <= 1'b0;
-               sp                  <= sp - 32'd8;
-               int_mask[irq_sel_q] <= 1'b0;   // masked while handler runs; IRET restores
+               // MMU stage 1: entry from user mode swaps the stack pointers
+               // (sp = the kernel SP below the frame, sp_alt = the user SP)
+               if (EN_EXC && umode) begin
+                  sp     <= sp_alt - 32'd8;
+                  sp_alt <= sp;
+                  umode  <= 1'b0;
+               end else
+                  sp     <= sp - 32'd8;
+               if (EN_EXC) res_valid <= 1'b0;
                ev_pcz              = 1'b1;
-               pc                  <= irq_vec_q;
-               irq_ack             <= 1'b1;
-               irq_ack_sel         <= irq_sel_q;
+               if (EN_EXC && exc_ent) begin
+                  // exception: interrupts off (the old DI is in the frame)
+                  pc          <= evec;
+                  irq_dis     <= 1'b1;
+                  ecause      <= {4'b0, exc_cause_q};
+                  eaddr       <= exc_addr_q;
+                  fetch_halt  <= 1'b0;
+                  exc_ent     <= 1'b0;
+               end else begin
+                  int_mask[irq_sel_q] <= 1'b0;   // masked while handler runs; IRET restores
+                  pc                  <= irq_vec_q;
+                  irq_ack             <= 1'b1;
+                  irq_ack_sel         <= irq_sel_q;
+               end
                irq_xc              <= 1'b0;
                irq_active          <= 1'b0;
             end
@@ -2273,7 +2435,17 @@ module pipeline_core
             if (wb_sp_we)   sp <= wb_sp_new;
             if (wb_mask_we) int_mask <= wb_mask_new;
             if (EN_DIEI && wb_dis_we) irq_dis <= wb_dis_new;
-            if (wb_park) begin
+            if (wb_park && wb_exc_go) begin
+               // MMU stage 1: the exception op commits nothing and retires
+               // no trace line; everything younger is already gone (it
+               // serialized or squashed), fetch is halted.  The IRQ entry
+               // sequencer pushes the frame and vectors to EVEC.
+               irq_active  <= 1'b1;
+               exc_ent     <= 1'b1;
+               exc_cause_q <= wb_xcause;
+               exc_addr_q  <= wb_xaddr;
+               exc_epc_q   <= (wb_xcause == X_SYSCALL) ? wb_pc_next : wb_pc;
+            end else if (wb_park) begin
                parked   <= 1'b1;
                park_kind <= wb_park_kind;
                park_pc  <= wb_pc;  park_op <= wb_op;
@@ -2288,6 +2460,22 @@ module pipeline_core
                end
             end else begin
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
+               // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
+               if (EN_EXC && wb_mtsr) begin
+                  case (wb_op[15:12])
+                     4'd1: evec     <= {wb_value[31:2], 2'b00};
+                     4'd2: ecause   <= wb_value[7:0];
+                     4'd3: eaddr    <= wb_value[31:0];
+                     4'd4: sp_alt   <= wb_value[31:0];
+                     4'd5: scratch0 <= wb_value;
+                     4'd6: scratch1 <= wb_value;
+                     4'd7: tp       <= wb_value;
+                     default: ;     // STATUS: no writable bits in stage 1
+                  endcase
+                  ev_pcz     = 1'b1;
+                  pc         <= wb_pc + 32'd4;
+                  fetch_halt <= 1'b0;
+               end
             end
             ret_wr      <= wb_wr;
             ret_wr_addr <= wb_wr_addr;  ret_wr_be <= wb_wr_be;  ret_wr_raw <= wb_wr_raw;
@@ -2834,10 +3022,27 @@ module pipeline_core
             wb_dis_we  <= mem_valid && (mem_dis_we || mem_d.uop == U_IRET);
             wb_dis_new <= (mem_d.uop == U_IRET) ? m_rdata[43] : mem_dis_new;
             wb_park    <= mem_valid && (mem_d.uop == U_HALT || mem_d.uop == U_TRAP ||
-                                        mem_d.uop == U_WAIT || mem_d.uop == U_ILL);
+                                        mem_d.uop == U_WAIT || mem_d.uop == U_ILL ||
+                                        (EN_EXC && mem_d.uop == U_EXC));
+            // (MMU stage 1: an exception op parks as ILLEGAL when EVEC = 0)
             wb_park_kind <= mem_misal ? 3'd5
                           : (mem_d.uop == U_HALT) ? 3'd0 : (mem_d.uop == U_TRAP) ? 3'd1
-                          : (mem_d.uop == U_ILL)  ? 3'd2 : 3'd3;
+                          : (mem_d.uop == U_ILL || mem_d.uop == U_EXC) ? 3'd2 : 3'd3;
+            // MMU stage 1: the exception record (cause, EADDR, next PC)
+            wb_xc      <= EN_EXC && mem_valid &&
+                          (mem_d.uop == U_TRAP || mem_d.uop == U_ILL || mem_d.uop == U_EXC);
+            wb_xcause  <= mem_misal ? (mem_misal_st ? X_MISAL_ST : X_MISAL_LD)
+                        : (mem_d.uop == U_TRAP) ? X_TRAP
+                        : (mem_d.uop == U_ILL)  ? X_ILL : mem_d.sub;
+            wb_xaddr   <= (mem_misal || (mem_d.uop == U_EXC &&
+                                         (mem_d.sub == X_ACC_LD || mem_d.sub == X_ACC_ST))) ? mem_ea_raw
+                        : (mem_d.uop == U_EXC && mem_d.sub == X_SYSCALL) ? 32'b0
+                        : (mem_d.uop == U_EXC && mem_d.sub == X_MISAL_FE) ? mem_pc
+                        : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE)
+                          ? ((mem_pc[31:28] == 4'hF) ? mem_pc : 32'hF000_0000)
+                        : mem_op;
+            wb_pc_next <= mem_pc_next;
+            wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
             wb_wr      <= mem_is_write;
             wb_wr_addr <= mem_iaddr;  wb_wr_be <= mem_be;  wb_wr_raw <= (mem_d.uop == U_ENTER) ? mem_wdata : mem_result; // ENTER: stored R15
             // RET / IRET redirect + fetch resume at MEM completion
@@ -2924,6 +3129,8 @@ module pipeline_core
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_sp_new <= exo_sp_new; mem_sp_we <= ex_valid && exo_sp_we;
                mem_misal  <= ex_misal;
+               mem_misal_st <= (ex_d.uop == U_STORE);
+               mem_ea_raw <= ex_ea_raw;
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -2970,7 +3177,9 @@ module pipeline_core
                end else begin
                   ex_valid   <= id_valid && !fetch_halt && !(DEBUG_EN && id_bp);
                   ex_pc      <= id_pc;   ex_op <= id_op;
-                  ex_var1    <= id_var1; ex_var2 <= id_var2;
+                  // MMU stage 1: MFSR (not STATUS) is a MOV64 of its SR value
+                  ex_var1    <= (EN_EXC && id_mfsr) ? id_srv[31:0]  : id_var1;
+                  ex_var2    <= (EN_EXC && id_mfsr) ? id_srv[63:32] : id_var2;
                   ex_pc_next <= id_pc_next;
                   ex_pred    <= 1'b0;
                   ex_ptk     <= EN_BP && id_bp_tk;
@@ -3085,6 +3294,8 @@ module pipeline_core
                                   // HW proposal 6: FBR PRED 5-7 (EQW/LTW/ULTW)
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
+                     id_fx      <= w_fx;  id_fxc <= w_fxc;
+                     id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
                      id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
                      id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;

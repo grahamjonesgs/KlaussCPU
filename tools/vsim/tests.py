@@ -698,3 +698,175 @@ def smc_ahead():
                 want = (1 + 16) if warm else 16
                 out.append((a, {'end': 'park', 'kind': '0', 'r1': want}, [f'+LAT={1 + (k + pad) % 6}']))
     return out
+
+
+# ============================================ MMU stage 1 (MMU_PLAN.md)
+# The common exception handler records, at XD + 0/8/16/24/32: ECAUSE,
+# EADDR, the frame word, STATUS at entry, and a running count.  With
+# skip=True it steps the frame PC over a 1-word faulting instruction
+# (not for SYSCALL, whose frame PC is already the next instruction); with
+# fix=reg it instead sets that register in the frame-saved register file
+# — see _uhandler for the user-mode variant.
+XD = DATA + 0x400
+X_ILL, X_PRIV, X_TRAP, X_SYSCALL = 1, 2, 3, 4
+X_MISAL_LD, X_MISAL_ST, X_ACC_LD, X_ACC_ST, X_ACC_FE, X_MISAL_FE = 5, 6, 7, 8, 9, 10
+
+
+def _xhandler(a, skip=True, name='h'):
+    a.label(name)
+    a.push(13); a.push(14)
+    a.setr(14, XD)
+    a.mfsr(13, 'ecause'); a.st(64, 13, 14, 0)
+    a.mfsr(13, 'eaddr');  a.st(64, 13, 14, 8)
+    a.getsp(13); a.ld(64, 13, 13, 16); a.st(64, 13, 14, 16)
+    a.mfsr(13, 'status'); a.st(64, 13, 14, 24)
+    a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)
+    if skip:
+        a.mfsr(13, 'ecause')
+        a.fbr('eq', 13, X_SYSCALL, name + '_s', imm=True)
+        a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
+        a.label(name + '_s')
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+def _xsetup(a, handler='h'):
+    a.leapc(1, handler)
+    a.mtsr('evec', 1)
+
+
+def _xexp(cause, eaddr, frame_pc, count=1, status=2, frame_hi=0):
+    return {m(XD): cause, m(XD + 8): eaddr, m(XD + 16): (frame_hi << 32) | frame_pc,
+            m(XD + 24): status, m(XD + 32): count}
+
+
+@test
+def exc_syscall():
+    a = Asm()
+    _xsetup(a)
+    a.setr(5, 0)
+    at = a.syscall()
+    a.setr(5, 0x55)
+    a.mfsr(6, 'status')           # DI restored by IRET: 0
+    a.halt()
+    _xhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'r5': 0x55, 'r6': 0, 'sp': 0x08000000}
+    exp.update(_xexp(X_SYSCALL, 0, at + 4))
+    return a, exp, []
+
+
+@test
+def exc_trap_ill():
+    out = []
+    for kind, word, cause in (('trap', 0x6C040000, X_TRAP), ('ill', 0x7C000000, X_ILL),
+                              ('mfsr9', 0x6C409100, X_ILL), ('mtsr_cycle', 0x6C608010, X_ILL),
+                              ('syscall_rs1', 0x6C080010, X_ILL)):
+        a = Asm()
+        _xsetup(a)
+        a.setr(5, 1)
+        at = a.raw(word)
+        a.setr(5, 2)
+        a.halt()
+        _xhandler(a)
+        exp = {'end': 'park', 'kind': '0', 'r5': 2}
+        exp.update(_xexp(cause, word, at))
+        out.append((a, exp, []))
+    return out
+
+
+@test
+def exc_misal():
+    """misaligned load / store: rd and memory untouched, EADDR = raw EA"""
+    out = []
+    for st, size, off in ((False, 16, 1), (False, 32, 2), (True, 16, 3), (True, 32, 6)):
+        a = Asm()
+        _xsetup(a)
+        a.setr(2, DATA); a.setr(3, 0x77); a.setr(4, 0x1234); a.setr(7, off)
+        # 1-word reg+reg form, so the handler's 4-byte skip lands on the next op
+        at = (a.st_rr(size, 4, 2, 7) if st else a.ld_rr(size, 3, 2, 7))
+        a.setr(6, 9)
+        a.halt()
+        _xhandler(a)
+        exp = {'end': 'park', 'kind': '0', 'r3': 0x77, 'r6': 9, m(DATA): 0}
+        exp.update(_xexp(X_MISAL_ST if st else X_MISAL_LD, DATA + off, at))
+        out.append((a, exp, []))
+    return out
+
+
+@test
+def exc_evec0_parks():
+    """EVEC = 0 (the reset value): every cause parks exactly as before"""
+    out = []
+    for word, kind in ((0x6C040000, 1), (0x7C000000, 2), (0x6C080000, 2), (0x6C409100, 2),
+                       (0x6C608010, 2)):
+        a = Asm()
+        a.setr(5, 1)
+        at = a.raw(word)
+        a.setr(5, 2)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': str(kind), 'pc': at, 'op': word, 'r5': 1}, []))
+    a = Asm()
+    a.setr(2, DATA + 1)
+    at = a.ld(16, 3, 2)
+    a.halt()
+    out.append((a, {'end': 'park', 'kind': '5', 'pc': at}, []))
+    return out
+
+
+@test
+def sr_roundtrip():
+    a = Asm()
+    a.setr(12, DATA)
+    vals = {'evec': 0x12345677, 'ecause': 0x1A5, 'eaddr': 0xDEADBEEF, 'usp': 0x07F00010,
+            'scratch0': 0x0123456789ABCDEF, 'scratch1': 0xFEDCBA9876543210, 'tp': 0x1122334455667788}
+    for i, (sr, v) in enumerate(vals.items()):
+        a.setr64(1, v)
+        a.mtsr(sr, 1)
+        a.mfsr(2, sr)
+        a.st(64, 2, 12, 8 * i)
+    a.mtsr('evec', 0)                # leave EVEC clear
+    a.mfsr(3, 'status')
+    a.di(4)
+    a.mfsr(5, 'status')              # DI forwarded: 2
+    a.ei(4)
+    a.mfsr(6, 'status')
+    a.mfsr(7, 'cycle')
+    a.nop(); a.nop()
+    a.mfsr(8, 'cycle')
+    a.alu('sub', 9, 8, 7)
+    a.mtsr('status', 1)              # no writable bits: ignored
+    a.mfsr(10, 'status')
+    a.halt()
+    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0, 'r9': 'nonzero'}
+    want = {'evec': 0x12345674, 'ecause': 0xA5, 'eaddr': 0xDEADBEEF, 'usp': 0x07F00010,
+            'scratch0': 0x0123456789ABCDEF, 'scratch1': 0xFEDCBA9876543210, 'tp': 0x1122334455667788}
+    for i, sr in enumerate(vals):
+        exp[m(DATA + 8 * i)] = want[sr]
+    return a, exp, []
+
+
+@test
+def exc_di_irq():
+    """exception entry sets DI: a pending timer IRQ is not taken in the
+    handler, and is taken after the IRET restores DI = 0"""
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, XD)
+    a.set_int_mask(1)
+    a.setr(1, 300)
+    a.label('w'); a.dec(1); a.fbr('ne', 1, 0, 'w', imm=True)   # IRQs run here
+    a.syscall()
+    a.setr(1, 300)
+    a.label('w2'); a.dec(1); a.fbr('ne', 1, 0, 'w2', imm=True)
+    a.halt()
+    a.label('h')
+    a.push(13); a.push(14)
+    a.ld_abs(64, 13, 0x180000)                  # IRQ count at entry
+    a.setr(14, 400)
+    a.label('hw'); a.dec(14); a.fbr('ne', 14, 0, 'hw', imm=True)
+    a.ld_abs(64, 14, 0x180000)                  # ... and after a long wait
+    a.alu('sub', 13, 14, 13)
+    a.st(64, 13, 12, 0x40)                      # 0: no IRQ inside the handler
+    a.pop(14); a.pop(13)
+    a.iret()
+    return a, {'end': 'park', 'kind': '0', m(XD + 0x40): 0, 'm00180000': 'nonzero'}, ['+IRQ_PERIOD=60']
