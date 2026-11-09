@@ -2741,3 +2741,170 @@ def mpu_absent():
         exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 0, 'r7': 0x66,
                m(XD): X_ILL, m(XD + 32): 3}
     return a, exp, []
+
+
+# ===================== review 3 probes =====================
+def _r3_lr_wait(pre, lead=None):
+    """TE = 1 supervisor: LEAVERET with R15 at the last dword of a kseg page,
+    right behind a load (WB waits on it).  Decoy frames in the following pages."""
+    def setup(a):
+        pass
+    def body(a):
+        a.setr(9, 0x8002FFF8); a.setr64(3, 0x1122334455667788); a.st(64, 3, 9)
+        a.leapc(3, 'back'); a.setr(9, 0x80030000); a.st(64, 3, 9)
+        for k in range(1, 8):
+            a.setr(9, 0x8002FFF8 + k * 0x10000); a.setr(3, 0xDEAD0000 + k); a.st(64, 3, 9)
+            a.leapc(3, 'bad'); a.setr(9, 0x80030000 + k * 0x10000); a.st(64, 3, 9)
+        a.setr(15, 0x8002FFF8)
+        a.setr(8, 0x80010100)
+        pre(a)
+        a.leaveret()
+        a.setr(4, 0xBAD)
+        a.label('bad')
+        a.mov(5, 15); a.setr(6, 0xBAD0); a.setr(1, KSP); a.setsp(1); a.jmp('out')
+        a.label('back')
+        a.mov(5, 15); a.setr(6, 0x600D); a.setr(1, KSP); a.setsp(1)
+        a.label('out')
+    return _te_prog(body, False, {'r5': 0x1122334455667788, 'r6': 0x600D}, logs=[], setup=setup)
+
+
+@test
+def r3_lr_wait_ld():
+    return _r3_lr_wait(lambda a: a.ld(64, 3, 8))
+
+@test
+def r3_lr_wait_ld2():
+    return _r3_lr_wait(lambda a: (a.ld(64, 3, 8), a.ld(64, 2, 8, 8)))
+
+@test
+def r3_lr_wait_ldlat():
+    a, e, p = _r3_lr_wait(lambda a: a.ld(64, 3, 8))
+    return a, e, p + ['+LAT=9']
+
+@test
+def r3_lr_nowait():
+    return _r3_lr_wait(lambda a: a.nop())
+
+@test
+def r3_mg32_wait():
+    """MEMGET32 spanning a kseg page end, behind a load"""
+    def body(a):
+        a.setr(9, 0x8002FFF8); a.setr64(3, 0x1122334455667788); a.st(64, 3, 9)
+        a.setr(9, 0x80030000); a.setr64(3, 0x99AABBCCDDEEFF00); a.st(64, 3, 9)
+        for k in range(1, 8):
+            a.setr(9, 0x8002FFF8 + k * 0x10000); a.setr(3, 0); a.st(64, 3, 9)
+            a.setr(9, 0x80030000 + k * 0x10000); a.st(64, 3, 9)
+        a.setr(9, 0x8002FFFD); a.setr(8, 0x80010100)
+        a.ld(64, 3, 8)
+        a.ld(32, 7, 9)
+    return _te_prog(body, False, {'r7': 0x00112233}, logs=[])
+
+def _r3_mg(nops, lat):
+    def body(a):
+        a.setr(9, 0x8002FFF8); a.setr64(3, 0x1122334455667788); a.st(64, 3, 9)
+        a.setr(9, 0x80030000); a.setr64(3, 0x99AABBCCDDEEFF00); a.st(64, 3, 9)
+        for k in range(1, 8):
+            a.setr(9, 0x8002FFF8 + k * 0x10000); a.setr(3, 0); a.st(64, 3, 9)
+            a.setr(9, 0x80030000 + k * 0x10000); a.st(64, 3, 9)
+        a.setr(9, 0x8002FFFD); a.setr(8, 0x80010100)
+        a.ld(64, 3, 8)
+        for _ in range(nops): a.nop()
+        a.ld(32, 7, 9)
+    a, e, p = _te_prog(body, False, {'r7': 0x00112233}, logs=[])
+    return a, e, p + [f'+LAT={lat}']
+for _n in range(3):
+    for _l in (2, 3, 6, 9):
+        def _mk(n=_n, l=_l):
+            return lambda: _r3_mg(n, l)
+        f = _mk(); f.__name__ = f'r3_mg_{_n}_{_l}'; test(f)
+
+def _r3_mg2(pad, lat):
+    def body(a):
+        a.setr(9, 0x8002FFF8); a.setr64(3, 0x1122334455667788); a.st(64, 3, 9)
+        a.setr(9, 0x80030000); a.setr64(3, 0x99AABBCCDDEEFF00); a.st(64, 3, 9)
+        for k in range(1, 8):
+            a.setr(9, 0x8002FFF8 + k * 0x10000); a.setr(3, 0); a.st(64, 3, 9)
+            a.setr(9, 0x80030000 + k * 0x10000); a.st(64, 3, 9)
+        a.setr(9, 0x8002FFFD); a.setr(8, 0x80010100)
+        for _ in range(pad): a.nop()
+        a.ld(64, 3, 8)
+        a.ld(32, 7, 9)
+    a, e, p = _te_prog(body, False, {'r7': 0x00112233}, logs=[])
+    return a, e, p + [f'+LAT={lat}']
+for _n in range(4):
+    def _mk(n=_n):
+        return lambda: _r3_mg2(n, 3)
+    f = _mk(); f.__name__ = f'r3_mgp_{_n}'; test(f)
+
+@test
+def r3_len00_page_end():
+    """an illegal LEN=00 word (e.g. 0x00000000) in the last word of a page
+    whose next page is unmapped: ILLEGAL expected (it occupies one word)"""
+    def setup(a):
+        _tlb_set(a, 6, 0x0080, 0x001, TLB_V | TLB_X)                # 0x0081: no entry
+    def body(a):
+        a.setr(9, 0x0080FFFC); a.leapc(10, 'sb2'); a.jmpr(9)
+        a.label('sb2')
+    def snip(s):
+        s.emit(0x00000000)
+    a, e, p = _te_prog(body, False, {}, setup=setup)
+    _place(a, 0x1FFFC, snip)
+    logs = [(X_ILL, 0), (X_TLB_FE, 0x00810000)]
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        e[m(FLOG + 0x30 * i + 8)] = ea
+    e[m(XD + 32)] = len(logs)
+    return a, e, p
+
+@test
+def r3_len00_ctl():
+    """control: the same word mid-page is ILLEGAL"""
+    def setup(a):
+        _tlb_set(a, 6, 0x0080, 0x001, TLB_V | TLB_X)
+    def body(a):
+        a.setr(9, 0x0080FFF4); a.leapc(10, 'sb2'); a.jmpr(9)
+        a.label('sb2')
+    def snip(s):
+        s.emit(0x00000000); s.jmpr(10)
+    a, e, p = _te_prog(body, False, {}, setup=setup)
+    _place(a, 0x1FFF4, snip)
+    logs = [(X_ILL, 0)]
+    for i, (c, ea) in enumerate(logs):
+        e[m(FLOG + 0x30 * i)] = c
+        e[m(FLOG + 0x30 * i + 8)] = ea
+    e[m(XD + 32)] = len(logs)
+    return a, e, p
+
+@test
+def r3_mtsr_status_cost():
+    """TE = 0: LR; MTSR STATUS (unchanged value); SC; and a loop with MTSR STATUS"""
+    a = Asm()
+    a.setr(9, 0x10000)
+    a.lr(64, 2, 9)
+    a.mfsr(1, 'status'); a.mtsr('status', 1)
+    a.setr(3, 0x77); a.sc(64, 4, 3, 9)
+    a.setr(11, 20)
+    a.label('t')
+    a.mtsr('status', 1); a.addi_s(5, 5, 1); a.call('f'); a.addi_s(11, 11, -1); a.fbr('ne', 11, 0, 't', imm=True)
+    a.halt()
+    a.label('f'); a.ret()
+    return a, {'end': 'park', 'kind': '0'}, []
+
+
+@test
+def tlb_double_fault_irq():
+    """review 3 #4: an IRQ entry with TE = 1 and SP - 8 outside kseg is a
+    DOUBLE_FAULT: park 6, and the core stays parked — fetch halted, so the
+    still-pending IRQ is not re-taken and nothing dispatches (the RTL
+    asserts that a parked, running core has fetch halted)"""
+    out = []
+    for per in (60, 97):
+        a = Asm()
+        _xsetup(a)
+        _te_on(a, 0x08000000)                       # SP not in kseg
+        a.set_int_mask(1)
+        a.label('l'); a.inc(5); a.jmp('l')
+        a.halt()
+        _mpuhandler(a)
+        out.append((a, {'end': 'park', 'kind': '6'}, [f'+IRQ_PERIOD={per}', '+LAT=3', '+PARK_HOLD=400']))
+    return out

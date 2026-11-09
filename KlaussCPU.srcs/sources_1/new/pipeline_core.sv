@@ -1218,8 +1218,9 @@ module pipeline_core
                                       : (w_last_pc[31:30] == 2'b10 && w_last_pc[31:27] != 5'b10000));
    wire        w_tf1 = w_te && (in0 ? ifb_ft[0] : ifb_ft[1]);
    wire        w_tm1 = w_te && (in0 ? ifb_fm[0] : ifb_fm[1]);
-   wire        w_tf2 = w_te && in0 && w_span && ifb_ft[1];
-   wire        w_tm2 = w_te && in0 && w_span && ifb_fm[1];
+   // (LEN = 00, an illegal op, occupies one word: it spans nothing)
+   wire        w_tf2 = w_te && in0 && w_span && w_op[31:30] != 2'b00 && ifb_ft[1];
+   wire        w_tm2 = w_te && in0 && w_span && w_op[31:30] != 2'b00 && ifb_fm[1];
    wire        w_mpu = EN_MPU && !w_te;
    wire        w_p1  = w_s1a || (w_mpu && mpu_f1) || w_tsa || w_tf1;
    wire        w_p2  = w_s1b || (w_mpu && w_cross && mpu_f2) || w_tsb || w_tf2;
@@ -2732,6 +2733,7 @@ module pipeline_core
                      irq_active <= 1'b0;
                      exc_ent    <= 1'b0;
                      parked     <= 1'b1;
+                     fetch_halt <= 1'b1;   // (review 3: an IRQ entry's must not re-take / dispatch)
                      park_kind  <= 3'd6;
                      park_pc    <= exc_ent ? exc_epc_q : pc;
                      park_op    <= 32'b0;
@@ -2884,7 +2886,10 @@ module pipeline_core
          // captured in the op's first EX cycle; for a page-crossing two-
          // access op, the next page in its 3rd)
          if (!ex_mph)                                  ex_ea_q <= exo_eaddr;
-         else if (ex_mpu_hold && EN_TLB && ex_xpg_q) ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
+         // (review 3: only on the !mem_busy edge where ex_mph2 / ex_mok /
+         // t1_* advance — free-running, it stepped a page per stalled cycle)
+         else if (ex_mpu_hold && EN_TLB && ex_xpg_q && !mem_busy)
+                                                       ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
          // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
@@ -4303,6 +4308,9 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && running)
       assert (smc_hit_lat == (smc_st && (pc_dw == smc_dw || a_last_dw == smc_dw)))
          else $fatal(1, "smc_hit_lat form: pc=%h op=%h smc_dw=%h", pc, w_op, smc_dw);
+   // a parked core neither dispatches nor takes an IRQ
+   always_ff @(posedge clk) if (!rst && parked && running)
+      assert (fetch_halt) else $fatal(1, "parked with fetch running: kind=%0d", park_kind);
    // ex_b_zero tracks ex_b exactly (both its write sites set it)
    always_ff @(posedge clk) if (!rst)
       assert (ex_b_zero == (ex_b == 64'd0))

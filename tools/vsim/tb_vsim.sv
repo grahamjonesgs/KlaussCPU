@@ -219,6 +219,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    longint n_br = 0, n_br_taken = 0, n_fbr_taken = 0, n_ic_miss = 0, n_ic_fill = 0;
    integer trace_f = 0;
    bit     trace_cyc = 0;      // +TRACECYC: stamp each retire with its cycle
+   int     park_hold = 0, park_hold_n = 0;
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -265,7 +266,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       end
       // the SoC takes the bus only once the core's port is idle (a posted
       // store may still be draining when the core parks)
-      if (!rst && parked && park_kind != 3'd3 && bus_idle && !in_flight) done("park");
+      // (+PARK_HOLD=<n>: keep running n cycles first, so anything that still
+      // moves after a park — a re-taken IRQ, a dispatch — trips the core's
+      // assertions)
+      if (!rst && parked && park_kind != 3'd3 && bus_idle && !in_flight) begin
+         if (park_hold_n >= park_hold) done("park");
+         park_hold_n++;
+      end
       if (cyc > maxc) done("timeout");
    end
 
@@ -306,6 +313,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (!$value$plusargs("OUT=%s", out_name)) out_name = "tb_vsim.out";
       if ($value$plusargs("TRACE=%s", trace_name)) trace_f = $fopen(trace_name, "w");
       trace_cyc = $test$plusargs("TRACECYC");
+      void'($value$plusargs("PARK_HOLD=%d", park_hold));
       void'($value$plusargs("LAT=%d", lat_fix));
       void'($value$plusargs("LATR=%d", lat_rand));
       void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
