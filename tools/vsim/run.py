@@ -534,7 +534,7 @@ def _tlb_variant(seed, p_sys=0.04, irq=False):
     page to itself, round-robin over K entries (K = 2 thrashes; K = 1
     would livelock, as any load needs its code page and its data page).  Injected
     SYSCALLs bump ASID (the non-global entries stop matching) and TLBINV on
-    its wrap.  With IRQs, the TB's handler at 0x0010_0000 runs translated
+    its wrap.  The handler runs a TLBP first, which must miss.  With IRQs, the TB's handler at 0x0010_0000 runs translated
     in supervisor mode and is refilled the same way.  Every instruction
     runs once with its full effect, so the final state must equal the
     plain physical run's."""
@@ -599,6 +599,8 @@ def _tlb_variant(seed, p_sys=0.04, irq=False):
     asm.label('h_bad')
     asm.halt()
     asm.label('h_miss')                                 # TLB_HI = {VPN, G 0, ASID}
+    asm.tlbp(); asm.mfsr(13, 'tlb_index')               # (a TLBP must miss: P = 1)
+    asm.shift_n('shr', 13, 13, 31); asm.fbr('ne', 13, 1, 'h_bad', imm=True)
     asm.mfsr(13, 'tlb_hi'); asm.shift_n('shr', 13, 13, 16)
     asm.setr(14, CVP); asm.fbr('ne', 13, 14, 'h_id')
     asm.setr(13, 0)

@@ -414,6 +414,10 @@ module pipeline_core
    logic [10:0] tlb_d_pfn, tlb_f_pfn;
    logic [2:0]  tlb_d_xwr, tlb_f_xwr;   // {X, W, R}
    logic        mtsr_commit, tlbi_commit, tlb_discard, sr_ent_we;   // (assigned at the end)
+   wire         tlb_psel;        // a TLBP in MEM or WB: the fetch port is the probe's
+   wire         tlb_pload;       // a TLBP in MEM: load its key into it_vpn / it_asid
+   logic [15:0] tlb_hi_vpn_o;
+   logic [7:0]  tlb_hi_asid_o;
    logic [28:0] wb_va_dw;        // the WB op's VA doubleword (LR/SC reservation)
    logic [31:0] mpu_rdata;       // MFSR of an MPU SR
    logic        mpu_d1, mpu_dg1, mpu_d2, mpu_dg2;   // data: deny / GUARD, 1st and 2nd granule
@@ -423,6 +427,7 @@ module pipeline_core
    // exception entry: the IRQ entry sequencer runs with exc_ent set
    logic        exc_ent;
    logic [3:0]  exc_cause_q;
+   logic [31:0] exc_vec_q;       // (stage 3, timing) the vector, chosen as the exception is latched
    logic        exc_guard_q;     // ECAUSE[8]
    logic        exc_tlb_q;       // (stage 3) TLB-related: TLB_HI auto-load
    // the frame push address of an entry (the kernel SP after any swap)
@@ -633,6 +638,7 @@ module pipeline_core
    logic [15:0] ut_vpn, ut_pa;
    logic        it_ref;
    logic [15:0] it_vpn;
+   logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
    wire  [15:0] look_vpn = pf_sel ? pf_line[27:12] : miss_dw[28:13];
    logic [15:0] r_look_vpn = '0, r_look_pa = '0;
    logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
@@ -662,9 +668,11 @@ module pipeline_core
    wire ic_rd_current = (ic_rd_idx == ic_look_idx);
    // (stage 3: the registered look is for this page and fetch mode)
    wire lk_cov        = r_look_hit && r_look_vpn == miss_dw[28:13] && r_look_um == fe_um;
-   wire ic_tag_match  = ic_rd_current &&
-                        ((EN_TLB && te) ? (lk_cov && r_look_ok && ic_rd_tag == {r_look_pa, miss_dw[12:10]})
-                                        : (ic_rd_tag == ic_look_tag));
+   // (timing: the TE mux is on the reference — registers — so the BRAM's
+   // tag output feeds one compare, as before)
+   wire [18:0] ic_ref_tag = (EN_TLB && te) ? {r_look_pa, miss_dw[12:10]} : ic_look_tag;
+   wire ic_tag_match  = ic_rd_current && (ic_rd_tag == ic_ref_tag) &&
+                        (!(EN_TLB && te) || (lk_cov && r_look_ok));
    wire ic_dw_valid   = miss_dw[0] ? ic_rd_vlo : ic_rd_vhi;
    wire ic_hit        = ic_tag_match && ic_dw_valid;
    // (A registered dword-select shadow with a defer guard was tried here and
@@ -681,10 +689,10 @@ module pipeline_core
 
    // M9: prefetch-side decode of the registered read (meaningful under pf_sel)
    wire pf_rd_current = pf_sel && (ic_rd_idx == pf_line[IC_IDXW-1:0]);
-   wire pf_tag_match  = pf_rd_current &&
-                        ((EN_TLB && te) ? (r_look_hit && r_look_vpn == pf_line[27:12] && r_look_um == fe_um &&
-                                           r_look_ok && ic_rd_tag == {r_look_pa, pf_line[11:9]})
-                                        : (ic_rd_tag == pf_line[27:IC_IDXW]));
+   wire [18:0] pf_ref_tag = (EN_TLB && te) ? {r_look_pa, pf_line[11:9]} : pf_line[27:IC_IDXW];
+   wire pf_tag_match  = pf_rd_current && (ic_rd_tag == pf_ref_tag) &&
+                        (!(EN_TLB && te) || (r_look_hit && r_look_vpn == pf_line[27:12] &&
+                                             r_look_um == fe_um && r_look_ok));
    // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
    wire        nlb0_dw_ok     = (nlb_line == miss_dw[28:1]) &&
                                 (miss_dw[0] ? nlb_vlo : nlb_vhi);
@@ -1598,8 +1606,16 @@ module pipeline_core
    // (stage 3: the same EX cycle carries the TLB lookup while TE = 1 — the
    // CAM reads the registered EA; a page-crossing two-access op takes a
    // third cycle for its 2nd page)
-   wire ex_mpu_hold = ((EN_MPU && mpu_en) || (EN_TLB && te)) && ex_valid && ex_d.is_mem &&
-                      (!ex_mph || (EN_TLB && te && ex_xpg && !ex_mph2));
+   // (timing: xlt_q / te_q are MPU_EN || TE and TE registered a cycle late
+   // — safe: MTSR STATUS serializes and refetches, so no memory op is in EX
+   // within a cycle of its commit; start empties the pipe)
+   logic xlt_q = 1'b0, te_q = 1'b0;
+   always_ff @(posedge clk) if (ce) begin
+      xlt_q <= (EN_MPU && mpu_en) || (EN_TLB && te);
+      te_q  <= EN_TLB && te;
+   end
+   wire ex_mpu_hold = xlt_q && ex_valid && ex_d.is_mem &&
+                      (!ex_mph || (te_q && ex_xpg && !ex_mph2));
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
@@ -2257,7 +2273,7 @@ module pipeline_core
                        !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx) &&
                        // (stage 2: no early issue with the MPU on — its
                        // decision must not reach the EX->MEM enables)
-                       !(EN_MPU && mpu_en) && !(EN_TLB && te);
+                       !xlt_q;
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -2537,7 +2553,7 @@ module pipeline_core
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
-         ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
+         ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
          ex_mph2 <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
@@ -2720,8 +2736,9 @@ module pipeline_core
                if (EN_EXC && exc_ent) begin
                   // exception: interrupts off (the old DI is in the frame)
                   // (stage 3: a TLB miss goes to TLBVEC when that is set)
-                  pc          <= (EN_TLB && exc_cause_q >= X_TLB_LD && exc_cause_q <= X_TLB_FE &&
-                                  tlb_vec != 32'b0) ? tlb_vec : evec;
+                  // (stage 3: chosen into exc_vec_q when the exception
+                  // was latched — a register, so this pc leg is as it was)
+                  pc          <= EN_TLB ? exc_vec_q : evec;
                   irq_dis     <= 1'b1;
                   // (ECAUSE / EADDR written by mmu_sr: sr_ent_we)
                   fetch_halt  <= 1'b0;
@@ -2781,6 +2798,9 @@ module pipeline_core
                irq_active  <= 1'b1;
                exc_ent     <= 1'b1;
                exc_cause_q <= wb_xcause;
+               // (an older MTSR to EVEC / TLBVEC has committed: both are final)
+               exc_vec_q   <= (EN_TLB && wb_xcause >= X_TLB_LD && wb_xcause <= X_TLB_FE &&
+                               tlb_vec != 32'b0) ? tlb_vec : evec;
                exc_guard_q <= wb_xguard;
                exc_tlb_q   <= wb_xtlb;
                exc_addr_q  <= wb_xaddr;
@@ -3196,7 +3216,9 @@ module pipeline_core
                end else if (EN_TLB && te && !lk_cov) begin
                   // MMU stage 3: the micro-ITLB does not cover this page (in
                   // this fetch mode): refill it, then look again
-                  if (!it_ref) begin it_ref <= 1'b1;  it_vpn <= miss_dw[28:13]; end
+                  if (!it_ref && !tlb_psel) begin
+                     it_ref <= 1'b1;  it_vpn <= miss_dw[28:13];  it_asid <= tlb_asid;
+                  end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
@@ -3834,11 +3856,11 @@ module pipeline_core
             end
          end
          // MMU stage 3: the micro-ITLB refill, through the main TLB's fetch
-         // port (a TLBP committing this cycle owns that port).  The verdict
+         // port (a TLBP in WB owns that port: tlb_psel, from registers).  The verdict
          // is for the fetch mode now (ut_um): user at 0x8000_0000+ and the
          // supervisor hole are segment faults; useg / kmap go through the
          // TLB and need X; kseg is direct; MMIO is identity.
-         if (EN_TLB && it_ref && !tlbi_commit) begin : ut_refill
+         if (EN_TLB && it_ref && !tlb_psel) begin : ut_refill
             logic f_useg, f_kseg, f_kmap, f_seg, f_tlbs;
             f_useg = !it_vpn[15];
             f_kseg = it_vpn[15:11] == 5'b10000;
@@ -3852,6 +3874,12 @@ module pipeline_core
             ut_miss <= !f_seg && f_tlbs && !tlb_f_hit;
             ut_pa   <= f_tlbs ? {5'b0, tlb_f_pfn} : f_kseg ? {5'b0, it_vpn[10:0]} : it_vpn;
             it_ref  <= 1'b0;
+         end
+         // a TLBP takes the fetch port: its key (TLB_HI, final — TLBP
+         // serializes) is loaded as it sits in MEM; a pending refill is
+         // dropped and the lookup asks again afterwards
+         if (tlb_pload) begin
+            it_vpn <= tlb_hi_vpn_o;  it_asid <= tlb_hi_asid_o;  it_ref <= 1'b0;
          end
          // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
          // virtual copies (the I-cache, physically tagged, is kept)
@@ -4151,7 +4179,12 @@ module pipeline_core
    assign tlb_hi_load = sr_ent_we && exc_tlb_q;
    assign tlb_hi_vpn  = exc_addr_q[31:16];
    assign tlb_f_vpn   = it_vpn;   // the micro-ITLB refill
+   // (timing: the probe select is from registers, not the commit, which
+   // waits on the bus; the commit only enables TLB_INDEX's write)
+   assign tlb_psel    = EN_TLB && ((wb_valid && wb_tlbi && wb_op[21:16] == 6'd11) || tlb_pload);
+   assign tlb_pload   = EN_TLB && mem_valid && mem_d.tlbi && mem_op[21:16] == 6'd11;
    generate if (EN_TLB) begin : g_tlb
+      (* keep_hierarchy = "yes" *)
       mmu_tlb tlb_i (
          .clk, .rst, .ce,
          .clr      (start),
@@ -4169,11 +4202,13 @@ module pipeline_core
          .op_inv   (tlbi_commit && wb_op[21:16] == 6'd12),
          .hi_load  (tlb_hi_load), .hi_vpn (tlb_hi_vpn),
          .d_vpn    (tlb_d_vpn), .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
-         .f_vpn    (tlb_f_vpn), .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr));
+         .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
+         .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr));
    end else begin : g_notlb
       assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
       assign tlb_d_hit = 1'b0;  assign tlb_d_pfn = '0;  assign tlb_d_xwr = '0;
       assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
+      assign tlb_hi_vpn_o = '0;  assign tlb_hi_asid_o = '0;
    end endgenerate
 
 `ifndef SYNTHESIS
@@ -4485,7 +4520,10 @@ module mmu_tlb (
    output logic        d_hit,
    output logic [10:0] d_pfn,
    output logic [2:0]  d_xwr,
-   input  logic [15:0] f_vpn,
+   input  logic [15:0] f_vpn,         // registers: the micro-ITLB refill, or TLB_HI for a TLBP
+   input  logic [7:0]  f_asid,
+   output logic [15:0] hi_vpn_o,      // TLB_HI's VPN / ASID (the TLBP's search key)
+   output logic [7:0]  hi_asid_o,
    output logic        f_hit,
    output logic [10:0] f_pfn,
    output logic [2:0]  f_xwr
@@ -4515,7 +4553,10 @@ module mmu_tlb (
       return r;
    endfunction
    wire [N-1:0] dm = f_match(d_vpn, asid);
-   wire [N-1:0] fm = op_p ? f_match(hi_v, hi_a) : f_match(f_vpn, asid);
+   // one fetch-port CAM: TLBP's key is loaded into f_vpn / f_asid while
+   // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
+   wire [N-1:0] fm = f_match(f_vpn, f_asid);
+   assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
    always_comb begin
       d_pfn = '0;  d_xwr = '0;  f_pfn = '0;  f_xwr = '0;
       for (int n = 0; n < N; n++) begin
