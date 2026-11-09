@@ -1601,6 +1601,8 @@ module pipeline_core
    // and the compares are never in series.  Registered terms only.
    logic        ex_mph;           // the op in EX has had its MPU cycle
    logic        ex_mph2;          // ... and (TE, two-access op crossing a page) its 2nd-page cycle
+   logic        ex_mok;           // its check cycles are done (= ex_mph && !(ex_xpg_q && !ex_mph2);
+                                  // timing: ex_busy reads one register, as at stage 2)
    // MMU stage 3: a spanning MEMGET32 / LEAVERET (EA = ex_a) whose 2nd
    // doubleword is in the next 64 KiB page
    wire ex_xpg = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
@@ -1621,8 +1623,7 @@ module pipeline_core
    // ex_busy takes no ex_a-derived logic)
    logic ex_xpg_q = 1'b0;
    always_ff @(posedge clk) if (ce && !ex_mph) ex_xpg_q <= te_q && ex_xpg;
-   wire ex_mpu_hold = xlt_q && ex_valid && ex_d.is_mem &&
-                      (!ex_mph || (ex_xpg_q && !ex_mph2));
+   wire ex_mpu_hold = xlt_q && ex_valid && ex_d.is_mem && !ex_mok;
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
@@ -2247,21 +2248,22 @@ module pipeline_core
    // load's: the MEM store's from mem_eaddr; the port's / queued one's from
    // m_vahi / sq_vahi, valid (m_vav / sq_vav) only for stores issued from
    // MEM and dropped by a TLB / ASID / TE change, which may remap the VA.)
+   // (timing: with TE = 1 the load is in its extra EX cycle, so its VA page
+   // is compared from the registered ex_ea_q, not the EA adder; in a
+   // page-crossing op's 3rd cycle ex_ea_q is the next page: no forward)
    wire        sf_te      = EN_TLB && te;
-   wire        sf_hia     = sf_te ? (mem_eaddr[31:16] == exo_iaddr[31:16])
-                                  : (mem_iaddr[31:16] == exo_iaddr[31:16]);
-   wire        sf_hib     = sf_te ? (m_vav && m_vahi == exo_iaddr[31:16])
-                                  : (m_addr[31:16] == exo_iaddr[31:16]);
-   wire        sf_hic     = sf_te ? (sq_vav && sq_vahi == exo_iaddr[31:16])
-                                  : (sq_addr[31:16] == exo_iaddr[31:16]);
    wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || sf_hia);
+                            (sf_te || mem_iaddr[31:16] == exo_iaddr[31:16]);
    wire        sf_b       = m_write_DV && m_addr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || sf_hib);
+                            (sf_te || m_addr[31:16] == exo_iaddr[31:16]);
    // EN_SQ: the queued store (younger than the posted one on the port)
    wire        sf_c       = EN_SQ && sq_v && sq_addr[15:3] == exo_iaddr[15:3] &&
-                            (sf_te || sf_hic);
-   wire        sf_vok     = !sf_te || (sf_a ? sf_hia : sf_c ? sf_hic : sf_hib);
+                            (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
+   // (TE = 1) the youngest offset-matching store's VA page = the load's
+   wire        sf_vaa     = mem_eaddr[31:16] == ex_ea_q[31:16];
+   wire        sf_vab     = m_vav && m_vahi == ex_ea_q[31:16];
+   wire        sf_vac     = sq_vav && sq_vahi == ex_ea_q[31:16];
+   wire        sf_vok     = !sf_te || (!ex_xpg_q && (sf_a ? sf_vaa : sf_c ? sf_vac : sf_vab));
    wire        sf_cov     = sf_a ? ((mem_be & ex_ldmask) == ex_ldmask)
                           : sf_c ? ((sq_be  & ex_ldmask) == ex_ldmask)
                                  : ((m_be & ex_ldmask) == ex_ldmask);
@@ -2564,7 +2566,7 @@ module pipeline_core
          ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
-         ex_mph2 <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
+         ex_mph2 <= 1'b0; ex_mok <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -3508,8 +3510,8 @@ module pipeline_core
                mem_valid <= 1'b0;
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
                if (ex_mpu_hold) begin
-                  if (!ex_mph) ex_mph <= 1'b1;
-                  else         ex_mph2 <= 1'b1;
+                  if (!ex_mph) begin ex_mph <= 1'b1;  ex_mok <= !(te_q && ex_xpg); end
+                  else         begin ex_mph2 <= 1'b1; ex_mok <= 1'b1; end
                end
                // (stage 3) the 1st page's translation, kept for the 2nd-page cycle
                if (ex_mpu_hold && ex_mph) begin
@@ -3519,6 +3521,7 @@ module pipeline_core
             end else begin
                ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
                ex_mph2    <= 1'b0;
+               ex_mok     <= 1'b0;
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                // early load issue (see EN_EARLY_LD): the MEM engine then
                // starts in its wait-ready state
@@ -4250,6 +4253,10 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && wb_valid && wb_fmask.zero && wb_zval)
       assert (wb_zero == (wb_value == 64'b0))
          else $fatal(1, "wb_zero stale: pc=%h value=%h", wb_pc, wb_value);
+   // (stage 3 timing) ex_mok is the registered form of the check-cycle state
+   always_ff @(posedge clk) if (!rst)
+      assert (ex_mok == (ex_mph && !(ex_xpg_q && !ex_mph2)))
+         else $fatal(1, "ex_mok stale: mph=%b mph2=%b xpg_q=%b", ex_mph, ex_mph2, ex_xpg_q);
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
