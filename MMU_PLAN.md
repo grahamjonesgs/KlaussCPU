@@ -19,8 +19,8 @@ accesses park the core.
 | Stage | Contents | Detail here |
 |---|---|---|
 | 1 | Precise restartable exceptions, user and supervisor modes, SYSCALL, kernel stack switch, TP/CYCLE SRs, LR/SC | full (§2–§9) |
-| 2 | MPU: 16 base/limit/permission regions, if the LUTs allow (8 at minimum), for Zephyr USERSPACE and NuttX protected | outline (§10) |
-| 3 | Software-refilled TLB with ASIDs, 64 KiB pages | outline (§11) |
+| 2 | MPU: 16 base/limit/permission regions, for Zephyr USERSPACE and NuttX protected | full (§10) |
+| 3 | Software-refilled TLB with ASIDs, 64 KiB pages | full (§11) |
 
 Section numbers in `CPU_ARCHITECTURE.md` are written as "arch §n".
 
@@ -218,7 +218,7 @@ MEMGET32, byte, 64-bit and stack accesses never raise MISALIGNED.
 | 8 | ACCESS_STORE | user MMIO write; SC to MMIO in either mode; stage 2/3 write permission | the instruction | effective address |
 | 9 | ACCESS_FETCH | user fetch from `0xF…` (§3.6); stage 2/3 execute permission | the instruction | address of its first faulting word |
 | 10 | MISALIGNED_FETCH | user-mode PC with `[1:0] != 0` | the PC | the PC |
-| 11–13 | TLB_MISS_LOAD / _STORE / _FETCH | stage 3 | the instruction | faulting VA |
+| 11–13 | TLB_MISS_LOAD / _STORE / _FETCH | stage 3 (§11.3) | the instruction | faulting VA |
 | 14–255 | reserved | | | |
 
 - **Priority** when several causes apply to one instruction:
@@ -421,8 +421,8 @@ fail:
 | 0x06 | `SCRATCH1` | RW | 64-bit |
 | 0x07 | `TP` | RW **in user mode too** | 64-bit thread pointer, no hardware meaning |
 | 0x08 | `CYCLE` | R **in user mode too** | 64-bit core-cycle counter (§3.1, §5); MTSR to it is ILLEGAL |
-| 0x10–0x2F | MPU | | stage 2 (§10); room for 16 regions × 2 |
-| 0x30–0x3F | TLB / ASID | | stage 3 (§11) |
+| 0x10–0x2F | `MPU_BASEn` / `MPU_LIMITn` | supervisor | stage 2 (§10.1) |
+| 0x30–0x34 | `TLB_HI`, `TLB_LO`, `TLB_INDEX`, `ASID`, `TLBVEC` | supervisor | stage 3 (§11.3) |
 
 `STATUS` is readable in user mode so that code like Zephyr's
 `arch_is_user_context()` can test the mode without a syscall. `TP` serves
@@ -445,7 +445,7 @@ bitstream.
 | Bits | Meaning |
 |---|---|
 | `[0]` | stage 1: exceptions, user mode, SYSCALL, MFSR/MTSR, TP, CYCLE |
-| `[1]` | stage 2 MPU present (`[7:4]` = region count / 2 or similar, defined then) |
+| `[1]` | stage 2 MPU present; `[7:4]` = region count − 1 (§10.1) |
 | `[2]` | stage 3 TLB present (`[15:8]` = entry count) |
 | `[3]` | LR/SC (§5.1). Set together with `[0]` in stage 1, but kept separate so software tests for atomics by name. |
 
@@ -785,37 +785,77 @@ Zephyr handlers.
 
 ---
 
-## 10. Stage 2 outline: MPU
+## 10. Stage 2: MPU
 
-For Zephyr USERSPACE and NuttX protected builds, with translation off.
+Interface written 2026-11-09 (Graham: carry on through all stages). For
+Zephyr USERSPACE and NuttX protected builds, with translation off. Same
+rules as stage 1: everything is off at reset, so existing code is
+unaffected.
 
-- **16 regions if the LUTs allow, 8 at minimum.** The runtime review says 8
-  is tight for Zephyr memory domains (text, rodata, stack and partitions
-  per thread). Each region is a base/limit pair at 32-byte granularity
-  (cache-line sized, the same as ARMv8-M, so Zephyr's base/limit MPU code
-  maps over), with attributes R, W, X (for user mode) and GUARD. SRs
-  `0x10–0x2F`: `MPU_BASEn` = `{base[31:5], attrs}`, `MPU_LIMITn` = the last
-  byte, `[31:5]`. Direct access to every region (no index register), so a
-  context switch can reprogram the per-thread partitions with plain MTSRs.
-  `STATUS.MPU_EN` enables the MPU.
-- **User mode:** default deny. An access is allowed if any enabled region
-  covering it grants the permission (union, no priority). That covers
-  Zephyr memory domains (text RX, rodata R, thread stack RW, partitions)
-  and NuttX's user text/data.
-- **Supervisor mode:** default allow. A region marked GUARD denies
-  supervisor access, which gives stack guards (Zephyr
-  `HW_STACK_PROTECTION`).
-- **Checks:** data in EX on the EA, registered, and acted on in MEM cycle 1
-  (the §7.1 slot). Fetch on the PC at the IF→ID latch, registered (the
-  §7.5 override). With 8 regions that is 16 data and 16 fetch
-  27-bit comparators, about 1k LUTs; with 16 regions, about 2k. Faults are ACCESS_LOAD / ACCESS_STORE / ACCESS_FETCH with
-  `EADDR` = the address.
-- The user-mode MMIO rule (§3.6) still applies on top.
-- When `TE = 1` (stage 3) the MPU is ignored.
+### 10.1 Registers
+
+| SR | Name | Contents |
+|---|---|---|
+| `0x10 + 2n` | `MPU_BASEn` (n = 0–15) | `[31:5]` first 32-byte granule, `[4]` GUARD, `[3]` X, `[2]` W, `[1]` R, `[0]` EN |
+| `0x11 + 2n` | `MPU_LIMITn` | `[31:5]` **last** granule (inclusive); `[4:0]` read 0 |
+| `0x00` | `STATUS` | `[8]` MPU_EN (supervisor read/write) |
+
+- 16 regions. `CPU_FEATURES[1]` = 1 and `CPU_FEATURES[7:4]` = region count
+  − 1 (15).
+- Reset clears every region and `MPU_EN`. All MPU SRs are supervisor-only.
+  MTSR to them serializes, so the change applies from the next instruction,
+  including its fetch.
+- Region *n* **covers** address *a* when `EN` and `BASE[31:5] ≤ a[31:5] ≤
+  LIMIT[31:5]`. The granularity is 32 bytes, as on ARMv8-M.
+
+### 10.2 Rule
+
+With `MPU_EN = 1` and `TE = 0`, every checked access is decided as follows:
+
+1. If any enabled **GUARD** region covers it: **denied**, in either mode.
+   GUARD regions are deny regions, used for stack guards; their R/W/X bits
+   are ignored.
+2. Otherwise, in supervisor mode: **allowed** (default allow).
+3. Otherwise, in user mode: allowed only if some enabled non-GUARD region
+   covering it has the permission. Loads need R, stores need W, and
+   instruction fetch needs X. Regions combine as a union with no priority,
+   so user mode is default deny.
+
+Denied accesses raise ACCESS_LOAD / ACCESS_STORE / ACCESS_FETCH. `EADDR`
+follows §4.1: the raw EA, or the start of the second doubleword. For a fetch
+it is the first denied word of the instruction.
+
+What is checked:
+- Every data access by an instruction, including stack operations (by
+  direction), LR (load) and SC (store). For a two-access instruction
+  (MEMGET32 spanning two doublewords, LEAVERET), **both** doublewords are
+  checked before either access happens.
+- Every instruction fetched, at every doubleword it occupies.
+- **Not checked:** the frame push of exception or interrupt entry (so a
+  stack overflow into a guard cannot double-fault; leave one frame of slack
+  below a guard); debugger memory accesses; speculative I-cache fills and
+  prefetches (DDR reads have no side effects, and the decision is made when
+  the instruction is decoded).
+
+The stage 1 user-mode MMIO rule (§3.6) still applies first. In supervisor
+mode, GUARD regions also cover MMIO. Cause priority stays as in §4.1: an
+MPU denial is an ACCESS_* fault.
+
+### 10.3 Pipeline
+
+- **Data:** in EX, 16 base/limit comparisons on the EA (and on the second
+  doubleword's address for two-access ops), registered into MEM. The fault
+  is acted on in the MEM-cycle-1 slot (§7.1), the same as the user-MMIO
+  fault.
+- **Fetch:** the comparisons run on `pc` (and on the instruction's last
+  doubleword) at the IF→ID latch. The result is registered into the §7.5
+  fetch-fault override.
+- **Cost:** 16 regions × 2 comparators × 2 (data, fetch), plus about 950
+  FFs.
 
 ---
 
-## 11. Stage 3 outline: TLB, pages, LR/SC
+## 11. Stage 3: TLB and paging
 
 ### 11.1 Page size versus cache aliasing: **64 KiB pages**
 
@@ -841,36 +881,97 @@ segment). The page-table format is entirely software's choice (soft TLB).
 
 | VA | Mode | Translation |
 |---|---|---|
-| `0x0000_0000–0x7FFF_FFFF` | user + supervisor | TLB (ASID or global). User programs start above page 0, so NULL faults. |
-| `0x8000_0000–0xBFFF_FFFF` | supervisor only | **direct**: PA = VA − `0x8000_0000` (DDR, 128 MiB used), cached. Kernel text, data, direct map, **kernel stacks**. |
-| `0xC000_0000–0xEFFF_FFFF` | supervisor only | TLB (global entries). vmalloc, modules. |
+| `0x0000_0000–0x7FFF_FFFF` (useg) | user + supervisor | TLB (ASID-matched or global entry). User programs start above page 0, so NULL faults. |
+| `0x8000_0000–0x87FF_FFFF` (kseg) | supervisor only | **direct**: PA = VA − `0x8000_0000` (all 128 MiB of DDR), cached. Kernel text, data, direct map, **kernel stacks**. |
+| `0x8800_0000–0xBFFF_FFFF` | — | ACCESS_* fault (no DDR there) |
+| `0xC000_0000–0xEFFF_FFFF` (kmap) | supervisor only | TLB. vmalloc and modules; normally global entries. |
 | `0xF000_0000–0xFFFF_FFFF` | supervisor only | **direct, identity**, uncached MMIO, as now |
 
-With `TE = 0`, all addresses are physical, as now. The kernel boots with
-`TE = 0` at its physical address, sets up, then sets `TE` and jumps to its
-`0x8000_0000` alias.
+- Any user access (data or fetch) at or above `0x8000_0000` raises
+  ACCESS_*.
+- With `TE = 0`, every address is physical and the MPU applies (§10). With
+  `TE = 1`, the MPU is ignored.
+- `TE` is `STATUS[9]` and is set by MTSR STATUS, which serializes. The
+  kernel boots with `TE = 0` at its physical address, sets up, then sets
+  `TE` and jumps to its `0x8000_0000` alias.
+- TLB entries map DDR frames only (PFN = PA[26:16], 11 bits). So "is MMIO"
+  stays a function of VA[31:28], with no translation in front of any MMIO
+  decision. Mapping device registers into a user process is not supported;
+  mapping DDR such as a framebuffer is.
 
-TLB entries may map only DDR frames (PFN = PA[26:16], 11 bits). So
-"is MMIO" stays a function of VA[31:28], which keeps every existing
-MMIO/posting/hit-pipe decision on the virtual address with no translation in
-front of it. Mapping device registers into a user process is not supported;
-mapping DDR such as a framebuffer is.
+### 11.3 TLB programmer's model
 
-### 11.3 TLB
+- **Size:** 32 entries, fully associative. `CPU_FEATURES[2]` = 1, and
+  `CPU_FEATURES[15:8]` = 32.
+- **Entry:** VPN `[15:0]` (= VA[31:16]), ASID `[7:0]`, G, PFN `[10:0]`, V, R,
+  W, X.
+- **Match:** an entry matches VA when V = 1, its VPN = VA[31:16], and (G = 1
+  or its ASID = the `ASID` SR). An entry with V = 0 never matches. If more
+  than one entry matches, the PA is some DDR address (never MMIO). That is
+  a kernel bug, so software must avoid duplicates.
+- **Permissions:** R, W, X per entry, checked for loads, stores and fetches
+  respectively. Whether user mode may use the entry comes from the segment
+  (useg yes, kmap no), not from an entry bit. `W = 0` is how software
+  tracks dirty pages. Accessed tracking is software's (refill on first
+  touch).
 
-- 32 entries, fully associative, in FFs and LUTs (no BRAM). Each entry:
-  VPN[15:0], ASID[7:0], G, V, R, W, X, PFN[10:0]. `W = 0` is how software
-  tracks dirty pages; `V = 0` is how it tracks accessed pages. About 1.3k
-  FFs and 0.5k LUTs per lookup port.
-- **Software refill**, MIPS style. A miss raises TLB_MISS_LOAD / _STORE /
-  _FETCH with `EADDR` = VA. A permission failure raises ACCESS_*. A
-  separate `TLBVEC` (0 = use `EVEC`) gives the refill handler its own
-  entry point. That is an SR, so it needs no new encoding.
-- SRs `0x30+`: `ASID`, `TLB_INDEX`, `TLB_HI` {VPN, ASID, G}, `TLB_LO` {PFN,
-  V, R, W, X}, `TLB_RANDOM`, `TLBVEC`. Instructions (class B OPs 9–12,
-  proposed): `TLBWI`, `TLBWR`, `TLBP`, `TLBR`, and a flush (all / non-global
-  / by ASID). All serialize. Writing `ASID` or the TLB also discards the
-  fetch side's virtual copies: window, NLB and BTIC.
+System registers (supervisor only):
+
+| SR | Name | Contents |
+|---|---|---|
+| `0x30` | `TLB_HI` | `[31:16]` VPN, `[8]` G, `[7:0]` ASID |
+| `0x31` | `TLB_LO` | `[26:16]` PFN, `[3]` X, `[2]` W, `[1]` R, `[0]` V |
+| `0x32` | `TLB_INDEX` | `[4:0]` entry index; `[31]` P = the last TLBP found no match |
+| `0x33` | `ASID` | `[7:0]` current address-space ID |
+| `0x34` | `TLBVEC` | vector for TLB_MISS_* exceptions; 0 = use `EVEC` |
+| `0x00` | `STATUS` | `[9]` TE |
+
+Instructions (class B, LEN = 01, no operands, privileged, serializing):
+
+| Mnemonic | Template | Semantics |
+|---|---|---|
+| `TLBWI` | `0x6C09_0000` | entry[`TLB_INDEX[4:0]`] ← {`TLB_HI`, `TLB_LO`} |
+| `TLBR` | `0x6C0A_0000` | {`TLB_HI`, `TLB_LO`} ← entry[`TLB_INDEX[4:0]`] |
+| `TLBP` | `0x6C0B_0000` | search for `TLB_HI`'s VPN with `TLB_HI.ASID` (G-aware). Hit: `TLB_INDEX` ← {P = 0, index}; miss: `TLB_INDEX[31]` ← 1 |
+| `TLBINV` | `0x6C0C_0000` | V ← 0 in every entry |
+
+Replacement is software's choice: `TLB_INDEX` is plain software state,
+typically a round-robin counter. To invalidate a single ASID, software
+walks the entries with TLBR/TLBWI.
+
+**Faults.**
+- A useg or kmap access with no matching entry raises TLB_MISS_LOAD /
+  _STORE / _FETCH (11/12/13). It vectors to `TLBVEC` if that is nonzero,
+  else `EVEC`.
+- A matching entry without the needed permission raises ACCESS_*.
+- On both, `EADDR` = the VA (§4.1 rules), and hardware also loads
+  `TLB_HI` ← {VPN of `EADDR`, G = 0, current `ASID`}. A refill handler
+  therefore only has to find the PTE, write `TLB_LO`, pick an index and
+  run `TLBWI`.
+- **Priority:** within the §4.1 order, for one access: MISALIGNED >
+  ACCESS (segment, MMIO, kseg beyond DDR) > TLB_MISS > ACCESS (TLB
+  permission). Two-access instructions translate both doublewords before
+  either access, and report the lowest faulting byte.
+
+**Side effects of TLB changes.** TLBWI, TLBINV, MTSR `ASID` and MTSR
+`STATUS` serialize. They also discard the fetch side's virtual copies (the
+window, the NLB and the BTIC) and clear the LR/SC reservation. The I-cache
+and D-cache are physically tagged and are kept. The reservation holds a VA.
+Because every TLB or ASID change clears it, a VA is enough.
+
+**Frame pushes are not translated.** With `TE = 1`, the stack an entry
+pushes on (the kernel SP) must be a kseg address, and the push writes PA =
+SP − 8 − `0x8000_0000`. If it is not in kseg, the core parks with
+`park_kind` 6 (DOUBLE_FAULT), or debug-halts if a debugger is attached. For
+Linux: no `VMAP_STACK`.
+
+**Coherence.** Code written through a different mapping (for example the
+kernel writing user text through kseg) needs ICACHE_INV, which Linux's
+`flush_icache_*` hooks provide. Same-VA self-modifying code still works as
+today. Debugger memory accesses use physical addresses.
+
+### 11.4 Pipeline approach
+
 - **Data-side lookup** on the EA in EX, with the result **registered** into
   MEM (frame number, hit, permissions). The cache keeps reading its BRAMs
   with VA index bits on the EX→MEM edge (VIPT). The hit pipe's tag compare
@@ -902,11 +1003,6 @@ mapping DDR such as a framebuffer is.
 - **Frame pushes are not translated.** With `TE = 1` the kernel SP must be
   in the direct segment. Otherwise the core takes a double fault and parks
   with `park_kind` 6. Linux: no `VMAP_STACK`.
-
-### 11.4 LR/SC
-
-Moved into stage 1 (§5.1). With translation on, the reservation will hold the
-physical doubleword address.
 
 ---
 

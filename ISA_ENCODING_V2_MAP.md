@@ -778,3 +778,38 @@ LR_W_S,0x5A801000,1,6,"rd,rs1",,,load-reserved 32 sext (mmu stage 1)
 SC_D,0x5F001000,1,7,"rd,rs1,rs2",,,store-conditional 64; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
 SC_W,0x5E001000,1,7,"rd,rs1,rs2",,,store-conditional 32; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
 ```
+
+## 10. MMU stage 2 and 3 additions (2026-11-09, branch `mmu`)
+
+From [MMU_PLAN.md](MMU_PLAN.md) §10–§11. **Not yet in the RTL, klausscc or LLVM.**
+
+### 10.1 New system-register numbers (MFSR / MTSR, supervisor only)
+
+| SR | Name (assembler) | Stage |
+|---|---|---|
+| `0x10 + 2n`, n = 0–15 | `mpu_base0` … `mpu_base15` | 2 |
+| `0x11 + 2n` | `mpu_limit0` … `mpu_limit15` | 2 |
+| `0x30` | `tlb_hi` | 3 |
+| `0x31` | `tlb_lo` | 3 |
+| `0x32` | `tlb_index` | 3 |
+| `0x33` | `asid` | 3 |
+| `0x34` | `tlbvec` | 3 |
+
+`STATUS` gains `[8]` MPU_EN (stage 2) and `[9]` TE (stage 3).
+
+### 10.2 TLB instructions (class B, LEN=01, no operands, privileged, serializing)
+
+| Symbol | Template | Semantics |
+|---|---|---|
+| TLBWI | `0x6C090000` | entry[TLB_INDEX] ← {TLB_HI, TLB_LO} |
+| TLBR | `0x6C0A0000` | {TLB_HI, TLB_LO} ← entry[TLB_INDEX] |
+| TLBP | `0x6C0B0000` | look up TLB_HI → TLB_INDEX (bit 31 = no match) |
+| TLBINV | `0x6C0C0000` | invalidate every entry |
+
+```csv
+symbol,template,words,class,regs,imm,flags,notes
+TLBWI,0x6C090000,1,11,,,,TLB write indexed (mmu stage 3)
+TLBR,0x6C0A0000,1,11,,,,TLB read indexed (mmu stage 3)
+TLBP,0x6C0B0000,1,11,,,,TLB probe (mmu stage 3)
+TLBINV,0x6C0C0000,1,11,,,,TLB invalidate all (mmu stage 3)
+```
