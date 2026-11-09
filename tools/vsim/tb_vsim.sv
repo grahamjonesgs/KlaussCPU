@@ -208,6 +208,18 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 
    // ---------------- counters / trace ----------------------------------------
    longint icount = 0;
+   always @(posedge clk) if (!rst && dbg_drv) begin
+      dbg_i.resume <= 1'b0;  dbg_i.step <= 1'b0;
+      if (parked && park_kind == 3'd4 && !dbg_i.resume) begin
+         if (dbg_gap < 4) dbg_gap <= dbg_gap + 1;      // let the halt settle
+         else begin
+            dbg_gap <= 0;
+            dbg_i.resume <= 1'b1;
+            if (dbg_stepped < dbg_steps) begin dbg_i.step <= 1'b1; dbg_stepped <= dbg_stepped + 1; end
+            else dbg_i.bp_en[0] <= 1'b0;                // done: run freely
+         end
+      end
+   end
    longint exc_n = 0;          // exception entries completed (MMU)
 `ifdef HAS_EXC
    always @(posedge clk) if (!rst && dut.sr_ent_we) exc_n++;
@@ -220,6 +232,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    integer trace_f = 0;
    bit     trace_cyc = 0;      // +TRACECYC: stamp each retire with its cycle
    int     park_hold = 0, park_hold_n = 0;
+   // a minimal debugger driver (DEBUG_EN builds): +DBG_BP0=<pc> halts at a
+   // PC breakpoint, then +DBG_STEPS=<n> single steps (step + resume pulses,
+   // each waiting for the re-halt), then a plain resume
+   bit     dbg_drv = 0;
+   int     dbg_steps = 0, dbg_stepped = 0, dbg_gap = 0;
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -269,7 +286,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       // (+PARK_HOLD=<n>: keep running n cycles first, so anything that still
       // moves after a park — a re-taken IRQ, a dispatch — trips the core's
       // assertions)
-      if (!rst && parked && park_kind != 3'd3 && bus_idle && !in_flight) begin
+      if (!rst && parked && park_kind != 3'd3 && !(dbg_drv && park_kind == 3'd4) && bus_idle && !in_flight) begin
          if (park_hold_n >= park_hold) done("park");
          park_hold_n++;
       end
@@ -313,6 +330,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (!$value$plusargs("OUT=%s", out_name)) out_name = "tb_vsim.out";
       if ($value$plusargs("TRACE=%s", trace_name)) trace_f = $fopen(trace_name, "w");
       trace_cyc = $test$plusargs("TRACECYC");
+      begin
+         logic [31:0] bpa;
+         if ($value$plusargs("DBG_BP0=%h", bpa)) begin
+            dbg_drv = 1;  dbg_i.bp_en[0] = 1'b1;  dbg_i.bp_addr[0] = bpa;
+            void'($value$plusargs("DBG_STEPS=%d", dbg_steps));
+         end
+      end
       void'($value$plusargs("PARK_HOLD=%d", park_hold));
       void'($value$plusargs("LAT=%d", lat_fix));
       void'($value$plusargs("LATR=%d", lat_rand));
@@ -336,7 +360,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if ($test$plusargs("DBG_EXCPASS")) dbg_i.exc_pass = 1'b1;
 `endif
       $readmemh(img, mem_lo);
-      install_handler();
+      // (+NO_IRQ_HANDLER: the image supplies its own handler at 0x100000)
+      if (!$test$plusargs("NO_IRQ_HANDLER")) install_handler();
       repeat (4) @(posedge clk);
       rst <= 0;
       @(posedge clk); start <= 1;

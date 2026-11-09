@@ -1237,6 +1237,14 @@ module pipeline_core
    // privileged op is never a branch or return.)
    wire w_xser = EN_EXC && (w_fx || (fe_um && f_priv(w_dec, w_op)));
    logic id_ser;
+   // Precise EI (RISC-V-like): an EI latched while an interrupt is pending
+   // (irq_ok — never during a debugger single-step) serializes: fetch halts
+   // behind it, it commits its enable at WB and refetches at EI+4, and the
+   // next boundary sees the committed enable and takes the IRQ (frame PC =
+   // EI+4) before the next instruction.  An EI latched with nothing pending
+   // is an ordinary instruction (no cost).  Carried to WB's refetch leg.
+   wire  w_eiser = EN_DIEI && w_dec.uop == U_EI && irq_ok;
+   logic id_eiser, ex_eiser, mem_eiser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
    // ISA v3 short 1-word forms (ISA_V3_PROPOSAL.md §3): the immediate lives in
@@ -2654,6 +2662,7 @@ module pipeline_core
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
+         id_eiser <= 1'b0; ex_eiser <= 1'b0; mem_eiser <= 1'b0;
          id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
@@ -2894,7 +2903,7 @@ module pipeline_core
             end else begin
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
-               if (EN_EXC && wb_rfch) begin
+               if ((EN_EXC || EN_DIEI) && wb_rfch) begin
                   // (USP here; every other SR is written by mmu_sr / mmu_mpu /
                   // mmu_tlb; a TLB instruction runs in mmu_tlb)
                   if (wb_mtsr && wb_op[19:12] == 8'd4) sp_alt <= wb_value[31:0];
@@ -3550,7 +3559,8 @@ module pipeline_core
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
             wb_tlbi    <= EN_TLB && mem_valid && mem_d.tlbi;
-            wb_rfch    <= EN_EXC && mem_valid && (mem_d.mtsr || (EN_TLB && mem_d.tlbi));
+            wb_rfch    <= mem_valid && ((EN_EXC && (mem_d.mtsr || (EN_TLB && mem_d.tlbi))) ||
+                                            (EN_DIEI && mem_eiser));
             wb_va_dw   <= mem_eaddr[31:3];        // (the reservation holds a VA)
             wb_xtlb    <= EN_TLB && (mem_xsq ? mem_xs_tlb : (mem_valid && mem_d.uop == U_EXC && mem_d.fxl));
             wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
@@ -3634,6 +3644,7 @@ module pipeline_core
                      end
                end
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
+               mem_eiser  <= ex_eiser;
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
                mem_ptk    <= ex_ptk;  mem_pc_next <= ex_pc_next;
                mem_bp_idx <= ex_bp_idx;  mem_bp_ctr <= ex_bp_ctr;
@@ -3738,6 +3749,7 @@ module pipeline_core
                   ex_bp_cnd  <= id_bp_cnd;
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
+                  ex_eiser   <= id_eiser;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   mul_cnt    <= 2'd0;
                   if (DEBUG_EN && id_valid && id_bp) begin
@@ -3818,7 +3830,8 @@ module pipeline_core
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
-                     id_ser    <= w_decf.serialize || w_xser;
+                     id_ser    <= w_decf.serialize || w_xser || w_eiser;
+                     id_eiser  <= w_eiser;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
                      id_rpend   <= 1'b1;
@@ -4420,7 +4433,7 @@ module pipeline_core
       if (sq_spec)
          assert (st_post || sq_v) else $fatal(1, "sq_spec with the port idle: pc=%h", mem_pc);
       if (id_valid)
-         assert (id_ser == dec.serialize)
+         assert (id_ser == (dec.serialize || id_eiser))
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
    end
 `endif

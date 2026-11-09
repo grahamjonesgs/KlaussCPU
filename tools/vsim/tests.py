@@ -2908,3 +2908,148 @@ def tlb_double_fault_irq():
         _mpuhandler(a)
         out.append((a, {'end': 'park', 'kind': '6'}, [f'+IRQ_PERIOD={per}', '+LAT=3', '+PARK_HOLD=400']))
     return out
+
+
+# ---- precise EI (an EI enabling with an IRQ pending takes it right after itself)
+ELOG = DATA + 0x700        # [0] = IRQ entries, [8 * k] = the k-th frame's PC
+
+
+def _irq_logger(a):
+    """an IRQ handler at 0x100000 (+NO_IRQ_HANDLER): counts entries at ELOG
+    and logs each frame's PC at ELOG + 8 * count"""
+    def h(s):
+        s.push(1); s.push(2); s.push(3)
+        s.setr(1, ELOG); s.ld(64, 2, 1); s.inc(2); s.st(64, 2, 1)
+        s.shift_n('shl', 2, 2, 3); s.alu('add', 1, 1, 2)
+        s.getsp(3); s.ld(64, 3, 3, 24)
+        s.shift_n('shl', 3, 3, 32); s.shift_n('shr', 3, 3, 32); s.st(64, 3, 1)
+        s.pop(3); s.pop(2); s.pop(1)
+        s.iret()
+    _place(a, 0x100000, h)
+
+
+def _ei_prog(body, plus=(), per=400):
+    a = Asm()
+    a.setr(1, 0x08000000); a.setsp(1)
+    a.di(9)
+    a.set_int_mask(1)
+    body(a)
+    a.halt()
+    _irq_logger(a)
+    return a, ['+NO_IRQ_HANDLER', f'+IRQ_PERIOD={per}'] + list(plus)
+
+
+@test
+def ei_precise_take():
+    """xv6's idle pattern: DI; WAIT (wakes on the pending IRQ, no handler);
+    EI; DI.  The IRQ is taken between EI and DI: one entry, frame PC = the
+    DI's address, and the DI runs after the IRET (its old-enable result 1)"""
+    out = []
+    for plus in (['+LAT=1'], ['+LAT=3'], ['+LAT=7', '+HIT=70']):
+        def body(a):
+            a.wait()
+            a.setr(1, 1); a.ei(1)
+            a.label('d'); a.di(2)
+            for _ in range(8):
+                a.nop()
+        a, p = _ei_prog(body, plus)
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': 1, m(ELOG): 1, m(ELOG + 8): a.labels['d']}, p))
+    return out
+
+
+@test
+def ei_nothing_pending():
+    """EI; DI with no interrupt pending (masked): nothing taken, EI is not
+    serialized (same cycles as before precise EI)"""
+    a = Asm()
+    a.setr(1, 1)
+    for _ in range(4):
+        a.ei(1); a.di(2)
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r2': 1}, ['+IRQ_PERIOD=40']
+
+
+@test
+def ei_zero_pending():
+    """EI 0 with an IRQ pending: nothing taken (it serializes, harmlessly);
+    a later EI 1 takes it at once"""
+    def body(a):
+        a.wait()
+        a.setr(1, 0); a.ei(1)
+        a.di(2)                                  # old enable 0
+        a.setr(1, 1); a.ei(1)
+        a.label('n'); a.nop()
+        a.di(3)
+    a, p = _ei_prog(body)
+    return a, {'end': 'park', 'kind': '0', 'r2': 0, 'r3': 1, m(ELOG): 1, m(ELOG + 8): a.labels['n']}, p
+
+
+@test
+def ei_debugger_attached():
+    """the same with a debugger attached (DEBUG_EN builds): the IRQ is still
+    taken right after the EI (only single-steps are IRQ-free)"""
+    def body(a):
+        a.wait()
+        a.setr(1, 1); a.ei(1)
+        a.label('d'); a.di(2)
+    a, p = _ei_prog(body, ['+DBG_ATTACHED'])
+    # (attached, the closing HALT is a debug halt: park kind 4)
+    kind = '4' if _os.environ.get('VSIM_DEBUG_EN') == '1' else '0'
+    return a, {'end': 'park', 'kind': kind, 'r2': 1, m(ELOG): 1, m(ELOG + 8): a.labels['d']}, p
+
+
+@test
+def ei_in_exception_handler():
+    """inside an exception handler (entry set DI): EI; DI takes the pending
+    IRQ between them, nested; both handlers return"""
+    a = Asm()
+    a.setr(1, 0x08000000); a.setsp(1)
+    a.leapc(1, 'xh'); a.mtsr('evec', 1)
+    a.set_int_mask(1)
+    a.di(9)
+    a.wait()                                     # the IRQ is now pending
+    a.syscall()
+    a.label('back'); a.setr(5, 0x55)
+    a.halt()
+    a.label('xh')                                # exception handler: DI is set
+    a.setr(1, 1); a.ei(1)
+    a.label('d'); a.di(2)
+    a.iret()
+    _irq_logger(a)
+    return a, {'end': 'park', 'kind': '0', 'r2': 1, 'r5': 0x55, m(ELOG): 1,
+               m(ELOG + 8): a.labels['d']}, ['+NO_IRQ_HANDLER', '+IRQ_PERIOD=400']
+
+
+@test
+def iret_enable_pending():
+    """an IRET whose frame enables interrupts while one is pending takes it
+    before the target's first instruction (frame PC = the target)"""
+    def body(a):
+        a.wait()                                 # pending, DI
+        a.leapc(2, 't'); a.setr64(3, 1 << 39); a.alu('or', 2, 2, 3)
+        a.push(2); a.iret()                      # frame: PC = t, DI = 0, INT_MASK = 1
+        a.label('t'); a.setr(6, 0x66)
+    a, p = _ei_prog(body)
+    return a, {'end': 'park', 'kind': '0', 'r6': 0x66, m(ELOG): 1, m(ELOG + 8): a.labels['t']}, p
+
+
+@test
+def ei_single_step():
+    """DEBUG_EN: single-stepping over EI; DI with an IRQ pending takes no
+    interrupt (steps never do); the IRQ is taken after a later EI run
+    freely.  (Without DEBUG_EN the breakpoint is ignored: the first EI
+    takes it.)"""
+    dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
+    def body(a):
+        a.wait()
+        a.setr(1, 1)
+        a.label('e'); a.ei(1)
+        a.label('d'); a.di(2)
+        a.nop(); a.nop()
+        a.ei(1)
+        a.label('n'); a.nop()
+        a.di(3)
+    a, p = _ei_prog(body)
+    p += ['+DBG_BP0=%x' % a.labels['e'], '+DBG_STEPS=2']
+    want = a.labels['n'] if dbg else a.labels['d']
+    return a, {'end': 'park', 'kind': '0', m(ELOG): 1, m(ELOG + 8): want}, p
