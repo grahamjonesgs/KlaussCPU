@@ -1313,7 +1313,8 @@ the shipped bitstream.
   all_tests 30/31 with 0 failed, hw_tlb.kla 19/19, test_tlb 26/26 (T11a/b,
   the review 3 CRITICAL check), test_exc 53/53, test_atomic 139/139,
   test_mpu SKIP, board_suite -O2 with only the expected crypto_selftest
-  SKIPs, perf_baseline within ±0.03 % of master.
+  SKIPs, perf_baseline within ±0.03 % of master; ssh_shell 5/5 (SSH
+  session, HTTPS, MicroPython) on software AES.
 - **First release, superseded: `52bece8`** (`mmu_stage3_release_52bece8.bit`,
   md5 `c75aa83d…`), an alt-place ExtraPostPlacementOpt closure (WNS +0.008,
   WHS +0.015) of the same design without the last two fixes. Its board
