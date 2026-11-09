@@ -45,7 +45,10 @@ module pipeline_core
    parameter bit EXC_EN = 1'b1,
    // MMU_PLAN.md stage 2: the 16-region MPU (needs EXC_EN).  0 = its SRs
    // are illegal and nothing else changes (core 2 builds it off).
-   parameter bit MPU_EN = 1'b1
+   parameter bit MPU_EN = 1'b1,
+   // MMU_PLAN.md stage 3: the 32-entry software-refilled TLB, TE (needs
+   // EXC_EN).  0 = its SRs and instructions are illegal (core 2: off).
+   parameter bit TLB_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -304,6 +307,7 @@ module pipeline_core
    // exception parks exactly as before, so existing images are unaffected.
    localparam bit EN_EXC = EXC_EN;
    localparam bit EN_MPU = EXC_EN && MPU_EN;   // MMU stage 2 (MPU)
+   localparam bit EN_TLB = EXC_EN && TLB_EN;   // MMU stage 3 (TLB, TE)
    // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
    localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
                           X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
@@ -366,6 +370,7 @@ module pipeline_core
       logic       w32;          // ISA v3 D3: result = sext of its low 32 bits (in MEM)
       logic       mtsr;         // MMU stage 1: MTSR (SR written at WB, then refetch)
       logic       fx2, fxg;     // a fetch fault: on the instruction's 2nd granule only / a GUARD denial
+      logic       tlbi;         // MMU stage 3: TLBWI / TLBR / TLBP / TLBINV (at WB, then refetch)
    } dec_t;
 
    // ----------------------------------------------------- architectural state
@@ -395,6 +400,11 @@ module pipeline_core
    logic [8:0]  ecause;          // [8] GUARD (stage 2)
    // MMU stage 2: mmu_mpu's outputs (see its instance at the end)
    logic        mpu_en;          // STATUS[8]
+   // MMU stage 3: mmu_tlb's outputs (see its instance at the end)
+   logic        te;              // STATUS[9]
+   logic [7:0]  tlb_asid;
+   logic [31:0] tlb_vec;         // TLBVEC
+   logic [31:0] tlb_rdata;       // MFSR of a TLB SR
    logic [31:0] mpu_rdata;       // MFSR of an MPU SR
    logic        mpu_d1, mpu_dg1, mpu_d2, mpu_dg2;   // data: deny / GUARD, 1st and 2nd granule
    logic        mpu_f1, mpu_fg1, mpu_f2, mpu_fg2;   // fetch: the same at pc's granule and the next
@@ -995,6 +1005,10 @@ module pipeline_core
                      6'd4: if (op[7:4] == 4'h0) begin d.legal = 1'b1; d.uop = U_TRAP;  d.serialize = 1'b1; end
                      6'd5: begin d.legal = 1'b1; d.uop = U_DELAY; d.use_rs1 = 1'b1; end
                      // MMU stage 1: SYSCALL (an exception op from decode)
+                     // MMU stage 3: TLBWI (9) / TLBR (10) / TLBP (11) / TLBINV (12)
+                     6'd9, 6'd10, 6'd11, 6'd12: if (EN_TLB && op[7:4] == 4'h0) begin
+                        d.legal = 1'b1; d.uop = U_NOP; d.tlbi = 1'b1; d.serialize = 1'b1;
+                     end
                      6'd8: if (EN_EXC && op[7:4] == 4'h0) begin
                         d.legal = 1'b1; d.uop = U_EXC; d.sub = X_SYSCALL; d.serialize = 1'b1;
                      end
@@ -1012,11 +1026,13 @@ module pipeline_core
                // (id_mfsr).  MTSR is a flag-less COPY of rs1, committed to
                // the SR at WB, serializing.
                if (!op[21] && op[7:4] == 4'h0 &&
-                   (op[19:12] <= 8'd8 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F))) begin
+                   (op[19:12] <= 8'd8 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
+                    (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= 8'h34))) begin
                   d.legal = 1'b1; d.wreg = 1'b1;
                   d.uop = (op[19:12] == 8'd0) ? U_GETST : U_MOV64;
                end else if (op[21] && op[11:8] == 4'h0 &&
-                            (op[19:12] <= 8'd7 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F))) begin
+                            (op[19:12] <= 8'd7 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
+                             (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= 8'h34))) begin
                   d.legal = 1'b1; d.uop = U_UNARY; d.sub = 4'd0; d.use_rs1 = 1'b1;
                   d.mtsr = 1'b1; d.serialize = 1'b1;
                end
@@ -1061,7 +1077,7 @@ module pipeline_core
    function automatic dec_t f_mkx(dec_t din, logic [3:0] cause);
       dec_t d;
       d = din;
-      d.legal = 1'b0; d.uop = U_EXC; d.sub = cause; d.serialize = 1'b1; d.mtsr = 1'b0;
+      d.legal = 1'b0; d.uop = U_EXC; d.sub = cause; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
       d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
       d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
       return d;
@@ -1072,7 +1088,7 @@ module pipeline_core
       case (d.uop)
          U_DI, U_EI, U_IRET, U_HALT, U_WAIT, U_RESET, U_DELAY, U_LCD, U_LCDRST: return 1'b1;
          U_MOV64: return op[29:26] == 4'hB && op[19:12] != 8'd7 && op[19:12] != 8'd8;
-         default: return d.mtsr && op[19:12] != 8'd7;
+         default: return (d.mtsr && op[19:12] != 8'd7) || d.tlbi;
       endcase
    endfunction
    // um = user mode; fx / fxc = a fetch fault on this instruction (MMU
@@ -1083,7 +1099,7 @@ module pipeline_core
       dec_t d;
       d = f_decode_raw(op);
       if (!d.legal) begin
-         d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0;
+         d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
          d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
          d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
       end else if (EN_EXC && um && f_priv(d, op)) begin
@@ -1825,7 +1841,7 @@ module pipeline_core
          // MMU stage 1: MFSR STATUS = {DI, UM}; DI forwarded from an older
          // DI / EI in MEM / WB (program order), UM is stable (it only
          // changes with the pipe drained or behind a serializing IRET)
-         U_GETST: exo_result = {55'b0, EN_MPU && mpu_en, 6'b0, ex_dis_eff, umode};
+         U_GETST: exo_result = {54'b0, EN_TLB && te, EN_MPU && mpu_en, 6'b0, ex_dis_eff, umode};
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1906,6 +1922,7 @@ module pipeline_core
    logic [31:0] wb_xaddr, wb_pc_next;
    logic        wb_xguard;            // ECAUSE[8]: a GUARD denial (stage 2)
    logic        wb_mtsr;
+   logic        wb_tlbi;              // a TLB instruction (MMU stage 3)
    logic        wb_um_we, wb_um_new;     // IRET: UM restore (+ stack swap)
    logic [31:0] wb_spalt_new;
    assign fe_um = umode || (wb_valid && wb_um_we && wb_um_new);
@@ -1946,6 +1963,7 @@ module pipeline_core
    logic        if_rebase;
    // MMU stage 1: the fill in flight is a fake one (user fetch from 0xF...)
    logic        if_fake;
+   logic        if_drop;      // MMU stage 3: the fill in flight must not reach the window
    wire         w_ufz = EN_EXC && fe_um && miss_dw[28:25] == 4'hF;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
@@ -2393,7 +2411,7 @@ module pipeline_core
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
-         mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0;
+         mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0; if_drop <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
@@ -2617,9 +2635,11 @@ module pipeline_core
             end else begin
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
-               if (EN_EXC && wb_mtsr) begin
-                  // (USP here; every other SR is written by mmu_sr, sr_mtsr_we)
-                  if (wb_op[19:12] == 8'd4) sp_alt <= wb_value[31:0];
+               if (EN_EXC && (wb_mtsr || wb_tlbi)) begin
+                  // (USP here; every other SR is written by mmu_sr / mmu_mpu /
+                  // mmu_tlb; a TLB instruction runs in mmu_tlb)
+                  if (wb_mtsr && wb_op[19:12] == 8'd4) sp_alt <= wb_value[31:0];
+                  if (tlb_discard) res_valid <= 1'b0;   // (stage 3: TLB / ASID / TE change)
                   ev_pcz     = 1'b1;
                   pc         <= wb_pc + 32'd4;
                   fetch_halt <= 1'b0;
@@ -2918,7 +2938,9 @@ module pipeline_core
          if (if_xc) begin
             if (EN_EXC && if_fake) begin
                // MMU stage 1 fake fill (see the miss issue): zeros, no install
-               if (if_rebase) begin
+               if (EN_TLB && if_drop) begin
+                  // (a TLB / ASID / TE change discarded the window meanwhile)
+               end else if (if_rebase) begin
                   ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= 64'b0;  ifb_val[0] <= 1'b1;
@@ -2928,8 +2950,12 @@ module pipeline_core
                end
                if_xc   <= 1'b0;
                if_fake <= 1'b0;
+               if_drop <= 1'b0;
             end else if (w_mrdy) begin
-               if (if_rebase) begin
+               if_drop <= 1'b0;
+               if (EN_TLB && if_drop) begin
+                  // (window discarded meanwhile: install only, physical tags)
+               end else if (if_rebase) begin
                   ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
                   ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
@@ -3225,6 +3251,7 @@ module pipeline_core
                         : mem_op;
             wb_pc_next <= mem_pc_next;
             wb_mtsr    <= EN_EXC && mem_valid && mem_d.mtsr;
+            wb_tlbi    <= EN_TLB && mem_valid && mem_d.tlbi;
             wb_xguard  <= EN_MPU && (mem_xsq ? mem_xs_g
                                      : (mem_d.uop == U_EXC && mem_d.sub == X_ACC_FE && mem_d.fxg));
             wb_lr      <= EN_EXC && mem_valid && mem_d.uop == U_LR && !mem_xsq;
@@ -3585,6 +3612,14 @@ module pipeline_core
                nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             end
          end
+         // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
+         // virtual copies (the I-cache, physically tagged, is kept)
+         if (tlb_discard) begin
+            nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
+            if_look <= 1'b0;
+            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
+            if (if_xc) if_drop <= 1'b1;
+         end
          if (icinv) begin
             for (int i = 0; i < IC_LINES; i++) begin ic_vhi[i] <= 1'b0; ic_vlo[i] <= 1'b0; end
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
@@ -3714,16 +3749,16 @@ module pipeline_core
                if (ev_icinst && (bt_lidx[k] == ev_icinst_idx || bt_blidx[k] == ev_icinst_idx)) bt_v[k] <= 1'b0;
                if (snoop_q   && (bt_lidx[k] == snoop_idx_q   || bt_blidx[k] == snoop_idx_q))   bt_v[k] <= 1'b0;
             end
-            if (icinv) bt_v <= '0;
+            if (icinv || tlb_discard) bt_v <= '0;
             // the ID snapshot is a copy of one entry: the same kills apply to
             // it (an older snapshot via its own indices; one taken on this
             // edge via r_btk_* next cycle, in bt_hit)
             if (ev_icinst && (id_bt_li == ev_icinst_idx || id_bt_bli == ev_icinst_idx)) id_bt_hit <= 1'b0;
             if (snoop_q   && (id_bt_li == snoop_idx_q   || id_bt_bli == snoop_idx_q))   id_bt_hit <= 1'b0;
-            if (icinv) id_bt_hit <= 1'b0;
+            if (icinv || tlb_discard) id_bt_hit <= 1'b0;
             r_btk_icv <= ev_icinst;  r_btk_ic <= ev_icinst_idx;
             r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;
-            r_btk_all <= icinv;
+            r_btk_all <= icinv || tlb_discard;
          end
 
          // ---------------- M12 pos-tracker composer (runs LAST) ----------------
@@ -3800,12 +3835,19 @@ module pipeline_core
    // Written by MTSR as it commits at WB and by exception entry as it
    // completes; read at dispatch (MFSR, id_srv).
    wire mtsr_commit = EN_EXC && wb_valid && !wb_wait && wb_mtsr && !wb_park;
+   wire tlbi_commit = EN_TLB && wb_valid && !wb_wait && wb_tlbi && !wb_park;
+   // MMU stage 3: TLBWI, TLBINV, MTSR ASID and MTSR STATUS discard the fetch
+   // side's virtual copies (window, NLB, BTIC, the micro-ITLB) and clear the
+   // LR/SC reservation (MMU_PLAN.md §11.3)
+   wire tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
+                                 (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)));
    wire sr_mtsr_we  = mtsr_commit && wb_op[19:16] == 4'h0;     // SRs 0-8 (mmu_sr)
    wire sr_ent_we  = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
    logic [63:0] sr_rdata;
    // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
    // would alias 0-8)
-   assign id_srv = (EN_MPU && id_op[19:16] != 4'h0) ? {32'b0, mpu_rdata} : sr_rdata;
+   assign id_srv = (EN_TLB && id_op[19:16] == 4'h3) ? {32'b0, tlb_rdata}
+                 : (EN_MPU && id_op[19:16] != 4'h0) ? {32'b0, mpu_rdata} : sr_rdata;
    generate if (EN_EXC) begin : g_sr
       (* keep_hierarchy = "yes" *)
       mmu_sr sr_i (
@@ -3835,7 +3877,7 @@ module pipeline_core
       mmu_mpu mpu_i (
          .clk, .rst, .ce,
          .clr      (start),
-         .we       (mtsr_commit && (wb_op[19:16] == 4'h1 || wb_op[19:16] == 4'h2)),
+         .we       (mtsr_commit && (wb_op[19:16] == 4'h1 || wb_op[19:16] == 4'h2)),  // (0x10-0x2F)
          .widx     (wb_op[16:12] - 5'h10),
          .wdata    (wb_value[31:0]),
          .en_we    (mtsr_commit && wb_op[19:12] == 8'd0),
@@ -3855,6 +3897,44 @@ module pipeline_core
       assign mpu_en = 1'b0;  assign mpu_rdata = '0;
       assign mpu_d1 = 1'b0;  assign mpu_dg1 = 1'b0;  assign mpu_d2 = 1'b0;  assign mpu_dg2 = 1'b0;
       assign mpu_f1 = 1'b0;  assign mpu_fg1 = 1'b0;  assign mpu_f2 = 1'b0;  assign mpu_fg2 = 1'b0;
+   end endgenerate
+
+   // ----------------------------------------------- MMU stage 3: mmu_tlb
+   // 32 entries + TLB_HI / TLB_LO / TLB_INDEX / ASID / TLBVEC (0x30-0x34)
+   // and TE (STATUS[9]).  SR writes and TLB instructions act as they commit
+   // at WB (serializing); MFSR reads at dispatch.
+   logic        tlb_hi_load;          // exception entry: TLB_HI <- {VPN(EADDR), 0, ASID}
+   logic [15:0] tlb_hi_vpn;
+   logic [15:0] tlb_d_vpn, tlb_f_vpn;
+   logic        tlb_d_hit, tlb_f_hit;
+   logic [10:0] tlb_d_pfn, tlb_f_pfn;
+   logic [2:0]  tlb_d_xwr, tlb_f_xwr;
+   // (data / fetch translation is wired in the following steps)
+   assign tlb_hi_load = 1'b0;  assign tlb_hi_vpn = '0;
+   assign tlb_d_vpn = '0;  assign tlb_f_vpn = '0;
+   generate if (EN_TLB) begin : g_tlb
+      mmu_tlb tlb_i (
+         .clk, .rst, .ce,
+         .clr      (start),
+         .sr_we    (mtsr_commit && wb_op[19:16] == 4'h3),
+         .sr_widx  (wb_op[14:12]),
+         .sr_wdata (wb_value[31:0]),
+         .te_we    (mtsr_commit && wb_op[19:12] == 8'h00),
+         .te_wd    (wb_value[9]),
+         .sr_ridx  (id_op[14:12]),
+         .sr_rdata (tlb_rdata),
+         .te, .asid (tlb_asid), .tlbvec (tlb_vec),
+         .op_wi    (tlbi_commit && wb_op[21:16] == 6'd9),
+         .op_r     (tlbi_commit && wb_op[21:16] == 6'd10),
+         .op_p     (tlbi_commit && wb_op[21:16] == 6'd11),
+         .op_inv   (tlbi_commit && wb_op[21:16] == 6'd12),
+         .hi_load  (tlb_hi_load), .hi_vpn (tlb_hi_vpn),
+         .d_vpn    (tlb_d_vpn), .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
+         .f_vpn    (tlb_f_vpn), .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr));
+   end else begin : g_notlb
+      assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
+      assign tlb_d_hit = 1'b0;  assign tlb_d_pfn = '0;  assign tlb_d_xwr = '0;
+      assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
    end endgenerate
 
 `ifndef SYNTHESIS
@@ -4131,4 +4211,127 @@ module mmu_mpu (
    assign f_guard2 = mpu_en && |(fc2 & gd);
    assign f_deny1  = f_guard1 || (mpu_en && f_um && !(|(fc1 & ~gd & px)));
    assign f_deny2  = f_guard2 || (mpu_en && f_um && !(|(fc2 & ~gd & px)));
+endmodule
+
+
+//===========================================================================
+// mmu_tlb — MMU stage 3 TLB (MMU_PLAN.md §11.3): 32 fully associative
+// entries {VPN[15:0], ASID[7:0], G, V, PFN[10:0], X/W/R}, the TLB SRs
+// (TLB_HI 0x30, TLB_LO 0x31, TLB_INDEX 0x32, ASID 0x33, TLBVEC 0x34), TE
+// (STATUS[9]) and the TLB instructions.  Two lookup ports with the current
+// ASID: d_* (data) and f_* (fetch; with op_p it is TLBP's probe of
+// TLB_HI's VPN / ASID).  An entry matches when V, VPN equal, and G or its
+// ASID equals the lookup's.  TLBR reads a LUTRAM copy of the entry fields
+// (V from the flops); the CAMs read the flops.
+//===========================================================================
+module mmu_tlb (
+   input  logic        clk,
+   input  logic        rst,
+   input  logic        ce,
+   input  logic        clr,           // program load: as reset
+   input  logic        sr_we,         // MTSR to 0x30-0x34 commits
+   input  logic [2:0]  sr_widx,
+   input  logic [31:0] sr_wdata,
+   input  logic        te_we,         // MTSR STATUS commits
+   input  logic        te_wd,         //   its [9]
+   input  logic [2:0]  sr_ridx,
+   output logic [31:0] sr_rdata,
+   output logic        te,
+   output logic [7:0]  asid,
+   output logic [31:0] tlbvec,
+   input  logic        op_wi, op_r, op_p, op_inv,
+   input  logic        hi_load,       // exception entry: TLB_HI <- {hi_vpn, G 0, ASID}
+   input  logic [15:0] hi_vpn,
+   input  logic [15:0] d_vpn,
+   output logic        d_hit,
+   output logic [10:0] d_pfn,
+   output logic [2:0]  d_xwr,
+   input  logic [15:0] f_vpn,
+   output logic        f_hit,
+   output logic [10:0] f_pfn,
+   output logic [2:0]  f_xwr
+);
+   localparam int N = 32;
+   logic [N-1:0]  e_v, e_g;
+   logic [15:0]   e_vpn  [0:N-1];
+   logic [7:0]    e_asid [0:N-1];
+   logic [10:0]   e_pfn  [0:N-1];
+   logic [2:0]    e_xwr  [0:N-1];
+   // TLBR's copy: {VPN, G, ASID, PFN, XWR}
+   (* ram_style = "distributed" *) logic [38:0] e_copy [0:N-1];
+   logic [15:0] hi_v;  logic hi_g;  logic [7:0] hi_a;      // TLB_HI
+   logic [10:0] lo_pfn; logic [2:0] lo_xwr; logic lo_v;   // TLB_LO
+   logic [4:0]  idx;  logic idx_p;                         // TLB_INDEX
+   logic [29:0] vec;
+
+   function automatic logic [N-1:0] f_match(logic [15:0] vpn, logic [7:0] a);
+      logic [N-1:0] m;
+      for (int n = 0; n < N; n++) m[n] = e_v[n] && e_vpn[n] == vpn && (e_g[n] || e_asid[n] == a);
+      return m;
+   endfunction
+   function automatic logic [4:0] f_enc(logic [N-1:0] m);
+      logic [4:0] r;
+      r = '0;
+      for (int n = 0; n < N; n++) r = r | (m[n] ? 5'(n) : 5'd0);
+      return r;
+   endfunction
+   wire [N-1:0] dm = f_match(d_vpn, asid);
+   wire [N-1:0] fm = op_p ? f_match(hi_v, hi_a) : f_match(f_vpn, asid);
+   always_comb begin
+      d_pfn = '0;  d_xwr = '0;  f_pfn = '0;  f_xwr = '0;
+      for (int n = 0; n < N; n++) begin
+         d_pfn |= dm[n] ? e_pfn[n] : 11'd0;  d_xwr |= dm[n] ? e_xwr[n] : 3'd0;
+         f_pfn |= fm[n] ? e_pfn[n] : 11'd0;  f_xwr |= fm[n] ? e_xwr[n] : 3'd0;
+      end
+   end
+   assign d_hit = |dm;
+   assign f_hit = |fm;
+
+   always_ff @(posedge clk) if (ce && op_wi) e_copy[idx] <= {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};
+   wire [38:0] rd = e_copy[idx];
+
+   always_ff @(posedge clk) begin
+      if (rst || (ce && clr)) begin
+         te <= 1'b0;  asid <= '0;  vec <= '0;  e_v <= '0;
+         if (rst) begin
+            hi_v <= '0; hi_g <= 1'b0; hi_a <= '0; lo_pfn <= '0; lo_xwr <= '0; lo_v <= 1'b0;
+            idx <= '0; idx_p <= 1'b0;
+         end
+      end else if (ce) begin
+         if (sr_we) case (sr_widx)
+            3'd0: begin hi_v <= sr_wdata[31:16]; hi_g <= sr_wdata[8]; hi_a <= sr_wdata[7:0]; end
+            3'd1: begin lo_pfn <= sr_wdata[26:16]; lo_xwr <= sr_wdata[3:1]; lo_v <= sr_wdata[0]; end
+            3'd2: begin idx <= sr_wdata[4:0]; idx_p <= sr_wdata[31]; end
+            3'd3: asid <= sr_wdata[7:0];
+            3'd4: vec <= sr_wdata[31:2];
+            default: ;
+         endcase
+         if (te_we) te <= te_wd;
+         if (hi_load) begin hi_v <= hi_vpn; hi_g <= 1'b0; hi_a <= asid; end
+         if (op_wi) begin
+            e_v[idx] <= lo_v;  e_vpn[idx] <= hi_v;  e_g[idx] <= hi_g;  e_asid[idx] <= hi_a;
+            e_pfn[idx] <= lo_pfn;  e_xwr[idx] <= lo_xwr;
+         end
+         if (op_r) begin
+            {hi_v, hi_g, hi_a, lo_pfn, lo_xwr} <= rd;
+            lo_v <= e_v[idx];
+         end
+         if (op_p) begin
+            if (f_hit) begin idx <= f_enc(fm); idx_p <= 1'b0; end
+            else       idx_p <= 1'b1;                    // [4:0] unchanged on a miss
+         end
+         if (op_inv) e_v <= '0;
+      end
+   end
+   always_comb begin
+      case (sr_ridx)
+         3'd0:    sr_rdata = {hi_v, 7'b0, hi_g, hi_a};
+         3'd1:    sr_rdata = {5'b0, lo_pfn, 12'b0, lo_xwr, lo_v};
+         3'd2:    sr_rdata = {idx_p, 26'b0, idx};
+         3'd3:    sr_rdata = {24'b0, asid};
+         3'd4:    sr_rdata = {vec, 2'b00};
+         default: sr_rdata = 32'b0;
+      endcase
+   end
+   assign tlbvec = {vec, 2'b00};
 endmodule

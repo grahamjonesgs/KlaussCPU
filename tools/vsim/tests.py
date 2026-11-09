@@ -834,7 +834,8 @@ def sr_roundtrip():
     a.nop(); a.nop()
     a.mfsr(8, 'cycle')
     a.alu('sub', 9, 8, 7)
-    a.mtsr('status', 1)              # stage 2: only [8] MPU_EN is writable (r1 has it set)
+    a.setr(1, 0x100)
+    a.mtsr('status', 1)              # [8] MPU_EN only ([9] TE would translate the next fetch)
     a.mfsr(10, 'status')
     a.halt()
     exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r5': 2, 'r6': 0, 'r10': 0x100, 'r9': 'nonzero'}
@@ -2095,3 +2096,89 @@ def mpu_two_access_precedence():
     out.append(_mpu(bB, [CODE_RX, (1, E, E + 0x1F, A_EN | A_R), (2, E + 0x20, E + 0x3F, A_EN | A_G)], True,
                     logs=[(G_ | X_ACC_LD, E + 0x20), (G_ | X_ACC_LD, E + 0x20)]))
     return out
+
+
+# ============================================ MMU stage 3: TLB (MMU_PLAN §11)
+from kasm import TLB_V, TLB_R, TLB_W, TLB_X
+X_TLB_LD, X_TLB_ST, X_TLB_FE = 11, 12, 13
+
+
+def _tlb_set(a, idx, vpn, pfn, xwr_v, g=0, asid=0):
+    """entry[idx] <- VA page vpn -> PA page pfn (xwr_v = TLB_LO[3:0])"""
+    a.setr(1, (vpn << 16) | (g << 8) | asid); a.mtsr('tlb_hi', 1)
+    a.setr(1, (pfn << 16) | xwr_v); a.mtsr('tlb_lo', 1)
+    a.setr(1, idx); a.mtsr('tlb_index', 1)
+    a.tlbwi()
+
+
+@test
+def tlb_sr_and_ops():
+    """TLB SRs after reset and their writable bits; TLBWI / TLBR round trip;
+    TLBP hit (index, P = 0), miss (P = 1, [4:0] unchanged), G- and
+    ASID-aware; a V = 0 entry never matches; TLBINV; STATUS[9]"""
+    a = Asm()
+    a.setr(12, DATA); a.setr(3, 0)
+    for sr in ('tlb_hi', 'tlb_lo', 'tlb_index', 'asid', 'tlbvec'):
+        a.mfsr(2, sr); a.alu('or', 3, 3, 2)
+    a.mfsr(4, 'status')
+    a.setr(1, 0xFFFFFFFF)
+    for i, sr in enumerate(('tlb_hi', 'tlb_lo', 'tlb_index', 'asid', 'tlbvec')):
+        a.mtsr(sr, 1); a.mfsr(2, sr); a.st(64, 2, 12, 8 * i)
+    a.setr(1, 0); a.mtsr('asid', 1)
+    _tlb_set(a, 5, 0x1234, 0x7FF, TLB_V | TLB_R | TLB_X, g=0, asid=0x42)
+    _tlb_set(a, 9, 0x00C0, 0x001, TLB_V | TLB_W, g=1, asid=0x17)
+    _tlb_set(a, 12, 0x0BAD, 0x002, 0, asid=0)                  # V = 0
+    a.setr(1, 5); a.mtsr('tlb_index', 1); a.setr(1, 0); a.mtsr('tlb_hi', 1); a.mtsr('tlb_lo', 1)
+    a.tlbr(); a.mfsr(5, 'tlb_hi'); a.mfsr(6, 'tlb_lo')
+    a.setr(1, 9); a.mtsr('tlb_index', 1); a.tlbr(); a.mfsr(7, 'tlb_hi'); a.mfsr(8, 'tlb_lo')
+    a.setr(1, 3); a.mtsr('tlb_index', 1)
+    a.setr(1, (0x1234 << 16) | 0x42); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(9, 'tlb_index')   # hit: 5
+    a.setr(1, (0x1234 << 16) | 0x43); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(10, 'tlb_index')  # ASID: miss
+    a.setr(1, (0x00C0 << 16) | 0x99); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(11, 'tlb_index')  # G: hit 9
+    a.setr(1, 0x0BAD << 16); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(13, 'tlb_index')           # V = 0: miss
+    a.tlbinv()
+    a.setr(1, 5); a.mtsr('tlb_index', 1); a.tlbr(); a.mfsr(14, 'tlb_lo')                      # V gone
+    a.setr(1, (0x1234 << 16) | 0x42); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(15, 'tlb_index')
+    a.halt()
+    exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r4': 0,
+           m(DATA): 0xFFFF01FF, m(DATA + 8): 0x07FF000F, m(DATA + 16): 0x8000001F,
+           m(DATA + 24): 0xFF, m(DATA + 32): 0xFFFFFFFC,
+           'r5': (0x1234 << 16) | 0x42, 'r6': (0x7FF << 16) | TLB_V | TLB_R | TLB_X,
+           'r7': (0x00C0 << 16) | 0x100 | 0x17, 'r8': (0x001 << 16) | TLB_V | TLB_W,
+           'r9': 5, 'r10': 0x80000005, 'r11': 9, 'r13': 0x80000009,
+           'r14': (0x7FF << 16) | TLB_R | TLB_X, 'r15': 0x80000005}
+    return a, exp, []
+
+
+@test
+def tlb_user_priv():
+    """the TLB instructions and SRs are privileged in user mode"""
+    a = Asm()
+    _xsetup(a)
+    _to_user(a, 'u')
+    a.label('u')
+    a.tlbwi(); a.tlbr(); a.tlbp(); a.tlbinv()
+    a.mfsr(1, 'tlb_hi'); a.mtsr('asid', 1); a.mfsr(1, 'tlbvec')
+    a.halt()
+    _uhandler(a)
+    exp = {'end': 'park', 'kind': '0', m(XD + 32): 8}
+    for i in range(8):
+        exp[m(XLOG + 8 * i)] = X_PRIV
+    return a, exp, []
+
+
+@test
+def tlb_reservation_clears():
+    """MTSR ASID (same value), MTSR STATUS and TLBWI / TLBINV clear the LR/SC
+    reservation; MTSR TP and TLBR / TLBP do not"""
+    a = Asm()
+    a.setr(12, DATA); a.setr(3, 0x77); a.setr(2, 0)
+    for k, op in enumerate([lambda: a.mtsr('asid', 2), lambda: a.mtsr('status', 2),
+                            lambda: a.tlbwi(), lambda: a.tlbinv(),
+                            lambda: a.mtsr('tp', 2), lambda: a.tlbr(), lambda: a.tlbp()]):
+        a.lr(64, 4, 12); op(); a.sc(64, 5, 3, 12); a.st(64, 5, 12, 8 + 8 * k)
+    a.halt()
+    exp = {'end': 'park', 'kind': '0'}
+    for k, want in enumerate([1, 1, 1, 1, 0, 0, 0]):
+        exp[m(DATA + 8 + 8 * k)] = want
+    return a, exp, []

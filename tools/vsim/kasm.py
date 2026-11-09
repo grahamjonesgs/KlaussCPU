@@ -30,6 +30,9 @@ SR = {'status': 0, 'evec': 1, 'ecause': 2, 'eaddr': 3, 'usp': 4, 'scratch0': 5,
 SR.update({f'mpu_base{n}': 0x10 + 2 * n for n in range(16)})
 SR.update({f'mpu_limit{n}': 0x11 + 2 * n for n in range(16)})
 MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G = 1, 2, 4, 8, 16     # MPU_BASEn [4:0]
+# MMU stage 3
+SR.update({'tlb_hi': 0x30, 'tlb_lo': 0x31, 'tlb_index': 0x32, 'asid': 0x33, 'tlbvec': 0x34})
+TLB_V, TLB_R, TLB_W, TLB_X = 1, 2, 4, 8                  # TLB_LO [3:0]
 
 
 def H(length, cls):
@@ -354,6 +357,11 @@ class Asm:
 
     def sc(self, size, rd, rs2, rs1):           # SC.D / SC.W rd(result), rs2(data), [rs1]
         return self.emit(H(1, 7) | SZ[size] << 24 | 1 << 12 | rd << 8 | rs1 << 4 | rs2)
+
+    def tlbwi(self):  return self.sys(9)
+    def tlbr(self):   return self.sys(10)
+    def tlbp(self):   return self.sys(11)
+    def tlbinv(self): return self.sys(12)
 
     def nop(self):  return self.sys(0)
     def halt(self): return self.sys(1)
