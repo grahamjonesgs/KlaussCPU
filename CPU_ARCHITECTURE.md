@@ -1,6 +1,9 @@
 # CPU Architecture Reference — for C Compiler / Assembly Writers
 
-> **Currency (2026-10).** This document describes the CPU as executed by
+> **Currency (2026-11, branch `mmu`).** §13.2 (exceptions, user mode,
+> SYSCALL, system registers) and §8.4 (LR/SC) describe MMU stage 1
+> ([MMU_PLAN.md](MMU_PLAN.md)), which is on the `mmu` branch only.
+> This document describes the CPU as executed by
 > `pipeline_core.sv` (5-stage in-order pipeline) with ISA encoding v2 + the
 > v3 additions. It is the *programmer's model*: semantics, flags, alignment,
 > interrupts, and the pipeline costs that matter for code generation. The
@@ -42,6 +45,9 @@ and the crash dump; it does not execute programs.
   `ADDSP` and implicitly by push/pop/call/return. Reset value
   `0x0800_0000` (top of DDR; the `SP_RESET` parameter — core 2 of the AMP
   build uses the top of its local BRAM).
+- **User mode (§13.2)** has its own SP: the CPU keeps two stack pointers
+  and SP is always the current mode's. Supervisor code reaches the user SP
+  as system register `USP`.
 - **ABI (software convention, defined by the LLVM backend):** R4–R7 and
   R15 are callee-saved; the rest are caller-saved. Hardware enforces none of
   this, except that the frame instructions name R15.
@@ -264,6 +270,33 @@ retire. Before that it silently used the aligned slot. Byte accesses,
 Sub-word stores replicate the data across lanes and use byte enables, and
 MMIO devices see the same `be` pattern.
 
+With an exception vector installed (§13.2), a misaligned access raises
+MISALIGNED_LOAD / MISALIGNED_STORE instead of parking.
+
+### 8.4 LR/SC (MMU stage 1)
+
+```
+LR.D   rd, [rs1]         ; rd = mem64[rs1]; reserve          (0x5B00_1000)
+LR.W   rd, [rs1]         ; rd = zext(mem32[rs1]); reserve    (0x5A00_1000)
+LR.W.S rd, [rs1]         ; rd = sext(mem32[rs1]); reserve    (0x5A80_1000)
+SC.D   rd, rs2, [rs1]    ; if reserved: mem64[rs1] = rs2, rd = 0; else rd = 1
+SC.W   rd, rs2, [rs1]    ; 32-bit form                       (0x5F00_1000 / 0x5E00_1000)
+```
+
+- SC's fields differ from every other store: **rd is the 0/1 result and
+  the data is rs2**.
+- The address must be naturally aligned (also for 64-bit), or the
+  instruction raises MISALIGNED_*. LR/SC to MMIO raises ACCESS_* in either
+  mode.
+- There is one reservation, on the doubleword `EA[31:3]`. LR sets it; every
+  SC, every interrupt or exception entry, IRET and program load clear it.
+  Ordinary stores do not. It is atomic against this core only (not DMA,
+  the blitter or core 2).
+- Typical use is a retry loop (`LR; modify; SC; FBR.NE rd, #0, retry`). An
+  interrupt between LR and SC makes the SC fail, so the loop must be shorter
+  than the interrupt interval.
+- Probe `CPU_FEATURES[3]` (`0xF00F_0048`) before use.
+
 ---
 
 ## 9. Flow Control
@@ -358,13 +391,16 @@ without a separate SEXTW.
 | HALT | stop: drains the pipe and parks the core (`park_kind` 0). Nothing after it is dispatched, so no padding is needed. |
 | WAIT | sleep until an unmasked, vectored interrupt is pending, then take it through the normal dispatch. `IRET` resumes at WAIT+4. It never sleeps if an interrupt is already pending, and wake is level-sensitive, so "enable interrupts; WAIT" has no lost-wakeup race. Use it for idle loops (`arch_cpu_idle`). |
 | RESET | jump to `0x0004`. A PC redirect only: registers, flags, SP and the mask are **not** reset. `0x0004` is inside the heap header (§3.1), so RESET is only useful if that word holds a valid instruction. |
-| TRAP | software trap: parks the core (`park_kind` 1); the SoC produces the crash dump (CRASH_DUMP.md) |
+| TRAP | software trap: parks the core (`park_kind` 1); the SoC produces the crash dump (CRASH_DUMP.md). With an exception vector installed it raises TRAP instead (§13.2) |
+| SYSCALL | raise SYSCALL (§13.2); the frame PC is the next instruction. With no vector installed it parks as illegal |
+| MFSR rd, sr / MTSR sr, rs1 | read / write a system register (§13.2). MTSR serializes. Most SRs are supervisor-only |
 | DELAYR rs1 / DELAYV imm32 | spin for **N × 8192 core cycles** (≈ 81.9 µs per unit at 100 MHz) |
 | COPY, BSWAP, GETF | see §7 / §6.2 |
 
 **Illegal instructions** (anything not in the encoding map, including
 non-zero reserved fields) do not execute. The core parks with
 `park_kind` 2 at that instruction, and no trace line is emitted for it.
+With an exception vector installed (§13.2), they raise ILLEGAL instead.
 
 With a debugger attached, HALT, TRAP and illegal instructions become
 debug halts instead (§15).
@@ -414,7 +450,8 @@ Single-stepping under the debugger never takes interrupts.
 **Saved frame** (pushed on entry, popped by `IRET`):
 
 ```
-[63:44] = 0            (reserved)
+[63:45] = 0            (reserved)
+[44]    = PM           previous mode, 1 = user (restored by IRET; §13.2)
 [43]    = DI disable   (restored by IRET; 1 = disabled, so a frame built
                         by software with 0 here resumes enabled)
 [42:39] = INT_MASK     (restored by IRET)
@@ -458,6 +495,58 @@ timer_handler:
 
 Level-triggered sources (blitter, Ethernet) must be acknowledged at the
 device before `IRET`, or they are dispatched again immediately.
+
+### 13.2 Exceptions, user mode and system registers (MMU stage 1)
+
+The full specification is MMU_PLAN.md §3–§6. In summary:
+
+- **Compatibility.** Reset and program load start in **supervisor mode**
+  with the exception vector `EVEC = 0`. In that state every fault parks
+  exactly as described above, so code that never sets `EVEC` sees no
+  change. Probe `CPU_FEATURES` (`0xF00F_0048`, reads 0 on older bitstreams):
+  bit 0 = this section, bit 3 = LR/SC.
+- **Exceptions are precise.** The faulting instruction commits nothing:
+  no register, flag, SP, R15 or PC change, and no memory or device access.
+  That includes PUSH/POP/CALL/RET/ENTER/LEAVE/LEAVERET. The core then takes
+  the entry sequence below. The frame PC is the faulting instruction (IRET
+  re-executes it), except for SYSCALL, where it is the next instruction.
+- **Causes (`ECAUSE`)**: 1 ILLEGAL, 2 PRIVILEGED, 3 TRAP, 4 SYSCALL,
+  5/6 MISALIGNED_LOAD/STORE, 7/8 ACCESS_LOAD/STORE, 9 ACCESS_FETCH,
+  10 MISALIGNED_FETCH. `EADDR` holds the instruction word for 1–3, 0 for
+  SYSCALL, and the address otherwise. The raw computed EA is used; when an
+  op's second doubleword faults, that doubleword's start is used.
+- **Entry** (exceptions and interrupts, pipe drained): from user mode, the
+  stack pointers swap (SP = kernel SP) and UM = 0. Then one frame is pushed
+  (§13.1, with PM = the old mode). An exception also writes `ECAUSE`/`EADDR`,
+  sets **DI**, and jumps to `EVEC`. An interrupt clears its `INT_MASK` bit
+  and jumps to `INT_VECn`, as before. Both clear the LR/SC reservation.
+  **IRET** restores UM from frame bit 44, and when returning to user mode
+  swaps back to the user SP.
+- **User mode** (UM = 1, entered only by an IRET of a frame with PM = 1):
+  DI, EI, IRET, HALT, WAIT, RESET, DELAY, the LCD ops, MFSR other than
+  `STATUS`/`TP`/`CYCLE` and MTSR other than `TP` raise PRIVILEGED. Any data
+  access to `0xF000_0000`+ raises ACCESS_*. Fetching there raises
+  ACCESS_FETCH, and the fetch never reaches the device. A PC with
+  `[1:0] != 0` raises MISALIGNED_FETCH. DDR is unprotected in stage 1.
+- **With the JTAG debugger attached**, ILLEGAL, TRAP and MISALIGNED_LOAD/STORE
+  still debug-halt (unless DMCONTROL[5] EXC_PASS); the other causes go to
+  `EVEC`.
+
+| SR | Name | Notes |
+|---|---|---|
+| 0 | `STATUS` | `[0]` UM, `[1]` DI; readable in user mode; no writable bits in stage 1 |
+| 1 | `EVEC` | exception vector (`[1:0]` read 0); 0 = exceptions park |
+| 2 | `ECAUSE` | `[7:0]` |
+| 3 | `EADDR` | `[31:0]` |
+| 4 | `USP` | the user SP (while in supervisor mode) |
+| 5, 6 | `SCRATCH0/1` | 64-bit, for the kernel |
+| 7 | `TP` | 64-bit thread pointer; read/write in user mode |
+| 8 | `CYCLE` | 64-bit core-cycle counter, read-only, readable in user mode; not ordered against older instructions |
+
+Encodings: `SYSCALL` `0x6C08_0000`; `MFSR rd, sr` `0x6C40_0000 | sr<<12 |
+rd<<8`; `MTSR sr, rs1` `0x6C60_0000 | sr<<12 | rs1<<4` (ISA_ENCODING_V2_MAP.md
+§9). An unimplemented SR number, or MTSR to `CYCLE`, is ILLEGAL in either
+mode.
 
 ---
 
@@ -557,6 +646,10 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
   is attached.
 - A halt request stops a WAIT in place. A single step completes the WAIT as
   if it had been woken.
+- MMU stage 1: register indices 20 (`SP_ALT`, the inactive stack pointer)
+  and 21 (`{DI, UM}` in `[1:0]`), and DMCONTROL[5] EXC_PASS (with it set, an
+  attached debugger lets ILLEGAL/TRAP/MISALIGNED go to `EVEC`). DMSTATUS
+  version 2 reports both.
 - Resume refetches through the start path, so code patched while halted
   takes effect.
 
@@ -574,6 +667,11 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
   ENTER/LEAVE/LEAVERET, LDIDX32_S, 32-bit compares and W ALU ops
   (ISA_V3_IMPL.md).
 - **Multicycle FSM → 5-stage pipeline** (PIPELINE_IMPL.md).
+- **MMU stage 1 (2026-11, branch `mmu`):** precise exceptions with
+  `EVEC`/`ECAUSE`/`EADDR`, user and supervisor modes with a kernel stack
+  switch (frame bit 44), SYSCALL, MFSR/MTSR with the TP and CYCLE registers,
+  LR/SC, and `CPU_FEATURES`. Off on core 2. Compatible: with `EVEC = 0`,
+  random-program retire traces are identical to master's (MMU_PLAN.md).
 - **Little-endian conversion fixes (April 2026, FSM era):** SETR64/PUSHV64
   high-word selection, LDIDX/STIDX 8/16/32 lane and byte-enable inversions,
   and null-terminated TXSTRMEM. The `.vh` task files they referred to are
