@@ -1113,7 +1113,13 @@ module pipeline_core
    wire        w_fxc = EN_EXC && umode && (pc[1:0] != 2'b00);
    wire        w_fx  = EN_EXC && umode && ((pc[1:0] != 2'b00) || pc[31:28] == 4'hF ||
                                            w_last_pc[31:28] == 4'hF);
-   assign w_decf = f_decode(w_op, umode, w_fx, w_fxc);
+   assign w_decf = f_decode(w_op, 1'b0, 1'b0, 1'b0);
+   // (timing: the latch-time predecode — id_ser, the branch / return
+   // predictor bits — reads the decode WITHOUT the MMU overrides; a fetch
+   // fault gates the predictor bits at their uses (id_fx), and the
+   // overrides' serialize is ORed in as a parallel term, w_xser.  A
+   // privileged op is never a branch or return.)
+   wire w_xser = EN_EXC && (w_fx || (umode && f_priv(w_dec, w_op)));
    logic id_ser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
@@ -1237,7 +1243,8 @@ module pipeline_core
    logic               ev_icinst;        // blocking event: an I-cache line install
    logic [8:0]         ev_icinst_idx;
    wire  [5:0]         bt_lidx_pc = pc[7:2] ^ pc[13:8];   // looked up at the IF->ID latch
-   wire                id_bp_tk  = EN_BP && (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
+   wire                id_bp_tk  = EN_BP && !(EN_EXC && id_fx) &&
+                                   (id_bp_unc || ((id_bp_cnd || id_bp_fbr) &&
                                    (BP_STRONG ? (id_bp_ctr == 2'b11) : id_bp_ctr[1])));
    // 2a early redirect (see id_rpend)
    wire                id_early_rd  = EN_BP && id_valid && id_rpend && id_bp_tk && !fetch_halt &&
@@ -1885,6 +1892,9 @@ module pipeline_core
    logic [31:0] st_spec_nx;
    logic [28:0] if_req_dw;
    logic        if_rebase;
+   // MMU stage 1: the fill in flight is a fake one (user fetch from 0xF...)
+   logic        if_fake;
+   wire         w_ufz = EN_EXC && umode && miss_dw[28:25] == 4'hF;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
 
@@ -2314,7 +2324,7 @@ module pipeline_core
          dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
-         mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00;
+         mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
@@ -2843,7 +2853,19 @@ module pipeline_core
          // completion, capture into the IFB AND install the line. The IFB capture
          // is byte-identical between the hit and miss paths (ifr_* mirrors m_*).
          if (if_xc) begin
-            if (w_mrdy) begin
+            if (EN_EXC && if_fake) begin
+               // MMU stage 1 fake fill (see the miss issue): zeros, no install
+               if (if_rebase) begin
+                  ev_fill   = 1'b1;
+                  ifb_base  <= if_req_dw;
+                  ifb_dw[0] <= 64'b0;  ifb_val[0] <= 1'b1;
+                  ifb_val[1] <= 1'b0;
+               end else begin
+                  ifb_dw[1] <= 64'b0;  ifb_val[1] <= 1'b1;
+               end
+               if_xc   <= 1'b0;
+               if_fake <= 1'b0;
+            end else if (w_mrdy) begin
                if (if_rebase) begin
                   ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
@@ -2899,18 +2921,6 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
-               end else if (EN_EXC && umode && miss_dw[28:25] == 4'hF) begin
-                  // MMU stage 1: user mode never fetches from MMIO, not even
-                  // speculatively.  Serve zeros instead (no port, no I-cache
-                  // install); the ID fetch check turns the op ACCESS_FETCH.
-                  if (!in0) begin
-                     ifb_base  <= miss_dw;  ev_rebase = 1'b1;
-                     ifb_dw[0] <= 64'b0;    ifb_val[0] <= 1'b1;
-                     ifb_dw[1] <= 64'b0;    ifb_val[1] <= 1'b0;
-                  end else begin
-                     ifb_dw[1] <= 64'b0;    ifb_val[1] <= 1'b1;
-                  end
-                  if_look <= 1'b0;
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
@@ -2924,7 +2934,13 @@ module pipeline_core
                   // the IRET returns to). irq_xc ⊆ irq_active, so this covers the
                   // whole entry window; if_look simply holds and re-evaluates.
                   m_addr    <= {miss_dw, 3'b000};   // miss: issue the shared-port fill
-                  m_read_DV <= 1'b1;
+                  // MMU stage 1: in user mode a 0xF... dword is a FAKE fill —
+                  // no DV on the port; it completes next cycle with zeros and
+                  // no I-cache install, and the ID fetch check makes the op
+                  // ACCESS_FETCH.  (Steers only these D inputs: off the
+                  // ic_hit serve chain.)
+                  m_read_DV <= !w_ufz;
+                  if_fake   <= w_ufz;
                   rdy_armed <= !m_ready;
                   if_req_dw <= miss_dw;             // old base+data captured together
                   r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
@@ -3319,7 +3335,7 @@ module pipeline_core
                      id_bp       <= 1'b0;
                      dbg_active  <= 1'b1;
                      dbg_cause_q <= DBG_CAUSE_BP;
-                  end else if (EN_RAS && id_valid && !fetch_halt && id_ras_ret &&
+                  end else if (EN_RAS && id_valid && !fetch_halt && id_ras_ret && !(EN_EXC && id_fx) &&
                                ras_cnt != '0) begin
                      // 2a: predicted return — fetch continues at the RAS top
                      // (no serialize); verified when the RET completes MEM
@@ -3387,7 +3403,7 @@ module pipeline_core
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
-                     id_ser    <= w_decf.serialize;
+                     id_ser    <= w_decf.serialize || w_xser;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
                      id_rpend   <= 1'b1;
