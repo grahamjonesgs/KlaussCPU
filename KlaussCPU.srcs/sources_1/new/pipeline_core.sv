@@ -2310,9 +2310,15 @@ module pipeline_core
    // The op being LATCHED into ID on this edge (from the IFB slot the store
    // invalidates on this same edge) is a stale copy too: smc_hit_id only
    // sees the op already in ID.  Its dword span, as id_last_dw computes it.
-   wire [28:0] w_last_dw  = (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
-                          : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
-   wire        smc_hit_lat = smc_st && (pc_dw == smc_dw || w_last_dw == smc_dw);
+   // Its last dword is pc_dw + w_span (an instruction spills into at most
+   // the next dword), so the test needs no adder on pc's side (timing:
+   // pc -> pc+4/+8 -> compare -> pc CE was a wall): pc_dw is compared with
+   // the store's dword and the dword before it, the latter from the
+   // registered EA in parallel.  Exactly the old pc_dw / w_last_dw test.
+   wire [28:0] smc_dwm1   = smc_dw - 29'd1;
+   // (LEN = 00, an illegal op, spans nothing: the old test used pc_dw)
+   wire        smc_hit_lat = smc_st && (pc_dw == smc_dw ||
+                                        (w_span && w_op[31:30] != 2'b00 && pc_dw == smc_dwm1));
    // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
    wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr && !wb_wait;   // as it leaves MEM
    wire pht_we_ex    = EN_BP && ex_valid && ex_bp_cnd && !ex_busy && !mem_busy &&
@@ -4253,6 +4259,12 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && wb_valid && wb_fmask.zero && wb_zval)
       assert (wb_zero == (wb_value == 64'b0))
          else $fatal(1, "wb_zero stale: pc=%h value=%h", wb_pc, wb_value);
+   // smc_hit_lat's adder-free form equals the pc_dw / last-dword test
+   wire [28:0] a_last_dw = (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
+                         : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
+   always_ff @(posedge clk) if (!rst && running)
+      assert (smc_hit_lat == (smc_st && (pc_dw == smc_dw || a_last_dw == smc_dw)))
+         else $fatal(1, "smc_hit_lat form: pc=%h op=%h smc_dw=%h", pc, w_op, smc_dw);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst)
       assert (ex_mok == (ex_mph && !(ex_xpg_q && !ex_mph2)))
