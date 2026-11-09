@@ -527,6 +527,126 @@ def cmd_mpudiff(a):
     return 1 if fails else 0
 
 
+def _tlb_variant(seed, p_sys=0.04, irq=False):
+    """MMU stage 3: randprog `seed` in user mode with TE = 1, its code run
+    through a non-identity VA (page CVP -> frame 0), starting from an empty
+    TLB.  A kseg refill handler at TLBVEC maps CVP -> 0 and every other
+    page to itself, round-robin over K entries (K = 2 thrashes; K = 1
+    would livelock, as any load needs its code page and its data page).  Injected
+    SYSCALLs bump ASID (the non-global entries stop matching) and TLBINV on
+    its wrap.  With IRQs, the TB's handler at 0x0010_0000 runs translated
+    in supervisor mode and is refilled the same way.  Every instruction
+    runs once with its full effect, so the final state must equal the
+    plain physical run's."""
+    import random, randprog
+    from kasm import Asm
+    from tests import _tlb_set, HALT_W, KSP, USP, TLB_RWX
+    rnd = random.Random(seed * 7919 + 3)
+    # (with IRQs every ~150-200 cycles, K = 2 starves: the handler's two
+    # pages evict the interrupted instruction's two before it can retire)
+    K = rnd.choice([4, 32] if irq else [2, 4, 32])
+    CVP = rnd.choice([0x0040, 0x0123, 0x0400, 0x07F0])
+    CNT = 0x80200000                                       # kseg: the round-robin index
+
+    class TlbAsm(Asm):
+        def __init__(self, *aa, **kk):
+            super().__init__(*aa, **kk)
+            self.inj = False
+            self.n_inj = 0
+            self.leapc(1, 'h'); self.setr(2, 0x80000000); self.alu('or', 1, 1, 2)
+            self.mtsr('evec', 1); self.mtsr('tlbvec', 1)
+            self.setr(1, KSP); self.setsp(1)
+            _tlb_set(self, 0, 0x0000, 0x000, TLB_RWX, g=1)
+            self.setr(1, 0x200); self.mtsr('status', 1)  # TE (through the identity entry)
+            self.leapc(1, 'kz'); self.setr(2, 0x80000000); self.alu('or', 1, 1, 2); self.jmpr(1)
+            self.label('kz')                                # now in kseg
+            self.tlbinv()
+            self.setr(1, USP); self.mtsr('usp', 1)
+            self.leapc(2, 'u'); self.alui('and', 2, 2, 0xFFFF, sgn=False)
+            self.setr(3, CVP << 16); self.alu('or', 2, 2, 3)
+            self.setr64(3, (1 << 44) | ((1 if irq else 0) << 39)); self.alu('or', 2, 2, 3)
+            self.push(2); self.iret()
+            self.label('u')
+            self.inj = True
+
+        def emit(self, *ws):
+            if self.inj and rnd.random() < p_sys:
+                self.n_inj += 1
+                super().emit(0x6C080000)                  # SYSCALL
+            return super().emit(*ws)
+
+    old = randprog.Asm
+    randprog.Asm = TlbAsm
+    try:
+        asm = randprog.gen(seed, irq=irq)
+    finally:
+        randprog.Asm = old
+    asm.inj = False
+    asm.label('h')                                      # runs at its kseg alias
+    asm.mtsr('scratch0', 13); asm.mtsr('scratch1', 14)
+    asm.mfsr(13, 'eaddr'); asm.setr(14, HALT_W)
+    asm.fbr('ne', 13, 14, 'h_nh'); asm.halt()
+    asm.label('h_nh')
+    asm.mfsr(13, 'ecause'); asm.alui('and', 13, 13, 0xFF, sgn=False)
+    asm.fbr('eq', 13, 4, 'h_sys', imm=True)
+    asm.addi_s(14, 13, -11); asm.fbr('ule', 14, 2, 'h_miss', imm=True)
+    # ACCESS_* on MMIO (randprog's INT_MASK store, with IRQs): step over;
+    # anything else is a bug: stop here (the state then differs)
+    asm.mfsr(13, 'eaddr'); asm.shift_n('shr', 13, 13, 28); asm.setr(14, 15)
+    asm.fbr('ne', 13, 14, 'h_bad')
+    asm.getsp(13); asm.ld(64, 14, 13); asm.addi_s(14, 14, 4); asm.st(64, 14, 13)
+    asm.jmp('h_ret')
+    asm.label('h_bad')
+    asm.halt()
+    asm.label('h_miss')                                 # TLB_HI = {VPN, G 0, ASID}
+    asm.mfsr(13, 'tlb_hi'); asm.shift_n('shr', 13, 13, 16)
+    asm.setr(14, CVP); asm.fbr('ne', 13, 14, 'h_id')
+    asm.setr(13, 0)
+    asm.label('h_id')
+    asm.shift_n('shl', 13, 13, 16); asm.alui('or', 13, 13, TLB_RWX, sgn=False)
+    asm.mtsr('tlb_lo', 13)
+    asm.setr(13, CNT); asm.ld(64, 14, 13); asm.inc(14)
+    asm.alui('and', 14, 14, K - 1, sgn=False); asm.st(64, 14, 13)
+    asm.mtsr('tlb_index', 14); asm.tlbwi()
+    asm.jmp('h_ret')
+    asm.label('h_sys')                                  # ASID + 1 (mod 4); TLBINV on the wrap
+    asm.mfsr(13, 'asid'); asm.inc(13); asm.alui('and', 13, 13, 3, sgn=False)
+    asm.mtsr('asid', 13)
+    asm.fbr('ne', 13, 0, 'h_ret', imm=True)
+    asm.tlbinv()
+    asm.label('h_ret')
+    asm.mfsr(13, 'scratch0'); asm.mfsr(14, 'scratch1')
+    asm.iret()
+    return asm, (K, CVP, asm.n_inj)
+
+
+def cmd_tlbdiff(a):
+    import randprog
+    exe = build(None)
+    fails = n_exc = 0
+    for s in range(a.seed0, a.seed0 + a.seeds):
+        for lat in a.lats:
+            plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
+            sa, _ = run(exe, randprog.gen(s, irq=a.irq), f'ta{s}_{lat}', plus)
+            asm, info = _tlb_variant(s, irq=a.irq)
+            sb, _ = run(exe, asm, f'tb{s}_{lat}', plus)
+            n_exc += int(sb.get('exc_n', 0))
+            keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
+                   sorted({k for k in list(sa) + list(sb) if re.fullmatch(r'm[0-9a-f]{8}', k) and k != 'm00180000'})
+            bad = [k for k in keys if sa.get(k) != sb.get(k)]
+            ok = sa.get('end') == 'park' and sb.get('end') == 'park' and sb.get('kind') == '0' and not bad
+            if 'fatal' in (sa['log'] + sb['log']).lower():
+                ok = False
+            if not ok:
+                fails += 1
+            if not ok or a.verbose:
+                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} K,CVP,sys={info} exc={sb.get("exc_n")} '
+                      f'cycles {sa.get("cycles")}/{sb.get("cycles")} end {sa.get("end")}/{sb.get("end")} '
+                      f'kind {sb.get("kind")} {bad[:4]}')
+    print(f'{fails} differing; {n_exc} exception entries')
+    return 1 if fails else 0
+
+
 def cmd_socmmio(a):
     """full SoC, base rev vs working tree: MMIO / DRAM interleavings must
     give identical retire traces (the bus_splitter response paths)"""
@@ -597,6 +717,10 @@ def main():
     mp.add_argument('--seed0', type=int, default=1); mp.add_argument('--lats', type=int, nargs='+', default=[3])
     mp.add_argument('--irq', action='store_true'); mp.add_argument('-v', '--verbose', action='store_true')
     mp.add_argument('--plus', nargs='*', default=[])
+    tl = sub.add_parser('tlbdiff'); tl.add_argument('--seeds', type=int, default=20)
+    tl.add_argument('--seed0', type=int, default=1); tl.add_argument('--lats', type=int, nargs='+', default=[3])
+    tl.add_argument('--irq', action='store_true'); tl.add_argument('-v', '--verbose', action='store_true')
+    tl.add_argument('--plus', nargs='*', default=[])
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -622,6 +746,8 @@ def main():
         sys.exit(cmd_dmtest(a))
     elif a.cmd == 'mpudiff':
         sys.exit(cmd_mpudiff(a))
+    elif a.cmd == 'tlbdiff':
+        sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':
         sys.exit(cmd_socmmio(a))
     else:
