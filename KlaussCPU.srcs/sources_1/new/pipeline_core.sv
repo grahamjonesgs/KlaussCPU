@@ -1614,8 +1614,12 @@ module pipeline_core
       xlt_q <= (EN_MPU && mpu_en) || (EN_TLB && te);
       te_q  <= EN_TLB && te;
    end
+   // (ex_xpg_q: ex_xpg && TE, registered while !ex_mph like ex_ea_q, so
+   // ex_busy takes no ex_a-derived logic)
+   logic ex_xpg_q = 1'b0;
+   always_ff @(posedge clk) if (ce && !ex_mph) ex_xpg_q <= te_q && ex_xpg;
    wire ex_mpu_hold = xlt_q && ex_valid && ex_d.is_mem &&
-                      (!ex_mph || (te_q && ex_xpg && !ex_mph2));
+                      (!ex_mph || (ex_xpg_q && !ex_mph2));
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
@@ -2013,7 +2017,7 @@ module pipeline_core
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
    logic [15:0] t1_pahi;
    wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
-   wire ex_x3    = EN_TLB && te && ex_xpg;                      // leaving in its 3rd cycle
+   wire ex_x3    = EN_TLB && ex_xpg_q;                          // leaving in its 3rd cycle
    wire d1_dn    = ex_x3 ? t1_dn   : t_dn;
    wire d1_seg   = ex_x3 ? t1_seg  : t_seg;
    wire d1_miss  = ex_x3 ? t1_miss : t_miss;
@@ -2840,7 +2844,7 @@ module pipeline_core
          // captured in the op's first EX cycle; for a page-crossing two-
          // access op, the next page in its 3rd)
          if (!ex_mph)                                  ex_ea_q <= exo_eaddr;
-         else if (ex_mpu_hold && EN_TLB && te && ex_xpg) ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
+         else if (ex_mpu_hold && EN_TLB && ex_xpg_q) ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
          // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
@@ -4567,12 +4571,19 @@ module mmu_tlb (
    assign d_hit = |dm;
    assign f_hit = |fm;
 
-   always_ff @(posedge clk) if (ce && op_wi) e_copy[idx] <= {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};
+   // (timing) TLBWI / TLBINV write the entries the cycle AFTER they commit:
+   // the commit waits on the bus, and its enable fanned out to every
+   // entry's CE.  Safe: both serialize and discard, so the next lookup
+   // that can see the entries (a refill or the next instruction's access)
+   // is at least two cycles after the commit, and TLB_HI / TLB_LO /
+   // TLB_INDEX cannot change in between (MTSR serializes behind them).
+   logic wi_q, inv_q;
+   always_ff @(posedge clk) if (ce && wi_q) e_copy[idx] <= {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};
    wire [38:0] rd = e_copy[idx];
 
    always_ff @(posedge clk) begin
       if (rst || (ce && clr)) begin
-         te <= 1'b0;  asid <= '0;  vec <= '0;  e_v <= '0;
+         te <= 1'b0;  asid <= '0;  vec <= '0;  e_v <= '0;  wi_q <= 1'b0;  inv_q <= 1'b0;
          if (rst) begin
             hi_v <= '0; hi_g <= 1'b0; hi_a <= '0; lo_pfn <= '0; lo_xwr <= '0; lo_v <= 1'b0;
             idx <= '0; idx_p <= 1'b0;
@@ -4588,7 +4599,9 @@ module mmu_tlb (
          endcase
          if (te_we) te <= te_wd;
          if (hi_load) begin hi_v <= hi_vpn; hi_g <= 1'b0; hi_a <= asid; end
-         if (op_wi) begin
+         wi_q  <= op_wi;
+         inv_q <= op_inv;
+         if (wi_q) begin
             e_v[idx] <= lo_v;  e_vpn[idx] <= hi_v;  e_g[idx] <= hi_g;  e_asid[idx] <= hi_a;
             e_pfn[idx] <= lo_pfn;  e_xwr[idx] <= lo_xwr;
          end
@@ -4600,7 +4613,7 @@ module mmu_tlb (
             if (f_hit) begin idx <= f_enc(fm); idx_p <= 1'b0; end
             else       idx_p <= 1'b1;                    // [4:0] unchanged on a miss
          end
-         if (op_inv) e_v <= '0;
+         if (inv_q) e_v <= '0;
       end
    end
    always_comb begin
