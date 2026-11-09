@@ -48,7 +48,10 @@ module pipeline_core
    parameter bit MPU_EN = 1'b1,
    // MMU_PLAN.md stage 3: the 32-entry software-refilled TLB, TE (needs
    // EXC_EN).  0 = its SRs and instructions are illegal (core 2: off).
-   parameter bit TLB_EN = 1'b1
+   parameter bit TLB_EN = 1'b1,
+   // its entry count (a power of two, 2-32): 16 on the xc7a100t (MMU_PLAN.md
+   // §11.5, area); TLB_INDEX uses the low $clog2(TLB_N) bits
+   parameter int TLB_N = 16
 )
 (
    input  logic         clk,
@@ -4191,7 +4194,7 @@ module pipeline_core
    assign tlb_pload   = EN_TLB && mem_valid && mem_d.tlbi && mem_op[21:16] == 6'd11;
    generate if (EN_TLB) begin : g_tlb
       (* keep_hierarchy = "yes" *)
-      mmu_tlb tlb_i (
+      mmu_tlb #(.N(TLB_N)) tlb_i (
          .clk, .rst, .ce,
          .clr      (start),
          .sr_we    (mtsr_commit && wb_op[19:16] == 4'h3),
@@ -4504,7 +4507,9 @@ endmodule
 // ASID equals the lookup's.  TLBR reads a LUTRAM copy of the entry fields
 // (V from the flops); the CAMs read the flops.
 //===========================================================================
-module mmu_tlb (
+module mmu_tlb #(
+   parameter int N = 16              // entries (a power of two, 2-32)
+) (
    input  logic        clk,
    input  logic        rst,
    input  logic        ce,
@@ -4534,7 +4539,7 @@ module mmu_tlb (
    output logic [10:0] f_pfn,
    output logic [2:0]  f_xwr
 );
-   localparam int N = 32;
+   localparam int IW = $clog2(N);    // TLB_INDEX bits; the rest of [4:0] ignored, read 0
    logic [N-1:0]  e_v, e_g;
    logic [15:0]   e_vpn  [0:N-1];
    logic [7:0]    e_asid [0:N-1];
@@ -4544,7 +4549,7 @@ module mmu_tlb (
    (* ram_style = "distributed" *) logic [38:0] e_copy [0:N-1];
    logic [15:0] hi_v;  logic hi_g;  logic [7:0] hi_a;      // TLB_HI
    logic [10:0] lo_pfn; logic [2:0] lo_xwr; logic lo_v;   // TLB_LO
-   logic [4:0]  idx;  logic idx_p;                         // TLB_INDEX
+   logic [IW-1:0] idx;  logic idx_p;                       // TLB_INDEX
    logic [29:0] vec;
 
    function automatic logic [N-1:0] f_match(logic [15:0] vpn, logic [7:0] a);
@@ -4552,10 +4557,10 @@ module mmu_tlb (
       for (int n = 0; n < N; n++) m[n] = e_v[n] && e_vpn[n] == vpn && (e_g[n] || e_asid[n] == a);
       return m;
    endfunction
-   function automatic logic [4:0] f_enc(logic [N-1:0] m);
-      logic [4:0] r;
+   function automatic logic [IW-1:0] f_enc(logic [N-1:0] m);
+      logic [IW-1:0] r;
       r = '0;
-      for (int n = 0; n < N; n++) r = r | (m[n] ? 5'(n) : 5'd0);
+      for (int n = 0; n < N; n++) r = r | (m[n] ? IW'(n) : IW'(0));
       return r;
    endfunction
    wire [N-1:0] dm = f_match(d_vpn, asid);
@@ -4594,7 +4599,7 @@ module mmu_tlb (
          if (sr_we) case (sr_widx)
             3'd0: begin hi_v <= sr_wdata[31:16]; hi_g <= sr_wdata[8]; hi_a <= sr_wdata[7:0]; end
             3'd1: begin lo_pfn <= sr_wdata[26:16]; lo_xwr <= sr_wdata[3:1]; lo_v <= sr_wdata[0]; end
-            3'd2: begin idx <= sr_wdata[4:0]; idx_p <= sr_wdata[31]; end
+            3'd2: begin idx <= sr_wdata[IW-1:0]; idx_p <= sr_wdata[31]; end
             3'd3: asid <= sr_wdata[7:0];
             3'd4: vec <= sr_wdata[31:2];
             default: ;
@@ -4622,7 +4627,7 @@ module mmu_tlb (
       case (sr_ridx)
          3'd0:    sr_rdata = {hi_v, 7'b0, hi_g, hi_a};
          3'd1:    sr_rdata = {5'b0, lo_pfn, 12'b0, lo_xwr, lo_v};
-         3'd2:    sr_rdata = {idx_p, 26'b0, idx};
+         3'd2:    sr_rdata = {idx_p, 31'(idx)};
          3'd3:    sr_rdata = {24'b0, asid};
          3'd4:    sr_rdata = {vec, 2'b00};
          default: sr_rdata = 32'b0;

@@ -2142,7 +2142,7 @@ def tlb_sr_and_ops():
     a.setr(1, (0x1234 << 16) | 0x42); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(15, 'tlb_index')
     a.halt()
     exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r4': 0,
-           m(DATA): 0xFFFF01FF, m(DATA + 8): 0x07FF000F, m(DATA + 16): 0x8000001F,
+           m(DATA): 0xFFFF01FF, m(DATA + 8): 0x07FF000F, m(DATA + 16): 0x8000000F,          # (16 entries: [4] ignored, reads 0)
            m(DATA + 24): 0xFF, m(DATA + 32): 0xFFFFFFFC,
            'r5': (0x1234 << 16) | 0x42, 'r6': (0x7FF << 16) | TLB_V | TLB_R | TLB_X,
            'r7': (0x00C0 << 16) | 0x100 | 0x17, 'r8': (0x001 << 16) | TLB_V | TLB_W,
@@ -2658,3 +2658,22 @@ def tlb_stlf_alias():
         a.dword(0x20018, 0x7777); a.dword(0x20020, 0x8888)
         out.append((a, e, p))
     return out
+
+
+@test
+def tlb_index_width():
+    """16 entries: TLB_INDEX [3:0]; [4] (and [30:5]) ignored on write, read
+    0.  A TLBWI with index 0x13 writes entry 3, which TLBR at 3 reads and
+    TLBP finds as index 3"""
+    a = Asm()
+    a.setr(1, 0x13); a.mtsr('tlb_index', 1); a.mfsr(4, 'tlb_index')
+    a.setr(1, (0x0777 << 16) | 0x12); a.mtsr('tlb_hi', 1)
+    a.setr(1, (0x005 << 16) | TLB_V | TLB_R); a.mtsr('tlb_lo', 1)
+    a.tlbwi()
+    a.setr(1, 0); a.mtsr('tlb_hi', 1); a.mtsr('tlb_lo', 1)
+    a.setr(1, 3); a.mtsr('tlb_index', 1); a.tlbr(); a.mfsr(5, 'tlb_hi'); a.mfsr(6, 'tlb_lo')
+    a.setr(1, 0); a.mtsr('tlb_index', 1)
+    a.setr(1, (0x0777 << 16) | 0x12); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(7, 'tlb_index')
+    a.halt()
+    return a, {'end': 'park', 'kind': '0', 'r4': 3, 'r5': (0x0777 << 16) | 0x12,
+               'r6': (0x005 << 16) | TLB_V | TLB_R, 'r7': 3}, []

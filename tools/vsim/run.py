@@ -544,7 +544,7 @@ def _tlb_variant(seed, p_sys=0.04, irq=False):
     rnd = random.Random(seed * 7919 + 3)
     # (with IRQs every ~150-200 cycles, K = 2 starves: the handler's two
     # pages evict the interrupted instruction's two before it can retire)
-    K = rnd.choice([4, 32] if irq else [2, 4, 32])
+    K = rnd.choice([4, 16] if irq else [2, 4, 16])
     CVP = rnd.choice([0x0040, 0x0123, 0x0400, 0x07F0])
     CNT = 0x80200000                                       # kseg: the round-robin index
 
@@ -664,13 +664,13 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x20FF = stage 1 +
-    # LR/SC + the 16-region MPU + the 32-entry TLB
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x10FF = stage 1 +
+    # LR/SC + the 16-region MPU + the 16-entry TLB
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=00000000000020ff' not in last:
+    if 'r2=00000000000010ff' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
