@@ -7,8 +7,20 @@
 #         AggressiveExplore, stopping as soon as setup AND hold are met.
 # The bitstream is written only when timing is met (unless -force_bit).
 #
-# INCREMENTAL PLACEMENT IS CONDEMNED on this design / Vivado 2025.2 (placer
-# errors, silently poisoned QoR, a 9-hour wedge) — this script turns it off.
+# INCREMENTAL PLACEMENT was CONDEMNED on this design / Vivado 2025.2 (placer
+# errors, silently poisoned QoR, a 9-hour wedge): it is OFF by default.
+# -incr <routed.dcp> opts in for a quick turnaround on a small RTL change
+# (2026-11-09, Graham: fast builds), with a wall-clock cap; its bitstream is
+# for testing, and a release still comes from a full (non-incremental) run.
+#
+# Run builds ONE AT A TIME (each wants most of the machine); on a narrow
+# miss, tools/build_alt_place.tcl re-places from the opt checkpoint —
+# sequentially, after the build, not in parallel with another build.
+#
+# OOC IP checkpoints (the MIG) are not in git, so every fresh git-archive
+# copy used to re-synthesise them (~1 min).  They are now cached across
+# copies in ~/.cache/kbuild/ipcache/<sha1 of the .xci + .prj + Vivado
+# version> (KBUILD_IPCACHE overrides the location; -no_ipcache disables).
 #
 # Usage (from anywhere):
 #   vivado -mode batch -source tools/build_fast.tcl [-tclargs <options>]
@@ -19,6 +31,17 @@
 #   -resynth      force synth_1 to re-run even if it is up to date
 #   -tier2_only   skip tier 1; run tier 2 on the existing routed checkpoint
 #   -force_bit    write the bitstream even if timing is not met
+#   -incr DCP     incremental synthesis + place and route from a reference
+#                 build: DCP is its routed checkpoint (<dir>/KlaussCPU.runs/
+#                 impl_1/KlaussCPU_routed.dcp); its synth checkpoint next to
+#                 it (../synth_1/KlaussCPU.dcp) seeds incremental synthesis,
+#                 which keeps the netlist names stable so placement can be
+#                 reused.  Capped at -incr_cap minutes (default 30); on a
+#                 failure or the cap it falls back to the full flow.  OFF by
+#                 default.
+#   -incr_cap M   the incremental run's wall-clock cap in minutes
+#   -no_ipcache   do not use / fill the OOC IP checkpoint cache
+#   -stop_after_synth   stop once synthesis (and the IP cache) is done
 #   -quick        TEST build: impl_1 with the default strategy (Vivado
 #                 Implementation Defaults, much faster than
 #                 Performance_Explore), no tier 2, bitstream always written
@@ -41,6 +64,10 @@ set opt_resynth 0
 set opt_tier2_only 0
 set opt_force_bit 0
 set opt_quick 0
+set opt_incr ""
+set opt_incr_cap 30
+set opt_ipcache 1
+set opt_stop_synth 0
 for {set i 0} {$i < [llength $argv]} {incr i} {
    switch -- [lindex $argv $i] {
       -jobs       { incr i; set opt_jobs [lindex $argv $i] }
@@ -49,6 +76,10 @@ for {set i 0} {$i < [llength $argv]} {incr i} {
       -tier2_only { set opt_tier2_only 1 }
       -force_bit  { set opt_force_bit 1 }
       -quick      { set opt_quick 1; set opt_force_bit 1 }
+      -incr       { incr i; set opt_incr [file normalize [lindex $argv $i]] }
+      -incr_cap   { incr i; set opt_incr_cap [lindex $argv $i] }
+      -no_ipcache { set opt_ipcache 0 }
+      -stop_after_synth { set opt_stop_synth 1 }
       default     { puts "build_fast: unknown option [lindex $argv $i]"; exit 2 }
    }
 }
@@ -74,6 +105,53 @@ proc met {} { return [expr {[wns] >= 0.0 && [whs] >= 0.0}] }
 
 set_param general.maxThreads $opt_threads
 open_project $proj_xpr
+
+# ---- the OOC IP cache (before anything else touches the project)
+set ipcache [expr {[info exists ::env(KBUILD_IPCACHE)] ? $::env(KBUILD_IPCACHE)
+                                                        : [file normalize ~/.cache/kbuild/ipcache]}]
+set runs_dir [file join $proj_dir KlaussCPU.runs]
+# The cache entry of an OOC IP is its state after its synth run: the run
+# directory (Vivado judges the run from it — without it launch_runs
+# synth_1 re-runs the IP) and the IP's own files (ip.tar: the .xci
+# directory, whose regenerated .xml lists the checkpoint / stubs — a fresh
+# generate_target leaves them out and synth_1 cannot find the module; or
+# a core container's .xcix, which the run rewrites, and its directory).
+# Keyed by the IP's source file(s) as checked out and the Vivado version.
+proc ip_key {ip_file} {
+   set files [list $ip_file]
+   if {[file extension $ip_file] eq ".xci"} {
+      set files [concat $files [glob -nocomplain -directory [file dirname $ip_file] *.prj]]
+   }
+   return [lindex [exec sh -c "{ cat [join [lsort $files] { }]; echo [version -short]; } | sha1sum"] 0]
+}
+array set ip_cdir {}
+set ip_restored 0
+foreach ip [get_ips] {
+   set ipf [get_property IP_FILE $ip]
+   set run [get_runs -quiet ${ip}_synth_1]
+   if {$run eq ""} continue
+   if {![file exists $ipf]} {
+      # a core-container IP (clk_wiz_0 in clk_wiz_0_1.xcix): key by the .xcix
+      set ipf [lindex [glob -nocomplain -directory [file join $proj_dir KlaussCPU.srcs sources_1 ip] ${ip}*.xcix] 0]
+      if {$ipf eq ""} continue
+   }
+   set cdir [file join $ipcache ${ip}_[ip_key $ipf]]
+   set ip_cdir($ip) $cdir
+   set rdir [file join $runs_dir ${ip}_synth_1]
+   if {$opt_ipcache && [file exists [file join $cdir run.tar]] && [file exists [file join $cdir ip.tar]]
+       && ![file exists $rdir]} {
+      file mkdir $runs_dir
+      exec tar -xf [file join $cdir run.tar] -C $runs_dir
+      exec tar -xf [file join $cdir ip.tar] -C [file join $proj_dir KlaussCPU.srcs sources_1 ip]
+      bf_log "IP $ip: run and IP products restored from the cache ($cdir)"
+      set ip_restored 1
+   }
+}
+# reopen so the restored run directories are seen
+if {$ip_restored} {
+   close_project
+   open_project $proj_xpr
+}
 set top      [get_property top [current_fileset]]
 set impl_dir [get_property DIRECTORY [get_runs impl_1]]
 set routed   [file join $impl_dir ${top}_routed.dcp]
@@ -86,7 +164,23 @@ if {!$opt_tier2_only} {
                                            : "Performance_Explore"}] $impl
    set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED false $impl
    set_property AUTO_INCREMENTAL_CHECKPOINT 0 $impl
-   set_property INCREMENTAL_CHECKPOINT "" $impl
+   set synth_run [get_runs synth_1]
+   set_property AUTO_INCREMENTAL_CHECKPOINT 0 $synth_run
+   if {$opt_incr ne ""} {
+      if {![file exists $opt_incr]} { bf_log "-incr: no checkpoint $opt_incr"; exit 2 }
+      set incr_synth [file normalize [file join [file dirname $opt_incr] .. synth_1 ${top}.dcp]]
+      set_property INCREMENTAL_CHECKPOINT $opt_incr $impl
+      set_property INCREMENTAL_CHECKPOINT.DIRECTIVE RuntimeOptimized $impl
+      if {[file exists $incr_synth]} {
+         set_property INCREMENTAL_CHECKPOINT $incr_synth $synth_run
+      } else {
+         set incr_synth "(none)"
+      }
+      bf_log "INCREMENTAL from $opt_incr, synthesis from $incr_synth (RuntimeOptimized, cap ${opt_incr_cap} min)"
+   } else {
+      set_property INCREMENTAL_CHECKPOINT "" $impl
+      set_property INCREMENTAL_CHECKPOINT "" $synth_run
+   }
 
    # IP output products are not tracked in git (they differ per OS — see
    # .gitignore), so a fresh checkout has only the IP sources.  Generate
@@ -104,6 +198,7 @@ if {!$opt_tier2_only} {
    foreach ip [get_ips] {
       set xci [get_property IP_FILE $ip]
       if {![file exists $xci]} continue
+      if {[file extension $xci] ne ".xci"} continue
       if {![get_property GENERATE_SYNTH_CHECKPOINT [get_files $xci]]} continue
       if {[file exists "[file rootname $xci].dcp"]} continue
       set run [get_runs -quiet ${ip}_synth_1]
@@ -152,11 +247,50 @@ if {!$opt_tier2_only} {
       bf_log "synth_1 up to date, skipping"
    }
 
+   if {$opt_ipcache} {
+      foreach ip [array names ip_cdir] {
+         set cdir $ip_cdir($ip)
+         set rdir [file join $runs_dir ${ip}_synth_1]
+         if {[file exists [file join $cdir run.tar]] || ![file isdirectory $rdir]} continue
+         if {![run_ok ${ip}_synth_1]} continue
+         file mkdir $cdir
+         exec tar -cf [file join $cdir run.tar] -C $runs_dir ${ip}_synth_1
+         # the IP's own files, relative to sources_1/ip
+         set ipf [get_property IP_FILE [get_ips $ip]]
+         set iproot [file join $proj_dir KlaussCPU.srcs sources_1 ip]
+         if {[file exists $ipf]} {
+            set members [list [file tail [file dirname $ipf]]]
+         } else {
+            set xcix [lindex [glob -nocomplain -directory $iproot ${ip}*.xcix] 0]
+            set members [list [file tail $xcix]]
+            set xdir [file rootname $xcix]
+            if {[file isdirectory $xdir]} { lappend members [file tail $xdir] }
+         }
+         exec tar -cf [file join $cdir ip.tar] -C $iproot {*}$members
+         bf_log "IP $ip: run and IP products cached ($cdir)"
+      }
+   }
+   if {$opt_stop_synth} { bf_log "stopping after synthesis (-stop_after_synth). Total [elapsed $t_start]"; exit 0 }
+
    set t0 [clock seconds]
    bf_log "impl_1 tier 1 -> route_design"
    reset_run impl_1
    launch_runs impl_1 -to_step route_design -jobs $opt_jobs
-   wait_on_run impl_1
+   if {$opt_incr ne ""} {
+      # (the cap: incremental placement once wedged for 9 hours here; and
+      # the incremental placer can simply fail — then run the full flow)
+      set incr_err [catch {wait_on_run -timeout $opt_incr_cap impl_1} incr_msg]
+      if {$incr_err || ![file exists $routed]} {
+         bf_log "INCREMENTAL impl failed or exceeded ${opt_incr_cap} min after [elapsed $t0]: falling back to the full flow"
+         reset_run impl_1
+         set_property INCREMENTAL_CHECKPOINT "" [get_runs impl_1]
+         set t0 [clock seconds]
+         launch_runs impl_1 -to_step route_design -jobs $opt_jobs
+         wait_on_run impl_1
+      }
+   } else {
+      wait_on_run impl_1
+   }
    if {![file exists $routed]} {
       bf_log "impl_1 FAILED: [get_property STATUS [get_runs impl_1]]"
       exit 2
@@ -170,6 +304,11 @@ if {![file exists $routed]} {
 }
 
 open_checkpoint $routed
+if {$opt_incr ne "" && !$opt_tier2_only} {
+   # how much of the reference was reused (cells / nets)
+   report_incremental_reuse -file [file join $impl_dir build_fast_incr_reuse.rpt]
+   bf_log "incremental reuse report: [file join $impl_dir build_fast_incr_reuse.rpt]"
+}
 set tier1_wns [wns]
 set tier1_whs [whs]
 bf_log [format "tier 1: WNS %+.3f  WHS %+.3f" $tier1_wns $tier1_whs]

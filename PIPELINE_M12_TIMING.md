@@ -46,6 +46,39 @@ delta; a silently poisoned QoR route (−0.617 where the honest build lands
 optimization wedge on its IDEAL case (matched reference, 4-line delta).
 Do not re-enable without a wall-clock watchdog and a QoR probe.
 
+**Update 2026-11-09 (build speed, Graham: fast turnaround for small RTL
+changes).** Measured on one small change (a constant in the top's MMIO read
+mux) against `98fe470`, one build at a time on this machine:
+
+| Flow | IPs | Synthesis | P&R (tier 1) | Total | Result |
+|---|---|---|---|---|---|
+| full (`build_fast -resynth`), IP cache miss | MIG re-synthesised (47 s) | 2m15s | 8m18s–9m03s | ~12m40s | met |
+| full, **IP cache hit** (new default) | restored, 0 s | 1m58s | 9m03s | **11m50s** | met (+0.041) |
+| `-incr <ref routed.dcp>` (new, off by default) | — | 2m15s | incremental placer fails after 1m48s, then the full flow | 13m35s | met via the fallback |
+| `-quick` (Implementation Defaults; test bitstream) | — | 2m15s–2m52s | 4m54s | ~7–8m45s | −0.43 (test only) |
+
+- **OOC IP cache** (`~/.cache/kbuild/ipcache`): the MIG's and clk_wiz's
+  state after their synth runs (the run directory, plus the IP's own files —
+  the `.xci` directory, whose regenerated `.xml` lists the checkpoint and
+  stubs, or the core container `.xcix`), keyed by the IP's source files
+  and the Vivado version. A fresh git-archive copy restores it before
+  `generate_target`, so neither IP re-runs (restoring the `.dcp` alone is
+  not enough: Vivado re-runs an IP whose run directory is missing, and a
+  fresh `generate_target` drops the stub from the IP's file list).
+  Saves about 75 s per build. `-no_ipcache` disables it.
+- **Incremental implementation** (`-incr`, with the reference build's
+  synthesis checkpoint seeding incremental synthesis): still not viable
+  here. The incremental placer stops with "Need spiral search for more than
+  5% of movable instances" within two minutes, with or without incremental
+  synthesis. Vivado declined incremental synthesis for a change in the
+  top, and the flattened core gives it nothing to reuse. The option stays,
+  off by default, capped (`-incr_cap`, 30 min) and falling back to the full
+  flow on failure, so it costs about 2 minutes when it fails.
+- **For a quick board test of a small change**, `-quick` with a warm IP
+  cache is the fastest bitstream (about 7 minutes; it does not meet timing).
+  A real bitstream is the full flow (about 12 minutes). Run builds one at a
+  time; on a narrow miss, run `build_alt_place.tcl` afterwards, sequentially.
+
 ## Stage B — position-flag fetch tracker (the fetch-family fix, done right)
 
 The M11a war proved: (a) the serve/dispatch enables cannot afford the
