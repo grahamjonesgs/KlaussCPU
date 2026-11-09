@@ -2677,3 +2677,28 @@ def tlb_index_width():
     a.halt()
     return a, {'end': 'park', 'kind': '0', 'r4': 3, 'r5': (0x0777 << 16) | 0x12,
                'r6': (0x005 << 16) | TLB_V | TLB_R, 'r7': 3}, []
+
+
+@test
+def div_by_zero_operand_paths():
+    """DIV / MOD by zero with the divisor from each ex_b source: the
+    register file, forwarded from MEM, forwarded from WB, a load just
+    completed; and a divisor zero only in its low 32 bits (not zero).
+    DIV by zero = all ones, MOD by zero = the dividend (ex_b_zero)"""
+    out = []
+    for plus in (['+LAT=1'], ['+LAT=3'], ['+HIT=100'], ['+LAT=7', '+HIT=70']):
+        a = Asm()
+        a.setr(12, DATA); a.setr(1, 100); a.setr(4, 0)
+        for _ in range(4):
+            a.nop()
+        a.div(5, 1, 4); a.mod(6, 1, 4)                    # rf
+        a.setr(4, 0); a.div(7, 1, 4)                      # forwarded from MEM
+        a.setr(4, 0); a.nop(); a.mod(8, 1, 4)             # from WB
+        a.setr(3, 0); a.st(64, 3, 12); a.ld(64, 4, 12); a.div(9, 1, 4)   # a load's zero
+        a.setr64(4, 1 << 32); a.div(10, 1, 4)             # low 32 zero, not zero: 0
+        a.setr(4, 7); a.div(11, 1, 4)                     # 14
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', 'r5': 0xFFFFFFFFFFFFFFFF, 'r6': 100,
+                        'r7': 0xFFFFFFFFFFFFFFFF, 'r8': 100, 'r9': 0xFFFFFFFFFFFFFFFF,
+                        'r10': 0, 'r11': 14}, plus))
+    return out

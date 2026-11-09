@@ -1268,6 +1268,10 @@ module pipeline_core
    function automatic logic [63:0] f_wsh(logic w, logic [63:0] v);
       return w ? {v[31:0], 32'b0} : v;
    endfunction
+   // f_wsh(w, v) == 0
+   function automatic logic f_wz(logic w, logic [63:0] v);
+      return w ? (v[31:0] == 32'd0) : (v == 64'd0);
+   endfunction
    // ex_b operand select, predecoded at the latch (M13): constant 1 (INC/DEC),
    // the extended immediate, or a register. Replaces a dec.len/dec.uop test
    // on the id_op->ex_b cone; asserted equal to the old decode below.
@@ -1586,7 +1590,10 @@ module pipeline_core
    wire ex_is_mul  = ex_valid && (ex_d.uop == U_MUL);
    wire ex_is_div  = ex_valid && (ex_d.uop == U_DIV || ex_d.uop == U_MOD);
    wire ex_div_mod = (ex_d.uop == U_MOD);
-   wire ex_div_by0 = ex_is_div && (div_ph == MD_IDLE) && (ex_b == 64'd0);
+   // (timing: ex_b_zero, registered with ex_b — the 64-bit zero test sat on
+   // ex_b -> md_done -> ex_busy -> the fetch fill-issue enable)
+   logic ex_b_zero = 1'b1;
+   wire ex_div_by0 = ex_is_div && (div_ph == MD_IDLE) && ex_b_zero;
    wire md_done    = (ex_is_mul && mul_cnt == (EN_MUL2 ? 2'd1 : 2'd3)) ||
                      (ex_is_div && div_ph == MD_STEP && dv.counter >= 7'd64) || ex_div_by0;
    wire ex_is_dly  = ex_valid && (ex_d.uop == U_DELAY);
@@ -2788,7 +2795,10 @@ module pipeline_core
          if (EN_LDBYP && ex_valid && (ex_lb_a || ex_lb_b) && wb_valid && !wb_wait &&
              (ex_busy || mem_busy)) begin
             if (ex_lb_a) ex_a <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
-            if (ex_lb_b) ex_b <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
+            if (ex_lb_b) begin
+               ex_b      <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
+               ex_b_zero <= f_wz(ex_w, wb_ldval);
+            end
             ex_lb_a <= 1'b0;  ex_lb_b <= 1'b0;
          end
 
@@ -3660,6 +3670,13 @@ module pipeline_core
                            : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
                            : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
                            : rf[dec.rs2]);
+               // (timing) "ex_b == 0" for DIV's divide-by-zero, registered:
+               // each candidate reduced in parallel, the same select picks
+               ex_b_zero  <= id_b_one ? 1'b0
+                           : id_b_imm ? (id_var1 == 32'd0)
+                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? f_wz(id_w, mem_result_eff)
+                           : (b_wb       && wb_rd    == dec.rs2) ? f_wz(id_w, wb_fwd_v)
+                           : f_wz(id_w, rf[dec.rs2]);
 
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
@@ -4280,6 +4297,10 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && running)
       assert (smc_hit_lat == (smc_st && (pc_dw == smc_dw || a_last_dw == smc_dw)))
          else $fatal(1, "smc_hit_lat form: pc=%h op=%h smc_dw=%h", pc, w_op, smc_dw);
+   // ex_b_zero tracks ex_b exactly (both its write sites set it)
+   always_ff @(posedge clk) if (!rst)
+      assert (ex_b_zero == (ex_b == 64'd0))
+         else $fatal(1, "ex_b_zero stale: ex_b=%h", ex_b);
    // ras_miss's compare-then-select form equals ret_actual != mem_pred_tgt
    always_ff @(posedge clk) if (!rst && mem_valid && mem_pred)
       assert (ret_ne == (ret_actual != mem_pred_tgt))
