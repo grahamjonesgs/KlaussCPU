@@ -855,7 +855,11 @@ software rule.
 
 The stage 1 user-mode MMIO rule (§3.6) still applies first. In supervisor
 mode, GUARD regions also cover MMIO. Cause priority stays as in §4.1: an
-MPU denial is an ACCESS_* fault.
+MPU denial is an ACCESS_* fault. With `MPU_EN = 1`, an instruction fetch
+never reads MMIO, even in supervisor mode: the fill returns zeros, so code
+executed from `0xF…` raises ACCESS_FETCH with GUARD where a GUARD region
+covers it and ILLEGAL elsewhere (with `MPU_EN = 0` it reads the device, as
+before).
 
 ### 10.3 Pipeline (as built, `d546911` + `da8c085`)
 

@@ -2593,3 +2593,36 @@ def wp_te_physical():
              if dbg else {'end': 'park', 'kind': '0', 'r6': 0x31, 'r7': 0x77})
         out.append((a, e, ['+WP0RD=%x' % DATA, '+LAT=3'] + plus))
     return out
+
+
+@test
+def mmio_fetch_no_device_read():
+    """review 2 #1: with the MPU on (or TE = 1) a fetch fill at 0xF... is a
+    fake fill: no MMIO read.  Supervisor, GUARD over the UART block:
+    ACCESS_FETCH|GUARD; MPU on, no region there: zeros (ILLEGAL); TE = 1:
+    zeros (ILLEGAL).  MPU and TE off: the fill reads the device, as before."""
+    out = []
+    for mode in ('guard', 'mpu', 'te', 'off'):
+        a = Asm()
+        _xsetup(a)
+        if mode == 'guard':
+            _mpu_reg(a, 0, 0xF0010000, 0xF001001F, A_EN | A_G)
+        if mode in ('guard', 'mpu'):
+            _mpu_on(a)
+        if mode == 'te':
+            _te_on(a)
+        a.leapc(10, 'back')
+        a.setr(9, 0xF0010010); a.jmpr(9)       # supervisor jump into MMIO
+        a.label('back'); a.setr(7, 0x77); a.halt()
+        a.label('h')
+        a.mfsr(8, 'ecause'); a.mfsr(11, 'eaddr')
+        a.getsp(13); a.ld(64, 14, 13); a.setr64(12, 0xFFFFFFFF00000000); a.alu('and', 14, 14, 12)
+        a.alu('or', 14, 14, 10); a.st(64, 14, 13)
+        a.iret()
+        e = {'end': 'park', 'kind': '0', 'r7': 0x77, 'mmio_rd': '1' if mode == 'off' else '0'}
+        if mode == 'guard':
+            e.update({'r8': G_ | X_ACC_FE, 'r11': 0xF0010010})
+        elif mode != 'off':
+            e.update({'r8': X_ILL, 'r11': 0})                 # (EADDR = the op word)
+        out.append((a, e, ['+LAT=3', '+MAXC=20000']))
+    return out

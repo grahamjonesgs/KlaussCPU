@@ -2073,7 +2073,12 @@ module pipeline_core
    logic        if_drop;      // MMU stage 3: the fill in flight must not reach the window
    logic        if_fflt, if_fmiss;   // (stage 3) the fake fill is a refused page / a TLB miss
    logic [15:0] if_tghi;             // (stage 3) the fill's I-cache tag [18:3] (PA[31:16] with TE)
-   wire         w_ufz = EN_EXC && fe_um && miss_dw[28:25] == 4'hF;
+   // (also, review 2 #1, in supervisor mode with the MPU on or TE = 1: no
+   // fetch fill ever reads a device.  A GUARD over the address then
+   // raises ACCESS_FETCH|GUARD at ID; otherwise the zeros are ILLEGAL.
+   // With both off a supervisor fetch from MMIO reads it, as before.)
+   wire         w_ufz = EN_EXC && (fe_um || (EN_MPU && mpu_en) || (EN_TLB && te)) &&
+                        miss_dw[28:25] == 4'hF;
    assign bus_idle = (mem_xc == 2'd0) && !if_xc && !irq_xc && !st_post && !sq_v && !ld_out
                      && !m_read_DV && !m_write_DV;
 
