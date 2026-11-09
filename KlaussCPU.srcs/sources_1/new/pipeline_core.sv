@@ -2542,6 +2542,23 @@ module pipeline_core
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
    wire [63:0] wb_fwd_v = ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
+   // (timing) f_wz(id_w, wb_fwd_v) for ex_b_zero, from the sources' byte-
+   // zero flags in parallel instead of after the MUL / load-extract selects:
+   // a MUL's product halves (registers), a load's dword by its size / offset
+   // (an extension of zero is zero), else wb_value.  Asserted equal.
+   function automatic logic [7:0] f_bz(logic [63:0] v);
+      for (int i = 0; i < 8; i++) f_bz[i] = (v[8*i +: 8] == 8'd0);
+   endfunction
+   wire [7:0] wbz_mr  = wb_mhi ? f_bz(mul_pipe2[127:64]) : f_bz(mul_pipe2[63:0]);
+   wire       wbz_mul = (id_w || wb_mw32) ? &wbz_mr[3:0] : &wbz_mr;
+   wire [7:0] wbz_ld  = (EN_DC_H && wb_h && wb_hok) ? f_bz(wb_hdw) : f_bz(m_rdata_dram);
+   wire       wbz_ldd = id_w ? &wbz_ld[3:0] : &wbz_ld;
+   wire       wbz_ldx = (wb_ld_full || wb_ld_msz == 2'd3) ? wbz_ldd
+                      : (wb_ld_msz == 2'd0) ? wbz_ld[wb_ld_ea]
+                      : (wb_ld_msz == 2'd1) ? (wbz_ld[{wb_ld_ea[2:1], 1'b0}] && wbz_ld[{wb_ld_ea[2:1], 1'b1}])
+                      : (wb_ld_ea[2] ? &wbz_ld[7:4] : &wbz_ld[3:0]);
+   wire       wbz_fwd = (EN_MUL2 && wb_mdir) ? wbz_mul
+                      : (EN_LD_FWD && wb_ld) ? wbz_ldx : f_wz(id_w, wb_value);
    flags_t wb_fval_eff;
    always_comb begin
       wb_fval_eff = wb_fval;
@@ -3686,7 +3703,7 @@ module pipeline_core
                ex_b_zero  <= id_b_one ? 1'b0
                            : id_b_imm ? (id_var1 == 32'd0)
                            : (mem_fwd_ok && mem_d.rd == dec.rs2) ? f_wz(id_w, mem_result_eff)
-                           : (b_wb       && wb_rd    == dec.rs2) ? f_wz(id_w, wb_fwd_v)
+                           : (b_wb       && wb_rd    == dec.rs2) ? wbz_fwd
                            : f_wz(id_w, rf[dec.rs2]);
 
                // EX redirect: taken branch/call, RESET
@@ -4311,6 +4328,10 @@ module pipeline_core
    // a parked core neither dispatches nor takes an IRQ
    always_ff @(posedge clk) if (!rst && parked && running)
       assert (fetch_halt) else $fatal(1, "parked with fetch running: kind=%0d", park_kind);
+   // the parallel WB-forward zero bit equals the zero test of the value
+   always_ff @(posedge clk) if (!rst)
+      assert (wbz_fwd == f_wz(id_w, wb_fwd_v))
+         else $fatal(1, "wbz_fwd form: mdir=%b ld=%b v=%h", wb_mdir, wb_ld, wb_fwd_v);
    // ex_b_zero tracks ex_b exactly (both its write sites set it)
    always_ff @(posedge clk) if (!rst)
       assert (ex_b_zero == (ex_b == 64'd0))
