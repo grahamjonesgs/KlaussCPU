@@ -445,9 +445,12 @@ bitstream.
 | Bits | Meaning |
 |---|---|
 | `[0]` | stage 1: exceptions, user mode, SYSCALL, MFSR/MTSR, TP, CYCLE |
-| `[1]` | stage 2 MPU present; `[7:4]` = region count − 1 (§10.1) |
+| `[1]` | stage 2 MPU present; `[7:4]` = region count − 1 (§10.1). An optional build feature, **off on the Nexys A7** (timing margin, Graham 2026-11-09): `[1]` = 0, `[7:4]` = 0 |
 | `[2]` | stage 3 TLB present (`[15:8]` = entry count) |
 | `[3]` | LR/SC (§5.1). Set together with `[0]` in stage 1, but kept separate so software tests for atomics by name. |
+
+The Nexys A7 bitstream reads **`0x100D`**: stage 1, LR/SC, and a 16-entry
+TLB, with no MPU.
 
 ---
 
@@ -786,6 +789,13 @@ Zephyr handlers.
 ---
 
 ## 10. Stage 2: MPU
+
+> **Optional build feature** (`EN_MPU` / `MPU_EN`; KlaussCPU
+> `CORE1_MPU_EN`). **Off in the Nexys A7 bitstream for timing margin**
+> (Graham, 2026-11-09); Zephyr runs in supervisor mode. With it off,
+> MFSR/MTSR of SRs 0x10–0x2F is ILLEGAL (§6.1), `STATUS[8]` reads 0 and
+> ignores writes, nothing is checked, and `ECAUSE[8]` is always 0. The RTL
+> stays and is simulated in an `MPU_EN = 1` build.
 
 Interface written 2026-11-09 (Graham: carry on through all stages). For
 Zephyr USERSPACE and NuttX protected builds, with translation off. Same
@@ -1214,7 +1224,12 @@ base in EX, with the MEM replay above".
 - **Build switches**: the module parameter `TLB_EN` (on; off on core 2) and
   `EN_TLB = EXC_EN && TLB_EN`. KlaussCPU's `CORE1_TLB_EN` drives
   CPU_FEATURES[2] and [15:8] = the entry count; `TLB_N` / `CORE1_TLB_N`
-  = 16 here, so CPU_FEATURES = 0x10FF.
+  = 16 here. With the MPU off on the A7 (§10), CPU_FEATURES = 0x100D.
+- **MPU off on the Nexys A7** (Graham, 2026-11-09): core 1 builds the TLB
+  and not the MPU, for timing margin; Zephyr runs in supervisor mode. The
+  MPU is a build option (`CORE1_MPU_EN`), simulated in an `MPU_EN = 1`
+  build (`VSIM_MPU_EN=1`: its tests, `mpudiff`, and a diff against
+  `7893230`).
 - **Compatibility**: with TE = 0 the core is cycle-identical to the stage 2
   head `7893230` (diff, --irq, +HIT, EXC_EN = 0, socdiff).
 - **Cost** (60 randprog seeds, every page mapped; STATUS the only
@@ -1253,7 +1268,7 @@ the shipped bitstream.
 | `mmu3e` | `1b87316` | STLF page compare from `ex_ea_q`; `ex_mok` | −0.392 | −0.262 / −5.9 | −0.262 | 43,603 | 30,549 |
 | `mmu3f` | `8f4ad33` | SMC hit-latch test without the pc adder | −0.048 | −0.013 / −0.01 | −0.184 | 44,619 | 30,657 |
 | `mmu3g` | `f9d4aac` | RAS miss as compare-then-select | −0.417 | −0.398 / −34.6 | −0.165 | 44,743 | 30,710 |
-| `mmu3i` | `875296e` | + `keep_hierarchy` on `mmu_mpu`; registered `ex_b_zero` | −0.200 | −0.106 / −1.4 | | 43,828 | 30,302 |
+| `mmu3i` | `875296e` | + `keep_hierarchy` on `mmu_mpu`; registered `ex_b_zero` | −0.200 | −0.106 / −1.4 | −0.021 | 43,828 | 30,302 |
 
 - **What failed and why.** The first build's worst paths ran through new
   stage 3 legs on old near-critical cones: TLBVEC in the `pc` mux behind
@@ -1268,6 +1283,11 @@ the shipped bitstream.
   entry count went to 16 (§11.5) and why the later steps are stage 2
   walls. They are fixed exactly and CPI-neutrally, and also buy margin for
   master.
+- **Interim board bitstream (an exception).** `875296e`'s ExtraTimingOpt
+  alt-place met (WNS +0.014, WHS +0.024, all clocks), and was saved as
+  `mmu_875296e_altplace.bit` for SRAM-only board validation of stage 3 in
+  parallel. It is never written to QSPI and is not the release bitstream,
+  which must close with the standard flow.
 - **Synthesis folding.** Without `keep_hierarchy`, synthesis placed core
   logic inside `mmu_tlb` (`pc`-mux LUTs) and `mmu_mpu` (`id_ser`, the
   multiplier). Both are kept now, like `mmu_sr`.

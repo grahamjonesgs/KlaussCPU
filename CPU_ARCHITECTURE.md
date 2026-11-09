@@ -506,7 +506,9 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   exactly as described above, so code that never sets `EVEC` sees no
   change. Probe `CPU_FEATURES` (`0xF00F_0048`, reads 0 on older bitstreams):
   bit 0 = this section, bit 3 = LR/SC, bit 1 = the MPU (§13.3) and
-  `[7:4]` = its region count − 1 (15).
+  `[7:4]` = its region count − 1 (15; both 0 on the Nexys A7, which has no
+  MPU), bit 2 = the TLB (§13.4) and `[15:8]` = its entry count (16). The A7
+  reads `0x100D`.
 - **Exceptions are precise.** The faulting instruction commits nothing:
   no register, flag, SP, R15 or PC change, and no memory or device access.
   That includes PUSH/POP/CALL/RET/ENTER/LEAVE/LEAVERET. The core then takes
@@ -551,6 +553,13 @@ rd<<8`; `MTSR sr, rs1` `0x6C60_0000 | sr<<12 | rs1<<4` (ISA_ENCODING_V2_MAP.md
 mode.
 
 ### 13.3 MPU (MMU stage 2)
+
+> **Optional build feature** (`CORE1_MPU_EN`), **off in the Nexys A7
+> bitstream** for timing margin (Graham, 2026-11-09); Zephyr runs in
+> supervisor mode. With it off, MFSR/MTSR of SRs 0x10–0x2F is ILLEGAL,
+> `STATUS[8]` reads 0 and ignores writes, nothing is checked, `ECAUSE[8]`
+> is 0, and `CPU_FEATURES[1]` / `[7:4]` read 0. The A7 reads
+> `CPU_FEATURES` = `0x100D`.
 
 16 regions, 32-byte granularity (MMU_PLAN.md §10). All registers are
 supervisor-only; MTSR to them serializes, so a change applies from the
@@ -786,6 +795,8 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 - **MMU stage 2 (2026-11, branch `mmu`):** the 16-region MPU (§13.3) and
   `ECAUSE[8]` GUARD. Off on core 2. With MPU_EN = 0, cycle-identical to
   stage 1.
+- **Nexys A7 build (2026-11-09):** core 1 has the TLB and no MPU
+  (`CORE1_MPU_EN` = 0, timing margin); `CPU_FEATURES` = `0x100D`.
 - **MMU stage 3 (2026-11, branch `mmu`):** the 16-entry software-refilled
   TLB with 64 KiB pages, kseg / kmap / useg, ASIDs and `TLBVEC` (§13.4).
   Off on core 2. With TE = 0, cycle-identical to stage 2.
