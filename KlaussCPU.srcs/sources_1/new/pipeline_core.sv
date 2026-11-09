@@ -4176,6 +4176,9 @@ module pipeline_core
    // decision on pc's granule (and the next one): both only REGISTERED
    // (mem_xsq / id_fx), never on an EX->MEM or dispatch enable.
    generate if (EN_MPU) begin : g_mpu
+      // (timing: kept, so synthesis cannot fold core logic — id_ser, the
+      // pc mux — into the MPU's cells, as it did; outputs as before)
+      (* keep_hierarchy = "yes" *)
       mmu_mpu mpu_i (
          .clk, .rst, .ce,
          .clr      (start),
