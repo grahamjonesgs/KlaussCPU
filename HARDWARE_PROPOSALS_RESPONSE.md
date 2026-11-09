@@ -935,6 +935,15 @@ problem.
 - The frame saves the bit at [43] in *disable* sense, so software-built
   frames (bit 43 = 0) resume enabled.
 - `SWAP`/`CAS` (7b) were not done.
+- **2026-11-09 (`d9cf6c2`, branch `mmu`): EI is precise.** Before, the
+  enable committed at WB and the drain-time re-check abandoned the IRQ when
+  a younger DI committed meanwhile, so `EI; DI` never took a pending
+  interrupt and the window after `EI` depended on stalls. Now an `EI`
+  latched while an interrupt is pending and unmasked serializes: it commits
+  its enable at WB, refetches at EI+4, and the next boundary takes the
+  interrupt (frame PC = EI+4). An `EI` with nothing pending is unchanged and
+  free; single-steps never take interrupts. Driven by the xv6 bring-up
+  (`intr_on(); intr_off()`); matches the klausscc emulator.
 
 ### §3.3 / 8 — misaligned trap (`EN_MISAL_TRAP`)
 

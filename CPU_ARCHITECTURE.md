@@ -433,6 +433,19 @@ restores the previous state (encodings: ISA_ENCODING_V2_MAP.md §8.2). While
 disabled, `WAIT` still wakes on a pending interrupt but does not enter the
 handler.
 
+**Precise EI (2026-11-09, `d9cf6c2`).** An `EI` that sets enable = 1
+while an interrupt is pending and unmasked takes it at the boundary
+immediately after the `EI`, before the next instruction executes (RISC-V
+semantics): the frame's PC is EI+4. So `EI; DI` takes a pending interrupt
+between the two, which xv6's scheduler loop (`intr_on(); intr_off()`) and
+Linux `local_irq_enable()` / `local_irq_disable()` pairs rely on. An `EI`
+with no interrupt pending costs nothing. A debugger single-step never takes
+an interrupt. `IRET` restoring enable = 1 and `MTSR STATUS` (both
+serializing) take a pending interrupt at the first boundary after they
+commit. (Implementation: an `EI` latched with an interrupt pending
+serializes, commits at WB and refetches at EI+4; the next boundary takes
+the interrupt.)
+
 A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`
 and interrupts are not disabled by `DI`.
 

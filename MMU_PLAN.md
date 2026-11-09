@@ -149,6 +149,19 @@ that wants interrupt entry with interrupts disabled starts its handler with
 
 Exceptions are synchronous: they are taken whatever DI and `INT_MASK` say.
 
+**Precise EI (2026-11-09, `d9cf6c2`).** An `EI` that sets enable = 1
+while an interrupt is pending and unmasked takes it at the boundary
+immediately after the `EI`, before the next instruction executes (RISC-V
+semantics): the frame's PC is EI+4. So `EI; DI` takes a pending interrupt
+between the two, which xv6's scheduler loop (`intr_on(); intr_off()`) and
+Linux `local_irq_enable()` / `local_irq_disable()` pairs rely on. An `EI`
+with no interrupt pending costs nothing. A debugger single-step never takes
+an interrupt. `IRET` restoring enable = 1 and `MTSR STATUS` (both
+serializing) take a pending interrupt at the first boundary after they
+commit. (Implementation: an `EI` latched with an interrupt pending
+serializes, commits at WB and refetches at EI+4; the next boundary takes
+the interrupt.)
+
 ### 3.4 IRET
 
 IRET pops the frame from the current SP (it is privileged, so this is the
