@@ -985,3 +985,312 @@ def user_irq():
     c = 0xC0FFEE0011223344
     return a, {'end': 'park', 'kind': '0', 'r1': 2001000, 'r3': 2001000, 'r5': USP, 'r6': 1,
                'r8': c, 'r9': c, 'r10': c, 'm00180000': 'nonzero', m(XD): X_PRIV}, ['+IRQ_PERIOD=97']
+
+
+# ---------------------------------------------- (c) access and fetch faults
+GOOD = DATA + 0x300        # a usable stack top / data area (dumped)
+BADSP = 0xF0000100         # MMIO
+FLOG = XD + 0x100          # 0x30 bytes per fault: cause, eaddr, usp, r15, r9, frame
+GETF_ZE = 0xC000000000000000
+
+
+def _getf(a, rd):
+    return a.raw(0x40000000 | 5 << 26 | 12 << 22 | rd << 8)
+
+
+def _fixhandler(a, name='h'):
+    """logs every exception at FLOG + 0x30*i (the state AT the fault), then:
+    a user HALT halts; ACCESS_LOAD/STORE: r9 <- r10, r15 <- r11, USP <- r12
+    if USP is in MMIO, and retry (no skip); fetch faults: frame PC <- r10;
+    others: step over 1 word (not SYSCALL)."""
+    a.label(name)
+    a.push(13); a.push(14)
+    a.setr(14, XD)
+    a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)          # count
+    a.mulv_s(13, 13, 0x30); a.alu('add', 13, 13, 14); a.addi_s(13, 13, 0x100 - 0x30 - 128)
+    a.addi_s(13, 13, 127); a.addi_s(13, 13, 1)                       # 13 = FLOG + 0x30*(count-1)
+    a.mfsr(14, 'ecause'); a.st(64, 14, 13, 0)
+    a.mfsr(14, 'eaddr');  a.st(64, 14, 13, 8)
+    a.mfsr(14, 'usp');    a.st(64, 14, 13, 16)
+    a.st(64, 15, 13, 24); a.st(64, 9, 13, 32)
+    a.getsp(14); a.ld(64, 14, 14, 16); a.st(64, 14, 13, 40)
+    a.mfsr(13, 'eaddr'); a.setr(14, HALT_W)
+    a.fbr('ne', 13, 14, name + '_nh'); a.halt()
+    a.label(name + '_nh')
+    a.mfsr(13, 'ecause')
+    a.fbr('eq', 13, X_SYSCALL, name + '_ret', imm=True)
+    a.addi_s(14, 13, -X_ACC_LD); a.fbr('ule', 14, 1, name + '_acc', imm=True)   # 7 / 8
+    a.addi_s(14, 13, -X_ACC_FE); a.fbr('ule', 14, 1, name + '_fe', imm=True)    # 9 / 10
+    a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
+    a.jmp(name + '_ret')
+    a.label(name + '_acc')
+    a.mov(9, 10); a.mov(15, 11)
+    a.mfsr(13, 'usp'); a.shift_n('shr', 13, 13, 28); a.setr(14, 15)
+    a.fbr('ne', 13, 14, name + '_ret')
+    a.mtsr('usp', 12)
+    a.jmp(name + '_ret')
+    a.label(name + '_fe')
+    a.getsp(13); a.ld(64, 14, 13, 16)
+    a.shift_n('shr', 14, 14, 32); a.shift_n('shl', 14, 14, 32); a.alu('or', 14, 14, 10)
+    a.st(64, 14, 13, 16)
+    a.label(name + '_ret')
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+def _ufault(body, exp_extra, plus=(), log0=None):
+    """user-mode program: body(a) runs in user mode then HALTs (PRIVILEGED,
+    which the handler turns into a supervisor halt)"""
+    a = Asm()
+    _xsetup(a)
+    _to_user(a, 'u')
+    a.label('u')
+    a.setr(12, GOOD)
+    body(a)
+    a.halt()
+    _fixhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'mmio_wr': '0', 'mmio_rd': '0'}
+    if log0:
+        for k, v in zip((0, 8, 16, 24, 32), log0):
+            if v is not None:
+                exp[m(FLOG + k)] = v
+    exp.update(exp_extra)
+    return a, exp, list(plus)
+
+
+def _stk_cases():
+    cases = {}
+
+    def push(a):
+        a.setr(1, 0xAAAA); a.setr(2, BADSP); a.cmp(1, 1); a.setsp(2)
+        a.push(1); _getf(a, 8); a.getsp(2)
+    cases['push'] = (push, {'r2': GOOD - 8, m(GOOD - 8): 0xAAAA, 'r8': GETF_ZE},
+                     (X_ACC_ST, BADSP - 8, BADSP))
+
+    def pushv(a):
+        a.setr(2, BADSP); a.setsp(2); a.pushv(0x1234); a.getsp(2)
+    cases['pushv'] = (pushv, {'r2': GOOD - 8, m(GOOD - 8): 0x1234}, (X_ACC_ST, BADSP - 8, BADSP))
+
+    def pop(a):
+        a.setr(3, 0x5555); a.st(64, 3, 12); a.setr(3, 0x77)
+        a.setr(2, BADSP); a.setsp(2); a.pop(3); a.getsp(2)
+    cases['pop'] = (pop, {'r2': GOOD + 8, 'r3': 0x5555}, (X_ACC_LD, BADSP, BADSP))
+
+    def call(a):
+        a.setr(2, BADSP); a.setsp(2); a.setr(4, 0)
+        a.call('f'); a.getsp(2); a.jmp('e')
+        a.label('f'); a.getsp(4); a.ret()
+        a.label('e')
+    cases['call'] = (call, {'r2': GOOD, 'r4': GOOD - 8}, (X_ACC_ST, BADSP - 8, BADSP))
+
+    def callcc_nt(a):
+        a.setr(2, BADSP); a.setsp(2); a.setr(1, 1); a.setr(3, 2); a.cmp(1, 3)   # Z = 0
+        a.call('f', cond='z'); a.getsp(2); a.jmp('e')
+        a.label('f'); a.setr(4, 0xBAD); a.ret()
+        a.label('e')
+    cases['callcc_nt'] = (callcc_nt, {'r2': BADSP, 'r4': 0, m(FLOG): X_PRIV}, None)
+
+    def callr(a):
+        a.leapc(5, 'f'); a.setr(2, BADSP); a.setsp(2); a.setr(4, 0)
+        a.jmpr(5, link=True); a.getsp(2); a.jmp('e')
+        a.label('f'); a.getsp(4); a.ret()
+        a.label('e')
+    cases['callr'] = (callr, {'r2': GOOD, 'r4': GOOD - 8}, (X_ACC_ST, BADSP - 8, BADSP))
+
+    def ret(a):
+        a.leapc(6, 'back'); a.st(64, 6, 12)
+        a.setr(2, BADSP); a.setsp(2); a.ret()
+        a.setr(4, 0xBAD)
+        a.label('back'); a.getsp(2)
+    cases['ret'] = (ret, {'r2': GOOD + 8, 'r4': 0}, (X_ACC_LD, BADSP, BADSP))
+
+    def ret_ras(a):
+        a.setr(2, GOOD + 8); a.setsp(2)
+        a.call('f'); a.getsp(2); a.jmp('e')
+        a.label('f')
+        a.setr(3, BADSP); a.setsp(3); a.ret()          # RAS-predicted; its read faults
+        a.label('e')
+    cases['ret_ras'] = (ret_ras, {'r2': GOOD + 8}, (X_ACC_LD, BADSP, BADSP))
+
+    def enter(a):
+        a.setr(15, 0x777); a.setr(11, 0x777); a.setr(2, BADSP); a.setsp(2)
+        a.enter(2); a.getsp(2); a.mov(3, 15)
+    cases['enter'] = (enter, {'r2': GOOD - 8 - 16, 'r3': GOOD - 8, m(GOOD - 8): 0x777},
+                      (X_ACC_ST, BADSP - 8, BADSP, 0x777))
+
+    def leave(a):
+        a.setr(3, 0x999); a.st(64, 3, 12); a.setr(11, GOOD)
+        a.setr(15, 0xF0000200); a.leave(); a.getsp(2); a.mov(3, 15)
+    cases['leave'] = (leave, {'r2': GOOD + 8, 'r3': 0x999}, (X_ACC_LD, 0xF0000200, USP, 0xF0000200))
+
+    def leaveret(a):
+        a.setr(3, 0x999); a.st(64, 3, 12); a.leapc(6, 'back'); a.st(64, 6, 12, 8)
+        a.setr(11, GOOD); a.setr(15, 0xF0000200); a.leaveret()
+        a.setr(4, 0xBAD)
+        a.label('back'); a.getsp(2); a.mov(3, 15)
+    cases['leaveret'] = (leaveret, {'r2': GOOD + 16, 'r3': 0x999, 'r4': 0},
+                         (X_ACC_LD, 0xF0000200, USP, 0xF0000200))
+
+    def leaveret_x(a):          # [R15] is DRAM-side, [R15+8] = 0xF000_0000
+        a.setr(3, 0x999); a.st(64, 3, 12); a.leapc(6, 'back'); a.st(64, 6, 12, 8)
+        a.setr(11, GOOD); a.setr(15, 0xEFFFFFF8); a.leaveret()
+        a.setr(4, 0xBAD)
+        a.label('back'); a.getsp(2); a.mov(3, 15)
+    cases['leaveret_x'] = (leaveret_x, {'r2': GOOD + 16, 'r3': 0x999, 'r4': 0},
+                           (X_ACC_LD, 0xF0000000, USP, 0xEFFFFFF8))
+
+    def ld32_span(a):           # MEMGET32 at 0xEFFF_FFFD spans into 0xF000_0000
+        a.setr64(3, 0x8877665544332211); a.st(64, 3, 12)
+        a.setr(10, GOOD + 1); a.setr(9, 0xEFFFFFFD); a.setr(3, 0)
+        a.ld(32, 3, 9)
+    cases['ld32_span'] = (ld32_span, {'r3': 0x55443322}, (X_ACC_LD, 0xF0000000, USP, None, 0xEFFFFFFD))
+
+    def ld(a):
+        a.setr64(3, 0x0102030405060708); a.st(64, 3, 12, 8)
+        a.setr(10, GOOD); a.setr(9, 0xF0010010); a.setr(3, 0)
+        a.cmp(3, 3); a.ld(64, 3, 9, 8); _getf(a, 8)
+    cases['ld'] = (ld, {'r3': 0x0102030405060708, 'r8': GETF_ZE},
+                   (X_ACC_LD, 0xF0010018, USP, None, 0xF0010010))
+
+    def st32(a):
+        a.setr(10, GOOD); a.setr(9, 0xF0010000); a.setr(1, 0x41424344)
+        a.st(32, 1, 9, 4)
+    cases['st32'] = (st32, {m(GOOD): 0x4142434400000000}, (X_ACC_ST, 0xF0010004, USP, None, 0xF0010000))
+
+    def st_rr(a):
+        a.setr(10, GOOD); a.setr(9, 0xF0010000); a.setr(1, 0x61); a.setr(7, 3)
+        a.st_rr(8, 1, 9, 7)
+    cases['st_rr'] = (st_rr, {m(GOOD): 0x61000000}, (X_ACC_ST, 0xF0010003, USP, None, 0xF0010000))
+    return cases
+
+
+@test
+def user_access_faults():
+    out = []
+    for name, (body, extra, log0) in _stk_cases().items():
+        for lat in (1, 3, 7):
+            out.append(_ufault(body, extra, [f'+LAT={lat}'], log0))
+    return out
+
+
+@test
+def user_fault_pipe_mix():
+    """a faulting PUSH with a missed load waiting in WB, a posted store
+    draining and a DIV behind it; all of it right after the retry"""
+    def body(a):
+        a.setr(3, 0x1111); a.st(64, 3, 12, 0x40)
+        a.setr(1, 100); a.setr(4, 7); a.setr(7, 0x2222); a.setr(2, BADSP)
+        a.setsp(2)
+        a.ld(64, 5, 12, 0x40)
+        a.st(64, 7, 12, 0x48)
+        a.push(1)
+        a.div(6, 1, 4)
+        a.alu('add', 8, 5, 6)
+        a.getsp(2)
+    out = []
+    for lat in (1, 3, 7):
+        out.append(_ufault(body, {'r5': 0x1111, 'r6': 14, 'r8': 0x1111 + 14, 'r2': GOOD - 8,
+                                  m(GOOD - 8): 100, m(GOOD + 0x48): 0x2222},
+                           [f'+LAT={lat}'], (X_ACC_ST, BADSP - 8, BADSP)))
+    return out
+
+
+@test
+def user_fetch_faults():
+    out = []
+
+    def mis(a):
+        a.leapc(10, 'ok'); a.leapc(5, 't'); a.addi_s(5, 5, 2); a.jmpr(5)
+        a.label('t'); a.setr(4, 0xBAD)
+        a.label('ok'); a.setr(6, 0x60)
+    a, exp, plus = _ufault(mis, {'r6': 0x60, 'r4': 0, m(FLOG): X_MISAL_FE}, ())
+    out.append((a, exp, plus))
+
+    def acc(a):
+        a.leapc(10, 'ok'); a.jmp_abs(0xF0010000)
+        a.setr(4, 0xBAD)
+        a.label('ok'); a.setr(6, 0x60)
+    a, exp, plus = _ufault(acc, {'r6': 0x60, 'r4': 0, m(FLOG): X_ACC_FE, m(FLOG + 8): 0xF0010000,
+                                 m(FLOG + 40): (1 << 44) | 0xF0010000}, ())
+    out.append((a, exp, plus))
+
+    # a 2-word op at 0xEFFF_FFFC whose immediate is at 0xF000_0000
+    edw = '+EDW=8BC001006C000000'          # [0xEFFFFFFC] = SETR r1, [0xEFFFFFF8] = NOP
+
+    def strad(a):
+        a.leapc(10, 'ok'); a.setr(1, 0x33); a.jmp_abs(0xEFFFFFFC)
+        a.label('ok'); a.setr(6, 0x60)
+    a, exp, plus = _ufault(strad, {'r6': 0x60, 'r1': 0x33, m(FLOG): X_ACC_FE,
+                                   m(FLOG + 8): 0xF0000000, m(FLOG + 40): (1 << 44) | 0xEFFFFFFC},
+                           (edw,))
+    out.append((a, exp, plus))
+
+    # supervisor controls: the same fetches DO reach the bus
+    a = Asm(); a.jmp_abs(0xF0010000); a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'mmio_rd': 'nonzero'}, []))
+    a = Asm(); a.setr(1, 0x33); a.jmp_abs(0xEFFFFFFC); a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'r1': 0, 'mmio_rd': 'nonzero'}, [edw]))
+    return out
+
+
+@test
+def user_wrongpath_fetch():
+    """a wrong-path, predicted-taken JMP to MMIO behind a mispredicted
+    fused branch: no MMIO read in user mode.  The supervisor variant is the
+    control (it shows whether the speculative fill happens at all)."""
+    out = []
+    for user in (True, False):
+        for lat in (1, 3, 7):
+            a = Asm()
+            _xsetup(a)
+            if user:
+                _to_user(a, 'u')
+            a.label('u')
+            a.setr(12, GOOD); a.setr(6, 0); a.setr(7, 3)
+            # the FBR consumes a load through the bypass, so it waits in EX
+            # for the load's response while the JMP behind it redirects fetch
+            # (a loop: once the code is in the I-cache, fetch outruns the load;
+            # the 2-bit counter still predicts not-taken on the 2nd pass)
+            a.label('top')
+            a.ld(64, 1, 12)
+            a.fbr('eq', 1, 1, 'tk')                # taken; predicted not taken
+            a.jmp_abs(0xF0010000)                  # wrong path, predicted taken
+            a.nop(); a.nop()
+            a.label('tk'); a.dec(7); a.fbr('ne', 7, 0, 'top', imm=True)
+            a.setr(6, 0x66)
+            a.halt()
+            _fixhandler(a)
+            exp = {'end': 'park', 'kind': '0', 'r6': 0x66}
+            if user:
+                exp.update({'mmio_rd': '0', m(FLOG): X_PRIV})
+            out.append((a, exp, [f'+LAT={lat}']))
+    return out
+
+
+@test
+def user_early_fetch():
+    """fetch running ahead of execution toward MMIO: a JMP latched in ID
+    behind a DIV redirects fetch (2a early redirect) while the DIV holds EX.
+    In user mode no MMIO read happens and the JMP raises ACCESS_FETCH; the
+    supervisor control fetches (and parks on the zero words it reads)."""
+    out = []
+    for user in (True, False):
+        a = Asm()
+        if user:                       # (the control parks with EVEC = 0)
+            _xsetup(a)
+            _to_user(a, 'u')
+        a.label('u')
+        a.leapc(10, 'ok')
+        a.setr(1, 1000000); a.setr(2, 3)
+        a.div(3, 1, 2)
+        a.jmp_abs(0xF0010000)
+        a.label('ok'); a.setr(6, 0x66)
+        a.halt()
+        _fixhandler(a)
+        if user:
+            exp = {'end': 'park', 'kind': '0', 'r6': 0x66, 'r3': 333333, 'mmio_rd': '0',
+                   m(FLOG): X_ACC_FE, m(FLOG + 8): 0xF0010000}
+        else:
+            exp = {'end': 'park', 'kind': '2', 'r3': 333333, 'mmio_rd': 'nonzero'}
+        out.append((a, exp, ['+LAT=3']))
+    return out

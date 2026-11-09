@@ -79,6 +79,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    localparam int LO_DW = 1048576;
    localparam logic [31:0] HI_BASE = 32'h07F0_0000;
    localparam int HI_DW = 131072;
+   logic [63:0] edw = 64'h0;          // the dword at 0xEFFF_FFF8 (+EDW=<hex>)
    logic [63:0] mem_lo [0:LO_DW-1];
    logic [63:0] mem_hi [0:HI_DW-1];
 
@@ -88,6 +89,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
          else if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) rd_dw = {60'b0, int_mask_o};
          else rd_dw = 64'h0;
       end
+      else if (a[31:3] == 29'h1DFF_FFFF) rd_dw = edw;   // +EDW: code straddling into 0xF...
       else if (a < 32'(LO_DW*8)) rd_dw = mem_lo[a[31:3]];
       else if (a >= HI_BASE && a < 32'h0800_0000) rd_dw = mem_hi[(a - HI_BASE) >> 3];
       else rd_dw = 64'h0;
@@ -102,7 +104,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
    int          lat_cnt;
    int          uart_n = 0;
    string       uart_s = "";
-   longint      n_rd = 0, n_wr = 0, n_mmio_wr = 0;
+   longint      n_rd = 0, n_wr = 0, n_mmio_wr = 0, n_mmio_rd = 0;
 
    task automatic apply_write(input logic [31:0] a, input logic [63:0] wd, input logic [7:0] be);
       logic [63:0] cur, nxt;
@@ -144,6 +146,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
                m_rdata_next <= rd_dw({q_addr[31:3], 3'b000} + 32'd8);
                m_next_valid <= (q_addr[31:28] != 4'hF) && (q_addr[4:3] != 2'b11);
                n_rd++;
+               if (q_addr[31:28] == 4'hF) n_mmio_rd++;
             end
             m_ready   <= 1'b1;
             in_flight <= 1'b0;
@@ -247,7 +250,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
       for (int i = 0; i < 8; i++) $fdisplay(f, "perf%0d=%0d", i, pst[i]);
       $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d ic_fill=%0d", n_br, n_br_taken,
                 n_fbr_taken, n_ic_miss, n_ic_fill);
-      $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d", n_rd, n_wr, n_mmio_wr);
+      $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d mmio_rd=%0d", n_rd, n_wr, n_mmio_wr, n_mmio_rd);
       $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d", uart_n);
@@ -271,6 +274,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0);
       void'($value$plusargs("LATR=%d", lat_rand));
       void'($value$plusargs("IRQ_PERIOD=%d", irq_period));
       void'($value$plusargs("MAXC=%d", maxc));
+      void'($value$plusargs("EDW=%h", edw));
       $readmemh(img, mem_lo);
       install_handler();
       repeat (4) @(posedge clk);

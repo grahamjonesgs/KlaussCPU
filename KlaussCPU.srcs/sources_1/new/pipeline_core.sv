@@ -1781,6 +1781,29 @@ module pipeline_core
                          :                         ex_a[31:0] + ex_b[31:0];
    logic        mem_misal_st;   // the converted misaligned op was a store
    logic [31:0] mem_ea_raw;
+   // MMU stage 1 data-side access fault (MMU_PLAN.md §7.1): a user-mode
+   // access to MMIO (0xF000_0000+), including the second doubleword of a
+   // LEAVERET / spanning MEMGET32, or an LR/SC to MMIO in either mode.
+   // Computed in EX from the EA and only REGISTERED (mem_xsq): the op
+   // enters MEM converted to an exception op (no port access), and in its
+   // first MEM cycle squashes EX / ID like a taken fused branch.
+   wire ex_memop  = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_STORE ||
+                     ex_d.uop == U_PUSH || ex_d.uop == U_POP || ex_d.uop == U_RET ||
+                     ex_d.uop == U_IRET || ex_d.uop == U_ENTER || ex_d.uop == U_LEAVE ||
+                     ex_d.uop == U_LEAVERET || ex_d.uop == U_LR || ex_d.uop == U_SC ||
+                     (ex_d.uop == U_CALL && ex_bcvt_t[0]));
+   wire ex_mst    = (ex_d.uop == U_STORE || ex_d.uop == U_PUSH || ex_d.uop == U_CALL ||
+                     ex_d.uop == U_ENTER || ex_d.uop == U_SC);
+   wire ex_lrsc   = (ex_d.uop == U_LR || ex_d.uop == U_SC);
+   wire ex_ea_f   = exo_eaddr[31:28] == 4'hF;
+   wire ex_ea_xf  = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && exo_eaddr[2:0] > 3'd4)) &&
+                    exo_eaddr[31:3] == 29'h1DFF_FFFF;     // the 2nd dword is 0xF000_0000
+   wire ex_ufault = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc) &&
+                    (ex_ea_f || ex_ea_xf);
+   // (for the early-issue ops — MEMGET32 [rs1], LEAVERET: EA = ex_a — the
+   // same test from the register alone, off the EA adder)
+   wire ex_uf_early = EN_EXC && umode && (ex_a[31:28] == 4'hF || ex_a[31:3] == 29'h1DFF_FFFF);
+   logic mem_xsq;       // the MEM op is a converted access fault (squash EX / ID)
    // MEM -> WB exception record: wb_xc = the WB op is an exception op
    // (ILLEGAL / TRAP / misaligned / U_EXC), with its cause and EADDR
    logic        wb_xc;
@@ -1845,6 +1868,9 @@ module pipeline_core
    // (ready is earliest 2 cycles after DV, the load reaches WB after 1)
    wire wb_wait      = EN_LD_WB && wb_valid && wb_ld && !(ld_out && w_mrdy) &&
                        !(EN_DC_H && wb_h && wb_hok);
+   // MMU stage 1: an access-fault op in MEM squashes EX / ID on the edge it
+   // leaves MEM (as fbr_taken: only !wb_wait holds it there)
+   wire mem_xsq_go   = EN_EXC && mem_valid && mem_xsq && !wb_wait;
    // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
    // its port request — every younger port user holds off until it issues.
    wire wb_hmiss     = EN_DC_H && wb_valid && wb_h && !wb_hok && !ld_out;
@@ -1962,7 +1988,7 @@ module pipeline_core
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
-                       !ld_out && !fbr_taken && !(DEBUG_EN && dbg_mx);
+                       !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx);
    wire mem_is_read  = mem_port_rd;
    wire mem_is_write = mem_port_wr;
 
@@ -1995,7 +2021,7 @@ module pipeline_core
    // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
    wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr && !wb_wait;   // as it leaves MEM
    wire pht_we_ex    = EN_BP && ex_valid && ex_bp_cnd && !ex_busy && !mem_busy &&
-                       !fbr_taken && !sq_ex;   // (no ras_miss term: training only)
+                       !fbr_taken && !sq_ex && !mem_xsq_go;   // (no ras_miss term: training only)
    assign pht_we = pht_we_mem || pht_we_ex;
    assign pht_wa = pht_we_mem ? mem_bp_idx : ex_bp_idx;
    assign pht_wd = pht_we_mem ? f_sat2(mem_bp_ctr, mem_result[0]) : f_sat2(ex_bp_ctr, ex_bcvt_t[0]);
@@ -2210,7 +2236,8 @@ module pipeline_core
    // is busy EX holds, and a strobe then (with lcd_ready dropping behind it,
    // so ex_busy keeps the op in EX) sent the byte twice; a taken fused branch
    // or an EX squash kills the op, so it must not send.
-   assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex;
+   assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
+                     !mem_xsq_go;
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -2228,7 +2255,7 @@ module pipeline_core
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          umode <= 1'b0; sp_alt <= '0; evec <= '0; eaddr <= '0; ecause <= '0;
          scratch0 <= '0; scratch1 <= '0; tp <= '0; cycle <= '0;
-         res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0;
+         res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0;
          wb_um_we <= 1'b0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
@@ -2544,7 +2571,8 @@ module pipeline_core
          end
 
          lcd_rst_wr <= 1'b0;
-         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !ras_miss && !sq_ex) begin
+         if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
+             !mem_xsq_go) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end
@@ -2827,6 +2855,18 @@ module pipeline_core
                      ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
                   end
                   if_look <= 1'b0;
+               end else if (EN_EXC && umode && miss_dw[28:25] == 4'hF) begin
+                  // MMU stage 1: user mode never fetches from MMIO, not even
+                  // speculatively.  Serve zeros instead (no port, no I-cache
+                  // install); the ID fetch check turns the op ACCESS_FETCH.
+                  if (!in0) begin
+                     ifb_base  <= miss_dw;  ev_rebase = 1'b1;
+                     ifb_dw[0] <= 64'b0;    ifb_val[0] <= 1'b1;
+                     ifb_dw[1] <= 64'b0;    ifb_val[1] <= 1'b0;
+                  end else begin
+                     ifb_dw[1] <= 64'b0;    ifb_val[1] <= 1'b1;
+                  end
+                  if_look <= 1'b0;
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
                   // !irq_active: a lookup that was live when the IRQ was taken must
@@ -3082,7 +3122,7 @@ module pipeline_core
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                // early load issue (see EN_EARLY_LD): the MEM engine then
                // starts in its wait-ready state
-               if (w_early_ld && !ex_misal) begin
+               if (w_early_ld && !ex_misal && !ex_uf_early) begin
                   m_addr     <= exo_iaddr;
                   m_be       <= exo_be;
                   m_read_DV  <= 1'b1;
@@ -3133,7 +3173,7 @@ module pipeline_core
                // mispredicted RET redirects costs only a later RAS miss, and the
                // m_rdata compare would sit on the RAS write enable)
                if (EN_RAS && ex_valid && ex_d.uop == U_CALL && exo_taken &&
-                   !fbr_taken && !sq_ex && !sq_spec) begin
+                   !fbr_taken && !sq_ex && !sq_spec && !mem_xsq_go) begin
                   ras[ras_ptr] <= ex_pc_next;
                   ras_ptr      <= ras_ptr + 1'b1;
                   if (ras_cnt != (RAS_PW+1)'(RAS_DEPTH)) ras_cnt <= ras_cnt + 1'b1;
@@ -3148,6 +3188,23 @@ module pipeline_core
                mem_misal  <= ex_misal;
                mem_misal_st <= (ex_d.uop == U_STORE);
                mem_ea_raw <= ex_ea_raw;
+               // MMU stage 1: an access fault enters MEM as an exception op
+               // with no effects (the squash of EX / ID follows in MEM)
+               mem_xsq    <= ex_ufault;
+               if (ex_ufault) begin
+                  mem_d.uop    <= U_EXC;
+                  mem_d.sub    <= ex_mst ? X_ACC_ST : X_ACC_LD;
+                  mem_d.wreg   <= 1'b0;
+                  mem_d.is_mem <= 1'b0;
+                  mem_d.mtsr   <= 1'b0;
+                  mem_sp_we    <= 1'b0;
+                  mem_fmask    <= '0;
+                  mem_dis_we   <= 1'b0;
+                  mem_lkq      <= 1'b0;  mem_mulq <= 1'b0;  mem_mulf <= 1'b0;  mem_fastq <= 1'b0;
+                  mem_h        <= 1'b0;  mem_h1 <= 1'b0;    mem_fq <= 1'b0;
+                  mem_pred     <= 1'b0;  mem_bp_fbr <= 1'b0;
+                  if (!ex_ea_f) mem_ea_raw <= 32'hF000_0000;   // the 2nd dword faulted
+               end
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -3360,6 +3417,20 @@ module pipeline_core
          // taken meanwhile drains first and then pushes this corrected pc.
          // 2a: a mispredicted return squashes the same way, redirecting to
          // its loaded target (the RET itself retires to WB this edge).
+         // MMU stage 1: an access-fault op leaving MEM squashes everything
+         // younger (EX / ID) and halts fetch; at WB it takes the exception.
+         // (Before the SMC / EN_ST1 squashes below, which are older and win.)
+         if (mem_xsq_go) begin
+            if (DEBUG_EN) begin dbg_active <= 1'b0;  id_bp <= 1'b0; end
+            ev_ovr     = 1'b1;
+            mem_valid  <= 1'b0;
+            ex_valid   <= 1'b0;
+            id_valid   <= 1'b0;
+            dly_on     <= 1'b0;
+            div_ph     <= MD_IDLE;
+            fetch_halt <= 1'b1;
+            irq_active <= 1'b0;
+         end
          if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
             ev_pcz     = 1'b1;
@@ -3490,7 +3561,10 @@ module pipeline_core
          // pre-store window.  Nor on an EN_ST1 squash edge (the window may
          // predate the store).  The capture stays pending; a later, fresh
          // window at the target installs it.
+         // (MMU stage 1: never a window at 0xF... — in user mode that is a
+         // zero-served window, not a copy of an I-cache line)
          if (EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
+             !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
              pc_dw == r_bt_wbase && !sq_spec &&
              !(snoop_q && (r_bt_wbase[IC_IDXW:1] == snoop_idx_q || r_bt_wblidx == snoop_idx_q))) begin
             bt_v[r_bt_widx]    <= 1'b1;
