@@ -260,7 +260,7 @@ of it or none of it.
 | IRET | load, SP, flags, mask, DI, UM, PC | in user mode: PRIVILEGED. In supervisor mode in stage 1 it cannot fault (supervisor may touch MMIO) |
 | MEMGET32 (spanning) | one or two loads, rd | none; both addresses are checked first |
 | DI | rd, DI bit | PRIVILEGED in user mode; cannot fault in supervisor |
-| SC | store (only on success), rd, reservation cleared | none: no store, rd unchanged, and the reservation is **kept**, so the retry after the handler can still succeed |
+| SC | store (only on success), rd, reservation cleared | none: no store, rd unchanged. The SC itself does not clear the reservation, but its exception entry does (§3.3 step 4), so the SC restarted by IRET fails (rd = 1) and the LR/SC loop retries from the LR. Correct, just one extra loop pass |
 | LR | load, rd, reservation set | none; the reservation is not set |
 
 A fault on the *target* of a CALL, RET or IRET (ACCESS_FETCH or
@@ -578,9 +578,9 @@ holds copies of I-cache lines. Supervisor fetch is unchanged.
   checks.
 - A faulting SC leaves rd and memory alone, and does not itself clear the
   reservation. Its exception entry does (§3.3 step 4), so the retried SC
-  fails and the LR/SC loop starts again. The §4.2 table's "so the retry
-  after the handler can still succeed" does not hold as written; this has
-  been raised with the runtime session and §4.2 is left as is.
+  fails and the LR/SC loop starts again. §4.2 originally said the retry
+  could still succeed, which contradicted §3.3/§5.1. It was corrected on
+  2026-11-09 to match this behaviour.
 
 ### 7.7b Other implementation notes
 
