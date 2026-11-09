@@ -1578,3 +1578,41 @@ def clar_misal_fetch_no_halt():
         exp[m(FLOG)] = X_MISAL_LD
     out.append((a, exp, plus))
     return out
+
+
+# ------------------------------------- review finding: squashed queued store
+@test
+def sq_spec_squashed_store():
+    """S1 (posted speculatively) patches the dword holding S2 to a NOP; S2,
+    already in MEM when S1's SMC squash lands, must not reach memory —
+    neither through the store queue (sq_enq_now) nor chained onto the port
+    as S1 drains.  (Also with S2 = an SC.)  From the independent review's
+    t_sq.py repro; fails on b6fa71c / master."""
+    NOP = 0x6C000000
+    out = []
+    for sc in (False, True):
+        for fill in range(0, 6):
+            for lat in (1, 3, 6):
+                a = Asm()
+                a.setr(4, DATA); a.setr(3, 0x55); a.setr(10, 0)
+                if sc:
+                    a.lr(64, 9, 4)
+                a.leapc(5, 's1')
+                a.setr(7, 0); a.setr(6, NOP); a.shift_n('shl', 6, 6, 32)
+                a.ld(64, 7, 5)
+                a.alui('and', 7, 7, 0xFFFFFFFF, sgn=False)
+                a.alu('or', 6, 6, 7)           # {NOP, S1}
+                for _ in range(fill):
+                    a.nop()
+                while (a.pc & 7) != 0:
+                    a.nop()
+                a.label('s1')
+                a.st(64, 6, 5)                 # S1: patch S2's word
+                if sc:
+                    a.sc(64, 10, 3, 4)         # S2 = SC.D r10, r3, [r4]
+                else:
+                    a.st(64, 3, 4)             # S2 = ST [r4], r3
+                a.nop(); a.nop()
+                a.halt()
+                out.append((a, {'end': 'park', 'kind': '0', m(DATA): 0, 'r10': 0}, [f'+LAT={lat}']))
+    return out

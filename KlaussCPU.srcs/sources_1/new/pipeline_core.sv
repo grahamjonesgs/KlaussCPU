@@ -1980,11 +1980,16 @@ module pipeline_core
                        !if_xc && !wb_hmiss && !ld_out && !st_post && !sq_v && !(DEBUG_EN && dbg_mx);
    // EN_SQ: ...or leaves MEM behind the posted store (into sq_*, or straight
    // onto the port if that one drains this edge)
+   // (the EN_ST1 store that left MEM last edge turns out, this cycle, to
+   // overlap fetch-side code: everything younger is squashed — see sq_spec
+   // below the dispatch)
+   wire sq_spec      = EN_ST1 && st_spec && !st_post_ok;
+   // (not on the sq_spec edge: the MEM store is younger than the store that
+   // squashes, and the squash never clears sq_v — it would still write)
    wire sq_enq_now   = EN_SQ && EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
                        mem_iaddr[31:28] != 4'hF && mem_xc == 2'd0 &&
-                       st_post && !sq_v && !if_xc && !wb_hmiss && !ld_out && !(DEBUG_EN && dbg_mx);
-   // ...and, the cycle after, turns out to overlap fetch-side code
-   wire sq_spec      = EN_ST1 && st_spec && !st_post_ok;
+                       st_post && !sq_v && !if_xc && !wb_hmiss && !ld_out && !(DEBUG_EN && dbg_mx) &&
+                       !sq_spec;
    wire mem_done_now = st_spec_now || sq_enq_now ||
                        (mem_xc == 2'd1 && w_mrdy && !mem_need2) ||
                        (mem_xc == 2'd3 && w_mrdy) ||
@@ -2699,7 +2704,10 @@ module pipeline_core
          if (st_spec) st_post_ok <= 1'b0;
 
          // ---------------- MEM port engine (extra_clock pattern) ----------------
-         if (mem_port_op) begin
+         // (nothing issues for a MEM op the EN_ST1 squash kills this edge: a
+         // store chained onto the draining posted store would write, and any
+         // issue would leave mem_xc busy with no MEM op behind it)
+         if (mem_port_op && !sq_spec) begin
             case (mem_xc)
                // wait for the port (IF / a posted store / a fast load's read);
                // 1a: chain onto a fast load's completion edge when the address
@@ -3823,6 +3831,11 @@ module pipeline_core
       if (EN_EXC && wb_valid && wb_um_we)
          assert (!id_valid && !ex_valid && !mem_valid)
             else $fatal(1, "MMU: op in flight behind a committing IRET: pc=%h", wb_pc);
+      // a sq_spec edge always has the posted store still on the port (it
+      // posted last edge), so a younger store cannot post straight onto an
+      // idle port on that edge (st_spec_now needs !st_post)
+      if (sq_spec)
+         assert (st_post || sq_v) else $fatal(1, "sq_spec with the port idle: pc=%h", mem_pc);
       if (id_valid)
          assert (id_ser == dec.serialize)
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
