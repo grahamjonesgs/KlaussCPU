@@ -113,7 +113,7 @@ module sd_native (
     // -----------------------------------------------------------------------
     logic [31:0] r_arg;
     logic [63:0] r_resp0, r_resp1;
-    logic [11:3] r_blksz;            // block size in 8-byte words
+    logic [11:2] r_blksz;            // block size in 4-byte units (a multiple of 4, §4.3)
     logic [15:0] r_blkcnt;           // 0 = open-ended
     logic        r_cmd_done, r_data_done;
     logic [10:0] r_err;
@@ -175,7 +175,9 @@ module sd_native (
                               D_WR_REL, D_WR_TOK, D_WR_TST, D_WR_BUSY} dstate_t;
     dstate_t     r_d_state;
     logic        r_d_w4;
-    logic [8:0]  r_d_blkw;          // words per block (1..511)
+    logic [9:0]  r_d_blkw;          // FIFO words per block, ceil(size / 8)
+    logic [9:0]  r_d_sz4;           // block size in 4-byte units (latched)
+    logic [5:0]  r_d_wpos;          // unit position within the current word
     logic [15:0] r_d_cnt;           // block count, 0 = open-ended
     logic [14:0] r_d_units;         // bits (1-bit) or nibbles (4-bit) left in the block
     logic [4:0]  r_d_aux;
@@ -204,7 +206,10 @@ module sd_native (
 
     wire [9:0]  w_level = r_wc - r_rp;
     wire [9:0]  w_used  = r_wp - r_rp;
-    wire [8:0]  w_blkw  = (r_blksz == 9'd0) ? 9'd1 : r_blksz;   // a size of 0 acts as 8 bytes
+    // a size field of 0 (or 1..3 written) acts as 8 bytes; a block takes
+    // ceil(size / 8) words, the last one half full when size mod 8 = 4
+    wire [9:0]  w_sz4   = (r_blksz == 10'd0) ? 10'd2 : r_blksz;
+    wire [9:0]  w_blkw  = 10'((11'(w_sz4) + 11'd1) >> 1);
     wire        w_full  = (w_used == 10'd512);
 
     // -----------------------------------------------------------------------
@@ -223,9 +228,11 @@ module sd_native (
     wire       w_acc_data = w_cmd_acc && i_wdata[11];
     wire       w_acc_stop = w_cmd_acc && i_wdata[13];
 
-    // words per word-boundary test
-    wire w_rx_wordb = r_d_w4 ? (r_d_units[3:0] == 4'd1) : (r_d_units[5:0] == 6'd1);
+    // the last unit of a FIFO word: a full word, or the block's last unit
+    // (which ends a half word when size mod 8 = 4)
+    wire w_rx_wordb = (r_d_wpos == (r_d_w4 ? 6'd15 : 6'd63)) || (r_d_units == 15'd1);
     wire w_tx_wordb = w_rx_wordb;
+    wire w_rx_half  = (r_d_units == 15'd1) && r_d_sz4[0];
 
     // receive: next shifter value and the end-of-block checks
     wire [63:0] w_rx_next = r_d_w4 ? {r_d_sh[59:0], r_dat_in} : {r_d_sh[62:0], r_dat_in[0]};
@@ -235,7 +242,7 @@ module sd_native (
     wire w_rd_last_blk = (r_d_cnt != 16'd0) && (r_blkdone + 16'd1 == r_d_cnt);
 
     // write: a whole block in the FIFO and the head word ready
-    wire w_blk_ready = (w_level >= {1'b0, r_d_blkw}) && r_head_v;
+    wire w_blk_ready = (w_level >= r_d_blkw) && r_head_v;
 
     // FIFO side effects
     wire w_eng_we  = r_samp && (r_d_state == D_RD_DATA) && w_rx_wordb;
@@ -258,9 +265,9 @@ module sd_native (
     // NONE (after a FIFO reset, so a write pre-fill never raises it).
     // The block size (and count) are those latched by the data command
     // (§4.8): SDM_BLK writes take effect at the next data command.
-    wire w_thresh_rd = (r_dir == DIR_READ) && (w_level >= {1'b0, r_d_blkw});
+    wire w_thresh_rd = (r_dir == DIR_READ) && (w_level >= r_d_blkw);
     wire w_thresh_wr = (r_dir == DIR_WRITE) && w_d_write
-                       && ((11'd512 - {1'b0, w_level}) >= {2'b0, r_d_blkw})
+                       && ((11'd512 - {1'b0, w_level}) >= {1'b0, r_d_blkw})
                        && ((r_d_cnt == 16'd0) || (r_push_words < r_d_target));
     wire w_thresh    = w_thresh_rd || w_thresh_wr;
     wire w_err_any   = |r_err;
@@ -272,7 +279,10 @@ module sd_native (
     // FIFO memory (simple dual port, synchronous read)
     // -----------------------------------------------------------------------
     wire        w_mem_we    = (w_eng_we && !w_full) || w_push_ok;
-    wire [63:0] w_mem_wdata = w_eng_we ? f_bswap(w_rx_next) : i_wdata;
+    // a half last word: its 4 bytes in [31:0], [63:32] = 0
+    wire [63:0] w_rx_word   = w_rx_half ? {32'h0, w_rx_next[7:0], w_rx_next[15:8], w_rx_next[23:16], w_rx_next[31:24]}
+                                        : f_bswap(w_rx_next);
+    wire [63:0] w_mem_wdata = w_eng_we ? w_rx_word : i_wdata;
     always_ff @(posedge i_Clk) begin
         if (w_mem_we) r_mem[r_wp[8:0]] <= w_mem_wdata;
         if (w_fetch)  r_mem_q <= r_mem[r_mrp[8:0]];
@@ -308,7 +318,7 @@ module sd_native (
             r_waddr_q   <= 16'h0; r_raddr_q <= 16'h0;
             r_arg       <= 32'h0;
             r_resp0     <= 64'h0; r_resp1 <= 64'h0;
-            r_blksz     <= 9'd64; r_blkcnt <= 16'd1;       // 0x0001_0200
+            r_blksz     <= 10'd128; r_blkcnt <= 16'd1;     // 0x0001_0200
             r_dir       <= DIR_NONE;
             r_cmd_done  <= 1'b0;  r_data_done <= 1'b0;
             r_err       <= 11'h0;
@@ -325,7 +335,8 @@ module sd_native (
             r_c_sh      <= 128'h0;
             r_c_busy    <= 32'h0;
             r_d_state   <= D_IDLE;
-            r_d_w4      <= 1'b0;  r_d_blkw <= 9'd64; r_d_cnt <= 16'd1;
+            r_d_w4      <= 1'b0;  r_d_blkw <= 10'd64; r_d_sz4 <= 10'd128; r_d_cnt <= 16'd1;
+            r_d_wpos    <= 6'd0;
             r_d_target  <= 26'd64;
             r_d_units   <= 15'd0; r_d_aux <= 5'd0;  r_d_tok <= 4'd0;
             for (int i = 0; i < 4; i++) r_d_crc[i] <= 16'h0;
@@ -347,7 +358,7 @@ module sd_native (
 
             // ---------------- plain register writes ----------------
             if (w_wr && w_off == O_ARG)   r_arg <= i_wdata[31:0];
-            if (w_wr && w_off == O_BLK)   begin r_blksz <= i_wdata[11:3]; r_blkcnt <= i_wdata[31:16]; end
+            if (w_wr && w_off == O_BLK)   begin r_blksz <= i_wdata[11:2]; r_blkcnt <= i_wdata[31:16]; end
             if (w_wr && w_off == O_IRQEN) r_irq_en <= i_wdata[26:0] & IRQ_MASK[26:0];
             if (w_wr && w_off == O_TMO)   begin r_tmo_data <= i_wdata[31:0]; r_tmo_busy <= i_wdata[63:32]; end
             if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= i_wdata[0]; r_cfg_clkon <= i_wdata[2]; end
@@ -391,7 +402,7 @@ module sd_native (
                     r_err[E_FIFO] <= 1'b1;
                 end
             end
-            r_rd_room <= ({1'b0, w_used} + {2'b0, r_d_blkw}) <= 11'd512;
+            r_rd_room <= ({1'b0, w_used} + {1'b0, r_d_blkw}) <= 11'd512;
 
             // =================================================================
             // Engines (only in SD mode; otherwise idle and off the pins)
@@ -553,7 +564,8 @@ module sd_native (
                             r_d_state <= D_IDLE;            // response error: abort, no DATA_DONE
                         end else if (r_samp) begin
                             if (!r_dat_in[0]) begin
-                                r_d_units <= r_d_w4 ? {2'b0, r_d_blkw, 4'b0} : {r_d_blkw, 6'b0};
+                                r_d_units <= r_d_w4 ? {2'b0, r_d_sz4, 3'b0} : {r_d_sz4, 5'b0};
+                                r_d_wpos  <= 6'd0;
                                 for (int i = 0; i < 4; i++) r_d_crc[i] <= 16'h0;
                                 r_d_state <= D_RD_DATA;
                             end else if (r_d_tmo >= r_tmo_data) begin
@@ -578,6 +590,7 @@ module sd_native (
                                 else        r_wp <= r_wp + 10'd1;
                             end
                             r_d_units <= r_d_units - 15'd1;
+                            r_d_wpos  <= w_rx_wordb ? 6'd0 : r_d_wpos + 6'd1;
                             if (r_d_units == 15'd1) begin
                                 r_d_aux   <= 5'd0;
                                 r_d_state <= D_RD_CRC;
@@ -642,7 +655,8 @@ module sd_native (
                             o_dat     <= r_d_w4 ? 4'h0 : 4'hE;   // start bit
                             o_dat_oe  <= r_d_w4 ? 4'hF : 4'h1;
                             r_d_sh    <= f_bswap(r_head);
-                            r_d_units <= r_d_w4 ? {2'b0, r_d_blkw, 4'b0} : {r_d_blkw, 6'b0};
+                            r_d_units <= r_d_w4 ? {2'b0, r_d_sz4, 3'b0} : {r_d_sz4, 5'b0};
+                            r_d_wpos  <= 6'd0;
                             for (int i = 0; i < 4; i++) r_d_crc[i] <= 16'h0;
                             r_d_state <= D_WR_DATA;
                         end
@@ -655,6 +669,7 @@ module sd_native (
                             for (int i = 0; i < 4; i++)
                                 if (r_d_w4 || i == 0) r_d_crc[i] <= f_crc16(r_d_crc[i], u[i]);
                             r_d_units <= r_d_units - 15'd1;
+                            r_d_wpos  <= w_tx_wordb ? 6'd0 : r_d_wpos + 6'd1;
                             if (r_d_units == 15'd1) begin
                                 r_d_aux   <= 5'd0;
                                 r_d_state <= D_WR_CRC;
@@ -761,6 +776,7 @@ module sd_native (
                     r_blkdone <= 16'h0;
                     r_d_w4    <= r_cfg_w4;
                     r_d_blkw  <= w_blkw;
+                    r_d_sz4   <= w_sz4;
                     r_d_cnt   <= r_blkcnt;
                     r_d_target <= r_blkcnt * w_blkw;
                     r_d_state <= i_wdata[12] ? D_WR_WRSP : D_RD_WCMD;
@@ -787,7 +803,7 @@ module sd_native (
             O_ARG:     o_rdata <= {32'h0, r_arg};
             O_RESP0:   o_rdata <= r_resp0;
             O_RESP1:   o_rdata <= r_resp1;
-            O_BLK:     o_rdata <= {32'h0, r_blkcnt, 4'h0, r_blksz, 3'b000};
+            O_BLK:     o_rdata <= {32'h0, r_blkcnt, 4'h0, r_blksz, 2'b00};
             O_STATUS:  o_rdata <= {32'h0, w_status};
             O_IRQEN:   o_rdata <= {37'h0, r_irq_en};
             O_TMO:     o_rdata <= {r_tmo_busy, r_tmo_data};

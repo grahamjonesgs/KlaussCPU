@@ -160,6 +160,15 @@ module tb_sd_native;
         for (int k = 0; k < 8; k++) w[8*k +: 8] = card.rd_byte(byteaddr + k);
         return w;
     endfunction
+    function automatic logic [31:0] f_be32(input int v);     // big-endian bytes, byte 0 in [7:0]
+        return {8'(v), 8'(v >> 8), 8'(v >> 16), 8'(v >> 24)};
+    endfunction
+    // FIFO word w of a short block (bytes) from the card, half word zero-padded
+    function automatic logic [63:0] card_word_n(input longint blkaddr, input int w, input int bytes);
+        logic [63:0] x = 0;
+        for (int k = 0; k < 8; k++) if (w * 8 + k < bytes) x[8*k +: 8] = card.rd_byte(blkaddr * 512 + w * 8 + k);
+        return x;
+    endfunction
     function automatic logic [63:0] wpat(input longint blk, input int w, input int seed);
         return {32'(blk * 1000 + w + seed), 32'(32'hA5C3_0000 ^ (w * 7919) ^ (seed << 20))};
     endfunction
@@ -258,7 +267,8 @@ module tb_sd_native;
 
         // =========================================================== register R/W
         mw(SDM_ARG, 64'hFFFF_FFFF_1234_5678);    mr(SDM_ARG, d);  check("SDM_ARG", d, 64'h1234_5678);
-        mw(SDM_BLK, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_BLK, d);  check("SDM_BLK [2:0]/[15:12] read 0", d, 64'hFFFF_0FF8);
+        mw(SDM_BLK, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_BLK, d);  check("SDM_BLK [1:0]/[15:12] read 0", d, 64'hFFFF_0FFC);
+        mw(SDM_BLK, 64'h0001_0003);              mr(SDM_BLK, d);  check("SDM_BLK size 3 reads 0", d, 64'h0001_0000);
         mw(SDM_IRQ_EN, 64'hFFFF_FFFF_FFFF_FFFF); mr(SDM_IRQ_EN, d); check("SDM_IRQ_EN mask", d, 64'h07FF_0310);
         mw(SDM_IRQ_EN, 0);
         mw(SDM_CFG, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_CFG, d);  check("SDM_CFG reserved bits read 0", d, 64'h5);
@@ -339,6 +349,15 @@ module tb_sd_native;
         pop(d); check("SCR little-endian (byte 0 = 0x02 in [7:0])", d, 64'h0000_0000_0380_3502);
         mr(SDM_FIFO, d); check("SCR popped", d, 0);
         pop(d); check("pop from empty FIFO returns 0", d, 0);
+        wait_card_idle();
+        // ACMD22 (4-byte block, 1-bit): one half word, [63:32] = 0
+        fifo_reset(); set_blk(4, 1);
+        do_cmd("CMD55", 55, {rca, 16'h0}, RT_R1, st);
+        clr_status(); cmd_start(22, 0, RT_R1, 1, 0); wait_data(st);
+        check("ACMD22 1-bit DATA_DONE", st[B_DATA_DONE], 1);
+        check("ACMD22 1-bit no error", st & ERR_MASK, 0);
+        mr(SDM_FIFO, d); check("ACMD22: one word", d, 1);
+        pop(d); check("ACMD22 1-bit: count in [31:0], [63:32] = 0", d, {32'h0, f_be32(card.blocks_written)});
         mr(SDM_FIFO, d); check("pop from empty FIFO leaves level 0", d, 0);
         wait_card_idle();
 
@@ -406,6 +425,64 @@ module tb_sd_native;
         check("early data: no error", st & ERR_MASK, 0);
         pop(d); check("early data: SCR", d, 64'h0000_0000_0380_3502);
         card.n_ac = 8;
+        wait_card_idle();
+
+        // =========================================================== 4-byte granularity (§4.3): ACMD22, 12-byte blocks
+        fifo_reset(); set_blk(4, 1);
+        do_cmd("CMD55", 55, {rca, 16'h0}, RT_R1, st);
+        clr_status(); cmd_start(22, 0, RT_R1, 1, 0); wait_data(st);
+        check("ACMD22 4-bit DATA_DONE", st[B_DATA_DONE], 1);
+        check("ACMD22 4-bit no error", st & ERR_MASK, 0);
+        pop(d); check("ACMD22 4-bit word", d, {32'h0, f_be32(card.blocks_written)});
+        wait_card_idle();
+        do_cmd("CMD16 12", 16, 12, RT_R1, st);
+        fifo_reset(); clr_status(); set_blk(12, 3);
+        cmd_start(18, 14000, RT_R1, 1, 0);
+        wait_data(st);
+        check("12-byte x3 read DATA_DONE", st[B_DATA_DONE], 1);
+        check("12-byte x3 read no error", st & ERR_MASK, 0);
+        mr(SDM_FIFO, d); check("12-byte x3 read: 2 words per block", d, 6);
+        check("12-byte read THRESH (level >= 2 words)", st[B_THRESH], 1);
+        begin
+            automatic int bad = 0;
+            for (int b = 0; b < 3; b++)
+                for (int w = 0; w < 2; w++) begin
+                    pop(d);
+                    if (d !== card_word_n(14000 + b, w, 12)) begin
+                        bad++; $display("FAIL 12-byte read block %0d word %0d: %h exp %h", b, w, d, card_word_n(14000 + b, w, 12));
+                    end
+                end
+            check("12-byte x3 read data (half last words, [63:32] = 0)", bad, 0);
+        end
+        mr(SDM_BLKDONE, d); check("12-byte read BLKDONE", d, 3);
+        do_cmd("CMD12", 12, 0, RT_R1B, st);
+        wait_card_idle();
+        // 12-byte multi-block write: [63:32] of each half word must not go out
+        fifo_reset(); clr_status(); set_blk(12, 3);
+        for (int b = 0; b < 2; b++) begin push(wpat(14100 + b, 0, 5)); push({32'hDEAD_BEEF, wpat(14100 + b, 1, 5)[31:0]}); end
+        cmd_start(25, 14100, RT_R1, 1, 1);
+        t0 = ncyc;
+        do status(st); while (!st[B_THRESH] && ncyc - t0 < 1_000_000);
+        check("12-byte write THRESH for the third block", st[B_THRESH], 1);
+        push(wpat(14102, 0, 5)); push({32'hDEAD_BEEF, wpat(14102, 1, 5)[31:0]});
+        status(st); check("12-byte write THRESH clear after 3 blocks (6 words)", st[B_THRESH], 0);
+        wait_data(st);
+        check("12-byte x3 write DATA_DONE", st[B_DATA_DONE], 1);
+        check("12-byte x3 write no error", st & ERR_MASK, 0);
+        mr(SDM_BLKDONE, d); check("12-byte write BLKDONE", d, 3);
+        do_cmd("CMD12", 12, 0, RT_R1B, st);
+        begin
+            automatic int bad = 0;
+            for (int b = 0; b < 3; b++) begin
+                if (card_word(longint'(14100 + b) * 512) !== wpat(14100 + b, 0, 5)) bad++;
+                for (int k = 8; k < 12; k++)
+                    if (card.rd_byte(longint'(14100 + b) * 512 + k) !== wpat(14100 + b, 1, 5)[8*(k-8) +: 8]) bad++;
+                for (int k = 12; k < 16; k++)            // beyond the block: untouched
+                    if (card.mem.exists(longint'(14100 + b) * 512 + k)) bad++;
+            end
+            check("12-byte x3 write: 12 bytes per block on the card, nothing more", bad, 0);
+        end
+        do_cmd("CMD16 512", 16, 512, RT_R1, st);
         wait_card_idle();
 
         // =========================================================== read flow control: 20 blocks, CPU slow
@@ -786,6 +863,28 @@ module tb_sd_native;
         check("CMD25 1-bit no error", st & ERR_MASK, 0);
         do_cmd("CMD12", 12, 0, RT_R1B, st);
         check_written("CMD25 1-bit x2", 12100, 2, 99);
+        wait_card_idle();
+        do_cmd("CMD16 12", 16, 12, RT_R1, st);
+        fifo_reset(); clr_status(); set_blk(12, 2);
+        cmd_start(18, 12200, RT_R1, 1, 0); wait_data(st);
+        check("12-byte 1-bit read no error", st & ERR_MASK, 0);
+        begin
+            automatic int bad = 0;
+            for (int b = 0; b < 2; b++) for (int w = 0; w < 2; w++) begin
+                pop(d); if (d !== card_word_n(12200 + b, w, 12)) bad++;
+            end
+            check("12-byte 1-bit read data", bad, 0);
+        end
+        do_cmd("CMD12", 12, 0, RT_R1B, st);
+        wait_card_idle();
+        fifo_reset(); clr_status(); set_blk(12, 1);
+        push(wpat(12300, 0, 6)); push({32'hFFFF_FFFF, wpat(12300, 1, 6)[31:0]});
+        cmd_start(24, 12300, RT_R1, 1, 1); wait_data(st);
+        check("12-byte 1-bit write DATA_DONE", st[B_DATA_DONE], 1);
+        check("12-byte 1-bit write no error", st & ERR_MASK, 0);
+        check("12-byte 1-bit write: bytes 0..7", card_word(longint'(12300) * 512), wpat(12300, 0, 6));
+        check("12-byte 1-bit write: bytes 8..11", card_word(longint'(12300) * 512 + 8) & 64'hFFFF_FFFF, wpat(12300, 1, 6) & 64'hFFFF_FFFF);
+        do_cmd("CMD16 512", 16, 512, RT_R1, st);
         wait_card_idle();
 
         // =========================================================== program-load reset

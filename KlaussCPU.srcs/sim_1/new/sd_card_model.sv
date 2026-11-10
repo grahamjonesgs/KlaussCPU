@@ -3,7 +3,10 @@
 // sd_card_model — behavioural SDHC card on the native SD bus, for simulation
 // only (tb_sd_native).  Not synthesisable.
 //
-// Commands: CMD0/2/3/6/7/8/9/12/13/16/17/18/24/25/55, ACMD6/13/41/51.
+// Commands: CMD0/2/3/6/7/8/9/12/13/16/17/18/24/25/55, ACMD6/13/22/41/51.
+// CMD16 sets the length of CMD17/18/24/25 blocks (1..512; block addresses
+// keep a 512-byte stride), so short blocks can be tested; ACMD22 returns the
+// count of blocks written (4 bytes, big-endian).
 // Responses R1/R1b/R2/R3/R6/R7 with correct CRC7 (unless injected), 1-bit and
 // 4-bit data with one CRC16 per line, write CRC status token + busy, a
 // sparse byte backing store (absent bytes read as f_pat(addr)).
@@ -66,6 +69,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     int  last_idx = -1;
     logic [31:0] last_arg;
     bit  w4 = 0;              // bus width
+    int  blen = 512;          // CMD16 block length for memory blocks
     logic [15:0] rca = 16'h0;
     localparam logic [15:0] NEW_RCA = 16'hB37A;
 
@@ -244,19 +248,22 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     endtask
 
     task automatic rd_sender(input longint blk, input bit multi, input int kind);
-        // kind 0: memory blocks, 1: SCR (8 B), 2: CMD6 status (64 B), 3: SD status (64 B)
+        // kind 0: memory blocks, 1: SCR (8 B), 2: CMD6 status (64 B), 3: SD status (64 B),
+        // 4: ACMD22 blocks written (4 B)
         int nb = 0;
+        int nwr = blocks_written;
         repeat (n_ac) @(posedge clk);
         forever begin
             logic [7:0] b[];
             int len;
-            len = (kind == 0) ? 512 : (kind == 1) ? 8 : 64;
+            len = (kind == 0) ? blen : (kind == 1) ? 8 : (kind == 4) ? 4 : 64;
             b = new[len];
             for (int k = 0; k < len; k++)
                 case (kind)
                     0: b[k] = rd_byte((blk + nb) * 512 + k);
                     1: b[k] = scr[63 - 8*k -: 8];
                     2: b[k] = sw_status[k];
+                    4: b[k] = 8'(nwr >> (24 - 8 * k));
                     default: b[k] = sd_status[k];
                 endcase
             send_block(b, len, nb == inj_rd_crc_blk, nb == inj_rd_end_blk);
@@ -300,7 +307,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             if (w4 && dat !== 4'h0) herr($sformatf("write start bit not on all lines (%b)", dat));
             if (clk_n - wr_ref - 1 < 2) herr($sformatf("N_WR %0d < 2", clk_n - wr_ref - 1));
             for (int i = 0; i < 4; i++) begin c[i] = 0; rc[i] = 0; end
-            for (int k = 0; k < 512; k++) begin
+            for (int k = 0; k < blen; k++) begin
                 if (w4) begin
                     logic [3:0] hi, lo;
                     @(posedge clk); hi = dat; for (int i = 0; i < 4; i++) c[i] = crc16_step(c[i], hi[i]);
@@ -332,7 +339,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                 for (int j = 2; j >= 0; j--) begin @(negedge clk); drv_dat({3'b111, tok[j]}, 4'h1); end
                 @(negedge clk); drv_dat(4'hF, 4'h1);
                 if (tok == 3'b010) begin
-                    for (int k = 0; k < 512; k++) mem[(blk + nb) * 512 + k] = b[k];
+                    for (int k = 0; k < blen; k++) mem[(blk + nb) * 512 + k] = b[k];
                     blocks_written++;
                     busy = (nb == inj_wr_longbusy_blk) ? long_busy : wr_busy;
                     if (nb == inj_wr_longbusy_blk) inj_wr_longbusy_blk = -1;
@@ -411,6 +418,10 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                     logic [31:0] s; s = status32() | 32'h20;
                     st = S_DATA; start_read(0, 0, 3); send_r48(idx, s); return;
                 end
+                6'd22: if (st == S_TRAN) begin
+                    logic [31:0] s; s = status32() | 32'h20;
+                    st = S_DATA; start_read(0, 0, 4); send_r48(idx, s); return;
+                end
                 6'd41: if (st == S_IDLE || st == S_READY) begin
                     acmd41_n++;
                     ocr_ready = (acmd41_n > acmd41_busy_n);
@@ -462,7 +473,10 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                 inj_r1b_long = 0;
             end
             6'd13: if (arg[31:16] == rca) send_r48(idx, status32());
-            6'd16: if (st == S_TRAN) send_r48(idx, status32());
+            6'd16: if (st == S_TRAN) begin
+                if (arg >= 1 && arg <= 512) blen = arg;
+                send_r48(idx, status32());
+            end
             6'd17, 6'd18: if (st == S_TRAN) begin
                 // data is timed from the command's end bit (N_AC), so with
                 // a small n_ac it starts before the response has finished
