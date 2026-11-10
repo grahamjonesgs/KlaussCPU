@@ -457,6 +457,10 @@ which models this controller. The RTL and the emulator follow this table.
 | Clearing SD_MODE (a `SD_CTRL` write) | the command and data engines abandon what they are doing: busy bits clear, no DONE bit is set, and the pins return to the SPI mapping. The registers, the FIFO contents and DIR are kept. |
 | Registers other than `SDM_CMD` while SD_MODE = 0 | work normally: read and write, `SDM_DATA` pop and push, W1C on `SDM_STATUS`, FIFO reset |
 | `SDM_BLK` size field written with 0 | treated as 8 (`[2:0]` read 0, so the field reads 0). Software must not use it. |
+| Block size used by FIFO_THRESH and the data engine | the size **latched when the data command is issued**, during the phase and after it ends (DIR = READ). Writing `SDM_BLK` mid-phase or after the phase has no effect until the next data command. |
+| `SDM_RESP*` after CMD_TIMEOUT (types 1–4) | unchanged. After a CRC, end-bit or index error they hold the response as received. |
+| Counted write stopped early by CMD12 | the unsent words stay in the FIFO (the driver resets it) |
+| An ignored `SDM_CMD` (SD_MODE = 0, CMD_BUSY, or data while DATA_BUSY) | ignored entirely: DIR, `SDM_BLKDONE`, the latched size and every status bit are unchanged |
 
 ## 5. Software interface: what the runtime session reviews
 
