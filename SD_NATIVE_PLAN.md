@@ -634,6 +634,13 @@ WNS +0.008, WHS +0.013; 35.5k LUTs = 56 %, 70.2 % slices, 75.5 BRAM;
   - The gap to the bare-metal 12 MB/s is Linux's per-request CPU cost; the
     runtime session is tuning it.
   - No error bits were seen.
+- **Linux native driver on `5648f75` (runtime 8348ad4+), 2026-11-10:**
+  - Starting from a card left in SPI mode, the driver's own power cycle
+    switched it to SD mode: SDXC, 4-bit, 25 MHz.
+  - The SD root boots, the QSPI host key is presented (`DYRxGy…IYI`), and
+    eth0 works through the cascade (DHCP, ping 1.3 ms, ssh).
+  - 16 MiB × 2: raw read 3.08, file read 3.10, write plus sync 1.96 MB/s.
+  - The runtime session signs off 5648f75 as the native-SD release.
 
 ## 7. Cost and timing (question 6)
 
