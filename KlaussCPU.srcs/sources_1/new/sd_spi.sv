@@ -30,24 +30,36 @@
 //
 // SD_DAT[1] and SD_DAT[2] are unused in SPI mode but should not float; we
 // drive them high.
+//
+// Native SD mode (SD_CTRL[18] = SD_MODE, SD_NATIVE_PLAN.md): the sd_native
+// engine (1-bit / 4-bit SD bus, command and data engines, a 4 KiB FIFO,
+// registers 0x100..0x1F8) takes over the pins.  With SD_MODE = 0 the block
+// is the SPI controller above, unchanged: same registers, pin values and
+// timing (CMD = MOSI, DAT3 = CS_n, DAT1/DAT2 driven high, DAT0 = MISO).
+// Reset: CPU_RESETN resets everything; a program load (i_load_rst) resets
+// the whole controller as CPU_RESETN does iff SD_MODE = 1 (clearing SD_MODE
+// and pwr_en), and changes nothing if SD_MODE = 0.
 //////////////////////////////////////////////////////////////////////////////////
 
 module sd_spi (
     input             i_Clk,
     input             i_Rst_L,
+    input             i_load_rst,      // program load (LOAD_COMPLETE) pulse
 
     // ----- MMIO peripheral bus (slave). Offsets use mmio.addr[15:0]. -----
     mmio_if.slave     mmio,
+    output            o_irq,           // native-mode interrupt (level, registered)
 
     // ----- SD card pins (Nexys A7 microSD slot) -----
     input             i_sd_cd,         // card detect (board-dependent polarity)
     output            o_sd_reset_n,    // active-low slot power gate (0 = powered)
-    output logic        o_sd_sck,
-    output logic        o_sd_mosi,
-    input             i_sd_miso,
-    output logic        o_sd_cs_n,
-    output            o_sd_dat1,       // unused in SPI mode — drive high
-    output            o_sd_dat2        // unused in SPI mode — drive high
+    output            o_sd_sck,        // SCK / CLK
+    output            o_sd_cmd,        // CMD (SPI: MOSI)
+    output            o_sd_cmd_oe,
+    input             i_sd_cmd,
+    output     [3:0]  o_sd_dat,        // DAT[3:0] (SPI: DAT3 = CS_n, DAT1/2 high)
+    output     [3:0]  o_sd_dat_oe,
+    input      [3:0]  i_sd_dat         // (SPI: DAT0 = MISO)
 );
 
     // -----------------------------------------------------------------------
@@ -71,11 +83,16 @@ module sd_spi (
     // -----------------------------------------------------------------------
     logic [15:0] r_clk_div;     // half-period of SCK, in i_Clk cycles minus 1
     logic        r_pwr_en;      // 1 → slot powered (drives SD_RESET low)
-    // o_sd_cs_n is a reg, written directly from SD_CTRL[16] writes.
+    logic        r_sd_mode;     // SD_CTRL[18]: 1 = native SD bus (sd_native)
+    logic        o_sd_cs_n;     // SPI chip select, written directly from SD_CTRL[16]
+    logic        o_sd_sck_spi;  // SPI shifter's SCK and MOSI
+    logic        o_sd_mosi;
+    wire         i_sd_miso = i_sd_dat[0];
 
     assign o_sd_reset_n = ~r_pwr_en;
-    assign o_sd_dat1    = 1'b1;
-    assign o_sd_dat2    = 1'b1;
+
+    // Program-load reset: only when the last program used native mode.
+    wire w_soft_rst = i_load_rst && r_sd_mode;
 
     // -----------------------------------------------------------------------
     // Byte transfer FSM (SPI mode 0, MSB first).
@@ -109,12 +126,23 @@ module sd_spi (
             r_rx_shift    <= 8'h00;
             r_rx_byte     <= 8'hFF;
             r_byte_busy   <= 1'b0;
-            o_sd_sck      <= 1'b0;
+            o_sd_sck_spi  <= 1'b0;
+            o_sd_mosi     <= 1'b1;
+        end else if (w_soft_rst) begin
+            r_byte_sm     <= BYTE_IDLE;
+            r_bit_idx     <= 3'd7;
+            r_sck_phase   <= 1'b0;
+            r_phase_count <= 16'd0;
+            r_tx_shift    <= 8'hFF;
+            r_rx_shift    <= 8'h00;
+            r_rx_byte     <= 8'hFF;
+            r_byte_busy   <= 1'b0;
+            o_sd_sck_spi  <= 1'b0;
             o_sd_mosi     <= 1'b1;
         end else begin
             case (r_byte_sm)
                 BYTE_IDLE: begin
-                    o_sd_sck      <= 1'b0;
+                    o_sd_sck_spi  <= 1'b0;
                     r_byte_busy   <= 1'b0;
                     r_phase_count <= 16'd0;
                     r_sck_phase   <= 1'b0;
@@ -132,12 +160,12 @@ module sd_spi (
                         r_phase_count <= 16'd0;
                         if (r_sck_phase == 1'b0) begin
                             // End of SCK-low half — drive SCK high; slave samples MOSI on this edge.
-                            o_sd_sck    <= 1'b1;
+                            o_sd_sck_spi <= 1'b1;
                             r_sck_phase <= 1'b1;
                         end else begin
                             // End of SCK-high half — sample MISO, then either advance bit or finish.
                             r_rx_shift  <= {r_rx_shift[6:0], i_sd_miso};
-                            o_sd_sck    <= 1'b0;
+                            o_sd_sck_spi <= 1'b0;
                             r_sck_phase <= 1'b0;
                             if (r_bit_idx == 3'd0) begin
                                 r_rx_byte   <= {r_rx_shift[6:0], i_sd_miso};
@@ -183,23 +211,75 @@ module sd_spi (
             r_clk_div <= 16'd249;   // ~200 kHz init speed @ 100 MHz i_Clk
             o_sd_cs_n <= 1'b1;       // CS deasserted
             r_pwr_en  <= 1'b0;       // slot off
+            r_sd_mode <= 1'b0;       // SPI mode
+        end else if (w_soft_rst) begin
+            r_clk_div <= 16'd249;
+            o_sd_cs_n <= 1'b1;
+            r_pwr_en  <= 1'b0;
+            r_sd_mode <= 1'b0;
         end else if (mmio.write_DV && (mmio.addr[15:0] == OFF_CTRL)) begin
             r_clk_div <= mmio.write_data[15:0];
             o_sd_cs_n <= mmio.write_data[16];
             r_pwr_en  <= mmio.write_data[17];
+            r_sd_mode <= mmio.write_data[18];
         end
     end
 
     // -----------------------------------------------------------------------
-    // Read mux — combinational. Returns 0 for undefined offsets.
+    // Native SD engine (SD_MODE = 1) and the pin mux
+    // -----------------------------------------------------------------------
+    // Its own synchronous reset: CPU_RESETN (i_Rst_L comes from the
+    // synchronised w_reset_H), or the program-load reset.
+    wire         w_nat_rst = ~i_Rst_L | w_soft_rst;
+
+    wire [63:0]  w_nat_rdata;
+    wire         w_nat_clk, w_nat_cmd, w_nat_cmd_oe;
+    wire [3:0]   w_nat_dat, w_nat_dat_oe;
+    wire         is_nat = (mmio.addr[15:9] == 7'd0) && mmio.addr[8];
+
+    sd_native native_i (
+        .i_Clk     (i_Clk),
+        .i_rst     (w_nat_rst),
+        .i_sd_mode (r_sd_mode),
+        .i_clk_div (r_clk_div),
+        .i_wr_dv   (mmio.write_DV),
+        .i_rd_dv   (mmio.read_DV),
+        .i_addr    (mmio.addr[15:0]),
+        .i_wdata   (mmio.write_data),
+        .o_rdata   (w_nat_rdata),
+        .o_irq     (o_irq),
+        .o_clk     (w_nat_clk),
+        .o_cmd     (w_nat_cmd),
+        .o_cmd_oe  (w_nat_cmd_oe),
+        .o_dat     (w_nat_dat),
+        .o_dat_oe  (w_nat_dat_oe),
+        .i_cmd     (i_sd_cmd),
+        .i_dat     (i_sd_dat),
+        .i_cd      (i_sd_cd)
+    );
+
+    // SPI mode: every pin keeps its old direction and value.
+    assign o_sd_sck    = r_sd_mode ? w_nat_clk    : o_sd_sck_spi;
+    assign o_sd_cmd    = r_sd_mode ? w_nat_cmd    : o_sd_mosi;
+    assign o_sd_cmd_oe = r_sd_mode ? w_nat_cmd_oe : 1'b1;
+    assign o_sd_dat    = r_sd_mode ? w_nat_dat    : {o_sd_cs_n, 1'b1, 1'b1, 1'b1};
+    assign o_sd_dat_oe = r_sd_mode ? w_nat_dat_oe : 4'b1110;
+
+    // -----------------------------------------------------------------------
+    // Read mux — combinational. Returns 0 for undefined offsets.  The native
+    // registers (0x100..0x1F8) come from sd_native's registered mux, which
+    // holds the value for the address of the previous cycle (an MMIO read
+    // holds its address; the SoC samples the data in the second cycle).
     // -----------------------------------------------------------------------
     always_comb begin
         mmio.read_data = 64'h0;
         if (is_buf) begin
             mmio.read_data = r_sector_buf[buf_idx];
+        end else if (is_nat) begin
+            mmio.read_data = w_nat_rdata;
         end else begin
             case (mmio.addr[15:0])
-                OFF_CTRL:   mmio.read_data = {46'b0, r_pwr_en, o_sd_cs_n, r_clk_div};
+                OFF_CTRL:   mmio.read_data = {45'b0, r_sd_mode, r_pwr_en, o_sd_cs_n, r_clk_div};
                 OFF_DATA:   mmio.read_data = {56'b0, r_rx_byte};
                 OFF_STATUS: mmio.read_data = {62'b0, i_sd_cd, r_byte_busy};
                 default:    mmio.read_data = 64'h0;

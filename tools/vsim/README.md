@@ -21,6 +21,7 @@ python3 tools/vsim/run.py test fbr_w --rev HEAD~3     # one test on an older com
 python3 tools/vsim/run.py diff --base master --seeds 40 --lats 1 3 7
 python3 tools/vsim/run.py diff --base master --seeds 30 --lats 2 5 --irq
 python3 tools/vsim/run.py socdiff --base master --seeds 30   # full SoC (tb_soc.sv)
+python3 tools/vsim/run.py socsd                    # native SD MMIO through the SoC bus
 VSIM_DEBUG_EN=1 python3 tools/vsim/run.py test        # elaborate DEBUG_EN=1
 ```
 

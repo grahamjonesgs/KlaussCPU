@@ -84,7 +84,7 @@ def build(rev=None, quiet=True):
 
 SOC_FILES = ['klauss_pkg.sv', 'membus_if.sv', 'mmio_if.sv', 'pipeline_core.sv', 'core2_subsys.sv',
              'bus_splitter.sv', 'mem_read_write.sv', 'boot_rom.sv', 'uart_send_msg.sv', 'uart_rx.sv',
-             'uart_rx_fifo.sv', 'sd_spi.sv', 'qspi_ctrl.sv', 'crypto_aes.sv', 'crypto_sha.sv', 'aes_core.sv',
+             'uart_rx_fifo.sv', 'sd_native.sv', 'sd_spi.sv', 'qspi_ctrl.sv', 'crypto_aes.sv', 'crypto_sha.sv', 'aes_core.sv',
              'aes_sbox.sv', 'ghash.sv', 'sha256_core.sv', 'trng.sv', 'blitter_dma.sv',
              'eth_mmio_bridge.sv', 'Seven_seg_LED_Display_Controller.sv', 'SPI_Master.sv',
              'SPI_Master_With_Single_CS.sv', 'RGB_LED.sv', 'vga_timing.sv', 'vga_scanout.sv',
@@ -673,13 +673,13 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x0010_100D = stage 1
-    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only): the A7
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x0030_100D = stage 1
+    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only), native SD: the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=000000000010100d' not in last:
+    if 'r2=000000000030100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
@@ -720,15 +720,86 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x001F100D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x003F100D}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x0010100D}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x0030100D}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
         print(f'{"pass" if ok else "FAIL"} {"full" if full else "lean"}: ' +
               ' '.join(f'{k}={v:x}' for k, v in got.items()))
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
+def _socsd_progs():
+    """the native SD controller's MMIO through the real SoC bus (sd_native.sv;
+    SD_NATIVE_PLAN.md): reset values, CPU_FEATURES[21], INT2_EN / INT2_PENDING,
+    FIFO push and pop-on-read with back-to-back loads, and the source-2
+    cascade.  No card: the controller stays in SPI mode, where every SDM_*
+    register but SDM_CMD works (§4.8)."""
+    from kasm import Asm
+    SD, IRQ = 0xF0000000, 0xF00F0000
+    progs = []
+    a = Asm(); a.setr(15, SD); a.setr(14, IRQ)
+    a.ld(64, 1, 14, 0x48); a.ld(64, 2, 14, 0x50); a.ld(64, 3, 14, 0x58)
+    a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
+    a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)
+    a.halt()
+    progs.append(('regs', a, {'r1': 0x0030100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+                              'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x4, 'r9': 0}))
+    a = Asm(); a.setr(15, SD)
+    a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
+    for k in range(8):
+        a.setr64(13, 0x1111111111111111 * (k + 1)); a.st(64, 13, 15, 0x180)
+    a.ld(64, 12, 15, 0x148)                                            # level 8
+    for k in range(8):
+        a.ld(64, k + 1, 15, 0x180)                                     # back-to-back pops
+    a.ld(64, 9, 15, 0x148)                                             # level 0
+    a.ld(64, 10, 15, 0x180)                                            # pop from empty: 0
+    a.halt()
+    exp = {f'r{k + 1}': 0x1111111111111111 * (k + 1) for k in range(8)}
+    exp.update({'r12': 8, 'r9': 0, 'r10': 0})
+    progs.append(('fifo', a, exp))
+    a = Asm(); a.setr(15, SD); a.setr(14, IRQ)
+    a.setr(1, 1 << 26); a.st(64, 1, 15, 0x130)                         # SDM_IRQ_EN = FIFO_ERR
+    a.setr(1, 0x80000000); a.st(64, 1, 15, 0x148)
+    a.setr(7, 513)
+    a.label('p'); a.st(64, 7, 15, 0x180); a.dec(7); a.fbr('ne', 7, 0, 'p', imm=True)
+    a.ld(64, 10, 15, 0x148)                                            # 512
+    a.ld(64, 2, 14, 0x58)                                              # INT2_PENDING = 0b10
+    a.ld(64, 3, 14, 0x08)                                              # INT_PENDING[2] = 0 (INT2_EN = 01)
+    a.setr(4, 2); a.st(64, 4, 14, 0x50)                                # INT2_EN = SD
+    a.nop(); a.nop(); a.nop()
+    a.ld(64, 5, 14, 0x08)                                              # INT_PENDING[2] = 1
+    a.ld(64, 6, 14, 0x50)                                              # 2
+    a.st(64, 1, 15, 0x148)                                             # FIFO reset (not the error)
+    a.setr(7, 1 << 26); a.st(64, 7, 15, 0x128)                         # W1C FIFO_ERR
+    a.nop(); a.nop(); a.nop()
+    a.ld(64, 8, 14, 0x58)                                              # 0
+    a.ld(64, 9, 14, 0x08)                                              # INT_PENDING[2] = 0
+    a.halt()
+    progs.append(('cascade', a, {'r10': 512, 'r2': 2, 'r3': ('bit2', 0), 'r5': ('bit2', 1), 'r6': 2,
+                                 'r8': 0, 'r9': ('bit2', 0)}))
+    return progs
+
+
+def cmd_socsd(a):
+    exe = build_soc(None)
+    fails = 0
+    for name, asm, exp in _socsd_progs():
+        r = run_soc(exe, asm, 'socsd_' + name, trace=True)
+        last = open(r['trace']).read().strip().splitlines()[-1] if 'HALTED' in r['log'] else ''
+        regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
+        bad = []
+        for k, v in exp.items():
+            got = regs.get(k)
+            ok = got is not None and (((got >> 2) & 1) == v[1] if isinstance(v, tuple) else got == v)
+            if not ok:
+                bad.append(f'{k}={got if got is None else hex(got)} want {v if isinstance(v, tuple) else hex(v)}')
+        fails += bool(bad) or not last
+        print(f'{"pass" if not bad and last else "FAIL"} {name} ' + ' '.join(bad))
     print(f'{fails} failing')
     return 1 if fails else 0
 
@@ -784,6 +855,7 @@ def main():
     tp.add_argument('--irq', action='store_true'); tp.add_argument('--hit', type=int)
     tp.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('soccrypto')
+    sub.add_parser('socsd')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -814,6 +886,8 @@ def main():
         sys.exit(tlbpage.main(a.seed0, a.seeds, a.lats, a.hit, a.irq, a.plus))
     elif a.cmd == 'soccrypto':
         sys.exit(cmd_soccrypto(a))
+    elif a.cmd == 'socsd':
+        sys.exit(cmd_socsd(a))
     elif a.cmd == 'tlbdiff':
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':

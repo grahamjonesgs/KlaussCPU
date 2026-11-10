@@ -71,12 +71,10 @@ module KlaussCPU #(
     // microSD slot (Nexys A7, SPI mode)
     output            o_SD_RESET,    // active-low slot power gate
     input             i_SD_CD,       // card detect
-    output            o_SD_SCK,
-    output            o_SD_MOSI,
-    input             i_SD_MISO,
-    output            o_SD_CS_n,     // SD_DAT[3] used as CS in SPI mode
-    output            o_SD_DAT1,     // unused in SPI mode — driven high
-    output            o_SD_DAT2,     // unused in SPI mode — driven high
+    output            o_SD_SCK,      // SCK (SPI) / CLK (native)
+    inout             io_SD_CMD,     // CMD; SPI mode: MOSI (always driven)
+    inout      [3:0]  io_SD_DAT,     // DAT[3:0]; SPI mode: DAT0 = MISO (input),
+                                     // DAT3 = CS_n, DAT1/DAT2 driven high
 
     // QSPI configuration flash (qspi_ctrl, MMIO 0xF012_xxxx).  CCLK is
     // driven through STARTUPE2 below, so it has no port.
@@ -310,7 +308,13 @@ module KlaussCPU #(
    wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
    wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
    wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
-   logic r_eth_irq;   // registered LiteEth interrupt (driven after the LiteEth instance)
+   // Source 2 is a cascade (SD_NATIVE_PLAN.md §4.5): INT_PENDING[2] =
+   // |(INT2_PENDING & INT2_EN), INT2_PENDING = {[1] SD, [0] Ethernet}.
+   // r_eth_irq is that OR, registered once from the raw sources exactly as
+   // the Ethernet level was before (INT2_EN resets to 0b01 = Ethernet only).
+   logic r_eth_irq;   // registered source-2 level (driven after the LiteEth instance)
+   logic r_eth_irq_raw;     // registered raw Ethernet level (INT2_PENDING[0])
+   logic [1:0] r_int2_en;   // INT2_EN (0xF00F_0050): [0] Ethernet, [1] SD; reset 0b01
    wire w_irq_src2  = r_eth_irq         && (r_interrupt_table[2] != 32'h0) && pip_int_mask[2];
    wire w_vga_irq;    // VGA vsync — driven at the vga_ctrl instance
    wire w_irq_src3  = w_vga_irq         && (r_interrupt_table[3] != 32'h0) && pip_int_mask[3];
@@ -775,19 +779,44 @@ module KlaussCPU #(
    assign sd_bus.addr       = w_mmio_addr;
    assign sd_bus.write_data = w_mmio_write_data;
    assign sd_bus.byte_en    = w_mmio_byte_en;
+   // CMD and DAT[3:0] are bidirectional (IOBUFs, inferred here); in SPI mode
+   // (SD_MODE = 0) CMD / DAT3 / DAT1 / DAT2 are always driven and DAT0 is
+   // an input, exactly as the old output-only ports.
+   wire       w_sd_cmd_o, w_sd_cmd_oe;
+   wire [3:0] w_sd_dat_o, w_sd_dat_oe;
+   assign io_SD_CMD = w_sd_cmd_oe ? w_sd_cmd_o : 1'bz;
+   for (genvar gi = 0; gi < 4; gi++) begin : g_sd_dat
+      assign io_SD_DAT[gi] = w_sd_dat_oe[gi] ? w_sd_dat_o[gi] : 1'bz;
+   end
+   wire       w_sd_irq;
+   // LOAD_COMPLETE, registered: resets the SD controller iff SD_MODE = 1
+   // (sd_spi), and INT2_EN.
+   logic r_load_pulse = 1'b0;
+   always_ff @(posedge i_Clk) r_load_pulse <= (st.SM == LOAD_COMPLETE);
+   // INT2_EN: CPU_RESETN and program load return it to Ethernet only, so a
+   // freshly loaded program sees source 2 exactly as on older bitstreams.
+   always_ff @(posedge i_Clk) begin
+      if (w_reset_H || r_load_pulse)
+         r_int2_en <= 2'b01;
+      else if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h00F && w_mmio_addr[15:0] == 16'h0050)
+         r_int2_en <= w_mmio_write_data[1:0];
+   end
    (* KEEP_HIERARCHY = "yes" *)
    sd_spi sd_spi_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
+       .i_load_rst(r_load_pulse),
        .mmio(sd_bus),
+       .o_irq(w_sd_irq),
        .i_sd_cd(i_SD_CD),
        .o_sd_reset_n(o_SD_RESET),
        .o_sd_sck(o_SD_SCK),
-       .o_sd_mosi(o_SD_MOSI),
-       .i_sd_miso(i_SD_MISO),
-       .o_sd_cs_n(o_SD_CS_n),
-       .o_sd_dat1(o_SD_DAT1),
-       .o_sd_dat2(o_SD_DAT2)
+       .o_sd_cmd(w_sd_cmd_o),
+       .o_sd_cmd_oe(w_sd_cmd_oe),
+       .i_sd_cmd(io_SD_CMD),
+       .o_sd_dat(w_sd_dat_o),
+       .o_sd_dat_oe(w_sd_dat_oe),
+       .i_sd_dat(io_SD_DAT)
    );
    assign w_sd_read_data = sd_bus.read_data;
 
@@ -1186,7 +1215,7 @@ module KlaussCPU #(
          12'h00F: begin  // Interrupt controller / timer
             case (r_mmio_addr_q[15:0])
                16'h0000: r_mmio_read_data_comb = {60'b0, pip_int_mask};  // M5d: live mask is the pipeline's
-               16'h0008: r_mmio_read_data_comb = {60'b0, w_vga_irq, r_eth_irq, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter, [2]=eth, [3]=vga vsync
+               16'h0008: r_mmio_read_data_comb = {60'b0, w_vga_irq, r_eth_irq, w_blit_irq, r_timer_interrupt}; // INT_PENDING: [0]=timer, [1]=blitter, [2]=eth|SD cascade, [3]=vga vsync
                16'h0010: r_mmio_read_data_comb = {32'b0, r_interrupt_table[0]};
                16'h0018: r_mmio_read_data_comb = {32'b0, r_interrupt_table[1]};
                16'h0020: r_mmio_read_data_comb = {32'b0, r_interrupt_table[2]};
@@ -1200,13 +1229,16 @@ module KlaussCPU #(
                // [2] the TLB and [15:8] its entry count (stage 3),
                // [16] AES, [17] GCM / GHASH, [18] SHA-256, [19] HMAC, [20]
                // the TRNG (always 1: [20] = 0 means a bitstream older than
-               // these bits, where every crypto block is present).
+               // these bits, where every crypto block is present), [21] the
+               // native SD controller (SD_NATIVE_PLAN.md).
                // Reads 0 on earlier bitstreams (a reserved offset).
-               16'h0048: r_mmio_read_data_comb = {43'b0, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
+               16'h0048: r_mmio_read_data_comb = {42'b0, 1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
                                                   (CORE1_EXC_EN && CORE1_TLB_EN) ? 8'(CORE1_TLB_N) : 8'd0,
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
                                                   CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN};
+               16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
+               16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -1428,7 +1460,11 @@ module KlaussCPU #(
    );
    // Interrupt source 2: LiteEth's combined event, registered (same i_Clk
    // domain) and masked off while core 2 owns the MAC.
-   always_ff @(posedge i_Clk) r_eth_irq <= w_eth_irq && !w_eth_own2;
+   // Source 2: the cascade of Ethernet and the native SD controller.
+   always_ff @(posedge i_Clk) begin
+      r_eth_irq_raw <= w_eth_irq && !w_eth_own2;
+      r_eth_irq     <= (w_eth_irq && !w_eth_own2 && r_int2_en[0]) || (w_sd_irq && r_int2_en[1]);
+   end
    assign w_eth_read_data = w_eth_own2 ? 64'h0          : eth_bus.read_data;
    assign w_eth_ready     = w_eth_own2 ? w_eth_nown_ack : eth_bus.ready;
    assign w_c2e_read_data = eth_bus.read_data;

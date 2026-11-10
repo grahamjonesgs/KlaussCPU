@@ -193,7 +193,11 @@ module tb_soc;
    wire        o_SPI_LCD_Clk, o_SPI_LCD_MOSI, o_SPI_LCD_CS_n, o_LCD_DC, o_LCD_reset_n;
    wire [7:0]  o_Anode_Activate, o_LED_cathode;
    wire [2:0]  o_LED_RGB_1, o_LED_RGB_2;
-   wire        o_SD_RESET, o_SD_SCK, o_SD_MOSI, o_SD_CS_n, o_SD_DAT1, o_SD_DAT2;
+   wire        o_SD_RESET, o_SD_SCK;
+   wire        io_SD_CMD;
+   wire [3:0]  io_SD_DAT;
+   pullup (io_SD_CMD);
+   pullup (io_SD_DAT[0]); pullup (io_SD_DAT[1]); pullup (io_SD_DAT[2]); pullup (io_SD_DAT[3]);
    wire        ETH_MDC, ETH_RSTN, ETH_TXEN, ETH_REFCLK;
    wire [1:0]  ETH_TXD;
    wire [15:0] ddr2_dq;
@@ -223,8 +227,7 @@ module tb_soc;
       .i_switch   (16'h0),
       .o_LED_RGB_1(o_LED_RGB_1), .o_LED_RGB_2(o_LED_RGB_2),
       .o_SD_RESET(o_SD_RESET), .i_SD_CD(1'b0), .o_SD_SCK(o_SD_SCK),
-      .o_SD_MOSI(o_SD_MOSI), .i_SD_MISO(1'b0), .o_SD_CS_n(o_SD_CS_n),
-      .o_SD_DAT1(o_SD_DAT1), .o_SD_DAT2(o_SD_DAT2),
+      .io_SD_CMD(io_SD_CMD), .io_SD_DAT(io_SD_DAT),
       .o_QSPI_CS_n(), .o_QSPI_DQ0(), .i_QSPI_DQ1(1'b1), .o_QSPI_DQ2(), .o_QSPI_DQ3(),
       .ETH_MDC(ETH_MDC), .ETH_MDIO(), .ETH_RSTN(ETH_RSTN),
       .ETH_CRSDV(1'b0), .ETH_RXERR(1'b0), .ETH_RXD(2'b00),
