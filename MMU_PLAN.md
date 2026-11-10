@@ -1316,7 +1316,24 @@ the shipped bitstream.
   entry count went to 16 (§11.5) and why the later steps are stage 2
   walls. They are fixed exactly and CPI-neutrally, and also buy margin for
   master.
-- **Release bitstream: `98fe470`** (`~/.cache/kbuild/mmu_stage3_release_98fe470.bit`,
+- **Release bitstream: `d9cf6c2`** (`~/.cache/kbuild/mmu_stage3_release_d9cf6c2.bit`,
+  md5 `bdaed149…`), 2026-11-10. It is `98fe470` plus **precise EI** (§3.3:
+  an EI that enables while an interrupt is pending takes it before the next
+  instruction). It closed with the **standard flow** (tier 1 −0.064, tier 2
+  AggressiveExplore WNS +0.041 / TNS 0, WHS +0.013 / THS 0, 12 min 54 s).
+  **LEAN**: MPU off, TRNG-only crypto, CPU_FEATURES `0x0010_100D`. Board
+  validation: klausscc all_tests 31/32 with 0 failed (hw_tlb.kla 19/19),
+  test_tlb 26/26, test_exc 53/53, test_atomic 139/139, test_mpu SKIP,
+  board_suite -O2 with only the expected crypto_selftest SKIPs,
+  perf_baseline within ±0.03 % of master, ssh_shell 5/5, xv6 with its
+  **original upstream idle** (`intr_on(); intr_off(); … wait` under DI,
+  which hung on `98fe470`) echoing shell input, `tools/validate/xv6.sh full
+  board` (usertests -q ALL TESTS PASSED), and Linux 7.3.3 booting to a
+  busybox shell (`tools/validate/linux.sh … busybox board`). The first
+  attempt to load it failed silently (the JTAG step printed nothing; `/tmp`
+  was 75 % full) and its first "validation" ran on `98fe470`; it was
+  reloaded with "DONE" checked and re-validated.
+- **Previous release, superseded: `98fe470`** (`~/.cache/kbuild/mmu_stage3_release_98fe470.bit`,
   md5 `9a6ee8bc…`), chosen by Graham on 2026-11-09. It closed with the
   **standard flow in tier 1** (WNS +0.011 / TNS 0, WHS +0.026 / THS 0,
   12 min 40 s), so a normal `build_fast` of the commit reproduces it.
