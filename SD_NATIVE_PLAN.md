@@ -341,15 +341,22 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
   DATA_DONE, so a threaded handler can pace a multi-block transfer block by
   block. It is not cleared by writing to it; it drops when the condition
   stops holding.
-  - **Read:** the FIFO holds at least one whole block of unread data
+  - It depends on a **direction latch** DIR, which can be NONE, READ or
+    WRITE. An `SDM_CMD` with the data flag sets DIR from `[12]`. A FIFO
+    reset (`SDM_FIFO[31]`), CPU_RESETN or the native-mode load reset sets
+    DIR to NONE.
+  - **DIR = READ:** the FIFO holds at least one whole block of unread data
     (level ≥ block size / 8 words). It also stays set after the transfer has
     ended, until the FIFO is drained below one block. So after DATA_DONE the
     handler keeps popping until FIFO_THRESH drops; with whole blocks that
     leaves the FIFO empty.
-  - **Write:** a write data phase is running, the FIFO has room for at
+  - **DIR = WRITE:** a write data phase is running, the FIFO has room for at
     least one more block, and fewer blocks have been pushed than the block
-    count (or the count is open-ended). It is never set while idle, so an
-    empty FIFO doesn't leave the interrupt stuck high.
+    count (or the count is open-ended). "Pushed" counts words since the last
+    FIFO reset, pre-filled words included.
+  - **DIR = NONE:** 0. A write pre-fill (FIFO reset, push, then `SDM_CMD`)
+    therefore never raises FIFO_THRESH before the command, and neither does
+    an idle, empty FIFO.
 
 ### 4.6 Clocking and I/O timing (question 2)
 
@@ -410,6 +417,46 @@ Registers elsewhere:
 The SD-mode registers are writable at any time. They act only when
 SD_MODE = 1, and writing `SDM_CMD` while CMD_BUSY is set is ignored. The
 `addr[9]` decode of `SD_BUF` doesn't change, so 0x100–0x1F8 is free.
+
+### 4.8 Reset values and corner cases
+
+Settled 2026-11-10 with the klausscc emulator (ea2874c, `--sd-native`),
+which models this controller. The RTL and the emulator follow this table.
+
+**Reset values** (CPU_RESETN, and the native-mode load reset of §4.1):
+
+| Register | Reset |
+|---|---|
+| `SD_CTRL` | clk_div 249, cs_n 1, pwr_en 0, SD_MODE 0 (as today) |
+| `SDM_ARG` | 0 |
+| `SDM_RESP0`, `SDM_RESP1` | 0 |
+| `SDM_BLK` | `0x0001_0200`: 512 bytes, 1 block |
+| `SDM_STATUS` | every sticky bit 0. The live bits are live: busy bits 0, DAT0 and CARD_PRESENT as on the pins, FIFO_THRESH 0 |
+| `SDM_IRQ_EN` | 0 |
+| `SDM_TIMEOUT` | data 2 500 000, busy 12 500 000 |
+| `SDM_CFG` | 0 |
+| `SDM_FIFO` | empty (level 0), DIR = NONE |
+| `SDM_BLKDONE` | 0 |
+| `INT2_EN` | `0b01` |
+
+**Corner cases:**
+
+| Case | Behaviour |
+|---|---|
+| `SDM_ARG` width | 32 bits: `[31:0]`. `[63:32]` ignored on write, read as 0. |
+| Response types 5–7 | treated as 0 (no response) |
+| `SDM_RESP*` after a 48-bit response | `RESP0[31:0]` = the argument field, `RESP0[37:32]` = the index echo, `RESP0[63:38]` = 0, `RESP1` = 0 |
+| `SDM_RESP*` after a type-0 command | unchanged from the previous command |
+| `SDM_CMD` while CMD_BUSY | ignored entirely |
+| `SDM_CMD` with the data flag while DATA_BUSY | ignored entirely: no command is sent and no bit changes |
+| `SDM_CMD` without the data flag while DATA_BUSY | allowed. CMD12 (`[13]`) stops the phase. Others, such as CMD13, go out on CMD and leave the data phase running. |
+| `SDM_CMD` while SD_MODE = 0 | ignored |
+| `[13]` stop when no data phase is running | sent as an ordinary R1b command; DATA_* bits unchanged |
+| `[13]` stop ends an **open-ended** (count 0) phase with no error | DATA_DONE is set |
+| `[13]` stop ends a **counted** phase early | DATA_BUSY clears and DATA_DONE is **not** set. `SDM_BLKDONE` says how far it got. |
+| Clearing SD_MODE (a `SD_CTRL` write) | the command and data engines abandon what they are doing: busy bits clear, no DONE bit is set, and the pins return to the SPI mapping. The registers, the FIFO contents and DIR are kept. |
+| Registers other than `SDM_CMD` while SD_MODE = 0 | work normally: read and write, `SDM_DATA` pop and push, W1C on `SDM_STATUS`, FIFO reset |
+| `SDM_BLK` size field written with 0 | treated as 8 (`[2:0]` read 0, so the field reads 0). Software must not use it. |
 
 ## 5. Software interface: what the runtime session reviews
 
