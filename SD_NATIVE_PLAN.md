@@ -1,7 +1,9 @@
 # Native 4-bit SD controller: plan
 
-Status: **register map frozen (v1, 2026-11-10); phase 1 RTL in progress** on
-klaussCPU branch `mmu-sd` (Graham's go-ahead, relayed by the runtime session).
+Status: **register map frozen (v1, 2026-11-10); phase 1 RTL implemented and
+simulated** on klaussCPU branch `mmu-sd` (`sd_native.sv`; implementation
+notes and interpretations in §4.9); board test (phase 2) pending.
+(Graham's go-ahead, relayed by the runtime session.)
 Plan written 2026-11-10. Requested by Graham through the
 klausscpu-runtime session; that session reviews the software interface (§5)
 and plans the Linux, Zephyr and bare-metal driver changes.
@@ -461,6 +463,61 @@ which models this controller. The RTL and the emulator follow this table.
 | `SDM_RESP*` after CMD_TIMEOUT (types 1–4) | unchanged. After a CRC, end-bit or index error they hold the response as received. |
 | Counted write stopped early by CMD12 | the unsent words stay in the FIFO (the driver resets it) |
 | An ignored `SDM_CMD` (SD_MODE = 0, CMD_BUSY, or data while DATA_BUSY) | ignored entirely: DIR, `SDM_BLKDONE`, the latched size and every status bit are unchanged |
+
+### 4.9 Phase 1 implementation notes
+
+`sd_native.sv` (engines, registers, FIFO) under `sd_spi.sv` (SD_CTRL, the
+SPI shifter, SD_BUF, the pin mux), KEEP_HIERARCHY on `sd_spi`. Unit tests:
+`tools/sdsim/run_sd_tb.sh` (`tb_sd_native` against `sd_card_model`,
+`tb_sd_spi_compat` against the d9cf6c2 SPI controller); SoC:
+`tools/vsim/run.py socsd`. Where the text above left room, the RTL does
+this (the register map is unchanged):
+
+- **Input sampling point (corrects §4.6).** In default speed the card's
+  outputs change after the *falling* edge of CLK (tODLY ≤ 14 ns), so
+  sampling on the rising edge at 25 MHz would leave about 20 − 14 − pad
+  delays, i.e. no margin. The host samples instead on the fabric edge that
+  drives CLK low, i.e. just before the card's next change: ~20 ns of setup
+  at 25 MHz, and the output path delay (clock-to-pad, ≥ 4 ns) as hold.
+  Outputs change on that same edge (the card samples on the rising edge,
+  half a period later). Inputs go through one IOB flip-flop; CD through a
+  two-flop synchroniser (`SDM_STATUS[3]`; `SD_STATUS[1]` stays the raw pin).
+- **No ODDR / IDDR in phase 1.** CLK is a fabric register muxed with the
+  SPI SCK (one LUT), as are CMD and DAT; outputs are therefore not
+  IOB-packed. Skew of a few ns is immaterial at ≤ 25 MHz. Phase 3 adds the
+  ODDR clock and IDDR sampling.
+- **CLK_ON** keeps the clock running except for the flow-control stops
+  between blocks (so a driver that leaves CLK_ON set cannot overrun the
+  FIFO).
+- **FIFO_THRESH, write:** "fewer blocks pushed than the count" compares
+  the words pushed since the FIFO reset with count × the latched block size;
+  the count is latched with the size by the data command.
+- **Trailing clocks / N_CC / N_RC:** 8 clocks after every command or data
+  phase; a command written meanwhile waits for them, so the card always sees
+  ≥ 8 clocks (in fact 9) between CMD-line frames.
+- **Busy detection** (R1b and write busy) ignores DAT0 for the first 4
+  clocks after the response / token end bit, then waits for DAT0 high. The
+  response start bit is awaited for 66 clocks (N_CR 64 plus slack); the
+  write CRC token start bit for 8 clocks after the end bit.
+- **A stop (`[13]`) acts when SDM_CMD is accepted**: the data engine stops
+  at once (a partly received read block is rolled back, data the card
+  sends while CMD12 goes out is ignored), then CMD12 is sent. For a write
+  stopped mid-block the words of that block already sent have left the
+  FIFO; the unsent words stay.
+- **Clearing SD_MODE** rolls back a partly received read block (it was
+  never FIFO content); committed blocks, DIR and the registers stay.
+- **R1b with data** (not used by SD) would start a write phase only after
+  the busy.
+- **INT2_EN is reset by every program load**, not only the native-mode
+  load reset: the four interrupt vectors are cleared at every load anyway,
+  and an older program loaded after one that set `INT2_EN` = `0b10` would
+  otherwise lose its Ethernet interrupt. (Flag for the emulator.)
+- **SDM_* reads are registered** inside the block (the value for the
+  access's address, one cycle old): invisible to software, it keeps the
+  native read mux off the MMIO address path.
+- Misuse that the map leaves undefined: a CPU push in the same cycle as a
+  read-data word write is dropped with FIFO_ERR; a pop is honoured only if
+  the word it returns was valid.
 
 ## 5. Software interface: what the runtime session reviews
 

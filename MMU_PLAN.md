@@ -466,13 +466,15 @@ bitstream.
 | `[18]` | SHA-256 present |
 | `[19]` | HMAC-SHA-256 present (only with SHA-256) |
 | `[20]` | TRNG present (always built: always 1) |
+| `[21]` | native SD controller (`SD_CTRL[18]` SD_MODE, `SDM_*` at `0xF000_0100`; SD_NATIVE_PLAN.md, branch `mmu-sd`) |
 
 If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's MMIO window reads 0, ignores writes and
 completes in the normal MMIO time (MMIO_MAP.md).
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`**: stage 1, LR/SC, a
 16-entry TLB, no MPU, and the TRNG as the only crypto block. The full
-crypto configuration reads `0x001F_100D`.
+crypto configuration reads `0x001F_100D`. With the native SD controller
+(`mmu-sd`), `[21]` is also set: `0x0030_100D` lean, `0x003F_100D` full.
 
 ---
 

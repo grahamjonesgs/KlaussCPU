@@ -96,7 +96,7 @@ without re-synthesising.
 
 | Offset | Reg         | RW | Width | Bits | Description |
 |--------|-------------|----|-------|------|-------------|
-| 0x000  | `SD_CTRL`   | RW | 18    | `[15:0]` `clk_div`, `[16]` `cs_n`, `[17]` `pwr_en` | Clock divisor, chip-select, slot power |
+| 0x000  | `SD_CTRL`   | RW | 19    | `[15:0]` `clk_div`, `[16]` `cs_n`, `[17]` `pwr_en`, `[18]` `SD_MODE` | Clock divisor, chip-select, slot power; `SD_MODE` = 1 selects the native SD bus (below) |
 | 0x008  | `SD_DATA`   | W  | 8     | `[7:0]` byte to send | Triggers a single-byte SPI transfer when written (ignored if busy) |
 | 0x008  | `SD_DATA`   | R  | 8     | `[7:0]` last RX byte | Byte received on the most recent transfer |
 | 0x010  | `SD_STATUS` | R  | 2     | `[0]` `busy`, `[1]` `card_present` | Transfer in progress / card detect line |
@@ -131,6 +131,52 @@ removing a card.
 before issuing CMD24, or reads the incoming sector here after CMD17. Use
 `MEMSET64`/`MEMGET64` for fast 8-byte transfers; byte/halfword/word stores
 also work via byte enables.
+
+#### Native SD mode (`SD_CTRL[18]` = 1)
+
+Present when `CPU_FEATURES[21]` = 1 (`sd_native.sv`; the design, sequencing
+rules and every corner case are in [SD_NATIVE_PLAN.md](SD_NATIVE_PLAN.md)
+§4, frozen register map v1). With `SD_MODE` = 0 (the reset value) the block
+is exactly the SPI controller above. With `SD_MODE` = 1 a hardware engine
+drives the 1-bit or 4-bit SD bus at default speed (≤ 25 MHz in this
+bitstream): CLK = 100 MHz / (2·(`clk_div`+1)), commands with CRC7 and
+48/136-bit responses, data blocks with a CRC16 per line, write CRC tokens and
+busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
+(`pwr_en` = 0 for ≥ 10 ms). `SD_CTRL[16]` (cs_n) is ignored in SD mode.
+
+| Offset | Reg | RW | Content |
+|---|---|---|---|
+| 0x100 | `SDM_CMD` | W | starts a command: `[5:0]` index, `[10:8]` response type (0 none, 1 R1/R5/R6/R7, 2 R1b, 3 R2, 4 R3 (no CRC check); 5–7 = none), `[11]` data phase, `[12]` 1 = write, `[13]` stop (CMD12). Ignored while CMD_BUSY, while `SD_MODE` = 0, and (with `[11]`) while DATA_BUSY. Reads 0 |
+| 0x108 | `SDM_ARG` | RW | `[31:0]` command argument |
+| 0x110 | `SDM_RESP0` | R | 48-bit response: `[31:0]` argument field, `[37:32]` index echo, `[63:38]` 0. R2: response bits `[63:0]` (CRC7 and end bit in `[7:0]`) |
+| 0x118 | `SDM_RESP1` | R | R2: response bits `[127:64]`; 0 after a 48-bit response |
+| 0x120 | `SDM_BLK` | RW | `[11:0]` block size in bytes (multiple of 8, 8–2048; `[2:0]` read 0), `[31:16]` block count (0 = open-ended). Reset `0x0001_0200`. Latched by each data command |
+| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT, `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR; `[31]` ERR_ANY (live OR of `[26:16]`) |
+| 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[26:16]`) |
+| 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` read start-bit timeout, `[63:32]` busy timeout, in CLK cycles. Reset 2 500 000 / 12 500 000 (100 / 500 ms at 25 MHz) |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply). `[1]`, `[7:4]`, `[16]` reserved (read 0) |
+| 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in 64-bit words; write `[31]` = 1 to empty the FIFO (also sets the direction latch to NONE) |
+| 0x150 | `SDM_DMA_ADDR` | — | reserved (reads 0) |
+| 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command |
+| 0x180 | `SDM_DATA` | RW | FIFO port: a 64-bit load pops a word (0 if empty), a 64-bit store pushes one (dropped + FIFO_ERR if full). Byte 0 of the block in `[7:0]` |
+| 0x1F8 | `SDM_CAPS` | R | `0x0008_0101`: version 1, 4-bit, no high speed, 8 × 512-byte FIFO |
+
+- **Interrupt**: `|(SDM_STATUS & SDM_IRQ_EN)`, a level, cascaded on
+  interrupt source 2 through `INT2_EN[1]` (Timers / interrupts below).
+- **FIFO_THRESH** (live): after a read command, the FIFO holds a whole
+  block; during a write phase, there is room for a block and fewer blocks
+  have been pushed (since the FIFO reset) than the count; 0 after a FIFO
+  reset until the next data command.
+- **Flow control**: CLK stops between blocks while the FIFO cannot take
+  (read) or does not hold (write) a whole block; a slow CPU only slows the
+  transfer. A read block with a CRC or end-bit error never becomes visible
+  in the FIFO.
+- **Program load** (LOAD_COMPLETE) with `SD_MODE` = 1 resets the whole
+  controller as `CPU_RESETN` does (SD_MODE and `pwr_en` cleared, FIFO
+  emptied); with `SD_MODE` = 0 it changes nothing.
+- **Pins**: CMD and DAT[3:0] are bidirectional with pull-ups. In SPI mode
+  CMD (MOSI), DAT3 (CS_n), DAT1 and DAT2 are always driven and DAT0 is an
+  input, as before.
 
 ### QSPI flash — base `0xF012_0000`
 
@@ -627,7 +673,7 @@ one frame, subsequent frames increment `RX_ERRORS` and are dropped.
 LiteEth aggregates RX-done and TX-done into one combined `interrupt`
 output (`EV_PENDING & EV_ENABLE` of both paths), wired to **interrupt
 source 2** (`INT_PENDING[2]`, `INT_VEC2`; registered once, masked while core 2
-owns the MAC). It is a **level** source like the blitter: the ISR must W1C the
+owns the MAC), through the source-2 cascade's `INT2_EN[0]`, which resets to 1. It is a **level** source like the blitter: the ISR must W1C the
 `EV_PENDING` bit(s) before `IRET`, or it re-dispatches. The bundled network
 stacks (lwIP port, Zephyr driver) still poll and never unmask source 2; to
 use the interrupt, set `INT_VEC2`, set `EV_ENABLE` for the events wanted and
@@ -724,7 +770,7 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | Offset  | Reg            | RW | Width | Description |
 |---------|----------------|----|-------|-------------|
 | 0x0000  | `INT_MASK`     | RW | 4     | Per-source enable; bit N = source N. Only bits [3:0] are used; upper bits ignored on write, read as 0. |
-| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bit 2 = Ethernet (source 2, = LiteEth `interrupt`, i.e. any `EV_PENDING & EV_ENABLE`; 0 while core 2 owns the MAC); bit 3 = VGA vsync (source 3, = `VGA_STATUS.VSYNC_PENDING & VGA_CTRL.VSYNC_IRQ_EN`; level, the ISR writes `VGA_STATUS` bit 1 to clear). |
+| 0x0008  | `INT_PENDING`  | R  | 4     | Live pending bits. Bit 0 = timer (source 0); bit 1 = blitter DONE (source 1, = blitter `r_done & IRQ_EN`); bit 2 = source 2 = `|(INT2_PENDING & INT2_EN)`: Ethernet (LiteEth `interrupt`, i.e. any `EV_PENDING & EV_ENABLE`; 0 while core 2 owns the MAC) and, when `INT2_EN[1]` is set, the native SD controller; bit 3 = VGA vsync (source 3, = `VGA_STATUS.VSYNC_PENDING & VGA_CTRL.VSYNC_IRQ_EN`; level, the ISR writes `VGA_STATUS` bit 1 to clear). |
 | 0x0010  | `INT_VEC0`     | RW | 32    | Handler byte address for source 0 (timer). A vector of 0 disables the source even when its mask bit is set. |
 | 0x0018  | `INT_VEC1`     | RW | 32    | Handler for source 1 (2D DMA blitter DONE). A vector of 0 disables the source. |
 | 0x0020  | `INT_VEC2`     | RW | 32    | Handler for source 2 (Ethernet RX/TX). A vector of 0 disables the source. |
@@ -732,6 +778,8 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | 0x0030  | `TIMER_PERIOD` | RW | 32    | Source-0 period in raw `i_Clk` cycles. Writing it resets the cycle counter so the new period takes effect immediately. |
 | 0x0038  | `TIMER_COUNT`  | R  | 32    | Live cycle counter — useful for profiling. |
 | 0x0048  | `CPU_FEATURES` | R  | 64    | Build features (MMU_PLAN.md §6.3), table below. Reads 0 on bitstreams older than the MMU work. |
+| 0x0050  | `INT2_EN`      | RW | 2     | Source-2 cascade enables: `[0]` Ethernet, `[1]` native SD controller. Reset `0b01` (by `CPU_RESETN` and by every program load), so source 2 behaves as on older bitstreams. Reads 0 on older bitstreams. |
+| 0x0058  | `INT2_PENDING` | R  | 2     | `[0]` the raw Ethernet interrupt, `[1]` the raw SD interrupt (`|(SDM_STATUS & SDM_IRQ_EN)`), both before `INT2_EN`. Reads 0 on older bitstreams. |
 | 0x0040  | `CLOCK_MS`     | R  | 64    | Free-running millisecond counter since FPGA power-on. Increments every 100 000 cycles at the 100 MHz `i_Clk` (constrained in `nexys_ddr.xdc`). 64-bit so it takes ~5.8 × 10⁸ years to wrap. Not reset by `CPU_RESETN` or by program load — programs that need a "time since started" value should snapshot it on entry. |
 
 **`CPU_FEATURES` (0x0048)**, 1 = present:
@@ -747,10 +795,12 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[18]` | SHA-256 (`0xF00B_0000`) |
 | `[19]` | HMAC-SHA-256 (`0xF00B_0080`; only with SHA-256) |
 | `[20]` | TRNG (`0xF00C_0000`; always built, so always 1) |
+| `[21]` | native SD controller (`SD_CTRL[18]`, `SDM_*` at `0xF000_0100`) |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
-`0x001F_100D`. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+`0x001F_100D`. With the native SD controller (branch `mmu-sd`) `[21]` is set
+too: `0x0030_100D` lean, `0x003F_100D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
