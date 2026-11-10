@@ -42,7 +42,7 @@ module sd_native (
     input  logic        i_rd_dv,
     input  logic [15:0] i_addr,
     input  logic [63:0] i_wdata,
-    output logic [63:0] o_rdata,         // registered: the value for the address of the previous cycle
+    output logic [63:0] o_rdata,         // for the address of the previous cycle; 0 outside 0x100..0x1F8
     output logic        o_irq,           // registered level
 
     // pins (the parent muxes them with the SPI path)
@@ -123,22 +123,45 @@ module sd_native (
     logic [15:0] r_blkdone;
 
     // -----------------------------------------------------------------------
+    // MMIO inputs, registered first: the raw address comes through the
+    // SoC's st.SM address mux, which must not reach the command / FIFO
+    // decode (it was a failing path).  An access holds its strobe and
+    // address for at least three cycles, so acting one cycle later is
+    // invisible; read data for an access is valid in its second cycle,
+    // which is when the SoC samples it (combinational from r_in_addr).
+    // -----------------------------------------------------------------------
+    logic        r_in_wr, r_in_rd;
+    logic [15:0] r_in_addr;
+    logic [63:0] r_in_wdata;
+    always_ff @(posedge i_Clk) begin
+        if (i_rst) begin
+            r_in_wr <= 1'b0;
+            r_in_rd <= 1'b0;
+        end else begin
+            r_in_wr <= i_wr_dv;
+            r_in_rd <= i_rd_dv;
+        end
+        r_in_addr  <= i_addr;
+        r_in_wdata <= i_wdata;
+    end
+
+    // -----------------------------------------------------------------------
     // MMIO strobes.  A store holds write_DV for several cycles, and stores
     // to different addresses may keep it high throughout: side effects with
     // history act on the first cycle of each access only (as qspi_ctrl).
     // -----------------------------------------------------------------------
-    wire       w_win    = (i_addr[15:9] == 7'd0) && i_addr[8];
-    wire [7:0] w_off    = i_addr[7:0];
+    wire       w_win    = (r_in_addr[15:9] == 7'd0) && r_in_addr[8];
+    wire [7:0] w_off    = r_in_addr[7:0];
     logic        r_wr_q, r_rd_q;
     logic [15:0] r_waddr_q, r_raddr_q;
-    wire w_new_wr = i_wr_dv && (!r_wr_q || (i_addr != r_waddr_q));
-    wire w_new_rd = i_rd_dv && (!r_rd_q || (i_addr != r_raddr_q));
-    wire w_wr     = i_wr_dv && w_win;                 // level: plain register writes
+    wire w_new_wr = r_in_wr && (!r_wr_q || (r_in_addr != r_waddr_q));
+    wire w_new_rd = r_in_rd && (!r_rd_q || (r_in_addr != r_raddr_q));
+    wire w_wr     = r_in_wr && w_win;                 // level: plain register writes
     wire w_wr1    = w_new_wr && w_win;                 // first cycle: side effects
 
     wire w_cmd_wr  = w_wr1 && (w_off == O_CMD);
     wire w_push    = w_wr1 && (w_off == O_DATA);
-    wire w_fifo_rs = w_wr1 && (w_off == O_FIFO) && i_wdata[31];
+    wire w_fifo_rs = w_wr1 && (w_off == O_FIFO) && r_in_wdata[31];
     wire w_w1c     = w_wr1 && (w_off == O_STATUS);
 
     // -----------------------------------------------------------------------
@@ -197,9 +220,9 @@ module sd_native (
     logic [9:0]  r_mrp;             // memory fetch pointer
     logic [63:0] r_head;
     logic        r_head_v, r_fetch;
-    logic        r_pop_pend, r_pop_hv;
     logic [25:0] r_push_words;      // words pushed since the FIFO reset (write FIFO_THRESH)
     logic [25:0] r_d_target;        // block count × latched block size, in words
+    logic        r_d_tgt_stale;     // r_d_target is one cycle behind the latch
     logic        r_rd_room;         // room for one more whole read block (registered)
     logic [1:0]  r_dir;             // direction latch (§4.5): NONE / READ / WRITE
     localparam logic [1:0] DIR_NONE = 2'd0, DIR_READ = 2'd1, DIR_WRITE = 2'd2;
@@ -223,10 +246,10 @@ module sd_native (
 
     // a command accepted this cycle (§4.8: ignored while CMD_BUSY, while
     // SD_MODE = 0, and — with the data flag — while DATA_BUSY)
-    wire       w_cmd_acc  = w_cmd_wr && i_sd_mode && !w_c_active && !(i_wdata[11] && w_d_active);
-    wire [2:0] w_rtype_in = (i_wdata[10:8] > 3'd4) ? 3'd0 : i_wdata[10:8];
-    wire       w_acc_data = w_cmd_acc && i_wdata[11];
-    wire       w_acc_stop = w_cmd_acc && i_wdata[13];
+    wire       w_cmd_acc  = w_cmd_wr && i_sd_mode && !w_c_active && !(r_in_wdata[11] && w_d_active);
+    wire [2:0] w_rtype_in = (r_in_wdata[10:8] > 3'd4) ? 3'd0 : r_in_wdata[10:8];
+    wire       w_acc_data = w_cmd_acc && r_in_wdata[11];
+    wire       w_acc_stop = w_cmd_acc && r_in_wdata[13];
 
     // the last unit of a FIFO word: a full word, or the block's last unit
     // (which ends a half word when size mod 8 = 4)
@@ -248,7 +271,7 @@ module sd_native (
     wire w_eng_we  = r_samp && (r_d_state == D_RD_DATA) && w_rx_wordb;
     wire w_eng_pop = ev_fall && (((r_d_state == D_WR_WAIT) && w_blk_ready)
                               || ((r_d_state == D_WR_DATA) && (r_d_units != 15'd1) && w_tx_wordb));
-    wire w_cpu_pop = r_pop_pend && r_pop_hv && r_head_v;
+    wire w_cpu_pop = w_new_rd && w_win && (w_off == O_DATA) && r_head_v;
     wire w_pop     = w_cpu_pop || w_eng_pop;
     wire w_fetch   = (r_mrp != r_wc) && !r_fetch && (!r_head_v || w_pop);
     wire w_push_ok = w_push && !w_full && !w_eng_we;
@@ -268,7 +291,7 @@ module sd_native (
     wire w_thresh_rd = (r_dir == DIR_READ) && (w_level >= r_d_blkw);
     wire w_thresh_wr = (r_dir == DIR_WRITE) && w_d_write
                        && ((11'd512 - {1'b0, w_level}) >= {1'b0, r_d_blkw})
-                       && ((r_d_cnt == 16'd0) || (r_push_words < r_d_target));
+                       && !r_d_tgt_stale && ((r_d_cnt == 16'd0) || (r_push_words < r_d_target));
     wire w_thresh    = w_thresh_rd || w_thresh_wr;
     wire w_err_any   = |r_err;
     wire [31:0] w_status = {w_err_any, 4'b0, r_err, 6'b0, r_data_done, r_cmd_done,
@@ -282,7 +305,7 @@ module sd_native (
     // a half last word: its 4 bytes in [31:0], [63:32] = 0
     wire [63:0] w_rx_word   = w_rx_half ? {32'h0, w_rx_next[7:0], w_rx_next[15:8], w_rx_next[23:16], w_rx_next[31:24]}
                                         : f_bswap(w_rx_next);
-    wire [63:0] w_mem_wdata = w_eng_we ? w_rx_word : i_wdata;
+    wire [63:0] w_mem_wdata = w_eng_we ? w_rx_word : r_in_wdata;
     always_ff @(posedge i_Clk) begin
         if (w_mem_we) r_mem[r_wp[8:0]] <= w_mem_wdata;
         if (w_fetch)  r_mem_q <= r_mem[r_mrp[8:0]];
@@ -338,6 +361,7 @@ module sd_native (
             r_d_w4      <= 1'b0;  r_d_blkw <= 10'd64; r_d_sz4 <= 10'd128; r_d_cnt <= 16'd1;
             r_d_wpos    <= 6'd0;
             r_d_target  <= 26'd64;
+            r_d_tgt_stale <= 1'b0;
             r_d_units   <= 15'd0; r_d_aux <= 5'd0;  r_d_tok <= 4'd0;
             for (int i = 0; i < 4; i++) r_d_crc[i] <= 16'h0;
             r_d_sh      <= 64'h0;
@@ -346,40 +370,35 @@ module sd_native (
             o_dat       <= 4'hF;  o_dat_oe <= 4'h0;
             r_wp        <= 10'd0; r_wc <= 10'd0; r_rp <= 10'd0; r_mrp <= 10'd0;
             r_head      <= 64'h0; r_head_v <= 1'b0; r_fetch <= 1'b0;
-            r_pop_pend  <= 1'b0;  r_pop_hv <= 1'b0;
             r_push_words <= 26'd0;
             r_rd_room   <= 1'b0;
             o_irq       <= 1'b0;
         end else begin
-            r_wr_q    <= i_wr_dv;  r_waddr_q <= i_addr;
-            r_rd_q    <= i_rd_dv;  r_raddr_q <= i_addr;
+            r_wr_q    <= r_in_wr;  r_waddr_q <= r_in_addr;
+            r_rd_q    <= r_in_rd;  r_raddr_q <= r_in_addr;
             r_c_ok_p  <= 1'b0;
             r_c_err_p <= 1'b0;
 
             // ---------------- plain register writes ----------------
-            if (w_wr && w_off == O_ARG)   r_arg <= i_wdata[31:0];
-            if (w_wr && w_off == O_BLK)   begin r_blksz <= i_wdata[11:2]; r_blkcnt <= i_wdata[31:16]; end
-            if (w_wr && w_off == O_IRQEN) r_irq_en <= i_wdata[26:0] & IRQ_MASK[26:0];
-            if (w_wr && w_off == O_TMO)   begin r_tmo_data <= i_wdata[31:0]; r_tmo_busy <= i_wdata[63:32]; end
-            if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= i_wdata[0]; r_cfg_clkon <= i_wdata[2]; end
+            if (w_wr && w_off == O_ARG)   r_arg <= r_in_wdata[31:0];
+            if (w_wr && w_off == O_BLK)   begin r_blksz <= r_in_wdata[11:2]; r_blkcnt <= r_in_wdata[31:16]; end
+            if (w_wr && w_off == O_IRQEN) r_irq_en <= r_in_wdata[26:0] & IRQ_MASK[26:0];
+            if (w_wr && w_off == O_TMO)   begin r_tmo_data <= r_in_wdata[31:0]; r_tmo_busy <= r_in_wdata[63:32]; end
+            if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= r_in_wdata[0]; r_cfg_clkon <= r_in_wdata[2]; end
 
             // ---------------- sticky status: W1C first, engine sets below win ----------------
             if (w_w1c) begin
-                if (i_wdata[8]) r_cmd_done  <= 1'b0;
-                if (i_wdata[9]) r_data_done <= 1'b0;
-                r_err <= r_err & ~i_wdata[26:16];
+                if (r_in_wdata[8]) r_cmd_done  <= 1'b0;
+                if (r_in_wdata[9]) r_data_done <= 1'b0;
+                r_err <= r_err & ~r_in_wdata[26:16];
             end
 
             // ---------------- trailing clocks ----------------
             if (ev_fall && r_trail != 4'd0) r_trail <= r_trail - 4'd1;
 
-            // ---------------- FIFO: CPU pop (pop-on-read, one cycle after the access) ----------------
-            // The read data for SDM_DATA is registered from the address of
-            // the access's first cycle; the SoC samples it in the second,
-            // and the pop commits at the end of that second cycle.  It pops
-            // only if the word returned was valid.
-            r_pop_pend <= w_new_rd && w_win && (w_off == O_DATA);
-            r_pop_hv   <= r_head_v;
+            // FIFO: CPU pop (pop-on-read): w_cpu_pop commits at the end of
+            // the access's second cycle, the cycle the SoC samples the head
+            // word, and only if that word was valid.
 
             // ---------------- FIFO: head / fetch ----------------
             r_fetch <= w_fetch;
@@ -403,6 +422,8 @@ module sd_native (
                 end
             end
             r_rd_room <= ({1'b0, w_used} + {1'b0, r_d_blkw}) <= 11'd512;
+            r_d_target    <= r_d_cnt * r_d_blkw;      // from the latched values (DSP), a cycle later
+            r_d_tgt_stale <= w_acc_data;
 
             // =================================================================
             // Engines (only in SD mode; otherwise idle and off the pins)
@@ -541,8 +562,8 @@ module sd_native (
 
                 // a new command (only from C_IDLE)
                 if (w_cmd_acc) begin
-                    r_c_tx    <= {1'b0, 1'b1, i_wdata[5:0], r_arg};
-                    r_c_idx   <= i_wdata[5:0];
+                    r_c_tx    <= {1'b0, 1'b1, r_in_wdata[5:0], r_arg};
+                    r_c_idx   <= r_in_wdata[5:0];
                     r_c_rtype <= w_rtype_in;
                     r_c_cnt   <= 8'd0;
                     r_c_state <= C_WAIT;
@@ -772,14 +793,13 @@ module sd_native (
                     if (w_acc_stop && w_d_active && r_d_cnt == 16'd0) r_data_done <= 1'b1;
                 end
                 if (w_acc_data) begin
-                    r_dir     <= i_wdata[12] ? DIR_WRITE : DIR_READ;
+                    r_dir     <= r_in_wdata[12] ? DIR_WRITE : DIR_READ;
                     r_blkdone <= 16'h0;
                     r_d_w4    <= r_cfg_w4;
                     r_d_blkw  <= w_blkw;
                     r_d_sz4   <= w_sz4;
                     r_d_cnt   <= r_blkcnt;
-                    r_d_target <= r_blkcnt * w_blkw;
-                    r_d_state <= i_wdata[12] ? D_WR_WRSP : D_RD_WCMD;
+                    r_d_state <= r_in_wdata[12] ? D_WR_WRSP : D_RD_WCMD;
                 end
             end
 
@@ -796,23 +816,25 @@ module sd_native (
     end
 
     // -----------------------------------------------------------------------
-    // Read mux, registered (the SoC samples it in the access's second cycle)
+    // Read mux: combinational from the registered address (valid in the
+    // access's second cycle); 0 outside the window, so the parent ORs it in.
     // -----------------------------------------------------------------------
-    always_ff @(posedge i_Clk) begin
-        case (w_off)
-            O_ARG:     o_rdata <= {32'h0, r_arg};
-            O_RESP0:   o_rdata <= r_resp0;
-            O_RESP1:   o_rdata <= r_resp1;
-            O_BLK:     o_rdata <= {32'h0, r_blkcnt, 4'h0, r_blksz, 2'b00};
-            O_STATUS:  o_rdata <= {32'h0, w_status};
-            O_IRQEN:   o_rdata <= {37'h0, r_irq_en};
-            O_TMO:     o_rdata <= {r_tmo_busy, r_tmo_data};
-            O_CFG:     o_rdata <= {61'h0, r_cfg_clkon, 1'b0, r_cfg_w4};
-            O_FIFO:    o_rdata <= {54'h0, w_level};
-            O_BLKDONE: o_rdata <= {48'h0, r_blkdone};
-            O_DATA:    o_rdata <= r_head_v ? r_head : 64'h0;
-            O_CAPS:    o_rdata <= CAPS;
-            default:   o_rdata <= 64'h0;          // SDM_CMD, SDM_DMA_ADDR, reserved
+    always_comb begin
+        o_rdata = 64'h0;
+        if (w_win) case (w_off)
+            O_ARG:     o_rdata = {32'h0, r_arg};
+            O_RESP0:   o_rdata = r_resp0;
+            O_RESP1:   o_rdata = r_resp1;
+            O_BLK:     o_rdata = {32'h0, r_blkcnt, 4'h0, r_blksz, 2'b00};
+            O_STATUS:  o_rdata = {32'h0, w_status};
+            O_IRQEN:   o_rdata = {37'h0, r_irq_en};
+            O_TMO:     o_rdata = {r_tmo_busy, r_tmo_data};
+            O_CFG:     o_rdata = {61'h0, r_cfg_clkon, 1'b0, r_cfg_w4};
+            O_FIFO:    o_rdata = {54'h0, w_level};
+            O_BLKDONE: o_rdata = {48'h0, r_blkdone};
+            O_DATA:    o_rdata = r_head_v ? r_head : 64'h0;
+            O_CAPS:    o_rdata = CAPS;
+            default:   o_rdata = 64'h0;           // SDM_CMD, SDM_DMA_ADDR, reserved
         endcase
     end
 

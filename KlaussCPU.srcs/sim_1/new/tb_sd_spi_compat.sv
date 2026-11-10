@@ -8,7 +8,10 @@
 // held 1..4 cycles, sometimes across two addresses.  Every cycle compares
 // SCK, CMD (= MOSI, always driven), DAT3 (= CS_n), DAT1/DAT2 (driven high),
 // DAT0 (an input), SD_RESET, and the read data for every offset outside the
-// native window (which read 0 on the old design).  Prints "TB_SDSPI PASS".
+// native window (which read 0 on the old design).  The native registers are
+// ORed in from the previous cycle's address (a read holds its address and is
+// sampled in its second cycle), so a cycle whose previous address was in the
+// window is not compared either.  Prints "TB_SDSPI PASS".
 module tb_sd_spi_compat;
     logic clk = 0, rst_l = 0, load_rst = 0;
     always #5 clk = ~clk;
@@ -44,6 +47,8 @@ module tb_sd_spi_compat;
 
     int errors = 0, cycles = 0, reads_cmp = 0, kicks = 0, sck_edges = 0;
     wire native_win = (s_addr[15:9] == 7'd0) && s_addr[8];
+    logic native_prev = 0;
+    always @(posedge clk) native_prev <= native_win;
     always @(negedge clk) if (rst_l) begin
         cycles++;
         if ({sck_n, cmd_o, cmd_oe, dat_o[3], dat_oe[3], dat_o[2:1], dat_oe[2:1], dat_oe[0], reset_n_n}
@@ -53,7 +58,7 @@ module tb_sd_spi_compat;
                 $display("[%0t] PIN MISMATCH new sck %b cmd %b/%b dat %b/%b rst %b | ref sck %b mosi %b cs %b d1 %b d2 %b rst %b",
                          $time, sck_n, cmd_o, cmd_oe, dat_o, dat_oe, reset_n_n, sck_r, mosi_r, cs_n_r, dat1_r, dat2_r, reset_n_r);
         end
-        if (!native_win) begin
+        if (!native_win && !native_prev) begin
             reads_cmp++;
             if (bus_n.read_data !== bus_r.read_data) begin
                 errors++;

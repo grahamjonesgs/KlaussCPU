@@ -521,9 +521,13 @@ this (the register map is unchanged):
   load reset: the four interrupt vectors are cleared at every load anyway,
   and an older program loaded after one that set `INT2_EN` = `0b10` would
   otherwise lose its Ethernet interrupt. (Flag for the emulator.)
-- **SDM_* reads are registered** inside the block (the value for the
-  access's address, one cycle old): invisible to software, it keeps the
-  native read mux off the MMIO address path.
+- **The MMIO inputs are registered** at the top of `sd_native` (strobes,
+  address, data): the raw address comes through the SoC's st.SM address
+  mux, and the first build had a failing path from it into the command
+  decode. Writes act one cycle later; reads are combinational from the
+  registered address, valid in the access's second cycle (when the SoC
+  samples them), and a pop commits at the end of that cycle. Invisible to
+  software.
 - Misuse that the map leaves undefined: a CPU push in the same cycle as a
   read-data word write is dropped with FIFO_ERR; a pop is honoured only if
   the word it returns was valid.

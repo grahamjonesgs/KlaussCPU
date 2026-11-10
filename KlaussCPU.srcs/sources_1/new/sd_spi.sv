@@ -235,7 +235,6 @@ module sd_spi (
     wire [63:0]  w_nat_rdata;
     wire         w_nat_clk, w_nat_cmd, w_nat_cmd_oe;
     wire [3:0]   w_nat_dat, w_nat_dat_oe;
-    wire         is_nat = (mmio.addr[15:9] == 7'd0) && mmio.addr[8];
 
     sd_native native_i (
         .i_Clk     (i_Clk),
@@ -266,17 +265,17 @@ module sd_spi (
     assign o_sd_dat_oe = r_sd_mode ? w_nat_dat_oe : 4'b1110;
 
     // -----------------------------------------------------------------------
-    // Read mux — combinational. Returns 0 for undefined offsets.  The native
-    // registers (0x100..0x1F8) come from sd_native's registered mux, which
-    // holds the value for the address of the previous cycle (an MMIO read
-    // holds its address; the SoC samples the data in the second cycle).
+    // Read mux — combinational. Returns 0 for undefined offsets (including
+    // 0x100..0x1F8 here).  The native registers are ORed in from sd_native,
+    // which decodes the address of the previous cycle (registered) and
+    // gives 0 outside its window: an MMIO read holds its address and the
+    // SoC samples the data in the second cycle, so the raw address never
+    // reaches the native decode.
     // -----------------------------------------------------------------------
     always_comb begin
         mmio.read_data = 64'h0;
         if (is_buf) begin
             mmio.read_data = r_sector_buf[buf_idx];
-        end else if (is_nat) begin
-            mmio.read_data = w_nat_rdata;
         end else begin
             case (mmio.addr[15:0])
                 OFF_CTRL:   mmio.read_data = {45'b0, r_sd_mode, r_pwr_en, o_sd_cs_n, r_clk_div};
@@ -285,6 +284,7 @@ module sd_spi (
                 default:    mmio.read_data = 64'h0;
             endcase
         end
+        mmio.read_data = mmio.read_data | w_nat_rdata;
     end
 
 endmodule
