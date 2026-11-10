@@ -21,7 +21,7 @@ module tb_sd_native;
     wire [3:0]  dat_o, dat_oe;
     wire        sd_cmd;
     wire [3:0]  sd_dat;
-    logic       cd = 1'b1;
+    logic       cd = 1'b0;          // SD_CD pin, active low: 0 = card inserted
 
     assign sd_cmd = cmd_oe ? cmd_o : 1'bz;
     for (genvar i = 0; i < 4; i++) begin : g_d
@@ -261,9 +261,9 @@ module tb_sd_native;
         mr(SDM_BLKDONE, d);  check("SDM_BLKDONE reset", d, 0);
         mr(SDM_DMA, d);      check("SDM_DMA_ADDR", d, 0);
         status(st);          check("SDM_STATUS reset (slot off: DAT0 driven low; card present)", st, 64'h08);
-        cd = 0; repeat (4) @(posedge clk);
+        cd = 1; repeat (4) @(posedge clk);       // card removed (CD high)
         status(st);          check("CARD_PRESENT follows CD", st[B_CP], 0);
-        cd = 1;
+        cd = 0;
         check("irq low", irq, 0);
 
         // =========================================================== register R/W

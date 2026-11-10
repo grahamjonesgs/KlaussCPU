@@ -295,7 +295,10 @@ module sd_native (
     wire w_thresh    = w_thresh_rd || w_thresh_wr;
     wire w_err_any   = |r_err;
     wire [31:0] w_status = {w_err_any, 4'b0, r_err, 6'b0, r_data_done, r_cmd_done,
-                            3'b0, w_thresh, r_cd_sync[1], r_dat_in[0], w_d_active, w_c_active};
+                            3'b0, w_thresh, ~r_cd_sync[1], r_dat_in[0], w_d_active, w_c_active};
+    // CARD_PRESENT = NOT the CD pin: the Nexys A7 slot's card-detect switch
+    // pulls SD_CD low with a card inserted (measured on the board, 2026-11-10;
+    // SD_STATUS[1] keeps reporting the raw pin for compatibility).
     localparam logic [31:0] IRQ_MASK = 32'h07FF_0310;
 
     // -----------------------------------------------------------------------

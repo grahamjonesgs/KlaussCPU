@@ -130,9 +130,10 @@ native SD mode (SD_NATIVE_PLAN.md §4.1).
 `SD_DATA`, software polls `SD_STATUS` until `busy == 0`, then reads back
 `SD_DATA` for the received byte.
 
-**`card_present`** reflects the live `SD_CD` pin. Polarity is board-dependent
-on the Nexys A7 (mechanical contact); calibrate empirically by inserting and
-removing a card.
+**`card_present`** reflects the live `SD_CD` pin, raw. On the Nexys A7 it is
+**active low: 0 = a card is inserted** (measured 2026-11-10). The native
+controller's `SDM_STATUS[3]` CARD_PRESENT is the inverted, synchronised form
+(1 = card in).
 
 **Sector buffer** is plain memory. Software stages an outgoing sector here
 before issuing CMD24, or reads the incoming sector here after CMD17. Use
@@ -158,7 +159,7 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 | 0x110 | `SDM_RESP0` | R | 48-bit response: `[31:0]` argument field, `[37:32]` index echo, `[63:38]` 0. R2: response bits `[63:0]` (CRC7 and end bit in `[7:0]`) |
 | 0x118 | `SDM_RESP1` | R | R2: response bits `[127:64]`; 0 after a 48-bit response |
 | 0x120 | `SDM_BLK` | RW | `[11:0]` block size in bytes (multiple of 4, 4–2048; `[1:0]` read 0; 0 acts as 8), `[31:16]` block count (0 = open-ended). Reset `0x0001_0200`. Latched by each data command. A block takes ceil(size/8) FIFO words; when size mod 8 = 4 its last word holds the final 4 bytes in `[31:0]` (`[63:32]` = 0 on reads, ignored on writes) |
-| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT, `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR; `[31]` ERR_ANY (live OR of `[26:16]`) |
+| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR; `[31]` ERR_ANY (live OR of `[26:16]`) |
 | 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[26:16]`) |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` read start-bit timeout, `[63:32]` busy timeout, in CLK cycles. Reset 2 500 000 / 12 500 000 (100 / 500 ms at 25 MHz) |
 | 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply). `[1]`, `[7:4]`, `[16]` reserved (read 0) |
