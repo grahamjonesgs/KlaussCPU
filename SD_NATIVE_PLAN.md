@@ -528,6 +528,15 @@ this (the register map is unchanged):
   registered address, valid in the access's second cycle (when the SoC
   samples them), and a pop commits at the end of that cycle. Invisible to
   software.
+- **Build** (`c1e540a`, LEAN, standard `build_fast`): tier 1 WNS −0.007
+  (paths inside `pipeline_core`), tier 2 WNS +0.126 / TNS 0, WHS +0.024;
+  bitstream `~/.cache/kbuild/mmu-sd_c1e540a_LEAN.bit`. Against `d9cf6c2`:
+  +1,541 LUTs (35,546), +667 FFs (23,375), +291 slices (11,219, 70.8 %),
+  +1 BRAM (75.5), +1 DSP. `sd_native` itself: 1,341 LUTs, 984 FFs, one
+  RAMB36, one DSP48 (count × block words). Worst SD-block paths: +0.54 ns
+  (FIFO level → FIFO_THRESH → MMIO read register), +0.74 ns (into the
+  unchanged SPI `SD_CTRL` write). The CMD / DAT input flip-flops are in the
+  ILOGIC (IOB), the pins have PULLUP.
 - Misuse that the map leaves undefined: a CPU push in the same cycle as a
   read-data word write is dropped with FIFO_ERR; a pop is honoured only if
   the word it returns was valid.
