@@ -1,8 +1,8 @@
 # Native 4-bit SD controller: plan
 
-Status: **register map frozen (v1, 2026-11-10); phase 1 RTL implemented and
-simulated** on klaussCPU branch `mmu-sd` (`sd_native.sv`; implementation
-notes and interpretations in §4.9); board test (phase 2) pending.
+Status: **phases 0–2 done (2026-11-10)**: release candidate `5648f75` on
+klaussCPU branch `mmu-sd`, board-validated (results §6.1; implementation notes
+§4.9). Register map v1 frozen. Phase 3 (high speed) not started.
 (Graham's go-ahead, relayed by the runtime session.)
 Plan written 2026-11-10. Requested by Graham through the
 klausscpu-runtime session; that session reviews the software interface (§5)
