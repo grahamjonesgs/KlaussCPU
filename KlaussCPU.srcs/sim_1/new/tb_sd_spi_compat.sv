@@ -6,6 +6,8 @@
 // writes into the native window 0x100..0x1F8 — SDM_CMD, CLK_ON, FIFO pushes
 // — and program-load pulses), random MISO and card-detect, and the strobe
 // held 1..4 cycles, sometimes across two addresses.  Every cycle compares
+// (while the slot is unpowered, pwr_en = 0, the new block drives every SD line
+// low instead of the old idle levels; the TB expects that)
 // SCK, CMD (= MOSI, always driven), DAT3 (= CS_n), DAT1/DAT2 (driven high),
 // DAT0 (an input), SD_RESET, and the read data for every offset outside the
 // native window (which read 0 on the old design).  The native registers are
@@ -52,7 +54,10 @@ module tb_sd_spi_compat;
     always @(negedge clk) if (rst_l) begin
         cycles++;
         if ({sck_n, cmd_o, cmd_oe, dat_o[3], dat_oe[3], dat_o[2:1], dat_oe[2:1], dat_oe[0], reset_n_n}
-            !== {sck_r, mosi_r, 1'b1, cs_n_r, 1'b1, dat2_r, dat1_r, 2'b11, 1'b0, reset_n_r}) begin
+            !== (reset_n_r == 1'b0
+                 ? {sck_r, mosi_r, 1'b1, cs_n_r, 1'b1, dat2_r, dat1_r, 2'b11, 1'b0, reset_n_r}
+                 // slot unpowered: every SD line driven low (no back-powering; sd_spi.sv)
+                 : {1'b0, 1'b0, 1'b1, 1'b0, 1'b1, 2'b00, 2'b11, 1'b1, reset_n_r})) begin
             errors++;
             if (errors < 10)
                 $display("[%0t] PIN MISMATCH new sck %b cmd %b/%b dat %b/%b rst %b | ref sck %b mosi %b cs %b d1 %b d2 %b rst %b",

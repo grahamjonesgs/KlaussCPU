@@ -123,6 +123,14 @@ input flip-flops.
   - **LOAD_COMPLETE with SD_MODE = 0**: nothing changes, exactly as today,
     so existing SPI flows that leave the card initialised across a load
     behave the same.
+  - **Slot power off drives every SD line low** (CLK, CMD, DAT[3:0], in
+    both modes; `sd_spi.sv`, added after the phase-1 board test, 2026-11-10).
+    Without it, the lines idling high (the SPI MOSI/CS/DAT1/DAT2 drivers, or
+    the PULLUPs in SD mode) back-powered the card. On the board, a card stayed
+    in SD mode across a 1 s `pwr_en` = 0 and SPI init failed, and the reverse
+    also happened. Only an FPGA reprogram, which releases every pin, reset
+    it. `d9cf6c2` and older bitstreams have the same leak, which went
+    unnoticed because the card never had to leave SPI mode.
   - **Rule for SPI drivers** (Zephyr, the loader, `test_sd`): before the
     first CMD0, write `pwr_en` = 0, wait for the power-off time (≥ 10 ms,
     to be measured), then power up. This covers both a load straight after

@@ -745,10 +745,10 @@ def _socsd_progs():
     a = Asm(); a.setr(15, SD); a.setr(14, IRQ)
     a.ld(64, 1, 14, 0x48); a.ld(64, 2, 14, 0x50); a.ld(64, 3, 14, 0x58)
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
-    a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)
+    a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: slot off at reset, so DAT0 is driven low (0)
     a.halt()
     progs.append(('regs', a, {'r1': 0x0030100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
-                              'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x4, 'r9': 0}))
+                              'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x0, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
     for k in range(8):

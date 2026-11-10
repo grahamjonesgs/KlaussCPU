@@ -118,6 +118,13 @@ responsible for asserting it (write 0) before a command and releasing it
 **`pwr_en`** drives the slot's active-low power gate (`SD_RESET` on the Nexys
 A7 schematic). At reset `pwr_en = 0` → slot is OFF. Software **must** set
 `pwr_en = 1` and wait ≥1 ms before any SPI activity.
+On bitstreams with the native controller (`CPU_FEATURES[21]`), all SD lines
+(SCK/CLK, CMD/MOSI, DAT[3:0] including CS_n) are **driven low while
+`pwr_en = 0`**, in either mode. Older bitstreams kept MOSI, CS_n, DAT1 and
+DAT2 high, which back-powers the card through its I/O pins, so a power cycle
+did not reset it. A power cycle (`pwr_en = 0` for ≥ 20 ms, then 1) now
+really resets the card, which is how software moves it between SPI and
+native SD mode (SD_NATIVE_PLAN.md §4.1).
 
 **`busy`** is 1 while a single-byte transfer is in progress. After writing
 `SD_DATA`, software polls `SD_STATUS` until `busy == 0`, then reads back

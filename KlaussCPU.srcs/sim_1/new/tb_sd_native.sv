@@ -60,9 +60,10 @@ module tb_sd_native;
 
     // ---------------- contention / pin monitors ----------------
     always @(posedge clk) begin
-        if (cmd_oe && card.cmd_oe) begin contention++; if (contention < 5) $display("[%0t] CONTENTION on CMD", $time); end
+        // an unpowered card cannot drive (the model's send tasks may still run)
+        if (!reset_n && cmd_oe && card.cmd_oe) begin contention++; if (contention < 5) $display("[%0t] CONTENTION on CMD", $time); end
         for (int i = 0; i < 4; i++)
-            if (dat_oe[i] && card.dat_oe[i]) begin contention++; if (contention < 5) $display("[%0t] CONTENTION on DAT%0d", $time, i); end
+            if (!reset_n && dat_oe[i] && card.dat_oe[i]) begin contention++; if (contention < 5) $display("[%0t] CONTENTION on DAT%0d", $time, i); end
     end
     // SD CLK activity: cycles since the last edge
     longint last_sck_edge = 0;
@@ -259,7 +260,7 @@ module tb_sd_native;
         mr(SDM_FIFO, d);     check("SDM_FIFO reset", d, 0);
         mr(SDM_BLKDONE, d);  check("SDM_BLKDONE reset", d, 0);
         mr(SDM_DMA, d);      check("SDM_DMA_ADDR", d, 0);
-        status(st);          check("SDM_STATUS reset (DAT0 pulled up, card present)", st, 64'h0C);
+        status(st);          check("SDM_STATUS reset (slot off: DAT0 driven low; card present)", st, 64'h08);
         cd = 0; repeat (4) @(posedge clk);
         status(st);          check("CARD_PRESENT follows CD", st[B_CP], 0);
         cd = 1;
@@ -278,7 +279,7 @@ module tb_sd_native;
         mw(SDM_DMA, 64'hFFFF_FFFF);              mr(SDM_DMA, d);  check("SDM_DMA_ADDR reads 0", d, 0);
         mw(SDM_CAPS, 0);                          mr(SDM_CAPS, d); check("SDM_CAPS read-only", d, 64'h0008_0101);
         mr(SDM_CMD, d);                           check("SDM_CMD reads 0", d, 0);
-        mw(SDM_STATUS, 64'hFFFF_FFFF);            status(st);      check("SDM_STATUS W1C on clean", st, 64'h0C);
+        mw(SDM_STATUS, 64'hFFFF_FFFF);            status(st);      check("SDM_STATUS W1C on clean", st, 64'h08);
 
         // =========================================================== SDM_CMD ignored in SPI mode
         n0 = sck_rises;
@@ -898,8 +899,8 @@ module tb_sd_native;
         repeat (3) @(posedge clk);
         mr(SD_CTRL, d);     check("load reset (SD mode): SD_CTRL", d, 64'h0001_00F9);
         check("load reset: slot power off", reset_n, 1);
-        check("load reset: SPI pins (CMD driven high)", {cmd_oe, cmd_o}, 2'b11);
-        check("load reset: SPI pins (DAT3 = CS_n = 1, DAT1/2 high, DAT0 input)", {dat_oe, dat_o[3:1]}, 7'b1110_111);
+        check("load reset: slot off, CMD driven low", {cmd_oe, cmd_o}, 2'b10);
+        check("load reset: slot off, DAT[3:0] driven low", {dat_oe, dat_o[3:1]}, 7'b1111_000);
         check("load reset: SCK low", sck, 0);
         mr(SDM_FIFO, d);    check("load reset: FIFO empty", d, 0);
         mr(SDM_BLK, d);     check("load reset: SDM_BLK", d, 64'h0001_0200);

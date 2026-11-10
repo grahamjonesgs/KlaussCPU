@@ -257,12 +257,20 @@ module sd_spi (
         .i_cd      (i_sd_cd)
     );
 
-    // SPI mode: every pin keeps its old direction and value.
-    assign o_sd_sck    = r_sd_mode ? w_nat_clk    : o_sd_sck_spi;
-    assign o_sd_cmd    = r_sd_mode ? w_nat_cmd    : o_sd_mosi;
-    assign o_sd_cmd_oe = r_sd_mode ? w_nat_cmd_oe : 1'b1;
-    assign o_sd_dat    = r_sd_mode ? w_nat_dat    : {o_sd_cs_n, 1'b1, 1'b1, 1'b1};
-    assign o_sd_dat_oe = r_sd_mode ? w_nat_dat_oe : 4'b1110;
+    // Slot powered (pwr_en = 1): SPI mode keeps every pin's old direction and
+    // value; SD mode hands the pins to the native engine.
+    // Slot unpowered (pwr_en = 0), either mode: CLK, CMD and DAT[3:0] are all
+    // driven LOW.  Driving them high (SPI's MOSI/CS/DAT1/DAT2 idle level) or
+    // leaving them on the PULLUPs back-powers the card through its I/O pins,
+    // so cutting the slot's power never resets it: on the board, a card left
+    // in SD mode stayed there across a 1 s power-off (and vice versa), which
+    // breaks the SPI <-> native mode switch (SD_NATIVE_PLAN.md §4.1).
+    wire w_on = r_pwr_en;
+    assign o_sd_sck    = w_on & (r_sd_mode ? w_nat_clk : o_sd_sck_spi);
+    assign o_sd_cmd    = w_on & (r_sd_mode ? w_nat_cmd : o_sd_mosi);
+    assign o_sd_cmd_oe = ~w_on | (r_sd_mode ? w_nat_cmd_oe : 1'b1);
+    assign o_sd_dat    = {4{w_on}} & (r_sd_mode ? w_nat_dat : {o_sd_cs_n, 1'b1, 1'b1, 1'b1});
+    assign o_sd_dat_oe = {4{~w_on}} | (r_sd_mode ? w_nat_dat_oe : 4'b1110);
 
     // -----------------------------------------------------------------------
     // Read mux — combinational. Returns 0 for undefined offsets (including
