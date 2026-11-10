@@ -590,6 +590,51 @@ this (the register map is unchanged):
    flush/invalidate (also useful to Linux as a whole). Only if the CPU share
    in phases 2 and 3 matters.
 
+### 6.1 Results (2026-11-10)
+
+**Phase 0 (`tools/board/sd_pio.c`, d9cf6c2):**
+- Copying through a 64-bit MMIO data port to cached DDR costs **577 cycles
+  per 512-byte block** (about 9 per word), i.e. 88.7 MB/s. Stores the other
+  way cost 514 cycles (99.6 MB/s).
+- So PIO costs **~14 % of the CPU at 12.5 MB/s** (default speed) and ~28 % at
+  25 MB/s (high speed). §4.4's estimate was 15 % at 25 MB/s.
+- The runtime session's tuned SPI driver under Linux (multi-block,
+  pipelined) reaches read 1.02 / write 0.91 MB/s, which works out to about
+  100 CPU cycles per byte.
+
+**Phase 1:** the RTL, the card-model unit tests (337 checks), SPI
+cycle-by-cycle equivalence and SoC tests are summarised in §4.9.
+
+**Phase 2: board, release candidate `5648f75` LEAN** (standard flow, tier 2
+WNS +0.008, WHS +0.013; 35.5k LUTs = 56 %, 70.2 % slices, 75.5 BRAM;
+`~/.cache/kbuild/mmu-sd_5648f75_LEAN.bit`, md5 `3c679fa5…`):
+- **Bare-metal `tools/board/sd_native_test.c`: 0 fails** on a 64 GB SDXC
+  card. It covers identification, 1-bit and 4-bit, CMD17/18/24/25,
+  ACMD51/13/22 (8-, 64- and 4-byte blocks), CMD18 data equal to CMD17
+  data, and writes only in the gap before partition 1, which are restored.
+  - **Read 1 MiB in 86–87 ms = 12.1 MB/s**, the 4-bit 25 MHz limit.
+  - Write about 8 MB/s (32 KiB, coarse).
+- **Mode switching by power cycle only:** SPI `test_sd` 22/22 and the native
+  test alternated five times in a row, both directions, with no reload.
+  - On the first candidate, `c1e540a`, this failed: the card was
+    back-powered through its I/O pins while the slot was off (§4.1), and
+    only an FPGA reload reset it.
+  - Fixed in `76e5e40`.
+- **CARD_PRESENT:** `SDM_STATUS[3]` reads 1 with a card in, and the raw
+  `SD_STATUS[1]` reads 0. The pin is active low; fixed in `5648f75`.
+- **Regressions:**
+  - klausscc all_tests 31/32 with 0 failed, the same as d9cf6c2.
+  - Zephyr `ssh_shell`: SD mounts over SPI, Ethernet works through the
+    INT2 cascade, and the QSPI keystore key is presented
+    (`SHA256:DYRxGy…IYI`, unchanged).
+- **Linux native driver (runtime session, on `c1e540a`):**
+  - mmcblk0 4-bit at 25 MHz, with the SD-root boot working.
+  - 16 MiB raw read 3.06 MB/s, file read 3.07 MB/s, write plus sync
+    1.95 MB/s, against SPI's 1.02 / 0.91.
+  - The gap to the bare-metal 12 MB/s is Linux's per-request CPU cost; the
+    runtime session is tuning it.
+  - No error bits were seen.
+
 ## 7. Cost and timing (question 6)
 
 | Part | LUTs | FFs | BRAM |
