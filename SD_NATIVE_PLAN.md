@@ -196,9 +196,18 @@ Results:
 ### 4.3 Data engine
 
 - `SDM_BLK`:
-  - `[11:0]` block size in bytes, **a multiple of 8, from 8 to 2048**: 512
+  - `[11:0]` block size in bytes, **a multiple of 4, from 4 to 2048**: 512
     for blocks, 64 for the SD status and the CMD6 switch status, 8 for the
-    SCR. Bits `[2:0]` are ignored on write and read back as 0.
+    SCR, and 4 for ACMD22 (SEND_NUM_WR_BLOCKS). Bits `[1:0]` are ignored on
+    write and read back as 0.
+  - A block occupies ceil(size / 8) FIFO words. When size mod 8 = 4, the
+    block's last word carries its final 4 bytes in `[31:0]`:
+    - on a read, `[63:32]` are 0;
+    - on a write, `[63:32]` of that word are ignored, and only `[31:0]` go
+      out.
+    The next block starts in a new word. The 4-byte case was added on
+    2026-11-10 at the runtime session's request, after the v1 freeze but
+    before any RTL release, for the Linux mmc core's ACMD22 recovery.
   - `[31:16]` block count, where 0 means open-ended until a CMD12.
 - `SDM_BLKDONE` (0x158, read-only) counts **good blocks** in the current
   data command. It resets to 0 when an `SDM_CMD` with the data flag is
@@ -348,7 +357,7 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
     reset (`SDM_FIFO[31]`), CPU_RESETN or the native-mode load reset sets
     DIR to NONE.
   - **DIR = READ:** the FIFO holds at least one whole block of unread data
-    (level ≥ block size / 8 words). It also stays set after the transfer has
+    (level ≥ ceil(block size / 8) words). It also stays set after the transfer has
     ended, until the FIFO is drained below one block. So after DATA_DONE the
     handler keeps popping until FIFO_THRESH drops; with whole blocks that
     leaves the FIFO empty.
@@ -397,7 +406,7 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
 | 0x108 | `SDM_ARG` | RW | command argument |
 | 0x110 | `SDM_RESP0` | R | response [63:0] (48-bit: [31:0] = status/OCR/RCA) |
 | 0x118 | `SDM_RESP1` | R | R2 response [127:64] |
-| 0x120 | `SDM_BLK` | RW | `[11:0]` block size (multiple of 8, 8–2048; `[2:0]` read 0), `[31:16]` block count (0 = open-ended) |
+| 0x120 | `SDM_BLK` | RW | `[11:0]` block size (multiple of 4, 4–2048; `[1:0]` read 0; a block takes ceil(size/8) words, §4.3), `[31:16]` block count (0 = open-ended) |
 | 0x128 | `SDM_STATUS` | R/W1C | **live** (read-only): `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0 level, `[3]` CARD_PRESENT, `[4]` FIFO_THRESH (§4.5). **sticky** (write-1-to-clear): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT (no read start bit), `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR (token ≠ 010), `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT (R1b or write busy), `[26]` FIFO_ERR (push to a full FIFO). `[31]` ERR_ANY (live) = OR of `[26:16]` |
 | 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same bit positions as `SDM_STATUS` (`[4]`, `[9:8]`, `[26:16]`); others ignored |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` data timeout (read start bit), `[63:32]` busy timeout (R1b / write busy), both in CLK cycles. Reset 2 500 000 / 12 500 000 (100 ms / 500 ms at 25 MHz); software rescales for other clocks |
@@ -458,7 +467,7 @@ which models this controller. The RTL and the emulator follow this table.
 | `[13]` stop ends a **counted** phase early | DATA_BUSY clears and DATA_DONE is **not** set. `SDM_BLKDONE` says how far it got. |
 | Clearing SD_MODE (a `SD_CTRL` write) | the command and data engines abandon what they are doing: busy bits clear, no DONE bit is set, and the pins return to the SPI mapping. The registers, the FIFO contents and DIR are kept. |
 | Registers other than `SDM_CMD` while SD_MODE = 0 | work normally: read and write, `SDM_DATA` pop and push, W1C on `SDM_STATUS`, FIFO reset |
-| `SDM_BLK` size field written with 0 | treated as 8 (`[2:0]` read 0, so the field reads 0). Software must not use it. |
+| `SDM_BLK` size field written with 0 (or 1–3) | the field reads 0 and behaves as 8. Software must not use it. |
 | Block size used by FIFO_THRESH and the data engine | the size **latched when the data command is issued**, during the phase and after it ends (DIR = READ). Writing `SDM_BLK` mid-phase or after the phase has no effect until the next data command. |
 | `SDM_RESP*` after CMD_TIMEOUT (types 1–4) | unchanged. After a CRC, end-bit or index error they hold the response as received. |
 | Counted write stopped early by CMD12 | the unsent words stay in the FIFO (the driver resets it) |
