@@ -2707,7 +2707,10 @@ rams_sp_nc rams_sp_nc1 (
          pip_perf_stall[0] && w_px_free };
 `ifndef SYNTHESIS
    always_ff @(posedge i_Clk)
+      // The table has no reset: in a 4-state sim it is X until LOAD_COMPLETE
+      // or an MMIO write, so skip the check while it is unknown.
       for (int k = 0; k < 4; k++)
+         if (!$isunknown(r_interrupt_table[k]))
          assert (r_ivec_nz[k] == (r_interrupt_table[k] != 32'h0))
             else $fatal(1, "r_ivec_nz[%0d] stale: vector %h", k, r_interrupt_table[k]);
    always_ff @(posedge i_Clk) if (r_perf_excl)
