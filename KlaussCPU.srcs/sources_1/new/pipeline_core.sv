@@ -2616,6 +2616,10 @@ module pipeline_core
    logic [63:0] r_shl1, r_shr1, r_sar1, r_rol1, r_ror1, r_oh1, r_btr1, r_sha_op;
    logic [2:0]  r_shhi, r_bthi;
    logic [3:0]  r_shsub;
+   // per-byte "is zero" flags (bit i: v[8i+7:8i] == 0)
+   function automatic logic [7:0] f_bz(logic [63:0] v);
+      for (int i = 0; i < 8; i++) f_bz[i] = (v[8*i +: 8] == 8'd0);
+   endfunction
    always_ff @(posedge clk) if (ce) begin
       if (ex_is_sh_hand) begin
          r_shl1  <= ex_a << ex_shcnt[2:0];
@@ -2648,6 +2652,42 @@ module pipeline_core
          4'd9:  w_sh2 = r_sha_op & ~(r_oh1 << hi8);
          4'd10: w_sh2 = r_sha_op ^  (r_oh1 << hi8);
          default: w_sh2 = {63'b0, btr_full[0]};   // BTSTRR
+      endcase
+   end
+   // (timing) the shift result's byte-zero flags: stage 1's byte flags
+   // moved by the byte shift r_shhi — so "result == 0" (the DIV-by-zero
+   // ex_b_zero forward, wb_zero) no longer waits for stage 2's 64-bit
+   // combine and a 64-bit reduce behind it.  bzs = flags of the stage 1
+   // value r_shsub selects (shl / shr / sar / rol / ror / the BTS-family
+   // operand); bzc / bzt = the operand's bytes with bit shcnt[2:0] (r_oh1)
+   // cleared is zero / equal to that bit alone (BTR / BTC).  All from the
+   // stage 1 registers, in MEM.  w_sh2_bz == f_bz(w_sh2) — asserted.
+   logic [7:0] w_sh2_bz;
+   always_comb begin : sh_stage2_bz
+      logic [7:0] kb, bzs, bzc, bzt;
+      kb = 8'd1 << r_shhi;                  // the byte that r_oh1 << hi8 hits
+      case (r_shsub)
+         4'd0:    bzs = f_bz(r_shl1);
+         4'd1:    bzs = f_bz(r_shr1);
+         4'd2:    bzs = f_bz(r_sar1);
+         4'd3:    bzs = f_bz(r_rol1);
+         4'd4:    bzs = f_bz(r_ror1);
+         default: bzs = f_bz(r_sha_op);
+      endcase
+      for (int i = 0; i < 8; i++) begin
+         bzc[i] = (r_sha_op[8*i +: 8] & ~r_oh1[7:0]) == 8'd0;
+         bzt[i] =  r_sha_op[8*i +: 8] ==  r_oh1[7:0];
+      end
+      case (r_shsub)
+         4'd0:  w_sh2_bz = ~(~bzs << r_shhi);           // vacated bytes are zero
+         4'd1:  w_sh2_bz = ~(~bzs >> r_shhi);
+         4'd2:  w_sh2_bz = ~((~bzs >> r_shhi) | (r_sar1[63] ? ~(8'hFF >> r_shhi) : 8'h00));
+         4'd3:  w_sh2_bz = (bzs << r_shhi) | (bzs >> (4'd8 - {1'b0, r_shhi}));
+         4'd4:  w_sh2_bz = (bzs >> r_shhi) | (bzs << (4'd8 - {1'b0, r_shhi}));
+         4'd8:  w_sh2_bz = bzs & ~kb;
+         4'd9:  w_sh2_bz = (bzs & ~kb) | (bzc & kb);
+         4'd10: w_sh2_bz = (bzs & ~kb) | (bzt & kb);
+         default: w_sh2_bz = {7'h7F, !r_btr1[{r_bthi, 3'b000}]};   // BTSTRR
       endcase
    end
    // v3 D3: a W op's result is its low 32 bits sign-extended — applied here,
@@ -2744,9 +2784,7 @@ module pipeline_core
    // zero flags in parallel instead of after the MUL / load-extract selects:
    // a MUL's product halves (registers), a load's dword by its size / offset
    // (an extension of zero is zero), else wb_value.  Asserted equal.
-   function automatic logic [7:0] f_bz(logic [63:0] v);
-      for (int i = 0; i < 8; i++) f_bz[i] = (v[8*i +: 8] == 8'd0);
-   endfunction
+   // (f_bz: with the shifter's stage 1 above)
    // (a MUL: from mul_r2, already half-selected and W-extended — the W
    // sign extension of a zero low word is zero)
    wire [7:0] wbz_mr  = f_bz(mul_r2);
@@ -3716,7 +3754,7 @@ module pipeline_core
             // Z producers are never port reads (IRET's flags come from
             // iret_fval with wb_zval 0), so the reduce sees mem_result_eff
             // only and stays off the m_rdata path.
-            wb_zero    <= (mem_result_eff == 64'b0);
+            wb_zero    <= mem_is_sh ? &w_sh2_bz : (mem_result_eff == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
@@ -3942,7 +3980,9 @@ module pipeline_core
                // each candidate reduced in parallel, the same select picks
                ex_b_zero  <= id_b_one ? 1'b0
                            : id_b_imm ? (id_var1 == 32'd0)
-                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? f_wz(id_w, mem_result_eff)
+                           : (mem_fwd_ok && mem_d.rd == dec.rs2)
+                             ? (mem_is_sh ? (id_w ? &w_sh2_bz[3:0] : &w_sh2_bz)
+                                          : f_wz(id_w, mem_result_eff))
                            : (b_wb       && wb_rd    == dec.rs2) ? wbz_fwd
                            : f_wz(id_w, rf[dec.rs2]);
 
@@ -4677,6 +4717,10 @@ module pipeline_core
       // idle port on that edge (st_spec_now needs !st_post)
       if (sq_spec)
          assert (st_post || sq_v) else $fatal(1, "sq_spec with the port idle: pc=%h", mem_pc);
+      if (mem_is_sh)
+         assert (w_sh2_bz == f_bz(w_sh2))
+            else $fatal(1, "shift byte-zero flags drift: sub=%0d hi=%0d w_sh2=%h bz=%b",
+                        r_shsub, r_shhi, w_sh2, w_sh2_bz);
       if (running && !fetch_halt)
          assert (w_is_ei == (EN_DIEI && w_dec.uop == U_EI))
             else $fatal(1, "EI raw-bit predecode drift: op=%h", w_op);
