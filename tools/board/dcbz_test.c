@@ -68,7 +68,16 @@ static struct cnt snap(void) {
     return c;
 }
 
-static void zero_dcbz(uintptr_t b) { for (uint32_t o = 0; o < SPAN; o += L) dcbz(b + o); }
+/* L in a local, and 4 lines per iteration like zero_st: the asm's "memory"
+ * clobber makes the compiler reload the global L after every DCBZ, and that
+ * MEMGET32 -> add -> address chain (14 cycles a line in tb_soc with the DCBZ
+ * a NOP) measured the loop, not the DCBZ (18 cycles a line, 3 in the cache) */
+static void zero_dcbz(uintptr_t b) {
+    const uint32_t l = L;
+    for (uint32_t o = 0; o < SPAN; o += 4 * l) {
+        dcbz(b + o); dcbz(b + o + l); dcbz(b + o + 2 * l); dcbz(b + o + 3 * l);
+    }
+}
 static void zero_st(uintptr_t b) {
     for (uint32_t o = 0; o < SPAN; o += 32) {
         volatile uint64_t *p = (volatile uint64_t *)(b + o);

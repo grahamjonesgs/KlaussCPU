@@ -288,7 +288,23 @@ Decisions taken while implementing the frozen text above:
   site on the tag / hit-pipe tag arrays made Vivado implement them in
   registers — Synth 8-4767, 248k LUTs. Every cache array keeps the write
   sites it had before DCBZ.) `CNT_ZERO_LINES` (0xF005_0070) counts both;
-  they are also write hits / misses.
+  they are also write hits / misses. A DCBZ's dirty victim goes out from
+  WRITE_FETCH directly, without the 3-cycle EVICT_SHADOW_GAP: no refill
+  was issued, so ddr2_control is already waiting for a DV.
+- **Throughput** (xsim cache bench, `run_m10_cache.sh` Phase P: 64 KiB
+  back-to-back, cycles per 32 B line, real ddr2_control on the bench's MIG
+  model). Clean or invalid victim: DCBZ 3 (WAIT, CHECK, WRITE_FETCH, one
+  each), 4 stores 27 (19 waiting for the fetch). Dirty victim: DCBZ 13 (10
+  waiting for the writeback; 16 with the gap), 4 stores 40. With
+  scanout-shaped VGA traffic a clean DCBZ stays at 3: it needs no DDR
+  access and nothing waits for the grant. The first board run
+  (`tools/board/dcbz_test.c`, 88acc21) showed 18.1 cycles a line for
+  clean DCBZ because the loop reloaded the global line size after every
+  DCBZ (the asm's `memory` clobber). The MEMGET32 → add → address chain
+  alone costs 14 cycles a line in tb_soc (the same machine code with the
+  DCBZ replaced by a NOP), and a MEMGET32 right behind a DCBZ waits about
+  4 more. dcbz_test now keeps L in a local and does 4 lines an iteration.
+  That loop measures 3.25 (clean) and 13 (dirty) cycles a line in tb_soc.
 - **MAL64** is a flop in the core, written by MTSR STATUS as it commits
   (serializing), cleared by reset and `start`. The misaligned check uses
   EA[2:0] from a 3-bit add (was 2). Trapping 64-bit accesses become the
