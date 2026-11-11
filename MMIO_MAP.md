@@ -322,10 +322,11 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
-| 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line. |
-| 0x0058  | `CNT_WRITE_MISSES`   | R  | 64    | Write accesses that missed and triggered a fetch-then-merge refill. |
+| 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line (including DCBZ hits). |
+| 0x0058  | `CNT_WRITE_MISSES`   | R  | 64    | Write accesses that missed and triggered a fetch-then-merge refill (a DCBZ miss counts here too, though it fetches nothing). |
 | 0x0060  | `CNT_WRITEBACKS`     | R  | 64    | Dirty-line evictions (the cache wrote a dirty line back to DDR before refilling its slot). Counts both write-miss and read-miss eviction paths. |
 | 0x0068  | `CNT_STALL_CYCLES`   | R  | 64    | `i_Clk` cycles the CPU was blocked on the cache miss/refill chain. M10a: counting stops at the critical-word-first early restart — the remaining line-install and shadow-writeback cycles overlap execution and are not counted. M10b: write misses are acknowledged at the latch edge and contribute ~nothing. `STALL/(RD_MISS+WR_MISS)` is therefore the CPU-visible average miss penalty, dominated by read misses. |
+| 0x0070  | `CNT_ZERO_LINES`     | R  | 64    | DCBZ operations (HW_PERF_PLAN.md §1), hits and misses: a hit overwrites the line with zeros, a miss installs a zero line without reading DDR (a dirty victim is still written back and counted in `CNT_WRITEBACKS`). Each is also one `CNT_WRITE_HITS` / `CNT_WRITE_MISSES` event. Reads 0 on older bitstreams. `CPU_FEATURES[22]`. |
 
 **Counters are 64-bit and free-running.** At `i_Clk = 100 MHz` even an event
 that fires every cycle takes ~5.8 × 10⁹ years to wrap, so software never has
@@ -804,11 +805,14 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[19]` | HMAC-SHA-256 (`0xF00B_0080`; only with SHA-256) |
 | `[20]` | TRNG (`0xF00C_0000`; always built, so always 1) |
 | `[21]` | native SD controller (`SD_CTRL[18]`, `SDM_*` at `0xF000_0100`) |
+| `[22]` | DCBZ (HW_PERF_PLAN.md §1; `CNT_ZERO_LINES` at `0xF005_0070`) |
+| `[23]` | `STATUS[10]` MAL64, the opt-in misaligned 64-bit trap (HW_PERF_PLAN.md §4) |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
 `0x001F_100D`. With the native SD controller (branch `mmu-sd`) `[21]` is set
-too: `0x0030_100D` lean, `0x003F_100D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+too: `0x0030_100D` lean, `0x003F_100D` full; with DCBZ and MAL64 (branch
+`perf-hw`) `0x00F0_100D` lean, `0x00FF_100D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =

@@ -765,6 +765,25 @@ on LR_W_S.
 
 Example: `SC.D r6, r5, [r1]` = `0x5F001615`.
 
+### 9.2a DCBZ (class 7, LEN=01, MODE=00, `[13]` = 1) — HW_PERF_PLAN.md §1
+
+| Symbol | Template | Regs | Semantics |
+|---|---|---|---|
+| DCBZ | `0x5F002000` | rs1 (address) | zero the whole D-cache line holding rs1 (L = `CACHE_INFO[31:24]` bytes, 32 today; EA aligned down; never MISALIGNED); a store of the line for permissions, ordering and the I-cache snoop |
+
+The only encoding is `0x5F00_2000 | rs1 << 4`: SIZE `[25:24]` = 11, SGN = 0,
+MODE = 00, A = 0, `[19:14]` = 0, `[13]` = 1, `[12]` = 0, `[11:8]` = 0,
+`[3:0]` = 0. Every other class 6/7 LEN=01 MODE ∈ {00, 10, 11} word with
+`[13]` = 1 is ILLEGAL (`[12]` = 1 as well, another SIZE, SGN, A, a nonzero
+`[11:8]` / `[3:0]` / `[19:14]`, LEN = 10, class 6). (MODE = 01 is the
+existing short store: its `[19:12]` is imm8, so `[13]` = 1 there is a
+displacement bit, not DCBZ.) Illegal on older bitstreams and on core 2.
+DCBZ to `0xF…` raises ACCESS_STORE in both modes. Probe `CPU_FEATURES[22]`.
+The retire trace shows it as a write of the line's first doubleword:
+`wr=<EA & ~31>/ff/0000000000000000`.
+
+Example: `DCBZ [r3]` = `0x5F002030`.
+
 ### 9.3 Machine-readable additions
 
 ```csv
@@ -777,6 +796,7 @@ LR_W,0x5A001000,1,6,"rd,rs1",,,load-reserved 32 zext (mmu stage 1)
 LR_W_S,0x5A801000,1,6,"rd,rs1",,,load-reserved 32 sext (mmu stage 1)
 SC_D,0x5F001000,1,7,"rd,rs1,rs2",,,store-conditional 64; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
 SC_W,0x5E001000,1,7,"rd,rs1,rs2",,,store-conditional 32; rd = 0 ok / 1 fail; data = rs2 (mmu stage 1)
+DCBZ,0x5F002000,1,7,rs1,,,zero the D-cache line holding rs1; no fetch (HW_PERF_PLAN.md §1; CPU_FEATURES[22])
 ```
 
 ## 10. MMU stage 2 and 3 additions (2026-11-09, branch `mmu`)
@@ -795,7 +815,11 @@ From [MMU_PLAN.md](MMU_PLAN.md) §10–§11. **Not yet in the RTL, klausscc or L
 | `0x33` | `asid` | 3 |
 | `0x34` | `tlbvec` | 3 |
 
-`STATUS` gains `[8]` MPU_EN (stage 2) and `[9]` TE (stage 3).
+`STATUS` gains `[8]` MPU_EN (stage 2) and `[9]` TE (stage 3); `[10]` MAL64
+(HW_PERF_PLAN.md §4, `CPU_FEATURES[23]`): with MAL64 = 1 every 64-bit
+load / store (A = 0 or 1, any addressing mode) with EA[2:0] ≠ 0 raises
+MISALIGNED_LOAD / _STORE instead of using the aligned-down doubleword
+(§8.4); stack ops, MEMGET32 and DCBZ are exempt.
 
 ### 10.2 TLB instructions (class B, LEN=01, no operands, privileged, serializing)
 

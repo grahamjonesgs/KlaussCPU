@@ -152,7 +152,56 @@ A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
 | `[23]` | STATUS.MAL64 (§4) |
 | `[24]` | `ETH_RX_SLOTS` (§3) |
 
+## Implementation notes (§1 and §4, 2026-11-11)
+
+Decisions taken while implementing the frozen text above:
+
+- **MODE = 01 neighbours.** §1 says any other MODE with `[13]` = 1 is
+  ILLEGAL. For MODE = 10 and 11 that holds (those LEN = 01 words were
+  already illegal). MODE = 01 is the existing v3 short store / load, whose
+  `[19:12]` is the imm8 displacement, so `[13]` = 1 there is an ordinary
+  displacement bit and keeps its meaning (backward compatibility). The
+  exact DCBZ word is `0x5F00_2000 | rs1 << 4`; every other class 6/7
+  MODE ∈ {00, 10, 11} word with `[13]` = 1 is ILLEGAL. An emulator that
+  rejects MODE = 01 words with `[13]` = 1 would reject existing code.
+- **Trace.** The retire record of a DCBZ is a write of the line's first
+  doubleword: address `EA & ~31`, byte enables `ff`, data 0 (tb_vsim /
+  tb_soc: `wr=<base>/ff/0000000000000000`). With TE = 1 the address is the
+  PA, as for every store's trace record.
+- **Build gating.** DCBZ needs stage 1 (its MMIO fault): the core's
+  `EN_DCBZ = EXC_EN && DCBZ_EN`, and `CPU_FEATURES[22]` =
+  `CORE1_EXC_EN`. MAL64 needs MTSR STATUS: `CPU_FEATURES[23]` =
+  `CORE1_EXC_EN`. Core 2 passes `DCBZ_EN = 0` (and has `EXC_EN = 0`).
+- **Core.** DCBZ is a `U_STORE` with a decode flag (`zl`): EA aligned down
+  to the line, data 0, byte enables FF, so the existing store machinery
+  (permissions, posting, the store queue, ordering) applies. A new port
+  flag `m_zl` (membus `zero_line`) marks the request. Every compare that
+  tracks a store against loads or code is line-granular for a DCBZ: store
+  → load forwarding / the hit-pipe block (`sf_a` / `sf_b` / `sf_c`: a load
+  of any dword of the line forwards the zeros), the post check, the issue
+  and completion SMC squashes, the NLB kills, and watchpoints (any dword of
+  the line). The I-cache snoop compares both 16 B halves and, if either
+  tag matches, clears both (the other half may then be an unrelated line
+  at the same index: one extra I-cache miss, never a stale hit); the BTIC
+  kills follow the same pair rule.
+- **Reservation.** An ordinary store does not touch the LR/SC
+  reservation on this single-hart core, so neither does DCBZ.
+- **Cache.** `mem_read_write` latches `zero_line` with the write (acked at
+  the latch, M10b). In CHECK a hit writes a zero line, a miss installs a
+  zero line dirty in the victim way at once (no DDR read, no WRITE_FETCH)
+  and goes to the existing shadow writeback if the victim is dirty.
+  `CNT_ZERO_LINES` (0xF005_0070) counts both; they are also write hits /
+  misses.
+- **MAL64** is a flop in the core, written by MTSR STATUS as it commits
+  (serializing), cleared by reset and `start`. The misaligned check uses
+  EA[2:0] from a 3-bit add (was 2). Trapping 64-bit accesses become the
+  existing converted misaligned op (cause 5 / 6, EADDR = raw EA).
+
 ## Status
 
 - 2026-11-11: plan and specification agreed with the runtime session.
-  Implementation has not started.
+- 2026-11-11: §1 DCBZ and §4 MAL64 implemented in RTL on `perf-hw`
+  (pipeline_core, mem_read_write, membus_if, bus_splitter, KlaussCPU,
+  core2_subsys). Simulation only (Verilator tools/vsim directed and random
+  tests, the xsim cache bench `perf/m5a/run_m10_cache.sh`); not yet built
+  or run on the board. §2 and §3 not started here.
