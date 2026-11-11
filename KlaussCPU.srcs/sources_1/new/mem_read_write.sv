@@ -881,7 +881,20 @@ module mem_read_write (
                         r_dv_served   <= 1;
                         r_served_addr <= cpu.addr;
                     end
-                    if (r_do_evict) begin
+                    if (r_do_evict && r_zero_line) begin
+                        // DCBZ: no refill was issued, so ddr2_control has
+                        // been in its DV-gated WAIT since this request's own
+                        // WAIT → CHECK (it passes the gate one edge after
+                        // any earlier transaction's DV drop) — the DV-low
+                        // settle gap has nothing to settle.  Raise the
+                        // writeback now, exactly as CHECK raises a refill's
+                        // read DV.  (3 cycles off every dirty-victim DCBZ.)
+                        o_ddr_mem_addr       <= r_evict_ddr_addr_r;
+                        o_ddr_mem_write_data <= r_evict_data_hold;
+                        r_app_wdf_mask       <= 16'b0000_0000_0000_0000; // all bytes valid
+                        o_ddr_mem_write_DV   <= 1;
+                        state                <= EVICT_SHADOW_WAIT;
+                    end else if (r_do_evict) begin
                         r_gap_count <= 4'd2;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin

@@ -21,5 +21,5 @@ xelab tb_cache -s tcache --relax > xelab.log 2>&1 \
   || { tail -30 xelab.log; exit 1; }
 xsim tcache -runall > xsim.log 2>&1 || { tail -30 xsim.log; exit 1; }
 
-grep -E "Phase|PASS|FAIL|TIMEOUT|latency|miss @" xsim.log
+grep -E "Phase|PASS|FAIL|TIMEOUT|latency|miss @|^  P " xsim.log
 grep -q "TB_CACHE PASS" xsim.log && echo "M10-CACHE: PASS" || { echo "M10-CACHE: FAIL"; exit 1; }

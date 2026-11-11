@@ -256,6 +256,10 @@ module tb_cache;
    endfunction
 
    integer errors = 0;
+   // Phase P streams re-address in the ready cycle itself (the core's
+   // combinational return), which this one-cycle-late monitor attributes to
+   // the next request: it is muted for a stream (Phase H checks the data).
+   bit     p_quiet = 0;
 
    // -------------------------------------------------------------------------
    // Always-on monitors
@@ -277,7 +281,7 @@ module tb_cache;
       end
       if (mb.ready && !ready_q) begin
          pulses_this_txn = pulses_this_txn + 1;
-         if (pulses_this_txn > 1) begin
+         if (pulses_this_txn > 1 && !p_quiet) begin
             errors++; $display("FAIL monitor: multiple ready pulses in one transaction (t=%0t)", $time);
          end
       end
@@ -478,6 +482,91 @@ module tb_cache;
          end
          @(negedge clk);
          vga_done = 1; vga_req = 0; @(negedge clk); vga_done = 0;
+      end
+   endtask
+
+   // -------------------------------------------------------------------------
+   // Phase P throughput driver: a back-to-back stream of n line writes from
+   // `base`, as fast as the cache accepts them — the core's shape with the
+   // combinational DRAM return (bus_splitter COMB_DRAM_RET): the next
+   // request is on the bus in the cycle its predecessor's ready shows (DV
+   // held, re-addressed).  dz = 1: one DCBZ per line; 0: four 64-bit stores
+   // per line.  Counts the cycles spent in each FSM state from the first
+   // request to the last ready (p_hist, p_cyc).
+   // -------------------------------------------------------------------------
+   bit     p_on = 0;
+   longint p_t0 = 0;
+   bit     p_dz = 0, p_vdirty = 0;
+   int     p_cyc = 0;
+   int     p_hist [int];
+   always @(posedge clk) if (p_on) begin
+      p_cyc++;
+      p_hist[int'(dut.state)] = (p_hist.exists(int'(dut.state)) ? p_hist[int'(dut.state)] : 0) + 1;
+   end
+   task automatic stream_lines(input [31:0] base, input integer n, input bit dz);
+      logic [31:0] a;
+      logic [63:0] d;
+      begin
+         p_hist.delete(); p_cyc = 0;
+         @(negedge clk);
+         p_on = 1; p_quiet = 1;
+         for (int i = 0; i < (dz ? n : 4 * n); i++) begin
+            a = dz ? base + 32'(32 * i) : base + 32'(32 * (i / 4) + 8 * (i % 4));
+            d = dz ? 64'h0 : {32'hC0DE_0000 | 32'(i), a};
+            mb.addr = a; mb.write_data = d; mb.byte_en = 8'hFF;
+            mb.zero_line = dz; mb.write_DV = 1;
+            if (dz) for (int k = 0; k < 4; k++) sb[k_cpu(a + 32'(8 * k))] = 64'h0;
+            else    sb[k_cpu(a)] = d;
+            @(negedge clk);
+            while (!mb.ready) @(negedge clk);
+         end
+         p_on = 0;
+         mb.write_DV = 0; mb.zero_line = 0;
+         while (dut.state != dut.WAIT) @(negedge clk);
+         repeat (4) @(negedge clk);
+         p_quiet = 0;
+      end
+   endtask
+   task p_report(input string name, input integer n);
+      string s;
+      begin
+         s = "";
+         foreach (p_hist[k]) begin
+            string nm;
+            case (k)
+               2:     nm = "WAIT";        4:    nm = "CHECK";
+               16:    nm = "EV_GAP";      32:   nm = "EV_WAIT";
+               128:   nm = "WR_FETCH";    4096: nm = "RD_WAIT";
+               16384: nm = "MAINT";       default: nm = $sformatf("%0d", k);
+            endcase
+            s = {s, $sformatf(" %s=%0d.%02d", nm, p_hist[k] / n, (p_hist[k] * 100 / n) % 100)};
+         end
+         $display("  P %-22s %0d lines %0d cyc = %0d.%02d cyc/line; per line:%s", name, n, p_cyc,
+                  p_cyc / n, (p_cyc * 100 / n) % 100, s);
+      end
+   endtask
+
+   // the same stream after an invalidate (p_vdirty: and after dirtying
+   // every line), against scanout-shaped VGA traffic: a 4-read tenure every
+   // 320 cycles (640 x 16 bpp: 40 reads per 3200-cycle display line)
+   task p_vga_stream;
+      begin
+         do_inval;
+         if (p_vdirty) stream_lines(32'h0054_0000, 2048, 0);   // every victim dirty
+         v2_cpu_done = 0;
+         fork
+            begin
+               stream_lines(p_dz ? 32'h0050_0000 : 32'h0052_0000, 2048, p_dz);
+               v2_cpu_done = 1;
+            end
+            begin
+               while (!v2_cpu_done) begin
+                  p_t0 = $time;
+                  vga_burst(32'h0061_0000 + 32'(vga_reads % 5) * 128, 4);
+                  while ($time - p_t0 < 3200 && !v2_cpu_done) @(negedge clk);
+               end
+            end
+         join
       end
    endtask
 
@@ -728,7 +817,9 @@ module tb_cache;
                automatic logic [31:0] ca;
                ca = {15'b0, 2'($urandom), 10'h010, 5'b0}
                     | (32'($urandom & 1) << 5) | (32'($urandom & 3) << 3);
-               if (($urandom & 3) == 0) check_read(ca);
+               sel = $urandom & 7;
+               if (sel < 2)       check_read(ca);
+               else if (sel == 7) cpu_zero(ca);    // DCBZ, often a dirty victim, under DMA grants
                else cpu_write(ca, {$urandom, $urandom}, (8'($urandom) | 8'h01));
             end
          end
@@ -837,7 +928,9 @@ module tb_cache;
                automatic logic [31:0] ca;
                ca = {15'b0, 2'($urandom), 10'h010, 5'b0}
                     | (32'($urandom & 1) << 5) | (32'($urandom & 3) << 3);
-               if (($urandom & 3) == 0) check_read(ca);
+               sel = $urandom & 7;
+               if (sel < 2)       check_read(ca);
+               else if (sel == 7) cpu_zero(ca);    // DCBZ, often a dirty victim, under DMA grants
                else cpu_write(ca, {$urandom, $urandom}, (8'($urandom) | 8'h01));
             end
             // dirty a spread of sets, then flush while VGA is streaming
@@ -866,6 +959,26 @@ module tb_cache;
                vga_reads, vga_grants_in_walk);
       if (vga_grants_in_walk == 0) begin
          errors++; $display("FAIL V2: VGA was never granted inside a maintenance walk");
+      end
+
+      // ===== Phase P: zeroing throughput (DCBZ vs 4 stores per line) ========
+      // 64 KiB streams (the whole cache), clean (invalid) and dirty victims,
+      // and with scanout-shaped VGA traffic (a 4-read tenure every 320
+      // cycles: 640 x 16 bpp, 40 reads per 3200-cycle display line).
+      // Cycle counts and the per-state split are printed, not checked.
+      $display("Phase P: zeroing throughput (cycles per 32 B line)");
+      begin : phase_p
+         do_inval;
+         stream_lines(32'h0050_0000, 2048, 1);  p_report("dcbz clean", 2048);
+         do_inval;
+         stream_lines(32'h0052_0000, 2048, 0);  p_report("4x st64 clean", 2048);
+         stream_lines(32'h0050_0000, 2048, 1);  p_report("dcbz dirty", 2048);
+         stream_lines(32'h0054_0000, 2048, 0);  p_report("4x st64 dirty", 2048);
+         p_dz = 1; p_vga_stream; p_report("dcbz clean +VGA", 2048);
+         p_dz = 0; p_vga_stream; p_report("4x st64 clean +VGA", 2048);
+         p_vdirty = 1;
+         p_dz = 1; p_vga_stream; p_report("dcbz dirty +VGA", 2048);
+         p_dz = 0; p_vga_stream; p_report("4x st64 dirty +VGA", 2048);
       end
 
       // ===== Phase H: final image equality ==================================
