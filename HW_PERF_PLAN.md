@@ -222,11 +222,15 @@ Decisions taken while implementing the frozen text above:
 - **Reservation.** An ordinary store does not touch the LR/SC
   reservation on this single-hart core, so neither does DCBZ.
 - **Cache.** `mem_read_write` latches `zero_line` with the write (acked at
-  the latch, M10b). In CHECK a hit writes a zero line, a miss installs a
-  zero line dirty in the victim way at once (no DDR read, no WRITE_FETCH)
-  and goes to the existing shadow writeback if the victim is dirty.
-  `CNT_ZERO_LINES` (0xF005_0070) counts both; they are also write hits /
-  misses.
+  the latch, M10b). In CHECK a hit writes a zero line. A miss takes the
+  write-miss path without raising the DDR read DV: WRITE_FETCH installs a
+  zero line, dirty, in the victim way on its first cycle, through the same
+  install write as a refill, and a dirty victim then goes out through the
+  shadow writeback. (A first version installed in CHECK; that second write
+  site on the tag / hit-pipe tag arrays made Vivado implement them in
+  registers — Synth 8-4767, 248k LUTs. Every cache array keeps the write
+  sites it had before DCBZ.) `CNT_ZERO_LINES` (0xF005_0070) counts both;
+  they are also write hits / misses.
 - **MAL64** is a flop in the core, written by MTSR STATUS as it commits
   (serializing), cleared by reset and `start`. The misaligned check uses
   EA[2:0] from a 3-bit add (was 2). Trapping 64-bit accesses become the

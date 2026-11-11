@@ -544,12 +544,12 @@ module mem_read_write (
     // cycle), so the dirty-set condition keys off the combinational hit
     // decode rather than a latched r_hit_way.
     wire w_write_hit_now = (state == CHECK) && r_is_write && r_cache_hit;
-    // DCBZ miss: the zero line is installed (dirty) in the victim way in CHECK
-    wire w_zl_miss_now   = (state == CHECK) && r_is_write && r_zero_line && !r_cache_hit;
+    // WRITE_FETCH installs: on the refill's ready, or (DCBZ: no refill was
+    // issued) on its first cycle — one install write for every array
+    wire w_wf_fill       = w_cache_ddr_ready || r_zero_line;
 
     wire dirty0_wen = (w_write_hit_now &&                       r_hit_way0) ||
-                      (w_zl_miss_now   &&                       r_evict_way_sel == 1'b0) ||
-                      (state == WRITE_FETCH  && w_cache_ddr_ready && r_evict_way == 1'b0) ||
+                      (state == WRITE_FETCH  && w_wf_fill         && r_evict_way == 1'b0) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b0) ||
                       (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
     // WRITE_FETCH installs as DIRTY (write-back on miss): avoids DDR write-through
@@ -557,14 +557,13 @@ module mem_read_write (
     // could clobber bytes committed by a prior buffered write to the same line.
     // The dirty line will be written back to DDR when it is itself evicted
     // (EVICT_SHADOW_* on that later miss) or by a maintenance flush.
-    wire dirty0_din = w_write_hit_now || w_zl_miss_now || (state == WRITE_FETCH && w_cache_ddr_ready);
+    wire dirty0_din = w_write_hit_now || (state == WRITE_FETCH && w_wf_fill);
 
     wire dirty1_wen = (w_write_hit_now &&                       r_hit_way1) ||
-                      (w_zl_miss_now   &&                       r_evict_way_sel == 1'b1) ||
-                      (state == WRITE_FETCH  && w_cache_ddr_ready && r_evict_way == 1'b1) ||
+                      (state == WRITE_FETCH  && w_wf_fill         && r_evict_way == 1'b1) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b1) ||
                       (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
-    wire dirty1_din = w_write_hit_now || w_zl_miss_now || (state == WRITE_FETCH && w_cache_ddr_ready);
+    wire dirty1_din = w_write_hit_now || (state == WRITE_FETCH && w_wf_fill);
 
     always_ff @(posedge i_Clk) begin
         if (dirty0_wen) cache_dirty_way0[r_cache_index] <= dirty0_din;
@@ -752,45 +751,20 @@ module mem_read_write (
                         // Already acked at the WAIT latch (write-ack-at-latch).
                         state       <= WAIT;
 
-                    end else if (r_zero_line) begin
-                        // DCBZ miss: no fetch.  Install a zero line, dirty
-                        // (w_zl_miss_now), in the victim way now; a dirty
-                        // victim goes out through the shadow writeback
-                        // exactly as after a refill.
-                        if (r_evict_way_sel == 1'b0) begin
-                            cache_val_data_way0[r_cache_index] <= '0;
-                            cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
-                            h_data_way0[r_cache_index]         <= '0;
-                            h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
-                        end else begin
-                            cache_val_data_way1[r_cache_index] <= '0;
-                            cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
-                            h_data_way1[r_cache_index]         <= '0;
-                            h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
-                        end
-                        cache_lru[r_cache_index] <= (r_evict_way_sel == 1'b0) ? 1'b1 : 1'b0;
-                        r_evict_way        <= r_evict_way_sel;
-                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
-                        r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
-                        r_do_evict         <= r_evict_dirty;
-                        if (r_evict_dirty) begin
-                            r_gap_count <= 4'd2;
-                            state       <= EVICT_SHADOW_GAP;
-                        end else begin
-                            state       <= WAIT;   // acked at the latch
-                        end
-
                     end else begin
                         // Write miss — M10a fetch-first: issue the refill NOW
                         // (dirty or not); a dirty victim's writeback runs in
                         // the shadow after the CPU restarts (r_do_evict).
+                        // DCBZ (r_zero_line): no refill is issued; WRITE_FETCH
+                        // installs the zero line on its first cycle through
+                        // the same install write (one write port per array).
                         r_evict_way        <= r_evict_way_sel;
                         r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
                         r_fetch_ddr_addr   <= r_computed_ddr_addr;
                         r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
                         r_do_evict         <= r_evict_dirty;
                         o_ddr_mem_addr     <= r_computed_ddr_addr;
-                        o_ddr_mem_read_DV  <= 1;
+                        o_ddr_mem_read_DV  <= !r_zero_line;
                         state              <= WRITE_FETCH;
                     end
 
@@ -853,7 +827,7 @@ module mem_read_write (
                     r_served_addr <= cpu.addr;
                     r_miss_served <= 1;
                 end
-                if (w_cache_ddr_ready) begin
+                if (w_wf_fill) begin
                     o_ddr_mem_read_DV <= 0;
 
                     begin : write_fetch_merge
@@ -881,6 +855,7 @@ module mem_read_write (
                             2'b10:   merged[127:64]  = new_dw;
                             default: merged[63:0]    = new_dw;
                         endcase
+                        if (r_zero_line) merged = '0;   // DCBZ miss: a zero line, no fetch
                     end
 
                     // Install merged line in cache as DIRTY (write-back policy on miss).
