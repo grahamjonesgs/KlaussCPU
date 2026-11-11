@@ -597,7 +597,15 @@ module pipeline_core
    localparam int IC_PRW   = IC_IDXW - 1;       // pair index width
    localparam int IC_PAIRS = IC_LINES / 2;
    (* ram_style = "block" *) logic [127:0]       ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
-   (* ram_style = "block" *) logic [IC_TAGW-1:0] ic_tag  [0:IC_LINES-1];
+   // The fetch-side tag is LUTRAM (§2 timing closure): its registered read
+   // (ic_rd_tag) then starts the hit compare at a flip-flop next to it.  As
+   // a block RAM the hit path began with the RAM's clock-to-out plus a long
+   // route out of the RAM column (~3.8 ns before the compare) and was the
+   // tier-1 worst path once ic_data spread over four RAMB36: ic_tag ->
+   // compare -> ic_hit -> the IFB load enables.  (~0.5k LUTs; one RAMB18
+   // fewer.)
+   (* ram_style = "distributed" *) logic [IC_TAGW-1:0] ic_tag  [0:IC_LINES-1];
+   initial for (int i = 0; i < IC_LINES; i++) ic_tag[i] = '0;
    // Validity (§2 timing closure).  ic_lv: one flip-flop per line, "the
    // line holds something" — set by an install, cleared by a snoop, by
    // ICACHE_INV / start / reset (the whole vector in one cycle).  ic_dv: the
