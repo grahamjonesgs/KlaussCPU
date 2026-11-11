@@ -3373,6 +3373,21 @@ module pipeline_core
          // (hit, 1 cyc, no port — the win) or issue the m_* miss-fill; on fill
          // completion, capture into the IFB AND install the line. The IFB capture
          // is byte-identical between the hit and miss paths (ifr_* mirrors m_*).
+         // The fill's own registers are read only while it is in flight
+         // (if_xc), so they follow the issue-time values on EVERY cycle
+         // without one: the value they hold when if_xc rises is the issue
+         // cycle's, exactly as if loaded by the issue.  (§2 timing closure:
+         // their enable was the issue condition, i.e. !ic_hit — the
+         // ic_tag BRAM -> tag compare -> 170-fanout enable path.)
+         if (!if_xc) begin
+            if_req_dw <= miss_dw;             // old base+data captured together
+            r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
+            if_rebase <= !in0;
+            if_tghi   <= (EN_TLB && te) ? r_look_pa : miss_dw[28:13];
+            if_fflt   <= EN_TLB && te && !r_look_ok;
+            if_fmiss  <= EN_TLB && te && r_look_miss;
+            if_fake   <= w_ufz || (EN_TLB && te && !r_look_ok);
+         end
          if (if_xc) begin
             if (EN_EXC && if_fake) begin
                // MMU stage 1 fake fill (see the miss issue): zeros, no install
@@ -3479,20 +3494,16 @@ module pipeline_core
                   // fault tag, nothing on the port)
                   m_addr    <= (EN_TLB && te) ? {r_look_pa, miss_dw[12:0], 3'b000}
                                               : {miss_dw, 3'b000};   // miss: issue the shared-port fill
-                  if_tghi   <= (EN_TLB && te) ? r_look_pa : miss_dw[28:13];
-                  if_fflt   <= EN_TLB && te && !r_look_ok;
-                  if_fmiss  <= EN_TLB && te && r_look_miss;
                   // MMU stage 1: in user mode a 0xF... dword is a FAKE fill —
                   // no DV on the port; it completes next cycle with zeros and
                   // no I-cache install, and the ID fetch check makes the op
                   // ACCESS_FETCH.  (Steers only these D inputs: off the
                   // ic_hit serve chain.)
                   m_read_DV <= !(w_ufz || (EN_TLB && te && !r_look_ok));
-                  if_fake   <= w_ufz || (EN_TLB && te && !r_look_ok);
                   rdy_armed <= !m_ready;
-                  if_req_dw <= miss_dw;             // old base+data captured together
-                  r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
-                  if_rebase <= !in0;
+                  // (if_req_dw, r_ifq_p1, if_tghi, if_fflt, if_fmiss,
+                  // if_fake, if_rebase: loaded on every cycle without a fill
+                  // in flight — see above the fill engine)
                   if_xc     <= 1'b1;
                   if_look   <= 1'b0;
                end
