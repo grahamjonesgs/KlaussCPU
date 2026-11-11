@@ -628,6 +628,23 @@ module pipeline_core
    // HW_PERF_PLAN §1: the snoop is a DCBZ's — it clears BOTH 16 B I-cache
    // lines of its 32 B line (snoop_idx_q is the even one)
    logic               snoop_pr_q = 1'b0;
+   // Tag-shadow read guard.  Vivado implements ic_tagff_* as block RAM, with
+   // mem_iaddr's register absorbed as the read-address register (the 8 KiB
+   // builds' synthesis log: "Read Address Register Found", Synth 8-6430
+   // collision warning).  The RAM then samples the shadow when mem_iaddr is
+   // loaded (and, at best, again each cycle), not when the store issues: an
+   // install that lands at or after that edge — a fill completing while the
+   // store waits in MEM for the port — can be missing from the compare, and
+   // a store into the line just fetched would leave it valid and stale.  The
+   // RTL (the flip-flop model every simulator runs) always reads the
+   // current value.  So the installs since mem_iaddr was loaded are tracked
+   // here (ri_idx: the latest; ri_m: more than one) and a store whose line
+   // (a DCBZ: its pair) matches one is treated as a tag hit: it clears the
+   // line and does not post.  Rare and conservative; correct for both
+   // readings of the shadow.
+   logic               ri_v = 1'b0, ri_m = 1'b0;
+   logic [IC_IDXW-1:0] ri_idx = '0;
+   logic               ev_mload;        // blocking event: mem_iaddr loaded this edge
    // does a pending snoop (index s, pair pr) cover I-cache line i?
    function automatic logic f_snm(logic [IC_IDXW-1:0] i, logic [IC_IDXW-1:0] s, logic pr);
       return i[IC_IDXW-1:1] == s[IC_IDXW-1:1] && (pr || i[0] == s[0]);
@@ -2442,6 +2459,9 @@ module pipeline_core
    wire        sn_vo      = sn_to && (ic_vhi[{sn_pr, 1'b1}] || ic_vlo[{sn_pr, 1'b1}]);
    wire        sn_hit     = mzl ? (sn_te || sn_to) : sn_idx[0] ? sn_to : sn_te;
    wire        sn_code    = mzl ? (sn_ve || sn_vo) : sn_idx[0] ? sn_vo : sn_ve;
+   // (an install since mem_iaddr was loaded may be missing from the
+   // shadow read: see ri_v — registers only, beside the RAM's compare)
+   wire        sn_rc      = ri_v && (ri_m || f_snm(ri_idx, sn_idx, mzl));
    // (HW_PERF_PLAN §1: a DCBZ's compares are line-granular: mzl)
    wire        smc_hit_id = smc_st && id_valid &&
                             (f_dweq(id_pc[31:3], smc_dw, mzl) || f_dweq(id_last_dw, smc_dw, mzl));
@@ -2772,7 +2792,7 @@ module pipeline_core
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
-         rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
+         rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0; ri_v <= 1'b0; ri_m <= 1'b0;
          dbg_active <= 1'b0; dbg_cause_q <= '0; dbg_cause <= '0;
          dbg_stepping <= 1'b0; dbg_step_done <= 1'b0; dbg_skip <= 1'b0; id_bp <= 1'b0;
          dbg_watch_req <= 1'b0; dbg_watch_addr <= '0;
@@ -2791,6 +2811,7 @@ module pipeline_core
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
          ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
+         ev_mload = 1'b0;
 
          // MMU stage 1: a program load starts in supervisor mode with no
          // vector (MMU_PLAN.md §3.1); a debugger resume keeps them
@@ -3225,7 +3246,7 @@ module pipeline_core
                   // before mem_xc==1 completes anyway.
                   // (HW_PERF_PLAN §1: a DCBZ compares both 16 B halves of
                   // its line and clears both — sn_* below)
-                  snoop_q     <= mem_port_wr && sn_hit;
+                  snoop_q     <= mem_port_wr && (sn_hit || sn_rc);
                   snoop_idx_q <= sn_idx;
                   snoop_pr_q  <= mzl;
                   // 1c: may this store post next cycle? (no code copy of its
@@ -3238,7 +3259,7 @@ module pipeline_core
                   // (HW_PERF_PLAN §1: for a DCBZ every compare is
                   // line-granular — mzl masks the dword-in-line bits)
                   st_post_ok  <= EN_POST_ST && mem_port_wr && mem_iaddr[31:28] != 4'hF &&
-                                 !sn_code &&
+                                 !sn_code && !sn_rc &&
                                  !(ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl)) &&
                                  !(ifb_val[1] && f_dweq(r_base_p1, smc_dw, mzl)) &&
                                  !((nlb_vhi || nlb_vlo) && f_lneq(nlb_line, smc_dw[28:1], mzl)) &&
@@ -3798,6 +3819,7 @@ module pipeline_core
                // (stage 3: with TE = 1 the port address is the PA; the page
                // offset is the VA's)
                mem_iaddr  <= (EN_TLB && te) ? {d1_pahi, exo_iaddr[15:0]} : exo_iaddr;
+               ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
                mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
                mem_xpg    <= ex_x3;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
@@ -4262,6 +4284,15 @@ module pipeline_core
             r_btk_icv <= ev_icinst;  r_btk_ic <= ev_icinst_idx;
             r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;  r_btk_snpr <= snoop_pr_q;
             r_btk_all <= icinv || tlb_discard;
+         end
+
+         // tag-shadow guard (ri_v): the installs since mem_iaddr was loaded
+         // (one on the load edge itself counts: the RAM read the old value)
+         if (ev_icinst) begin
+            ri_v <= 1'b1;  ri_idx <= ev_icinst_idx;
+            ri_m <= ri_v && !ev_mload;
+         end else if (ev_mload) begin
+            ri_v <= 1'b0;  ri_m <= 1'b0;
          end
 
          // ---------------- M12 pos-tracker composer (runs LAST) ----------------
