@@ -97,6 +97,14 @@ module mig_7series_0 (
    assign app_rdy     = 1'b1;
    assign app_wdf_rdy = 1'b1;
 
+   // read commands accepted (DCBZ checks: a zero-line miss issues none)
+   int rd_cmds = 0, wr_cmds = 0;
+   always @(posedge sys_clk_i)
+      if (!ui_clk_sync_rst && app_en && app_rdy) begin
+         if (app_cmd == 3'b001) rd_cmds <= rd_cmds + 1;
+         if (app_cmd == 3'b000) wr_cmds <= wr_cmds + 1;
+      end
+
    // 8 MiB modeled: 1M 64-bit dwords, key = app_addr[21:2].
    logic [63:0] mem [0:1048575];
    function automatic logic [63:0] init_dw(input logic [19:0] k);
@@ -174,6 +182,7 @@ module tb_cache;
    always #5 clk = ~clk;   // 100 MHz
 
    membus_if mb();
+   wire [63:0] cnt_zero_lines;
 
    logic          dma_req = 0, dma_done = 0, dma_w = 0, dma_r = 0;
    logic  [31:0]  dma_addr = 0;
@@ -197,7 +206,7 @@ module tb_cache;
       .i_stat_clear(1'b0),
       .o_cache_info(), .o_cnt_read_hits(), .o_cnt_read_misses(),
       .o_cnt_write_hits(), .o_cnt_write_misses(), .o_cnt_writebacks(),
-      .o_cnt_stall_cycles(),
+      .o_cnt_stall_cycles(), .o_cnt_zero_lines(cnt_zero_lines),
       .clk_50(), .o_ui_clk(), .o_calib_done(),
       .i_dma_req(dma_req), .i_dma_done(dma_done),
       .i_dma_write_DV(dma_w), .i_dma_read_DV(dma_r),
@@ -310,19 +319,34 @@ module tb_cache;
    // -------------------------------------------------------------------------
    // CPU-side drivers (bus_splitter-faithful timing)
    // -------------------------------------------------------------------------
+   logic zl = 0;      // cpu_write issues a DCBZ (cpu_zero)
    task cpu_write(input [31:0] a, input [63:0] d, input [7:0] ben);
       integer k;
       logic [63:0] cur;
       begin
          @(negedge clk);
-         mb.addr = a; mb.write_data = d; mb.byte_en = ben; mb.write_DV = 1;
+         mb.addr = a; mb.write_data = d; mb.byte_en = ben; mb.write_DV = 1; mb.zero_line = zl;
          @(negedge clk);
          while (!ready_d) @(negedge clk);
          mb.write_DV = 0; mb.byte_en = 8'hFF;
+         if (zl) begin
+            // DCBZ (HW_PERF_PLAN.md §1): the whole 32 B line reads 0
+            for (k = 0; k < 4; k = k + 1) sb[k_cpu({a[31:5], 5'b0} + 32'(8 * k))] = 64'h0;
+         end else begin
          cur = sb_rd(a);
          for (k = 0; k < 8; k = k + 1)
             if (ben[k]) cur[8*k +: 8] = d[8*k +: 8];
          sb[k_cpu(a)] = cur;
+         end
+         mb.zero_line = 0;
+      end
+   endtask
+   // DCBZ: a zero-line write request (addr = the line base, as the core sends it)
+   task cpu_zero(input [31:0] a);
+      begin
+         zl = 1;
+         cpu_write({a[31:5], 5'b0}, 64'h0, 8'hFF);
+         zl = 0;
       end
    endtask
 
@@ -518,7 +542,7 @@ module tb_cache;
 
    initial begin
       mb.write_DV = 0; mb.read_DV = 0; mb.addr = '0;
-      mb.write_data = '0; mb.byte_en = 8'hFF;
+      mb.write_data = '0; mb.byte_en = 8'hFF; mb.zero_line = 0;
       // POR (32 board cycles) + fake-MIG reset pipe
       repeat (60) @(posedge clk);
 
@@ -593,15 +617,98 @@ module tb_cache;
       check_read(32'h0001_0100);
       check_read(32'h0001_8100);
 
+      // ===== Phase Z: DCBZ (HW_PERF_PLAN.md §1) — zero a line, no fetch ====
+      // One set (index 0x200), tags T1..T4.  Every case: no DDR read command
+      // is issued for the DCBZ, all four dwords then read 0, CNT_ZERO_LINES
+      // counts it; a dirty victim reaches DDR through the shadow writeback.
+      $display("Phase Z: DCBZ");
+      begin : phase_z
+         logic [31:0] t1, t2, t3, t4;
+         int rd0, wr0;
+         logic [63:0] z0;
+         t1 = 32'h0030_4000; t2 = 32'h0031_4000; t3 = 32'h0032_4000; t4 = 32'h0033_4000;
+         z0 = cnt_zero_lines;
+         // Z1: hit on a clean line
+         check_read(t1 + 8);
+         rd0 = dut.ddr2_control.mig_7series_0.rd_cmds;
+         cpu_zero(t1);
+         for (int k = 0; k < 4; k++) check_read(t1 + 32'(8*k));
+         if (dut.ddr2_control.mig_7series_0.rd_cmds != rd0) begin
+            errors++; $display("FAIL Z1: DCBZ hit issued a DDR read");
+         end
+         // Z2: hit on a dirty line (back-to-back store / DCBZ / load)
+         cpu_write(t1 + 16, 64'h0BAD_0BAD_0BAD_0BAD, 8'hFF);
+         cpu_zero(t1);
+         check_read(t1 + 16); check_read(t1); check_read(t1 + 24);
+         // the zeroed line is dirty: DDR still holds the old pattern
+         if (ddr_dword(t1 + 16) === 64'h0) begin
+            errors++; $display("FAIL Z2: DCBZ hit wrote through to DDR");
+         end
+         // Z3: miss, clean victim (set = {t1 dirty-zero, t2 clean}; t1 MRU after a read)
+         check_read(t2);
+         check_read(t1 + 8);                     // t1 MRU: t2 is the victim
+         rd0 = dut.ddr2_control.mig_7series_0.rd_cmds;
+         wr0 = dut.ddr2_control.mig_7series_0.wr_cmds;
+         cpu_zero(t3);
+         repeat (40) @(negedge clk);
+         if (dut.ddr2_control.mig_7series_0.rd_cmds != rd0 ||
+             dut.ddr2_control.mig_7series_0.wr_cmds != wr0) begin
+            errors++; $display("FAIL Z3: DCBZ miss (clean victim) touched DDR: rd %0d wr %0d",
+                               dut.ddr2_control.mig_7series_0.rd_cmds - rd0,
+                               dut.ddr2_control.mig_7series_0.wr_cmds - wr0);
+         end
+         rd0 = dut.ddr2_control.mig_7series_0.rd_cmds;
+         for (int k = 0; k < 4; k++) check_read(t3 + 32'(8*k));
+         check_read(t1 + 24);                    // still resident (hit)
+         if (dut.ddr2_control.mig_7series_0.rd_cmds != rd0) begin
+            errors++; $display("FAIL Z3: the zeroed line or its neighbour missed afterwards");
+         end
+         // Z4: miss, dirty victim: t1 (dirty zeros) is LRU after the t3 reads
+         rd0 = dut.ddr2_control.mig_7series_0.rd_cmds;
+         wr0 = dut.ddr2_control.mig_7series_0.wr_cmds;
+         cpu_write(t3 + 8, 64'h1357_9BDF_2468_ACE0, 8'hFF);   // t3 dirty, MRU
+         cpu_zero(t4);                           // evicts t1 (dirty)
+         check_read(t4 + 24);                    // a load right behind it
+         repeat (60) @(negedge clk);
+         if (dut.ddr2_control.mig_7series_0.rd_cmds != rd0) begin
+            errors++; $display("FAIL Z4: DCBZ miss issued a DDR read");
+         end
+         if (dut.ddr2_control.mig_7series_0.wr_cmds != wr0 + 2) begin   // two BL8 bursts
+            errors++; $display("FAIL Z4: victim writeback: %0d write bursts",
+                               dut.ddr2_control.mig_7series_0.wr_cmds - wr0);
+         end
+         for (int k = 0; k < 4; k++)
+            if (ddr_dword(t1 + 32'(8*k)) !== 64'h0) begin
+               errors++; $display("FAIL Z4: victim dw%0d not in DDR: %h", k, ddr_dword(t1 + 32'(8*k)));
+            end
+         // Z5: miss evicting the dirty data line t3 (t4 MRU): DDR gets it
+         cpu_zero(t2);
+         repeat (60) @(negedge clk);
+         if (ddr_dword(t3 + 8) !== 64'h1357_9BDF_2468_ACE0) begin
+            errors++; $display("FAIL Z5: victim t3 not written back: %h", ddr_dword(t3 + 8));
+         end
+         for (int k = 0; k < 4; k++) begin
+            check_read(t3 + 32'(8*k));           // refetched from DDR
+            check_read(t2 + 32'(8*k));
+            check_read(t1 + 32'(8*k));
+         end
+         if (cnt_zero_lines - z0 != 64'd5) begin
+            errors++; $display("FAIL Z: CNT_ZERO_LINES +%0d, want 5", cnt_zero_lines - z0);
+         end
+         if (errors == 0) $display("PASS DCBZ directed");
+      end
+
       // ===== Phase D: randomized stress, 2 sets x 4 tags x 4 dwords =========
       $display("Phase D: 4000 random ops");
       for (n = 0; n < 4000; n = n + 1) begin
          a = {15'b0, 2'($urandom), 10'h010, 5'b0}
              | (32'($urandom & 1) << 5)          // 2 sets (index 0x10/0x11)
              | (32'($urandom & 3) << 3);         // random dword in line
-         sel = $urandom & 3;
-         if (sel == 0)
+         sel = $urandom & 15;
+         if (sel < 4)
             check_read(a);
+         else if (sel == 15)
+            cpu_zero(a);                    // DCBZ (HW_PERF_PLAN §1)
          else
             cpu_write(a, {$urandom, $urandom}, (8'($urandom) | 8'h01));
       end

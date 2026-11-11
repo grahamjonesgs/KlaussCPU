@@ -383,6 +383,7 @@ module KlaussCPU #(
    wire [63:0] w_cnt_write_misses;
    wire [63:0] w_cnt_writebacks;
    wire [63:0] w_cnt_stall_cycles;
+   wire [63:0] w_cnt_zero_lines;     // DCBZ operations (HW_PERF_PLAN.md §1)
    // CACHE_CTRL bit 0 self-clearing: a 1-cycle pulse on the cycle the CPU
    // writes 0xF005_0000 with bit 0 set, fed straight into mem_read_write's
    // i_stat_clear (which zeros all counters on the next edge).
@@ -614,11 +615,13 @@ module KlaussCPU #(
    wire        pip_m_read_DV, pip_m_write_DV;
    wire [63:0] pip_m_wdata;
    wire [7:0]  pip_m_be;
+   wire        pip_m_zl;
    assign cpu_mem.write_DV      = w_pipe_owns ? pip_m_write_DV : st.mem_write_DV;
    assign cpu_mem.read_DV       = w_pipe_owns ? pip_m_read_DV  : st.mem_read_DV;
    assign cpu_mem.addr          = w_pipe_owns ? pip_m_addr     : st.mem_addr;
    assign cpu_mem.write_data    = w_pipe_owns ? pip_m_wdata    : st.mem_write_data;
    assign cpu_mem.byte_en       = w_pipe_owns ? pip_m_be       : st.mem_byte_en;
+   assign cpu_mem.zero_line     = w_pipe_owns && pip_m_zl;
    assign w_mem_read_data       = cpu_mem.read_data;
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
@@ -693,6 +696,7 @@ module KlaussCPU #(
       .m_write_DV (pip_m_write_DV),
       .m_wdata    (pip_m_wdata),
       .m_be       (pip_m_be),
+      .m_zl       (pip_m_zl),
       .m_rdata    (w_mem_read_data),
       .m_rdata_dram (dram_mem.read_data),
       .h_addr     (w_h_addr),
@@ -1202,6 +1206,7 @@ module KlaussCPU #(
                16'h0058: r_mmio_read_data_comb = w_cnt_write_misses;
                16'h0060: r_mmio_read_data_comb = w_cnt_writebacks;
                16'h0068: r_mmio_read_data_comb = w_cnt_stall_cycles;
+               16'h0070: r_mmio_read_data_comb = w_cnt_zero_lines;   // CNT_ZERO_LINES (DCBZ)
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -1230,9 +1235,12 @@ module KlaussCPU #(
                // [16] AES, [17] GCM / GHASH, [18] SHA-256, [19] HMAC, [20]
                // the TRNG (always 1: [20] = 0 means a bitstream older than
                // these bits, where every crypto block is present), [21] the
-               // native SD controller (SD_NATIVE_PLAN.md).
+               // native SD controller (SD_NATIVE_PLAN.md), [22] DCBZ and
+               // [23] STATUS.MAL64 (HW_PERF_PLAN.md §1 / §4; both need
+               // stage 1).
                // Reads 0 on earlier bitstreams (a reserved offset).
-               16'h0048: r_mmio_read_data_comb = {42'b0, 1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
+               16'h0048: r_mmio_read_data_comb = {40'b0, CORE1_EXC_EN, CORE1_EXC_EN,
+                                                  1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
                                                   (CORE1_EXC_EN && CORE1_TLB_EN) ? 8'(CORE1_TLB_N) : 8'd0,
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
@@ -1338,6 +1346,7 @@ module KlaussCPU #(
        .o_cnt_write_misses(w_cnt_write_misses),
        .o_cnt_writebacks(w_cnt_writebacks),
        .o_cnt_stall_cycles(w_cnt_stall_cycles),
+       .o_cnt_zero_lines(w_cnt_zero_lines),
 
        // 50 MHz output for Ethernet PHY REF_CLK (drives liteeth_core and ODDR).
        .clk_50(clk_50),

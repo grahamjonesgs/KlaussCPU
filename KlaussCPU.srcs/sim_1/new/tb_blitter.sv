@@ -124,6 +124,7 @@ module tb_blitter;
    assign cpu_bus.addr       = 32'h0;
    assign cpu_bus.write_data = 64'h0;
    assign cpu_bus.byte_en    = 8'hFF;
+   assign cpu_bus.zero_line  = 1'b0;
 
    wire blit_irq;
 

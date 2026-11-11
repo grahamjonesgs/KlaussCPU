@@ -50,6 +50,7 @@ module mem_read_write (
     output logic [63:0] o_cnt_write_misses,
     output logic [63:0] o_cnt_writebacks,
     output logic [63:0] o_cnt_stall_cycles,
+    output logic [63:0] o_cnt_zero_lines,   // DCBZ operations (HW_PERF_PLAN.md §1)
 
     // 50 MHz clock for Ethernet RMII REF_CLK — produced by clk_wiz_0
     // alongside the existing 200 MHz DDR reference clock.  Plumbed up to
@@ -381,6 +382,11 @@ module mem_read_write (
     logic [7:0]            r_byte_en;       // byte enables (8'hFF = full doubleword write)
     logic [63:0]           r_write_data;
     logic                  r_is_write;
+    // HW_PERF_PLAN.md §1 DCBZ: the latched write zeroes the whole line —
+    // a hit overwrites it with zeros, a miss installs a zero line, both
+    // dirty, with no DDR read (a dirty victim still goes out through the
+    // shadow writeback).  Acked at the latch like every write (M10b).
+    logic                  r_zero_line = 1'b0;
     logic [31:0]           r_computed_ddr_addr;
 
     // -------------------------------------------------------------------------
@@ -538,8 +544,11 @@ module mem_read_write (
     // cycle), so the dirty-set condition keys off the combinational hit
     // decode rather than a latched r_hit_way.
     wire w_write_hit_now = (state == CHECK) && r_is_write && r_cache_hit;
+    // DCBZ miss: the zero line is installed (dirty) in the victim way in CHECK
+    wire w_zl_miss_now   = (state == CHECK) && r_is_write && r_zero_line && !r_cache_hit;
 
     wire dirty0_wen = (w_write_hit_now &&                       r_hit_way0) ||
+                      (w_zl_miss_now   &&                       r_evict_way_sel == 1'b0) ||
                       (state == WRITE_FETCH  && w_cache_ddr_ready && r_evict_way == 1'b0) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b0) ||
                       (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
@@ -548,13 +557,14 @@ module mem_read_write (
     // could clobber bytes committed by a prior buffered write to the same line.
     // The dirty line will be written back to DDR when it is itself evicted
     // (EVICT_SHADOW_* on that later miss) or by a maintenance flush.
-    wire dirty0_din = w_write_hit_now || (state == WRITE_FETCH && w_cache_ddr_ready);
+    wire dirty0_din = w_write_hit_now || w_zl_miss_now || (state == WRITE_FETCH && w_cache_ddr_ready);
 
     wire dirty1_wen = (w_write_hit_now &&                       r_hit_way1) ||
+                      (w_zl_miss_now   &&                       r_evict_way_sel == 1'b1) ||
                       (state == WRITE_FETCH  && w_cache_ddr_ready && r_evict_way == 1'b1) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b1) ||
                       (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
-    wire dirty1_din = w_write_hit_now || (state == WRITE_FETCH && w_cache_ddr_ready);
+    wire dirty1_din = w_write_hit_now || w_zl_miss_now || (state == WRITE_FETCH && w_cache_ddr_ready);
 
     always_ff @(posedge i_Clk) begin
         if (dirty0_wen) cache_dirty_way0[r_cache_index] <= dirty0_din;
@@ -664,6 +674,7 @@ module mem_read_write (
                     r_byte_en           <= cpu.byte_en;
                     r_write_data        <= cpu.write_data;
                     r_is_write          <= cpu.write_DV;
+                    r_zero_line         <= cpu.write_DV && cpu.zero_line;
                     r_computed_ddr_addr <= w_computed_ddr_addr;
                     r_miss_served       <= cpu.write_DV;  // writes: served right here
                     if (cpu.write_DV) begin
@@ -724,6 +735,7 @@ module mem_read_write (
                                 2'b10:   merged[127:64]  = new_dw;
                                 default: merged[63:0]    = new_dw;
                             endcase
+                            if (r_zero_line) merged = '0;   // DCBZ hit: the whole line
                         end
 
                         // Separate write-enable per way — one write per array per cycle, BRAM-friendly.
@@ -739,6 +751,34 @@ module mem_read_write (
 
                         // Already acked at the WAIT latch (write-ack-at-latch).
                         state       <= WAIT;
+
+                    end else if (r_zero_line) begin
+                        // DCBZ miss: no fetch.  Install a zero line, dirty
+                        // (w_zl_miss_now), in the victim way now; a dirty
+                        // victim goes out through the shadow writeback
+                        // exactly as after a refill.
+                        if (r_evict_way_sel == 1'b0) begin
+                            cache_val_data_way0[r_cache_index] <= '0;
+                            cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
+                            h_data_way0[r_cache_index]         <= '0;
+                            h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
+                        end else begin
+                            cache_val_data_way1[r_cache_index] <= '0;
+                            cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
+                            h_data_way1[r_cache_index]         <= '0;
+                            h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
+                        end
+                        cache_lru[r_cache_index] <= (r_evict_way_sel == 1'b0) ? 1'b1 : 1'b0;
+                        r_evict_way        <= r_evict_way_sel;
+                        r_evict_ddr_addr_r <= {r_evict_tag, r_cache_index, 5'b00000};
+                        r_evict_data_hold  <= r_evict_way_sel ? r_data_way1 : r_data_way0;
+                        r_do_evict         <= r_evict_dirty;
+                        if (r_evict_dirty) begin
+                            r_gap_count <= 4'd2;
+                            state       <= EVICT_SHADOW_GAP;
+                        end else begin
+                            state       <= WAIT;   // acked at the latch
+                        end
 
                     end else begin
                         // Write miss — M10a fetch-first: issue the refill NOW
@@ -1206,6 +1246,7 @@ module mem_read_write (
         o_cnt_write_misses = 64'd0;
         o_cnt_writebacks   = 64'd0;
         o_cnt_stall_cycles = 64'd0;
+        o_cnt_zero_lines   = 64'd0;
     end
 
     always_ff @(posedge i_Clk) begin
@@ -1216,6 +1257,7 @@ module mem_read_write (
             o_cnt_write_misses <= 64'd0;
             o_cnt_writebacks   <= 64'd0;
             o_cnt_stall_cycles <= 64'd0;
+            o_cnt_zero_lines   <= 64'd0;
         end else begin
             if (state == CHECK) begin
                 if (!r_is_write &&  r_cache_hit)              o_cnt_read_hits    <= o_cnt_read_hits    + 64'd1;
@@ -1223,6 +1265,7 @@ module mem_read_write (
                 if ( r_is_write &&  r_cache_hit)              o_cnt_write_hits   <= o_cnt_write_hits   + 64'd1;
                 if ( r_is_write && !r_cache_hit)              o_cnt_write_misses <= o_cnt_write_misses + 64'd1;
                 if (!r_cache_hit && r_evict_dirty)            o_cnt_writebacks   <= o_cnt_writebacks   + 64'd1;
+                if ( r_is_write &&  r_zero_line)              o_cnt_zero_lines   <= o_cnt_zero_lines   + 64'd1;
             end
             // M10a: count only CPU-VISIBLE miss stall — once the early restart
             // has released the CPU (r_miss_served), the remaining install /

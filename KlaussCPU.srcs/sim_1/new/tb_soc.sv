@@ -151,6 +151,7 @@ module ddr2_control (
    localparam LAT    = 8;
    localparam DW_LAT = 4;   // CWF dword leads the full line by this many cycles
    logic [4:0] cnt = 0;
+   int n_rd = 0, n_wr = 0;  // completed DDR transactions (reported at HALTED)
    initial begin
       o_mem_dw_ready   = 0;
       o_mem_dw_next_ok = 0;
@@ -162,8 +163,8 @@ module ddr2_control (
          cnt <= 0;
       end else if (!o_mem_ready) begin
          if (cnt == LAT) begin
-            if (i_mem_read_DV === 1'b1) o_mem_read_data <= line_rd(i_mem_addr);
-            else                        line_wr(i_mem_addr, i_mem_write_data, i_mem_wide);
+            if (i_mem_read_DV === 1'b1) begin o_mem_read_data <= line_rd(i_mem_addr); n_rd++; end
+            else                        begin line_wr(i_mem_addr, i_mem_write_data, i_mem_wide); n_wr++; end
             o_mem_ready <= 1;
             cnt <= 0;
          end else begin
@@ -296,6 +297,8 @@ module tb_soc;
    longint maxi = 0;
    always @(posedge dut.i_Clk) begin
       if (dut.st.SM == HALTED) begin
+         $display("TB_SOC: DDR reads=%0d writes=%0d", dut.mem_read_write.ddr2_control.n_rd,
+                  dut.mem_read_write.ddr2_control.n_wr);
          $display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);
          $fclose(uart_f); $fclose(trace_f);
          $finish;

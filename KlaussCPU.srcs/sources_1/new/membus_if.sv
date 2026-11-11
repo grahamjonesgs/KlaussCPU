@@ -8,7 +8,9 @@
 // so one interface collapses ~18 ports on bus_splitter and ~9 on
 // mem_read_write into typed ports.
 //
-// Request:  write_DV, read_DV, addr, write_data, byte_en
+// Request:  write_DV, read_DV, addr, write_data, byte_en, zero_line
+//           (zero_line: with write_DV, zero the whole cache line at addr —
+//           DCBZ, HW_PERF_PLAN.md §1; DRAM only, never MMIO)
 // Response: read_data, read_data_next (next consecutive doubleword in the same
 //           cache line), next_valid (read_data_next valid), ready.
 //
@@ -22,13 +24,14 @@ interface membus_if;
    logic [31:0] addr;            // byte address (doubleword-aligned for 64-bit ops)
    logic [63:0] write_data;      // write data
    logic [ 7:0] byte_en;         // byte enables (8'hFF = full doubleword)
+   logic        zero_line;       // DCBZ: the write zeroes the whole line (addr = line base)
    logic [63:0] read_data;       // read data
    logic [63:0] read_data_next;  // next consecutive doubleword in the same cache line
    logic        next_valid;      // 1 when read_data_next is valid (offset == 0)
    logic        ready;           // transaction complete
 
-   modport master (output write_DV, read_DV, addr, write_data, byte_en,
+   modport master (output write_DV, read_DV, addr, write_data, byte_en, zero_line,
                    input  read_data, read_data_next, next_valid, ready);
-   modport slave  (input  write_DV, read_DV, addr, write_data, byte_en,
+   modport slave  (input  write_DV, read_DV, addr, write_data, byte_en, zero_line,
                    output read_data, read_data_next, next_valid, ready);
 endinterface : membus_if

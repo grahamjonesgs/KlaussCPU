@@ -129,9 +129,10 @@ module core2_subsys
    logic [31:0] c2_dbg_sp;
    flags_t      c2_dbg_flags;
 
-   // (no MMU on core 2: EXC_EN / MPU_EN / TLB_EN = 0, the new encodings trap)
+   // (no MMU on core 2: EXC_EN / MPU_EN / TLB_EN = 0, the new encodings trap;
+   // no D-cache: DCBZ_EN = 0, DCBZ is ILLEGAL — HW_PERF_PLAN.md §1)
    pipeline_core #(.SP_RESET(32'h0002_0000), .BTIC_EN(1'b0), .EXC_EN(1'b0), .MPU_EN(1'b0),
-                   .TLB_EN(1'b0)) c2_core_i (   // SP = top of local BRAM
+                   .TLB_EN(1'b0), .DCBZ_EN(1'b0)) c2_core_i (   // SP = top of local BRAM
       .clk        (i_Clk),
       .ce         (r_ce),
       .rst        (!i_Rst_L || !r_run),
@@ -142,6 +143,7 @@ module core2_subsys
       .m_write_DV (c2_write_DV),
       .m_wdata    (c2_wdata),
       .m_be       (c2_be),
+      .m_zl       (),            // (DCBZ_EN = 0: always 0)
       .m_rdata    (m2_rdata),
       .m_rdata_dram (m2_rdata),
       .h_addr     (),            // no hit pipe on core 2: the slow path

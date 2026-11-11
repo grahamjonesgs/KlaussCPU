@@ -23,6 +23,8 @@ python3 tools/vsim/run.py diff --base master --seeds 30 --lats 2 5 --irq
 python3 tools/vsim/run.py socdiff --base master --seeds 30   # full SoC (tb_soc.sv)
 python3 tools/vsim/run.py socsd                    # native SD MMIO through the SoC bus
 VSIM_DEBUG_EN=1 python3 tools/vsim/run.py test        # elaborate DEBUG_EN=1
+python3 tools/vsim/run.py dcbzdiff --seeds 200     # DCBZ programs vs 4-store references (core TB)
+python3 tools/vsim/run.py socdcbz --seeds 20       # DCBZ through the SoC: counters, DDR traffic, SMC, random
 ```
 
 - **`diff`** runs the same random programs on a base revision and on the
@@ -30,6 +32,13 @@ VSIM_DEBUG_EN=1 python3 tools/vsim/run.py test        # elaborate DEBUG_EN=1
   `--irq`, IRQ timing can legitimately shift, so it compares the main
   program's final registers and memory instead. It reports total cycles for a
   quick A/B.
+- **`dcbzdiff`** / **`socdcbz`** (HW_PERF_PLAN.md §1): randprog programs
+  with DCBZ groups injected, against the same programs with each DCBZ
+  replaced by four zero stores; the final registers (and, in the core TB,
+  the data window; on the SoC a checksum of it) must match. `socdcbz` also
+  checks the cache counters, that a DCBZ miss reads nothing from DDR
+  (tb_soc prints `DDR reads= writes=` at HALTED), the trace record, and a
+  zeroed-then-patched code line.
 - **`socdiff`** builds `sim_1/new/tb_soc.sv` (real cache, bus splitter, MMIO,
   HCF, behavioural DDR) and boots each program through the boot-ROM path. It
   compares retire traces and reports PIPE_RUN cycles. That model reproduces

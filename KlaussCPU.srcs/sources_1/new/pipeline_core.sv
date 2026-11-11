@@ -53,7 +53,11 @@ module pipeline_core
    parameter bit TLB_EN = 1'b1,
    // its entry count (a power of two, 2-32): 16 on the xc7a100t (MMU_PLAN.md
    // §11.5, area); TLB_INDEX uses the low $clog2(TLB_N) bits
-   parameter int TLB_N = 16
+   parameter int TLB_N = 16,
+   // HW_PERF_PLAN.md §1: DCBZ (zero a D-cache line without fetching it;
+   // needs EXC_EN and a cache that serves m_zl).  0 = its encoding is
+   // ILLEGAL (core 2: no D-cache) and m_zl stays 0.
+   parameter bit DCBZ_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -74,6 +78,9 @@ module pipeline_core
    output logic         m_write_DV,
    output logic [63:0]  m_wdata,
    output logic [7:0]   m_be,
+   // HW_PERF_PLAN.md §1 DCBZ: with m_write_DV, the request zeroes the whole
+   // cache line at m_addr (m_addr is the line base, m_wdata 0, m_be 8'hFF)
+   output logic         m_zl,
    input  logic [63:0]  m_rdata,
    input  logic [63:0]  m_rdata_next,   // next sequential dword, same line
    // 1a: the DRAM side's read data (the cache's registered output, before
@@ -313,6 +320,15 @@ module pipeline_core
    localparam bit EN_EXC = EXC_EN;
    localparam bit EN_MPU = EXC_EN && MPU_EN;   // MMU stage 2 (MPU)
    localparam bit EN_TLB = EXC_EN && TLB_EN;   // MMU stage 3 (TLB, TE)
+   // HW_PERF_PLAN.md §1: DCBZ [rs1] (0x5F00_2000 | rs1 << 4) — a U_STORE
+   // with .zl: the EA is aligned down to the line, the data is 0 with byte
+   // enables FF, and every store-tracking compare (STLF / hit-pipe block,
+   // the SMC / post checks, the I-cache snoop) is line-granular for it.
+   // Needs EXC_EN: DCBZ to MMIO raises ACCESS_STORE in both modes.
+   localparam bit EN_DCBZ = EXC_EN && DCBZ_EN;
+   localparam int DZ_LB   = 5;                 // log2(D-cache line bytes)
+   // HW_PERF_PLAN.md §4: STATUS[10] MAL64 (needs EXC_EN: MTSR STATUS).
+   localparam bit EN_MAL64 = EXC_EN;
    // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
    localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
                           X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
@@ -378,6 +394,7 @@ module pipeline_core
       logic       fx2, fxg;     // a fetch fault: on the instruction's 2nd granule only / a GUARD denial
       logic       fxl;          // (stage 3) a TLB-related fetch fault (miss / X): TLB_HI auto-load
       logic       tlbi;         // MMU stage 3: TLBWI / TLBR / TLBP / TLBINV (at WB, then refetch)
+      logic       zl;           // HW_PERF_PLAN §1: DCBZ (a U_STORE of the whole line, zeros)
    } dec_t;
 
    // ----------------------------------------------------- architectural state
@@ -409,6 +426,7 @@ module pipeline_core
    logic        mpu_en;          // STATUS[8]
    // MMU stage 3: mmu_tlb's outputs (see its instance at the end)
    logic        te;              // STATUS[9]
+   logic        mal64;           // STATUS[10] (HW_PERF_PLAN.md §4)
    logic [7:0]  tlb_asid;
    logic [31:0] tlb_vec;         // TLBVEC
    logic [31:0] tlb_rdata;       // MFSR of a TLB SR
@@ -586,6 +604,22 @@ module pipeline_core
    // clear so a lookup in the gap cycle cannot hit the stale line.
    logic               snoop_q;
    logic [IC_IDXW-1:0] snoop_idx_q;
+   // HW_PERF_PLAN §1: the snoop is a DCBZ's — it clears BOTH 16 B I-cache
+   // lines of its 32 B line (snoop_idx_q is the even one)
+   logic               snoop_pr_q = 1'b0;
+   // does a pending snoop (index s, pair pr) cover I-cache line i?
+   function automatic logic f_snm(logic [IC_IDXW-1:0] i, logic [IC_IDXW-1:0] s, logic pr);
+      return i[IC_IDXW-1:1] == s[IC_IDXW-1:1] && (pr || i[0] == s[0]);
+   endfunction
+   // store-vs-code compares: dword a against the store's dword b, or (zl: a
+   // DCBZ, b its line's first dword) any dword of b's 32 B line; the same
+   // for a 16 B line address
+   function automatic logic f_dweq(logic [28:0] a, logic [28:0] b, logic zl);
+      return a[28:2] == b[28:2] && (zl || a[1:0] == b[1:0]);
+   endfunction
+   function automatic logic f_lneq(logic [27:0] a, logic [27:0] b, logic zl);
+      return a[27:1] == b[27:1] && (zl || a[0] == b[0]);
+   endfunction
 
    // ======================= M9: next-line buffer (NLB) ========================
    // One prefetched 16 B line + a background I-cache lookup that runs while the
@@ -653,7 +687,7 @@ module pipeline_core
    logic [18:0]        ic_rd_tag;
    logic               ic_rd_vhi, ic_rd_vlo;
    // pending snoop clear (lands this edge) — read it as already invalid
-   wire snoop_kill = snoop_q && (snoop_idx_q == ic_look_idx);
+   wire snoop_kill = snoop_q && f_snm(ic_look_idx, snoop_idx_q, snoop_pr_q);
    always_ff @(posedge clk) if (ce) begin
       ic_rd_idx  <= ic_look_idx;
       ic_rd_data <= ic_data[ic_look_idx];
@@ -935,6 +969,13 @@ module pipeline_core
                end else if (cls == 4'h7 && !op[23]) begin
                   d.legal = 1'b1; d.uop = U_SC; d.use_rs2 = 1'b1;
                end
+            end else if (EN_DCBZ && op[31:8] == 24'h5F_0020 && op[3:0] == 4'h0) begin
+               // HW_PERF_PLAN.md §1 DCBZ [rs1]: exactly 0x5F00_2000 | rs1 << 4
+               // (class 7, LEN 01, SIZE 11, SGN 0, MODE 00, A 0, [13] = 1);
+               // every other [13] = 1 form stays ILLEGAL.  A store of the
+               // whole line (no data register).
+               d.legal = 1'b1; d.uop = U_STORE; d.is_mem = 1'b1; d.use_rs1 = 1'b1;
+               d.zl = 1'b1;
             end
          end
          4'h8: begin // branch / call
@@ -1139,7 +1180,7 @@ module pipeline_core
       dec_t d;
       d = din;
       d.legal = 1'b0; d.uop = U_EXC; d.sub = cause; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
-      d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
+      d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0; d.zl = 1'b0;
       d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
       return d;
    endfunction
@@ -1162,7 +1203,7 @@ module pipeline_core
       d = f_decode_raw(op);
       if (!d.legal) begin
          d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
-         d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0;
+         d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0; d.zl = 1'b0;
          d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
       end else if (EN_EXC && um && f_priv(d, op)) begin
          d = f_mkx(d, X_PRIV);
@@ -1386,9 +1427,11 @@ module pipeline_core
    // index (r_btk_*).)
    logic [IC_IDXW-1:0] id_bt_li, id_bt_bli, r_btk_ic, r_btk_sn;
    logic               r_btk_icv, r_btk_snv, r_btk_all;
+   logic               r_btk_snpr = 1'b0;
    wire                bt_hit    = EN_BTIC && id_bt_hit && !r_btk_all &&
                                    !(r_btk_icv && (id_bt_li == r_btk_ic || id_bt_bli == r_btk_ic)) &&
-                                   !(r_btk_snv && (id_bt_li == r_btk_sn || id_bt_bli == r_btk_sn));
+                                   !(r_btk_snv && (f_snm(id_bt_li, r_btk_sn, r_btk_snpr) ||
+                                                   f_snm(id_bt_bli, r_btk_sn, r_btk_snpr)));
    function automatic logic [1:0] f_sat2(logic [1:0] c, logic t);
       return t ? ((c == 2'b11) ? c : c + 2'b01) : ((c == 2'b00) ? c : c - 2'b01);
    endfunction
@@ -1882,6 +1925,12 @@ module pipeline_core
                   exo_wdata = ex_c;  exo_be = 8'hFF;
                end
             endcase
+            // DCBZ ([rs1] only): the line base, zeros, all bytes (the trace
+            // shows a write of the line's first doubleword, data 0, be FF)
+            if (EN_DCBZ && ex_d.zl) begin
+               exo_eaddr = {ex_a[31:DZ_LB], {DZ_LB{1'b0}}};
+               exo_wdata = '0;  exo_raw = '0;  exo_be = 8'hFF;
+            end
          end
          U_PUSH: begin
             exo_eaddr  = ex_sp_r - 32'd8;
@@ -1957,7 +2006,8 @@ module pipeline_core
          // MMU stage 1: MFSR STATUS = {DI, UM}; DI forwarded from an older
          // DI / EI in MEM / WB (program order), UM is stable (it only
          // changes with the pipe drained or behind a serializing IRET)
-         U_GETST: exo_result = {54'b0, EN_TLB && te, EN_MPU && mpu_en, 6'b0, ex_dis_eff, umode};
+         U_GETST: exo_result = {53'b0, EN_MAL64 && mal64, EN_TLB && te, EN_MPU && mpu_en, 6'b0,
+                                ex_dis_eff, umode};
          default: ;   // NOP/HALT/WAIT/TRAP/DELAY/LCD/LOAD/LOAD32/ILL: nothing in EX
       endcase
       // port issue address (loads align per f_ld_idx; stores already aligned)
@@ -1970,17 +2020,21 @@ module pipeline_core
       endcase
    end
 
-   // HW proposal 8 / §3.3 misaligned trap detect.  The low two EA bits come
-   // from their own 2-bit adds (off the 32-bit EA carry chain); the uop /
+   // HW proposal 8 / §3.3 misaligned trap detect.  The low three EA bits come
+   // from their own 3-bit adds (off the 32-bit EA carry chain); the uop /
    // size terms are register-sourced.  U_LOAD32 (MEMGET32) is exempt.
-   wire [1:0] ex_ea_lo = (ex_d.mmode == 2'b00) ? ex_a[1:0]
-                       : (ex_d.mmode == 2'b01) ? ex_a[1:0] + ex_var1[1:0]
-                       : (ex_d.mmode == 2'b10) ? ex_var1[1:0]
-                       :                         ex_a[1:0] + ex_b[1:0];
+   // HW_PERF_PLAN.md §4: with STATUS.MAL64 = 1 a 64-bit LOAD / STORE (A = 0
+   // or 1, every addressing mode) with EA[2:0] != 0 traps too; DCBZ, the
+   // stack ops and MEMGET32 are exempt (they are not these uops / have .zl).
+   wire [2:0] ex_ea_lo = (ex_d.mmode == 2'b00) ? ex_a[2:0]
+                       : (ex_d.mmode == 2'b01) ? ex_a[2:0] + ex_var1[2:0]
+                       : (ex_d.mmode == 2'b10) ? ex_var1[2:0]
+                       :                         ex_a[2:0] + ex_b[2:0];
    wire ex_misal = EN_MISAL_TRAP && ex_valid &&
                    (((ex_d.uop == U_LOAD || ex_d.uop == U_STORE) &&
                      ((ex_d.msz == 2'd1 && ex_ea_lo[0]) ||
-                      (ex_d.msz == 2'd2 && ex_ea_lo != 2'b00))) ||
+                      (ex_d.msz == 2'd2 && ex_ea_lo[1:0] != 2'b00) ||
+                      (EN_MAL64 && mal64 && ex_d.msz == 2'd3 && !ex_d.zl && ex_ea_lo != 3'b000))) ||
                     // MMU stage 1: LR/SC ([rs1] only) must be naturally aligned
                     (EN_EXC && (ex_d.uop == U_LR || ex_d.uop == U_SC) &&
                      ((ex_d.msz == 2'd2 && ex_a[1:0] != 2'b00) ||
@@ -2016,7 +2070,8 @@ module pipeline_core
    // per doubleword: the stage 1 rule (u1 / u2) first, then the MPU (stage
    // 2) at the EA's granule and — for a two-access op whose 2nd dword is in
    // the next granule (EA = ex_a for both) — at that granule
-   wire ex_s1    = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc);
+   // (DCBZ to MMIO faults in both modes too — the LR/SC rule; HW_PERF_PLAN §1)
+   wire ex_s1    = EN_EXC && ex_valid && ex_memop && !ex_misal && (umode || ex_lrsc || (EN_DCBZ && ex_d.zl));
    wire ex_u1    = ex_s1 && ex_ea_f;
    wire ex_u2    = ex_s1 && ex_ea_xf;
    wire ex_mchk  = EN_MPU && !(EN_TLB && te) && ex_valid && ex_memop && !ex_misal;
@@ -2104,6 +2159,7 @@ module pipeline_core
    logic [31:0] sq_addr;
    logic [63:0] sq_wdata;
    logic [7:0]  sq_be;
+   logic        sq_zl;            // (HW_PERF_PLAN §1) the queued store is a DCBZ
    // (stage 3) the VA page of the store on the port / in sq_*, for STLF with TE = 1
    logic [15:0] m_vahi, sq_vahi;
    logic        m_vav, sq_vav;
@@ -2282,12 +2338,17 @@ module pipeline_core
    // is compared from the registered ex_ea_q, not the EA adder; in a
    // page-crossing op's 3rd cycle ex_ea_q is the next page: no forward)
    wire        sf_te      = EN_TLB && te;
-   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:3] == exo_iaddr[15:3] &&
+   // (HW_PERF_PLAN §1: a DCBZ matches every dword of its line — it writes
+   // them all — and, its data being 0 with byte enables FF, forwards zeros)
+   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:5] == exo_iaddr[15:5] &&
+                            ((EN_DCBZ && mem_d.zl) || mem_iaddr[4:3] == exo_iaddr[4:3]) &&
                             (sf_te || mem_iaddr[31:16] == exo_iaddr[31:16]);
-   wire        sf_b       = m_write_DV && m_addr[15:3] == exo_iaddr[15:3] &&
+   wire        sf_b       = m_write_DV && m_addr[15:5] == exo_iaddr[15:5] &&
+                            ((EN_DCBZ && m_zl) || m_addr[4:3] == exo_iaddr[4:3]) &&
                             (sf_te || m_addr[31:16] == exo_iaddr[31:16]);
    // EN_SQ: the queued store (younger than the posted one on the port)
-   wire        sf_c       = EN_SQ && sq_v && sq_addr[15:3] == exo_iaddr[15:3] &&
+   wire        sf_c       = EN_SQ && sq_v && sq_addr[15:5] == exo_iaddr[15:5] &&
+                            ((EN_DCBZ && sq_zl) || sq_addr[4:3] == exo_iaddr[4:3]) &&
                             (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
    // (TE = 1) the youngest offset-matching store's VA page = the load's
    wire        sf_vaa     = mem_eaddr[31:16] == ex_ea_q[31:16];
@@ -2327,10 +2388,27 @@ module pipeline_core
    wire        smc_st     = mem_done_now && mem_is_write && mem_iaddr[31:28] != 4'hF &&
                             !st_spec_now && !sq_enq_now;   // (EN_ST1 / EN_SQ: checked the cycle after, sq_spec)
    wire [28:0] smc_dw     = mem_eaddr[31:3];     // the store's VA (= mem_iaddr with TE = 0)
+   // HW_PERF_PLAN §1: the MEM op is a DCBZ (its EA / port address is the
+   // line base)
+   wire        mzl        = EN_DCBZ && mem_d.zl;
+   // issue-time I-cache snoop of the MEM store (registered into snoop_q /
+   // st_post_ok): the tag-shadow read at the store's 16 B line, as a pair
+   // (both halves of its 32 B line, compare then select) so a DCBZ checks
+   // both; sn_hit = tag match (snoop), sn_code = a valid matching line (post)
+   wire [IC_IDXW-1:0] sn_idx  = mem_iaddr[IC_IDXW+3:4];
+   wire [IC_IDXW-1:0] sn_ie   = {sn_idx[IC_IDXW-1:1], 1'b0};
+   wire [IC_IDXW-1:0] sn_io   = {sn_idx[IC_IDXW-1:1], 1'b1};
+   wire        sn_te      = ic_tagff[sn_ie] == mem_iaddr[31:IC_IDXW+4];
+   wire        sn_to      = ic_tagff[sn_io] == mem_iaddr[31:IC_IDXW+4];
+   wire        sn_ve      = sn_te && (ic_vhi[sn_ie] || ic_vlo[sn_ie]);
+   wire        sn_vo      = sn_to && (ic_vhi[sn_io] || ic_vlo[sn_io]);
+   wire        sn_hit     = mzl ? (sn_te || sn_to) : sn_idx[0] ? sn_to : sn_te;
+   wire        sn_code    = mzl ? (sn_ve || sn_vo) : sn_idx[0] ? sn_vo : sn_ve;
+   // (HW_PERF_PLAN §1: a DCBZ's compares are line-granular: mzl)
    wire        smc_hit_id = smc_st && id_valid &&
-                            (id_pc[31:3] == smc_dw || id_last_dw == smc_dw);
+                            (f_dweq(id_pc[31:3], smc_dw, mzl) || f_dweq(id_last_dw, smc_dw, mzl));
    wire        smc_hit_ex = smc_st && ex_valid &&
-                            (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw);
+                            (f_dweq(ex_pc[31:3], smc_dw, mzl) || f_dweq(ex_last_dw, smc_dw, mzl));
    // ICACHE_INV (CACHE_CTRL 0xF005_0000 bit 3, a fence.i): the SoC ignores
    // bit 3; the core decodes its own completing store. Invalidates every
    // fetch-side code copy and refetches everything younger — for code written
@@ -2351,7 +2429,9 @@ module pipeline_core
    // registered EA in parallel.  Exactly the old pc_dw / w_last_dw test.
    wire [28:0] smc_dwm1   = smc_dw - 29'd1;
    // (LEN = 00, an illegal op, spans nothing: the old test used pc_dw)
-   wire        smc_hit_lat = smc_st && (pc_dw == smc_dw ||
+   // (a DCBZ: smc_dw is its line's first dword, so the dword before it is
+   // the only one outside the line whose span reaches in)
+   wire        smc_hit_lat = smc_st && (f_dweq(pc_dw, smc_dw, mzl) ||
                                         (w_span && w_op[31:30] != 2'b00 && pc_dw == smc_dwm1));
    // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
    wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr && !wb_wait;   // as it leaves MEM
@@ -2652,7 +2732,7 @@ module pipeline_core
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0; if_drop <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
-         m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF;
+         m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0;
          dbg_active <= 1'b0; dbg_cause_q <= '0; dbg_cause <= '0;
@@ -2793,7 +2873,7 @@ module pipeline_core
                                     flags.overflow, flags.sign,
                                     (flags.sign ^ flags.overflow), flags.carry,
                                     (EN_EXC && exc_ent) ? exc_epc_q : pc};
-                     m_be       <= 8'hFF;
+                     m_be       <= 8'hFF;  m_zl <= 1'b0;
                      m_write_DV <= 1'b1;
                      m_vav      <= 1'b0;
                      rdy_armed  <= !m_ready;
@@ -2992,6 +3072,10 @@ module pipeline_core
          if (snoop_q) begin
             ic_vhi[snoop_idx_q] <= 1'b0;
             ic_vlo[snoop_idx_q] <= 1'b0;
+            if (EN_DCBZ && snoop_pr_q) begin
+               ic_vhi[snoop_idx_q | IC_IDXW'(1)] <= 1'b0;
+               ic_vlo[snoop_idx_q | IC_IDXW'(1)] <= 1'b0;
+            end
          end
 
          // 1c: posted-store drain.  Nothing else can be on the port (every
@@ -3004,7 +3088,7 @@ module pipeline_core
             if (sq_v && sq_addr != m_addr) begin
                m_addr     <= sq_addr;
                m_wdata    <= sq_wdata;
-               m_be       <= sq_be;
+               m_be       <= sq_be;  m_zl <= sq_zl;
                m_write_DV <= 1'b1;
                m_vahi     <= sq_vahi;  m_vav <= sq_vav;
                rdy_armed  <= !m_ready;
@@ -3016,7 +3100,7 @@ module pipeline_core
          if (EN_SQ && sq_v && !st_post && !if_xc && !ld_out && mem_xc == 2'd0) begin
             m_addr     <= sq_addr;
             m_wdata    <= sq_wdata;
-            m_be       <= sq_be;
+            m_be       <= sq_be;  m_zl <= sq_zl;
             m_write_DV <= 1'b1;
             m_vahi     <= sq_vahi;  m_vav <= sq_vav;
             rdy_armed  <= !m_ready;
@@ -3037,14 +3121,14 @@ module pipeline_core
          if (wb_hmiss && !if_xc && !st_post && !sq_v && mem_xc == 2'd0 && !irq_xc &&
              !(DEBUG_EN && dbg_mx)) begin
             m_addr    <= wb_iaddr;
-            m_be      <= wb_be;
+            m_be      <= wb_be;  m_zl <= 1'b0;
             m_read_DV <= 1'b1;
             rdy_armed <= !m_ready;
             ld_out    <= 1'b1;
          end
          if (h_miss_now) begin
             m_addr    <= mem_iaddr;
-            m_be      <= mem_be;
+            m_be      <= mem_be;  m_zl <= 1'b0;
             m_read_DV <= 1'b1;
             rdy_armed <= !m_ready;
             ld_out    <= 1'b1;
@@ -3074,7 +3158,7 @@ module pipeline_core
                   if (!sq_enq_now || (w_mrdy && mem_iaddr != m_addr)) begin
                      m_addr     <= mem_iaddr;
                      m_wdata    <= mem_wdata;
-                     m_be       <= mem_be;
+                     m_be       <= mem_be;  m_zl <= EN_DCBZ && mem_d.zl;
                      m_read_DV  <= mem_port_rd;
                      m_write_DV <= mem_port_wr;
                      m_vahi     <= mem_eaddr[31:16];  m_vav <= 1'b1;
@@ -3085,6 +3169,7 @@ module pipeline_core
                      sq_vahi    <= mem_eaddr[31:16];  sq_vav <= 1'b1;
                      sq_wdata   <= mem_wdata;
                      sq_be      <= mem_be;
+                     sq_zl      <= EN_DCBZ && mem_d.zl;
                   end
                   mem_xc     <= 2'd1;
                   // M7b store-snoop: TAG-CHECKED. Invalidate only if the store's
@@ -3099,9 +3184,11 @@ module pipeline_core
                   // !if_xc and the store then holds the port (mem_port_op
                   // blocks fill issue), and the store's data is not in memory
                   // before mem_xc==1 completes anyway.
-                  snoop_q     <= mem_port_wr &&
-                                 ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4];
-                  snoop_idx_q <= mem_iaddr[IC_IDXW+3:4];
+                  // (HW_PERF_PLAN §1: a DCBZ compares both 16 B halves of
+                  // its line and clears both — sn_* below)
+                  snoop_q     <= mem_port_wr && sn_hit;
+                  snoop_idx_q <= sn_idx;
+                  snoop_pr_q  <= mzl;
                   // 1c: may this store post next cycle? (no code copy of its
                   // dword anywhere on the fetch side; MMIO never posts)
                   // (the I-cache holds a copy only if the line is VALID: the
@@ -3109,21 +3196,22 @@ module pipeline_core
                   // compare kept refusing every later store to a once-code
                   // line — on the board, lines left by earlier programs /
                   // the boot ROM: stores stopped posting (EN_ST1: squashed))
+                  // (HW_PERF_PLAN §1: for a DCBZ every compare is
+                  // line-granular — mzl masks the dword-in-line bits)
                   st_post_ok  <= EN_POST_ST && mem_port_wr && mem_iaddr[31:28] != 4'hF &&
-                                 !(ic_tagff[mem_iaddr[IC_IDXW+3:4]] == mem_iaddr[31:IC_IDXW+4] &&
-                                   (ic_vhi[mem_iaddr[IC_IDXW+3:4]] || ic_vlo[mem_iaddr[IC_IDXW+3:4]])) &&
-                                 !(ifb_val[0] && ifb_base  == smc_dw) &&
-                                 !(ifb_val[1] && r_base_p1 == smc_dw) &&
-                                 !((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) &&
-                                 !((nlb1_vhi || nlb1_vlo) && nlb1_line == smc_dw[28:1]) &&
-                                 !(id_valid && (id_pc[31:3] == smc_dw || id_last_dw == smc_dw)) &&
-                                 !(ex_valid && (ex_pc[31:3] == smc_dw || ex_last_dw == smc_dw));
+                                 !sn_code &&
+                                 !(ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl)) &&
+                                 !(ifb_val[1] && f_dweq(r_base_p1, smc_dw, mzl)) &&
+                                 !((nlb_vhi || nlb_vlo) && f_lneq(nlb_line, smc_dw[28:1], mzl)) &&
+                                 !((nlb1_vhi || nlb1_vlo) && f_lneq(nlb1_line, smc_dw[28:1], mzl)) &&
+                                 !(id_valid && (f_dweq(id_pc[31:3], smc_dw, mzl) || f_dweq(id_last_dw, smc_dw, mzl))) &&
+                                 !(ex_valid && (f_dweq(ex_pc[31:3], smc_dw, mzl) || f_dweq(ex_last_dw, smc_dw, mzl)));
                   // Watchpoints: compare this access at issue; the halt is
                   // taken at the next dispatch boundary (the instruction
                   // completes; at most the two younger ones in EX/ID too).
                   if (DEBUG_EN) begin
                      for (int w = 0; w < 2; w++)
-                        if (dbg_i.wp_en[w] && mem_iaddr[31:3] == dbg_i.wp_dw[w] &&
+                        if (dbg_i.wp_en[w] && f_dweq(mem_iaddr[31:3], dbg_i.wp_dw[w], mzl) &&
                             (mem_be & dbg_i.wp_be[w]) != 8'h00 &&
                             ((dbg_i.wp_rd[w] && mem_port_rd) || (dbg_i.wp_wr[w] && mem_port_wr))) begin
                            dbg_watch_req  <= 1'b1;
@@ -3135,14 +3223,14 @@ module pipeline_core
                   // predates this store's ic_v* clear (the mem_done_now
                   // store-match below is the belt-and-braces line-granular kill).
                   if (mem_port_wr && (nlb_vhi || nlb_vlo)
-                      && nlb_line == mem_eaddr[31:4]) begin
+                      && f_lneq(nlb_line, mem_eaddr[31:4], mzl)) begin
                      nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
                   end
                   if (mem_port_wr && (nlb1_vhi || nlb1_vlo)
-                      && nlb1_line == mem_eaddr[31:4]) begin
+                      && f_lneq(nlb1_line, mem_eaddr[31:4], mzl)) begin
                      nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
                   end
-                  if (mem_port_wr && pf_look && pf_line == mem_eaddr[31:4])
+                  if (mem_port_wr && pf_look && f_lneq(pf_line, mem_eaddr[31:4], mzl))
                      pf_look <= 1'b0;
                   // EN_ST1: the store leaves MEM now, already posted
                   // (EN_SQ: or queued behind the posted store)
@@ -3196,7 +3284,7 @@ module pipeline_core
                if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out) begin
                   m_addr     <= dbg_i.mem_addr;
                   m_wdata    <= dbg_i.mem_wdata;
-                  m_be       <= dbg_i.mem_be;
+                  m_be       <= dbg_i.mem_be;  m_zl <= 1'b0;
                   m_read_DV  <= !dbg_i.mem_we;
                   m_write_DV <= dbg_i.mem_we;
                   m_vav      <= 1'b0;
@@ -3603,7 +3691,7 @@ module pipeline_core
                // starts in its wait-ready state
                if (w_early_ld && !ex_misal && !ex_uf_early) begin
                   m_addr     <= exo_iaddr;
-                  m_be       <= exo_be;
+                  m_be       <= exo_be;  m_zl <= 1'b0;
                   m_read_DV  <= 1'b1;
                   rdy_armed  <= !m_ready;
                   mem_xc     <= 2'd1;
@@ -3943,13 +4031,13 @@ module pipeline_core
          // span overlaps the stored dword; refetch from the oldest squashed.
          // Safe because side effects only exist from MEM onward.
          if (smc_st) begin
-            if (ifb_val[0] && ifb_base == smc_dw)          ifb_val[0] <= 1'b0;
-            if (ifb_val[1] && ifb_base + 29'd1 == smc_dw)  ifb_val[1] <= 1'b0;
+            if (ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl))          ifb_val[0] <= 1'b0;
+            if (ifb_val[1] && f_dweq(ifb_base + 29'd1, smc_dw, mzl))  ifb_val[1] <= 1'b0;
             // M9: the NLB is a code copy too — same store-match rule (line-granular)
-            if ((nlb_vhi || nlb_vlo) && nlb_line == smc_dw[28:1]) begin
+            if ((nlb_vhi || nlb_vlo) && f_lneq(nlb_line, smc_dw[28:1], mzl)) begin
                nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
             end
-            if ((nlb1_vhi || nlb1_vlo) && nlb1_line == smc_dw[28:1]) begin
+            if ((nlb1_vhi || nlb1_vlo) && f_lneq(nlb1_line, smc_dw[28:1], mzl)) begin
                nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             end
          end
@@ -4097,7 +4185,8 @@ module pipeline_core
              !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
              !(EN_TLB && (ifb_ft[0] || (ifb_val[1] && ifb_ft[1]))) &&   // (stage 3: a refused page)
              pc_dw == r_bt_wbase && !sq_spec &&
-             !(snoop_q && (r_bt_wbase[IC_IDXW:1] == snoop_idx_q || r_bt_wblidx == snoop_idx_q))) begin
+             !(snoop_q && (f_snm(r_bt_wbase[IC_IDXW:1], snoop_idx_q, snoop_pr_q) ||
+                           f_snm(r_bt_wblidx, snoop_idx_q, snoop_pr_q)))) begin
             bt_v[r_bt_widx]    <= 1'b1;
             bt_tag[r_bt_widx]  <= r_bt_wtag;
             bt_base[r_bt_widx] <= r_bt_wbase;
@@ -4117,17 +4206,19 @@ module pipeline_core
          if (EN_BTIC) begin
             for (int k = 0; k < BT_N; k++) begin
                if (ev_icinst && (bt_lidx[k] == ev_icinst_idx || bt_blidx[k] == ev_icinst_idx)) bt_v[k] <= 1'b0;
-               if (snoop_q   && (bt_lidx[k] == snoop_idx_q   || bt_blidx[k] == snoop_idx_q))   bt_v[k] <= 1'b0;
+               if (snoop_q   && (f_snm(bt_lidx[k], snoop_idx_q, snoop_pr_q) ||
+                                 f_snm(bt_blidx[k], snoop_idx_q, snoop_pr_q)))                  bt_v[k] <= 1'b0;
             end
             if (icinv || tlb_discard) bt_v <= '0;
             // the ID snapshot is a copy of one entry: the same kills apply to
             // it (an older snapshot via its own indices; one taken on this
             // edge via r_btk_* next cycle, in bt_hit)
             if (ev_icinst && (id_bt_li == ev_icinst_idx || id_bt_bli == ev_icinst_idx)) id_bt_hit <= 1'b0;
-            if (snoop_q   && (id_bt_li == snoop_idx_q   || id_bt_bli == snoop_idx_q))   id_bt_hit <= 1'b0;
+            if (snoop_q   && (f_snm(id_bt_li, snoop_idx_q, snoop_pr_q) ||
+                              f_snm(id_bt_bli, snoop_idx_q, snoop_pr_q)))                       id_bt_hit <= 1'b0;
             if (icinv || tlb_discard) id_bt_hit <= 1'b0;
             r_btk_icv <= ev_icinst;  r_btk_ic <= ev_icinst_idx;
-            r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;
+            r_btk_snv <= snoop_q;    r_btk_sn <= snoop_idx_q;  r_btk_snpr <= snoop_pr_q;
             r_btk_all <= icinv || tlb_discard;
          end
 
@@ -4212,6 +4303,15 @@ module pipeline_core
    assign tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
                                  (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)));
    wire sr_mtsr_we  = mtsr_commit && wb_op[19:16] == 4'h0;     // SRs 0-8 (mmu_sr)
+   // HW_PERF_PLAN.md §4: STATUS[10] MAL64, written by MTSR STATUS as it
+   // commits (serializing: the refetch puts no memory op in EX before it
+   // lands), 0 after reset and at start (program load)
+   always_ff @(posedge clk)
+      if (rst) mal64 <= 1'b0;
+      else if (ce) begin
+         if (EN_MAL64 && mtsr_commit && wb_op[19:12] == 8'h00) mal64 <= wb_value[10];
+         if (start) mal64 <= 1'b0;
+      end
    assign sr_ent_we = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
    logic [63:0] sr_rdata;
    // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
@@ -4346,7 +4446,7 @@ module pipeline_core
    wire [28:0] a_last_dw = (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
                          : (w_op[31:30] == 2'b10) ? w_pc_p4[31:3] : pc_dw;
    always_ff @(posedge clk) if (!rst && running)
-      assert (smc_hit_lat == (smc_st && (pc_dw == smc_dw || a_last_dw == smc_dw)))
+      assert (smc_hit_lat == (smc_st && (f_dweq(pc_dw, smc_dw, mzl) || f_dweq(a_last_dw, smc_dw, mzl))))
          else $fatal(1, "smc_hit_lat form: pc=%h op=%h smc_dw=%h", pc, w_op, smc_dw);
    // a parked core neither dispatches nor takes an IRQ
    always_ff @(posedge clk) if (!rst && parked && running)

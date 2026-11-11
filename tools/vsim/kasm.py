@@ -358,6 +358,11 @@ class Asm:
     def sc(self, size, rd, rs2, rs1):           # SC.D / SC.W rd(result), rs2(data), [rs1]
         return self.emit(H(1, 7) | SZ[size] << 24 | 1 << 12 | rd << 8 | rs1 << 4 | rs2)
 
+    # HW_PERF_PLAN.md §1: DCBZ [rs1] — zero the cache line holding rs1
+    # (no assembler support yet: the raw word 0x5F00_2000 | rs1 << 4)
+    def dcbz(self, rs1):
+        return self.emit(0x5F002000 | rs1 << 4)
+
     def tlbwi(self):  return self.sys(9)
     def tlbr(self):   return self.sys(10)
     def tlbp(self):   return self.sys(11)

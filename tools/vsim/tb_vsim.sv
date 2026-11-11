@@ -24,6 +24,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic         m_read_DV, m_write_DV;
    logic [63:0]  m_wdata, m_rdata = '0, m_rdata_next = '0;
    logic [7:0]   m_be;
+   logic         m_zl = 1'b0;      // DCBZ: zero the whole 32 B line (HW_PERF_PLAN §1)
    logic         m_next_valid = 1'b0, m_ready = 1'b0;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
    logic [7:0]   perf_stall;
@@ -71,6 +72,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    ) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
       .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be,
+`ifdef HAS_DCBZ
+      .m_zl,
+`endif
       .m_rdata,
 `ifdef HAS_RDATA_DRAM
       .m_rdata_dram(m_rdata),
@@ -123,6 +127,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic        q_wr;
    logic [63:0] q_wdata;
    logic [7:0]  q_be;
+   logic        q_zl;
+   longint      n_zl = 0;
    int          lat_cnt;
    int          uart_n = 0;
    string       uart_s = "";
@@ -157,12 +163,20 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       end else if (!in_flight && !m_ready && (m_read_DV || m_write_DV)) begin
          in_flight <= 1'b1;
          q_addr <= m_addr;  q_wr <= m_write_DV;  q_wdata <= m_wdata;  q_be <= m_be;
+         q_zl <= m_write_DV && m_zl;
          if (m_addr[31:28] == 4'hF) lat_cnt <= m_read_DV ? 2 : 1;
          else lat_cnt <= lat_fix + (lat_rand ? ($urandom % lat_rand) : 0);
       end else if (in_flight) begin
          if (lat_cnt > 1) lat_cnt <= lat_cnt - 1;
          else begin
-            if (q_wr) begin apply_write(q_addr, q_wdata, q_be); n_wr++; end
+            if (q_wr && q_zl) begin
+               // DCBZ: the line (L = 32) — the core never sends one to MMIO
+               if (q_addr[31:28] == 4'hF || q_addr[4:0] != 5'd0)
+                  $display("TB: FATAL zero-line request at %08x", q_addr);
+               for (int k = 0; k < 4; k++) apply_write({q_addr[31:5], 5'b0} + 32'(8 * k), 64'h0, 8'hFF);
+               n_wr++;  n_zl++;
+            end
+            else if (q_wr) begin apply_write(q_addr, q_wdata, q_be); n_wr++; end
             else begin
                m_rdata      <= rd_dw(q_addr);
                m_rdata_next <= rd_dw({q_addr[31:3], 3'b000} + 32'd8);
@@ -307,7 +321,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d ic_fill=%0d", n_br, n_br_taken,
                 n_fbr_taken, n_ic_miss, n_ic_fill);
       $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d mmio_rd=%0d", n_rd, n_wr, n_mmio_wr, n_mmio_rd);
-      $fdisplay(f, "posted=%0d nopost_dram=%0d", n_post, n_nopost_dram);
+      $fdisplay(f, "posted=%0d nopost_dram=%0d zero_lines=%0d", n_post, n_nopost_dram, n_zl);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d lcd_n=%0d lcdrst_n=%0d", uart_n, lcd_n, lcdrst_n);
 `ifdef HAS_EXC

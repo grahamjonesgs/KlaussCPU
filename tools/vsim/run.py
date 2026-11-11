@@ -69,6 +69,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_POST')
     if 'output logic [1:0]   perf_ic' in core:
         defs.append('+define+HAS_PERF_IC')
+    if 'output logic         m_zl' in core:
+        defs.append('+define+HAS_DCBZ')
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-O2', '-Wno-fatal', '-Wno-lint',
            '-Wno-style', '-Wno-MULTIDRIVEN', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_vsim',
            '-Mdir', os.path.join(d, 'obj'), *defs,
@@ -673,13 +675,14 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x0030_100D = stage 1
-    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only), native SD: the A7
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x00F0_100D = stage 1
+    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only), native SD,
+    # DCBZ, STATUS.MAL64: the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=000000000030100d' not in last:
+    if 'r2=0000000000f0100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
@@ -720,10 +723,10 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x003F100D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x00FF100D}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x0030100D}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x00F0100D}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
@@ -747,7 +750,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x0030100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x00F0100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -804,6 +807,214 @@ def cmd_socsd(a):
     return 1 if fails else 0
 
 
+# --------------------------------------------- HW_PERF_PLAN.md §1: DCBZ
+def _dcbz_variant(seed, use_dcbz, p=0.08, span=0x100, csum=False):
+    """randprog `seed` (data span `span`) with line-zeroing groups injected
+    before random instructions.  use_dcbz: `r14 = line; r13 = 0; r13 = EA;
+    DCBZ [r13]`; else the reference `r14 = line; r13 = 0; 4 x st r13 ->
+    [r14 + 8i]; r13 = EA`.  Both leave the same registers and memory, so
+    the final states must match.  csum: before the HALT, fold the data
+    window into r13 (for runs that only report registers: tb_soc)."""
+    import random, randprog
+    from kasm import Asm
+    rnd = random.Random(seed * 31337 + 11)
+
+    class DzAsm(Asm):
+        def __init__(self, *aa, **kk):
+            super().__init__(*aa, **kk)
+            self.inj = True
+            self.n_inj = 0
+
+        def emit(self, *ws):
+            if self.inj and rnd.random() < p:
+                self.inj = False
+                line = randprog.DATA + rnd.randrange(0, span, 32)
+                if rnd.random() < 0.3:      # same D-cache set, other tags: evictions
+                    line += 0x8000 * rnd.randrange(1, 4)
+                ea = line + rnd.randrange(32)
+                self.setr(0, 0)
+                if use_dcbz:
+                    self.setr(0, ea); self.dcbz(0)
+                else:
+                    for i in range(4):
+                        self.st_abs(64, 0, line + 8 * i)
+                    self.setr(0, ea)
+                # often a load of the line right behind it (into a data
+                # register, so a stale value spreads into the final state)
+                if rnd.random() < 0.6:
+                    sz = rnd.choice([8, 16, 32, 64])
+                    self.ld_abs(sz, rnd.randrange(1, 11), line + rnd.randrange(0, 32 // (sz // 8)) * (sz // 8))
+                self.n_inj += 1
+                self.inj = True
+            return super().emit(*ws)
+
+        def halt(self):
+            if csum:
+                self.inj = False
+                self.setr(13, 0)
+                for o in range(0, 0x800, 8):
+                    self.ld(64, 14, 12, o, mode='long')
+                    self.alu('xor', 13, 13, 14)
+                    self.shift_n('rol', 13, 13, 7)
+            return super().halt()
+
+    old = randprog.Asm
+    randprog.Asm = DzAsm
+    try:
+        asm = randprog.gen(seed, span=span)
+    finally:
+        randprog.Asm = old
+    return asm, asm.n_inj
+
+
+def cmd_dcbzdiff(a):
+    """core TB: DCBZ programs vs their 4-store references (same final
+    registers, flags and data window), over latencies and hit-pipe rates"""
+    exe = build(None)
+    fails = n_inj = n_dyn = 0
+    plus_sets = [['+LAT=1'], ['+LAT=3', '+HIT=70'], ['+LAT=7', '+HIT=100'], ['+LAT=2', '+LATR=6', '+HIT=40']]
+    for sd in range(a.seed0, a.seed0 + a.seeds):
+        for pi, plus in enumerate(plus_sets):
+            span = (0x40, 0x100, 0x800)[(sd + pi) % 3]
+            ra, n = _dcbz_variant(sd, True, span=span)
+            rb, _ = _dcbz_variant(sd, False, span=span)
+            n_inj += n
+            sa, _ = run(exe, ra, f'za{sd}_{pi}', plus)
+            sb, _ = run(exe, rb, f'zb{sd}_{pi}', plus)
+            keys = [f'r{i}' for i in range(16)] + ['sp', 'flags', 'end', 'kind'] + \
+                   sorted({k for k in list(sa) + list(sb) if re.fullmatch(r'm[0-9a-f]{8}', k)})
+            bad = [k for k in keys if sa.get(k) != sb.get(k)]
+            # (zero_lines counts executed DCBZs: loops repeat / skip groups)
+            ok = sa.get('end') == 'park' and sa.get('kind') in ('0', '5') and not bad and \
+                 (n == 0 or int(sa.get('zero_lines', 0)) > 0) and sb.get('zero_lines') == '0' and \
+                 'fatal' not in (sa['log'] + sb['log']).lower()
+            n_dyn += int(sa.get('zero_lines', 0))
+            fails += not ok
+            if not ok or a.verbose:
+                print(f'{"same" if ok else "DIFF"} seed={sd} {" ".join(plus)} span={span:#x} dcbz={n} '
+                      f'zl={sa.get("zero_lines")} cycles {sa.get("cycles")}/{sb.get("cycles")} {bad[:4]}')
+    print(f'{fails} differing; {n_inj} DCBZs injected, {n_dyn} executed')
+    return 1 if fails else 0
+
+
+def _soc_regs(r):
+    """registers of the last retire line (the HALT) of a tb_soc run"""
+    if 'HALTED' not in r['log']:
+        return None
+    last = open(r['trace']).read().strip().splitlines()[-1]
+    return {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
+
+
+def _soc_ddr(r):
+    m = re.search(r'DDR reads=(\d+) writes=(\d+)', r['log'])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _dz_cnt_prog(dz=True, tail=True):
+    """the SoC DCBZ program: set 0 (index 0) holds A (dirty) and B (dirty,
+    MRU); DCBZ C (miss: A is the victim, written back, no fetch); loads of
+    C read 0; DCBZ C again (hit); the counter deltas; A read back from DDR.
+    dz=False: each DCBZ is a NOP (same code layout); tail=False: HALT right
+    after the delay that follows the first DCBZ."""
+    from kasm import Asm
+    A, B, C = 0x200000, 0x208000, 0x210000
+    a = Asm()
+    a.setr(15, 0xF0050000)
+    a.setr(10, A); a.setr(11, B); a.setr(12, C + 13)
+    a.setr64(1, 0x1111222233334444); a.st(64, 1, 10, 8)       # write miss: A dirty
+    a.setr64(2, 0x5555666677778888); a.st(64, 2, 11, 16)      # write miss: B dirty, MRU
+    a.ld(64, 3, 10, 8)                                        # (hit pipe: no LRU change)
+    def delay(n):
+        a.setr(9, n); a.label(f'd{len(a.labels)}'); lb = f'd{len(a.labels) - 1}'
+        a.dec(9); a.fbr('ne', 9, 0, lb, imm=True)
+    delay(40)
+    for i, off in enumerate((0x48, 0x58, 0x60, 0x70, 0x50)):   # r4..r8 = counters before
+        a.ld(64, 4 + i, 15, off)
+    dzat = a.dcbz(12) if dz else a.nop()
+    if not tail:
+        delay(60)
+        a.halt()
+        return a, dzat
+    a.ld(64, 9, 12, 24 - 13, mode='long')                     # C+24 right behind it
+    a.ld(64, 13, 12, -13, mode='long')                        # C+0
+    a.alu('or', 9, 9, 13)
+    a.setr(12, C + 1)
+    a.dcbz(12) if dz else a.nop()                             # hit
+    delay(60)
+    for i, off in enumerate((0x48, 0x58, 0x60, 0x70, 0x50)):  # deltas
+        a.ld(64, 13, 15, off); a.alu('sub', 4 + i, 13, 4 + i)
+    a.ld(64, 14, 10, 8)                                       # A: a miss, from DDR
+    a.ld(64, 13, 11, 16)                                      # B: still cached
+    a.halt()
+    return a, dzat
+
+
+def cmd_socdcbz(a):
+    """DCBZ through the full SoC (real cache, bus splitter, behavioural DDR)"""
+    from kasm import Asm
+    exe = build_soc(None)
+    fails = 0
+
+    def report(name, ok, msg=''):
+        nonlocal fails
+        fails += not ok
+        print(f'{"pass" if ok else "FAIL"} {name} {msg}')
+
+    # counters, zeros, the victim through DDR, the retire trace line
+    prog, dzat = _dz_cnt_prog()
+    r = run_soc(exe, prog, 'dz_cnt', trace=True)
+    g = _soc_regs(r)
+    want = {'r9': 0, 'r4': 0, 'r5': 1, 'r6': 1, 'r7': 2, 'r8': 1,
+            'r14': 0x1111222233334444, 'r13': 0x5555666677778888}
+    bad = {k: hex(g.get(k, -1)) for k in want if g is None or g.get(k) != want[k]} if g else {'halt': 0}
+    tl = [l for l in open(r['trace']) if f'pc={dzat:08x}' in l]
+    tr_ok = len(tl) == 1 and ' wr=00210000/ff/0000000000000000' in tl[0]
+    report('counters', not bad and tr_ok, f'{bad} trace={tl[0].split(" wr=")[-1].strip() if tl else None}')
+    # DDR traffic: the DCBZ miss (dirty victim) adds one line write and no
+    # read, against the same program with the DCBZ a NOP
+    r0 = run_soc(exe, _dz_cnt_prog(False, False)[0], 'dz_ref')
+    r1 = run_soc(exe, _dz_cnt_prog(True, False)[0], 'dz_one')
+    d0, d1 = _soc_ddr(r0), _soc_ddr(r1)
+    report('ddr', d0 is not None and d1 is not None and d1[0] == d0[0] and d1[1] == d0[1] + 1,
+           f'ref={d0} dcbz={d1}')
+    # a code line zeroed and patched through the D-cache: the patch runs
+    # (the I-cache copies of both halves were snooped)
+    for half in (0, 16):
+        pa = Asm()
+        new_w = Asm(); new_w.inc(2); new_w.ret()
+        w = new_w.assemble()
+        pa.setr(1, 0); pa.setr(2, 0)
+        pa.leapc(3, 'F')
+        pa.call('F'); pa.call('F')
+        pa.dcbz(3)
+        pa.setr64(4, (w[1] << 32) | w[0]); pa.st(64, 4, 3)
+        pa.call('F')
+        pa.halt()
+        pa.nop()
+        while (pa.pc & 31) != 0:
+            pa.nop()
+        for _ in range(half // 4):
+            pa.nop()
+        pa.label('F')
+        pa.inc(1); pa.ret()
+        rr = run_soc(exe, pa, f'dz_smc{half}', trace=True)
+        g = _soc_regs(rr)
+        report(f'smc{half}', g is not None and g.get('r1') == 2 and g.get('r2') == 1,
+               f'r1={g and g.get("r1")} r2={g and g.get("r2")}')
+    # random DCBZ programs vs their 4-store references (checksummed window)
+    for sd in range(a.seed0, a.seed0 + a.seeds):
+        span = (0x40, 0x100, 0x800)[sd % 3]
+        ra, n = _dcbz_variant(sd, True, span=span, csum=True)
+        rb, _ = _dcbz_variant(sd, False, span=span, csum=True)
+        ga = _soc_regs(run_soc(exe, ra, f'dz_ra{sd}', trace=True))
+        gb = _soc_regs(run_soc(exe, rb, f'dz_rb{sd}', trace=True))
+        report(f'random seed={sd} span={span:#x} dcbz={n}', ga is not None and ga == gb,
+               '' if ga == gb else str({k: (hex(ga[k]), hex(gb[k])) for k in ga if ga[k] != gb.get(k)}))
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
+
 def cmd_socdiff(a):
     """random programs through the full SoC (real cache / bus splitter):
     base rev vs working tree, retire traces must be identical"""
@@ -855,6 +1066,10 @@ def main():
     tp.add_argument('--irq', action='store_true'); tp.add_argument('--hit', type=int)
     tp.add_argument('--plus', nargs='*', default=[])
     sub.add_parser('soccrypto')
+    dz = sub.add_parser('dcbzdiff'); dz.add_argument('--seeds', type=int, default=20)
+    dz.add_argument('--seed0', type=int, default=1); dz.add_argument('-v', '--verbose', action='store_true')
+    sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
+    sz.add_argument('--seed0', type=int, default=1)
     sub.add_parser('socsd')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
@@ -886,6 +1101,10 @@ def main():
         sys.exit(tlbpage.main(a.seed0, a.seeds, a.lats, a.hit, a.irq, a.plus))
     elif a.cmd == 'soccrypto':
         sys.exit(cmd_soccrypto(a))
+    elif a.cmd == 'dcbzdiff':
+        sys.exit(cmd_dcbzdiff(a))
+    elif a.cmd == 'socdcbz':
+        sys.exit(cmd_socdcbz(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
     elif a.cmd == 'tlbdiff':

@@ -3053,3 +3053,487 @@ def ei_single_step():
     p += ['+DBG_BP0=%x' % a.labels['e'], '+DBG_STEPS=2']
     want = a.labels['n'] if dbg else a.labels['d']
     return a, {'end': 'park', 'kind': '0', m(ELOG): 1, m(ELOG + 8): want}, p
+
+
+# ============================================ HW_PERF_PLAN.md §1: DCBZ
+# DCBZ [rs1] = 0x5F00_2000 | rs1 << 4 (kasm Asm.dcbz).  It zeroes the 32 B
+# line holding rs1, as a store: every later load of the line returns 0.
+# The TB's memory model zeroes the line on the request's ready edge (its
+# hit-pipe model, +HIT, answers from memory: until then the core's
+# same-line block / store forwarding must cover the line).
+import os as _osz
+NOEXC = _osz.environ.get('VSIM_EXC_EN') == '0'      # core 2's shape: DCBZ illegal
+ZL = DATA + 0x40                                    # the line zeroed by most tests
+DZ_V = [0x1111111111111111 * (i + 1) for i in range(4)]
+
+
+def _dz_fill(a, base_reg=12):
+    """the line at ZL = DZ_V, and sentinels in the dwords either side"""
+    a.setr64(1, 0xA5A5A5A5A5A5A5A5); a.st(64, 1, base_reg, 0x38)
+    a.setr64(1, 0x5A5A5A5A5A5A5A5A); a.st(64, 1, base_reg, 0x60)
+    for i, v in enumerate(DZ_V):
+        a.setr64(1, v); a.st(64, 1, base_reg, 0x40 + 8 * i)
+
+
+def _dz_exp(extra=None):
+    e = {'end': 'park', 'kind': '0', m(DATA + 0x38): 0xA5A5A5A5A5A5A5A5,
+         m(DATA + 0x60): 0x5A5A5A5A5A5A5A5A}
+    for i in range(4):
+        e[m(ZL + 8 * i)] = 0
+    e.update(extra or {})
+    return e
+
+
+_DZ_PLUS = [['+LAT=1'], ['+LAT=3', '+HIT=70'], ['+LAT=7', '+HIT=100'], ['+LAT=2', '+LATR=5', '+HIT=50'],
+            ['+LAT=1', '+HIT=100']]
+
+
+@test
+def dcbz_load_after():
+    """a load of each dword of the line 0..4 instructions after the DCBZ
+    (the stores filling the line just before it): 0, every size; the
+    sentinels either side untouched.  Covers STLF / the same-line block in
+    every position (MEM, port, store queue) with and without hit-pipe hits."""
+    out = []
+    n = 0
+    for k in range(4):
+        for d in (0, 1, 2, 4):
+            for off in (0, (13 + 8 * k) & 31):
+                a = Asm()
+                a.setr(12, DATA); a.setr(9, ZL + off)
+                _dz_fill(a)
+                a.dcbz(9)
+                for _ in range(d):
+                    a.nop()
+                a.ld(64, 3, 12, 0x40 + 8 * k)
+                a.ld(8, 4, 12, 0x40 + 8 * ((k + 1) & 3) + 5, sgn=True)
+                a.ld(32, 5, 12, 0x40 + 8 * ((k + 2) & 3) + 4, sgn=True, mode='long')
+                a.ld(16, 6, 12, 0x40 + 8 * ((k + 3) & 3) + 2, sgn=True)
+                a.ld(64, 7, 12, 0x38)
+                a.ld(64, 8, 12, 0x60)
+                a.halt()
+                exp = _dz_exp({'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0, 'r7': 0xA5A5A5A5A5A5A5A5,
+                               'r8': 0x5A5A5A5A5A5A5A5A, 'zero_lines': '1'})
+                out.append((a, exp, _DZ_PLUS[n % len(_DZ_PLUS)]))
+                n += 1
+    return out
+
+
+@test
+def dcbz_sq():
+    """a DCBZ queued behind a posted store (EN_SQ) to another line, then a
+    load of the zeroed line while it waits there (sf_c)"""
+    out = []
+    n = 0
+    for k in range(4):
+        for d in (0, 1, 2):
+            for lat in (5, 9):
+                a = Asm()
+                a.setr(12, DATA); a.setr(9, ZL + 3); a.setr(2, 0x99)
+                _dz_fill(a)
+                for _ in range(30):
+                    a.nop()                        # everything drained
+                a.st(64, 2, 12, 0x100)             # posted (another line)
+                a.dcbz(9)                          # queued behind it
+                for _ in range(d):
+                    a.nop()
+                a.ld(64, 3, 12, 0x40 + 8 * k)
+                a.ld(64, 4, 12, 0x100)
+                a.halt()
+                exp = _dz_exp({'r3': 0, 'r4': 0x99, m(DATA + 0x100): 0x99})
+                out.append((a, exp, [f'+LAT={lat}', '+HIT=100' if n % 2 else '+HIT=60']))
+                n += 1
+    return out
+
+
+@test
+def dcbz_store_load():
+    """DCBZ, then a 64-bit store into dword k and a byte store into dword j,
+    then loads: the stores' bytes, zeros elsewhere (younger stores win)"""
+    out = []
+    n = 0
+    for k in range(4):
+        for j in range(4):
+            for d in (0, 2):
+                a = Asm()
+                a.setr(12, DATA); a.setr(9, ZL + 31)
+                _dz_fill(a)
+                a.setr64(2, 0xC0FFEE00C0FFEE00 + k); a.setr(10, 0x7E)
+                a.dcbz(9)
+                for _ in range(d):
+                    a.nop()
+                a.st(64, 2, 12, 0x40 + 8 * k)
+                a.st(8, 10, 12, 0x40 + 8 * j + 3)
+                for i in range(4):
+                    a.ld(64, 3 + i, 12, 0x40 + 8 * i)
+                a.halt()
+                want = [0, 0, 0, 0]
+                want[k] = 0xC0FFEE00C0FFEE00 + k
+                want[j] = (want[j] & ~(0xFF << 24)) | (0x7E << 24)
+                exp = _dz_exp({f'r{3 + i}': want[i] for i in range(4)})
+                for i in range(4):
+                    exp[m(ZL + 8 * i)] = want[i]
+                out.append((a, exp, _DZ_PLUS[n % len(_DZ_PLUS)]))
+                n += 1
+    return out
+
+
+@test
+def dcbz_forms():
+    """rs1 in any register, EA anywhere in the line (aligned down; the line
+    after is untouched, also from the last byte), back-to-back DCBZs of the
+    same and of adjacent lines, and a DCBZ chained behind posted stores"""
+    out = []
+    for rs1 in (0, 5, 13, 15):
+        for off in (0, 1, 8, 31):
+            a = Asm()
+            a.setr(12, DATA)
+            _dz_fill(a)
+            a.setr(rs1, ZL + off)
+            a.dcbz(rs1)
+            a.halt()
+            out.append((a, _dz_exp({f'r{rs1}': ZL + off}), ['+LAT=3']))
+    a = Asm()
+    a.setr(12, DATA); a.setr(9, ZL); a.setr(8, ZL + 0x20)
+    _dz_fill(a)
+    a.setr64(1, 0x77); a.st(64, 1, 12, 0x60); a.st(64, 1, 12, 0x78)
+    a.dcbz(9); a.dcbz(9); a.dcbz(8); a.dcbz(9)
+    a.ld(64, 3, 12, 0x60); a.ld(64, 4, 12, 0x78); a.ld(64, 5, 12, 0x58)
+    a.halt()
+    exp = _dz_exp({'r3': 0, 'r4': 0, 'r5': 0, m(DATA + 0x60): 0, m(DATA + 0x78): 0, 'zero_lines': '4'})
+    out += [(a, exp, p) for p in _DZ_PLUS]
+    return out
+
+
+def _dz_code_ahead(k, pad, warm, lat, pre_ld=False):
+    """DCBZ zeroes the code line holding X, k instructions ahead in straight
+    code (pass 2 when warm: pass 1 runs X and the line is in the I-cache /
+    NLB / IFB).  The first instruction at or after the line start executes
+    the zeros: ILLEGAL (LEN 00) at max(DCBZ + 4, line base)."""
+    a = Asm()
+    a.setr(1, 0); a.setr(6, 2 if warm else 1); a.setr(5, 0)
+    a.leapc(2, 'X')
+    a.label('again')
+    for _ in range(pad):
+        a.nop()
+    if warm:
+        a.fbr('ne', 6, 1, 'skip', imm=True)
+    if pre_ld:
+        a.ld(64, 8, 2)          # a slow-path load on the port: the DCBZ chains
+                                # behind it and completes unposted (smc_st)
+    dz = a.dcbz(2)
+    a.label('skip')
+    for _ in range(k - 1):
+        a.inc(5)
+    a.label('X')
+    a.alui_s('add', 1, 1, 1)
+    a.addi_s(6, 6, -1)
+    a.fbr('ne', 6, 0, 'again', imm=True)
+    a.halt()
+    x = a.labels['X']
+    at = max(dz + 4, x & ~31)
+    # instructions between the DCBZ and `at` ran (pass 2)
+    n_inc = (at - (dz + 4)) // 4
+    exp = {'end': 'park', 'kind': '2', 'pc': at, 'op': 0, 'r1': 1 if warm else 0,
+           'r5': (k - 1 if warm else 0) + n_inc}
+    return a, exp, [f'+LAT={lat}']
+
+
+@test
+def dcbz_code_ahead():
+    out = []
+    for k in range(1, 11):
+        for pad in range(8):
+            for warm in (False, True):
+                for pre in (False, True):
+                    out.append(_dz_code_ahead(k, pad, warm, 1 + (k + pad) % 7, pre))
+    return out
+
+
+@test
+def dcbz_code_call():
+    """a function (warm: called twice — I-cache, BTIC, RAS) in either 16 B
+    half of a line, zeroed by a DCBZ through an address in the other half
+    (or the same); the next call executes the zeros (ILLEGAL at its entry)"""
+    out = []
+    for half in (0, 16):
+        for ea_off in (0, 5, 16, 27):
+            for lat in (1, 4):
+                a = Asm()
+                a.setr(1, 0)
+                a.leapc(2, 'F')
+                a.setr(7, 0)
+                a.call('F'); a.call('F')
+                if half:
+                    a.call('G')                  # the even half's I-cache line: another tag
+                a.alui('and', 3, 2, ~31 & 0xFFFFFFFF, sgn=False)
+                a.addi_s(3, 3, ea_off)
+                a.dcbz(3)
+                a.call('F')
+                a.halt()
+                a.nop()
+                while (a.pc & 31) != 0:             # F's line holds no other code
+                    a.nop()
+                for _ in range(half // 4):
+                    a.nop()
+                a.label('F')
+                a.inc(1)
+                a.ret()
+                f = a.labels['F']
+                if half:
+                    while a.pc != (f & ~31) + 0x2000:     # 8 KiB on: same I-cache index
+                        a.nop()
+                    a.label('G')
+                    a.inc(7)
+                    a.ret()
+                out.append((a, {'end': 'park', 'kind': '2', 'pc': f, 'op': 0, 'r1': 2,
+                                'r7': 1 if half else 0}, [f'+LAT={lat}']))
+    return out
+
+
+@test
+def dcbz_mmio():
+    """DCBZ to MMIO raises ACCESS_STORE in supervisor AND user mode (EADDR =
+    the raw EA, nothing reaches the bus); EVEC = 0: parks as ILLEGAL"""
+    out = []
+    if NOEXC:
+        return out
+    for ea in (0xF0010000, 0xF001000D, 0xFFFFFFFF):
+        a = Asm()
+        _xsetup(a)
+        a.setr(9, ea); a.setr(3, 0x33)
+        at = a.dcbz(9)
+        a.setr(4, 0x44)
+        a.halt()
+        _xhandler(a)
+        exp = {'end': 'park', 'kind': '0', 'r3': 0x33, 'r4': 0x44, 'mmio_wr': '0', 'zero_lines': '0'}
+        exp.update(_xexp(X_ACC_ST, ea, at))
+        out.append((a, exp, []))
+    a = Asm(); a.setr(9, 0xF0010008); at = a.dcbz(9); a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'pc': at, 'mmio_wr': '0'}, []))
+
+    a = Asm()                                       # user mode
+    _xsetup(a)
+    a.setr(12, DATA); _dz_fill(a)
+    _to_user(a, 'u')
+    a.label('u')
+    a.setr(9, 0xF0010010); a.dcbz(9)                # ACCESS_STORE
+    a.setr(9, ZL + 9); a.dcbz(9)                    # user DRAM: zeroes the line
+    a.halt()
+    _uhandler(a)
+    out.append((a, _dz_exp({m(XLOG): X_ACC_ST, m(XLOG + 8): X_PRIV, m(XD + 32): 2, 'mmio_wr': '0'}), []))
+    return out
+
+
+@test
+def dcbz_tlb():
+    """TE = 1, user mode: DCBZ needs store permission — a read-only page is
+    ACCESS_STORE, an unmapped one TLB_MISS_STORE (EADDR = the raw EA,
+    TLB_HI loaded); a writable page zeroes the PA line, and loads right
+    behind it (same VA, and the identity alias of the PA) read 0"""
+    if NOEXC:
+        return []
+    def setup(a):
+        _tlb_set(a, 2, 0x0100, 0x001, TLB_V | TLB_R | TLB_W)        # 0x0100_0000 -> PA 0x10000
+        _tlb_set(a, 3, 0x0300, 0x001, TLB_V | TLB_R)                # read-only alias
+        a.setr(12, DATA); _dz_fill(a)
+    def body(a):
+        a.setr(9, 0x03000045); a.dcbz(9)                            # R only: ACC_ST
+        a.setr(9, 0x02000013); a.dcbz(9)                            # unmapped: TLB_MISS_ST
+        a.ld(64, 4, 12, ZL - GOOD)                                  # still DZ_V[0]
+        a.setr(9, 0x01000047); a.setr(10, 0x01000058)
+        a.dcbz(9)
+        a.ld(64, 5, 10)                                             # same VA page: 0
+        a.ld(64, 6, 12, ZL + 8 - GOOD)                              # the identity alias: 0
+        a.ld(64, 7, 9, 0x60 - 0x47, mode='long')                   # the next line: sentinel
+    logs = [(X_ACC_ST, 0x03000045), (X_TLB_ST, 0x02000013)]
+    return [_te_prog(body, True, _dz_exp({'r4': DZ_V[0], 'r5': 0, 'r6': 0, 'r7': 0x5A5A5A5A5A5A5A5A}),
+                     logs=logs, setup=setup, plus=p) for p in (['+LAT=3'], ['+LAT=1', '+HIT=100'])]
+
+
+@test
+def dcbz_illegal():
+    """only 0x5F00_2000 | rs1 << 4 is DCBZ: its [13] = 1 neighbours stay
+    ILLEGAL ([12] = 1 too, another SIZE, SGN, A, MODE 10 / 11, a nonzero
+    [11:8] / [3:0] / [19:14], LEN 10, class 6).  (MODE 01 with [13] = 1 is
+    the existing short store, imm8 = [19:12].)  Core 2's shape (EXC_EN = 0,
+    no D-cache): DCBZ itself is ILLEGAL."""
+    out = []
+    words = [0x5F003010, 0x5E002010, 0x5D002010, 0x5C002010, 0x5F802010, 0x5F102010,
+             0x5F402010, 0x5F602010, 0x5F002110, 0x5F002011, 0x5F006010, 0x5F0A2010,
+             0x5F082010, 0x5B002010]
+    if NOEXC:
+        words.append(0x5F002010)
+    for w in words:
+        a = Asm(); a.setr(1, DATA); at = a.raw(w); a.halt()
+        out.append((a, {'end': 'park', 'kind': '2', 'pc': at, 'op': w, 'bus_wr': '0'}, []))
+    a = Asm(); a.setr(1, DATA); at = a.raw(0x9F002010, 0); a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'pc': at, 'bus_wr': '0'}, []))
+    return out
+
+
+# ============================================ HW_PERF_PLAN.md §4: STATUS.MAL64
+MLOG = XD + 0x100           # _lenhandler: 16 bytes per entry (ECAUSE, EADDR)
+
+
+def _lenhandler(a, name='h'):
+    """logs ECAUSE / EADDR at MLOG + 16*(n-1) (count at XD+32) and steps the
+    frame PC over the faulting instruction, whatever its length"""
+    a.label(name)
+    a.push(13); a.push(14)
+    a.setr(14, XD)
+    a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)
+    a.shift_n('shl', 13, 13, 4); a.alui('add', 13, 13, MLOG - 16)
+    a.mfsr(14, 'ecause'); a.st(64, 14, 13, 0)
+    a.mfsr(14, 'eaddr');  a.st(64, 14, 13, 8)
+    a.mfsr(13, 'eaddr'); a.setr(14, HALT_W)
+    a.fbr('ne', 13, 14, name + '_nh'); a.halt()                # a user HALT halts
+    a.label(name + '_nh')
+    a.getsp(13); a.ld(64, 14, 13, 16)                           # the frame word
+    a.ld(32, 13, 14)                                            # the op at its PC (MEMGET32)
+    a.shift_n('shr', 13, 13, 30); a.shift_n('shl', 13, 13, 2)   # 4 * LEN
+    a.alu('add', 14, 14, 13)
+    a.getsp(13); a.st(64, 14, 13, 16)
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+def _a1(a, at):
+    """set A ([20]) on the instruction just emitted at `at` (64-bit forms)"""
+    i = (at - a.base) // 4
+    a.words[i] |= 1 << 20
+
+
+MB = DATA + 0x80            # the MAL64 tests' data (MB .. MB+0x3F)
+MV = [0x0102030405060708 * (i + 1) for i in range(8)]
+
+
+def _mal_ops(a, mis):
+    """every 64-bit LOAD / STORE addressing mode, A = 0 and A = 1, at an EA
+    with EA[2:0] = mis (0: aligned).  r12 = MB, r9 = MB + mis, r11 = mis.
+    Loads write r3 (preset 0x33); stores write r4 (0x44).  Returns the list
+    of (pc, is_store, raw EA)."""
+    ops = []
+    for A in (0, 1):
+        def lds():
+            yield lambda: a.ld(64, 3, 9), MB + mis                         # [rs1]
+            yield lambda: a.ld(64, 3, 9, 8), MB + 8 + mis                  # short simm8
+            yield lambda: a.ld(64, 3, 12, 16 + mis, mode='long'), MB + 16 + mis
+            yield lambda: a.ld_abs(64, 3, MB + 24 + mis), MB + 24 + mis
+            yield lambda: a.ld_rr(64, 3, 12, 11), MB + mis
+        def sts():
+            yield lambda: a.st(64, 4, 9), MB + mis
+            yield lambda: a.st(64, 4, 9, 8), MB + 8 + mis
+            yield lambda: a.st(64, 4, 12, 16 + mis, mode='long'), MB + 16 + mis
+            yield lambda: a.st_abs(64, 4, MB + 24 + mis), MB + 24 + mis
+            yield lambda: a.st_rr(64, 4, 12, 11), MB + mis
+        for st, gen in ((False, lds), (True, sts)):
+            for fn, ea in gen():
+                at = fn()
+                if A:
+                    _a1(a, at)
+                ops.append((at, st, ea))
+    return ops
+
+
+def _mal_prog(mis, mal, user=False):
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, MB); a.setr(9, MB + mis); a.setr(11, mis)
+    for i, v in enumerate(MV[:5]):
+        a.setr64(1, v); a.st(64, 1, 12, 8 * i)
+    a.mfsr(5, 'status')                                    # 0 after reset
+    a.setr(1, 0x400 if mal else 0); a.mtsr('status', 1)
+    a.mfsr(6, 'status')
+    if user:
+        _to_user(a, 'u')
+    a.label('u')
+    a.setr(3, 0x33); a.setr(4, 0x44)
+    a.mfsr(7, 'status')                                    # readable in user mode
+    ops = _mal_ops(a, mis)
+    a.halt()
+    _lenhandler(a)
+    return a, ops
+
+
+@test
+def mal64_traps():
+    """STATUS[10] MAL64 = 1: every misaligned 64-bit LOAD / STORE traps with
+    cause 5 / 6, EADDR = the raw EA, nothing loaded or stored; aligned ones
+    run.  MAL64 = 0: a misaligned 64-bit access uses the doubleword aligned
+    down (unchanged).  Also in user mode."""
+    if NOEXC:
+        return []
+    out = []
+    for mis in (0, 1, 3, 4, 7):
+        for mal in (True, False):
+            for user in ((False, True) if (mal and mis == 3) else (False,)):
+                a, ops = _mal_prog(mis, mal, user)
+                trap = mal and mis != 0
+                exp = {'end': 'park', 'kind': '0', 'r5': 0, 'r6': 0x400 if mal else 0,
+                       'r7': (0x400 if mal else 0) | (1 if user else 0)}
+                if trap:
+                    exp['r3'] = 0x33
+                    for i, v in enumerate(MV[:5]):
+                        exp[m(MB + 8 * i)] = v                     # untouched
+                    for n, (at, st, ea) in enumerate(ops):
+                        exp[m(MLOG + 16 * n)] = X_MISAL_ST if st else X_MISAL_LD
+                        exp[m(MLOG + 16 * n + 8)] = ea
+                    exp[m(XD + 32)] = len(ops) + (1 if user else 0)
+                else:
+                    # the aligned-down dword (the last load, A = 1 [r12 + r11],
+                    # reads MB, which the A = 0 stores wrote)
+                    exp['r3'] = 0x44
+                    for i in range(5):
+                        exp[m(MB + 8 * i)] = 0x44 if i < 4 else MV[4]
+                    exp[m(XD + 32)] = 1 if user else 0
+                if user:
+                    exp[m(MLOG + 16 * len(ops) * trap)] = X_PRIV
+                for p in (['+LAT=3'], ['+LAT=1', '+HIT=100']):
+                    out.append((a, exp, p))
+    return out
+
+
+@test
+def mal64_exempt():
+    """with MAL64 = 1 the stack ops (misaligned SP), MEMGET32, DCBZ and 8 /
+    16 / 32-bit accesses keep their behaviour; LR.D still traps; EVEC = 0
+    parks a misaligned 64-bit load with kind 5; MTSR STATUS leaves MAL64
+    clear when [10] = 0"""
+    if NOEXC:
+        return []
+    out = []
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, MB)
+    for i, v in enumerate(MV[:5]):
+        a.setr64(1, v); a.st(64, 1, 12, 8 * i)
+    a.setr(1, 0x400); a.mtsr('status', 1)
+    a.getsp(8); a.setr(1, MB + 0x3C); a.setsp(1)
+    a.setr64(2, 0xDEAD); a.push(2); a.pop(3)               # [MB+0x34] (aligned down by the port)
+    a.setsp(8)
+    a.setr(9, MB + 5); a.ld(32, 4, 9)                      # MEMGET32, spanning
+    a.ld(8, 5, 12, 0x13)                                   # byte
+    a.setr(9, MB + 0x2B); a.dcbz(9)                        # DCBZ at a misaligned EA: zeroes MB+0x20..0x3F
+    a.setr(9, MB + 4); a.lr(64, 6, 9)                      # LR.D: MISALIGNED_LOAD (as always)
+    a.halt()
+    _lenhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'r3': 0xDEAD,
+           'r4': ((MV[0] >> 40) | (MV[1] << 24)) & 0xFFFFFFFF, 'r5': (MV[2] >> 24) & 0xFF,
+           m(MLOG): X_MISAL_LD, m(MLOG + 8): MB + 4, m(XD + 32): 1,
+           m(MB + 0x20): 0, m(MB + 0x28): 0, m(MB + 0x30): 0, m(MB + 0x38): 0, 'zero_lines': '1'}
+    out.append((a, exp, ['+LAT=3']))
+    a = Asm()
+    a.setr(1, 0x400); a.mtsr('status', 1)
+    a.setr(9, MB + 2); at = a.ld(64, 3, 9)
+    a.halt()
+    out.append((a, {'end': 'park', 'kind': '5', 'pc': at}, []))
+    a = Asm()
+    a.setr(12, MB); a.setr64(1, MV[0]); a.st(64, 1, 12)
+    a.setr(1, 0x400); a.mtsr('status', 1)
+    a.setr(1, 0); a.mtsr('status', 1)                      # MAL64 back to 0
+    a.mfsr(6, 'status')
+    a.setr(9, MB + 2); a.ld(64, 3, 9)                      # aligned down again
+    a.halt()
+    out.append((a, {'end': 'park', 'kind': '0', 'r6': 0, 'r3': MV[0]}, []))
+    return out

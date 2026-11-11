@@ -74,6 +74,9 @@ module bus_splitter #(
     assign dram.addr       = cpu.addr;
     assign dram.write_data = cpu.write_data;
     assign dram.byte_en    = cpu.byte_en;
+    // DCBZ (HW_PERF_PLAN.md §1): the core faults a DCBZ to MMIO, so the
+    // flag only ever accompanies a DRAM write
+    assign dram.zero_line  = cpu.zero_line;
     assign o_mmio_addr       = cpu.addr;
     assign o_mmio_write_data = cpu.write_data;
     assign o_mmio_byte_en    = cpu.byte_en;
