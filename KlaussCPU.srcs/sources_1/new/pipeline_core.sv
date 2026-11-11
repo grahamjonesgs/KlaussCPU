@@ -1706,6 +1706,19 @@ module pipeline_core
    endfunction
    wire [65:0] mul_m = f_mulres(mul_pipe2, mem_d.mdhigh, mem_d.mduns, mem_d.w32);
    wire [65:0] mul_w = f_mulres(mul_pipe2, wb_mhi, wb_muns, wb_mw32);
+   // (timing, HW_PERF_PLAN §2 closure) mul_w's value, selected a stage
+   // early: the WB forward of a direct MUL (wb_mdir) started at wb_mhi ->
+   // the hi / lo half select -> the W extension -> the forward muxes ->
+   // ex_a.  A MUL is in WB only for the cycle after the MEM -> WB latch
+   // loaded it (it never waits there), and that edge also loads mul_pipe2
+   // from mul_pipe1 and wb_mhi / wb_muns / wb_mw32 from mem_d, so in that
+   // cycle mul_r2 == mul_w[63:0] (asserted below).
+   logic [63:0] mul_r2;
+   always_ff @(posedge clk) if (ce) begin
+      logic [65:0] t;
+      t = f_mulres(mul_pipe1, mem_d.mdhigh, mem_d.mduns, mem_d.w32);
+      mul_r2 <= t[63:0];
+   end
    // divide (silicon restoring divider, M4)
    typedef enum logic [1:0] { MD_IDLE, MD_PREP, MD_STEP } md_phase_t;
    md_phase_t  div_ph;
@@ -2693,7 +2706,7 @@ module pipeline_core
    // (EN_MUL2: a MUL in WB taking its product from the DSP joins here, the
    // first select of the load-forward path, as a full-dword "load" — no
    // extra mux level at the end of the forward cone)
-   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_w[63:0]
+   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2
                         : (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
    always_comb begin
       logic [7:0]  b8;
@@ -2720,8 +2733,10 @@ module pipeline_core
    function automatic logic [7:0] f_bz(logic [63:0] v);
       for (int i = 0; i < 8; i++) f_bz[i] = (v[8*i +: 8] == 8'd0);
    endfunction
-   wire [7:0] wbz_mr  = wb_mhi ? f_bz(mul_pipe2[127:64]) : f_bz(mul_pipe2[63:0]);
-   wire       wbz_mul = (id_w || wb_mw32) ? &wbz_mr[3:0] : &wbz_mr;
+   // (a MUL: from mul_r2, already half-selected and W-extended — the W
+   // sign extension of a zero low word is zero)
+   wire [7:0] wbz_mr  = f_bz(mul_r2);
+   wire       wbz_mul = id_w ? &wbz_mr[3:0] : &wbz_mr;
    wire [7:0] wbz_ld  = (EN_DC_H && wb_h && wb_hok) ? f_bz(wb_hdw) : f_bz(m_rdata_dram);
    wire       wbz_ldd = id_w ? &wbz_ld[3:0] : &wbz_ld;
    wire       wbz_ldx = (wb_ld_full || wb_ld_msz == 2'd3) ? wbz_ldd
@@ -4565,6 +4580,10 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst)
       assert (wbz_fwd == f_wz(id_w, wb_fwd_v))
          else $fatal(1, "wbz_fwd form: mdir=%b ld=%b v=%h", wb_mdir, wb_ld, wb_fwd_v);
+   // a direct MUL in WB: the early-selected product equals the late select
+   always_ff @(posedge clk) if (!rst)
+      assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
+         else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
    // ex_b_zero tracks ex_b exactly (both its write sites set it)
    always_ff @(posedge clk) if (!rst)
       assert (ex_b_zero == (ex_b == 64'd0))
