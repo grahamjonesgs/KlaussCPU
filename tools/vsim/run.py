@@ -30,7 +30,9 @@ def build(rev=None, quiet=True):
     dbg = os.environ.get('VSIM_DEBUG_EN') == '1'     # elaborate DEBUG_EN=1
     noexc = os.environ.get('VSIM_EXC_EN') == '0'     # elaborate EXC_EN=0 (core 2's MMU-less core)
     mpu = os.environ.get('VSIM_MPU_EN') == '1'       # elaborate MPU_EN=1 (off on the A7)
-    tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '')
+    tlbn = os.environ.get('VSIM_TLB_N', '')         # elaborate TLB_N=<n> (default: the core's, 32)
+    tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '') + \
+          (f'_tlb{tlbn}' if tlbn else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -45,7 +47,7 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu)).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -59,6 +61,8 @@ def build(rev=None, quiet=True):
             defs.append('-GEXC_EN=0')
     if mpu and 'parameter bit MPU_EN' in core:
         defs += ['+define+HAS_MPU', '-GMPU_EN=1']
+    if tlbn and 'parameter int TLB_N' in core:
+        defs += ['+define+HAS_TLBN', f'-GTLB_N={int(tlbn)}']
     if 'm_rdata_dram' in core:
         defs.append('+define+HAS_RDATA_DRAM')
     if 'input  logic [63:0]  h_dword' in core:
@@ -538,7 +542,7 @@ def cmd_mpudiff(a):
     return 1 if fails else 0
 
 
-def _tlb_variant(seed, p_sys=0.04, irq=False):
+def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
     """MMU stage 3: randprog `seed` in user mode with TE = 1, its code run
     through a non-identity VA (page CVP -> frame 0), starting from an empty
     TLB.  A kseg refill handler at TLBVEC maps CVP -> 0 and every other
@@ -551,11 +555,13 @@ def _tlb_variant(seed, p_sys=0.04, irq=False):
     plain physical run's."""
     import random, randprog
     from kasm import Asm
-    from tests import _tlb_set, HALT_W, KSP, USP, TLB_RWX
+    from tests import _tlb_set, HALT_W, KSP, USP, TLB_RWX, TLB_N
     rnd = random.Random(seed * 7919 + 3)
     # (with IRQs every ~150-200 cycles, K = 2 starves: the handler's two
     # pages evict the interrupted instruction's two before it can retire)
     K = rnd.choice([4, 16] if irq else [2, 4, 16])
+    if k_force:                      # --k: every seed over K entries (up to TLB_N)
+        K = k_force
     CVP = rnd.choice([0x0040, 0x0123, 0x0400, 0x07F0])
     CNT = 0x80200000                                       # kseg: the round-robin index
 
@@ -641,7 +647,7 @@ def cmd_tlbdiff(a):
         for lat in a.lats:
             plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
             sa, _ = run(exe, randprog.gen(s, irq=a.irq), f'ta{s}_{lat}', plus)
-            asm, info = _tlb_variant(s, irq=a.irq)
+            asm, info = _tlb_variant(s, irq=a.irq, k_force=a.k)
             sb, _ = run(exe, asm, f'tb{s}_{lat}', plus)
             n_exc += int(sb.get('exc_n', 0))
             keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
@@ -676,13 +682,13 @@ def cmd_socmmio(a):
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
     # CPU_FEATURES (0xF00F_0048) on the working tree: 0x01F0_100D = stage 1
-    # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only), native SD,
+    # + LR/SC + the 32-entry TLB, no MPU, lean crypto (TRNG only), native SD,
     # DCBZ, STATUS.MAL64, ETH_RX_SLOTS: the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=0000000001f0100d' not in last:
+    if 'r2=0000000001f0200d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -733,10 +739,10 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF100D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF200D}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x01F0100D}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x01F0200D}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
@@ -760,7 +766,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x01F0100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x01F0200D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -1042,7 +1048,7 @@ def cmd_soceth(a):
     a.ld(64, 7, 15, 0x08)                                              # 0
     a.setr(3, 1); a.st(64, 3, 15, 0x00); a.ld(64, 8, 15, 0x00)         # 1 -> 2
     a.halt()
-    exp = {'r1': 0x01F0100D, 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
+    exp = {'r1': 0x01F0200D, 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
     r = run_soc(exe, a, 'soceth', trace=True)
     last = open(r['trace']).read().strip().splitlines()[-1] if 'HALTED' in r['log'] else ''
     regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
@@ -1098,6 +1104,7 @@ def main():
     tl.add_argument('--seed0', type=int, default=1); tl.add_argument('--lats', type=int, nargs='+', default=[3])
     tl.add_argument('--irq', action='store_true'); tl.add_argument('-v', '--verbose', action='store_true')
     tl.add_argument('--plus', nargs='*', default=[])
+    tl.add_argument('--k', type=int, default=0, help='refill over K entries (a power of two <= TLB_N; default: random 2/4/16)')
     tp = sub.add_parser('tlbpage'); tp.add_argument('--seeds', type=int, default=30)
     tp.add_argument('--seed0', type=int, default=1); tp.add_argument('--lats', type=int, nargs='+', default=[3])
     tp.add_argument('--irq', action='store_true'); tp.add_argument('--hit', type=int)

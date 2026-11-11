@@ -51,9 +51,9 @@ module pipeline_core
    // MMU_PLAN.md stage 3: the 32-entry software-refilled TLB, TE (needs
    // EXC_EN).  0 = its SRs and instructions are illegal (core 2: off).
    parameter bit TLB_EN = 1'b1,
-   // its entry count (a power of two, 2-32): 16 on the xc7a100t (MMU_PLAN.md
-   // §11.5, area); TLB_INDEX uses the low $clog2(TLB_N) bits
-   parameter int TLB_N = 16,
+   // its entry count (a power of two, 2-32): 32 on the xc7a100t (MMU_PLAN.md
+   // §11.5, 2026-11-11); TLB_INDEX uses the low $clog2(TLB_N) bits
+   parameter int TLB_N = 32,
    // HW_PERF_PLAN.md §1: DCBZ (zero a D-cache line without fetching it;
    // needs EXC_EN and a cache that serves m_zl).  0 = its encoding is
    // ILLEGAL (core 2: no D-cache) and m_zl stays 0.
@@ -4543,9 +4543,19 @@ module pipeline_core
          .op_p     (tlbi_commit && wb_op[21:16] == 6'd11),
          .op_inv   (tlbi_commit && wb_op[21:16] == 6'd12),
          .hi_load  (tlb_hi_load), .hi_vpn (tlb_hi_vpn),
-         .d_vpn    (tlb_d_vpn), .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
+         .d_vpn    (tlb_d_vpn), .d_vnx (exo_eaddr[31:16]), .d_vld (!ex_mph),
+         .d_vstep  (ex_mpu_hold && ex_xpg_q && !mem_busy),
+         .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr));
+`ifndef SYNTHESIS
+      // the data CAM's registered VPN copy and d_ok (timing) give the exact
+      // lookup wherever its result is used: an op in its 2nd / 3rd EX cycle
+      always_ff @(posedge clk) if (ce && !rst && ex_tchk && ex_mph && t_tlbs)
+         assert (tlb_i.d_vq_ok && tlb_i.dm == tlb_i.dm_exact)
+            else $fatal(1, "mmu_tlb: data CAM %h != exact %h (vq %h / %h, vpn %h)", tlb_i.dm,
+                        tlb_i.dm_exact, tlb_i.d_vq0, tlb_i.d_vq1, tlb_d_vpn);
+`endif
    end else begin : g_notlb
       assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
       assign tlb_d_hit = 1'b0;  assign tlb_d_pfn = '0;  assign tlb_d_xwr = '0;
@@ -4892,7 +4902,10 @@ module mmu_tlb #(
    input  logic        op_wi, op_r, op_p, op_inv,
    input  logic        hi_load,       // exception entry: TLB_HI <- {hi_vpn, G 0, ASID}
    input  logic [15:0] hi_vpn,
-   input  logic [15:0] d_vpn,
+   input  logic [15:0] d_vpn,         // (sim: the core's ex_ea_q[31:16], checked against d_vq)
+   input  logic [15:0] d_vnx,         // ex_ea_q's next VPN and its load / page-step enables:
+   input  logic        d_vld,         //   the CAM reads its own copy d_vq (timing)
+   input  logic        d_vstep,
    output logic        d_hit,
    output logic [10:0] d_pfn,
    output logic [2:0]  d_xwr,
@@ -4928,7 +4941,35 @@ module mmu_tlb #(
       for (int n = 0; n < N; n++) r = r | (m[n] ? IW'(n) : IW'(0));
       return r;
    endfunction
-   wire [N-1:0] dm = f_match(d_vpn, asid);
+   // (timing, 32 entries: the data CAM is ex_ea_q -> match -> PFN mux ->
+   // the hit pipe's tag / mem_iaddr / the fault flags, a full cycle)
+   // d_vq: the data port's own copy of ex_ea_q[31:16], loaded exactly as
+   // ex_ea_q is (kept inside this hierarchy, so it is not merged with it),
+   // one per half of the entries, so the VPN bits fan out locally.
+   // d_ok[n] = e_v && (e_g || e_asid == ASID), registered: the match is
+   // then the 16-bit VPN compare and one bit.  It is a cycle behind the
+   // entries / ASID, which is safe: they change only through TLBWI /
+   // TLBINV (written the cycle after commit), MTSR ASID and program load,
+   // all serializing and refetching, so the next data lookup is several
+   // cycles later (the core asserts d_ok's lookups equal the exact ones).
+   localparam int NH = (N >= 4) ? N / 2 : N;
+   (* keep = "true" *) logic [15:0] d_vq0;
+   (* keep = "true" *) logic [15:0] d_vq1;
+   always_ff @(posedge clk) if (ce && !rst) begin
+      if (d_vld)        begin d_vq0 <= d_vnx;          d_vq1 <= d_vnx;          end
+      else if (d_vstep) begin d_vq0 <= d_vq0 + 16'd1;  d_vq1 <= d_vq1 + 16'd1;  end
+   end
+   logic [N-1:0] d_ok;
+   always_ff @(posedge clk)
+      if (rst) d_ok <= '0;
+      else if (ce) for (int n = 0; n < N; n++) d_ok[n] <= e_v[n] && (e_g[n] || e_asid[n] == asid);
+   logic [N-1:0] dm;
+   always_comb for (int n = 0; n < N; n++) dm[n] = d_ok[n] && e_vpn[n] == (n < NH ? d_vq0 : d_vq1);
+`ifndef SYNTHESIS
+   // the exact match (the core checks it equals dm where it is used)
+   wire [N-1:0] dm_exact = f_match(d_vpn, asid);
+   wire         d_vq_ok  = d_vq0 == d_vpn && d_vq1 == d_vpn;
+`endif
    // one fetch-port CAM: TLBP's key is loaded into f_vpn / f_asid while
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
    wire [N-1:0] fm = f_match(f_vpn, f_asid);

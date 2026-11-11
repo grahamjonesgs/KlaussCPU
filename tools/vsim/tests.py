@@ -20,6 +20,21 @@ import os as _os0
 MPU = _os0.environ.get('VSIM_MPU_EN') == '1'
 
 
+# the TLB's entry count: VSIM_TLB_N (run.py elaborates TLB_N with it), else
+# pipeline_core's default (32 on the xc7a100t, MMU_PLAN §11.5)
+def _tlb_n():
+    import re as _re
+    if _os0.environ.get('VSIM_TLB_N'):
+        return int(_os0.environ['VSIM_TLB_N'])
+    src = open(_os0.path.join(_os0.path.dirname(_os0.path.abspath(__file__)), '..', '..',
+                              'KlaussCPU.srcs', 'sources_1', 'new', 'pipeline_core.sv')).read()
+    return int(_re.search(r'parameter int TLB_N = (\d+)', src).group(1))
+
+
+TLB_N = _tlb_n()
+TLB_IW = TLB_N.bit_length() - 1          # TLB_INDEX bits (log2 N)
+
+
 def mpu_test(fn):
     if MPU:
         ALL[fn.__name__] = fn
@@ -2157,7 +2172,7 @@ def tlb_sr_and_ops():
     a.setr(1, (0x1234 << 16) | 0x42); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(15, 'tlb_index')
     a.halt()
     exp = {'end': 'park', 'kind': '0', 'r3': 0, 'r4': 0,
-           m(DATA): 0xFFFF01FF, m(DATA + 8): 0x07FF000F, m(DATA + 16): 0x8000000F,          # (16 entries: [4] ignored, reads 0)
+           m(DATA): 0xFFFF01FF, m(DATA + 8): 0x07FF000F, m(DATA + 16): 0x80000000 | (TLB_N - 1),  # (log2 N index bits)
            m(DATA + 24): 0xFF, m(DATA + 32): 0xFFFFFFFC,
            'r5': (0x1234 << 16) | 0x42, 'r6': (0x7FF << 16) | TLB_V | TLB_R | TLB_X,
            'r7': (0x00C0 << 16) | 0x100 | 0x17, 'r8': (0x001 << 16) | TLB_V | TLB_W,
@@ -2719,21 +2734,113 @@ def tlb_stlf_alias():
 
 @test
 def tlb_index_width():
-    """16 entries: TLB_INDEX [3:0]; [4] (and [30:5]) ignored on write, read
-    0.  A TLBWI with index 0x13 writes entry 3, which TLBR at 3 reads and
-    TLBP finds as index 3"""
+    """TLB_INDEX holds log2 N bits ([4:0] with 32 entries, [3:0] with 16);
+    the bits above them (to [30]) are ignored on write and read 0.  A TLBWI
+    with index 0x7FFF_FFF3 writes entry 0x13 mod N (19 with 32 entries, so
+    TLB_INDEX[4] is significant; 3 with 16), which TLBR at that index reads
+    and TLBP finds; entry 0x13 - 16 (3) is a different entry"""
+    E = 0x13 & (TLB_N - 1)
     a = Asm()
-    a.setr(1, 0x13); a.mtsr('tlb_index', 1); a.mfsr(4, 'tlb_index')
+    a.setr(1, 0x7FFFFFF3); a.mtsr('tlb_index', 1); a.mfsr(4, 'tlb_index')
     a.setr(1, (0x0777 << 16) | 0x12); a.mtsr('tlb_hi', 1)
     a.setr(1, (0x005 << 16) | TLB_V | TLB_R); a.mtsr('tlb_lo', 1)
     a.tlbwi()
+    if TLB_N > 16:
+        _tlb_set(a, 3, 0x0333, 0x003, TLB_V | TLB_W, asid=0x12)
     a.setr(1, 0); a.mtsr('tlb_hi', 1); a.mtsr('tlb_lo', 1)
-    a.setr(1, 3); a.mtsr('tlb_index', 1); a.tlbr(); a.mfsr(5, 'tlb_hi'); a.mfsr(6, 'tlb_lo')
+    a.setr(1, E); a.mtsr('tlb_index', 1); a.tlbr(); a.mfsr(5, 'tlb_hi'); a.mfsr(6, 'tlb_lo')
     a.setr(1, 0); a.mtsr('tlb_index', 1)
     a.setr(1, (0x0777 << 16) | 0x12); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(7, 'tlb_index')
+    a.setr(1, (0x0333 << 16) | 0x12); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(8, 'tlb_index')
     a.halt()
-    return a, {'end': 'park', 'kind': '0', 'r4': 3, 'r5': (0x0777 << 16) | 0x12,
-               'r6': (0x005 << 16) | TLB_V | TLB_R, 'r7': 3}, []
+    return a, {'end': 'park', 'kind': '0', 'r4': E, 'r5': (0x0777 << 16) | 0x12,
+               'r6': (0x005 << 16) | TLB_V | TLB_R, 'r7': E,
+               'r8': 3 if TLB_N > 16 else 0x80000000 | E}, []      # (a miss keeps the index)
+
+
+@test
+def tlb_entries_upper():
+    """every entry 0..N-1 written by TLBWI with its own VPN / ASID / PFN /
+    XWR; TLBR at each of the upper half (16-31 with 32 entries) reads its
+    own entry back, and TLBP of each upper entry's VPN finds its index
+    (P = 0).  TLBINV then empties all of them: a TLBP misses"""
+    a = Asm()
+    def hi(i): return ((0x0200 + i) << 16) | ((i & 1) << 8) | (0x40 + i)
+    def lo(i): return ((0x400 + 3 * i) << 16) | ((i % 7) << 1) | TLB_V
+    for i in range(TLB_N):
+        a.setr(1, hi(i)); a.mtsr('tlb_hi', 1)
+        a.setr(1, lo(i)); a.mtsr('tlb_lo', 1)
+        a.setr(1, i); a.mtsr('tlb_index', 1)
+        a.tlbwi()
+    a.setr(12, DATA + 0x100)
+    exp = {'end': 'park', 'kind': '0'}
+    for k, i in enumerate(range(TLB_N // 2, TLB_N)):
+        a.setr(1, 0); a.mtsr('tlb_hi', 1); a.mtsr('tlb_lo', 1)
+        a.setr(1, i); a.mtsr('tlb_index', 1); a.tlbr()
+        a.mfsr(2, 'tlb_hi'); a.st(64, 2, 12, 24 * k)
+        a.mfsr(2, 'tlb_lo'); a.st(64, 2, 12, 24 * k + 8)
+        a.setr(1, 0); a.mtsr('tlb_index', 1)
+        a.setr(1, hi(i)); a.mtsr('tlb_hi', 1); a.tlbp()
+        a.mfsr(2, 'tlb_index'); a.st(64, 2, 12, 24 * k + 16)
+        exp[m(DATA + 0x100 + 24 * k)] = hi(i)
+        exp[m(DATA + 0x100 + 24 * k + 8)] = lo(i)
+        exp[m(DATA + 0x100 + 24 * k + 16)] = i
+    a.tlbinv()
+    a.setr(1, 1); a.mtsr('tlb_index', 1)
+    a.setr(1, hi(TLB_N - 1)); a.mtsr('tlb_hi', 1); a.tlbp(); a.mfsr(3, 'tlb_index')
+    a.halt()
+    exp['r3'] = 0x80000001
+    return a, exp, []
+
+
+@test
+def tlb_working_set():
+    """TE = 1: a working set of W = N - 4 data pages (28 with 32 entries;
+    every VA page aliases PA page 1) next to the identity code and data
+    entries 0 and 1, refilled by a kseg handler round-robin over entries
+    2..N-1.  Three passes (store, load, load) take exactly W refills: after
+    the first pass every page hits (with 16 entries and W = 28 it would be
+    3 W)"""
+    W = TLB_N - 4
+    CNT, NREF = 0x10700, 0x10708          # round-robin index, refill count
+    a = Asm()
+    a.leapc(1, 'rf'); a.setr(2, 0x80000000); a.alu('or', 1, 1, 2)
+    a.mtsr('evec', 1); a.mtsr('tlbvec', 1)
+    a.setr(1, 2); a.setr(2, CNT); a.st(64, 1, 2)
+    _te_on(a)
+    a.setr(11, 0x10008)                    # VA step: next page, next dword
+    a.setr(9, 0x01000200); a.setr(10, W); a.setr(3, 1)
+    a.label('p1')                          # pass 1: page i offset 0x200 + 8 i <- i + 1
+    a.st(64, 3, 9); a.inc(3); a.alu('add', 9, 9, 11); a.dec(10)
+    a.fbr('ne', 10, 0, 'p1', imm=True)
+    a.setr(5, 0); a.setr(7, 2)
+    a.label('pp')                          # passes 2 and 3: sum
+    a.setr(9, 0x01000200); a.setr(10, W)
+    a.label('p2')
+    a.ld(64, 4, 9); a.alu('add', 5, 5, 4); a.alu('add', 9, 9, 11); a.dec(10)
+    a.fbr('ne', 10, 0, 'p2', imm=True)
+    a.dec(7); a.fbr('ne', 7, 0, 'pp', imm=True)
+    a.halt()
+    a.label('rf')                          # runs at its kseg alias: VPN >= 0x100 -> PA page 1
+    a.push(13); a.push(14)
+    a.mfsr(13, 'tlb_hi'); a.shift_n('shr', 13, 13, 16)
+    a.fbr_imm32('ult', 13, 0x100, 'rf_id')
+    a.setr(13, 1)
+    a.label('rf_id')
+    a.shift_n('shl', 13, 13, 16); a.alui('or', 13, 13, TLB_RWX, sgn=False); a.mtsr('tlb_lo', 13)
+    a.setr(13, 0x80000000 | NREF); a.ld(64, 14, 13); a.inc(14); a.st(64, 14, 13)
+    a.setr(13, 0x80000000 | CNT); a.ld(64, 14, 13)
+    a.mtsr('tlb_index', 14); a.tlbwi()
+    a.inc(14); a.fbr_imm32('ult', 14, TLB_N, 'rf_st')
+    a.setr(14, 2)
+    a.label('rf_st')
+    a.st(64, 14, 13)
+    a.pop(14); a.pop(13)
+    a.iret()
+    exp = {'end': 'park', 'kind': '0', 'r5': W * (W + 1), m(NREF): W}
+    for i in range(W):
+        exp[m(0x10200 + 8 * i)] = i + 1
+    return a, exp, []
 
 
 @test

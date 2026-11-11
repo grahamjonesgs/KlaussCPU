@@ -17,7 +17,8 @@
 //===========================================================================
 `timescale 1ns/1ps
 module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
-                 parameter bit MPU_EN = 1'b1);   // (MPU_EN: only with +define+HAS_MPU)
+                 parameter bit MPU_EN = 1'b1,    // (MPU_EN: only with +define+HAS_MPU)
+                 parameter int TLB_N = 32);      // (TLB_N: only with +define+HAS_TLBN)
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -68,6 +69,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
 `ifdef HAS_MPU
       , .MPU_EN(MPU_EN)
+`endif
+`ifdef HAS_TLBN
+      , .TLB_N(TLB_N)
 `endif
    ) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,

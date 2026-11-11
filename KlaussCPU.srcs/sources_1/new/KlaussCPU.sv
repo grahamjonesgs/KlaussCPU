@@ -38,8 +38,8 @@ module KlaussCPU #(
     parameter bit CORE1_MPU_EN = 1'b0,
     // MMU stage 3 (the TLB, TE) on core 1.  CPU_FEATURES[2], [15:8].
     parameter bit CORE1_TLB_EN = 1'b1,
-    // its entry count: 16 on this part (MMU_PLAN.md §11.5)
-    parameter int CORE1_TLB_N = 16,
+    // its entry count: 32 on this part (MMU_PLAN.md §11.5, 2026-11-11)
+    parameter int CORE1_TLB_N = 32,
     // core 1's fetch I-cache: lines of 16 B, direct-mapped (HW_PERF_PLAN.md
     // §2): 1024 = 16 KiB.  ICACHE_INFO (0xF005_0018) reports it.
     parameter int CORE1_IC_LINES = 1024,
@@ -272,6 +272,10 @@ module KlaussCPU #(
 
    // Interrupt handler
    logic [31:0] r_interrupt_table[3:0];
+   // r_ivec_nz[k] == (r_interrupt_table[k] != 0), written with the table
+   // (timing: the 32-bit zero tests sat on the vector -> w_irq_ready -> the
+   // core's IRQ take -> pc / dispatch cone; asserted below)
+   logic [3:0]  r_ivec_nz = 4'b0;
    logic r_timer_interrupt;
    logic [31:0] r_timer_interrupt_counter;
    logic [63:0] r_timer_interrupt_counter_sec;
@@ -309,8 +313,8 @@ module KlaussCPU #(
    dbg_out_t w_dbg_o;
    wire      w_dbg_freeze = DEBUG_EN && w_dbg_o.halted;
    wire w_blit_irq;   // blitter DONE — declared here (used below, driven at the blitter instance)
-   wire w_irq_src0  = r_timer_interrupt && (r_interrupt_table[0] != 32'h0) && pip_int_mask[0];
-   wire w_irq_src1  = w_blit_irq        && (r_interrupt_table[1] != 32'h0) && pip_int_mask[1];
+   wire w_irq_src0  = r_timer_interrupt && r_ivec_nz[0] && pip_int_mask[0];
+   wire w_irq_src1  = w_blit_irq        && r_ivec_nz[1] && pip_int_mask[1];
    // Source 2 is a cascade (SD_NATIVE_PLAN.md §4.5): INT_PENDING[2] =
    // |(INT2_PENDING & INT2_EN), INT2_PENDING = {[1] SD, [0] Ethernet}.
    // r_eth_irq is that OR, registered once from the raw sources exactly as
@@ -318,9 +322,9 @@ module KlaussCPU #(
    logic r_eth_irq;   // registered source-2 level (driven after the LiteEth instance)
    logic r_eth_irq_raw;     // registered raw Ethernet level (INT2_PENDING[0])
    logic [1:0] r_int2_en;   // INT2_EN (0xF00F_0050): [0] Ethernet, [1] SD; reset 0b01
-   wire w_irq_src2  = r_eth_irq         && (r_interrupt_table[2] != 32'h0) && pip_int_mask[2];
+   wire w_irq_src2  = r_eth_irq         && r_ivec_nz[2] && pip_int_mask[2];
    wire w_vga_irq;    // VGA vsync — driven at the vga_ctrl instance
-   wire w_irq_src3  = w_vga_irq         && (r_interrupt_table[3] != 32'h0) && pip_int_mask[3];
+   wire w_irq_src3  = w_vga_irq         && r_ivec_nz[3] && pip_int_mask[3];
    wire w_irq_ready = w_irq_src0 || w_irq_src1 || w_irq_src2 || w_irq_src3;
    wire [1:0] w_irq_sel = w_irq_src0 ? 2'd0 : w_irq_src1 ? 2'd1 : w_irq_src2 ? 2'd2 : 2'd3;
 
@@ -2040,6 +2044,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_interrupt_table[1] <= 32'h0;  // a 0 vector disables that source
                   r_interrupt_table[2] <= 32'h0;
                   r_interrupt_table[3] <= 32'h0;
+                  r_ivec_nz <= 4'b0;
                   r_msg_send_DV <= 1'b0;
                   st.flags.overflow <= 1'b0;
                   st.PC <= r_PC_requested;
@@ -2602,10 +2607,22 @@ rams_sp_nc rams_sp_nc1 (
                   case (w_mmio_addr[15:0])
                      16'h0000: st.int_mask           <= w_mmio_write_data[3:0];
                      // 16'h0008 (INT_PENDING) is read-only; writes ignored
-                     16'h0010: r_interrupt_table[0] <= w_mmio_write_data[31:0];
-                     16'h0018: r_interrupt_table[1] <= w_mmio_write_data[31:0];
-                     16'h0020: r_interrupt_table[2] <= w_mmio_write_data[31:0];
-                     16'h0028: r_interrupt_table[3] <= w_mmio_write_data[31:0];
+                     16'h0010: begin
+                        r_interrupt_table[0] <= w_mmio_write_data[31:0];
+                        r_ivec_nz[0]         <= (w_mmio_write_data[31:0] != 32'h0);
+                     end
+                     16'h0018: begin
+                        r_interrupt_table[1] <= w_mmio_write_data[31:0];
+                        r_ivec_nz[1]         <= (w_mmio_write_data[31:0] != 32'h0);
+                     end
+                     16'h0020: begin
+                        r_interrupt_table[2] <= w_mmio_write_data[31:0];
+                        r_ivec_nz[2]         <= (w_mmio_write_data[31:0] != 32'h0);
+                     end
+                     16'h0028: begin
+                        r_interrupt_table[3] <= w_mmio_write_data[31:0];
+                        r_ivec_nz[3]         <= (w_mmio_write_data[31:0] != 32'h0);
+                     end
                      16'h0030: begin
                         r_timer_period            <= w_mmio_write_data[31:0];
                         r_timer_interrupt_counter <= 32'h0;  // restart with new period
@@ -2689,6 +2706,10 @@ rams_sp_nc rams_sp_nc1 (
          pip_perf_stall[1] && w_px_free,
          pip_perf_stall[0] && w_px_free };
 `ifndef SYNTHESIS
+   always_ff @(posedge i_Clk)
+      for (int k = 0; k < 4; k++)
+         assert (r_ivec_nz[k] == (r_interrupt_table[k] != 32'h0))
+            else $fatal(1, "r_ivec_nz[%0d] stale: vector %h", k, r_interrupt_table[k]);
    always_ff @(posedge i_Clk) if (r_perf_excl)
       assert ($countones({w_perf_st[7], w_perf_st[6], w_perf_st[4], w_perf_st[3],
                           w_perf_st[2], w_perf_st[0]}) <= 1 &&
