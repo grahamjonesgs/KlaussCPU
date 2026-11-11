@@ -132,7 +132,9 @@ A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
     after the register, inside the existing valid-select LUTs
     (`ic_dw_valid`, `ifr_next_valid`).
   The valid bits are packed vectors (2 × 1024 flip-flops), still cleared in
-  one cycle by reset, `start` and ICACHE_INV.
+  one cycle by reset, `start` and ICACHE_INV.  (Superseded by the timing
+  closure below: one line-valid flip-flop per line plus the dword bits in
+  LUTRAM.)
 - **Tag-shadow guard (separate commit).** Because the shadow is a block
   RAM read at `mem_iaddr`'s load edge, an I-cache install landing at or
   after that edge (a fill completing while a store waits in MEM) can be
@@ -160,6 +162,76 @@ A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
   miss-count checks of the 16 KiB-specific ones (they then show the 8 KiB
   numbers, e.g. a 12 KiB loop misses 770 / 1284 / 2311 times after 1 / 2 / 4
   passes instead of 770 each time).
+
+### §2 timing closure (2026-11-11)
+
+The first 16 KiB build (`2e9dc8a`, `~/.cache/kbuild/perfhw3`) missed:
+tier 1 WNS −0.267, tier 2 −0.185, 38,290 LUTs (+1.9k over `perf-hw-a`
+`88acc21`, which met at +0.034 with 36,375), 25,254 FFs, 81 BRAM tiles.
+Synthesis showed +2.3k logic LUTs: the 2 × 1024 per-dword valid
+flip-flops, their next-state decode (install, snoop clear, flash clear)
+and the 512:1 read muxes.  The worst paths were mostly the core's
+long-standing zero-margin families (EA adder → `mem_hok`, the bus ready →
+`pos`, the IRQ vector → `pc` enable, `ex_a` / `mem_result` forwards)
+pushed over by that area; `ic_tag` → `if_req_dw` enable (−0.115) was
+directly the I-cache.  Every fix below is a design change with identical
+retire traces **and cycle counts** (`run.py diff --base HEAD` before each
+commit); the full sim set passed on each.
+
+| Build | Commit | Change | Tier 1 WNS | Final WNS / WHS | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `perfhw3` | `2e9dc8a` | 16 KiB as first written | −0.267 | −0.185 / — | 38,290 | 25,254 | 81 |
+| `perfhw4` | `bc527b1` | line-valid FFs + dword bits in LUTRAM | −0.105 | +0.005 / +0.017 (tier 2) | 34,601 | 23,966 | 81 |
+| `perfhw5` | `445631a` | + fill registers off the hit enable; DELAY down-counter | −0.371 | −0.362 / — | 34,398 | 23,887 | 81 |
+| `perfhw6` | `30eeab2` | + fetch tag in LUTRAM | −0.125 | −0.060 / — | 35,272 | 24,012 | 80.5 |
+| **`perfhw7`** | **`be78350`** | + MUL WB forward selected a stage early | **+0.033** | **+0.033 / +0.024 (tier 1)** | 35,259 | 23,939 | 80.5 |
+
+- **`bc527b1` valid bits.** `ic_lv` (one flip-flop per line: set by an
+  install, cleared by a snoop and by the flash clear) and `ic_dv` (LUTRAM,
+  1024 × 2: which dwords, written only by the install, which always writes
+  both and sets `ic_lv`).  vhi = lv ∧ dv[1], vlo = lv ∧ dv[0] and
+  vhi ∨ vlo = lv exactly, so the snoop and the lookup read one bit per line.
+  Half the valid flip-flops and their decode: −3.7k LUTs placed, below
+  `perf-hw-a` (the flash clear now fans out to 1024 flip-flops, as at
+  8 KiB).  The generation-counter / BRAM redesign was not needed.
+- **`d64006e` fill registers.** `if_req_dw`, `r_ifq_p1`, `if_rebase`,
+  `if_tghi`, `if_fflt`, `if_fmiss` and `if_fake` are read only while a
+  fill is in flight, so they now load on every cycle without one (enable
+  `!if_xc`) instead of at the miss issue (enable = the issue condition,
+  i.e. `!ic_hit`: the `ic_tag` → compare → 170-fanout enable path).
+- **`445631a` DELAY.** `perfhw4`'s single tier-1 violator was `dly_cnt` →
+  the 45-bit `dly_cnt >= dly_max` carry chain → `ex_busy`.  It is now a
+  down-counter with a registered zero flag (DELAYR 0–3: identical cycle
+  counts).
+- **`30eeab2` fetch tag in LUTRAM.** `perfhw5`'s whole failing set was the
+  hit path: the `ic_tag` RAMB18's clock-to-out plus a ~1.4 ns route out of
+  the RAM column (four RAMB36 for `ic_data` spread the RAMs) → compare →
+  `ic_hit` → the IFB load enables (−0.37).  `ic_tag` is now distributed RAM
+  (RAM64M × 96, ~0.4k LUTs, one RAMB18 fewer) read into `ic_rd_tag` as
+  before, so the compare starts at a flip-flop.  The snoop shadow
+  `ic_tagff_e/_o` stays block RAM.
+- **`be78350` MUL forward.** `perfhw6`'s worst was a direct MUL's WB
+  forward: `wb_mhi` (fanout 90) → half select → W extension → forward
+  muxes → `ex_a`.  `mul_r2` registers that select from `mul_pipe1` and
+  `mem_d` on the MEM → WB edge (a MUL never waits in WB, so it equals
+  `mul_w` whenever WB holds one — asserted); `wbz_mul` reads its byte
+  flags.
+- **Release bitstream** `~/.cache/kbuild/perf-hw_be78350.bit` (md5
+  `4241b554…`), build dir `~/.cache/kbuild/perfhw7`, standard
+  `build_fast -resynth` flow, **tier 1 met: WNS +0.033, WHS +0.024**, 8 min
+  37 s.  35,259 LUTs (3,476 as memory), 23,939 FFs, 80.5 BRAM tiles, 19
+  DSPs; every cache array RAM-inferred (no Synth 8-4767).  No alternate
+  placement was used.  The worst remaining path is `m_addr` → qspi_ctrl's
+  register enables (+0.033).  The core's own near-critical families
+  remain (in `perfhw6` after tier 2: `ex_b_zero` from the MEM shifter
+  −0.018, the ID decode → `ex_d.sub` −0.023, `mem_d.uop` → the multiplier
+  inputs −0.010); they are the next candidates if a later feature tips
+  them over.
+- **Tag-shadow guard (`2a2ffb3`) kept.**  It never appeared on a near-
+  critical path in these builds, so it stays as the defensive measure it
+  was written as.
+- **Not changed:** `ICACHE_INFO`, the miss behaviour (`ic16_*` pass with the
+  16 KiB counts), the snoop's tag compare.
 
 ## 3. LiteEth: 8 RX slots, opt-in
 
@@ -327,3 +399,8 @@ Decisions taken while implementing the frozen text above:
   perf/m5a programs (tb_soc, 04b4055 → this) change by −0.35 % to +0.12 %
   (their hot code fits in 8 KiB; UART identical except the
   timing-dependent lines of dhrystone and test_atomic). Not yet built.
+- 2026-11-11: §2 timing closed on `perf-hw` (`be78350`): the 16 KiB build
+  missed (−0.185); valid bits restructured, the fetch tag moved to LUTRAM,
+  three CPI-neutral core fixes; standard flow tier 1 WNS +0.033 / WHS
+  +0.024, `~/.cache/kbuild/perf-hw_be78350.bit` (§2 timing closure). Not
+  yet run on the board.
