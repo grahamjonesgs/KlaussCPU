@@ -675,14 +675,14 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x00F0_100D = stage 1
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x01F0_100D = stage 1
     # + LR/SC + the 16-entry TLB, no MPU, lean crypto (TRNG only), native SD,
-    # DCBZ, STATUS.MAL64: the A7
+    # DCBZ, STATUS.MAL64, ETH_RX_SLOTS: the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=0000000000f0100d' not in last:
+    if 'r2=0000000001f0100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     print(f'{fails} differing')
@@ -723,10 +723,10 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x00FF100D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF100D}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x00F0100D}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x01F0100D}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
@@ -750,7 +750,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x00F0100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x01F0100D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -1015,6 +1015,33 @@ def cmd_socdcbz(a):
 
 
 
+def cmd_soceth(a):
+    """ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3) through the real SoC bus
+    (bus_splitter -> eth_mmio_bridge; tb_soc stubs liteeth_core, the RX slot
+    behaviour itself is tools/ethsim/run_eth_tb.sh): reset value 0x802 after
+    the program load, write clamping, the [11:8] = 8 field, the rest of the
+    0xF007 window reading 0, CPU_FEATURES[24]."""
+    from kasm import Asm
+    exe = build_soc(None)
+    a = Asm(); a.setr(15, 0xF0070000); a.setr(14, 0xF00F0000)
+    a.ld(64, 1, 14, 0x48)                                              # CPU_FEATURES
+    a.ld(64, 2, 15, 0x00)                                              # 0x802 (reset / program load)
+    a.setr(3, 5); a.st(64, 3, 15, 0x00); a.ld(64, 4, 15, 0x00)         # 0x805
+    a.setr(3, 0); a.st(64, 3, 15, 0x00); a.ld(64, 5, 15, 0x00)         # 0 -> 2
+    a.setr(3, 100); a.st(64, 3, 15, 0x00); a.ld(64, 6, 15, 0x00)       # 100 -> 8
+    a.ld(64, 7, 15, 0x08)                                              # 0
+    a.setr(3, 1); a.st(64, 3, 15, 0x00); a.ld(64, 8, 15, 0x00)         # 1 -> 2
+    a.halt()
+    exp = {'r1': 0x01F0100D, 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
+    r = run_soc(exe, a, 'soceth', trace=True)
+    last = open(r['trace']).read().strip().splitlines()[-1] if 'HALTED' in r['log'] else ''
+    regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
+    bad = [f'{k}={regs.get(k) if regs.get(k) is None else hex(regs[k])} want {hex(v)}'
+           for k, v in exp.items() if regs.get(k) != v]
+    print(f'{"pass" if last and not bad else "FAIL"} soceth ' + ' '.join(bad))
+    return 1 if bad or not last else 0
+
+
 def cmd_socdiff(a):
     """random programs through the full SoC (real cache / bus splitter):
     base rev vs working tree, retire traces must be identical"""
@@ -1071,6 +1098,7 @@ def main():
     sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
     sz.add_argument('--seed0', type=int, default=1)
     sub.add_parser('socsd')
+    sub.add_parser('soceth')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -1107,6 +1135,8 @@ def main():
         sys.exit(cmd_socdcbz(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
+    elif a.cmd == 'soceth':
+        sys.exit(cmd_soceth(a))
     elif a.cmd == 'tlbdiff':
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':

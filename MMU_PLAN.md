@@ -469,6 +469,7 @@ bitstream.
 | `[21]` | native SD controller (`SD_CTRL[18]` SD_MODE, `SDM_*` at `0xF000_0100`; SD_NATIVE_PLAN.md, branch `mmu-sd`) |
 | `[22]` | DCBZ (HW_PERF_PLAN.md §1; branch `perf-hw`) |
 | `[23]` | `STATUS[10]` MAL64 (HW_PERF_PLAN.md §4; branch `perf-hw`) |
+| `[24]` | `ETH_RX_SLOTS` at `0xF007_0000`: LiteEth built with 8 RX slots, software chooses 2..8 (HW_PERF_PLAN.md §3, MMIO_MAP.md Ethernet) |
 
 If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's MMIO window reads 0, ignores writes and
 completes in the normal MMIO time (MMIO_MAP.md).
@@ -477,8 +478,8 @@ The lean Nexys A7 MMU bitstream reads **`0x0010_100D`**: stage 1, LR/SC, a
 16-entry TLB, no MPU, and the TRNG as the only crypto block. The full
 crypto configuration reads `0x001F_100D`. With the native SD controller
 (`mmu-sd`), `[21]` is also set: `0x0030_100D` lean, `0x003F_100D` full.
-With DCBZ and MAL64 (`perf-hw`), `[23:22]` too: `0x00F0_100D` lean,
-`0x00FF_100D` full.
+With DCBZ, MAL64 and `ETH_RX_SLOTS` (`perf-hw`), `[24:22]` too: `0x01F0_100D` lean,
+`0x01FF_100D` full.
 
 ---
 

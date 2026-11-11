@@ -26,6 +26,11 @@ phy_clk_freq:      50000000
 # has room), allowing a second accidental push → every frame sent twice.
 ntxslots:         1
 
+# RX SRAM slots (HW_PERF_PLAN.md §3).  8 are built; the bridge's ETH_RX_SLOTS
+# register (0xF007_0000, reset 2) chooses how many the MAC cycles through, via
+# the project patch applied by patch_liteeth_core.py (see REGENERATE.md).
+nrxslots:         8
+
 # Default MAC (D6: software can override via CSR write)
 mac_address:      0x020000000001
 

@@ -1244,7 +1244,8 @@ module KlaussCPU #(
                                                   (CORE1_EXC_EN && CORE1_TLB_EN) ? 8'(CORE1_TLB_N) : 8'd0,
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
-                                                  CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN};
+                                                  CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN}
+                                                 | 64'h0100_0000;  // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;
@@ -1440,6 +1441,8 @@ module KlaussCPU #(
    // its own strobe (reads 0) so its bus never hangs; core 2's adapter
    // self-completes on its side (core2_subsys.sv).
    wire w_eth_own2 = w_c2_eth_owner;
+   wire [3:0] w_eth_rx_nslots;
+   wire       w_eth_rx_slot_reset;
    assign eth_bus.write_DV   = w_eth_own2 ? w_c2e_write_DV   : w_eth_write_DV;
    assign eth_bus.read_DV    = w_eth_own2 ? w_c2e_read_DV    : w_eth_read_DV;
    assign eth_bus.addr       = w_eth_own2 ? w_c2e_addr       : w_eth_addr;
@@ -1465,7 +1468,12 @@ module KlaussCPU #(
        .o_wb_cti          (w_eth_wb_cti),
        .i_wb_dat_r        (w_eth_wb_dat_r),
        .i_wb_ack          (w_eth_wb_ack),
-       .i_wb_err          (w_eth_wb_err)
+       .i_wb_err          (w_eth_wb_err),
+       // ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3): back to 2 slots on
+       // program load, with the MAC's RX slot state flushed.
+       .i_load_rst        (r_load_pulse),
+       .o_rx_nslots       (w_eth_rx_nslots),
+       .o_rx_slot_reset   (w_eth_rx_slot_reset)
    );
    // Interrupt source 2: LiteEth's combined event, registered (same i_Clk
    // domain) and masked off while core 2 owns the MAC.
@@ -1487,6 +1495,8 @@ module KlaussCPU #(
        // RMII connection to PHY pins
        .rmii_clocks_ref_clk(clk_50),
        .rmii_crs_dv        (ETH_CRSDV),
+       .rx_nslots          (w_eth_rx_nslots),       // ETH_RX_SLOTS (project patch)
+       .rx_slot_reset      (w_eth_rx_slot_reset),
        .rmii_mdc           (ETH_MDC),
        .rmii_mdio          (ETH_MDIO),
        .rmii_rst_n         (ETH_RSTN),
