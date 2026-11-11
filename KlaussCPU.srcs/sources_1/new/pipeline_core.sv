@@ -598,9 +598,19 @@ module pipeline_core
    localparam int IC_PAIRS = IC_LINES / 2;
    (* ram_style = "block" *) logic [127:0]       ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
    (* ram_style = "block" *) logic [IC_TAGW-1:0] ic_tag  [0:IC_LINES-1];
-   // per-dword valid, flip-flops (the whole array clears in one cycle)
-   logic [IC_LINES-1:0] ic_vhi;                 // addr3=0 dword present
-   logic [IC_LINES-1:0] ic_vlo;                 // addr3=1 dword present
+   // Validity (§2 timing closure).  ic_lv: one flip-flop per line, "the
+   // line holds something" — set by an install, cleared by a snoop, by
+   // ICACHE_INV / start / reset (the whole vector in one cycle).  ic_dv: the
+   // per-dword presence {addr3=0 dword (hi), addr3=1 dword (lo)} in LUTRAM.
+   // An install always writes both dv bits (deterministic, see ic_install),
+   // and every install sets lv with at least one of them, so the old
+   // per-dword flip-flops are exactly vhi = lv && dv[1], vlo = lv && dv[0],
+   // and (vhi || vlo) = lv.  This halves the valid flip-flops and their
+   // next-state logic, and the snoop and the lookup read one bit per line
+   // instead of two.
+   logic [IC_LINES-1:0] ic_lv;
+   (* ram_style = "distributed" *) logic [1:0] ic_dv [0:IC_LINES-1];
+   initial for (int i = 0; i < IC_LINES; i++) ic_dv[i] = 2'b00;
    // M7b: FF shadow of the tags, read COMBINATIONALLY by the store-snoop so it
    // can invalidate only a line the store actually overwrites (tag-checked),
    // not every line that index-aliases the store (index-only was catastrophic
@@ -725,13 +735,16 @@ module pipeline_core
    logic [IC_IDXW-1:0] ic_rd_idx;
    logic [127:0]       ic_rd_data;
    logic [IC_TAGW-1:0] ic_rd_tag;
-   // §2: the valid bits are read for BOTH lines of the looked-up pair (two
-   // IC_LINES/2:1 muxes from the pair index, the 8 KiB cache's depth);
+   // §2: the line-valid bits are read for BOTH lines of the looked-up pair
+   // (two IC_LINES/2:1 muxes from the pair index, the 8 KiB cache's depth);
    // ic_rd_idx[0] picks one after the register, inside the consumers'
-   // existing valid-select LUTs (ic_dw_valid, ifr_next_valid)
-   logic               ic_rd_vhi_e, ic_rd_vlo_e, ic_rd_vhi_o, ic_rd_vlo_o;
-   wire                ic_rd_vhi = ic_rd_idx[0] ? ic_rd_vhi_o : ic_rd_vhi_e;
-   wire                ic_rd_vlo = ic_rd_idx[0] ? ic_rd_vlo_o : ic_rd_vlo_e;
+   // existing valid-select LUTs (ic_dw_valid, ifr_next_valid).  The dword
+   // presence is a LUTRAM read at the line index, registered beside them.
+   logic               ic_rd_lv_e, ic_rd_lv_o;
+   logic [1:0]         ic_rd_dv;
+   wire                ic_rd_lv  = ic_rd_idx[0] ? ic_rd_lv_o : ic_rd_lv_e;
+   wire                ic_rd_vhi = ic_rd_lv && ic_rd_dv[1];
+   wire                ic_rd_vlo = ic_rd_lv && ic_rd_dv[0];
    wire [IC_PRW-1:0]   ic_look_pr = ic_look_idx[IC_IDXW-1:1];
    // pending snoop clear (lands this edge) — read it as already invalid
    // (per half: f_snm against the pair's even / odd line)
@@ -741,10 +754,9 @@ module pipeline_core
       ic_rd_idx   <= ic_look_idx;
       ic_rd_data  <= ic_data[ic_look_idx];
       ic_rd_tag   <= ic_tag [ic_look_idx];
-      ic_rd_vhi_e <= ic_vhi[{ic_look_pr, 1'b0}] && !snoop_kill_e;
-      ic_rd_vlo_e <= ic_vlo[{ic_look_pr, 1'b0}] && !snoop_kill_e;
-      ic_rd_vhi_o <= ic_vhi[{ic_look_pr, 1'b1}] && !snoop_kill_o;
-      ic_rd_vlo_o <= ic_vlo[{ic_look_pr, 1'b1}] && !snoop_kill_o;
+      ic_rd_lv_e  <= ic_lv[{ic_look_pr, 1'b0}] && !snoop_kill_e;
+      ic_rd_lv_o  <= ic_lv[{ic_look_pr, 1'b1}] && !snoop_kill_o;
+      ic_rd_dv    <= ic_dv[ic_look_idx];
       if (EN_TLB) begin
          r_look_vpn  <= look_vpn;
          r_look_um   <= fe_um;
@@ -2455,8 +2467,8 @@ module pipeline_core
    wire [IC_PRW-1:0]  sn_pr   = sn_idx[IC_IDXW-1:1];
    wire        sn_te      = ic_tagff_e[sn_pr] == mem_iaddr[31:IC_IDXW+4];
    wire        sn_to      = ic_tagff_o[sn_pr] == mem_iaddr[31:IC_IDXW+4];
-   wire        sn_ve      = sn_te && (ic_vhi[{sn_pr, 1'b0}] || ic_vlo[{sn_pr, 1'b0}]);
-   wire        sn_vo      = sn_to && (ic_vhi[{sn_pr, 1'b1}] || ic_vlo[{sn_pr, 1'b1}]);
+   wire        sn_ve      = sn_te && ic_lv[{sn_pr, 1'b0}];
+   wire        sn_vo      = sn_to && ic_lv[{sn_pr, 1'b1}];
    wire        sn_hit     = mzl ? (sn_te || sn_to) : sn_idx[0] ? sn_to : sn_te;
    wire        sn_code    = mzl ? (sn_ve || sn_vo) : sn_idx[0] ? sn_vo : sn_ve;
    // (an install since mem_iaddr was loaded may be missing from the
@@ -2803,7 +2815,7 @@ module pipeline_core
          id_eiser <= 1'b0; ex_eiser <= 1'b0; mem_eiser <= 1'b0;
          id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
-         begin ic_vhi <= '0; ic_vlo <= '0; end
+         ic_lv <= '0;
       end else if (ce) begin
          // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
          // real write sites below, folded by the pos_track composer at the
@@ -2829,7 +2841,7 @@ module pipeline_core
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
             ut_v <= 1'b0;  it_ref <= 1'b0;    // (stage 3: the micro-ITLB)
             // invalidate-all: a fresh program image may reuse code addresses
-            begin ic_vhi <= '0; ic_vlo <= '0; end
+            ic_lv <= '0;
             if (DEBUG_EN) begin
                dbg_stepping  <= !start && dbg_i.step;
                dbg_step_done <= 1'b0;
@@ -3129,12 +3141,8 @@ module pipeline_core
          // issue below re-arms snoop_q; NBA last-write wins).
          snoop_q <= 1'b0;
          if (snoop_q) begin
-            ic_vhi[snoop_idx_q] <= 1'b0;
-            ic_vlo[snoop_idx_q] <= 1'b0;
-            if (EN_DCBZ && snoop_pr_q) begin
-               ic_vhi[snoop_idx_q | IC_IDXW'(1)] <= 1'b0;
-               ic_vlo[snoop_idx_q | IC_IDXW'(1)] <= 1'b0;
-            end
+            ic_lv[snoop_idx_q] <= 1'b0;
+            if (EN_DCBZ && snoop_pr_q) ic_lv[snoop_idx_q | IC_IDXW'(1)] <= 1'b0;
          end
 
          // 1c: posted-store drain.  Nothing else can be on the port (every
@@ -3422,13 +3430,12 @@ module pipeline_core
                   else       ic_tagff_e[wi[IC_IDXW-1:1]] <= wt;
                   if (if_req_dw[0] == 1'b0) begin        // even fill: full line
                      ic_data[wi] <= {m_rdata, m_rdata_next};
-                     ic_vhi[wi]  <= 1'b1;
-                     ic_vlo[wi]  <= m_next_valid;
+                     ic_dv[wi]   <= {1'b1, m_next_valid};
                   end else begin                         // odd fill: low dword only
                      ic_data[wi][63:0] <= m_rdata;
-                     ic_vhi[wi]  <= 1'b0;
-                     ic_vlo[wi]  <= 1'b1;
+                     ic_dv[wi]   <= 2'b01;
                   end
+                  ic_lv[wi] <= 1'b1;
                end
             end
          end else if (if_look) begin
@@ -4142,7 +4149,7 @@ module pipeline_core
             if (if_xc) if_drop <= 1'b1;
          end
          if (icinv) begin
-            begin ic_vhi <= '0; ic_vlo <= '0; end
+            ic_lv <= '0;
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;  snoop_q <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
