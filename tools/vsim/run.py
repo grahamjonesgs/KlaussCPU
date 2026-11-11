@@ -685,6 +685,16 @@ def cmd_socmmio(a):
     if 'r2=0000000001f0100d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
+    # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
+    # §2: 1 way, 1024 sets, 16 B lines, 16 KiB); 0xF005_0020 reads 0
+    f = Asm(); f.setr(1, 0xF0050000)
+    f.ld(64, 2, 1, 8); f.ld(64, 3, 1, 0x18); f.ld(64, 4, 1, 0x20); f.halt()
+    rf = run_soc(new, f, 'icinfo', trace=True)
+    last = open(rf['trace']).read().strip().splitlines()[-1]
+    for want in ('r2=0001000020040002', 'r3=0000400010040001', 'r4=0000000000000000'):
+        if want not in last:
+            fails += 1
+            print(f'CACHE_INFO / ICACHE_INFO: want {want}: ' + last[:200])
     print(f'{fails} differing')
     return 1 if fails else 0
 

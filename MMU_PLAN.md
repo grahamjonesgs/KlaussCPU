@@ -961,7 +961,8 @@ before).
 ### 11.1 Page size versus cache aliasing: **64 KiB pages**
 
 The constraint: the D-cache is 2-way with **32 KiB per way** (index
-`[14:5]`), and the I-cache is direct-mapped **8 KiB** (index `[12:4]`). With
+`[14:5]`), and the I-cache is direct-mapped **8 KiB** (index `[12:4]`; 16 KiB,
+index `[13:4]`, since HW_PERF_PLAN §2 — still inside a 64 KiB page). With
 4 KiB pages, index bits `[14:12]` come from the translated part of the
 address.
 
@@ -1206,7 +1207,8 @@ base in EX, with the MEM replay above".
   +1.5 %.
 - **Fetch: a one-entry micro-ITLB.** {VPN, fetch mode, PA[31:16], verdict,
   miss}. It is read alongside the I-cache BRAM into `r_look_*`, so the
-  I-cache tag compare ({`r_look_pa`, VA[15:13]} against the stored PA tag)
+  I-cache tag compare ({`r_look_pa`, VA[15:14]} against the stored PA tag;
+  VA[15:13] with the 8 KiB I-cache before HW_PERF_PLAN §2)
   reads registers only; the prefetch's compare too. A lookup whose page it
   does not cover (in the current fetch mode) stalls while `it_ref` refills
   it from the TLB's second (fetch) port in one cycle — a TLBP committing

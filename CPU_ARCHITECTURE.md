@@ -77,7 +77,8 @@ The fetch path has three layers, all transparent to software:
 
 1. **IFB window** — two consecutive doublewords. Any 1/2/3-word instruction
    spans at most two, so an instruction issues from the window in one cycle.
-2. **I-cache** — direct-mapped, 512 lines × 16 B (8 KiB), BRAM, with a
+2. **I-cache** — direct-mapped, 1024 lines × 16 B (16 KiB; `ICACHE_INFO`
+   at `0xF005_0018`; 8 KiB before HW_PERF_PLAN §2), BRAM, with a
    valid bit per doubleword. A hit refills the window without using the
    shared port.
 3. **Next-line buffer (NLB)** — a background I-cache lookup of the next

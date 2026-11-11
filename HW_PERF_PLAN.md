@@ -103,6 +103,64 @@ generation counter. That redesign would also open the way to 32 KiB.
 A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
 `CACHE_INFO`: 1 way, 1024 sets, 16 B, 16 KiB.
 
+### §2 implementation notes (2026-11-11)
+
+- **One constant.** `pipeline_core` has a parameter `IC_LINES` (1024 on
+  core 1 through the top's `CORE1_IC_LINES`; core 2 keeps 512). `IC_IDXW`,
+  the tag width `IC_TAGW` = 28 − `IC_IDXW` and every index / tag slice
+  derive from it. With TE = 1 the tag is the constant shift
+  `{PA[31:16], VA[15:3]} >> (IC_IDXW + 1)`, i.e. `{PA[31:16], VA[15:14]}`
+  at 16 KiB; it stays correct for any size up to 64 KiB (the index has to
+  stay inside the page). `ICACHE_INFO` is built from the same parameter.
+- **Not the BRAM-port / generation-counter redesign.** The snoop's tag
+  shadow is already a block RAM: Vivado absorbs `mem_iaddr`'s register as
+  the RAM's read address (8 KiB synthesis logs: "Read Address Register
+  Found"), so the snoop path is BRAM clock-to-out → tag compare, and
+  1024 × 18 still fits one RAMB18. What grows with the line count is the
+  flip-flop valid bits and their read multiplexers. Those are kept at the
+  8 KiB depth by splitting on index bit 0 (the even / odd 16 B line of a
+  32 B pair, which is how DCBZ already snooped):
+  - the tag shadow is two banks, `ic_tagff_e` / `ic_tagff_o`, 512 × 18,
+    each with **one** read address (the pair index `mem_iaddr[13:5]`).
+    The DCBZ-era single shadow read at two addresses became
+    RAM64M × 112 (~416 LUTRAM) in synthesis; each bank now maps like the
+    8 KiB build's shadow;
+  - the snoop reads the valid bits at the pair index (512:1 muxes, as
+    before);
+  - the fetch lookup registers the valid bits of both lines of the pair
+    (`ic_rd_v*_e` / `_o`, 512:1 muxes) and `ic_rd_idx[0]` picks one
+    after the register, inside the existing valid-select LUTs
+    (`ic_dw_valid`, `ifr_next_valid`).
+  The valid bits are packed vectors (2 × 1024 flip-flops), still cleared in
+  one cycle by reset, `start` and ICACHE_INV.
+- **Tag-shadow guard (separate commit).** Because the shadow is a block
+  RAM read at `mem_iaddr`'s load edge, an I-cache install landing at or
+  after that edge (a fill completing while a store waits in MEM) can be
+  missing from the store's compare on hardware, while every simulator
+  reads the current value. The core now tracks the installs since
+  `mem_iaddr` was loaded (`ri_v`, `ri_idx`, `ri_m`) and treats a store to
+  such a line (a DCBZ: its pair) as a tag hit: it clears the line and does
+  not post. It fired in 3 of ~1000 directed tests (+9 to +15 cycles each);
+  no directed or swept self-modifying-code case produced a stale read in a
+  simulation model of the RAM's sampling, so it is defensive.
+- **Area estimate** (not synthesised here): BRAM +2 RAMB36 for `ic_data`
+  (1024 × 128); `ic_tag` stays one RAMB18; the tag shadow is one or two
+  RAMB18 (and the DCBZ-era LUTRAM shadow goes away). About +1.1k flip-flops
+  (valid bits, BTIC line indices one bit wider) and +1 to 1.5k LUTs
+  (valid-bit write decode, the extra 512:1 read muxes).
+- **Timing-sensitive paths.** The valid-bit flash clear (ICACHE_INV,
+  `start`, reset) now fans out to 2048 flip-flops; the snoop clear decode
+  likewise. `ic_data` spans four RAMB36 instead of two (longer routes on
+  the 128-bit read and on its address). The lookup's valid read depth, the
+  snoop's tag and valid read depth, and the hit path's logic depth are as
+  at 8 KiB.
+- **Tests** (tools/vsim): `ic16_loop`, `ic16_smc_alias`, `ic16_dcbz_pair`,
+  `ic16_icinv`, `ic16_te_pages`, `ic16_smc_fill`; `socmmio` checks
+  `ICACHE_INFO`. With `IC_LINES` = 512 every test passes except the
+  miss-count checks of the 16 KiB-specific ones (they then show the 8 KiB
+  numbers, e.g. a 12 KiB loop misses 770 / 1284 / 2311 times after 1 / 2 / 4
+  passes instead of 770 each time).
+
 ## 3. LiteEth: 8 RX slots, opt-in
 
 - Regenerate with `nrxslots: 8` (tools/liteeth/liteeth_nexys_a7.yml). TX
@@ -244,3 +302,12 @@ Decisions taken while implementing the frozen text above:
   core2_subsys). Simulation only (Verilator tools/vsim directed and random
   tests, the xsim cache bench `perf/m5a/run_m10_cache.sh`); not yet built
   or run on the board. §2 and §3 not started here.
+- 2026-11-11: §2 16 KiB I-cache implemented on `perf-hw` (pipeline_core,
+  KlaussCPU, core2_subsys; ICACHE_INFO). Simulation only: tools/vsim
+  `test` (1190 variants; also DEBUG_EN = 1, MPU_EN = 1), `dcbzdiff` (300
+  seeds), `diff --base master` (identical traces), `excdiff`, `tlbdiff`,
+  `tlbpage`, `mpudiff`, and on the SoC `socdiff --base 04b4055`, `socmmio`
+  (with ICACHE_INFO), `soccrypto`, `socsd`, `socdcbz`, `soceth`. The
+  perf/m5a programs (tb_soc, 04b4055 → this) change by −0.35 % to +0.12 %
+  (their hot code fits in 8 KiB; UART identical except the
+  timing-dependent lines of dhrystone and test_atomic). Not yet built.

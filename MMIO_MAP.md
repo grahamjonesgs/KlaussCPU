@@ -320,6 +320,7 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | 0x0000  | `CACHE_CTRL`         | W  | 4     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). `[3]` ICACHE_INV — fence.i: the core drops its whole I-cache, prefetch buffer and fetch window and refetches everything after the store (see below). Reads as 0. |
 | 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_2004_0002` (2 ways, 1024 sets, 32 B/line, 64 KB total). |
 | 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
+| 0x0018  | `ICACHE_INFO`        | R  | 64    | Read-only geometry of core 1's fetch I-cache, in `CACHE_INFO`'s format (`[7:0]` ways, `[23:8]` sets, `[31:24]` line bytes, `[63:32]` total bytes). Current build: `64'h0000_4000_1004_0001` (direct-mapped, 1024 sets, 16 B/line, 16 KiB; HW_PERF_PLAN.md §2). Reads 0 on older bitstreams (8 KiB I-cache, 512 sets). Build parameter `CORE1_IC_LINES`. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line (including DCBZ hits). |
@@ -1432,6 +1433,7 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define CACHE_BASE        (MMIO_BASE + 0x00050000u)
 #define REG_CACHE_CTRL    (*(volatile uint32_t *)(CACHE_BASE + 0x0000))
 #define REG_CACHE_INFO    (*(volatile uint64_t *)(CACHE_BASE + 0x0008))
+#define REG_ICACHE_INFO   (*(volatile uint64_t *)(CACHE_BASE + 0x0018))
 #define REG_CACHE_RD_HITS    (*(volatile uint64_t *)(CACHE_BASE + 0x0040))
 #define REG_CACHE_RD_MISSES  (*(volatile uint64_t *)(CACHE_BASE + 0x0048))
 #define REG_CACHE_WR_HITS    (*(volatile uint64_t *)(CACHE_BASE + 0x0050))
