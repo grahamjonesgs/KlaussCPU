@@ -25,6 +25,7 @@
 module liteeth_core (
     input  sys_clock, input sys_reset, output interrupt,
     input  rmii_clocks_ref_clk, input rmii_crs_dv, output rmii_mdc,
+    input  [3:0] rx_nslots, input rx_slot_reset,
     inout  rmii_mdio, output rmii_rst_n, input [1:0] rmii_rx_data,
     output [1:0] rmii_tx_data, output rmii_tx_en,
     input  [29:0] wishbone_adr, input [31:0] wishbone_dat_w,
