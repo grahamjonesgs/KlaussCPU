@@ -1358,7 +1358,14 @@ module pipeline_core
    // next boundary sees the committed enable and takes the IRQ (frame PC =
    // EI+4) before the next instruction.  An EI latched with nothing pending
    // is an ordinary instruction (no cost).  Carried to WB's refetch leg.
-   wire  w_eiser = EN_DIEI && w_dec.uop == U_EI && irq_ok;
+   // (timing: EI matched on the raw op bits — exactly f_decode_raw's U_EI
+   // case, asserted below — not through the uop encoding, whose shared
+   // decode tree put w_eiser 9-12 LUTs behind pos and was the id_ser
+   // family's worst path)
+   wire  w_is_ei = EN_DIEI && w_op[31:30] == 2'b01 && w_op[29:26] == 4'hB &&
+                   w_op[25:22] == 4'h0 && w_op[21:16] == 6'b000111 &&
+                   w_op[15:8] == 8'h00 && w_op[3:0] == 4'h0;
+   wire  w_eiser = w_is_ei && irq_ok;
    logic id_eiser, ex_eiser, mem_eiser;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
@@ -4670,6 +4677,9 @@ module pipeline_core
       // idle port on that edge (st_spec_now needs !st_post)
       if (sq_spec)
          assert (st_post || sq_v) else $fatal(1, "sq_spec with the port idle: pc=%h", mem_pc);
+      if (running && !fetch_halt)
+         assert (w_is_ei == (EN_DIEI && w_dec.uop == U_EI))
+            else $fatal(1, "EI raw-bit predecode drift: op=%h", w_op);
       if (id_valid)
          assert (id_ser == (dec.serialize || id_eiser))
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);

@@ -634,6 +634,14 @@ module KlaussCPU #(
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
    assign w_mem_ready           = cpu_mem.ready;
+   // The pipeline's ready, rebuilt from its own registered address instead
+   // of cpu_mem.ready: identical while it owns the port (cpu_mem.addr =
+   // pip_m_addr, so the splitter's MMIO decode is the same; COMB_DRAM_RET),
+   // and 0 otherwise as before.  Takes r_pipe_owns -> address mux ->
+   // splitter decode off the ready -> stall -> forward / pc cones (timing).
+   wire        w_split_ready_q;
+   wire        w_pip_ready = w_pipe_owns &&
+                             ((pip_m_addr[31:28] == 4'hF) ? w_split_ready_q : dram_mem.ready);
 
    // Pipeline core — the execution engine (owns rf / flags / SP / PC /
    // int_mask; single retire at WB; see pipeline_core.sv + PIPELINE_IMPL.md).
@@ -713,7 +721,7 @@ module KlaussCPU #(
       .h_dword    (w_h_dword),
       .m_rdata_next (w_mem_read_data_next),
       .m_next_valid (w_mem_next_valid),
-      .m_ready    (w_mem_ready && w_pipe_owns),
+      .m_ready    (w_pip_ready),
       .irq_ready  (w_irq_ready),
       .irq_sel    (w_irq_sel),
       .irq_vector (r_interrupt_table[w_irq_sel]),
@@ -773,7 +781,8 @@ module KlaussCPU #(
        .o_eth_write_data(w_eth_write_data),
        .o_eth_byte_en(w_eth_byte_en),
        .i_eth_read_data(w_eth_read_data),
-       .i_eth_ready(w_eth_ready)
+       .i_eth_ready(w_eth_ready),
+       .o_ready_q(w_split_ready_q)
    );
 
    // -------------------------------------------------------------------------

@@ -51,7 +51,12 @@ module bus_splitter #(
     output     [63:0] o_eth_write_data,
     output     [ 7:0] o_eth_byte_en,
     input      [63:0] i_eth_read_data,
-    input             i_eth_ready
+    input             i_eth_ready,
+    // the registered MMIO / Ethernet ready (r_ready below): cpu.ready for a
+    // request in the MMIO region.  The top rebuilds the pipeline's ready
+    // from it, dram.ready and the core's own registered address, off the
+    // ownership mux on cpu.addr (timing; KlaussCPU.sv w_pip_ready).
+    output            o_ready_q
 );
 
     wire is_mmio = (cpu.addr[31:28] == 4'hF);
@@ -136,4 +141,5 @@ module bus_splitter #(
         end
         cpu.ready = (COMB_DRAM_RET && !is_mmio) ? dram.ready : r_ready;
     end
+    assign o_ready_q = r_ready;
 endmodule
