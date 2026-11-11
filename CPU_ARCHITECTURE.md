@@ -521,9 +521,10 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   change. Probe `CPU_FEATURES` (`0xF00F_0048`, reads 0 on older bitstreams):
   bit 0 = this section, bit 3 = LR/SC, bit 1 = the MPU (§13.3) and
   `[7:4]` = its region count − 1 (15; both 0 on the Nexys A7, which has no
-  MPU), bit 2 = the TLB (§13.4) and `[15:8]` = its entry count (16), and
+  MPU), bit 2 = the TLB (§13.4) and `[15:8]` = its entry count (32; 16 before 2026-11-11), and
   `[20:16]` = the crypto blocks present (AES, GCM, SHA-256, HMAC, TRNG;
-  MMIO_MAP.md). The lean A7 MMU bitstream reads `0x0010_100D`. If
+  MMIO_MAP.md). The lean A7 MMU bitstream read `0x0010_100D`; with the
+  `perf-hw` features and the 32-entry TLB it reads `0x01F0_200D`. If
   `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits:
   assume every crypto block is present. (A future bitstream without a TRNG
   would therefore read as 'all present'; that is acceptable while the TRNG
@@ -621,7 +622,7 @@ cycles on random user-mode code. With MPU_EN = 0, timing is as before.
 
 ### 13.4 TLB and paging (MMU stage 3)
 
-A 16-entry (a build parameter; 16 on this part), fully associative,
+A 32-entry (a build parameter; 32 on this part since 2026-11-11, 16 before), fully associative,
 software-refilled TLB with **64 KiB
 pages** (MMU_PLAN.md §11). `STATUS[9]` TE turns translation on. With TE =
 0 every address is physical and the MPU applies; with TE = 1 the MPU is
@@ -645,7 +646,7 @@ gate loads / stores / fetches in both modes. TLB entries map DDR only, so
 |---|---|---|
 | `0x30` | `TLB_HI` | `[31:16]` VPN, `[8]` G, `[7:0]` ASID |
 | `0x31` | `TLB_LO` | `[26:16]` PFN, `[3]` X, `[2]` W, `[1]` R, `[0]` V |
-| `0x32` | `TLB_INDEX` | `[3:0]` index (16 entries; `[4]` ignored, reads 0); `[31]` P = the last TLBP missed |
+| `0x32` | `TLB_INDEX` | `[4:0]` index (log2 N bits; with 16 entries `[4]` is ignored and reads 0); `[31]` P = the last TLBP missed |
 | `0x33` | `ASID` | `[7:0]` |
 | `0x34` | `TLBVEC` | vector for TLB_MISS_*; 0 = use `EVEC` |
 

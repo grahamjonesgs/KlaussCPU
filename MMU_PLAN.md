@@ -479,7 +479,8 @@ The lean Nexys A7 MMU bitstream reads **`0x0010_100D`**: stage 1, LR/SC, a
 crypto configuration reads `0x001F_100D`. With the native SD controller
 (`mmu-sd`), `[21]` is also set: `0x0030_100D` lean, `0x003F_100D` full.
 With DCBZ, MAL64 and `ETH_RX_SLOTS` (`perf-hw`), `[24:22]` too: `0x01F0_100D` lean,
-`0x01FF_100D` full.
+`0x01FF_100D` full. With the 32-entry TLB (`tlb32`, 2026-11-11, §11.5)
+`[15:8]` = 32: **`0x01F0_200D`** lean, `0x01FF_200D` full.
 
 ---
 
@@ -1016,12 +1017,13 @@ segment). The page-table format is entirely software's choice (soft TLB).
 
 ### 11.3 TLB programmer's model
 
-- **Size:** fully associative; the entry count N is a build parameter:
-  **16 on the xc7a100t** (§11.5, area), 32 or 64 on a bigger part.
-  `CPU_FEATURES[2]` = 1, and `CPU_FEATURES[15:8]` = N (16).
-- **TLB_INDEX width:** log2 N bits, `[3:0]` with 16 entries. The bits above
-  them (`[4]` with 16 entries) are ignored on write and read 0. Below,
-  `TLB_INDEX[4:0]` means those log2 N bits.
+- **Size:** fully associative; the entry count N is a build parameter
+  (2 to 32, a power of two): **32 on the xc7a100t** since 2026-11-11 (16
+  before; §11.5). `CPU_FEATURES[2]` = 1, and `CPU_FEATURES[15:8]` = N (32).
+- **TLB_INDEX width:** log2 N bits: `[4:0]` with 32 entries, `[3:0]` with
+  16. The bits above them (to `[30]`; `[4]` too with 16 entries) are
+  ignored on write and read 0. Below, `TLB_INDEX[4:0]` means those log2 N
+  bits.
 - **Entry:** VPN `[15:0]` (= VA[31:16]), ASID `[7:0]`, G, PFN `[10:0]`, V, R,
   W, X.
 - **Match:** an entry matches VA when V = 1, its VPN = VA[31:16], and (G = 1
@@ -1040,7 +1042,7 @@ System registers (supervisor only):
 |---|---|---|
 | `0x30` | `TLB_HI` | `[31:16]` VPN, `[8]` G, `[7:0]` ASID |
 | `0x31` | `TLB_LO` | `[26:16]` PFN, `[3]` X, `[2]` W, `[1]` R, `[0]` V |
-| `0x32` | `TLB_INDEX` | `[4:0]` entry index (`[3:0]` with 16 entries; `[4]` ignored, reads 0); `[31]` P = the last TLBP found no match |
+| `0x32` | `TLB_INDEX` | `[4:0]` entry index (log2 N bits: all five with 32 entries; with 16, `[4]` is ignored and reads 0); `[31]` P = the last TLBP found no match |
 | `0x33` | `ASID` | `[7:0]` current address-space ID |
 | `0x34` | `TLBVEC` | vector for TLB_MISS_* exceptions; 0 = use `EVEC` |
 | `0x00` | `STATUS` | `[9]` TE |
@@ -1238,26 +1240,30 @@ base in EX, with the MEM replay above".
   debugger is attached). Neither writes ECAUSE / EADDR / TLB_HI.
 - **Watchpoints** compare PAs (`mem_iaddr`, `h_addr`), like debugger memory
   accesses.
-- **Entry count: 16 on the xc7a100t** (decision 2026-11-09, with the
-  runtime). With 32 entries the core missed timing by about 0.3 ns after
-  every design-level fix: the stage 3 area (+2.7k LUTs over stage 2, the
-  TLB 1.4k of it) tipped long-standing stage 2 paths, and the data CAM
-  path itself, over the edge (§11.6). 16 entries was chosen over sharing
-  one CAM between the data and fetch ports, because:
-  - the kernel runs in untranslated kseg, so the TLB maps only user pages
-    and kmap, and 16 × 64 KiB = 1 MiB of reach is ample (four times an
-    R3000's);
-  - it saves about twice the area of sharing, and congestion is what
-    failed;
-  - it is a parameter change, with no new EX hold or stall logic.
-  The count is the parameter `TLB_N` (`CORE1_TLB_N` in KlaussCPU); 32 or 64
-  fit a bigger part. CPU_FEATURES[15:8] reports it, and TLB_INDEX uses
-  log2 N bits (§11.3).
+- **Entry count: 32 on the xc7a100t** (decision 2026-11-11, Graham with
+  the runtime session; §11.7). The runtime measured, in the klausscc model
+  of Linux, that 32 entries make Python start-up 1.47× and a Python loop
+  2.68× faster than 16. Linux's refill handler already masks its
+  round-robin index with 31, so no kernel change was needed. 32 entries
+  met timing in the standard flow once the data CAM was shortened
+  (§11.7). No walker, no shared CAM: the only software-visible change is
+  CPU_FEATURES[15:8] = 32 and TLB_INDEX using 5 bits (§11.3).
+  *History (2026-11-09, superseded):* 16 entries. With 32 the core then
+  missed timing by about 0.3 ns after every design-level fix: the stage 3
+  area (+2.7k LUTs over stage 2, the TLB 1.4k of it) tipped long-standing
+  stage 2 paths, and the data CAM path itself, over the edge (§11.6). 16
+  entries was chosen over sharing one CAM between the data and fetch
+  ports, because the kernel runs in untranslated kseg (16 × 64 KiB = 1 MiB
+  of reach seemed ample), it saved about twice the area of sharing, and it
+  was a parameter change.
+  The count is the parameter `TLB_N` (`CORE1_TLB_N` in KlaussCPU; a power
+  of two, 2-32; 64 would need a bigger part and a 6-bit TLB_INDEX).
+  CPU_FEATURES[15:8] reports it, and TLB_INDEX uses log2 N bits (§11.3).
 - **Build switches**: the module parameter `TLB_EN` (on; off on core 2) and
   `EN_TLB = EXC_EN && TLB_EN`. KlaussCPU's `CORE1_TLB_EN` drives
   CPU_FEATURES[2] and [15:8] = the entry count; `TLB_N` / `CORE1_TLB_N`
-  = 16 here. With the MPU off on the A7 (§10) and lean crypto, CPU_FEATURES =
-  0x0010_100D.
+  = 32 here (16 until 2026-11-11). With the MPU off on the A7 (§10), lean
+  crypto and the `perf-hw` features, CPU_FEATURES = 0x01F0_200D (§6.3).
 - **MPU off on the Nexys A7** (Graham, 2026-11-09): core 1 builds the TLB
   and not the MPU, for timing margin; Zephyr runs in supervisor mode. The
   MPU is a build option (`CORE1_MPU_EN`), simulated in an `MPU_EN = 1`
@@ -1365,6 +1371,66 @@ the shipped bitstream.
 - **Synthesis folding.** Without `keep_hierarchy`, synthesis placed core
   logic inside `mmu_tlb` (`pc`-mux LUTs) and `mmu_mpu` (`id_ser`, the
   multiplier). Both are kept now, like `mmu_sr`.
+
+### 11.7 32 entries (2026-11-11, branch `tlb32`)
+
+`CORE1_TLB_N` = 32 on master `214db70` alone built at tier 1 WNS −0.095
+(`~/.cache/kbuild/tlb32_exp`; tier 2 +0.005), 35,613 LUTs. Every failing
+path was in two families: the data CAM (`ex_ea_q[31:16]` → VPN / ASID
+compare → match → 32:1 PFN mux → the hit pipe's `r_h_tag` in
+`mem_read_write` and `t1_pahi`; its last hop a 2.6 ns route across the
+chip) and the IRQ vector's `!= 0` test → `w_irq_ready` → the IF→ID latch
+/ BTIC enables. Two exact fixes (identical retire traces and cycle
+counts):
+
+- **The data CAM** (`mmu_tlb`). `d_ok[n]` = V ∧ (G ∨ ASID match) is
+  registered every cycle, so a match is the 16-bit VPN compare and one
+  bit. It lags the entries and `ASID` by a cycle, which is safe: they
+  change only by TLBWI / TLBINV (written the cycle after commit), MTSR
+  ASID and program load, all serializing and refetching, so the next data
+  lookup is several cycles later. (The fetch port keeps the exact match: a
+  micro-ITLB refill can come 2 cycles after a commit.) The CAM reads its
+  own copies of `ex_ea_q[31:16]` (`d_vq0` / `d_vq1`, one per half of the
+  entries, loaded and stepped exactly as `ex_ea_q`; inside the kept
+  hierarchy, so they are not merged with it), so the VPN bits fan out
+  locally. Simulation asserts, wherever the result is used (an op in its
+  2nd / 3rd EX cycle with TE = 1), that the copies equal `ex_ea_q` and the
+  match equals the exact one.
+- **`r_ivec_nz`** (KlaussCPU): each IRQ vector's `!= 0`, stored when the
+  table is written (asserted equal), so the 32-bit zero test is off the
+  `w_irq_ready` cone (first tried in `perfhw11`, HW_PERF_PLAN §2).
+
+| Build | Commit | Change | Tier 1 WNS / WHS | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|
+| `tlb32_exp` | (`214db70`, N = 32) | 32 entries only | −0.095 / +0.031 | 35,613 | | |
+| **`tlb32_b1`** | **`a92ce08`** | + registered `d_ok`, CAM VPN copies, `r_ivec_nz` | **+0.019 / +0.022** | 35,718 | 24,626 | 80.5 |
+
+- **Release bitstream** `~/.cache/kbuild/tlb32_a92ce08.bit` (md5
+  `ddf96605…`), build dir `~/.cache/kbuild/tlb32_b1`, standard
+  `build_fast -resynth`, **tier 1 met: WNS +0.019, WHS +0.022** (no tier
+  2, no alternate placement), 9 min 53 s. 35,718 LUTs (3,476 memory),
+  24,626 FFs, 80.5 BRAM tiles, 19 DSPs; no Synth 8-4767. CPU_FEATURES
+  `0x01F0_200D`. Not yet run on the board.
+- After the fixes the CAM family's worst is +0.206 (`d_vq1` → `mem_xsq`)
+  and the IRQ family is out of the worst 30. The worst paths left are the
+  long-standing EA adder → store-forward compare → `mem_h` / `mem_fq`
+  (+0.019 / +0.039, 17 levels; HW_PERF_PLAN §2 "Reading"), then the ID
+  predecode (`pos` → `id_b_imm`, +0.112) and `r_pipe_owns` → qspi_ctrl
+  (+0.115).
+- **Micro-ITLB miss penalty** (a fetch from a page that the one-entry
+  micro-ITLB does not hold, which hits the main TLB): **3 cycles** (the
+  lookup, the `it_ref` refill through the fetch port, the lookup again).
+  Measured in tb_vsim with TE = 1: a loop jumping between two code pages
+  (both preloaded) against the same code staying in one page, 399
+  cross-page jumps: +3.0 cycles each with 4 or 8 instructions per page
+  visit, +2.0 with one, and 0 when the loop is only jumps (the refill
+  hides under the redirect). A call into another page and its return so
+  cost about 6 cycles more than within a page.
+- **Tests**: `tlb_index_width` (TLB_INDEX[4] significant),
+  `tlb_entries_upper` (TLBWI / TLBR / TLBP at 16-31), `tlb_working_set`
+  (28 pages hit with no refill after warm-up). The tests read the entry
+  count (`tests.TLB_N`; `VSIM_TLB_N` elaborates another), and `tlbdiff
+  --k 32` refills over all 32 entries.
 
 ---
 
