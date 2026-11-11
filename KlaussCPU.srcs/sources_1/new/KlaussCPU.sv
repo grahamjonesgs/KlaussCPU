@@ -40,6 +40,9 @@ module KlaussCPU #(
     parameter bit CORE1_TLB_EN = 1'b1,
     // its entry count: 16 on this part (MMU_PLAN.md §11.5)
     parameter int CORE1_TLB_N = 16,
+    // core 1's fetch I-cache: lines of 16 B, direct-mapped (HW_PERF_PLAN.md
+    // §2): 1024 = 16 KiB.  ICACHE_INFO (0xF005_0018) reports it.
+    parameter int CORE1_IC_LINES = 1024,
     // Crypto blocks (CRYPTO_PLAN.md), optional build features; the TRNG is
     // always built.  An absent block's window reads 0 and ignores writes in
     // the normal MMIO time, and contributes no logic.  GCM needs AES, HMAC
@@ -377,6 +380,11 @@ module KlaussCPU #(
    // Cache performance counters / control (driven by mem_read_write below;
    // exposed via MMIO 0xF005_xxxx — see MMIO_MAP.md "Cache controller").
    wire [63:0] w_cache_info;
+   // ICACHE_INFO (0xF005_0018, HW_PERF_PLAN.md §2): core 1's I-cache in
+   // CACHE_INFO's format — [63:32] total bytes, [31:24] line bytes, [23:8]
+   // sets, [7:0] ways.  16 KiB: 64'h0000_4000_1004_0001.
+   localparam logic [63:0] LP_ICACHE_INFO = {32'(CORE1_IC_LINES * 16), 8'd16,
+                                             16'(CORE1_IC_LINES), 8'd1};
    wire [63:0] w_cnt_read_hits;
    wire [63:0] w_cnt_read_misses;
    wire [63:0] w_cnt_write_hits;
@@ -685,7 +693,8 @@ module KlaussCPU #(
    end endgenerate
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
-                   .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N)) pipeline_core_i (
+                   .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N),
+                   .IC_LINES(CORE1_IC_LINES)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -1200,6 +1209,7 @@ module KlaussCPU #(
                16'h0000: r_mmio_read_data_comb = 64'h0;
                16'h0008: r_mmio_read_data_comb = w_cache_info;
                16'h0010: r_mmio_read_data_comb = {63'b0, w_cache_mnt_busy}; // CACHE_STATUS
+               16'h0018: r_mmio_read_data_comb = LP_ICACHE_INFO;            // ICACHE_INFO
                16'h0040: r_mmio_read_data_comb = w_cnt_read_hits;
                16'h0048: r_mmio_read_data_comb = w_cnt_read_misses;
                16'h0050: r_mmio_read_data_comb = w_cnt_write_hits;

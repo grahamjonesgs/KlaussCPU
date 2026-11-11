@@ -130,9 +130,10 @@ module core2_subsys
    flags_t      c2_dbg_flags;
 
    // (no MMU on core 2: EXC_EN / MPU_EN / TLB_EN = 0, the new encodings trap;
-   // no D-cache: DCBZ_EN = 0, DCBZ is ILLEGAL — HW_PERF_PLAN.md §1)
+   // no D-cache: DCBZ_EN = 0, DCBZ is ILLEGAL — HW_PERF_PLAN.md §1;
+   // the 8 KiB I-cache it always had: IC_LINES = 512 — §2 grows core 1's)
    pipeline_core #(.SP_RESET(32'h0002_0000), .BTIC_EN(1'b0), .EXC_EN(1'b0), .MPU_EN(1'b0),
-                   .TLB_EN(1'b0), .DCBZ_EN(1'b0)) c2_core_i (   // SP = top of local BRAM
+                   .TLB_EN(1'b0), .DCBZ_EN(1'b0), .IC_LINES(512)) c2_core_i (   // SP = top of local BRAM
       .clk        (i_Clk),
       .ce         (r_ce),
       .rst        (!i_Rst_L || !r_run),

@@ -5,6 +5,7 @@ token the testbench writes to its .out file."""
 from kasm import Asm, H
 
 DATA = 0x10000          # the TB dumps 0x10000..0x10800
+IC_BYTES = 16384        # core 1's I-cache (IC_LINES 1024 x 16 B, HW_PERF_PLAN §2)
 ALL = {}
 
 
@@ -3281,7 +3282,7 @@ def dcbz_code_call():
                 a.ret()
                 f = a.labels['F']
                 if half:
-                    while a.pc != (f & ~31) + 0x2000:     # 8 KiB on: same I-cache index
+                    while a.pc != (f & ~31) + IC_BYTES:   # I-cache size on: same index
                         a.nop()
                     a.label('G')
                     a.inc(7)
@@ -3536,4 +3537,245 @@ def mal64_exempt():
     a.setr(9, MB + 2); a.ld(64, 3, 9)                      # aligned down again
     a.halt()
     out.append((a, {'end': 'park', 'kind': '0', 'r6': 0, 'r3': MV[0]}, []))
+    return out
+
+
+# ------------------------------------- HW_PERF_PLAN §2: 16 KiB I-cache
+# (IC_BYTES = 16 KiB: index VA[13:4], tag PA[31:14].  Under the old 8 KiB
+# geometry an address and the one 0x2000 above it shared an index.)
+IC_MISS_LOOP12 = 770    # the first pass: 768 lines + the setup / exit lines
+
+
+def _ic_loop(nbytes, passes):
+    """a loop whose body is nbytes of straight code (16 B aligned)"""
+    a = Asm()
+    a.setr(1, passes); a.setr(2, 0)
+    while a.pc & 15:
+        a.nop()
+    a.label('l')
+    for _ in range(nbytes // 4 - 3):
+        a.nop()
+    a.inc(2)
+    a.addi_s(1, 1, -1)
+    a.fbr('ne', 1, 0, 'l', imm=True)
+    a.halt()
+    return a
+
+
+@test
+def ic16_loop():
+    """a 12 KiB loop (> 8 KiB, < 16 KiB): only the first pass misses — the
+    I-cache miss count after 1, 2 and 4 passes is the same (8 KiB: every
+    pass refetched the whole loop)"""
+    out = []
+    for passes in (1, 2, 4):
+        for lat in (1, 5):
+            a = _ic_loop(12 * 1024, passes)
+            out.append((a, {'end': 'park', 'kind': '0', 'r2': passes, 'r1': 0,
+                            'ic_miss': str(IC_MISS_LOOP12)}, [f'+LAT={lat}']))
+    return out
+
+
+def _ic_pad(a, addr):
+    assert a.pc <= addr, (hex(a.pc), hex(addr))
+    while a.pc != addr:
+        a.nop()
+
+
+def _ic_funcs(a, funcs):
+    """emit (label, addr, emit_body) functions in address order"""
+    for lb, at, fn in sorted(funcs, key=lambda f: f[1]):
+        _ic_pad(a, at)
+        a.label(lb)
+        fn()
+
+
+@test
+def ic16_smc_alias():
+    """functions X at 0x1000 and Y at 0x3000 (old geometry: one index; now
+    two), both warm; a store patches X, then Y, through a 64 / 32 / 8-bit
+    store; each call runs the current code.  A data store to X + 0x4000
+    (the same index now, another tag) leaves X cached and correct."""
+    new1 = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    new2 = _word(lambda t: t.alui_s('add', 2, 2, 16))
+    out = []
+    for size in (64, 32, 8):
+        for lat in (1, 4):
+            a = Asm()
+            a.setr(1, 0); a.setr(2, 0)
+            a.leapc(8, 'X'); a.leapc(9, 'Y')
+            a.setr(4, 0x5000); a.setr(5, 0x5A)
+            for _ in range(2):
+                a.call('X'); a.call('Y')
+            a.st(64, 5, 4, 0x0)                     # X + 0x4000: data only
+            a.call('X'); a.call('Y')                # r1 = 3, r2 = 3
+
+            def patch(reg, new, addr):
+                if size == 64:
+                    a.ld(64, 6, addr)
+                    a.setr64(7, 0xFFFFFFFF00000000)
+                    a.alu('and', 6, 6, 7)
+                    a.setr(7, new)
+                    a.alu('or', 6, 6, 7)
+                    a.st(64, 6, addr)
+                elif size == 32:
+                    a.setr(7, new); a.st(32, 7, addr)
+                else:                               # byte 2 only: imm8 1 -> 0x11 (as _smc)
+                    a.setr(7, (new >> 16) & 0xFF); a.st(8, 7, addr, 2)
+            inc = 0x11 if size == 8 else 16
+            patch(1, new1, 8)
+            a.call('X'); a.call('Y')                # r1 = 3 + inc, r2 = 4
+            patch(2, new2, 9)
+            a.call('Y'); a.call('X')                # r2 = 4 + inc, r1 = 3 + 2 inc
+            a.ld(64, 10, 4)
+            a.halt()
+            _ic_pad(a, 0x1000)
+            a.label('X'); a.alui_s('add', 1, 1, 1); a.ret()
+            _ic_pad(a, 0x3000)
+            a.label('Y'); a.alui_s('add', 2, 2, 1); a.ret()
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 3 + 2 * inc, 'r2': 4 + inc, 'r10': 0x5A},
+                        [f'+LAT={lat}']))
+    # warm X / Y calls alternate with no misses after the cold ones (8 KiB:
+    # each call evicted the other)
+    a = Asm()
+    a.setr(1, 0); a.setr(2, 0); a.setr(3, 20)
+    a.label('l')
+    a.call('X'); a.call('Y')
+    a.addi_s(3, 3, -1)
+    a.fbr('ne', 3, 0, 'l', imm=True)
+    a.halt()
+    _ic_pad(a, 0x1000)
+    a.label('X'); a.alui_s('add', 1, 1, 1); a.ret()
+    _ic_pad(a, 0x3000)
+    a.label('Y'); a.alui_s('add', 2, 2, 1); a.ret()
+    out.append((a, {'end': 'park', 'kind': '0', 'r1': 20, 'r2': 20, 'ic_miss': '5'}, []))   # (8 KiB: 43)
+    return out
+
+
+@test
+def ic16_dcbz_pair():
+    """F (even 16 B half) and G (odd half) share a 32 B line at L, both warm;
+    so do H / K at L ^ 0x2000 (the old geometry's alias).  A DCBZ of L (EA
+    in either half) kills both halves: H / K still run, then G executes the
+    zeros (ILLEGAL at G).  A 64-bit store into G's half only: F runs its
+    old code, G the patched one."""
+    out = []
+    for base in (0x1000, 0x3000):
+        for ea_off in (0, 9, 16, 31):
+            for lat in (1, 4):
+                a = Asm()
+                a.setr(1, 0); a.setr(7, 0)
+                for _ in range(2):
+                    a.call('F'); a.call('G'); a.call('H'); a.call('K')
+                a.setr(3, base + ea_off)
+                a.dcbz(3)
+                a.call('H'); a.call('K')
+                a.call('G')
+                a.halt()
+                f1 = lambda: (a.inc(1), a.ret())
+                f7 = lambda: (a.inc(7), a.ret())
+                _ic_funcs(a, [('F', base, f1), ('G', base + 16, f1),
+                              ('H', base ^ 0x2000, f7), ('K', (base ^ 0x2000) + 16, f7)])
+                out.append((a, {'end': 'park', 'kind': '2', 'pc': base + 16, 'op': 0,
+                                'r1': 4, 'r7': 6}, [f'+LAT={lat}']))
+    newg = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    for base in (0x1000, 0x3000):
+        a = Asm()
+        a.setr(1, 0); a.setr(7, 0)
+        for _ in range(2):
+            a.call('F'); a.call('G'); a.call('H')
+        a.setr(3, base + 16)
+        a.setr64(4, (_word(lambda t: t.ret()) << 32) | newg)   # G: addi r1,16 ; ret
+        a.st(64, 4, 3)
+        a.call('F'); a.call('G'); a.call('H')       # r1 = 4 + 1 + 16
+        a.halt()
+        f1 = lambda: (a.inc(1), a.ret())
+        _ic_funcs(a, [('F', base, f1), ('G', base + 16, f1),
+                      ('H', base ^ 0x2000, lambda: (a.inc(7), a.ret()))])
+        out.append((a, {'end': 'park', 'kind': '0', 'r1': 21, 'r7': 3}, ['+LAT=3']))
+    return out
+
+
+@test
+def ic16_icinv():
+    """an 8 KiB function in the I-cache's upper half (0x2000-0x3FFF: index
+    bit 9 set, lines the 8 KiB cache did not have), called twice: warm, the
+    second call does not miss; with ICACHE_INV between the calls it misses
+    again on every line; code patched in DRAM then ICACHE_INV runs anew"""
+    out = []
+    for inv in (False, True):
+        a = Asm()
+        a.setr(2, 0)
+        a.call('B')
+        if inv:
+            a.setr(1, 0xF0050000); a.setr(3, 8); a.st(32, 3, 1)      # ICACHE_INV
+        a.call('B')
+        a.halt()
+        _ic_pad(a, 0x2000)
+        a.label('B')
+        for _ in range(0x2000 // 4 - 2):
+            a.nop()
+        a.inc(2); a.ret()
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': 2,
+                        'ic_miss': str(IC_MISS_INV if inv else IC_MISS_WARM)}, []))
+    new = _word(lambda t: t.alui_s('add', 2, 2, 16))
+    for lat in (1, 4):
+        a = Asm()
+        a.setr(2, 0)
+        a.call('P'); a.call('P')
+        a.setr(9, 0x3FF0); a.setr(4, new); a.st(32, 4, 9)        # P's first word
+        a.setr(1, 0xF0050000); a.setr(3, 8); a.st(32, 3, 1)      # ICACHE_INV
+        a.call('P')
+        a.halt()
+        _ic_pad(a, 0x3FF0)
+        a.label('P'); a.inc(2); a.ret()
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': 18}, [f'+LAT={lat}']))
+    return out
+
+
+IC_MISS_WARM = 514      # 512 lines of B + 2 of main
+IC_MISS_INV = 1028      # every line twice
+
+
+@test
+def ic16_te_pages():
+    """TE = 1, user mode: snippets at VAs with the same low 14 bits (one
+    I-cache index) in different pages / frames, and at VA[15:14] = 01 in the
+    same page (the tag's VA bits); one at an index differing only in bit 13;
+    a synonym (another VA page, the same frame).  Called round-robin three
+    times: each runs its own code"""
+    if NOEXC:
+        return []
+    def setup(a):
+        _tlb_set(a, 2, 0x0050, 0x002, TLB_V | TLB_X)                 # 0x0050xxxx -> PA 0x2xxxx
+        _tlb_set(a, 3, 0x0060, 0x003, TLB_V | TLB_X)                 # 0x0060xxxx -> PA 0x3xxxx
+        _tlb_set(a, 4, 0x0070, 0x002, TLB_V | TLB_X)                 # synonym of 0x0050
+    snips = [(0x00501230, 0x21230, 0x1), (0x00601230, 0x31230, 0x10),
+             (0x00505230, 0x25230, 0x100), (0x00503230, 0x23230, 0x1000),
+             (0x00701230, None, 0x1)]                                 # = the first one's code
+    def body(a):
+        a.setr(3, 0); a.setr(11, 3)
+        a.label('it')
+        for k, (va, _, _) in enumerate(snips):
+            a.setr(9, va); a.leapc(10, f'r{k}'); a.jmpr(9)
+            a.label(f'r{k}')
+        a.addi_s(11, 11, -1)
+        a.fbr('ne', 11, 0, 'it', imm=True)
+    a, e, p = _te_prog(body, True, {'r3': 3 * sum(v for _, _, v in snips)}, setup=setup)
+    for _, pa, val in snips:
+        if pa is not None:
+            _place(a, pa, lambda s, v=val: (s.setr(5, v), s.alu('add', 3, 3, 5), s.jmpr(10)))
+    return a, e, p
+
+
+@test
+def ic16_smc_fill():
+    """cold SMC sweep: the store patches an instruction whose line is being
+    fetched (or was just installed) while the store waits in MEM — the
+    case the tag-shadow guard (pipeline_core ri_v) covers"""
+    out = []
+    for dist in (0, 1, 2, 3, 5):
+        for pad in range(8):
+            for lat in (1, 2, 3, 5, 7):
+                out.append(_smc(dist, 32, False, lat, pad_align=pad))
     return out
