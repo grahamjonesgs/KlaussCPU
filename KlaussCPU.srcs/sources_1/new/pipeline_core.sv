@@ -1703,8 +1703,13 @@ module pipeline_core
    md_phase_t  div_ph;
    div_state_t dv;
    // delay spin
+   // (timing, HW_PERF_PLAN §2 closure: a down-counter with a registered
+   // zero flag — the old up-count's 45-bit dly_cnt >= dly_max compare sat
+   // on dly_done -> ex_busy -> the EX/MEM enables.  dly_rem = max - cnt,
+   // dly_z = (dly_rem == 0): the same count of spin cycles.)
    logic        dly_on;
-   logic [44:0] dly_cnt, dly_max;
+   logic [44:0] dly_rem;
+   logic        dly_z;
 
    wire ex_is_md   = ex_valid && (ex_d.uop == U_MUL || ex_d.uop == U_DIV || ex_d.uop == U_MOD);
    wire ex_is_mul  = ex_valid && (ex_d.uop == U_MUL);
@@ -1717,7 +1722,7 @@ module pipeline_core
    wire md_done    = (ex_is_mul && mul_cnt == (EN_MUL2 ? 2'd1 : 2'd3)) ||
                      (ex_is_div && div_ph == MD_STEP && dv.counter >= 7'd64) || ex_div_by0;
    wire ex_is_dly  = ex_valid && (ex_d.uop == U_DELAY);
-   wire dly_done   = dly_on && (dly_cnt >= dly_max);
+   wire dly_done   = dly_on && dly_z;
    wire ex_is_lcd  = ex_valid && (ex_d.uop == U_LCD);
    // EN_LDBYP: a bypass consumer whose load is not a hit-pipe answer in WB
    // (it missed) waits in EX for the load's response (captured into ex_a/b)
@@ -2796,7 +2801,7 @@ module pipeline_core
          r_btk_icv <= 1'b0; r_btk_snv <= 1'b0; r_btk_all <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
-         dly_on <= 1'b0; dly_cnt <= '0; dly_max <= '0;
+         dly_on <= 1'b0; dly_rem <= '0; dly_z <= 1'b1;
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0; if_drop <= 1'b0;
@@ -3123,11 +3128,17 @@ module pipeline_core
 
          if (ex_is_dly) begin
             if (!dly_on) begin
-               dly_on  <= 1'b1;  dly_cnt <= '0;
-               dly_max <= {(ex_d.len == 2'b01) ? ex_a[31:0] : ex_var1, 13'b0};
+               logic [31:0] n;
+               n = (ex_d.len == 2'b01) ? ex_a[31:0] : ex_var1;
+               dly_on  <= 1'b1;
+               dly_rem <= {n, 13'b0};
+               dly_z   <= (n == 32'd0);
             end else if (dly_done) begin
                if (!mem_busy) dly_on <= 1'b0;   // same freeze-on-finish rule
-            end else dly_cnt <= dly_cnt + 45'd1;
+            end else begin
+               dly_rem <= dly_rem - 45'd1;
+               dly_z   <= (dly_rem == 45'd1);
+            end
          end
 
          lcd_rst_wr <= 1'b0;
