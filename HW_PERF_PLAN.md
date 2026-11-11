@@ -242,6 +242,65 @@ commit); the full sim set passed on each.
 - **Not changed:** `ICACHE_INFO`, the miss behaviour (`ic16_*` pass with the
   16 KiB counts), the snoop's tag compare.
 
+### §2 timing after the CALL-squash fix (2026-11-11)
+
+`c1874cf` (`mem_succ`, the squashed CALL push refetching at the target)
+built at tier 1 WNS −0.298 (`perfhw8`; tier 2 AggressiveExplore +0.010,
+met, and that bitstream boots Linux on the board).  `mem_succ` itself is
+nowhere near critical (+2.07; `st_spec_nx` +1.75): the one-register change
+re-synthesised and re-placed the core, and two long-standing families
+went over — the IF→ID latch predecode (`pos` → `w_op` → `w_dec.uop ==
+U_EI` → `w_eiser` → `id_ser`: 9 LUT levels at +0.336 in `perfhw7`, 12
+levels at −0.298 in `perfhw8`, the uop compare sharing the whole decode
+tree) and the bus ready (`r_pipe_owns` → the `cpu_mem.addr` ownership
+mux → the splitter's MMIO decode → `cpu.ready` → `wb_wait` / stall →
+`ex_a` / `ex_b` / `pc` / multiplier inputs, −0.061 … +0.04).
+
+`a5d20f2` (trace- and cycle-identical to `c1874cf`):
+- `w_eiser` matches EI on the op's bits (exactly `f_decode_raw`'s U_EI
+  case, asserted) instead of through the uop encoding.
+- the core's `m_ready` is rebuilt in the top from its own registered
+  `m_addr[31:28]` (MMIO → the splitter's registered ready, new port
+  `o_ready_q`; else `dram.ready`) and `r_pipe_owns` — equal to
+  `cpu_mem.ready && owns`, without the ownership mux and splitter decode.
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Final | LUTs | FFs |
+|---|---|---|---|---|---|---|
+| `perfhw8` | `c1874cf` | `mem_succ` | −0.298 / +0.015 | +0.010 (tier 2) | 35,054 | 24,058 |
+| **`perfhw9`** | **`a5d20f2`** | EI raw match; ready off the mux | **+0.016 / +0.024** | tier 1 | 35,144 | 23,952 |
+| `perfhw10` | (not committed) | + shift byte-zero flags (EX side) | −0.485 / +0.019 | −0.277 | 35,389 | 24,169 |
+| `perfhw11` | (not committed) | + byte-zero flags (MEM side), IRQ vector ≠ 0 flags | −0.257 / +0.015 | −0.257 | 35,338 | 24,057 |
+
+- **Release bitstream** `~/.cache/kbuild/perf-hw_a5d20f2.bit` (md5
+  `b2c79baa…`), build dir `~/.cache/kbuild/perfhw9`, standard
+  `build_fast -resynth`, **tier 1 met: WNS +0.016, WHS +0.024** (no tier
+  2, no alternate placement), 11 min 35 s.  35,144 LUTs (3,476 memory),
+  23,952 FFs, 80.5 BRAM tiles, 19 DSPs; no Synth 8-4767.  Not yet run on
+  the board.  Short of the +0.02 margin aimed for.
+- `perfhw9`'s remaining worst: `r_shhi` → the MEM shifter's 64-bit result
+  → zero reduce → `ex_b_zero` (+0.016, L15; the DIV-by-zero forward, the
+  `ex_b_zero` family above), then +0.089 (`r_bt_wbase` → `bt_lidx`, a
+  pure route), `ex_a` → `mem_result` +0.094.
+- **Tried, not kept.**  Two further identical-behaviour fixes removed
+  their targets but the re-placed builds missed elsewhere: (1) the shift
+  result's byte-zero flags (stage 1's per-byte zero flags moved by the
+  byte shift `r_shhi`, asserted equal to `f_bz(w_sh2)`) for `ex_b_zero` and
+  `wb_zero`; computed in EX (`perfhw10`) they loaded `ex_a` and the build
+  fell to −0.485 (`id_ser` −0.485 via the full-decode legality /
+  `id_ras_ret` tree, the IRQ vector's `!= 0` → `w_irq_ready` → `pc`
+  −0.406, the EA adder → `mem_h` −0.353); (2) the same flags from the
+  stage 1 registers in MEM plus `r_ivec_nz` (each vector's `!= 0` written
+  with the table) (`perfhw11`): those paths gone, but the EA adder →
+  store-forward compare → `mem_h` / `mem_fq` (−0.257, L19), `mem_d.uop` →
+  the ID-latch / BTIC enables (−0.158) and `wb_fmask` → `pc` CE (−0.131)
+  went over.
+- **Reading.**  The core has five or six independent families (ID
+  predecode, IRQ → `pc`, bus ready → stall, EA → store forward, the
+  stall → ID / BTIC enables, the shifter → zero) within about ±0.3 ns of
+  zero; which one fails is decided by placement, and tier 1 swings by
+  ±0.4 ns between builds of near-identical netlists.  A dependable
+  +0.02 needs several of them restructured together, not one per build.
+
 ## 3. LiteEth: 8 RX slots, opt-in
 
 - Regenerate with `nrxslots: 8` (tools/liteeth/liteeth_nexys_a7.yml). TX
@@ -413,3 +472,7 @@ Decisions taken while implementing the frozen text above:
   three CPI-neutral core fixes; standard flow tier 1 WNS +0.033 / WHS
   +0.024, `~/.cache/kbuild/perf-hw_be78350.bit` (§2 timing closure). Not
   yet run on the board.
+- 2026-11-11: after the CALL-squash fix (`c1874cf`, tier 1 −0.298),
+  `a5d20f2` (EI raw-bit match, the core's ready off the ownership mux):
+  tier 1 WNS +0.016 / WHS +0.024, `~/.cache/kbuild/perf-hw_a5d20f2.bit`
+  (§2 timing after the CALL-squash fix). Not yet run on the board.
