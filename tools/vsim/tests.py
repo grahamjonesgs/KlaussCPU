@@ -2551,6 +2551,48 @@ def lcd_sq_spec_once():
     return out
 
 
+@test
+def call_sq_spec_target():
+    """A CALL whose return-address push posts speculatively (EN_ST1) and
+    then turns out to overlap code (sq_spec: here SP - 8 is an executed,
+    I-cache-valid code dword) squashes everything younger and refetches.
+    The refetch must start at the CALL's target, not its fall-through: on
+    be78350 it restarted at the fall-through and skipped the whole callee
+    (Linux: bootstrap()'s memcpy got a NULL kmem_cache, early-boot panic;
+    there the trigger was the tag-shadow guard's conservative sn_rc, when
+    the callee's own line fill landed on the stack slot's I-cache index).
+    Relative, absolute and register-indirect calls; the callee sets r6 and
+    returns, the fall-through counts itself in r5."""
+    out = []
+    for kind in ('rel', 'abs', 'reg'):
+        for fill in range(0, 4):
+            for lat in (1, 3, 6):
+                a = Asm()
+                while a.pc % 16:
+                    a.nop()
+                a.label('L'); a.nop(); a.nop()        # an executed code dword
+                a.setr(5, 0); a.setr(6, 0)
+                a.leapc(2, 'L'); a.addi_s(2, 2, 8)
+                a.setsp(2)                            # the push lands on L
+                a.leapc(3, 'f')
+                for _ in range(fill):
+                    a.nop()
+                if kind == 'rel':
+                    a.call('f')
+                elif kind == 'abs':
+                    a.jmp_abs('f', link=True)
+                else:
+                    a.jmpr(3, link=True)
+                a.addi_s(5, 5, 1)                     # the fall-through, once
+                a.halt()
+                a.label('f')
+                a.setr(6, 0x77)
+                a.ret()
+                out.append((a, {'end': 'park', 'kind': '0', 'r5': 1, 'r6': 0x77},
+                            [f'+LAT={lat}']))
+    return out
+
+
 @mpu_test
 def wp_mpu_denied_load():
     """review 2 #2: a read watchpoint on a dword whose load the MPU denies

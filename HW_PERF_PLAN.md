@@ -145,6 +145,15 @@ A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
   not post. It fired in 3 of ~1000 directed tests (+9 to +15 cycles each);
   no directed or swept self-modifying-code case produced a stale read in a
   simulation model of the RAM's sampling, so it is defensive.
+  **It exposed a latent EN_ST1 bug** (be78350's Linux early-boot panic,
+  reproduced in tb_soc): a store that posts speculatively and then turns
+  out not postable (`sq_spec`) squashes everything younger and refetches
+  from `st_spec_nx` — the store's fall-through, also for a CALL's
+  return-address push, so the callee was skipped. Before the guard a
+  CALL's push was never refused (its stack slot is not code); with it,
+  the callee's own line fill landing on the stack slot's I-cache index
+  refuses it. The refetch pc is now the op's successor (`mem_succ`: a
+  CALL's target); test `call_sq_spec_target`.
 - **Area estimate** (not synthesised here): BRAM +2 RAMB36 for `ic_data`
   (1024 × 128); `ic_tag` stays one RAMB18; the tag shadow is one or two
   RAMB18 (and the DCBZ-era LUTRAM shadow goes away). About +1.1k flip-flops

@@ -1447,6 +1447,12 @@ module pipeline_core
    logic               id_bp_unc, id_bp_cnd, id_bp_fbr, id_bp_abs;
    logic               ex_bp_cnd, ex_ptk, mem_bp_fbr, mem_ptk;
    logic [31:0]        mem_pc_next;
+   // EN_ST1: the MEM op's architectural successor — mem_pc_next, or for a
+   // CALL (the only store whose successor is not its fall-through) its
+   // target.  The refetch pc when a speculatively posted store squashes
+   // (st_spec_nx / sq_spec): a CALL's push squashing to its fall-through
+   // skipped the whole callee (Linux early-boot panic on be78350).
+   logic [31:0]        mem_succ;
    wire  [31:0]        id_bp_off = id_bp_fbr ? id_var2 : id_var1;
    wire  [31:0]        id_bp_tgt = id_bp_abs ? id_var1 : id_pc + id_bp_off;
    // 2a BTIC (see EN_BTIC): 64 entries, index = pc[7:2] ^ pc[13:8].  Tag,
@@ -2257,7 +2263,8 @@ module pipeline_core
    logic        m_vav, sq_vav;
    // EN_ST1: st_spec = the store that left MEM last edge posted
    // speculatively (st_post_ok is its verdict this cycle); st_spec_nx = its
-   // fall-through, the refetch pc if it was not postable
+   // successor (fall-through; a CALL's target), the refetch pc if it was
+   // not postable
    logic        st_spec;
    logic [31:0] st_spec_nx;
    logic [28:0] if_req_dw;
@@ -3342,7 +3349,7 @@ module pipeline_core
                      // posted store's — unless it chained on as that drained)
                      if (st_spec_now || (w_mrdy && mem_iaddr != m_addr)) st_post <= 1'b1;
                      st_spec    <= 1'b1;
-                     st_spec_nx <= mem_pc_next;
+                     st_spec_nx <= mem_succ;      // (a CALL: its target)
                   end
                end
                2'd1: if (w_mrdy) begin
@@ -3850,6 +3857,7 @@ module pipeline_core
                mem_eiser  <= ex_eiser;
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
                mem_ptk    <= ex_ptk;  mem_pc_next <= ex_pc_next;
+               mem_succ   <= (ex_d.uop == U_CALL) ? exo_target : ex_pc_next;
                mem_bp_idx <= ex_bp_idx;  mem_bp_ctr <= ex_bp_ctr;
                mem_bp_fbr <= ex_valid && ex_d.uop == U_FBR;
                // 2a: a taken CALL pushes its return address as it leaves EX
@@ -4243,9 +4251,10 @@ module pipeline_core
          // EN_ST1: the store that posted speculatively last edge overlaps
          // fetch-side code.  Everything younger (MEM, EX, ID, the IFB) was
          // fetched before its write: squash it all and refetch from the
-         // store's fall-through.  Last in the block: wins over every other
-         // redirect / dispatch this edge.  (MEM -> WB and the RAS push are
-         // gated by sq_spec where they are written.)
+         // store's successor (a CALL's is its target: mem_succ).  Last in
+         // the block: wins over every other redirect / dispatch this edge.
+         // (MEM -> WB and the RAS push are gated by sq_spec where they are
+         // written.)
          if (sq_spec) begin
             ev_ovr = 1'b1;
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;
