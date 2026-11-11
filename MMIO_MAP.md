@@ -20,8 +20,8 @@ cache controller.
 0xF004_xxxx                 LEDs / switches
 0xF005_xxxx                 cache controller (counters + control)
 0xF006_xxxx                 Ethernet — LiteEth CSRs (control + MDIO + MAC)
-0xF007_xxxx                 reserved (gap inside LiteEth WB space, returns 0)
-0xF008_xxxx                 Ethernet — RX/TX slot SRAM buffers (8 KiB)
+0xF007_xxxx                 Ethernet — ETH_RX_SLOTS at 0xF007_0000 (bridge-owned; rest reads 0)
+0xF008_xxxx                 Ethernet — RX/TX slot SRAM buffers (RX0..RX7, TX0; 18 KiB)
 0xF009_xxxx                 reserved
 0xF00A_xxxx                 Crypto — AES-128 (+ AES-GCM, planned)
 0xF00B_xxxx                 Crypto — SHA-256 (+ HMAC wrapper, planned)
@@ -513,7 +513,9 @@ void perf_profile(void (*workload)(void)) {
 on the Nexys A7's SMSC LAN8720A RMII PHY. The CPU reaches LiteEth through the
 [eth_mmio_bridge.v](KlaussCPU.srcs/sources_1/new/eth_mmio_bridge.v) which
 translates the 64-bit MMIO bus into LiteEth's 32-bit classic Wishbone slave
-(byte-for-byte, `cpu_byte_addr − 0xF006_0000` → LiteEth WB byte addr).
+(byte-for-byte, `cpu_byte_addr − 0xF006_0000` → LiteEth WB byte addr, except
+that the bridge remaps the slot SRAM so the 2-slot addresses did not move, and
+owns the `0xF007` window itself — see "Slot SRAM" and `ETH_RX_SLOTS` below).
 
 The MAC handles framing, preamble/SFD, padding, and CRC32. It does **not**
 implement IP, ARP, UDP, or TCP — those live in software (lwIP recommended).
@@ -526,8 +528,8 @@ device-id slot):
 
 ```
 0xF006_0000 – 0xF006_FFFF   CSR window (control + MDIO + MAC descriptors)
-0xF007_0000 – 0xF007_FFFF   gap (LiteEth WB 0x10000–0x1FFFF; reads 0, writes drop)
-0xF008_0000 – 0xF008_1FFF   slot SRAM (RX0, RX1 — 2 KiB each; TX0 — 2 KiB; TX1 unused)
+0xF007_0000 – 0xF007_FFFF   bridge-owned: ETH_RX_SLOTS at 0xF007_0000; the rest reads 0, writes drop
+0xF008_0000 – 0xF008_4FFF   slot SRAM (RX0..RX7 and TX0 — 2 KiB each; 0xF008_1800 unused)
 ```
 
 #### CSR registers
@@ -539,7 +541,7 @@ other peripherals — software accesses each as a 32-bit `volatile uint32_t`).
 
 | Offset       | Reg                  | RW | Width | Description |
 |--------------|----------------------|----|-------|-------------|
-| 0x0000       | `CTRL_RESET`         | RW | 2     | `[0]` soc_rst (pulse-reset whole LiteEth core), `[1]` cpu_rst (no-op here, no internal CPU) |
+| 0x0000       | `CTRL_RESET`         | RW | 2     | `[0]` soc_rst, `[1]` cpu_rst. Both read back but **do nothing**: in the standalone LiteEth core neither is wired to a reset (found 2026-11-11, HW_PERF_PLAN §3). Only `CPU_RESETN` resets the core. |
 | 0x0004       | `CTRL_SCRATCH`       | RW | 32    | Software scratchpad (default `0x12345678`) — useful as a connectivity self-test |
 | 0x0008       | `CTRL_BUS_ERRORS`    | RO | 32    | Counter of Wishbone bus errors observed by the SoC controller |
 
@@ -560,8 +562,8 @@ or any MDIO-over-GPIO driver works directly; one MDIO transaction takes
 
 | Offset       | Reg                       | RW | Width | Description |
 |--------------|---------------------------|----|-------|-------------|
-| 0x1000       | `RX_SLOT`                 | RO | 1     | Slot number (0 or 1) of the most recently completed RX frame |
-| 0x1004       | `RX_LENGTH`               | RO | 32    | Byte length of the frame in `RX_SLOT` (header through end of payload, no CRC) |
+| 0x1000       | `RX_SLOT`                 | RO | 3     | Slot number (0 … `ETH_RX_SLOTS`−1; 0 or 1 at the reset value) of the oldest received frame software has not released. Valid while `RX_EV_PENDING` = 1. |
+| 0x1004       | `RX_LENGTH`               | RO | 11    | Byte length of the frame in `RX_SLOT` (header through end of payload, no CRC) |
 | 0x1008       | `RX_ERRORS`               | RO | 32    | Free-running count of frames dropped due to FIFO overflow / preamble error |
 | 0x100C       | `RX_EV_STATUS`            | RO | 1     | `[0]` raw RX-done event source (live state) |
 | 0x1010       | `RX_EV_PENDING`           | RW | 1     | `[0]` latched RX-done event. **Write 1 to clear** (W1C). Read 1 means "a frame is ready in `RX_SLOT`." |
@@ -599,7 +601,57 @@ incoming frames here after seeing `RX_EV_PENDING` set.
 0xF008_0800 – 0xF008_0FFF   ETH_RX1   2 KiB RX slot 1
 0xF008_1000 – 0xF008_17FF   ETH_TX0   2 KiB TX slot (only one — see below)
 0xF008_1800 – 0xF008_1FFF   unused    (TX1 was here; LiteEth built with ntxslots=1)
+0xF008_2000 – 0xF008_27FF   ETH_RX2   2 KiB RX slot 2  ┐
+0xF008_2800 – 0xF008_2FFF   ETH_RX3                    │ used only when
+0xF008_3000 – 0xF008_37FF   ETH_RX4                    │ ETH_RX_SLOTS > k
+0xF008_3800 – 0xF008_3FFF   ETH_RX5                    │ (CPU_FEATURES[24])
+0xF008_4000 – 0xF008_47FF   ETH_RX6                    │
+0xF008_4800 – 0xF008_4FFF   ETH_RX7                    ┘
 ```
+
+RX slot k is at `0xF008_0000 + (k < 2 ? k·0x800 : 0x1000 + k·0x800)`, so RX0,
+RX1 and TX0 are where they were on the 2-slot bitstreams. LiteEth itself
+places RX k at WB `0x20000 + k·0x800` and TX0 at `0x24000`;
+[eth_mmio_bridge.sv](KlaussCPU.srcs/sources_1/new/eth_mmio_bridge.sv) remaps
+address bits [15:12] of the `0xF008` window. RX slots are read-only from the
+CPU (writes are dropped). The unused `0xF008_1800` half and everything above
+`0xF008_4FFF` have no slave: an access completes after the bridge's
+256-cycle watchdog and reads `0xFFFF_FFFF`, as before.
+
+#### `ETH_RX_SLOTS` (`0xF007_0000`) — RX slot count
+
+Present when `CPU_FEATURES[24]` = 1 (HW_PERF_PLAN.md §3). On older bitstreams
+`0xF007_0000` has no slave (the access times out and reads `0xFFFF_FFFF`).
+Owned by the bridge, so it is reachable by whichever core owns the LiteEth
+windows (`C2_ETH_OWNER`).
+
+| Bits | RW | Description |
+|---|---|---|
+| `[3:0]` | RW | Number of RX slots the MAC cycles through, 2 … 8. **Reset 2**, by `CPU_RESETN` and by every program load (`LOAD_COMPLETE`). A write of 0 or 1 gives 2; a write of more than 8 (the whole 32-bit value is compared) gives 8. A write must enable byte 0; a write that does not is ignored. |
+| `[11:8]` | R | The maximum, 8. |
+| others | R | 0. The high word (`0xF007_0004`) reads 0. |
+
+Program load **and every write** of `ETH_RX_SLOTS` also flush the MAC's RX
+slot state: the slot counter restarts at 0 and frames not yet released are
+dropped (`RX_EV_PENDING` reads 0). A frame that is arriving at that moment is
+discarded. `RX_ERRORS` is not changed. So a program loaded after Linux sees
+exactly the 2-slot behaviour, and changing the count is safe at any time:
+
+```c
+if (*(volatile uint64_t *)0xF00F0048 & (1u << 24)) {   /* CPU_FEATURES */
+    REG_ETH_RX_SLOTS = 8;              /* flushes; RX_SLOT now runs 0..7 */
+    nslots = REG_ETH_RX_SLOTS & 0xF;   /* 8 */
+}
+/* then enable RX_EV_ENABLE / start polling as usual */
+```
+
+(HW_PERF_PLAN.md specified "write `ETH_RX_SLOTS`, pulse `CTRL_RESET`, enable
+RX". That sequence still works, but the flush comes from the `ETH_RX_SLOTS`
+write: `CTRL_RESET` does nothing in this core.)
+
+With N slots the MAC fills slots 0, 1, …, N−1, 0, … in order. A frame that
+arrives while all N slots hold unreleased frames is dropped and counted in
+`RX_ERRORS`.
 
 **Only one TX slot.** The LiteEth core is generated with `ntxslots: 1`
 (see [tools/liteeth/liteeth_nexys_a7.yml](tools/liteeth/liteeth_nexys_a7.yml)).
@@ -660,7 +712,7 @@ next frame.
 /* Poll (or wait on the IRQ) */
 while (!(REG_ETH_RX_EV_PENDING & 1)) { }
 
-uint32_t slot = REG_ETH_RX_SLOT;     /* 0 or 1 */
+uint32_t slot = REG_ETH_RX_SLOT;     /* 0 .. ETH_RX_SLOTS-1 */
 uint32_t len  = REG_ETH_RX_LENGTH;   /* including 14-byte header, no CRC */
 volatile uint8_t *rx = ETH_RX_SLOT(slot);
 
@@ -672,9 +724,11 @@ REG_ETH_RX_EV_PENDING = 1;
 ```
 
 The MAC will not overwrite a slot whose RX event is still pending — read
-the data first, then clear `RX_EV_PENDING`. With both slots and W1C
-discipline you have a 2-deep ring; if software falls behind by more than
-one frame, subsequent frames increment `RX_ERRORS` and are dropped.
+the data first, then clear `RX_EV_PENDING`. With N = `ETH_RX_SLOTS` slots
+(2 at reset) and W1C discipline you have an N-deep ring: each W1C releases
+the slot in `RX_SLOT` and the next pending frame (if any) appears in
+`RX_SLOT` / `RX_LENGTH`. If software falls behind by more than N−1 frames,
+subsequent frames increment `RX_ERRORS` and are dropped.
 
 #### Interrupts
 
@@ -804,11 +858,13 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[19]` | HMAC-SHA-256 (`0xF00B_0080`; only with SHA-256) |
 | `[20]` | TRNG (`0xF00C_0000`; always built, so always 1) |
 | `[21]` | native SD controller (`SD_CTRL[18]`, `SDM_*` at `0xF000_0100`) |
+| `[24]` | `ETH_RX_SLOTS` (`0xF007_0000`): up to 8 LiteEth RX slots, see the Ethernet section |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
 `0x001F_100D`. With the native SD controller (branch `mmu-sd`) `[21]` is set
-too: `0x0030_100D` lean, `0x003F_100D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+too: `0x0030_100D` lean, `0x003F_100D` full. With `ETH_RX_SLOTS` (branch `perf-hw`)
+`[24]` is set as well: `0x0130_100D` lean, `0x013F_100D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
@@ -1588,14 +1644,19 @@ static inline int trng_read64(uint64_t *out) {
 #define REG_ETH_RX_PREAMBLE_ERR   (*(volatile uint32_t *)(ETH_BASE + 0x103C))
 #define REG_ETH_RX_CRC_ERR        (*(volatile uint32_t *)(ETH_BASE + 0x1040))
 
+/* RX slot count (CPU_FEATURES[24]): [3:0] 2..8, reset 2; [11:8] = 8 */
+#define REG_ETH_RX_SLOTS          (*(volatile uint32_t *)(MMIO_BASE + 0x00070000u))
+
 /* Slot SRAMs (2 KiB each — plain memory, byte-addressable).
  *
  * Note: LiteEth is built with ntxslots=1, so only ETH_TX_SLOT(0) is valid;
- * ETH_TX_SLOT(1)'s address window has no backing SRAM.  Two RX slots
- * (ETH_RX_SLOT(0) and ETH_RX_SLOT(1)) — MAC alternates between them.   */
+ * ETH_TX_SLOT(1)'s address window has no backing SRAM.  RX slots 0 ..
+ * ETH_RX_SLOTS-1 (two at reset) — the MAC fills them in turn.  RX2..RX7
+ * sit above TX0 so that RX0, RX1 and TX0 keep their 2-slot addresses.    */
 #define ETH_SRAM_BASE             (MMIO_BASE + 0x00080000u)
 #define ETH_SLOT_SIZE             2048
-#define ETH_RX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x0000 + (n) * ETH_SLOT_SIZE))
+#define ETH_RX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + \
+                                   ((n) < 2 ? 0 : 0x1000) + (n) * ETH_SLOT_SIZE))
 #define ETH_TX_SLOT(n)            ((volatile uint8_t *)(ETH_SRAM_BASE + 0x1000 + (n) * ETH_SLOT_SIZE))
 #define ETH_TX_SLOT0              ETH_TX_SLOT(0)   /* the only valid TX slot */
 

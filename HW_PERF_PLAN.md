@@ -130,6 +130,41 @@ A new read-only `ICACHE_INFO` at `0xF005_0018`, in the same format as
   changed".
 - **Feature bit.** `CPU_FEATURES[24]` = 1 means `ETH_RX_SLOTS` is present.
 
+### §3 implementation notes (branch `perf-eth`, 2026-11-11)
+
+Implemented as specified, with these choices where the specification could
+not be followed literally or left a detail open:
+
+- **`CTRL_RESET` does nothing** in the standalone LiteEth core (LiteX's
+  `soc_rst` bit is not wired to any reset; true of the old core too), so it
+  cannot restart the slot counter. Closest to the intent: **every write of
+  `ETH_RX_SLOTS` flushes the MAC's RX slot state** (slot counter to 0,
+  unreleased frames dropped). The specified sequence (write `ETH_RX_SLOTS`,
+  pulse `CTRL_RESET`, enable RX) still works; a change while frames are
+  pending is now defined (they are dropped) instead of undefined.
+- **Program load flushes too**, not just restarting the counter: frames left
+  pending by Linux would otherwise show `RX_SLOT` values ≥ 2 to an old
+  program. A frame arriving during a flush is discarded (not stored
+  truncated). `RX_ERRORS` is never cleared.
+- **Clamp** compares the whole 32-bit written value (16 → 8, not 0 → 2). A
+  write must enable byte 0; one that does not is ignored.
+- **The whole `0xF007` window is bridge-owned**: everything except
+  `0xF007_0000` reads 0 and drops writes (MMIO_MAP already said so; before,
+  an access timed out after 256 cycles and read `0xFFFF_FFFF`).
+- **2-slot equivalence**: the stat FIFO pointers also wrap at
+  `ETH_RX_SLOTS`, so at 2 slots the sram_writer is bit-for-bit the old one,
+  including the value `RX_SLOT` reads while nothing is pending.
+- Generated core: LiteX `30dbdec` / LiteEth `cd479a4` / migen `e19524c`
+  (tools/liteeth/REGENERATE.md); hand edits in
+  tools/liteeth/patch_liteeth_core.py.
+- Cost estimate (no synthesis run): +6 RAMB18 (8 RX + 1 TX slot = 9 RAMB18,
+  was 3), about +150–250 LUTs (8-way slot read mux, decoder, 8-entry stat
+  FIFO, slot/pointer wrap compares) and a few dozen FFs.
+- Verification: `tools/ethsim/run_eth_tb.sh all` (the real generated core
+  under Verilator, RMII frames injected / captured; at 2 slots the
+  transcript is identical to the old core's) and `tools/vsim/run.py soceth`
+  (`ETH_RX_SLOTS` and `CPU_FEATURES[24]` through the SoC bus).
+
 ## 4. Misaligned 64-bit accesses trap (opt-in)
 
 - **`STATUS[10]` MAL64**: supervisor read/write through MTSR STATUS, readable in user mode like
