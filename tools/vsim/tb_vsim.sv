@@ -14,12 +14,19 @@
 //   +LAT=<n>        DRAM latency (default 3)   +LATR=<n> random extra
 //   +IRQ_PERIOD=<n> periodic timer IRQ (handler at 0x100000 counts at 0x180000)
 //   +MAXC=<n>       cycle cap (default 2,000,000)
+//   +LDLY=<n> / +LDLYR=<n>  (32 B I-cache lines, HW_PERF_PLAN §5) the 32 B
+//                   line answer (m_line_v) of a DRAM read comes n (+ random
+//                   0..n-1) cycles after its ready, as after a D-cache miss's
+//                   early restart; no request is accepted meanwhile (the
+//                   cache is busy installing).  Default 0: with the ready.
 //===========================================================================
 `timescale 1ns/1ps
 module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                  parameter bit MPU_EN = 1'b1,    // (MPU_EN: only with +define+HAS_MPU)
                  parameter int TLB_N = 32,       // (TLB_N: only with +define+HAS_TLBN)
-                 parameter bit TLB_WALK = 1'b1); // (TLB_WALK: only with +define+HAS_WALK)
+                 parameter bit TLB_WALK = 1'b1,  // (TLB_WALK: only with +define+HAS_WALK)
+                 parameter int IC_LINES = 2048,  // (IC_LINES / IC_LB: only with +define+HAS_ICLB)
+                 parameter int IC_LB = 32);
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -28,6 +35,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic [7:0]   m_be;
    logic         m_zl = 1'b0;      // DCBZ: zero the whole 32 B line (HW_PERF_PLAN §1)
    logic         m_next_valid = 1'b0, m_ready = 1'b0;
+   logic [255:0] m_line = '0;       // HW_PERF_PLAN §5: the 32 B line answer
+   logic         m_line_v = 1'b0;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
    logic [7:0]   perf_stall;
    logic         perf_br, perf_br_taken, perf_fbr_taken;
@@ -77,6 +86,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `ifdef HAS_WALK
       , .TLB_WALK(TLB_WALK)
 `endif
+`ifdef HAS_ICLB
+      , .IC_LINES(IC_LINES), .IC_LB(IC_LB)
+`endif
    ) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
       .m_addr, .m_read_DV, .m_write_DV, .m_wdata, .m_be,
@@ -91,6 +103,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       .h_addr(h_addr), .h_ok(h_ok), .h_dword(h_dword),   // +HIT=<pct> models hits (default: none)
 `endif
       .m_rdata_next, .m_next_valid, .m_ready,
+`ifdef HAS_ICLB
+      .m_line, .m_line_v,
+`endif
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
       .irq_ready, .irq_sel, .irq_vector, .irq_ack, .irq_ack_sel, .int_mask_o,
       .mask_wr, .mask_wdata,
@@ -163,12 +178,31 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       end
    endtask
 
+   // the 32 B line of a DRAM read (HW_PERF_PLAN §5)
+   function automatic logic [255:0] rd_line(input logic [31:0] a);
+      for (int k = 0; k < 4; k++) rd_line[255 - 64*k -: 64] = rd_dw({a[31:5], 5'b0} + 32'(8 * k));
+   endfunction
+   int          ldly = 0, ldly_r = 0, ld_cnt = 0;
+   logic        ld_pend = 1'b0;
+   logic [31:0] ld_addr;
+   longint      n_line = 0;
    always @(posedge clk) begin
       m_ready <= 1'b0;
+      m_line_v <= 1'b0;
       mask_wr <= 1'b0;
+      if (!rst && ld_pend) begin
+         if (ld_cnt > 1) ld_cnt <= ld_cnt - 1;
+         else begin
+            m_line   <= rd_line(ld_addr);
+            m_line_v <= 1'b1;
+            ld_pend  <= 1'b0;
+            n_line++;
+         end
+      end
       if (rst) begin
          in_flight <= 1'b0;
-      end else if (!in_flight && !m_ready && (m_read_DV || m_write_DV)) begin
+         ld_pend   <= 1'b0;
+      end else if (!in_flight && !m_ready && !ld_pend && (m_read_DV || m_write_DV)) begin
          in_flight <= 1'b1;
          q_addr <= m_addr;  q_wr <= m_write_DV;  q_wdata <= m_wdata;  q_be <= m_be;
          q_zl <= m_write_DV && m_zl;
@@ -191,6 +225,17 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                m_next_valid <= (q_addr[31:28] != 4'hF) && (q_addr[4:3] != 2'b11);
                n_rd++;
                if (q_addr[31:28] == 4'hF) n_mmio_rd++;
+               else begin
+                  // the line answer: with the ready, or LDLY(+R) cycles later
+                  automatic int dl = ldly + (ldly_r ? ($urandom % ldly_r) : 0);
+                  if (dl == 0) begin
+                     m_line   <= rd_line(q_addr);
+                     m_line_v <= 1'b1;
+                     n_line++;
+                  end else begin
+                     ld_pend <= 1'b1;  ld_cnt <= dl;  ld_addr <= q_addr;
+                  end
+               end
             end
             m_ready   <= 1'b1;
             in_flight <= 1'b0;
@@ -287,6 +332,28 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.wk_fin) wk_n++;
       if (dut.wk) wk_cyc++;
       if (dut.sq_v) sq_cyc++;
+   end
+`endif
+   // HW_PERF_PLAN §5: 32 B line installs, installs dropped (a write to the
+   // line was on the port / queued as it arrived), valid sets deferred
+   // behind a snoop clear, flash-clear sweeps started
+   longint ic_inst = 0, ic_drop = 0, ic_vdefer = 0, ic_sweeps = 0;
+`ifdef HAS_ICLB
+   logic sw_q = 1'b0;
+   bit   icdbg = 0;   // +ICDBG: print each miss issue, line install and sweep
+   initial icdbg = $test$plusargs("ICDBG");
+   always @(posedge clk) if (!rst && icdbg) begin
+      if (perf_ic[0]) $display("ICDBG t=%0d miss pc=%08x dw=%08x", cyc, dut.pc, {dut.miss_dw, 3'b0});
+      if (dut.li_now) $display("ICDBG t=%0d inst idx=%0d pa=%08x", cyc, dut.li_idx, {dut.lp_pa, 5'b0});
+      if (dut.lp_ev && dut.lp_wrh) $display("ICDBG t=%0d drop pa=%08x", cyc, {dut.lp_pa, 5'b0});
+      if (dut.ic_sw && !sw_q) $display("ICDBG t=%0d sweep", cyc);
+   end
+   always @(posedge clk) if (!rst) begin
+      if (dut.li_now) ic_inst++;
+      if (dut.lp_ev && dut.lp_wrh) ic_drop++;
+      if (dut.vs_pend) ic_vdefer++;
+      sw_q <= dut.ic_sw;
+      if (dut.ic_sw && !sw_q) ic_sweeps++;
    end
 `endif
    // LCD strobes (a wrong-path LCD op must not send)
@@ -394,6 +461,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `ifdef HAS_EXC
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
+`ifdef HAS_ICLB
+      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line);
+`endif
 `ifdef HAS_WALK
       $fdisplay(f, "wk_s=%0d wk_n=%0d wk_cyc=%0d wk_irq=%0d", wk_s, wk_n, wk_cyc, wk_irq);
       $fdisplay(f, "wk_post=%0d wk_sq=%0d wk_pend=%0d wk_rd=%0d wk_same=%0d sq_cyc=%0d", wk_post, wk_sq, wk_pend, wk_rd, wk_same, sq_cyc);
@@ -430,6 +500,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       void'($value$plusargs("MAXC=%d", maxc));
       void'($value$plusargs("EDW=%h", edw));
       void'($value$plusargs("HIT=%d", hit_pct));
+      void'($value$plusargs("LDLY=%d", ldly));
+      void'($value$plusargs("LDLYR=%d", ldly_r));
       // debugger state without a debugger driver (DEBUG_EN builds only)
       if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
       // watchpoint 0 on a dword (read / write), without a debugger driver

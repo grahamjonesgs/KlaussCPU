@@ -26,14 +26,26 @@ def git_show(rev, path):
     return subprocess.check_output(['git', '-C', ROOT, 'show', f'{rev}:{rel}'], text=True)
 
 
+def ic_geom():
+    """VSIM_IC=<lines>x<line bytes> (HW_PERF_PLAN §5): the I-cache to
+    elaborate, e.g. 1024x16 (the 16 KiB I-cache before §5), 1024x32 (32
+    KiB), 2048x32 (64 KiB, the core's default); None = the default"""
+    v = os.environ.get('VSIM_IC', '')
+    if not v:
+        return None
+    n, b = v.lower().split('x')
+    return int(n), int(b)
+
+
 def build(rev=None, quiet=True):
     dbg = os.environ.get('VSIM_DEBUG_EN') == '1'     # elaborate DEBUG_EN=1
     noexc = os.environ.get('VSIM_EXC_EN') == '0'     # elaborate EXC_EN=0 (core 2's MMU-less core)
     mpu = os.environ.get('VSIM_MPU_EN') == '1'       # elaborate MPU_EN=1 (off on the A7)
     tlbn = os.environ.get('VSIM_TLB_N', '')         # elaborate TLB_N=<n> (default: the core's, 32)
     nowalk = os.environ.get('VSIM_TLB_WALK') == '0'  # elaborate TLB_EN=1, TLB_WALK=0 (MMU_PLAN §11.8: no walker)
+    ic = ic_geom()                                   # VSIM_IC=<lines>x<bytes>, e.g. 1024x16 (HW_PERF_PLAN §5)
     tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '') + \
-          (f'_tlb{tlbn}' if tlbn else '') + ('_nowalk' if nowalk else '')
+          (f'_tlb{tlbn}' if tlbn else '') + ('_nowalk' if nowalk else '') + (f'_ic{ic[0]}x{ic[1]}' if ic else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -48,7 +60,8 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn + str(nowalk)).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn + str(nowalk) +
+                      str(ic)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -80,6 +93,12 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_DCBZ')
     if 'parameter bit TLB_WALK' in core and not noexc:
         defs.append('+define+HAS_WALK')
+    if 'parameter int IC_LB' in core:
+        defs.append('+define+HAS_ICLB')
+        if ic:
+            defs += [f'-GIC_LINES={ic[0]}', f'-GIC_LB={ic[1]}']
+    elif ic and ic != (1024, 16):
+        raise SystemExit(f'VSIM_IC={ic[0]}x{ic[1]}: this revision has only the 16 KiB / 16 B I-cache')
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-O2', '-Wno-fatal', '-Wno-lint',
            '-Wno-style', '-Wno-MULTIDRIVEN', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_vsim',
            '-Mdir', os.path.join(d, 'obj'), *defs,
@@ -155,7 +174,9 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
     crypto_full: KlaussCPU with every optional crypto block (the default
     build is the lean A7 one)."""
-    tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '')
+    ic = ic_geom()
+    tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '') + \
+          (f'_ic{ic[0]}x{ic[1]}' if ic else '')
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -184,13 +205,19 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
                     '$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes, t=%0d", icount, uart_n, runcyc);')
     tb = tb.replace('   longint last_i = -1;', '   longint last_i = -1;\n   longint runcyc = 0;\n'
                     '   always @(posedge dut.i_Clk) if (dut.st.SM == PIPE_RUN) runcyc++;')
+    ov = []
     if crypto_full:
-        assert tb.count('KlaussCPU dut (') == 1
-        tb = tb.replace('KlaussCPU dut (', "KlaussCPU #(.CRYPTO_AES_EN(1'b1), .CRYPTO_GCM_EN(1'b1), "
-                        ".CRYPTO_SHA_EN(1'b1), .CRYPTO_HMAC_EN(1'b1)) dut (")
+        ov.append(".CRYPTO_AES_EN(1'b1), .CRYPTO_GCM_EN(1'b1), .CRYPTO_SHA_EN(1'b1), .CRYPTO_HMAC_EN(1'b1)")
     if nowalk:       # TLB_EN = 1, TLB_WALK = 0 on core 1 (CPU_FEATURES[25] = 0)
+        ov.append(".CORE1_TLB_WALK(1'b0)")
+    ic = ic_geom()   # VSIM_IC (HW_PERF_PLAN §5): core 1's I-cache geometry
+    if ic and 'CORE1_IC_LB' in allsrc:
+        ov.append(f'.CORE1_IC_LINES({ic[0]}), .CORE1_IC_LB({ic[1]})')
+    elif ic and ic != (1024, 16):
+        raise SystemExit(f'VSIM_IC={ic[0]}x{ic[1]}: this revision has only the 16 KiB / 16 B I-cache')
+    if ov:
         assert tb.count('KlaussCPU dut (') == 1
-        tb = tb.replace('KlaussCPU dut (', "KlaussCPU #(.CORE1_TLB_WALK(1'b0)) dut (")
+        tb = tb.replace('KlaussCPU dut (', 'KlaussCPU #(' + ', '.join(ov) + ') dut (')
     if rev is None and 'wk_fin' in allsrc:
         k = tb.rindex('endmodule')
         tb = tb[:k] + WK_PROBE + tb[k:]

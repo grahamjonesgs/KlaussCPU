@@ -43,9 +43,13 @@ module KlaussCPU #(
     // the hardware TLB walker (MMU_PLAN.md §11.8; needs the TLB): its SRs
     // 0x35-0x37 and the refill of useg misses.  CPU_FEATURES[25].
     parameter bit CORE1_TLB_WALK = 1'b1,
-    // core 1's fetch I-cache: lines of 16 B, direct-mapped (HW_PERF_PLAN.md
-    // §2): 1024 = 16 KiB.  ICACHE_INFO (0xF005_0018) reports it.
-    parameter int CORE1_IC_LINES = 1024,
+    // core 1's fetch I-cache, direct-mapped: CORE1_IC_LINES lines of
+    // CORE1_IC_LB bytes (16 or 32; HW_PERF_PLAN.md §2 / §5): 2048 x 32 B =
+    // 64 KiB (1024 x 32 B = 32 KiB also builds; 1024 x 16 B is the 16 KiB
+    // I-cache before §5, cycle-identical to it).  ICACHE_INFO (0xF005_0018)
+    // reports it.
+    parameter int CORE1_IC_LINES = 2048,
+    parameter int CORE1_IC_LB    = 32,
     // Crypto blocks (CRYPTO_PLAN.md), optional build features; the TRNG is
     // always built.  An absent block's window reads 0 and ignores writes in
     // the normal MMIO time, and contributes no logic.  GCM needs AES, HMAC
@@ -387,10 +391,11 @@ module KlaussCPU #(
    // Cache performance counters / control (driven by mem_read_write below;
    // exposed via MMIO 0xF005_xxxx — see MMIO_MAP.md "Cache controller").
    wire [63:0] w_cache_info;
-   // ICACHE_INFO (0xF005_0018, HW_PERF_PLAN.md §2): core 1's I-cache in
+   // ICACHE_INFO (0xF005_0018, HW_PERF_PLAN.md §2 / §5): core 1's I-cache in
    // CACHE_INFO's format — [63:32] total bytes, [31:24] line bytes, [23:8]
-   // sets, [7:0] ways.  16 KiB: 64'h0000_4000_1004_0001.
-   localparam logic [63:0] LP_ICACHE_INFO = {32'(CORE1_IC_LINES * 16), 8'd16,
+   // sets, [7:0] ways.  64 KiB of 32 B lines: 64'h0001_0000_2008_0001
+   // (16 KiB of 16 B lines, before §5: 64'h0000_4000_1004_0001).
+   localparam logic [63:0] LP_ICACHE_INFO = {32'(CORE1_IC_LINES * CORE1_IC_LB), 8'(CORE1_IC_LB),
                                              16'(CORE1_IC_LINES), 8'd1};
    wire [63:0] w_cnt_read_hits;
    wire [63:0] w_cnt_read_misses;
@@ -676,6 +681,8 @@ module KlaussCPU #(
    wire         pip_bus_idle;   // gates the park -> FSM bus handoff
    wire [7:0]   pip_perf_stall;
    // 1a stage 3 load-hit pipe (core <-> mem_read_write, STAGE3_DCACHE_PLAN.md)
+   wire [255:0] w_cpu_line;     // HW_PERF_PLAN §5: the D-cache's line answer
+   wire         w_cpu_line_v;
    wire [31:0]  w_h_addr;
    wire [15:0]  w_h_pg0, w_h_pg1;
    wire         w_h_c1;
@@ -711,7 +718,7 @@ module KlaussCPU #(
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
                    .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N), .TLB_WALK(CORE1_TLB_WALK),
-                   .IC_LINES(CORE1_IC_LINES)) pipeline_core_i (
+                   .IC_LINES(CORE1_IC_LINES), .IC_LB(CORE1_IC_LB)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -734,6 +741,11 @@ module KlaussCPU #(
       .m_rdata_next (w_mem_read_data_next),
       .m_next_valid (w_mem_next_valid),
       .m_ready    (w_pip_ready),
+      // HW_PERF_PLAN §5: the D-cache's line answer, straight from
+      // mem_read_write (registered there; DRAM reads only, so no splitter
+      // select — the core matches it to its own fill)
+      .m_line     (w_cpu_line),
+      .m_line_v   (w_cpu_line_v),
       .irq_ready  (w_irq_ready),
       .irq_sel    (w_irq_sel),
       .irq_vector (r_interrupt_table[w_irq_sel]),
@@ -1431,7 +1443,9 @@ module KlaussCPU #(
        .i_h_pg1(w_h_pg1),
        .i_h_c1(w_h_c1),
        .o_h_ok(w_h_ok),
-       .o_h_dword(w_h_dword)
+       .o_h_dword(w_h_dword),
+       .o_cpu_line(w_cpu_line),
+       .o_cpu_line_v(w_cpu_line_v)
    );
 
    // ==========================================================================

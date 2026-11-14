@@ -62,12 +62,17 @@ module pipeline_core
    // needs EXC_EN and a cache that serves m_zl).  0 = its encoding is
    // ILLEGAL (core 2: no D-cache) and m_zl stays 0.
    parameter bit DCBZ_EN = 1'b1,
-   // HW_PERF_PLAN.md §2: fetch I-cache lines (16 B each, direct-mapped).
-   // 1024 = 16 KiB on core 1 (core 2 keeps 512 = 8 KiB).  A power of two,
-   // 4..4096; the index VA[IC_IDXW+3:4] must stay inside the 64 KiB page
-   // (VIPT, MMU_PLAN §11.1), so 4096 (64 KiB) is the largest.  The index,
-   // tag and every slice of them derive from this one constant.
-   parameter int IC_LINES = 1024
+   // HW_PERF_PLAN.md §2 / §5: the fetch I-cache, direct-mapped, IC_LINES
+   // lines of IC_LB bytes.  IC_LB = 16 is the original line (per-dword
+   // valid, installed from the port's 2-dword answer; core 2: 512 x 16 B =
+   // 8 KiB); IC_LB = 32 is the D-cache's line, installed whole from the
+   // cache's line answer (m_line) with one valid bit per line (§5; core 1:
+   // 2048 x 32 B = 64 KiB).  IC_LINES is a power of two; IC_LINES * IC_LB
+   // <= 64 KiB, so the index stays inside the 64 KiB page (VIPT, MMU_PLAN
+   // §11.1); 32 B lines need IC_LINES >= 64.  The index, tag and every
+   // slice of them derive from these two constants.
+   parameter int IC_LINES = 2048,
+   parameter int IC_LB    = 32
 )
 (
    input  logic         clk,
@@ -109,6 +114,13 @@ module pipeline_core
    input  logic [63:0]  h_dword,
    input  logic         m_next_valid,
    input  logic         m_ready,
+   // HW_PERF_PLAN.md §5 (IC_LB = 32): the cache's whole 32 B line for each
+   // DRAM read it answers (m_line_v: one cycle, with the read's ready on a
+   // hit, or later — after an early-restart ready — when a miss's line has
+   // arrived; dword k of the line at [255-64k -: 64]).  The I-cache installs
+   // the first one at or after its fill's ready.  Unused with IC_LB = 16.
+   input  logic [255:0] m_line,
+   input  logic         m_line_v,
    // LCD side port
    output logic [7:0]   lcd_byte,
    output logic         lcd_dc,
@@ -624,11 +636,30 @@ module pipeline_core
    // one D-cache line (index bit 0 = VA[4]); the snoop structures below are
    // split by that bit so each one is IC_LINES/2 deep — the depth an 8 KiB
    // cache had — and a DCBZ reads both halves at one pair index.
+   // HW_PERF_PLAN §5 (IC_LB = 32, IC32): a line is a whole D-cache line,
+   // two 16 B "sub-lines".  The front end (window, NLB, prefetch, BTIC
+   // windows, pos tracker) still works in 16 B sub-lines (ic_look_idx,
+   // ic_rd_idx, pf_line); the arrays are indexed by the line (ic_look_li).
+   // With IC_LB = 16 the sub-line is the line and every expression below
+   // reduces to the 16 KiB design's.
+   localparam bit IC32     = (IC_LB == 32);
+   localparam int IC_LW    = IC32 ? 2 : 1;      // log2(dwords per line)
+   localparam int IC_SL    = IC_LW - 1;         // log2(16 B sub-lines per line)
    localparam int IC_IDXW  = $clog2(IC_LINES);  // line index width
-   localparam int IC_TAGW  = 28 - IC_IDXW;      // tag width (line address 28 b)
-   localparam int IC_PRW   = IC_IDXW - 1;       // pair index width
+   localparam int IC_SUBW  = IC_IDXW + IC_SL;   // sub-line index width
+   localparam int IC_TAGW  = 29 - IC_LW - IC_IDXW;   // tag width (dword address 29 b)
+   localparam int IC_PRW   = IC_IDXW - 1;       // (16 B) pair index width
+   // the store snoop's shadow read index: (16 B) the 32 B pair, (32 B) the line
+   // — either way the store's D-cache line, mem_iaddr[IC_SNW+4:5]
+   localparam int IC_SNW   = IC32 ? IC_IDXW : IC_PRW;
    localparam int IC_PAIRS = IC_LINES / 2;
-   (* ram_style = "block" *) logic [127:0]       ic_data [0:IC_LINES-1];  // {addr3=0 dw [127:64], addr3=1 dw [63:0]}
+   // elaboration check: a supported geometry
+   if (!(IC_LB == 16 || IC_LB == 32) || IC_LINES * IC_LB > 65536 || (IC_LINES & (IC_LINES - 1)) != 0 ||
+       (IC32 && IC_LINES < 64) || IC_LINES < 4)
+      $error("pipeline_core: unsupported I-cache geometry IC_LINES=%0d IC_LB=%0d", IC_LINES, IC_LB);
+   // {dword 0 [IC_LB*8-1 -: 64], dword 1, ...}: (16 B) {addr3=0 dw [127:64],
+   // addr3=1 dw [63:0]}; (32 B) the D-cache line layout, dw k at [255-64k -: 64]
+   (* ram_style = "block" *) logic [IC_LB*8-1:0] ic_data [0:IC_LINES-1];
    // The fetch-side tag is LUTRAM (§2 timing closure): its registered read
    // (ic_rd_tag) then starts the hit compare at a flip-flop next to it.  As
    // a block RAM the hit path began with the RAM's clock-to-out plus a long
@@ -668,6 +699,38 @@ module pipeline_core
    // A stale 0 tag only makes posting conservative for addresses below
    // IC_LINES*16 (16 KB).
    initial for (int i = 0; i < IC_PAIRS; i++) begin ic_tagff_e[i] = '0; ic_tagff_o[i] = '0; end
+   // ---- HW_PERF_PLAN §5, IC_LB = 32 ----
+   // The snoop's tag shadow: one bank (a store, and a DCBZ, covers exactly
+   // one 32 B line), block RAM read at sn_pra, the store's line index.
+   logic [IC_TAGW-1:0] ic_tagsh [0:IC_LINES-1];
+   initial for (int i = 0; i < IC_LINES; i++) ic_tagsh[i] = '0;
+   // Line valid bits: LUTRAM, VB_N banks of VB_D lines (the bank is the
+   // line index's high bits), one bit per line.  Every install writes the
+   // whole line, so one bit says everything (no per-dword presence).  One
+   // write port per bank: the sweep (all banks at once), else a snoop
+   // clear, else a pending valid set (see g_vl).  A flash clear (reset,
+   // start / debugger resume, ICACHE_INV) is a VB_D-cycle sweep (ic_sw):
+   // while it runs every lookup misses and no valid bit is set.  (2048
+   // flip-flops with a one-cycle clear, the 16 B design scaled, would be
+   // ~3k LUTs of decode and read muxes and a 2048-way clear fanout.)
+   localparam int VB_D  = 64;
+   localparam int VB_AW = $clog2(VB_D);
+   localparam int VB_N  = (IC_LINES + VB_D - 1) / VB_D;
+   logic               ic_sw;           // flash-clear sweep running
+   logic [VB_AW-1:0]   ic_swa;          // its bank address
+   logic               vl_rd_look, vl_rd_sn;   // valid at ic_look_li / sn_pra
+   // The install.  A fill's ready (early restart on a D-cache miss) serves
+   // the window as before; the line itself arrives with m_line_v, on the
+   // same edge (hit) or a few cycles later (the miss's full line).  lp_v:
+   // a DRAM fill has completed and its line is still to come; the fill's
+   // registers (if_req_dw, if_tghi) hold its address meanwhile, and no new
+   // fill issues.  An install is dropped if a write to its PA line is on
+   // the port or in the store queue as the line arrives (that write lands
+   // in the D-cache after the line was read).
+   logic               lp_v;
+   logic               li_q = 1'b0;     // an install landed on the last edge (its lookup re-reads now)
+   logic               vs_pend;         // a valid set deferred behind a snoop clear
+   logic [IC_IDXW-1:0] vs_idx;
    // M12 snoop split: the tag compare runs at store issue and is registered
    // here; the ic_v* clear lands one cycle later (the one-cycle compare +
    // clear was the tier-1 worst family: tagff LUTRAM read -> 19b compare ->
@@ -696,8 +759,9 @@ module pipeline_core
    logic [IC_IDXW-1:0] ri_idx = '0;
    logic               ev_mload;        // blocking event: mem_iaddr loaded this edge
    // does a pending snoop (index s, pair pr) cover I-cache line i?
+   // (32 B lines: a store or DCBZ covers exactly its own line)
    function automatic logic f_snm(logic [IC_IDXW-1:0] i, logic [IC_IDXW-1:0] s, logic pr);
-      return i[IC_IDXW-1:1] == s[IC_IDXW-1:1] && (pr || i[0] == s[0]);
+      return IC32 ? (i == s) : (i[IC_IDXW-1:1] == s[IC_IDXW-1:1] && (pr || i[0] == s[0]));
    endfunction
    // store-vs-code compares: dword a against the store's dword b, or (zl: a
    // DCBZ, b its line's first dword) any dword of b's 32 B line; the same
@@ -750,9 +814,11 @@ module pipeline_core
    // free first-cycle read of miss_dw stays free; the prefetch resumes.)
    logic              pf_yield;
    wire               pf_sel      = pf_look && !if_look && !(EN_NLB2 && EN_PFYIELD && pf_yield);
-   wire [IC_IDXW-1:0] ic_look_idx = pf_sel ? pf_line[IC_IDXW-1:0]
-                                           : miss_dw[IC_IDXW:1];
-   wire [IC_TAGW-1:0] ic_look_tag = miss_dw[28:IC_IDXW+1];
+   // (§5: the 16 B sub-line looked up, and its line — the arrays' index)
+   wire [IC_SUBW-1:0] ic_look_idx = pf_sel ? pf_line[IC_SUBW-1:0]
+                                           : miss_dw[IC_SUBW:1];
+   wire [IC_IDXW-1:0] ic_look_li  = ic_look_idx[IC_SUBW-1:IC_SL];
+   wire [IC_TAGW-1:0] ic_look_tag = miss_dw[28:IC_IDXW+IC_LW];
    // MMU stage 3 (TE = 1): VIPT.  The index (VA[13:4] at 16 KiB) is
    // untranslated; the tag is PA[31:14] = {PA[31:16], VA[15:14]} (in
    // general {PA[31:16], VA[15:IC_IDXW+4]}: the index stays inside the
@@ -772,31 +838,38 @@ module pipeline_core
    logic [15:0] r_look_vpn = '0, r_look_pa = '0;
    logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
    // registered read of the line for the current miss_dw (1-cycle BRAM latency)
-   logic [IC_IDXW-1:0] ic_rd_idx;
-   logic [127:0]       ic_rd_data;
+   logic [IC_SUBW-1:0] ic_rd_idx;
+   logic [IC_LB*8-1:0] ic_rd_data;
    logic [IC_TAGW-1:0] ic_rd_tag;
    // §2: the line-valid bits are read for BOTH lines of the looked-up pair
    // (two IC_LINES/2:1 muxes from the pair index, the 8 KiB cache's depth);
    // ic_rd_idx[0] picks one after the register, inside the consumers'
    // existing valid-select LUTs (ic_dw_valid, ifr_next_valid).  The dword
    // presence is a LUTRAM read at the line index, registered beside them.
-   logic               ic_rd_lv_e, ic_rd_lv_o;
+   // (§5, 32 B lines: one valid bit for the whole line, ic_rd_lv32.)
+   logic               ic_rd_lv_e, ic_rd_lv_o, ic_rd_lv32;
    logic [1:0]         ic_rd_dv;
-   wire                ic_rd_lv  = ic_rd_idx[0] ? ic_rd_lv_o : ic_rd_lv_e;
-   wire                ic_rd_vhi = ic_rd_lv && ic_rd_dv[1];
-   wire                ic_rd_vlo = ic_rd_lv && ic_rd_dv[0];
-   wire [IC_PRW-1:0]   ic_look_pr = ic_look_idx[IC_IDXW-1:1];
+   wire                ic_rd_lv  = IC32 ? ic_rd_lv32 : ic_rd_idx[0] ? ic_rd_lv_o : ic_rd_lv_e;
+   wire                ic_rd_vhi = ic_rd_lv && (IC32 || ic_rd_dv[1]);
+   wire                ic_rd_vlo = ic_rd_lv && (IC32 || ic_rd_dv[0]);
+   wire [IC_PRW-1:0]   ic_look_pr = ic_look_li[IC_IDXW-1:1];
    // pending snoop clear (lands this edge) — read it as already invalid
    // (per half: f_snm against the pair's even / odd line)
    wire snoop_kill_e = snoop_q && f_snm({ic_look_pr, 1'b0}, snoop_idx_q, snoop_pr_q);
    wire snoop_kill_o = snoop_q && f_snm({ic_look_pr, 1'b1}, snoop_idx_q, snoop_pr_q);
+   wire snoop_kill32 = snoop_q && snoop_idx_q == ic_look_li;
    always_ff @(posedge clk) if (ce) begin
       ic_rd_idx   <= ic_look_idx;
-      ic_rd_data  <= ic_data[ic_look_idx];
-      ic_rd_tag   <= ic_tag [ic_look_idx];
-      ic_rd_lv_e  <= ic_lv[{ic_look_pr, 1'b0}] && !snoop_kill_e;
-      ic_rd_lv_o  <= ic_lv[{ic_look_pr, 1'b1}] && !snoop_kill_o;
-      ic_rd_dv    <= ic_dv[ic_look_idx];
+      ic_rd_data  <= ic_data[ic_look_li];
+      ic_rd_tag   <= ic_tag [ic_look_li];
+      if (IC32) begin
+         // (a sweep in progress: nothing is valid)
+         ic_rd_lv32 <= vl_rd_look && !ic_sw && !snoop_kill32;
+      end else begin
+         ic_rd_lv_e  <= ic_lv[{ic_look_pr, 1'b0}] && !snoop_kill_e;
+         ic_rd_lv_o  <= ic_lv[{ic_look_pr, 1'b1}] && !snoop_kill_o;
+         ic_rd_dv    <= ic_dv[ic_look_li];
+      end
       if (EN_TLB) begin
          r_look_vpn  <= look_vpn;
          r_look_um   <= fe_um;
@@ -807,13 +880,15 @@ module pipeline_core
       end
    end
    // hit once the registered read has caught up to the (stable, stalled) miss_dw
-   wire ic_rd_current = (ic_rd_idx == ic_look_idx);
+   // (§5: the same LINE — its registered read holds both 16 B halves)
+   wire ic_rd_current = (ic_rd_idx[IC_SUBW-1:IC_SL] == ic_look_li);
    // (stage 3: the registered look is for this page and fetch mode)
    wire lk_cov        = r_look_hit && r_look_vpn == miss_dw[28:13] && r_look_um == fe_um;
    // (timing: the TE mux is on the reference — registers — so the BRAM's
    // tag output feeds one compare, as before)
-   // ({PA[31:16], VA[15:3]} >> the index: PA[31:IC_IDXW+4], constant shift)
-   wire [IC_TAGW-1:0] ic_ref_tag = (EN_TLB && te) ? IC_TAGW'({r_look_pa, miss_dw[12:0]} >> (IC_IDXW + 1))
+   // ({PA[31:16], VA[15:3]} >> the index: PA[31:IC_IDXW+IC_LW+3], constant
+   // shift; 64 KiB of 32 B lines: PA[31:16], the PFN itself)
+   wire [IC_TAGW-1:0] ic_ref_tag = (EN_TLB && te) ? IC_TAGW'({r_look_pa, miss_dw[12:0]} >> (IC_IDXW + IC_LW))
                                                   : ic_look_tag;
    wire ic_tag_match  = ic_rd_current && (ic_rd_tag == ic_ref_tag) &&
                         (!(EN_TLB && te) || (lk_cov && r_look_ok));
@@ -826,15 +901,36 @@ module pipeline_core
    // defer-guarded; see PIPELINE_M11_REDIRECT.md.)
    // triple mirroring the m_* line-read for this miss_dw (see mem_read_write:
    // addr3=0 -> line[127:64], addr3=1 -> line[63:0]; next = the low dword)
-   wire [63:0] ifr_rdata      = miss_dw[0] ? ic_rd_data[63:0] : ic_rd_data[127:64];
-   wire [63:0] ifr_rdata_next = ic_rd_data[63:0];
-   wire        ifr_next_valid = !miss_dw[0] && ic_rd_vlo;
+   // (§5, 32 B lines: exactly the port's own triple for a 32 B line — the
+   // dword at miss_dw[1:0] and the next one, valid unless it is dword 3)
+   logic [63:0] ifr_rdata, ifr_rdata_next;
+   logic        ifr_next_valid;
+   always_comb begin
+      if (IC32) begin
+         logic [255:0] l;
+         l = 256'(ic_rd_data);
+         case (miss_dw[1:0])
+            2'd0:    begin ifr_rdata = l[255:192]; ifr_rdata_next = l[191:128]; end
+            2'd1:    begin ifr_rdata = l[191:128]; ifr_rdata_next = l[127:64];  end
+            2'd2:    begin ifr_rdata = l[127:64];  ifr_rdata_next = l[63:0];    end
+            default: begin ifr_rdata = l[63:0];    ifr_rdata_next = l[63:0];    end
+         endcase
+         ifr_next_valid = ic_rd_lv && miss_dw[1:0] != 2'd3;
+      end else begin
+         ifr_rdata      = miss_dw[0] ? ic_rd_data[63:0] : ic_rd_data[127:64];
+         ifr_rdata_next = ic_rd_data[63:0];
+         ifr_next_valid = !miss_dw[0] && ic_rd_vlo;
+      end
+   end
    // (if_look is declared in the M9 NLB block above, ahead of the pf_sel mux)
 
    // M9: prefetch-side decode of the registered read (meaningful under pf_sel)
-   wire pf_rd_current = pf_sel && (ic_rd_idx == pf_line[IC_IDXW-1:0]);
-   wire [IC_TAGW-1:0] pf_ref_tag = (EN_TLB && te) ? IC_TAGW'({r_look_pa, pf_line[11:0]} >> IC_IDXW)
-                                                  : pf_line[27:IC_IDXW];
+   // (§5: the same line; the NLB entry takes the 16 B half pf_line[0])
+   wire pf_rd_current = pf_sel && (ic_rd_idx[IC_SUBW-1:IC_SL] == pf_line[IC_SUBW-1:IC_SL]);
+   wire [IC_TAGW-1:0] pf_ref_tag = (EN_TLB && te) ? IC_TAGW'({r_look_pa, pf_line[11:0]} >> (IC_IDXW + IC_SL))
+                                                  : pf_line[27:IC_IDXW+IC_SL];
+   wire [127:0] pf_rd_half = IC32 ? (pf_line[0] ? ic_rd_data[127:0] : ic_rd_data[IC_LB*8-1:IC_LB*8-128])
+                                  : ic_rd_data[127:0];
    wire pf_tag_match  = pf_rd_current && (ic_rd_tag == pf_ref_tag) &&
                         (!(EN_TLB && te) || (r_look_hit && r_look_vpn == pf_line[27:12] &&
                                              r_look_um == fe_um && r_look_ok));
@@ -2521,11 +2617,16 @@ module pipeline_core
    // carries into bits 5, 3 and 16 of the operands' sum.)
    wire [5:0]  ex_tlo5    = {1'b0, ex_ta[4:0]} + {1'b0, ex_tb[4:0]};
    wire [3:0]  ex_tlo3    = {1'b0, ex_ta[2:0]} + {1'b0, ex_tb[2:0]};
-   function automatic logic f_sf_ln(logic [15:0] k);     // EA[15:5] == k[15:5]
-      return f_sum_eq({5'b0, ex_ta[15:5]}, {5'b0, ex_tb[15:5]}, ex_tlo5[5], {5'b0, k[15:5]}, 11);
+   // (the EA's operands and carries are ARGUMENTS, not module signals read
+   // inside the function: sf_a / sf_b / sf_c are continuous assigns, and an
+   // event-driven simulator re-evaluates one only when an argument changes
+   // — xsim did not when ex_tlo5 / ex_tlo3 settled, MMU_PLAN §11.9's
+   // deferred note; synthesis and Verilator were right either way)
+   function automatic logic f_sf_ln(logic [15:0] k, logic [15:0] ta, logic [15:0] tb, logic c5);
+      return f_sum_eq({5'b0, ta[15:5]}, {5'b0, tb[15:5]}, c5, {5'b0, k[15:5]}, 11);   // EA[15:5] == k[15:5]
    endfunction
-   function automatic logic f_sf_dw(logic [15:0] k);     // EA[4:3] == k[4:3]
-      return f_sum_eq({14'b0, ex_ta[4:3]}, {14'b0, ex_tb[4:3]}, ex_tlo3[3], {14'b0, k[4:3]}, 2);
+   function automatic logic f_sf_dw(logic [15:0] k, logic [15:0] ta, logic [15:0] tb, logic c3);
+      return f_sum_eq({14'b0, ta[4:3]}, {14'b0, tb[4:3]}, c3, {14'b0, k[4:3]}, 2);    // EA[4:3] == k[4:3]
    endfunction
    wire [7:0]  ex_ldmask  = (ex_d.uop != U_LOAD || ex_d.msz == 2'd3) ? 8'hFF
                           : (ex_d.msz == 2'd2) ? (ex_tlo3[2] ? 8'hF0 : 8'h0F)
@@ -2544,15 +2645,15 @@ module pipeline_core
    wire        sf_te      = EN_TLB && te;
    // (HW_PERF_PLAN §1: a DCBZ matches every dword of its line — it writes
    // them all — and, its data being 0 with byte enables FF, forwards zeros)
-   wire        sf_a       = mem_valid && mem_port_wr && f_sf_ln(mem_iaddr[15:0]) &&
-                            ((EN_DCBZ && mem_d.zl) || f_sf_dw(mem_iaddr[15:0])) &&
+   wire        sf_a       = mem_valid && mem_port_wr && f_sf_ln(mem_iaddr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo5[5]) &&
+                            ((EN_DCBZ && mem_d.zl) || f_sf_dw(mem_iaddr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo3[3])) &&
                             (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, mem_iaddr[31:16]));
-   wire        sf_b       = m_write_DV && f_sf_ln(m_addr[15:0]) &&
-                            ((EN_DCBZ && m_zl) || f_sf_dw(m_addr[15:0])) &&
+   wire        sf_b       = m_write_DV && f_sf_ln(m_addr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo5[5]) &&
+                            ((EN_DCBZ && m_zl) || f_sf_dw(m_addr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo3[3])) &&
                             (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, m_addr[31:16]));
    // EN_SQ: the queued store (younger than the posted one on the port)
-   wire        sf_c       = EN_SQ && sq_v && f_sf_ln(sq_addr[15:0]) &&
-                            ((EN_DCBZ && sq_zl) || f_sf_dw(sq_addr[15:0])) &&
+   wire        sf_c       = EN_SQ && sq_v && f_sf_ln(sq_addr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo5[5]) &&
+                            ((EN_DCBZ && sq_zl) || f_sf_dw(sq_addr[15:0], ex_ta[15:0], ex_tb[15:0], ex_tlo3[3])) &&
                             (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, sq_addr[31:16]));
    // (TE = 1) the youngest offset-matching store's VA page = the load's
    wire        sf_vaa     = f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]);
@@ -2611,21 +2712,43 @@ module pipeline_core
    // both; sn_hit = tag match (snoop), sn_code = a valid matching line (post)
    // (§2: the even / odd shadow banks and valid bits are read at the pair
    // index — one read address per array, IC_LINES/2 deep)
-   wire [IC_IDXW-1:0] sn_idx  = mem_iaddr[IC_IDXW+3:4];
+   // (§5, 32 B lines: one shadow, read at the store's line index; a DCBZ
+   // covers exactly that line)
+   wire [IC_IDXW-1:0] sn_idx  = mem_iaddr[IC_IDXW+IC_LW+2:IC_LW+3];
    // (the tag shadow's read address: its own copy of mem_iaddr's pair index,
    // loaded with it, so synthesis absorbs it into the block RAM — §11.9's
    // mem_iaddr rewrite had lost that absorption: 2 RAMB18 -> 384 LUTRAM)
-   logic [IC_PRW-1:0] sn_pra;
-   wire [IC_PRW-1:0]  sn_pr   = sn_pra;
-   wire        sn_te      = ic_tagff_e[sn_pr] == mem_iaddr[31:IC_IDXW+4];
-   wire        sn_to      = ic_tagff_o[sn_pr] == mem_iaddr[31:IC_IDXW+4];
-   wire        sn_ve      = sn_te && ic_lv[{sn_pr, 1'b0}];
-   wire        sn_vo      = sn_to && ic_lv[{sn_pr, 1'b1}];
-   wire        sn_hit     = mzl ? (sn_te || sn_to) : sn_idx[0] ? sn_to : sn_te;
-   wire        sn_code    = mzl ? (sn_ve || sn_vo) : sn_idx[0] ? sn_vo : sn_ve;
+   logic [IC_SNW-1:0] sn_pra;
+   wire [IC_SNW-1:0]  sn_pr   = sn_pra;
+   wire        sn_te      = ic_tagff_e[sn_pr[IC_PRW-1:0]] == mem_iaddr[31:IC_IDXW+4];
+   wire        sn_to      = ic_tagff_o[sn_pr[IC_PRW-1:0]] == mem_iaddr[31:IC_IDXW+4];
+   wire        sn_ve      = sn_te && ic_lv[{sn_pr[IC_PRW-1:0], 1'b0}];
+   wire        sn_vo      = sn_to && ic_lv[{sn_pr[IC_PRW-1:0], 1'b1}];
+   wire        sn_t32     = ic_tagsh[sn_pr] == mem_iaddr[31:IC_IDXW+5];
+   wire        sn_hit     = IC32 ? sn_t32 : mzl ? (sn_te || sn_to) : sn_idx[0] ? sn_to : sn_te;
+   wire        sn_code    = IC32 ? (sn_t32 && vl_rd_sn) : mzl ? (sn_ve || sn_vo) : sn_idx[0] ? sn_vo : sn_ve;
+   // §5: the pending install (lp_v): its PA line (the fill's registers hold
+   // it), whether it is DRAM (the D-cache answers it with a line), and the
+   // install itself — on the line's arrival, unless a write to that PA line
+   // is on the port or queued then (it reaches the D-cache after the line
+   // was read).  Registers only, except the arrival.
+   wire [26:0]        lp_pa   = {if_tghi, if_req_dw[12:2]};
+   wire               lp_dram = if_tghi[15:12] != 4'hF;
+   wire               lp_fill = IC32 && if_xc && !(EN_EXC && if_fake) && w_mrdy && lp_dram;
+   wire               lp_ev   = IC32 && ce && !rst && m_line_v && (lp_v || lp_fill);
+   wire               lp_wrh  = (m_write_DV && m_addr[31:5] == lp_pa) ||
+                                (EN_SQ && sq_v && sq_addr[31:5] == lp_pa);
+   wire               li_now  = lp_ev && !lp_wrh;
+   wire [IC_IDXW-1:0] li_idx  = if_req_dw[IC_IDXW+1:2];
+   wire [IC_TAGW-1:0] li_tag  = IC_TAGW'({if_tghi, if_req_dw[12:0]} >> (IC_IDXW + IC_LW));
    // (an install since mem_iaddr was loaded may be missing from the
    // shadow read: see ri_v — registers only, beside the RAM's compare)
-   wire        sn_rc      = ri_v && (ri_m || f_snm(ri_idx, sn_idx, mzl));
+   // (§5: a store to the PA line of a pending install is a snoop hit too:
+   // the install is dropped (lp_wrh) or, landing on the store's issue
+   // edge, cleared by this snoop; either way the BTIC entries of that line
+   // die and the store does not post)
+   wire        sn_rc      = (ri_v && (ri_m || f_snm(ri_idx, sn_idx, mzl))) ||
+                            (IC32 && lp_v && mem_iaddr[31:5] == lp_pa);
    // (HW_PERF_PLAN §1: a DCBZ's compares are line-granular: mzl)
    wire        smc_hit_id = smc_st && id_valid &&
                             (f_dweq(id_pc[31:3], smc_dw, mzl) || f_dweq(id_last_dw, smc_dw, mzl));
@@ -2637,6 +2760,68 @@ module pipeline_core
    // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
    wire        icinv      = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
                             mem_be[0] && mem_wdata[3];
+
+   // ------------- HW_PERF_PLAN §5: line valid bits (IC_LB = 32) -------------
+   // VB_N LUTRAM banks of VB_D x 1, the bank = the line index's high bits.
+   // One shared write address, a write enable per bank, one write per
+   // cycle: the sweep (every bank at ic_swa, 0), else a snoop clear
+   // (snoop_q at snoop_idx_q, 0), else a valid set (1) — an install's
+   // (li_now) or a deferred one (vs_pend).  A set that meets a clear of
+   // the same line is dropped (the store hit the line just installed, or
+   // the snoop of a store to the pending install's line); one that meets
+   // a clear of another line, or a sweep, waits (vs_pend: the latest one;
+   // an install during a sweep is of a fill completed after the sweep's
+   // trigger — start and ICACHE_INV drop lp_v — so its line is current).
+   // Two asynchronous reads: the lookup's (ic_look_li, registered into
+   // ic_rd_lv32) and the store snoop's (sn_pra, beside the shadow's
+   // compare).  The sweep starts on reset, start / debugger resume and
+   // ICACHE_INV and runs VB_D cycles; until it ends every lookup misses.
+   // It is skipped when no valid bit has been set since the last sweep
+   // (vl_any; the configuration's LUTRAM is all 0, and vl_any's power-up
+   // value is 0 and survives reset).
+   generate if (IC32) begin : g_vl
+      wire               vreq  = li_now || vs_pend;
+      wire [IC_IDXW-1:0] vidx  = li_now ? li_idx : vs_idx;
+      wire               vdrop = snoop_q && snoop_idx_q == vidx;
+      wire [IC_IDXW-1:0] wl    = snoop_q ? snoop_idx_q : vidx;
+      wire [VB_AW-1:0]   wa    = ic_sw ? ic_swa : wl[VB_AW-1:0];
+      wire               wd    = !ic_sw && !snoop_q;
+      wire               swgo  = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv;
+      logic [VB_N-1:0]   bl, bs;
+      logic              vl_any = 1'b0;
+      for (genvar b = 0; b < VB_N; b++) begin : g_b
+         (* ram_style = "distributed" *) logic m [0:VB_D-1];
+         initial for (int i = 0; i < VB_D; i++) m[i] = 1'b0;
+         wire we = ic_sw || ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
+         always_ff @(posedge clk) if (ce && !rst && we) m[wa] <= wd;
+         assign bl[b] = m[ic_look_li[VB_AW-1:0]];
+         assign bs[b] = m[sn_pra[VB_AW-1:0]];
+      end
+      assign vl_rd_look = bl[ic_look_li >> VB_AW];
+      assign vl_rd_sn   = bs[sn_pra >> VB_AW];
+      always_ff @(posedge clk)
+         if (rst) begin
+            ic_sw <= vl_any;  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+         end else if (ce) begin
+            if (ic_sw) begin
+               ic_swa <= ic_swa + 1'b1;
+               if (ic_swa == VB_AW'(VB_D - 1)) begin
+                  ic_sw  <= 1'b0;
+                  vl_any <= 1'b0;
+               end
+            end else if (vreq && !vdrop && !snoop_q)
+               vl_any <= 1'b1;                    // a valid bit is set this edge
+            vs_pend <= vreq && !vdrop && (ic_sw || snoop_q);
+            vs_idx  <= vidx;
+            if (swgo) begin
+               ic_sw <= vl_any || (vreq && !vdrop && !snoop_q && !ic_sw);
+               ic_swa <= '0;  vs_pend <= 1'b0;
+            end
+         end
+   end else begin : g_novl
+      assign vl_rd_look = 1'b0;  assign vl_rd_sn = 1'b0;
+      assign ic_sw = 1'b0;  assign ic_swa = '0;  assign vs_pend = 1'b0;  assign vs_idx = '0;
+   end endgenerate
    // Squash the EX op (it must not enter MEM: it was fetched before the
    // store) / anything younger than the store.
    wire        sq_ex      = smc_hit_ex || (icinv && ex_valid);
@@ -2709,7 +2894,7 @@ module pipeline_core
    // (mirrors the if_look miss-issue condition in the fill engine)
    assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
                        !mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld &&
-                       !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted));
+                       !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted)) && !(IC32 && (lp_v || li_q));
    assign perf_ic[1] = if_xc;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
@@ -3011,7 +3196,7 @@ module pipeline_core
          id_eiser <= 1'b0; ex_eiser <= 1'b0; mem_eiser <= 1'b0;
          id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
-         ic_lv <= '0;
+         ic_lv <= '0;  lp_v <= 1'b0;  // (§5)
       end else if (ce) begin
          // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
          // real write sites below, folded by the pos_track composer at the
@@ -3651,7 +3836,9 @@ module pipeline_core
          // cycle's, exactly as if loaded by the issue.  (§2 timing closure:
          // their enable was the issue condition, i.e. !ic_hit — the
          // ic_tag BRAM -> tag compare -> 170-fanout enable path.)
-         if (!if_xc) begin
+         // (§5: and while a completed fill's line is still to come, lp_v —
+         // they hold its address for the install; no fill issues meanwhile)
+         if (!if_xc && !(IC32 && lp_v)) begin
             if_req_dw <= miss_dw;             // old base+data captured together
             r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
             if_rebase <= !in0;
@@ -3697,7 +3884,9 @@ module pipeline_core
                // --- install the fetched dword(s): if_req_dw[0]=addr3 (0->hi dword,
                //     + lo when m_next_valid; 1->lo dword). Per-dword valid tolerates
                //     the partial (odd-address) fill.
-               begin : ic_install
+               // (§5, 32 B lines: the install waits for the D-cache's line,
+               // lp_ev / li_now below the fill engine)
+               if (!IC32) begin : ic_install
                   // Deterministic install (no old-state read → robust to a
                   // redirect during the fill). An even fetch returns BOTH dwords
                   // (m_next_valid always set for addr3=0) → full-line install; an
@@ -3750,7 +3939,12 @@ module pipeline_core
                      it_ref <= 1'b1;  it_vpn <= miss_dw[28:13];  it_asid <= tlb_asid;
                   end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
-                            && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted))) begin
+                            && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted)) && !(IC32 && (lp_v || li_q))) begin
+                  // (§5 !lp_v: a completed fill's line is still to come — the
+                  // D-cache is busy with it anyway; this lookup re-reads after
+                  // the install and usually hits the line it just missed.
+                  // li_q: the install landed on the last edge, after this
+                  // cycle's registered read was taken)
                   // !irq_active: a lookup that was live when the IRQ was taken must
                   // NOT issue its miss-fill during IRQ entry — the sequencer's frame
                   // push only checks !if_xc, so a same-cycle (or mid-push) fill issue
@@ -3819,6 +4013,26 @@ module pipeline_core
             end
          end
 
+         // ---------- HW_PERF_PLAN §5: 32 B line install (IC_LB = 32) ----------
+         // A DRAM fill's line arrives with m_line_v — on its ready edge (a
+         // D-cache hit) or later (a miss: the ready was the early restart).
+         // The whole line is written at once (data, both tags); its valid
+         // bit is set by g_vl (or deferred behind a snoop clear).  lp_v
+         // marks a fill whose line is still to come.  (start / ICACHE_INV
+         // drop it below; the sweep they start covers a same-edge install.)
+         if (IC32) begin
+            if (li_now) begin
+               ic_data[li_idx]  <= m_line;
+               ic_tag[li_idx]   <= li_tag;
+               ic_tagsh[li_idx] <= li_tag;
+               ev_icinst = 1'b1;  ev_icinst_idx = li_idx;   // 2a: BTIC entries of this line die
+            end
+            li_q <= li_now;
+            if (lp_ev)        lp_v <= 1'b0;
+            else if (lp_fill) lp_v <= 1'b1;
+            if (start || (DEBUG_EN && dbg_halted && dbg_i.resume)) lp_v <= 1'b0;
+         end
+
          // ---------------- M9: NLB prefetch engine (background) ----------------
          // Runs the normal 1-cycle BRAM lookup at want_line through the shared
          // read port whenever the demand side is idle; captures on hit, gives
@@ -3833,12 +4047,12 @@ module pipeline_core
                   // EN_NLB2: into the entry that does not hold a line still
                   // ahead of the window (want / want+1)
                   if (EN_NLB2 && (nlb0_has_want || nlb0_has_wp1)) begin
-                     nlb1_data <= ic_rd_data;
+                     nlb1_data <= pf_rd_half;
                      nlb1_line <= pf_line;
                      nlb1_vhi  <= ic_rd_vhi;
                      nlb1_vlo  <= ic_rd_vlo;
                   end else begin
-                     nlb_data <= ic_rd_data;
+                     nlb_data <= pf_rd_half;
                      nlb_line <= pf_line;
                      nlb_vhi  <= ic_rd_vhi;
                      nlb_vlo  <= ic_rd_vlo;
@@ -3901,7 +4115,7 @@ module pipeline_core
                r_bt_widx   <= id_pc[7:2] ^ id_pc[13:8];
                r_bt_wtag   <= id_pc[31:2];
                r_bt_wbase  <= id_bp_tgt[31:3];
-               r_bt_wblidx <= id_pc[IC_IDXW+3:4];
+               r_bt_wblidx <= id_pc[IC_IDXW+IC_LW+2:IC_LW+3];
             end
          end
 
@@ -4112,7 +4326,7 @@ module pipeline_core
                              : ex_x3 ? t1_pahi
                              : t_kseg ? {5'b0, tva[26:16]} : tva[31:16],
                               exo_iaddr[15:0]};
-               sn_pra     <= exo_iaddr[IC_IDXW+3:5];
+               sn_pra     <= exo_iaddr[IC_SNW+4:5];
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
                mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
                mem_xpg    <= ex_x3;
@@ -4450,7 +4664,7 @@ module pipeline_core
             if (if_xc) if_drop <= 1'b1;
          end
          if (icinv) begin
-            ic_lv <= '0;
+            ic_lv <= '0;  lp_v <= 1'b0;  // (§5: a fill's line from before the fence is not installed)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;  snoop_q <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
@@ -4558,15 +4772,15 @@ module pipeline_core
              !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
              !(EN_TLB && (ifb_ft[0] || (ifb_val[1] && ifb_ft[1]))) &&   // (stage 3: a refused page)
              pc_dw == r_bt_wbase && !sq_spec &&
-             !(snoop_q && (f_snm(r_bt_wbase[IC_IDXW:1], snoop_idx_q, snoop_pr_q) ||
+             !(snoop_q && (f_snm(r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW], snoop_idx_q, snoop_pr_q) ||
                            f_snm(r_bt_wblidx, snoop_idx_q, snoop_pr_q)))) begin
             bt_v[r_bt_widx]    <= 1'b1;
             bt_tag[r_bt_widx]  <= r_bt_wtag;
             bt_base[r_bt_widx] <= r_bt_wbase;
             bt_d0[r_bt_widx]   <= ifb_dw[0];
             bt_d1[r_bt_widx]   <= ifb_dw[1];
-            bt_v1[r_bt_widx]   <= ifb_val[1] && !r_bt_wbase[0];
-            bt_lidx[r_bt_widx] <= r_bt_wbase[IC_IDXW:1];
+            bt_v1[r_bt_widx]   <= ifb_val[1] && r_bt_wbase[IC_LW-1:0] != '1;   // (slot 1 in the same line)
+            bt_lidx[r_bt_widx] <= r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW];
             bt_blidx[r_bt_widx] <= r_bt_wblidx;
             bt_bp1[r_bt_widx]  <= r_base_p1;    // = ifb_base + 1 (ifb_base == wbase)
             bt_bp2[r_bt_widx]  <= r_base_p2;
@@ -4897,9 +5111,9 @@ module pipeline_core
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
    // the snoop shadow's read address is the MEM op's I-line index (both
    // unreset: skipped while X in 4-state sims)
-   always_ff @(posedge clk) if (!rst && !$isunknown({sn_pra, mem_iaddr[IC_IDXW+3:5]}))
-      assert (sn_pra == mem_iaddr[IC_IDXW+3:5])
-         else $fatal(1, "sn_pra %h != mem_iaddr index %h", sn_pra, mem_iaddr[IC_IDXW+3:5]);
+   always_ff @(posedge clk) if (!rst && !$isunknown({sn_pra, mem_iaddr[IC_SNW+4:5]}))
+      assert (sn_pra == mem_iaddr[IC_SNW+4:5])
+         else $fatal(1, "sn_pra %h != mem_iaddr index %h", sn_pra, mem_iaddr[IC_SNW+4:5]);
    // (§11.9) the dispatch-time page-crossing bit is ex_xpg
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
       assert (ex_txpg == ex_xpg)

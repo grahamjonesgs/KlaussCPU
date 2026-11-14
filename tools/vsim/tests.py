@@ -5,7 +5,6 @@ token the testbench writes to its .out file."""
 from kasm import Asm, H
 
 DATA = 0x10000          # the TB dumps 0x10000..0x10800
-IC_BYTES = 16384        # core 1's I-cache (IC_LINES 1024 x 16 B, HW_PERF_PLAN §2)
 ALL = {}
 
 
@@ -31,6 +30,24 @@ def _tlb_n():
     return int(_re.search(r'parameter int TLB_N = (\d+)', src).group(1))
 
 
+# core 1's I-cache: VSIM_IC=<lines>x<line bytes> (run.py elaborates it),
+# else pipeline_core's default (2048 x 32 B = 64 KiB, HW_PERF_PLAN §5)
+def _ic_geom():
+    import re as _re
+    v = _os0.environ.get('VSIM_IC', '')
+    if v:
+        n, b = v.lower().split('x')
+        return int(n), int(b)
+    src = open(_os0.path.join(_os0.path.dirname(_os0.path.abspath(__file__)), '..', '..',
+                              'KlaussCPU.srcs', 'sources_1', 'new', 'pipeline_core.sv')).read()
+    n = _re.search(r'parameter int IC_LINES = (\d+)', src)
+    b = _re.search(r'parameter int IC_LB\s*= (\d+)', src)
+    return int(n.group(1)), (int(b.group(1)) if b else 16)
+
+
+IC_LINES, IC_LB = _ic_geom()
+IC_BYTES = IC_LINES * IC_LB
+IC32 = IC_LB == 32          # 32 B lines, installed whole (HW_PERF_PLAN §5)
 NOWALK = _os0.environ.get('VSIM_TLB_WALK') == '0'     # TLB_EN = 1, TLB_WALK = 0 (MMU_PLAN §11.8)
 TLB_N = _tlb_n()
 TLB_IW = TLB_N.bit_length() - 1          # TLB_INDEX bits (log2 N)
@@ -379,6 +396,9 @@ def ic_counters():
     a.fbr('ne', 1, 0, 'l', imm=True)
     a.halt()
     # (EN_BP: the loop-exit fall-through is fetched after the mispredict: +1 miss)
+    # (32 B lines: the setup line and the loop's line; the exit is in the latter)
+    if IC32:
+        return a, {'end': 'park', 'kind': '0', 'ic_miss': '2', 'ic_fill': '10', 'bus_rd': '2'}, []
     return a, {'end': 'park', 'kind': '0', 'ic_miss': '4', 'ic_fill': '20', 'bus_rd': '4'}, []
 
 
@@ -3693,7 +3713,7 @@ def mal64_exempt():
 # ------------------------------------- HW_PERF_PLAN §2: 16 KiB I-cache
 # (IC_BYTES = 16 KiB: index VA[13:4], tag PA[31:14].  Under the old 8 KiB
 # geometry an address and the one 0x2000 above it shared an index.)
-IC_MISS_LOOP12 = 770    # the first pass: 768 lines + the setup / exit lines
+IC_MISS_LOOP12 = 385 if IC32 else 770    # the first pass: 384 / 768 lines + the setup (/ exit) line(s)
 
 
 def _ic_loop(nbytes, passes):
@@ -3798,7 +3818,8 @@ def ic16_smc_alias():
     a.label('X'); a.alui_s('add', 1, 1, 1); a.ret()
     _ic_pad(a, 0x3000)
     a.label('Y'); a.alui_s('add', 2, 2, 1); a.ret()
-    out.append((a, {'end': 'park', 'kind': '0', 'r1': 20, 'r2': 20, 'ic_miss': '5'}, []))   # (8 KiB: 43)
+    out.append((a, {'end': 'park', 'kind': '0', 'r1': 20, 'r2': 20,
+                    'ic_miss': '4' if IC32 else '5'}, []))   # (8 KiB: 43)
     return out
 
 
@@ -3883,8 +3904,10 @@ def ic16_icinv():
     return out
 
 
-IC_MISS_WARM = 514      # 512 lines of B + 2 of main
-IC_MISS_INV = 1028      # every line twice
+IC_MISS_WARM = 257 if IC32 else 514     # 256 / 512 lines of B + 1 / 2 of main
+# every line twice; (32 B lines) + the lines fetched during the 64-cycle
+# flash-clear sweep after ICACHE_INV, which miss once per 16 B half
+IC_MISS_INV = 518 if IC32 else 1028
 
 
 @test

@@ -162,7 +162,17 @@ module mem_read_write (
     input      [15:0] i_h_pg1,
     input             i_h_c1,
     output            o_h_ok,
-    output     [63:0] o_h_dword
+    output     [63:0] o_h_dword,
+
+    // HW_PERF_PLAN.md §5: the whole 32 B line of every CPU read this cache
+    // answers, for the core's 32 B I-cache lines (one cycle, o_cpu_line_v):
+    // with the read's ready on a hit (CHECK), and on a miss when the line
+    // has arrived from DDR (READ_WAIT's install — after the early-restart
+    // ready, or with the fallback ready).  Exactly one per read, never
+    // before its ready and before any later request's; same layout as the
+    // arrays (dword k at [255-64k -: 64]).  Writes give none.
+    output logic [255:0] o_cpu_line = '0,
+    output logic         o_cpu_line_v = 1'b0
 );
 
     parameter  CACHE_SIZE = 1_024;              // number of sets — 2 ways × 1024 sets = 2048 total lines × 32 B = 64 KB
@@ -649,6 +659,7 @@ module mem_read_write (
         // pulses this edge (DV is always high at a ready-set edge).
         if (!(cpu.write_DV || cpu.read_DV))
             r_dv_served <= 1'b0;
+        o_cpu_line_v <= 1'b0;   // (HW_PERF_PLAN §5: one-cycle line strobe)
 
         case (state)
 
@@ -814,6 +825,8 @@ module mem_read_write (
                             cpu.next_valid <= (r_dw_offset != 2'b11);
                         end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
+                        o_cpu_line    <= r_hit_way0 ? r_data_way0 : r_data_way1;
+                        o_cpu_line_v  <= 1'b1;
 
                         cpu.ready     <= 1;
                         r_dv_served   <= 1;              // served-DV guard
@@ -954,6 +967,8 @@ module mem_read_write (
                 end
                 if (w_cache_ddr_ready) begin
                     o_ddr_mem_read_DV <= 0;
+                    o_cpu_line        <= i_ddr_mem_read_data;
+                    o_cpu_line_v      <= 1'b1;
 
                     // Dirty bit cleared via dirty0/1_wen combinatorial wires above.
                     if (r_evict_way == 1'b0) begin
