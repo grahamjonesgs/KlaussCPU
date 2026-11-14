@@ -1784,31 +1784,43 @@ module pipeline_core
    // cycle in EX — its EA is registered (ex_ea_q) in the first, and the
    // region compares run from that register in the second, so the EA adder
    // and the compares are never in series.  Registered terms only.
-   logic        ex_mph;           // the op in EX has had its MPU cycle
-   logic        ex_mph2;          // ... and (TE, two-access op crossing a page) its 2nd-page cycle
-   logic        ex_mok;           // its check cycles are done (= ex_mph && !(ex_xpg_q && !ex_mph2);
-                                  // timing: ex_busy reads one register, as at stage 2)
+   // MMU_PLAN §11.9: with TE = 1 the TLB's data CAM no longer needs that
+   // cycle: it matches the EA's page from the EA's two operands, registered
+   // at dispatch (ex_ta / ex_tb and mmu_tlb's copies), with a carry-free
+   // A + B = K compare — no adder in front of the CAM.  Only MEMGET32 and
+   // LEAVERET whose 2nd doubleword is in the next page (ex_txpg) still take
+   // one extra cycle with TE = 1, to translate that page; the MPU keeps its
+   // cycle for every memory op.
+   logic        ex_mph;           // the op in EX has had its extra cycle
+   logic        ex_mok;           // ... and leaves EX (= ex_mph; timing: ex_busy reads one register)
+   logic        ex_txpg;          // (registered at dispatch: ex_busy reads one register) = ex_xpg
+   // (§11.9) the EX memory op's EA operands, registered at dispatch: EA =
+   // ex_ta + ex_tb (mod 2^32; aligned-down forms share the page).  Read
+   // by STLF's VA-page compare; mmu_tlb keeps its own copies for the CAM.
+   logic [31:0] ex_ta, ex_tb;
+   wire  [16:0] ex_tlo = {1'b0, ex_ta[15:0]} + {1'b0, ex_tb[15:0]};
+   wire         ex_tc  = ex_tlo[16];      // the page offset's carry into bit 16
    // MMU stage 3: a spanning MEMGET32 / LEAVERET (EA = ex_a) whose 2nd
    // doubleword is in the next 64 KiB page
    wire ex_xpg = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
                  ex_a[15:3] == 13'h1FFF;
-   logic [31:0] ex_ea_q;          // exo_eaddr, registered every cycle
-   // (stage 3: the same EX cycle carries the TLB lookup while TE = 1 — the
-   // CAM reads the registered EA; a page-crossing two-access op takes a
-   // third cycle for its 2nd page)
+   logic [31:0] ex_ea_q;          // exo_eaddr, registered while !ex_mph (the MPU's input;
+                                  // with TE = 1 a page-crossing op's 2nd page)
    // (timing: xlt_q / te_q are MPU_EN || TE and TE registered a cycle late
    // — safe: MTSR STATUS serializes and refetches, so no memory op is in EX
    // within a cycle of its commit; start empties the pipe)
-   logic xlt_q = 1'b0, te_q = 1'b0;
+   // (mpu_q: the MPU applies — it is ignored while TE = 1)
+   logic xlt_q = 1'b0, te_q = 1'b0, mpu_q = 1'b0;
    always_ff @(posedge clk) if (ce) begin
       xlt_q <= (EN_MPU && mpu_en) || (EN_TLB && te);
       te_q  <= EN_TLB && te;
+      mpu_q <= EN_MPU && mpu_en && !(EN_TLB && te);
    end
    // (ex_xpg_q: ex_xpg && TE, registered while !ex_mph like ex_ea_q, so
-   // ex_busy takes no ex_a-derived logic)
+   // ex_busy takes no ex_a-derived logic; valid in the op's 2nd cycle)
    logic ex_xpg_q = 1'b0;
    always_ff @(posedge clk) if (ce && !ex_mph) ex_xpg_q <= te_q && ex_xpg;
-   wire ex_mpu_hold = xlt_q && ex_valid && ex_d.is_mem && !ex_mok;
+   wire ex_mpu_hold = ex_valid && ex_d.is_mem && !ex_mok && (mpu_q || (te_q && ex_txpg));
    wire ex_busy    = (ex_is_md && !md_done) || (ex_is_dly && !dly_done)
                   || (ex_is_lcd && !lcd_ready) || ex_lbhold || ex_mpu_hold;
    assign perf_stall[4] = ex_busy;
@@ -2201,10 +2213,14 @@ module pipeline_core
    wire ex_mchk  = EN_MPU && !(EN_TLB && te) && ex_valid && ex_memop && !ex_misal;
    wire ex_x2c   = (ex_d.uop == U_LEAVERET || (ex_d.uop == U_LOAD32 && ex_a[2:0] > 3'd4)) &&
                    ex_a[4:3] == 2'b11;
-   // MMU stage 3 (TE = 1): translate ex_ea_q — segment (§11.2), then the
+   // MMU stage 3 (TE = 1): translate the EA — segment (§11.2), then the
    // TLB's data port.  Per access: segment ACCESS > TLB_MISS > ACCESS (TLB
-   // permission).  The MPU is ignored while TE = 1.
-   wire [31:0] tva    = ex_ea_q;
+   // permission).  The MPU is ignored while TE = 1.  §11.9: in the op's
+   // first EX cycle (the segment from the EA adder; the CAM matches the
+   // EA's page from the dispatch-time operand copies, no adder in front);
+   // in a MEMGET32 / LEAVERET's 2nd cycle, ex_ea_q (its next page if it
+   // crosses one; the CAM's copies are stepped alike).
+   wire [31:0] tva    = ex_mph ? ex_ea_q : exo_eaddr;
    wire        t_useg = !tva[31];
    wire        t_kseg = tva[31:27] == 5'b10000;                 // 0x8000_0000-0x87FF_FFFF
    wire        t_kmap = tva[31:30] == 2'b11 && tva[31:28] != 4'hF;
@@ -2218,7 +2234,7 @@ module pipeline_core
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
    logic [15:0] t1_pahi;
    wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
-   wire ex_x3    = EN_TLB && ex_xpg_q;                          // leaving in its 3rd cycle
+   wire ex_x3    = EN_TLB && ex_mph && ex_xpg_q;                // in its 2nd-page cycle
    wire d1_dn    = ex_x3 ? t1_dn   : t_dn;
    wire d1_seg   = ex_x3 ? t1_seg  : t_seg;
    wire d1_miss  = ex_x3 ? t1_miss : t_miss;
@@ -2463,9 +2479,10 @@ module pipeline_core
    // load's: the MEM store's from mem_eaddr; the port's / queued one's from
    // m_vahi / sq_vahi, valid (m_vav / sq_vav) only for stores issued from
    // MEM and dropped by a TLB / ASID / TE change, which may remap the VA.)
-   // (timing: with TE = 1 the load is in its extra EX cycle, so its VA page
-   // is compared from the registered ex_ea_q, not the EA adder; in a
-   // page-crossing op's 3rd cycle ex_ea_q is the next page: no forward)
+   // (timing, §11.9: the load's VA page is compared from the EA's
+   // dispatch-time operands ex_ta / ex_tb with the CAM's carry-free
+   // A + B = K compare, not from the EA adder.  Only hit-pipe loads
+   // forward, and they never take an extra EX cycle.)
    wire        sf_te      = EN_TLB && te;
    // (HW_PERF_PLAN §1: a DCBZ matches every dword of its line — it writes
    // them all — and, its data being 0 with byte enables FF, forwards zeros)
@@ -2480,16 +2497,15 @@ module pipeline_core
                             ((EN_DCBZ && sq_zl) || sq_addr[4:3] == exo_iaddr[4:3]) &&
                             (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
    // (TE = 1) the youngest offset-matching store's VA page = the load's
-   wire        sf_vaa     = mem_eaddr[31:16] == ex_ea_q[31:16];
-   wire        sf_vab     = m_vav && m_vahi == ex_ea_q[31:16];
-   wire        sf_vac     = sq_vav && sq_vahi == ex_ea_q[31:16];
+   wire        sf_vaa     = f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]);
+   wire        sf_vab     = m_vav && f_pgeq(ex_ta, ex_tb, ex_tc, m_vahi);
+   wire        sf_vac     = sq_vav && f_pgeq(ex_ta, ex_tb, ex_tc, sq_vahi);
    // a candidate may forward: its bytes cover the load's and (TE = 1) its VA
    // page is the load's (timing: folded per candidate, so the late sf_a /
    // sf_c select one bit, as at stage 2)
-   wire        sf_vte     = !sf_te || !ex_xpg_q;
-   wire        sf_cova    = ((mem_be & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vaa));
-   wire        sf_covc    = ((sq_be  & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vac));
-   wire        sf_covb    = ((m_be   & ex_ldmask) == ex_ldmask) && (!sf_te || (sf_vte && sf_vab));
+   wire        sf_cova    = ((mem_be & ex_ldmask) == ex_ldmask) && (!sf_te || sf_vaa);
+   wire        sf_covc    = ((sq_be  & ex_ldmask) == ex_ldmask) && (!sf_te || sf_vac);
+   wire        sf_covb    = ((m_be   & ex_ldmask) == ex_ldmask) && (!sf_te || sf_vab);
    wire        sf_cov     = sf_a ? sf_cova : sf_c ? sf_covc : sf_covb;
    wire        h_line_blk = EN_STLF ? (sf_a || sf_b || sf_c)
                                     : ((m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) ||
@@ -2763,6 +2779,35 @@ module pipeline_core
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
    wire [63:0] wb_fwd_v = ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
+   // MMU_PLAN §11.9: the ID op's EA operands for the data CAM, as they will
+   // be in EX (the operand latches' forwarding, as for ex_a / ex_b / ex_sp):
+   // the base — SP for the stack ops, 0 for [imm], else rs1 — and the
+   // offset — -8 for a push (PUSH / CALL / ENTER), the imm32 for [rs1+imm] /
+   // [imm], rs2 for [rs1+rs2], else 0.  Loaded with the operand latches
+   // (!mem_busy && !ex_busy).  (Only the stack, load and store uops use them.)
+   wire t_sp  = dec.uop == U_PUSH || dec.uop == U_CALL || dec.uop == U_ENTER ||
+                dec.uop == U_POP  || dec.uop == U_RET  || dec.uop == U_IRET;
+   wire t_m8  = dec.uop == U_PUSH || dec.uop == U_CALL || dec.uop == U_ENTER;
+   wire t_ls  = dec.uop == U_LOAD || dec.uop == U_STORE;
+   wire t_lr  = dec.uop == U_LEAVERET;
+   wire t_l32 = dec.uop == U_LOAD32;
+   // ex_xpg's test on a candidate rs1 value: a LEAVERET, or a MEMGET32
+   // spanning two doublewords, whose 2nd doubleword is in the next page
+   function automatic logic f_xpg(logic lr, logic l32, logic [15:0] v);
+      return (lr || (l32 && v[2:0] > 3'd4)) && v[15:3] == 13'h1FFF;
+   endfunction
+   wire [31:0] t_ta_d = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
+                              : (wb_valid && wb_sp_we)   ? wb_sp_new : sp)
+                      : (t_ls && dec.mmode == 2'b10) ? 32'd0
+                      : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
+                      : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v[31:0]
+                      : rf[id_rs1][31:0];
+   wire [31:0] t_tb_d = t_m8 ? 32'hFFFF_FFF8
+                      : (!t_ls || dec.mmode == 2'b00) ? 32'd0
+                      : (dec.mmode != 2'b11) ? id_var1
+                      : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
+                      : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v[31:0]
+                      : rf[dec.rs2][31:0];
    // (timing) f_wz(id_w, wb_fwd_v) for ex_b_zero, from the sources' byte-
    // zero flags in parallel instead of after the MUL / load-extract selects:
    // a MUL's product halves (registers), a load's dword by its size / offset
@@ -2848,7 +2893,7 @@ module pipeline_core
          ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
-         ex_mph2 <= 1'b0; ex_mok <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
+         ex_mok <= 1'b0; ex_txpg <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
          wk <= 1'b0; wk_fin <= 1'b0; wk_pk <= 1'b0; wk_ph <= 2'd0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
@@ -3207,14 +3252,12 @@ module pipeline_core
          end
 
          // ---------------- EX free-running units ----------------
-         // (MMU stage 2 / 3: the MPU's and the TLB's data input — the EA,
-         // captured in the op's first EX cycle; for a page-crossing two-
-         // access op, the next page in its 3rd)
-         if (!ex_mph)                                  ex_ea_q <= exo_eaddr;
-         // (review 3: only on the !mem_busy edge where ex_mph2 / ex_mok /
-         // t1_* advance — free-running, it stepped a page per stalled cycle)
-         else if (ex_mpu_hold && EN_TLB && ex_xpg_q && !mem_busy)
-                                                       ex_ea_q <= {ex_ea_q[31:16] + 16'd1, 16'h0000};
+         // (MMU stage 2: the MPU's data input — the EA, captured in the
+         // op's first EX cycle.  Stage 3, §11.9: with TE = 1, for a page-
+         // crossing two-access op (EA = ex_a), its next page, for the
+         // segment checks of its 2nd cycle.  Reloaded while !ex_mph, so the
+         // value is the one on the !mem_busy edge that sets ex_mph.)
+         if (!ex_mph) ex_ea_q <= (te_q && ex_txpg) ? {ex_a[31:16] + 16'd1, 16'h0000} : exo_eaddr;
          // (multiply chain lives in its own always block above — timing)
 
          case (div_ph)
@@ -3898,18 +3941,15 @@ module pipeline_core
             if (ex_busy) begin
                mem_valid <= 1'b0;
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
-               if (ex_mpu_hold) begin
-                  if (!ex_mph) begin ex_mph <= 1'b1;  ex_mok <= !(te_q && ex_xpg); end
-                  else         begin ex_mph2 <= 1'b1; ex_mok <= 1'b1; end
-               end
-               // (stage 3) the 1st page's translation, kept for the 2nd-page cycle
-               if (ex_mpu_hold && ex_mph) begin
+               if (ex_mpu_hold) begin ex_mph <= 1'b1;  ex_mok <= 1'b1; end
+               // (stage 3) the 1st page's translation (from its 1st cycle),
+               // kept for the 2nd-page cycle (§11.9)
+               if (ex_mpu_hold && !ex_mph) begin
                   t1_dn <= t_dn;  t1_seg <= t_seg;  t1_miss <= t_miss;  t1_tlb <= t_miss || t_perm;
                   t1_pahi <= t_pahi;
                end
             end else begin
                ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
-               ex_mph2    <= 1'b0;
                ex_mok     <= 1'b0;
                mem_valid  <= ex_valid;   // not-taken CALL still retires (trace line)
                // early load issue (see EN_EARLY_LD): the MEM engine then
@@ -4017,6 +4057,13 @@ module pipeline_core
                // EN_SPFWD: the youngest older SP writer's value (one in EX
                // holds this op back via sp_busy)
                ex_lb_a    <= id_use_rs1 && lb1;
+               ex_ta      <= t_ta_d;  ex_tb <= t_tb_d;   // (§11.9)
+               // (§11.9) ex_xpg from rs1 as it will be in EX: each forwarding
+               // candidate tested in parallel, the same select picks (timing:
+               // the ex_b_zero pattern; ex_busy reads the register)
+               ex_txpg    <= (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_result_eff[15:0])
+                           : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                           : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
                ex_lb_b    <= id_use_rs2 && lb2;
                ex_w       <= id_w;
                ex_sp      <= (mem_valid && mem_sp_we) ? mem_sp_new
@@ -4642,8 +4689,9 @@ module pipeline_core
          .op_p     (tlbi_commit && wb_op[21:16] == 6'd11),
          .op_inv   (tlbi_commit && wb_op[21:16] == 6'd12),
          .hi_load  (tlb_hi_load), .hi_vpn (tlb_hi_vpn),
-         .d_vpn    (tlb_d_vpn), .d_vnx (exo_eaddr[31:16]), .d_vld (!ex_mph),
-         .d_vstep  (ex_mpu_hold && ex_xpg_q && !mem_busy),
+         .d_vpn    (tlb_d_vpn), .d_ta (t_ta_d), .d_tb (t_tb_d),
+         .d_ld     (!mem_busy && !ex_busy),
+         .d_step   (ex_mpu_hold && !ex_mph && te_q && ex_txpg && !mem_busy),
          .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr),
@@ -4652,12 +4700,22 @@ module pipeline_core
          .wk_pfn   (wk_t[14:4]), .wk_xwrv (wk_t[3:0]),
          .wk_en    (tlb_wk_en), .ptb (tlb_ptb));
 `ifndef SYNTHESIS
-      // the data CAM's registered VPN copy and d_ok (timing) give the exact
-      // lookup wherever its result is used: an op in its 2nd / 3rd EX cycle
-      always_ff @(posedge clk) if (ce && !rst && ex_tchk && ex_mph && t_tlbs)
+      // the data CAM's key copies (§11.9) and d_ok (timing) give the exact
+      // lookup wherever its result is used: a TLB-checked op in EX
+      always_ff @(posedge clk) if (ce && !rst && ex_tchk && t_tlbs)
          assert (tlb_i.d_vq_ok && tlb_i.dm == tlb_i.dm_exact)
-            else $fatal(1, "mmu_tlb: data CAM %h != exact %h (vq %h / %h, vpn %h)", tlb_i.dm,
-                        tlb_i.dm_exact, tlb_i.d_vq0, tlb_i.d_vq1, tlb_d_vpn);
+            else $fatal(1, "mmu_tlb: data CAM %h != exact %h (keys ok %b, vpn %h, pc %h)", tlb_i.dm,
+                        tlb_i.dm_exact, tlb_i.d_kok, tlb_d_vpn, ex_pc);
+      // ex_ta + ex_tb is the EX memory op's EA page (in its first cycle) ...
+      always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_memop && !ex_mph)
+         assert (((ex_ta + ex_tb) >> 16) == {16'd0, exo_eaddr[31:16]})
+            else $fatal(1, "ex_ta + ex_tb %h + %h != EA %h (pc %h uop %0d)", ex_ta, ex_tb,
+                        exo_eaddr, ex_pc, ex_d.uop);
+      // ... and f_pgeq is the page compare
+      always_ff @(posedge clk) if (ce && !rst)
+         assert (f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]) ==
+                 (((ex_ta + ex_tb) >> 16) == {16'd0, mem_eaddr[31:16]}))
+            else $fatal(1, "f_pgeq: %h + %h vs %h", ex_ta, ex_tb, mem_eaddr[31:16]);
 `endif
    end else begin : g_notlb
       assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
@@ -4724,8 +4782,12 @@ module pipeline_core
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst)
-      assert (ex_mok == (ex_mph && !(ex_xpg_q && !ex_mph2)))
-         else $fatal(1, "ex_mok stale: mph=%b mph2=%b xpg_q=%b", ex_mph, ex_mph2, ex_xpg_q);
+      assert (ex_mok == ex_mph)
+         else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
+   // (§11.9) the dispatch-time page-crossing bit is ex_xpg
+   always_ff @(posedge clk) if (!rst && ex_valid)
+      assert (ex_txpg == ex_xpg)
+         else $fatal(1, "ex_txpg stale: pc=%h a=%h", ex_pc, ex_a);
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
@@ -5006,7 +5068,9 @@ endmodule
 // §11.8) it also holds the walker's SRs (TLB_PTB 0x35, TLB_WALK 0x36,
 // TLB_WCNT 0x37) and takes its refill (wk_we) through TLBWI's write path.
 //===========================================================================
-module mmu_tlb #(
+module mmu_tlb
+   import klauss_pkg::*;
+#(
    parameter int N = 16,             // entries (a power of two, 2-32)
    parameter bit WALK = 1'b0         // the §11.8 walker's SRs and refill port
 ) (
@@ -5027,10 +5091,10 @@ module mmu_tlb #(
    input  logic        op_wi, op_r, op_p, op_inv,
    input  logic        hi_load,       // exception entry: TLB_HI <- {hi_vpn, G 0, ASID}
    input  logic [15:0] hi_vpn,
-   input  logic [15:0] d_vpn,         // (sim: the core's ex_ea_q[31:16], checked against d_vq)
-   input  logic [15:0] d_vnx,         // ex_ea_q's next VPN and its load / page-step enables:
-   input  logic        d_vld,         //   the CAM reads its own copy d_vq (timing)
-   input  logic        d_vstep,
+   input  logic [15:0] d_vpn,         // (sim: the exact VPN, checked against the copies)
+   input  logic [31:0] d_ta, d_tb,    // §11.9: the EA's operands at dispatch (the core's
+   input  logic        d_ld,          //   ex_ta / ex_tb), loaded with the operand latches;
+   input  logic        d_step,        //   stepped to the next page for a crossing op's 2nd cycle
    output logic        d_hit,
    output logic [10:0] d_pfn,
    output logic [2:0]  d_xwr,
@@ -5077,34 +5141,51 @@ module mmu_tlb #(
       for (int n = 0; n < N; n++) r = r | (m[n] ? IW'(n) : IW'(0));
       return r;
    endfunction
-   // (timing, 32 entries: the data CAM is ex_ea_q -> match -> PFN mux ->
-   // the hit pipe's tag / mem_iaddr / the fault flags, a full cycle)
-   // d_vq: the data port's own copy of ex_ea_q[31:16], loaded exactly as
-   // ex_ea_q is (kept inside this hierarchy, so it is not merged with it),
-   // one per half of the entries, so the VPN bits fan out locally.
+   // (timing, 32 entries: the data CAM is key -> match -> PFN mux -> the
+   // hit pipe's tag / mem_iaddr / the fault flags, a full cycle)
+   // §11.9: the key is the EA's two operands, registered at dispatch: the
+   // CAM tests "page of a + b == VPN" carry-free (f_sum_hi: one LUT per
+   // page bit), so no adder sits in front of it and the lookup runs in the
+   // op's first EX cycle.  Only address bit 16 needs the page offset's
+   // carry (c15, a 16-bit carry chain on the copies' low halves).
+   // q_a / q_b: NQ copies, each serving N / NQ entries, so the key bits fan
+   // out locally (kept inside this hierarchy, so they are not merged with
+   // the core's ex_ta / ex_tb).  d_step: a page-crossing MEMGET32 /
+   // LEAVERET (EA = rs1, offset 0) looks up its next page in its 2nd cycle.
    // d_ok[n] = e_v && (e_g || e_asid == ASID), registered: the match is
-   // then the 16-bit VPN compare and one bit.  It is a cycle behind the
+   // then the page test and one bit.  It is a cycle behind the
    // entries / ASID, which is safe: they change only through TLBWI /
    // TLBINV (written the cycle after commit), MTSR ASID and program load,
    // all serializing and refetching, so the next data lookup is several
    // cycles later (the core asserts d_ok's lookups equal the exact ones).
-   localparam int NH = (N >= 4) ? N / 2 : N;
-   (* keep = "true" *) logic [15:0] d_vq0;
-   (* keep = "true" *) logic [15:0] d_vq1;
-   always_ff @(posedge clk) if (ce && !rst) begin
-      if (d_vld)        begin d_vq0 <= d_vnx;          d_vq1 <= d_vnx;          end
-      else if (d_vstep) begin d_vq0 <= d_vq0 + 16'd1;  d_vq1 <= d_vq1 + 16'd1;  end
-   end
+   localparam int NQ = (N >= 16) ? 4 : (N >= 4) ? 2 : 1;
+   localparam int NE = N / NQ;
    logic [N-1:0] d_ok;
    always_ff @(posedge clk)
       if (rst) d_ok <= '0;
       else if (ce) for (int n = 0; n < N; n++) d_ok[n] <= e_v[n] && (e_g[n] || e_asid[n] == asid);
    logic [N-1:0] dm;
-   always_comb for (int n = 0; n < N; n++) dm[n] = d_ok[n] && e_vpn[n] == (n < NH ? d_vq0 : d_vq1);
+   logic [NQ-1:0] d_kok;                // (sim) each copy's page equals d_vpn
+   for (genvar q = 0; q < NQ; q++) begin : g_dq
+      (* keep = "true" *) logic [31:0] q_a;
+      (* keep = "true" *) logic [31:0] q_b;
+      always_ff @(posedge clk) if (ce && !rst) begin
+         if (d_ld)        begin q_a <= d_ta;  q_b <= d_tb;  end
+         else if (d_step) begin q_a <= {q_a[31:16] + 16'd1, 16'h0000};  q_b <= '0;  end
+      end
+      wire [16:0] q_lo = {1'b0, q_a[15:0]} + {1'b0, q_b[15:0]};
+      for (genvar e = 0; e < NE; e++) begin : g_de
+         assign dm[q * NE + e] = d_ok[q * NE + e] && f_pgeq(q_a, q_b, q_lo[16], e_vpn[q * NE + e]);
+      end
+`ifndef SYNTHESIS
+      wire [31:0] q_sum = q_a + q_b;
+      assign d_kok[q] = q_sum[31:16] == d_vpn;
+`endif
+   end
 `ifndef SYNTHESIS
    // the exact match (the core checks it equals dm where it is used)
    wire [N-1:0] dm_exact = f_match(d_vpn, asid);
-   wire         d_vq_ok  = d_vq0 == d_vpn && d_vq1 == d_vpn;
+   wire         d_vq_ok  = &d_kok;
 `endif
    // one fetch-port CAM: TLBP's key is loaded into f_vpn / f_asid while
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)

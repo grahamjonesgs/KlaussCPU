@@ -1302,6 +1302,66 @@ def cmd_socdiff(a):
     return 1 if fails else 0
 
 
+def _tecost_prog(seed, te, user):
+    """MMU_PLAN §11.9: randprog `seed` behind a prologue that maps every page
+    it touches (code, data, stack) with global identity entries and then
+    writes STATUS with TE = 1 or 0 -- the only difference between the two
+    runs.  user: IRET into user mode first (a user HALT traps to a
+    supervisor HALT)."""
+    import randprog
+    from kasm import Asm
+    from tests import _tlb_set, _to_user, TLB_RWX, USP, KSP
+
+    class CostAsm(Asm):
+        def __init__(self, *aa, **kk):
+            super().__init__(*aa, **kk)
+            self.leapc(1, 'h_cost'); self.mtsr('evec', 1)
+            for i, vp in enumerate((0x0000, 0x0001, USP >> 16, (USP >> 16) - 1)):
+                _tlb_set(self, i, vp, vp, TLB_RWX, g=1)
+            self.setr(1, USP); self.setsp(1)
+            self.setr(1, 0x200 if te else 0); self.mtsr('status', 1)
+            if user:                      # (the kernel SP of the final trap: kseg with TE)
+                self.setr(1, KSP if te else USP - 0x8000); self.setsp(1)
+                _to_user(self, 'u_cost')
+                self.label('u_cost')
+
+    old = randprog.Asm
+    randprog.Asm = CostAsm
+    try:
+        asm = randprog.gen(seed)
+    finally:
+        randprog.Asm = old
+    asm.label('h_cost')
+    asm.halt()
+    return asm
+
+
+def cmd_tecost(a):
+    """MMU_PLAN §11.9: the cycle cost of TE = 1 on randprog programs (every
+    page mapped; STATUS the only difference), supervisor and user mode"""
+    exe = build(a.rev)
+    rc = 0
+    for user in (False, True):
+        tot = [0, 0]
+        for s in range(a.seed0, a.seed0 + a.seeds):
+            st = []
+            for te in (0, 1):
+                r, _ = run(exe, _tecost_prog(s, te, user), f'tc{s}_{te}{int(user)}', a.plus)
+                if r.get('end') != 'park' or r.get('kind') != '0' or 'fatal' in r['log'].lower():
+                    print(f'FAIL seed={s} te={te} user={user}: end={r.get("end")} kind={r.get("kind")}')
+                    rc = 1
+                st.append(r)
+            if [st[0].get(k) for k in ('r1', 'r2', 'r3', 'r10', 'm00010000')] != \
+               [st[1].get(k) for k in ('r1', 'r2', 'r3', 'r10', 'm00010000')]:
+                print(f'DIFF seed={s} user={user}')
+                rc = 1
+            for i in (0, 1):
+                tot[i] += int(st[i].get('cycles', 0))
+        print(f'{"user" if user else "supervisor"}: TE=0 {tot[0]}  TE=1 {tot[1]}  '
+              f'({100.0 * (tot[1] - tot[0]) / max(1, tot[0]):+.2f}%)  {a.plus}')
+    return rc
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -1348,6 +1408,9 @@ def main():
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
     x.add_argument('-v', '--verbose', action='store_true')
     x.add_argument('--plus', nargs='*', default=[])
+    tc = sub.add_parser('tecost'); tc.add_argument('--seeds', type=int, default=60)
+    tc.add_argument('--seed0', type=int, default=1); tc.add_argument('--rev')
+    tc.add_argument('--plus', nargs='*', default=[])
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
@@ -1385,6 +1448,8 @@ def main():
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':
         sys.exit(cmd_socmmio(a))
+    elif a.cmd == 'tecost':
+        sys.exit(cmd_tecost(a))
     else:
         sys.exit(cmd_diff(a))
 

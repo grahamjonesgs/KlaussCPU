@@ -437,4 +437,23 @@ package klauss_pkg;
       logic        dis;
    } dbg_out_t;
 
+   // MMU_PLAN §11.9: a carry-free test that the page of a + b is k, for the
+   // data TLB's CAM and STLF's VA-page compare (no adder in front of
+   // them).  Bit i of the sum is k[i] iff the carry into bit i is
+   // a[i] ^ b[i] ^ k[i]; with the sum known to be k, the carry out of bit i
+   // is then fixed by bit i alone, (a & b) | ((a | b) & ~k).  So bits 1..15
+   // of the page are checked independently (6 inputs: one LUT6 each), and
+   // only bit 0 (address bit 16) needs the page offset's carry, c15.
+   function automatic logic f_sum_hi(logic [15:0] a, logic [15:0] b, logic [15:0] k);
+      logic ok;
+      ok = 1'b1;
+      for (int i = 1; i < 16; i++)
+         ok = ok & ((a[i] ^ b[i] ^ k[i]) == ((a[i-1] & b[i-1]) | ((a[i-1] | b[i-1]) & ~k[i-1])));
+      return ok;
+   endfunction
+   // (a + b)[31:16] == k, given c15 = the carry out of a[15:0] + b[15:0]
+   function automatic logic f_pgeq(logic [31:0] a, logic [31:0] b, logic c15, logic [15:0] k);
+      return f_sum_hi(a[31:16], b[31:16], k) && ((a[16] ^ b[16] ^ k[0]) == c15);
+   endfunction
+
 endpackage : klauss_pkg
