@@ -1711,7 +1711,14 @@ at c15's carry chain.
   its second page in the second — one extra cycle instead of two. The
   segment checks read the EA adder in the first cycle and `ex_ea_q` in the
   second (`tva`). Faults, `mem_iaddr`, `mem_pa2hi` and the §7.1 fault slot
-  are as before.
+  are as before, except that only `mem_xsq` (written as one select of the
+  TLB's `pok` over CAM-independent terms) is decided at the EX → MEM edge:
+  which dword faulted and whether the fault is a TLB miss / TLB-related
+  are read only at MEM → WB, so MEM computes them from the registered EX
+  terms and the TLB's two candidates (`mem_q*`, asserted equal to the EX
+  forms).
+- **Hit pipe.** Its array index (the page offset) comes from the
+  operands' own 16-bit add (`ex_tlo`), off the uop's EA mux.
 - **STLF.** Every address compare of store-to-load forwarding is carry-free
   on `ex_ta` / `ex_tb`: the line (`[15:5]`, with the carry into bit 5),
   the dword (`[4:3]`, carry into bit 3), with TE = 0 the page (c15), with
@@ -1773,8 +1780,9 @@ one that ignores the hit pipe's carry candidate fails `socx`.
 | `tlbx_b3` | `cc02d52` | the carry select in the core, merged with `h_addr` / `mem_iaddr` | −0.150 / +0.016 | −0.021 | 37,710 | 25,031 |
 | `tlbx_b4` | `e9c4c80` | STLF compares carry-free on `ex_ta` / `ex_tb` | −0.421 / +0.031 | (−0.4) | 38,465 | 25,293 |
 | `tlbx_b5` | `298b933` | the hit pipe registers both carry candidates' tags; R / W folded per entry (`pok`) | −0.040 / +0.034 | −0.040 | 37,357 | 25,171 |
-| **`tlbx_b6`** | **`fc4b1e8`** | the hit pipe's index from `ex_ta + ex_tb`; the fault bit as one select of `pok`; `ex_b_zero`'s reduces kept | −0.112 / +0.022 (one endpoint) | **+0.037 / +0.022** | 37,549 | 25,114 |
+| `tlbx_b6` | `fc4b1e8` | the hit pipe's index from `ex_ta + ex_tb`; the fault bit as one select of `pok`; `ex_b_zero`'s reduces kept | −0.112 / +0.022 (one endpoint) | +0.037 / +0.022 | 37,549 | 25,114 |
 | `tlbx_b7` | `f52d93d` | the I-cache snoop's tag shadow back in block RAM (its own read-address register) | −0.194 / +0.021 | −0.108 | | |
+| **`tlbx_b8`** | **`db67f3f`** | the fault kind (2nd dword / TLB miss / TLB-related) decided in MEM | −0.014 / +0.017 (one endpoint) | **+0.018 / +0.017** | 37,200 | 25,192 |
 
 - **What failed and why.** `tlbx_b1`: the operand copies' selects came
   through `f_decode`'s uop (15 levels from `id_op`), and every CAM path
@@ -1790,7 +1798,26 @@ one that ignores the hit pipe's carry candidate fails `socx`.
   within 0.04 ns: the long-standing WB forward → `ex_b_zero` (synthesis
   had folded the zero test back onto `ex_b`'s forwarding mux), CAM →
   `mem_xsq`, and EA adder → the uop's EA mux → the hit pipe's array index
-  (`r_h_tq1`).
+  (`r_h_tq1`). `b6` met in tier 2, but since `b3` synthesis had stopped
+  absorbing `mem_iaddr`'s pair index into the I-cache snoop's tag shadow
+  (`ic_tagff_e` / `_o`) as the block RAM's read address (after `cc02d52`
+  rewrote `mem_iaddr`'s D) and built it as LUTRAM (2 RAMB18 → +384 LUTs
+  as memory). `b7` gave the shadow its own read-address register
+  (`sn_pra`, a copy of `mem_iaddr[13:5]`, asserted equal) — block RAM
+  again — and missed on CAM → `mem_xs_tlb`. `b8` decides `mem_xs2` /
+  `mem_xs_tm` / `mem_xs_tlb` in MEM (below).
+- **Release bitstream: `db67f3f`** (`~/.cache/kbuild/tlbx_db67f3f.bit`,
+  md5 `a478ba57…`), build dir `~/.cache/kbuild/tlbx_b8`, standard
+  `build_fast -resynth`: tier 1 WNS −0.014 (one endpoint), **tier 2
+  AggressiveExplore WNS +0.018 / TNS 0, WHS +0.017 / THS 0**, 12 min 15 s;
+  no alternate placement. 37,200 LUTs (3,465 as memory), 25,192 FFs, 80.5
+  BRAM tiles, 19 DSPs, no Synth 8-4767 (+1,355 LUTs / +373 FFs over
+  `tlbwalk_b1`). CPU_FEATURES unchanged (`0x03F0_200D`). The worst paths
+  left are the hit pipe's H2 (`r_h_tag` → `wb_hext`, +0.018) and the
+  long-standing shifter → `ex_b_zero` (+0.044). Not yet run on the board.
+  Closure is in tier 2, as for `d9cf6c2`; master (`tlbwalk_b1`) closed in
+  tier 1 (+0.032). Successive placements of this design varied by about
+  ±0.3 ns, so the margin is thin.
 
 ---
 
