@@ -4782,6 +4782,414 @@ def wk_nowalk():
     return out
 
 
+
+# =================== MMU_PLAN §11.9: the data TLB lookup in the first EX cycle
+# The data CAM matches the page of the EA's two operands (base + offset,
+# registered at dispatch) carry-free, with no adder in front of it.  These
+# tests put EAs on both sides of page boundaries through bases in other
+# pages (forward / backward, several pages away, wrapping 2^32), in every
+# addressing mode and size, with the operands produced right before the
+# access (forwarded from MEM), one instruction earlier (WB) or long before.
+TX_MAP = {0x0100: 0x005, 0x0101: 0x003, 0x0102: 0x002}   # VA page -> frame (not in VA order)
+TX_RO = (0x0103, 0x006)                                   # a read-only page; 0x0104 is unmapped
+TX_WIN = ((0x0100FF00, 0x01010100), (0x0101FF00, 0x01020100), (0x0102FF00, 0x01030000))
+TX_B = (0x01010000, 0x01020000)                           # the boundaries inside the windows
+M64 = 2 ** 64 - 1
+
+
+def _tx_pa(va):
+    vp = va >> 16
+    f = TX_MAP[vp] if vp in TX_MAP else TX_RO[1]
+    return (f << 16) | (va & 0xFFFF)
+
+
+def _tx_pat(pa):
+    return (pa * 0x9E3779B97F4A7C15 + 0x0123456789ABCDEF) & M64
+
+
+def _tx_setup(a):
+    for i, (vp, f) in enumerate(sorted(TX_MAP.items())):
+        _tlb_set(a, 2 + i, vp, f, TLB_V | TLB_R | TLB_W)
+    _tlb_set(a, 5, TX_RO[0], TX_RO[1], TLB_V | TLB_R)
+
+
+def _tx_init():
+    """the byte model (by PA) of the preloaded windows (and TX_RO's first
+    0x100 bytes)"""
+    mem = {}
+    for lo, hi in list(TX_WIN) + [(TX_RO[0] << 16, (TX_RO[0] << 16) + 0x100)]:
+        for va in range(lo, hi, 8):
+            pa = _tx_pa(va)
+            v = _tx_pat(pa)
+            for i in range(8):
+                mem[pa + i] = (v >> (8 * i)) & 0xFF
+    return mem
+
+
+def _tx_preload(a):
+    for pa in sorted(_tx_init()):
+        if pa % 8 == 0:
+            a.dword(pa, _tx_pat(pa))
+
+
+def _rol(v, n=1):
+    return ((v << n) | (v >> (64 - n))) & M64
+
+
+def _tx_rd(mem, va, n):
+    return sum(mem[_tx_pa(va + i)] << (8 * i) for i in range(n))
+
+
+def _tx_battery(seed, user, plus):
+    """random loads / stores (every mode and size; MEMGET32 at any byte
+    alignment) at EAs near the page boundaries, through bases anywhere;
+    runs of back-to-back accesses.  r5 folds every loaded value, r6 a final
+    sweep of the windows (through kseg in supervisor mode, so each store's
+    PA is checked)"""
+    import random
+    rnd = random.Random(seed * 1009 + user)
+    mem = _tx_init()
+    loads = []
+
+    def pick_ea(n, una):
+        lo, hi = rnd.choice(TX_WIN)
+        bs = [b for b in TX_B if lo <= b < hi]
+        if bs and rnd.random() < 0.6:
+            ea = bs[0] + rnd.randrange(-24, 24)
+        else:
+            ea = rnd.randrange(lo, hi)
+        ea = max(lo, min(hi - n, ea))
+        return ea if una else ea - ea % n
+
+    def operands(ea, n):
+        """(mode, base, off): EA = base + off (mod 2^32)"""
+        k = rnd.random()
+        if k < 0.12:
+            return 'ind', ea, 0
+        if k < 0.22:
+            return 'abs', 0, ea
+        if k < 0.45:
+            off = rnd.randrange(-128, 128) * n
+            return 'short', (ea - off) & 0xFFFFFFFF, off
+        c = rnd.random()
+        if c < 0.3:
+            off = rnd.randrange(-0x300, 0x300)
+        elif c < 0.6:
+            off = rnd.choice([-1, 1]) * (rnd.randrange(1, 4) << 16) + rnd.randrange(-0x40, 0x40)
+        elif c < 0.8:
+            off = rnd.getrandbits(32)
+        else:                           # the base across 2^31 / 2^32
+            off = rnd.choice([0x80000000, 0x7FFF0000, 0xFFFF0000, 0x00010000]) + rnd.randrange(-8, 8)
+        off &= 0xFFFFFFFF
+        return ('rr' if rnd.random() < 0.5 else 'long'), (ea - off) & 0xFFFFFFFF, off
+
+    def body(a):
+        a.setr(5, 0); a.setr(6, 0)
+        for _ in range(100):
+            pend = []
+            for j in range(rnd.choice([1, 1, 2, 3, 4])):          # back-to-back runs
+                st = rnd.random() < 0.35
+                size = rnd.choice([8, 16, 32, 64])
+                n = size // 8
+                memget = not st and size == 32 and rnd.random() < 0.3
+                ea = pick_ea(n, memget)
+                mode, base, off = ('ind', ea, 0) if memget else operands(ea, n)
+                if mode == 'ind' and size == 32 and not memget:
+                    mode = 'short'                                  # ([rs1] 32-bit load = MEMGET32)
+                rb, ro = rnd.choice([(9, 11), (10, 13)])
+                setv = []
+                if mode != 'abs':
+                    setv.append(lambda rb=rb, base=base: a.setr(rb, base))
+                if mode == 'rr':
+                    setv.append(lambda ro=ro, off=off: a.setr(ro, off))
+                rnd.shuffle(setv)
+                for f in setv:
+                    f()
+                for _ in range(rnd.choice([0, 0, 1, 2])):          # MEM / WB / rf operands
+                    a.nop()
+                so = off - (1 << 32) if off >= 1 << 31 else off
+                if st:
+                    v = rnd.getrandbits(64) & ((1 << size) - 1)
+                    a.setr64(14, v)
+                    if mode == 'ind':     a.st(size, 14, rb)
+                    elif mode == 'abs':   a.st_abs(size, 14, ea)
+                    elif mode == 'short': a.st(size, 14, rb, so)
+                    elif mode == 'long':  a.st(size, 14, rb, off, mode='long')
+                    else:                 a.st_rr(size, 14, rb, ro)
+                    for i in range(n):
+                        mem[_tx_pa(ea + i)] = (v >> (8 * i)) & 0xFF
+                else:
+                    rd = [1, 2, 3, 4][j]
+                    if mode == 'ind':     a.ld(size, rd, rb)
+                    elif mode == 'abs':   a.ld_abs(size, rd, ea)
+                    elif mode == 'short': a.ld(size, rd, rb, so)
+                    elif mode == 'long':  a.ld(size, rd, rb, off, mode='long')
+                    else:                 a.ld_rr(size, rd, rb, ro)
+                    pend.append(rd)
+                    loads.append(_tx_rd(mem, ea, n))
+            for rd in pend:
+                a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, rd)
+        for lo, hi in TX_WIN:                                      # the sweep
+            for va in range(lo, hi, 8):
+                a.ld_abs(64, 7, va if user else 0x80000000 + _tx_pa(va))
+                a.shift_n('rol', 6, 6, 1); a.alu('xor', 6, 6, 7)
+
+    a, e, p = _te_prog(body, user, None, setup=_tx_setup, plus=plus)
+    _tx_preload(a)
+    acc = 0
+    for v in loads:
+        acc = _rol(acc) ^ v
+    sw = 0
+    for lo, hi in TX_WIN:
+        for va in range(lo, hi, 8):
+            sw = _rol(sw) ^ _tx_rd(mem, va, 8)
+    e['r5'] = acc
+    e['r6'] = sw
+    return a, e, p
+
+
+@test
+def tx_battery():
+    """TE = 1: random loads / stores at page boundaries through bases in
+    other pages, every mode and size, MEMGET32 at any alignment, operands
+    from MEM / WB / the register file, back-to-back runs; supervisor and
+    user mode, memory latency 1 / 3 / 7, the hit-pipe model"""
+    if NOEXC:
+        return []
+    return [_tx_battery(seed, user, plus)
+            for seed in range(3) for user in (False, True)
+            for plus in ([], ['+LAT=1'], ['+LAT=7'], ['+HIT=70'], ['+HIT=100', '+LAT=2'])]
+
+
+@test
+def tx_stack():
+    """TE = 1, stack ops whose SP / R15 base is in the page above the access:
+    PUSH / POP, CALL / RET, ENTER / LEAVE with SP at a page start (the access
+    at SP - 8 is in the page below), SP from a SETSP right before (MEM
+    forward); LEAVERET crossing (R15 at a page's last dword) and not, with
+    R15 from an ALU op right before, from a load, and long before; MEMGET32
+    at every byte offset of a page's last dword, rs1 from MEM / a load"""
+    if NOEXC:
+        return []
+    B2 = TX_B[1]
+    out = []
+    for plus in ([], ['+LAT=1'], ['+HIT=70'], ['+HIT=100', '+LAT=5']):
+        mem = _tx_init()
+        exp = {}
+        def body(a):
+            a.jmp('tx_go')
+            _tx_f(a)
+            a.label('tx_go')
+            # MEMGET32 at each offset of P1's last dword (5..7 span into P2)
+            a.setr(6, 0)
+            for o in range(8):
+                ea = 0x0101FFF8 + o
+                if o % 2:
+                    a.setr(13, ea); a.ld(32, 7, 13)
+                else:
+                    a.setr(1, ea); a.st(64, 1, 12, 0x40); a.ld(64, 13, 12, 0x40); a.ld(32, 7, 13)
+                a.shift_n('rol', 6, 6, 1); a.alu('xor', 6, 6, 7)
+            a.setr(1, B2); a.setsp(1); a.setr64(2, 0x1111222233334444); a.push(2); a.pop(3)
+            a.setr(1, B2); a.setsp(1); a.setr64(2, 0x5555666677778888); a.push(2)
+            a.nop(); a.nop(); a.nop(); a.pop(4); a.getsp(5)
+            a.setr(1, B2); a.setsp(1); a.call('tx_f')
+            a.label('tx_after')
+            a.getsp(8)
+            a.setr(15, 0xABCD); a.setr(1, B2); a.setsp(1); a.enter(1)
+            a.getsp(9); a.mov(10, 15); a.ld(64, 11, 15); a.leave(); a.getsp(1); a.mov(2, 15)
+            a.alu('xor', 9, 9, 1); a.alu('xor', 10, 10, 2)      # (B2 - 16) ^ B2, (B2 - 8) ^ 0xABCD
+            a.setr(1, KSP); a.setsp(1)
+            # LEAVERET: [R15] -> R15, [R15 + 8] -> PC; four bases
+            for i, (r15, how) in enumerate(((0x0101FFF8, 'alu'), (0x0101FFF8, 'load'),
+                                            (0x0101FFF8, 'rf'), (0x0101FFE0, 'alu'))):
+                a.setr(1, 0x80000000 + _tx_pa(r15)); a.setr(2, 0x7000 + i); a.st(64, 2, 1)
+                a.setr(1, 0x80000000 + _tx_pa(r15 + 8)); a.leapc(2, f'tx_lr{i}'); a.st(64, 2, 1)
+                if how == 'alu':
+                    a.setr(15, r15 - 8); a.addi_s(15, 15, 8)
+                elif how == 'load':
+                    a.setr(1, r15); a.st(64, 1, 12, 0x40); a.nop(); a.nop(); a.ld(64, 15, 12, 0x40)
+                else:
+                    a.setr(15, r15); a.nop(); a.nop(); a.nop()
+                a.leaveret()
+                a.setr(15, 0xBAD)
+                a.label(f'tx_lr{i}')
+                a.getsp(1); a.alu('xor', 1, 1, 15); a.st(64, 1, 12, 0x48 + 8 * i)   # (r15 + 16) ^ 0x700i
+                a.setr(1, KSP); a.setsp(1)
+                exp[m(GOOD + 0x48 + 8 * i)] = (r15 + 16) ^ (0x7000 + i)
+        a, e, p = _te_prog(body, False, None, setup=_tx_setup, plus=plus)
+        _tx_preload(a)
+        f = a.labels
+        e.update(exp)
+        e.update({'r3': 0x1111222233334444, 'r4': 0x5555666677778888, 'r5': B2,
+                  'r8': B2, 'r9': (B2 - 16) ^ B2, 'r10': (B2 - 8) ^ 0xABCD, 'r11': 0xABCD})
+        mg = 0
+        for o in range(8):
+            mg = _rol(mg) ^ _tx_rd(mem, 0x0101FFF8 + o, 4)
+        e['r6'] = mg
+        # the CALL's return-address slot (P1's last dword) and tx_f's view of it
+        e[m(GOOD + 0x30)] = f['tx_after']
+        e[m(GOOD + 0x38)] = B2 - 8
+        out.append((a, e, p))
+    return out
+
+
+def _tx_f(a):
+    a.label('tx_f')
+    a.getsp(1); a.ld(64, 2, 1); a.st(64, 2, 12, 0x30); a.st(64, 1, 12, 0x38)
+    a.ret()
+
+
+@test
+def tx_faults():
+    """TE = 1: faults of accesses whose base and EA pages differ (1-word
+    forms, the handler steps over them): a miss in the EA's page with the
+    base's mapped, a read-only EA page (store), an unmapped base page with a
+    mapped EA page (no fault), kseg base + offset into useg (translated) /
+    into the hole, useg base into kseg (user: ACCESS) and MMIO (user:
+    ACCESS); LEAVERET / MEMGET32 whose 2nd page is unmapped (its start) or
+    1st (the EA); operands from MEM / WB / the register file"""
+    if NOEXC:
+        return []
+    out = []
+    for user, plus, dist in [(u, pl, d) for u in (False, True) for pl in ([], ['+HIT=70', '+LAT=1'])
+                             for d in (0, 1, 3)]:
+            mem = _tx_init()
+            logs = []
+            vals = []
+            def body(a):
+                k = [0]
+                def fault(cause, ea):
+                    logs.append((cause, ea))
+                def rr(op, b, o, dist):
+                    if op == 'st':
+                        a.setr64(7, 0x77)
+                    a.setr(9, b); a.setr(11, o & 0xFFFFFFFF)
+                    for _ in range(dist):
+                        a.nop()
+                    if op == 'ld':
+                        a.ld_rr(64, 7, 9, 11)
+                    else:
+                        a.st_rr(64, 7, 9, 11)
+                a.setr(5, 0)
+                if True:
+                    rr('ld', 0x0103FFF8, 8, dist);  fault(X_TLB_LD, 0x01040000)    # base RO, EA unmapped
+                    rr('st', 0x0102FFF8, 8, dist);  fault(X_ACC_ST, 0x01030000)    # EA read-only
+                    rr('ld', 0x0104FFF8, -0x20000, dist)                           # base unmapped, EA in P2
+                    a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, 7); vals.append(_tx_rd(mem, 0x0102FFF8, 8))
+                    a.setr(9, 0x01040008); a.ld(64, 7, 9, -8); fault(X_TLB_LD, 0x01040000)   # short form
+                    a.setr(9, 0x0102FFF8); a.setr(7, 0x99); a.st(64, 7, 9, 8); fault(X_ACC_ST, 0x01030000)
+                    rr('ld', 0x80000000, 0x8102FFF8, dist)                         # kseg base, EA in P2
+                    a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, 7); vals.append(_tx_rd(mem, 0x0102FFF8, 8))
+                    if user:
+                        rr('ld', 0x7FFFFFF8, 0x10, dist); fault(X_ACC_LD, 0x80000008)   # useg -> kseg
+                        rr('ld', 0xEFFFFFF8, 8, dist);    fault(X_ACC_LD, 0xF0000000)   # -> MMIO
+                    else:
+                        rr('ld', 0x80000000, -8, dist);   fault(X_TLB_LD, 0x7FFFFFF8)   # kseg -> useg
+                        rr('ld', 0x87FFFFF8, 8, dist);    fault(X_ACC_LD, 0x88000000)   # -> the hole
+                        rr('ld', 0x01030000, 0x8002FF00 - 0x01030000, dist)             # useg -> kseg (PA 0x2FF00)
+                        a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, 7); vals.append(_tx_pat(0x2FF00))
+                    # two-access ops: the 2nd page unmapped / the 1st
+                    a.setr(15, 0x0103FFF0); a.addi_s(15, 15, 8)
+                    for _ in range(dist):
+                        a.nop()
+                    a.leaveret(); fault(X_TLB_LD, 0x01040000)
+                    a.setr(9, 0x0103FFFD)
+                    for _ in range(dist):
+                        a.nop()
+                    a.ld(32, 7, 9); fault(X_TLB_LD, 0x01040000)
+                    a.setr(9, 0x0104FFFE); a.ld(32, 7, 9); fault(X_TLB_LD, 0x0104FFFE)
+            a, e, p = _te_prog(body, user, None, logs=logs, setup=_tx_setup, plus=plus)
+            _tx_preload(a)
+            acc = 0
+            for v in vals:
+                acc = _rol(acc) ^ v
+            e['r5'] = acc
+            out.append((a, e, p))
+    return out
+
+
+@test
+def tx_stlf():
+    """TE = 1 store-to-load forwarding when the EA's page is not the base's:
+    the same VA through another base / offset forwards (the stored value);
+    the same page offset in another page (another PA) does not; a VA alias of
+    the stored PA does not forward but reads the stored value; runs of
+    stores then loads (the MEM / port / queued store candidates)"""
+    if NOEXC:
+        return []
+    out = []
+    for plus in ([], ['+HIT=100'], ['+HIT=70', '+LAT=1'], ['+HIT=100', '+LAT=7']):
+        mem = _tx_init()
+        vals = []
+        def setup(a):
+            _tx_setup(a)
+            _tlb_set(a, 6, 0x0105, TX_MAP[0x0101], TLB_V | TLB_R | TLB_W)   # an alias of P1
+        def body(a):
+            a.setr(5, 0)
+            def fold(rd, v):
+                a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, rd); vals.append(v)
+            # store [P1 end + 8] (= P2 start), load it as [P2 start + 16 - 16]
+            a.setr(9, 0x0101FFF8); a.setr(10, 0x01020010); a.setr64(3, 0xA1)
+            a.st(64, 3, 9, 8); a.ld(64, 7, 10, -16); fold(7, 0xA1)
+            mem.update({_tx_pa(0x01020000) + i: (0xA1 >> 8 * i) & 0xFF for i in range(8)})
+            # store via rs1 + rs2 (base 3 pages away), load [imm]
+            a.setr(9, 0x01050008); a.setr(11, 0xFFFCFFF8); a.setr64(3, 0xB2)
+            a.st_rr(64, 3, 9, 11); a.ld_abs(64, 7, 0x01020000); fold(7, 0xB2)
+            # same page offset, other page: no forward
+            a.setr(9, 0x0101FF00); a.setr64(3, 0xC3); a.st(64, 3, 9); a.ld_abs(64, 7, 0x0102FF00)
+            fold(7, _tx_rd(mem, 0x0102FF00, 8))
+            mem.update({_tx_pa(0x0101FF00) + i: (0xC3 >> 8 * i) & 0xFF for i in range(8)})
+            # an alias VA of the stored PA: the stored value
+            a.setr(9, 0x0101FF10); a.setr64(3, 0xD4); a.st(64, 3, 9); a.ld_abs(64, 7, 0x0105FF10)
+            fold(7, 0xD4)
+            # back-to-back stores, then loads of each through crossing bases
+            vs = [0xE5, 0xF6, 0x17]
+            eas = [0x0101FFF0, 0x01020008, 0x0101FFF8]
+            for v, ea in zip(vs, eas):
+                a.setr64(3, v); a.setr(9, ea + 0x18); a.st(64, 3, 9, -0x18)
+            for v, ea in zip(reversed(vs), reversed(eas)):
+                a.setr(10, ea - 0x10000); a.setr(11, 0x10000); a.ld_rr(64, 7, 10, 11); fold(7, v)
+            a.setr(9, 0x01020000); a.st(16, 3, 9, -2); a.ld(16, 7, 9, -2); fold(7, 0x17)
+        a, e, p = _te_prog(body, False, None, setup=setup, plus=plus)
+        _tx_preload(a)
+        acc = 0
+        for v in vals:
+            acc = _rol(acc) ^ v
+        e['r5'] = acc
+        out.append((a, e, p))
+    return out
+
+
+@test
+def tx_walk():
+    """TE = 1 with the walker: the walked page is the EA's, not the base's:
+    a load whose base is in an unmapped page and EA in another (one walk, of
+    the EA's page), back the other way (a 2nd walk), a 3rd access hits; a
+    TLBINV, then a crossing LEAVERET walks both pages"""
+    if NOEXC or NOWALK:
+        return []
+    fr = {0x0101: 0x3, 0x0102: 0x7}
+    ptes = {vp: _wk_pte(f, TLB_RWX) for vp, f in fr.items()}
+    def pa(va):
+        return (fr[va >> 16] << 16) | (va & 0xFFFF)
+    def body(a):
+        a.setr(9, 0x0101FFF8); a.setr(11, 0x18); a.ld_rr(64, 3, 9, 11)     # EA 0x0102_0010: walks 0x0102
+        a.setr(9, 0x01020000); a.ld(64, 4, 9, -0x10)                       # EA 0x0101_FFF0: walks 0x0101
+        a.setr(9, 0x01000010); a.ld(64, 5, 9, 0x20000, mode='long')       # EA 0x0102_0010: hits
+        a.tlbinv()                                                         # (the next fetch walks page 0)
+        a.setr(15, 0x0101FFF0); a.addi_s(15, 15, 8); a.leaveret()          # walks 0x0101, then 0x0102
+        a.setr(6, 0xBAD)
+        a.label('tx_wb')
+        a.mov(6, 15)
+        a.mfsr(7, 'tlb_wcnt')
+    exp = {'r3': 0x3333, 'r4': 0x4444, 'r5': 0x3333, 'r6': 0x6666, 'r7': 5, m(XD + 32): 0}
+    a, e, p = _wk_prog(body, ptes, exp)
+    a.dword(pa(0x01020010), 0x3333)
+    a.dword(pa(0x0101FFF0), 0x4444)
+    a.dword(pa(0x0101FFF8), 0x6666)
+    a.dword(pa(0x01020000), a.labels['tx_wb'])
+    return a, e, p
+
 # the TLB_WALK = 0 build has no walker: only wk_nowalk applies there
 if NOWALK:
     for _n in [n for n in ALL if n.startswith('wk_') and n != 'wk_nowalk']:
