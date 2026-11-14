@@ -155,6 +155,12 @@ module mem_read_write (
     // from those registered reads, the cycle after: the doubleword at the
     // address presented one cycle earlier, valid only when o_h_ok.
     input      [31:0] i_h_addr,
+    // (MMU_PLAN §11.9 timing) i_h_addr's page [31:16] for the TLB's two carry
+    // candidates and the carry (i_h_addr's own page is the selected one):
+    // both are registered and the carry picks after the tag read
+    input      [15:0] i_h_pg0,
+    input      [15:0] i_h_pg1,
+    input             i_h_c1,
     output            o_h_ok,
     output     [63:0] o_h_dword
 );
@@ -584,7 +590,10 @@ module mem_read_write (
     wire [INDEX_BITS-1:0] w_h_idx = i_h_addr[5+INDEX_BITS-1:5];
     logic [TAG_BITS:0]    r_h_tq0, r_h_tq1;
     logic [255:0]         r_h_dq0, r_h_dq1;
-    logic [TAG_BITS-1:0]  r_h_tag;
+    logic [TAG_BITS-1:0]  r_h_tag, r_h_tag1;
+    logic                 r_h_c1;
+    wire  [31:0]          w_h_a0 = {i_h_pg0, i_h_addr[15:0]};
+    wire  [31:0]          w_h_a1 = {i_h_pg1, i_h_addr[15:0]};
     logic [1:0]           r_h_off;
     logic                 r_h_conf = 1'b1;
     always_ff @(posedge i_Clk) begin
@@ -592,12 +601,25 @@ module mem_read_write (
         r_h_tq1  <= h_tag_way1[w_h_idx];
         r_h_dq0  <= h_data_way0[w_h_idx];
         r_h_dq1  <= h_data_way1[w_h_idx];
-        r_h_tag  <= i_h_addr[31:5+INDEX_BITS];
+        r_h_tag  <= w_h_a0[31:5+INDEX_BITS];
+        r_h_tag1 <= w_h_a1[31:5+INDEX_BITS];
+        r_h_c1   <= i_h_c1;
         r_h_off  <= i_h_addr[4:3];
         r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);
     end
-    wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_tq0[TAG_BITS-1:0] == r_h_tag);
-    wire w_h_hit1 = r_h_tq1[TAG_BITS] && (r_h_tq1[TAG_BITS-1:0] == r_h_tag);
+    // (both candidates compared in parallel; the carry selects the result)
+    wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_c1 ? (r_h_tq0[TAG_BITS-1:0] == r_h_tag1)
+                                                 : (r_h_tq0[TAG_BITS-1:0] == r_h_tag));
+    wire w_h_hit1 = r_h_tq1[TAG_BITS] && (r_h_c1 ? (r_h_tq1[TAG_BITS-1:0] == r_h_tag1)
+                                                 : (r_h_tq1[TAG_BITS-1:0] == r_h_tag));
+`ifndef SYNTHESIS
+    // the selected candidate is i_h_addr's tag
+    logic [TAG_BITS-1:0] r_h_tagx;
+    always_ff @(posedge i_Clk) r_h_tagx <= i_h_addr[31:5+INDEX_BITS];
+    always_ff @(posedge i_Clk)
+        assert ((r_h_c1 ? r_h_tag1 : r_h_tag) == r_h_tagx)
+            else $fatal(1, "hit-pipe tag candidates %h / %h (c1 %b) != %h", r_h_tag, r_h_tag1, r_h_c1, r_h_tagx);
+`endif
     assign o_h_ok = (w_h_hit0 || w_h_hit1) && !r_h_conf;
 `ifndef SYNTHESIS
     // +HCOV: cycles whose hit-pipe read would have hit but overlapped an FSM

@@ -27,6 +27,7 @@ VSIM_TLB_WALK=0 python3 tools/vsim/run.py test 'wk_*' 'tlb_*'   # TLB_EN=1, TLB_
 python3 tools/vsim/run.py socwalk                  # the hardware TLB walker through the real D-cache (tb_soc)
 python3 tools/vsim/run.py dcbzdiff --seeds 200     # DCBZ programs vs 4-store references (core TB)
 python3 tools/vsim/run.py socdcbz --seeds 20       # DCBZ through the SoC: counters, DDR traffic, SMC, random
+python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on randprog (MMU_PLAN §11.9)
 ```
 
 - **`diff`** runs the same random programs on a base revision and on the
@@ -41,6 +42,11 @@ python3 tools/vsim/run.py socdcbz --seeds 20       # DCBZ through the SoC: count
   checks the cache counters, that a DCBZ miss reads nothing from DDR
   (tb_soc prints `DDR reads= writes=` at HALTED), the trace record, and a
   zeroed-then-patched code line.
+- **`tecost`** (MMU_PLAN §11.9): each randprog seed behind a prologue that
+  maps every page it touches with global identity entries and writes
+  STATUS with TE = 1 or 0 (the only difference), in supervisor and user
+  mode; prints the total cycles and the TE = 1 cost (`--plus +HIT=70` for
+  the hit-pipe model, `--rev` for another revision).
 - **`socwalk`** (MMU_PLAN §11.8): directed SoC programs for the walker
   through `mem_read_write`: PTE / directory lines dirty in the D-cache when
   walked, walk reads missing with a dirty victim, a walk read meeting the

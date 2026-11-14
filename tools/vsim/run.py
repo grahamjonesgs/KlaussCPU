@@ -1251,6 +1251,33 @@ def cmd_socwalk(a):
     return 1 if fails else 0
 
 
+def cmd_socx(a):
+    """MMU_PLAN §11.9 through the real D-cache (tb_soc): tests.py's
+    tx_battery programs (page-boundary loads / stores through bases in other
+    pages, TE = 1, supervisor and user) with the windows stored first (TE =
+    0, so the translated loads hit those lines in the cache: the hit pipe's
+    two carry-candidate tags)"""
+    import tests
+    exe = build_soc(None)
+    fails = 0
+    for seed in range(a.seed0, a.seed0 + a.seeds):
+        for user in (False, True):
+            prog, e, _ = tests._tx_battery(seed, user, [], soc=True)
+            r = run_soc(exe, prog, f'sx{seed}_{int(user)}', trace=True)
+            g = _soc_regs(r)
+            ok = bool(g) and g.get('r5') == e['r5'] and g.get('r6') == e['r6'] and 'fatal' not in r['log'].lower()
+            fails += not ok
+            if not ok or a.verbose:
+                print(f'{"pass" if ok else "FAIL"} seed={seed} user={user} r5={g and hex(g.get("r5", 0))} '
+                      f'want {e["r5"]:#x} r6={g and hex(g.get("r6", 0))} want {e["r6"]:#x}')
+            try:
+                os.remove(r['trace'])
+            except OSError:
+                pass
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def cmd_soceth(a):
     """ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3) through the real SoC bus
     (bus_splitter -> eth_mmio_bridge; tb_soc stubs liteeth_core, the RX slot
@@ -1401,6 +1428,8 @@ def main():
     sub.add_parser('socsd')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
+    sx = sub.add_parser('socx'); sx.add_argument('--seeds', type=int, default=4)
+    sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -1442,6 +1471,8 @@ def main():
         sys.exit(cmd_socwalk(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
+    elif a.cmd == 'socx':
+        sys.exit(cmd_socx(a))
     elif a.cmd == 'soceth':
         sys.exit(cmd_soceth(a))
     elif a.cmd == 'tlbdiff':

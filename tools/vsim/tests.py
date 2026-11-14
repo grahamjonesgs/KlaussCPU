@@ -4840,7 +4840,7 @@ def _tx_rd(mem, va, n):
     return sum(mem[_tx_pa(va + i)] << (8 * i) for i in range(n))
 
 
-def _tx_battery(seed, user, plus):
+def _tx_battery(seed, user, plus, soc=False):
     """random loads / stores (every mode and size; MEMGET32 at any byte
     alignment) at EAs near the page boundaries, through bases anywhere;
     runs of back-to-back accesses.  r5 folds every loaded value, r6 a final
@@ -4934,8 +4934,15 @@ def _tx_battery(seed, user, plus):
                 a.ld_abs(64, 7, va if user else 0x80000000 + _tx_pa(va))
                 a.shift_n('rol', 6, 6, 1); a.alu('xor', 6, 6, 7)
 
-    a, e, p = _te_prog(body, user, None, setup=_tx_setup, plus=plus)
-    _tx_preload(a)
+    def setup(a):
+        if soc:     # (tb_soc's boot image holds 256 KiB: store the windows, TE = 0)
+            for pa in sorted(_tx_init()):
+                if pa % 8 == 0:
+                    a.setr(9, pa); a.setr64(3, _tx_pat(pa)); a.st(64, 3, 9)
+        _tx_setup(a)
+    a, e, p = _te_prog(body, user, None, setup=setup, plus=plus)
+    if not soc:
+        _tx_preload(a)
     acc = 0
     for v in loads:
         acc = _rol(acc) ^ v

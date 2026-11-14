@@ -101,6 +101,10 @@ module pipeline_core
    // out every cycle; the cache answers the cycle after with the doubleword
    // and whether it is a clean hit (STAGE3_DCACHE_PLAN.md)
    output logic [31:0]  h_addr,
+   // (§11.9 timing) h_addr's page for the TLB's two carry candidates and
+   // the carry: the hit pipe registers both and selects after its tag read
+   output logic [15:0]  h_pg0, h_pg1,
+   output logic         h_c1,
    input  logic         h_ok,
    input  logic [63:0]  h_dword,
    input  logic         m_next_valid,
@@ -446,16 +450,16 @@ module pipeline_core
    logic [15:0] tlb_d_vpn, tlb_f_vpn;   // lookup ports: data / fetch (+ TLBP)
    logic        tlb_d_hit, tlb_f_hit;
    logic [10:0] tlb_d_pfn, tlb_f_pfn;
-   logic [2:0]  tlb_d_xwr, tlb_f_xwr;   // {X, W, R}
+   logic [2:0]  tlb_f_xwr;              // {X, W, R}
    // (§11.9) the data port's two candidate results (bit 16's carry 0 / 1)
    // and that carry: the select is the core's, so it can merge with the
    // h_addr / mem_iaddr / fault logic behind it (mmu_tlb is a kept hierarchy)
-   logic        tlb_d_hit0, tlb_d_hit1, tlb_d_c15;
+   // (pok: a matching entry grants the access — R for a load, W for a store)
+   logic        tlb_d_hit0, tlb_d_hit1, tlb_d_c15, tlb_d_pok0, tlb_d_pok1, tlb_d_pok;
    logic [10:0] tlb_d_pfn0, tlb_d_pfn1;
-   logic [2:0]  tlb_d_xwr0, tlb_d_xwr1;
    assign tlb_d_hit = tlb_d_c15 ? tlb_d_hit1 : tlb_d_hit0;
    assign tlb_d_pfn = tlb_d_c15 ? tlb_d_pfn1 : tlb_d_pfn0;
-   assign tlb_d_xwr = tlb_d_c15 ? tlb_d_xwr1 : tlb_d_xwr0;
+   assign tlb_d_pok = tlb_d_c15 ? tlb_d_pok1 : tlb_d_pok0;
    logic        mtsr_commit, tlbi_commit, tlb_discard, sr_ent_we;   // (assigned at the end)
    wire         tlb_psel;        // a TLBP in MEM or WB: the fetch port is the probe's
    wire         tlb_pload;       // a TLBP in MEM: load its key into it_vpn / it_asid
@@ -2236,8 +2240,8 @@ module pipeline_core
    wire        t_tlbs = t_useg || t_kmap;
    wire        t_seg  = (tva[31:30] == 2'b10 && !t_kseg) || (umode && !t_useg);
    wire        t_miss = t_tlbs && !tlb_d_hit;
-   wire        t_perm = t_tlbs && tlb_d_hit && !(ex_mst ? tlb_d_xwr[1] : tlb_d_xwr[0]);
-   wire        t_dn   = t_seg || t_miss || t_perm;
+   wire        t_perm = t_tlbs && tlb_d_hit && !tlb_d_pok;
+   wire        t_dn   = t_seg || (t_tlbs && !tlb_d_pok);     // = t_seg || t_miss || t_perm
    wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[26:16]} : tva[31:16];
    assign tlb_d_vpn = tva[31:16];
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
@@ -2545,6 +2549,9 @@ module pipeline_core
    wire        h_tsel     = EN_TLB && te && t_tlbs;
    wire [15:0] h_alt      = (EN_TLB && te) ? (t_kseg ? {5'b0, tva[26:16]} : tva[31:16]) : exo_iaddr[31:16];
    assign h_addr     = {h_tsel ? {5'b0, tlb_d_pfn} : h_alt, exo_iaddr[15:0]};
+   assign h_pg0      = h_tsel ? {5'b0, tlb_d_pfn0} : h_alt;
+   assign h_pg1      = h_tsel ? {5'b0, tlb_d_pfn1} : h_alt;
+   assign h_c1       = tlb_d_c15;
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
@@ -4732,8 +4739,9 @@ module pipeline_core
          .d_vpn    (tlb_d_vpn), .d_ta (t_ta_d), .d_tb (t_tb_d),
          .d_ld     (!mem_busy && !ex_busy),
          .d_step   (ex_mpu_hold && !ex_mph && te_q && ex_txpg && !mem_busy),
-         .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_xwr0 (tlb_d_xwr0),
-         .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_xwr1 (tlb_d_xwr1), .d_c15 (tlb_d_c15),
+         .d_st     (ex_mst),
+         .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_pok0 (tlb_d_pok0),
+         .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_pok1 (tlb_d_pok1), .d_c15 (tlb_d_c15),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr),
          // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
@@ -4765,8 +4773,8 @@ module pipeline_core
 `endif
    end else begin : g_notlb
       assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
-      assign tlb_d_hit0 = 1'b0;  assign tlb_d_pfn0 = '0;  assign tlb_d_xwr0 = '0;
-      assign tlb_d_hit1 = 1'b0;  assign tlb_d_pfn1 = '0;  assign tlb_d_xwr1 = '0;  assign tlb_d_c15 = 1'b0;
+      assign tlb_d_hit0 = 1'b0;  assign tlb_d_pfn0 = '0;  assign tlb_d_pok0 = 1'b0;
+      assign tlb_d_hit1 = 1'b0;  assign tlb_d_pfn1 = '0;  assign tlb_d_pok1 = 1'b0;  assign tlb_d_c15 = 1'b0;
       assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
       assign tlb_hi_vpn_o = '0;  assign tlb_hi_asid_o = '0;
       assign tlb_wk_en = 1'b0;  assign tlb_ptb = '0;
@@ -5142,9 +5150,10 @@ module mmu_tlb
    input  logic [31:0] d_ta, d_tb,    // §11.9: the EA's operands at dispatch (the core's
    input  logic        d_ld,          //   ex_ta / ex_tb), loaded with the operand latches;
    input  logic        d_step,        //   stepped to the next page for a crossing op's 2nd cycle
+   input  logic        d_st,            // the data access is a store (W, else R)
    output logic        d_hit0, d_hit1,  // the match assuming bit 16's carry is 0 / 1,
    output logic [10:0] d_pfn0, d_pfn1,  //   and that carry (the core selects; §11.9)
-   output logic [2:0]  d_xwr0, d_xwr1,
+   output logic        d_pok0, d_pok1,  //   ... and it grants the access
    output logic        d_c15,
    input  logic [15:0] f_vpn,         // registers: the micro-ITLB refill, or TLB_HI for a TLBP
    input  logic [7:0]  f_asid,
@@ -5258,11 +5267,13 @@ module mmu_tlb
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
    wire [N-1:0] fm = f_match(f_vpn, f_asid);
    assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
+   // (timing: the permission is folded per entry, so the fault logic
+   // reads one OR per carry candidate instead of the XWR muxes)
    always_comb begin
-      d_pfn0 = '0;  d_xwr0 = '0;  d_pfn1 = '0;  d_xwr1 = '0;  f_pfn = '0;  f_xwr = '0;
+      d_pfn0 = '0;  d_pok0 = 1'b0;  d_pfn1 = '0;  d_pok1 = 1'b0;  f_pfn = '0;  f_xwr = '0;
       for (int n = 0; n < N; n++) begin
-         d_pfn0 |= dm0[n] ? e_pfn[n] : 11'd0;  d_xwr0 |= dm0[n] ? e_xwr[n] : 3'd0;
-         d_pfn1 |= dm1[n] ? e_pfn[n] : 11'd0;  d_xwr1 |= dm1[n] ? e_xwr[n] : 3'd0;
+         d_pfn0 |= dm0[n] ? e_pfn[n] : 11'd0;  d_pok0 |= dm0[n] && (d_st ? e_xwr[n][1] : e_xwr[n][0]);
+         d_pfn1 |= dm1[n] ? e_pfn[n] : 11'd0;  d_pok1 |= dm1[n] && (d_st ? e_xwr[n][1] : e_xwr[n][0]);
          f_pfn |= fm[n] ? e_pfn[n] : 11'd0;  f_xwr |= fm[n] ? e_xwr[n] : 3'd0;
       end
    end

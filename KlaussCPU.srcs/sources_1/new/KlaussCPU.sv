@@ -677,6 +677,8 @@ module KlaussCPU #(
    wire [7:0]   pip_perf_stall;
    // 1a stage 3 load-hit pipe (core <-> mem_read_write, STAGE3_DCACHE_PLAN.md)
    wire [31:0]  w_h_addr;
+   wire [15:0]  w_h_pg0, w_h_pg1;
+   wire         w_h_c1;
    wire         w_h_ok;
    wire [63:0]  w_h_dword;
    wire         pip_perf_id_empty;
@@ -724,6 +726,9 @@ module KlaussCPU #(
       .m_rdata    (w_mem_read_data),
       .m_rdata_dram (dram_mem.read_data),
       .h_addr     (w_h_addr),
+      .h_pg0      (w_h_pg0),
+      .h_pg1      (w_h_pg1),
+      .h_c1       (w_h_c1),
       .h_ok       (w_h_ok),
       .h_dword    (w_h_dword),
       .m_rdata_next (w_mem_read_data_next),
@@ -1422,6 +1427,9 @@ module KlaussCPU #(
        .i_inval_go(w_cache_inval_go),
        .o_mnt_busy(w_cache_mnt_busy),
        .i_h_addr(w_h_addr),
+       .i_h_pg0(w_h_pg0),
+       .i_h_pg1(w_h_pg1),
+       .i_h_c1(w_h_c1),
        .o_h_ok(w_h_ok),
        .o_h_dword(w_h_dword)
    );
