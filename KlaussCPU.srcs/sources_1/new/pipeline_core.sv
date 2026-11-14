@@ -72,7 +72,15 @@ module pipeline_core
    // §11.1); 32 B lines need IC_LINES >= 64.  The index, tag and every
    // slice of them derive from these two constants.
    parameter int IC_LINES = 2048,
-   parameter int IC_LB    = 32
+   parameter int IC_LB    = 32,
+   // 1: the instance ties ce high (core 1).  IC_LB = 32 needs it: the
+   // D-cache's line answer (m_line_v) is a one-cycle pulse in CLOCK
+   // cycles, and the core takes it (lp_ev) only on a ce edge — on an
+   // instance whose ce can be 0 a pulse in a ce = 0 cycle would be lost
+   // and lp_v would hold the fill engine for good.  An instance with a
+   // real clock enable (core 2) passes 0 and IC_LB = 16 (elaboration
+   // check below; a simulation assertion checks ce stays 1 when it is 1).
+   parameter bit CE_TIED  = 1'b1
 )
 (
    input  logic         clk,
@@ -660,6 +668,9 @@ module pipeline_core
    if (!(IC_LB == 16 || IC_LB == 32) || IC_LINES * IC_LB > 65536 || (IC_LINES & (IC_LINES - 1)) != 0 ||
        (IC32 && IC_LINES < 64) || IC_LINES < 4)
       $error("pipeline_core: unsupported I-cache geometry IC_LINES=%0d IC_LB=%0d", IC_LINES, IC_LB);
+   // (§5: the 32 B line install takes the one-cycle m_line_v pulse under ce)
+   if (IC32 && !CE_TIED)
+      $error("pipeline_core: IC_LB = 32 needs CE_TIED = 1 (ce tied high): m_line_v is not held across ce = 0 cycles");
    // {dword 0 [IC_LB*8-1 -: 64], dword 1, ...}: (16 B) {addr3=0 dw [127:64],
    // addr3=1 dw [63:0]}; (32 B) the D-cache line layout, dw k at [255-64k -: 64]
    (* ram_style = "block" *) logic [IC_LB*8-1:0] ic_data [0:IC_LINES-1];
@@ -2806,6 +2817,16 @@ module pipeline_core
    // a clear of another line, or a sweep, waits (vs_pend: the latest one;
    // an install during a sweep is of a fill completed after the sweep's
    // trigger — start and ICACHE_INV drop lp_v — so its line is current).
+   // An install-invalid (lp_ev && lp_wrh, a dropped install: data and tags
+   // written, see the install) writes its bit 0 in the set's place and
+   // cancels a deferred set; it is never deferred itself — when a clear or
+   // the sweep has the port its bit is 0 already: the store that dropped
+   // it cleared that index (its pending-line snoop, sn_rc, one or more
+   // edges earlier — a dropping write issued after the fill's ready), and
+   // nothing has set it since (one fill at a time); a debugger write does
+   // not snoop, but no store runs while the core is halted and the resume
+   // sweeps.  (The write enable no longer depends on lp_wrh; the data bit
+   // does.)
    // Two asynchronous reads: the lookup's (ic_look_li, registered into
    // ic_rd_lv32) and the store snoop's (sn_pra, beside the shadow's
    // compare).  The sweep starts on reset, start / debugger resume and
@@ -2814,12 +2835,14 @@ module pipeline_core
    // (vl_any; the configuration's LUTRAM is all 0, and vl_any's power-up
    // value is 0 and survives reset).
    generate if (IC32) begin : g_vl
-      wire               vreq  = li_now || vs_pend;
-      wire [IC_IDXW-1:0] vidx  = li_now ? li_idx : vs_idx;
+      wire               lpi   = lp_ev && lp_wrh;     // install-invalid
+      wire               vreq  = lp_ev || vs_pend;
+      wire [IC_IDXW-1:0] vidx  = lp_ev ? li_idx : vs_idx;
       wire               vdrop = snoop_q && snoop_idx_q == vidx;
+      wire               vset  = vreq && !vdrop && !lpi;   // a set, now or deferred
       wire [IC_IDXW-1:0] wl    = snoop_q ? snoop_idx_q : vidx;
       wire [VB_AW-1:0]   wa    = ic_sw ? ic_swa : wl[VB_AW-1:0];
-      wire               wd    = !ic_sw && !snoop_q;
+      wire               wd    = !ic_sw && !snoop_q && !lpi;
       wire               swgo  = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv;
       logic [VB_N-1:0]   bl, bs;
       logic              vl_any = 1'b0;
@@ -2838,8 +2861,8 @@ module pipeline_core
       assign vl_rd_sn   = bs[sn_pra >> VB_AW];
       always_ff @(posedge clk)
          if (rst) begin
-            ic_sw <= vl_any || (vreq && !vdrop && !snoop_q);  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
-            if (ce && !ic_sw && vreq && !vdrop && !snoop_q) vl_any <= 1'b1;
+            ic_sw <= vl_any || (vset && !snoop_q);  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+            if (ce && !ic_sw && vset && !snoop_q) vl_any <= 1'b1;
          end else if (ce) begin
             if (ic_sw) begin
                ic_swa <= ic_swa + 1'b1;
@@ -2847,12 +2870,12 @@ module pipeline_core
                   ic_sw  <= 1'b0;
                   vl_any <= 1'b0;
                end
-            end else if (vreq && !vdrop && !snoop_q)
+            end else if (vset && !snoop_q)
                vl_any <= 1'b1;                    // a valid bit is set this edge
-            vs_pend <= vreq && !vdrop && (ic_sw || snoop_q);
+            vs_pend <= vset && (ic_sw || snoop_q);
             vs_idx  <= vidx;
             if (swgo) begin
-               ic_sw <= vl_any || (vreq && !vdrop && !snoop_q && !ic_sw);
+               ic_sw <= vl_any || (vset && !snoop_q && !ic_sw);
                ic_swa <= '0;  vs_pend <= 1'b0;
             end
          end
@@ -2932,9 +2955,14 @@ module pipeline_core
    // [0] (HW_PERF_PLAN §5) a demand fill that puts a read on the port,
    // registered at its issue (was a mirror of the issue condition, which
    // also counted every micro-ITLB refill cycle with TE = 1, and fake fills)
-   logic r_perf_icm = 1'b0, r_perf_itlb = 1'b0;
+   // [1] fill cycles: a fill on the port (if_xc), or (§5, registered, one
+   // cycle late) a fetch-window miss cycle (perf_stall[6]) while a fill's
+   // 32 B line is still to come (lp_v) or was just installed (li_q, the
+   // held lookup's re-read), except a lookup's hit cycle — the wait for the
+   // rest of a cold line is fill time, as the whole fill was on 16 B lines
+   logic r_perf_icm = 1'b0, r_perf_itlb = 1'b0, r_perf_lpw = 1'b0;
    assign perf_ic[0] = r_perf_icm;
-   assign perf_ic[1] = if_xc;
+   assign perf_ic[1] = if_xc || r_perf_lpw;
    assign perf_itlb  = r_perf_itlb;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
@@ -3884,7 +3912,9 @@ module pipeline_core
          // (§5: and while a completed fill's line is still to come, lp_v —
          // they hold its address for the install; no fill issues meanwhile)
          r_perf_icm  <= 1'b0;                 // (perf_ic[0]: set by the issue below)
-         r_perf_itlb <= EN_TLB && it_ref && !tlb_psel;   // a micro-ITLB refill (ut_refill)
+         r_perf_itlb <= EN_TLB && it_ref && !tlb_psel && !tlb_discard;   // a micro-ITLB refill (ut_refill's condition)
+         r_perf_lpw  <= IC32 && (lp_v || li_q) && !if_xc && !(if_look && ic_hit) &&
+                        running && !fetch_halt && !parked && !irq_active && !fetch_ok;   // (perf_stall[6]'s cycles)
          if (!if_xc && !(IC32 && lp_v)) begin
             if_req_dw <= miss_dw;             // old base+data captured together
             r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
@@ -4070,12 +4100,22 @@ module pipeline_core
          // bit is set by g_vl (or deferred behind a snoop clear).  lp_v
          // marks a fill whose line is still to come.  (start / ICACHE_INV
          // drop it below; the sweep they start covers a same-edge install.)
+         // A dropped install (lp_wrh: a write to the line was on the port or
+         // queued as it arrived) is an INSTALL-INVALID: data and both tags
+         // are written all the same and the BTIC entries of the index die,
+         // but g_vl writes the valid bit 0.  So the snoop's shadow holds the
+         // line of every window served by this fill — a BTIC capture taken
+         // from that window after the store's pending-line snoop (or after
+         // the drop) has its line in the shadow, and a later store to it is
+         // a snoop hit that kills it (the BTIC kills go by line index only).
+         // A plain drop left the old line's tag there: such an entry
+         // survived every later store to its line.
          if (IC32) begin
-            if (li_now) begin
+            if (lp_ev) begin
                ic_data[li_idx]  <= m_line;
                ic_tag[li_idx]   <= li_tag;
                ic_tagsh[li_idx] <= li_tag;
-               ev_icinst = 1'b1;  ev_icinst_idx = li_idx;   // 2a: BTIC entries of this line die
+               ev_icinst = 1'b1;  ev_icinst_idx = li_idx;   // 2a: BTIC entries of this index die
             end
             li_q <= li_now;
             if (lp_ev)        lp_v <= 1'b0;
@@ -5169,6 +5209,9 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
          else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
+   // CE_TIED: the instance really ties ce high (§5, IC_LB = 32)
+   always_ff @(posedge clk) if (!rst && CE_TIED)
+      assert (ce === 1'b1) else $fatal(1, "pipeline_core: CE_TIED = 1 but ce = %b", ce);
    // ex_b_zero tracks ex_b exactly (both its write sites set it)
    always_ff @(posedge clk) if (!rst && !$isunknown({ex_b_zero, ex_b}))
       assert (ex_b_zero == (ex_b == 64'd0))

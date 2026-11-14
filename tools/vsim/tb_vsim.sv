@@ -19,7 +19,8 @@
 //                   0..n-1) cycles after its ready, as after a D-cache miss's
 //                   early restart; no DRAM request is accepted meanwhile
 //                   (the cache is busy installing; MMIO is).  Default 0: with
-//                   the ready.
+//                   the ready.  +LDLYA=<addr> +LDLYN=<n>: the line holding
+//                   addr answers n cycles late instead (n = 0: with the ready).
 //===========================================================================
 `timescale 1ns/1ps
 module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
@@ -199,6 +200,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       for (int k = 0; k < 4; k++) rd_line[255 - 64*k -: 64] = rd_dw({a[31:5], 5'b0} + 32'(8 * k));
    endfunction
    int          ldly = 0, ldly_r = 0, ld_cnt = 0;
+   logic [31:0] ldly_a = '0;     // +LDLYA=<addr> +LDLYN=<n>: that 32 B line's answer n cycles late
+   int          ldly_an = 0;
    logic        ld_pend = 1'b0;
    logic [255:0] ld_line;
    longint      n_line = 0;
@@ -246,7 +249,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                if (q_addr[31:28] == 4'hF) n_mmio_rd++;
                else begin
                   // the line answer: with the ready, or LDLY(+R) cycles later
-                  automatic int dl = ldly + (ldly_r ? ($urandom % ldly_r) : 0);
+                  automatic int dl = (ldly_a != 0 && q_addr[31:5] == ldly_a[31:5]) ? ldly_an :
+                                     ldly + (ldly_r ? ($urandom % ldly_r) : 0);
                   if (dl == 0) begin
                      m_line   <= rd_line(q_addr);
                      m_line_v <= 1'b1;
@@ -294,9 +298,20 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 
    // ---------------- counters / trace ----------------------------------------
    longint icount = 0;
+   // +DBG_MW=<addr> +DBG_MD=<dword>: at the first halt, before resuming,
+   // the debugger writes the dword (lane-placed, all byte enables) through
+   // the core's port (dbg_i.mem_req); the resume waits for its mem_done
+   bit          dbg_mw = 0, dbg_mw_go = 0;
+   logic [31:0] dbg_mw_a;
+   logic [63:0] dbg_mw_d;
    always @(posedge clk) if (!rst && dbg_drv) begin
-      dbg_i.resume <= 1'b0;  dbg_i.step <= 1'b0;
-      if (parked && park_kind == 3'd4 && !dbg_i.resume) begin
+      dbg_i.resume <= 1'b0;  dbg_i.step <= 1'b0;  dbg_i.mem_req <= 1'b0;
+      if (dbg_mw_go && dut.dbg_mem_done) dbg_mw_go <= 0;
+      if (parked && park_kind == 3'd4 && !dbg_i.resume && dbg_mw && !dbg_mw_go) begin
+         dbg_mw <= 0;  dbg_mw_go <= 1;
+         dbg_i.mem_req <= 1'b1;  dbg_i.mem_we <= 1'b1;  dbg_i.mem_addr <= dbg_mw_a;
+         dbg_i.mem_wdata <= dbg_mw_d;  dbg_i.mem_be <= 8'hFF;
+      end else if (parked && park_kind == 3'd4 && !dbg_i.resume && !dbg_mw && !dbg_mw_go) begin
          if (dbg_gap < 4) dbg_gap <= dbg_gap + 1;      // let the halt settle
          else begin
             dbg_gap <= 0;
@@ -376,6 +391,23 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
       if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
+   // The BTIC coverage invariant (32 B lines, TE = 0): every valid BTIC
+   // entry's window line sits in the snoop's tag shadow at its line index
+   // (bt_lidx), or is the pending install's line — so a later store to it
+   // is a snoop hit and kills the entry.  btic_unc counts the cycles an
+   // entry is uncovered (+BTICCHK prints them).
+   longint btic_unc = 0;
+   bit     bticchk = 0;
+   initial bticchk = $test$plusargs("BTICCHK");
+   always @(posedge clk) if (!rst && IC_LB == 32 && !dut.te) begin
+      for (int k = 0; k < $bits(dut.bt_v); k++)
+         if (dut.bt_v[k] && dut.ic_tagsh[dut.bt_lidx[k]] != dut.bt_base[k][28:$clog2(IC_LINES)+2] &&
+             !(dut.lp_v && dut.lp_pa == dut.bt_base[k][28:2])) begin
+            btic_unc++;
+            if (bticchk) $display("BTICCHK t=%0d entry %0d base=%08x lidx=%0d shadow=%04x", cyc, k,
+                                  {dut.bt_base[k], 3'b0}, dut.bt_lidx[k], dut.ic_tagsh[dut.bt_lidx[k]]);
+         end
+   end
    always @(posedge clk) if (!rst) begin
       if (dut.li_now) ic_inst++;
       if (dut.lp_ev && dut.lp_wrh) ic_drop++;
@@ -443,6 +475,20 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (perf_itlb) n_itlb++;
 `endif
    end
+`ifdef HAS_PERF_ITLB
+   // PERF_ITLB_REFILL counts exactly the refills that happen (ut_refill's
+   // condition: not on a TLB write's discard edge), one cycle late
+   // (itlb_disc: refills dropped on a discard edge — the case counted
+   // twice before; ICDBG-free evidence the tests reach it)
+   logic itlb_q = 1'b0;
+   longint itlb_disc = 0;
+   always @(posedge clk) begin
+      itlb_q <= !rst && dut.it_ref && !dut.tlb_psel && !dut.tlb_discard;
+      if (!rst && dut.it_ref && !dut.tlb_psel && dut.tlb_discard) itlb_disc++;
+      if (!rst && perf_itlb != itlb_q)
+         $display("TB: FATAL perf_itlb %b but refill %b at t=%0d", perf_itlb, itlb_q, cyc);
+   end
+`endif
 
    always @(negedge clk) begin
       if (!rst && ret_valid) begin
@@ -493,7 +539,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
 `ifdef HAS_ICLB
-      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb);
+      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc);
+`ifdef HAS_PERF_ITLB
+      $fdisplay(f, "itlb_disc=%0d", itlb_disc);
+`endif
 `endif
 `ifdef HAS_WALK
       $fdisplay(f, "wk_s=%0d wk_n=%0d wk_cyc=%0d wk_irq=%0d", wk_s, wk_n, wk_cyc, wk_irq);
@@ -522,6 +571,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
             dbg_drv = 1;  dbg_i.bp_en[0] = 1'b1;  dbg_i.bp_addr[0] = bpa;
             void'($value$plusargs("DBG_STEPS=%d", dbg_steps));
             void'($value$plusargs("DBG_PLAIN=%d", dbg_plain));
+            if ($value$plusargs("DBG_MW=%h", dbg_mw_a)) begin
+               dbg_mw = 1;
+               void'($value$plusargs("DBG_MD=%h", dbg_mw_d));
+            end
          end
       end
       void'($value$plusargs("PARK_HOLD=%d", park_hold));
@@ -533,6 +586,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       void'($value$plusargs("HIT=%d", hit_pct));
       void'($value$plusargs("LDLY=%d", ldly));
       void'($value$plusargs("LDLYR=%d", ldly_r));
+      void'($value$plusargs("LDLYA=%h", ldly_a));
+      void'($value$plusargs("LDLYN=%d", ldly_an));
       // debugger state without a debugger driver (DEBUG_EN builds only)
       if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
       // watchpoint 0 on a dword (read / write), without a debugger driver

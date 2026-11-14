@@ -133,7 +133,8 @@ module core2_subsys
    // no D-cache: DCBZ_EN = 0, DCBZ is ILLEGAL — HW_PERF_PLAN.md §1;
    // the 8 KiB I-cache it always had: IC_LINES = 512 — §2 grows core 1's)
    pipeline_core #(.SP_RESET(32'h0002_0000), .BTIC_EN(1'b0), .EXC_EN(1'b0), .MPU_EN(1'b0),
-                   .TLB_EN(1'b0), .DCBZ_EN(1'b0), .IC_LINES(512), .IC_LB(16)) c2_core_i (   // SP = top of local BRAM
+                   .TLB_EN(1'b0), .DCBZ_EN(1'b0), .IC_LINES(512), .IC_LB(16),
+                   .CE_TIED(1'b0)) c2_core_i (   // (ce = r_ce; IC_LB = 32 would need CE_TIED)   // SP = top of local BRAM
       .clk        (i_Clk),
       .ce         (r_ce),
       .rst        (!i_Rst_L || !r_run),

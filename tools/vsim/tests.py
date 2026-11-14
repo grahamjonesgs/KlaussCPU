@@ -4326,6 +4326,287 @@ def ic32_smc_btic():
             out.append((a, {'end': 'park', 'kind': '0', 'r1': 32}, [f'+LAT={lat}', f'+LDLY={ld}']))
     return out
 
+
+@test
+def ic32_drop_btic():
+    """a dropped install must still cover the BTIC window captured from its
+    fill (the review's scenario).  A cold 16 B loop at the start of the 32 B
+    line X stores into X's other half every iteration: the first store
+    issues while X's line answer is pending (the pending-line snoop kills
+    the BTIC entries of X that exist then), the line arrives with the store
+    on the port and the install is dropped, and the loop branch's BTIC
+    capture comes after that kill, from the window the early restart
+    filled.  After the loop, the loop's first word is patched (snoop-
+    coherent: no ICACHE_INV) and the loop entered again, cold, its line
+    late: a BTIC hit taken before that fill's install must not bring back
+    the old word (a <= 16 B loop then runs from the window for good).
+    (With EN_ST1 the dropping store is posted speculatively, does not pass
+    the post check and squashes everything younger, the window included,
+    so no capture from that fill's window outlives its snoop: this passes
+    on 112fc8b too, as it does with EN_ST1 = 0.  btic_unc — tb_vsim's
+    check that every valid entry's line is in the tag shadow or pending —
+    stays 0; ic32_dbg_write is the case where a plain drop broke that.)"""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    nops = _word(lambda t: (t.nop(), t.nop()))
+    X = 0x21000          # (above 64 KiB: the shadow's power-up tag 0 is another line's)
+    for ldv in (False, True):
+        for lat in (1, 2, 3, 5):
+            for ld in (4, 6, 8, 10, 12, 16):
+                a = Asm()
+                a.setr(1, 0); a.setr(2, X + 16); a.setr64(3, nops | nops << 32); a.setr(13, 3)
+                a.setr(5, DATA + 0x200); a.setr(12, 0)
+                a.jmp('X')
+                a.label('after')
+                a.setr(6, new); a.setr(7, X); a.st(32, 6, 7)      # patch X + 0
+                a.setr(2, DATA + 0x100); a.setr(1, 0); a.setr(13, 40); a.setr(12, 1)
+                a.jmp('X')
+                a.label('done')
+                a.halt()
+                _ic_pad(a, X)
+                a.label('X')
+                a.alui_s('add', 1, 1, 1)           # X + 0: patched to +16
+                if ldv:
+                    a.ld(64, 4, 5)                 # (the store chains onto this load's answer)
+                else:
+                    a.nop()
+                a.st(64, 3, 2)                     # X + 16 (the line's other half), then data
+                a.fbr('lt', 1, 13, 'X')            # X + 12
+                a.nop(); a.nop()                   # X + 16: the stored dword (two NOPs)
+                a.fbr('ne', 12, 0, 'dn', imm=True)
+                a.jmp('after')
+                a.label('dn')
+                a.jmp('done')
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 48, 'btic_unc': '0'},
+                            [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+ICINV_A = 0xF0050000      # CACHE_CTRL: bit 3 = ICACHE_INV
+
+
+def _icinv(a, ra=13, rv=14):
+    a.setr(ra, ICINV_A); a.setr(rv, 8); a.st(32, rv, ra)
+
+
+def _spin(a, reg, n, tag):
+    """a counted delay loop (about 2 cycles an iteration)"""
+    a.setr(reg, n)
+    a.label(tag)
+    a.addi_s(reg, reg, -1)
+    a.fbr('ne', reg, 0, tag, imm=True)
+
+
+@test
+def ic32_fill_cyc():
+    """PERF_IC_FILL_CYC with 32 B lines: straight 1-word code through 40
+    cold lines whose line answers come LDLY cycles after the early restart.
+    The fetch's wait for the rest of each line counts as fill time (it grows
+    with LDLY: about LDLY + LAT a line), not as window bubble"""
+    out = []
+    if not IC32:
+        return out
+    for ld in (8, 16):
+        a = Asm()
+        a.setr(3, 0)
+        a.jmp('S')
+        while a.pc % 32:
+            a.nop()
+        a.label('S')
+        for _ in range(8 * 40):
+            a.inc(3)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', 'r3': 320,
+                        'ic_fill': (40 * ld - 20, 40 * (ld + 6) + 20)}, ['+LAT=3', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_vdefer_snoop():
+    """a deferred valid set met by the snoop of a store to its own line
+    (g_vl's vdrop): a cold function L stores first into the line J — in the
+    tag shadow but invalid, so the store posts and its snoop clears J's
+    index — then into L's own second half.  L's line answer arrives on the
+    first store's snoop edge (L's set waits behind that clear) with the
+    second store on its issue edge (queued, not yet on the port: no drop);
+    the second store's snoop must cancel the waiting set, or L's line turns
+    valid with the word from before the store.  Swept over the line delay
+    so the arrival meets that edge."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    J, L = 0x22000, 0x23000
+    for lat in (1, 2, 3):
+        for ld in range(1, 11):
+            a = Asm()
+            a.setr(1, 0); a.setr(4, 0); a.setr(8, J + 24); a.setr(9, L + 16); a.setr(3, new)
+            a.call('J')                        # J installed
+            a.st(64, 4, 8)                     # J's valid bit 0, its tag stays in the shadow
+            _spin(a, 5, 8, 'w0')
+            a.call('L')                        # +16 (the store's squash refetches L + 16)
+            a.call('L2')                       # +16
+            a.halt()
+            _ic_pad(a, J)
+            a.label('J'); a.ret()
+            _ic_pad(a, L)
+            a.label('L')
+            a.st(64, 4, 8)                     # J + 24: a snoop hit on an invalid line (posts)
+            a.st(32, 3, 9)                     # L + 16: patched to +16
+            _ic_pad(a, L + 16)
+            a.label('L2')
+            a.alui_s('add', 1, 1, 1)
+            a.ret()
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 32}, [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_sweep_snoop():
+    """a line installed during a flash-clear sweep (its valid set waits for
+    the sweep's end) and then written by a snooped store: the store must
+    cancel the waiting set (vdrop), or the line turns valid after the sweep
+    with the word from before the store.  L (one window: no lookup after
+    its fill) stores into its own last dword — outside the window, so it
+    posts and nothing refetches L — and returns; the return's line answers
+    after the sweep (+LDLYA), so no other install replaces L's waiting set
+    meanwhile.  After the sweep a call to L's last dword must run the new
+    word."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    L = 0x23000
+    for lat in (1, 3):
+        for ld in (0, 1, 2):
+            for mn in (0, 90):
+                a = Asm()
+                a.setr(1, 0); a.setr(9, L + 24); a.setr(3, new)
+                _icinv(a)                          # the sweep (main's lines were valid)
+                while (a.pc + 4) % 32:
+                    a.nop()
+                a.call('L')                        # cold, inside the sweep
+                a.label('back')                    # (a line of its own)
+                _spin(a, 5, 50, 'w1')              # past the sweep (64 cycles)
+                a.call('L2')                       # +16
+                a.halt()
+                _ic_pad(a, L)
+                a.label('L')
+                a.nop(); a.nop()                   # (the install lands before the store's MEM)
+                a.st(32, 3, 9)                     # L + 24: patched to +16
+                a.ret()
+                _ic_pad(a, L + 24)
+                a.label('L2')
+                a.alui_s('add', 1, 1, 1)
+                a.ret()
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 16, 'ic_sweeps': (1, 9)},
+                            [f'+LAT={lat}', f'+LDLY={ld}', '+LDLYA=%x' % a.labels['back'],
+                             f'+LDLYN={mn}']))
+    return out
+
+
+@test
+def ic32_inv_defer():
+    """ICACHE_INV while a valid set waits for the end of a sweep (swgo's
+    vs_pend <= 0), i.e. a sweep restarted mid-sweep with a deferred set: a
+    fence starts a sweep; L's second half is entered cold inside it (its
+    line's set waits); from that window L has the non-coherent writer
+    rewrite L's first half and fences again — mid-sweep — as the line's
+    last word.  The refetch after that fence is of the next line, whose
+    answer comes after the new sweep (+LDLYA): no install replaces the
+    deferred set meanwhile.  A call to L's first half must then run the new
+    word: the set from before the fence would revalidate the line read
+    before the rewrite."""
+    out = []
+    newdw = _word(lambda t: t.alui_s('add', 1, 1, 16)) | (_word(lambda t: t.ret()) << 32)
+    L = 0x23000
+    for lat in (1, 3):
+        for ld in (0, 2, 5):
+            for mn in (0, 90):
+                a = Asm()
+                a.setr(1, 0); a.setr(8, POKE_A); a.setr(7, POKE_D); a.setr(9, L)
+                a.setr64(6, newdw); a.setr(13, ICINV_A); a.setr(14, 8)
+                a.st(32, 14, 13)                   # ICACHE_INV: sweep 1
+                a.call('Lh')                       # cold, inside sweep 1
+                _spin(a, 5, 60, 'w1')              # past sweep 2
+                a.call('L')                        # +16
+                a.halt()
+                _ic_pad(a, L)
+                a.label('L')
+                a.alui_s('add', 1, 1, 1); a.ret()  # (rewritten: +16)
+                _ic_pad(a, L + 16)
+                a.label('Lh')
+                a.st(64, 9, 8); a.st(64, 6, 7)     # poke L + 0 (no snoop)
+                a.nop()
+                a.st(32, 14, 13)                   # L + 28: ICACHE_INV, sweep 2 (restarts sweep 1)
+                a.ret()                            # L + 32: the next line
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 16},
+                            [f'+LAT={lat}', f'+LDLY={ld}', '+LDLYA=%x' % (L + 32), f'+LDLYN={mn}']))
+    return out
+
+
+@test
+def ic32_sweep_restart():
+    """ICACHE_INV during a sweep restarts it: a warm P is rewritten by the
+    non-coherent writer, fenced, rewritten again and fenced again k cycles
+    later (mid-sweep for small k; P called in between for some), then
+    called: it must run the second rewrite"""
+    out = []
+    w = lambda v: _word(lambda t: t.alui_s('add', 1, 1, v)) | (_word(lambda t: t.ret()) << 32)
+    P = 0x23000
+    for gap in (0, 1, 4, 20, 40, 70):
+        for mid in (False, True):
+            for ld in (0, 6):
+                a = Asm()
+                a.setr(1, 0); a.setr(8, POKE_A); a.setr(7, POKE_D); a.setr(9, P)
+                a.call('P')                        # +1, P warm
+                a.setr64(6, w(4)); a.st(64, 9, 8); a.st(64, 6, 7)
+                _icinv(a)
+                if gap:
+                    _spin(a, 5, gap, 'g')
+                if mid:
+                    a.call('P')                    # +4 (refilled, maybe inside the sweep)
+                a.setr64(6, w(16)); a.st(64, 9, 8); a.st(64, 6, 7)
+                _icinv(a)
+                a.call('P')                        # +16
+                a.halt()
+                _ic_pad(a, P)
+                a.label('P')
+                a.alui_s('add', 1, 1, 1)
+                a.ret()
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 1 + (4 if mid else 0) + 16},
+                            [f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_dbg_write():
+    """DEBUG_EN builds: a PC breakpoint inside a cold line X whose line
+    answer is still to come; at the halt the debugger writes X's second
+    dword through the core's port (no snoop), so the install is dropped
+    (the write is on the port as the line arrives) or, without a delay,
+    the line installed before it.  After the resume (a sweep, the BTIC
+    emptied) X must run the new code, twice."""
+    out = []
+    if not _os0.environ.get('VSIM_DEBUG_EN') == '1':
+        return out
+    newdw = _word(lambda t: t.alui_s('add', 1, 1, 16)) | (_word(lambda t: t.ret()) << 32)
+    X = 0x24000
+    for lat in (1, 3):
+        for ld in (0, 4, 12, 30):
+            a = Asm()
+            a.setr(1, 0)
+            a.call('X')
+            a.call('X')
+            a.halt()
+            _ic_pad(a, X)
+            a.label('X')
+            a.nop(); a.nop()
+            a.alui_s('add', 1, 1, 1); a.ret()      # X + 8: rewritten to +16
+            # (btic_unc: tb_vsim's check that every valid BTIC entry's line
+            # is in the snoop's tag shadow or pending — the CALL's capture
+            # from X's fill must die with the dropped install: a plain drop
+            # left it uncovered until the resume emptied the BTIC)
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 32, 'btic_unc': '0'},
+                        [f'+LAT={lat}', f'+LDLY={ld}', '+DBG_BP0=%x' % (X + 4),
+                         '+DBG_MW=%x' % (X + 8), '+DBG_MD=%x' % newdw]))
+    return out
+
 @test
 def ic32_remap():
     """TE = 1: code at a VA re-mapped by TLBWI to another frame (other code)
