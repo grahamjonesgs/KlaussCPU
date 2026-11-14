@@ -2589,7 +2589,11 @@ module pipeline_core
    // (§2: the even / odd shadow banks and valid bits are read at the pair
    // index — one read address per array, IC_LINES/2 deep)
    wire [IC_IDXW-1:0] sn_idx  = mem_iaddr[IC_IDXW+3:4];
-   wire [IC_PRW-1:0]  sn_pr   = sn_idx[IC_IDXW-1:1];
+   // (the tag shadow's read address: its own copy of mem_iaddr's pair index,
+   // loaded with it, so synthesis absorbs it into the block RAM — §11.9's
+   // mem_iaddr rewrite had lost that absorption: 2 RAMB18 -> 384 LUTRAM)
+   logic [IC_PRW-1:0] sn_pra;
+   wire [IC_PRW-1:0]  sn_pr   = sn_pra;
    wire        sn_te      = ic_tagff_e[sn_pr] == mem_iaddr[31:IC_IDXW+4];
    wire        sn_to      = ic_tagff_o[sn_pr] == mem_iaddr[31:IC_IDXW+4];
    wire        sn_ve      = sn_te && ic_lv[{sn_pr, 1'b0}];
@@ -4085,6 +4089,7 @@ module pipeline_core
                              : ex_x3 ? t1_pahi
                              : t_kseg ? {5'b0, tva[26:16]} : tva[31:16],
                               exo_iaddr[15:0]};
+               sn_pra     <= exo_iaddr[IC_IDXW+3:5];
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
                mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
                mem_xpg    <= ex_x3;
@@ -4853,7 +4858,8 @@ module pipeline_core
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst)
-      assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2))
+      assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2) &&
+              sn_pra == mem_iaddr[IC_IDXW+3:5])
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
    // (§11.9) the dispatch-time page-crossing bit is ex_xpg
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
