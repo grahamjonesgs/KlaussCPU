@@ -31,6 +31,7 @@ def _tlb_n():
     return int(_re.search(r'parameter int TLB_N = (\d+)', src).group(1))
 
 
+NOWALK = _os0.environ.get('VSIM_TLB_WALK') == '0'     # TLB_EN = 1, TLB_WALK = 0 (MMU_PLAN §11.8)
 TLB_N = _tlb_n()
 TLB_IW = TLB_N.bit_length() - 1          # TLB_INDEX bits (log2 N)
 
@@ -4303,9 +4304,11 @@ def wk_uitlb_evict():
 def wk_coherent():
     """the walker sees the newest page-table contents: a PTE and a
     directory entry written by stores (through kseg) right before the access,
-    still posted / queued when the access misses; a PTE first absent (the
+    still posted / queued when the access misses (wk_pend, from LAT 3 up); a PTE first absent (the
     access falls back: TLB_MISS), then written, and the retried access walks
-    (the Linux page-fault path).  Several latencies"""
+    (the Linux page-fault path).  Several latencies.  The TB's wk_pend / wk_post /
+    wk_sq count the walks that start with a store still in st_post / the store
+    queue: they must be non-zero (the case really is the posted one)"""
     if NOEXC:
         return []
     out = []
@@ -4319,16 +4322,67 @@ def wk_coherent():
                 a.setr(7, 0x80000000 | (0x26000 + 8 * 0x005))
                 a.setr64(3, _wk_pte(4, TLB_V | TLB_R)); a.st(64, 3, 7)
                 a.setr64(3, WK_JD | 0x26000 | 1); a.st(64, 3, 8)
-                a.setr(9, 0x0C050010); a.ld(64, 5, 9)            # both stores in flight
+                a.setr(6, 0x80000000 | (0x26000 + 8 * 0x006))
+                a.setr(9, 0x0C050010); a.st(64, 3, 6)            # (a 3rd store: the queue is in use)
+                a.ld(64, 5, 9)                                   # the stores still in flight
                 a.setr(9, 0x02100018); a.ld(64, 6, 9)            # absent: TLB_MISS_LD (handler steps over)
                 a.setr(8, 0x80000000 | (WK_TAB[0] + 8 * 0x210))
                 a.setr64(3, _wk_pte(4, TLB_V | TLB_R)); a.st(64, 3, 8)
                 a.ld(64, 6, 9)                                   # walks now
                 a.mfsr(10, 'tlb_wcnt')
             exp = {'r4': 0x42, 'r5': 0x4343, 'r6': 0x4444, 'r10': 3, 'wk_n': '3', 'wk_s': '4'}
+            if lat != '+LAT=1':      # (at latency 1 the posted stores have drained by the miss)
+                exp['wk_pend'] = 'nonzero'
             a, e, p = _wk_prog(body, {}, exp, logs=[(X_TLB_LD, 0x02100018)], plus=[lat] + hit)
             a.dword(0x30008, 0x42); a.dword(0x40010, 0x4343); a.dword(0x40018, 0x4444)
             out.append((a, e, p))
+    return out
+
+
+@test
+def wk_coherent_sq():
+    """as wk_coherent, in a warm loop (the code is fetched without gaps, so
+    the stores really queue): two plain stores, then the PTE store (or the
+    directory-entry store: 'dir'), then the access that misses and walks it:
+    the store is still on the port or in the store queue (sq_v) when the walk
+    starts.  The TB's wk_pend / wk_post / wk_sq count that (all non-zero)"""
+    if NOEXC:
+        return []
+    out = []
+    for kind in ('pte', 'dir'):
+        for lat in ('+LAT=3', '+LAT=7', '+LAT=12'):
+            for hit in ([], ['+HIT=70']):
+                def body(a):
+                    a.setr(1, 5); a.setr(5, 0)
+                    a.setr(7, 0x80000000 | (DATA + 0x100))
+                    if kind == 'pte':
+                        a.setr(2, 0x10000)
+                        a.setr(8, 0x80000000 | 0x26000); a.setr(9, 0x0C000008)
+                        a.setr64(3, _wk_pte(3, TLB_V | TLB_R))
+                    else:      # D[4 + i] -> table i (PTE 0 present in the image), VA = (4 + i) << 26
+                        a.setr(2, 0x2000); a.setr(6, 0x04000000)
+                        a.setr(8, 0x80000000 | (WK_PTB + 8 * 4)); a.setr(9, 0x10000008)
+                        a.setr64(3, WK_JD | 0x28000 | 1)
+                    a.label('lp')
+                    a.st(64, 1, 7); a.st(64, 1, 7, 8)
+                    a.st(64, 3, 8)                                   # the PTE / directory entry, last
+                    a.ld(64, 4, 9)                                   # misses, walks it
+                    a.alu('add', 5, 5, 4)
+                    a.addi_s(8, 8, 8)
+                    if kind == 'pte':
+                        a.alu('add', 9, 9, 2)
+                    else:
+                        a.alu('add', 3, 3, 2); a.alu('add', 9, 9, 6)
+                    a.addi_s(1, 1, -1); a.fbr('ne', 1, 0, 'lp', imm=True)
+                    a.mfsr(10, 'tlb_wcnt')
+                exp = {'r5': 5 * 0x42, 'r10': 5, 'wk_n': '5', 'wk_s': '5', m(XD + 32): 0,
+                       'wk_pend': 'nonzero', 'wk_post': 'nonzero', 'wk_sq': 'nonzero'}
+                a, e, p = _wk_prog(body, {}, exp, dirs={3: WK_JD | 0x26000 | 1}, plus=[lat] + hit)
+                a.dword(0x30008, 0x42)
+                if kind == 'dir':
+                    for k in range(5):
+                        a.dword(0x28000 + 0x2000 * k, _wk_pte(3, TLB_V | TLB_R))
+                out.append((a, e, p))
     return out
 
 
@@ -4427,11 +4481,18 @@ def wk_evec0():
 
 @test
 def wk_debug():
-    """DEBUG_EN builds (else these just run): with a debugger attached and
-    EVEC = 0 a successful walk does not halt, a fallback debug-halts as
-    today's park would (cause ILL, at the instruction); single-stepping
-    over a walked load (the step re-halts at the load, the next step
-    executes it) gives the plain run's result"""
+    """DEBUG_EN builds (else the halt log stays empty: dh_n = 0): with a
+    debugger attached and EVEC = 0 a successful walk does not halt, a
+    fallback debug-halts as today's park would (cause ILL, at the
+    instruction; one halt).  A PC breakpoint on a walked load: the first
+    resume skips the breakpoint for one dispatch, the walk restart refetches
+    the same pc and matches again, so there are two BP halts at that pc and
+    the second plain resume executes the load (MMU_PLAN §11.8).  Single
+    steps from the breakpoint: the first step re-halts at the load (cause
+    STEP: the walk counted as the step), the next executes it, then one
+    instruction per step; all give the plain run's result.  Each halt's pc /
+    cause is checked (TB: dh_n, dh<k> = pc:cause); debug_en proves the
+    elaboration"""
     if NOEXC:
         return []
     dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
@@ -4445,10 +4506,12 @@ def wk_debug():
     at = a.ld(64, 5, 9)
     a.halt()
     a.dword(0x30008, 0x42)
-    e = {'end': 'park', 'pc': at, 'r4': 0x42, 'wk_n': '1'}
-    e.update({'kind': '4', 'dbg_cause': '5'} if dbg else {'kind': '2'})
-    out.append((a, e, ['+DBG_ATTACHED']))
-    for steps in (1, 2, 3, 5):
+    e = {'end': 'park', 'pc': at, 'r4': 0x42, 'wk_n': '1', 'debug_en': '1' if dbg else '0'}
+    e.update({'kind': '4', 'dbg_cause': '5', 'dh_n': '1', 'dh0': f'{at:08x}:5'} if dbg
+             else {'kind': '2', 'dh_n': '0'})
+    out.append((a, e, ['+DBG_ATTACHED', '+PARK_HOLD=4']))    # (hold: the halt is logged a cycle after)
+
+    def prog():
         a = Asm()
         _xsetup(a)
         _wk_tables(a, {0x0200: _wk_pte(3, TLB_V | TLB_R)})
@@ -4460,6 +4523,266 @@ def wk_debug():
         a.halt()
         _mpuhandler(a)
         a.dword(0x30008, 0x42)
-        out.append((a, {'end': 'park', 'kind': '0', 'r4': 0x43, 'r10': 0x55, 'wk_n': '1', m(XD + 32): 0},
-                    ['+DBG_BP0=%x' % a.labels['b'], f'+DBG_STEPS={steps}', '+LAT=3']))
+        return a
+    # plain resumes with the breakpoint still set (D1): two halts at the load
+    for lat in (1, 3, 7):
+        a = prog()
+        b = a.labels['b']
+        e = {'end': 'park', 'kind': '0', 'r4': 0x43, 'r10': 0x55, 'wk_n': '1', m(XD + 32): 0,
+             'debug_en': '1' if dbg else '0'}
+        e.update({'dh_n': '2', 'dh0': f'{b:08x}:2', 'dh1': f'{b:08x}:2'} if dbg else {'dh_n': '0'})
+        out.append((a, e, ['+DBG_BP0=%x' % b, '+DBG_PLAIN=2', f'+LAT={lat}']))
+    for steps in (1, 2, 3, 4, 5):
+        a = prog()
+        b = a.labels['b']
+        ix = a.insn_starts.index(b)
+        seq = a.insn_starts[ix:]           # ld, addi, setr, halt, ...
+        e = {'end': 'park', 'kind': '0', 'r4': 0x43, 'r10': 0x55, 'wk_n': '1', m(XD + 32): 0,
+             'debug_en': '1' if dbg else '0'}
+        if dbg:
+            # halt 0: the breakpoint (cause 2) at the load; step 1: STEP at
+            # the load again (the walk); step k >= 2: STEP at the (k-1)-th
+            # instruction after it; stepping onto the HALT (step 5) executes it
+            hl = [(b, 2), (b, 1)] + [(seq[k - 1], 1) for k in range(2, steps + 1) if k - 1 < len(seq) - 0 and k <= 4]
+            e['dh_n'] = str(len(hl))
+            for k, (pc, c) in enumerate(hl):
+                e[f'dh{k}'] = f'{pc:08x}:{c}'
+        else:
+            e['dh_n'] = '0'
+        out.append((a, e, ['+DBG_BP0=%x' % b, f'+DBG_STEPS={steps}', '+LAT=3']))
     return out
+
+
+# ---- MMU_PLAN §11.8: double fault / TLBVEC / stack ops / D and T together /
+# ---- the TLB_EN = 1, TLB_WALK = 0 build
+
+@test
+def wk_df_fallback():
+    """a walk that falls back (PTE not PRESENT, or D[0] = 0) enters the
+    exception with a kernel SP whose frame push (SP - 8) is not in kseg:
+    DOUBLE_FAULT (park kind 6 at the instruction, ECAUSE / EADDR not
+    written), exactly as without the walker; the walk was tried (wk_s) and
+    did not succeed (wk_n = 0).  Load and store"""
+    if NOEXC:
+        return []
+    out = []
+    for why in ('absent', 'dir0'):
+        for op in ('ld', 'st'):
+            for ksp in (0x08000000, 0x80000000):
+                a = Asm()
+                _xsetup(a)
+                if why == 'absent':
+                    _wk_tables(a, {0x0200: _wk_pte(3, TLB_RWX, present=False)})
+                else:
+                    _wk_tables(a, {0x0200: _wk_pte(3, TLB_RWX)}, dirs={0: 0})
+                _wk_on(a, 8, 1)
+                a.setr(1, 0x55); a.mtsr('ecause', 1)
+                a.setr(1, 0x66); a.mtsr('eaddr', 1)
+                _te_on(a, ksp)
+                a.setr(9, 0x02000008); a.setr(3, 0x77)
+                at = a.ld(64, 4, 9) if op == 'ld' else a.st(64, 3, 9)
+                a.setr(5, 0x99)
+                a.halt()
+                _mpuhandler(a)
+                e = {'end': 'park', 'kind': '6', 'pc': at, 'ecause': '055', 'eaddr': '00000066',
+                     'wk_s': '1', 'wk_n': '0', 'r4': 0, 'r5': 0, m(XD + 32): 0}
+                out.append((a, e, []))
+    return out
+
+
+@test
+def wk_df_ok():
+    """a successful walk takes no frame push, so a kernel SP that would
+    double-fault on an exception entry (not in kseg) does not: the program
+    runs on (load and store), no handler entry, kind 0.  Control: with the
+    SP fine and the PTE absent the same access takes TLB_MISS normally"""
+    if NOEXC:
+        return []
+    out = []
+    for ksp in (0x08000000, 0x80000000, 0x88000000):
+        a = Asm()
+        _xsetup(a)
+        _wk_tables(a, {0x0200: _wk_pte(3, TLB_V | TLB_R | TLB_W), 0x0300: _wk_pte(4, TLB_V | TLB_R)})
+        _wk_on(a, 8, 1)
+        _te_on(a, ksp)
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)
+        a.setr(9, 0x03000010); a.ld(64, 5, 9)
+        a.setr(9, 0x02000020); a.setr(3, 0xBEEF); a.st(64, 3, 9)
+        a.ld(64, 6, 9)
+        a.mfsr(10, 'tlb_wcnt')
+        a.halt()
+        _mpuhandler(a)
+        a.dword(0x30008, 0x42); a.dword(0x40010, 0x43)
+        e = {'end': 'park', 'kind': '0', 'r4': 0x42, 'r5': 0x43, 'r6': 0xBEEF, 'r10': 2,
+             'wk_n': '2', 'wk_s': '2', m(XD + 32): 0, 'sp': ksp}
+        out.append((a, e, []))
+    return out
+
+
+@test
+def wk_tlbvec():
+    """a fallback with TLBVEC != 0 enters at TLBVEC (load, store and a kmap
+    miss: the walker never runs for it), not at EVEC; walks that succeed
+    do not enter either; ECAUSE / EADDR / TLB_HI as for the software path"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R), 0x0210: _wk_pte(4, TLB_V | TLB_R | TLB_W),
+            0x0220: _wk_pte(5, TLB_V | TLB_R, present=False),
+            0x0230: _wk_pte(6, TLB_V | TLB_R, present=False)}
+    def body(a):
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)               # walks
+        a.setr(9, 0x02200018); a.ld(64, 6, 9)               # absent: TLB_MISS_LD via TLBVEC
+        a.mfsr(11, 'tlb_hi')
+        a.setr(9, 0x02300020); a.setr(3, 0x1234); a.st(64, 3, 9)    # absent: TLB_MISS_ST via TLBVEC
+        a.setr(9, 0x02100010); a.ld(64, 5, 9)               # walks
+        a.setr(9, 0xC2000008); a.ld(64, 7, 9)               # kmap: TLB_MISS_LD via TLBVEC (no walk)
+        a.mfsr(10, 'tlb_wcnt')
+    exp = {'r4': 0x42, 'r5': 0x43, 'r6': 0, 'r7': 0, 'r10': 2, 'r11': 0x02200000,
+           m(XD + 0x58): 3, 'wk_n': '2', 'wk_s': '4'}
+    a, e, p = _te_prog(body, False, exp,
+                       logs=[(X_TLB_LD, 0x02200018), (X_TLB_ST, 0x02300020), (X_TLB_LD, 0xC2000008)],
+                       tlbvec=True, setup=lambda a: (_wk_tables(a, ptes), _wk_on(a, 8, 1)))
+    a.dword(0x30008, 0x42); a.dword(0x40010, 0x43)
+    return a, e, p
+
+
+@test
+def wk_stack_ops():
+    """stack instructions whose stack page is missing and walked (the SP in
+    useg, supervisor): PUSH, POP, CALL (the return address push), RET (the
+    pop), ENTER (the R15 push) and LEAVE (the R15 pop), each on its own page
+    (6 walks); every one completes with the SP / R15 / memory effect of a
+    plain run"""
+    if NOEXC:
+        return []
+    PG = lambda k: 0x0100 + k                       # VA page of op k
+    FR = lambda k: 0x08 + k                         # its frame (PA 0x80000..)
+    ptes = {PG(k): _wk_pte(FR(k), TLB_V | TLB_R | TLB_W) for k in range(6)}
+    va = lambda k, off: (PG(k) << 16) | off
+    pa = lambda k, off: (FR(k) << 16) | off
+    kseg = lambda p_: 0x80000000 | p_
+    def body(a):
+        a.getsp(11)
+        a.setr(10, 0)
+        a.setr64(5, 0x1111222233334444)
+        a.setr(1, va(0, 0x1000)); a.setsp(1); a.push(5)                  # PUSH: store at va(0, FF8)
+        a.setsp(11)
+        a.setr(8, kseg(pa(0, 0xFF8))); a.ld(64, 6, 8)                    # r6 = what PUSH stored
+        a.setr(1, va(1, 0xFF8)); a.setsp(1); a.pop(7)                    # POP: load from va(1, FF8)
+        a.getsp(2); a.setsp(11)                                          # r2 = SP after POP
+        a.setr(1, va(2, 0x1000)); a.setsp(1)
+        a.call('f')                                                      # CALL: the return address push
+        a.label('cret')
+        a.setsp(11)
+        a.setr(8, kseg(pa(2, 0xFF8))); a.ld(64, 9, 8)                    # r9 = the pushed return address
+        a.setr(1, va(3, 0xFF8)); a.setsp(1)
+        a.ret()                                                          # RET: pops 'rt' from va(3, FF8)
+        a.setr(10, 0xBAD)
+        a.label('rt')
+        a.setsp(11)
+        a.setr(15, 0xF15); a.setr(1, va(4, 0x1000)); a.setsp(1)
+        a.enter(2)                                                       # ENTER: push R15 at va(4, FF8)
+        a.getsp(3); a.alui('add', 14, 15, 0)                             # r3 = SP, r14 = R15 after ENTER
+        a.setsp(11)
+        a.setr(8, kseg(pa(4, 0xFF8))); a.ld(64, 4, 8)                    # r4 = the pushed R15
+        a.setr(15, va(5, 0xFF0)); a.setsp(11)
+        a.leave()                                                        # LEAVE: SP = R15, pop R15 from va(5, FF0)
+        a.getsp(1); a.setsp(11)                                          # r1 = SP after LEAVE
+        a.mfsr(13, 'tlb_wcnt')
+        a.jmp('done')
+        a.label('f')
+        a.ret()                                                          # (hits)
+        a.label('done')
+    exp = {'r6': 0x1111222233334444, 'r7': 0x7007, 'r2': va(1, 0x1000), 'r10': 0, 'r4': 0xF15,
+           'r3': va(4, 0x1000) - 8 - 16, 'r14': va(4, 0x1000) - 8,
+           'r15': 0xCAFE, 'r1': va(5, 0xFF8), 'r13': 6, 'wk_n': '6', 'wk_s': '6',
+           m(XD + 32): 0}
+    a, e, p = _wk_prog(body, ptes, exp)
+    e['r9'] = a.labels['cret']
+    a.dword(pa(1, 0xFF8), 0x7007)
+    a.dword(pa(3, 0xFF8), a.labels['rt'])
+    a.dword(pa(5, 0xFF0), 0xCAFE)
+    return a, e, p
+
+
+@test
+def wk_dt_same():
+    """a layout whose D read and T read are the same doubleword: the
+    directory is the page table (PTB = table + 8 * j, D index 0, VA[25:16]
+    = j, so D[0] and PTE j are one word).  PFN = D's table bits, so the
+    word is also a valid PTE.  Variants: load; store + readback (the second
+    layout uses D[1]); several latencies, with the hit-pipe model.  The TB's
+    wk_same counts walks whose T read hit D's doubleword"""
+    if NOEXC:
+        return []
+    out = []
+    JT = 0x5A5A0000F8000000                      # junk both reads ignore (bits [63:27])
+    for lat in ('+LAT=1', '+LAT=3', '+LAT=7'):
+        for hit in ([], ['+HIT=70']):
+            for layout in (0, 1):
+                if layout == 0:                  # D[0] at TAB + 8 * 5 = PTB; VA 0x0005_0010
+                    tab, ptb, va, flags = 0x24000, 0x24028, 0x00050010, 0x13
+                else:                            # D[1] at TAB + 8 * 1; VA 0x0401_0010 (store)
+                    tab, ptb, va, flags = 0x26000, 0x26000, 0x04010010, 0x17
+                word = JT | tab | flags          # PFN = tab[26:16] = 2: PA 0x20000
+                def body(a, layout=layout, ptb=ptb, va=va):
+                    a.setr(9, va)
+                    if layout == 0:
+                        a.ld(64, 4, 9)
+                        a.ld(64, 5, 9, 8)
+                    else:
+                        a.setr(3, 0xBEEF); a.st(64, 3, 9)
+                        a.ld(64, 4, 9)
+                        a.setr(8, 0x80020010); a.ld(64, 5, 8)
+                    a.mfsr(10, 'tlb_wcnt')
+                def setup(a, layout=layout, tab=tab, ptb=ptb, word=word):
+                    if layout == 0:
+                        a.dword(ptb, word)       # = PTE 5 of the table at tab
+                    else:
+                        a.dword(ptb + 8, word)   # D[1] = PTE 1 of the table at tab
+                    _wk_on(a, 8, 1, ptb=ptb)
+                if layout == 0:
+                    exp = {'r4': 0x1357, 'r5': 0x2468, 'r10': 1, 'wk_n': '1', 'wk_s': '1',
+                           'wk_same': '1', m(XD + 32): 0}
+                else:
+                    exp = {'r4': 0xBEEF, 'r5': 0xBEEF, 'r10': 1, 'wk_n': '1', 'wk_s': '1',
+                           'wk_same': '1', m(XD + 32): 0}
+                a, e, p = _te_prog(body, False, exp, plus=[lat] + hit, setup=setup)
+                if layout == 0:
+                    a.dword(0x20010, 0x1357); a.dword(0x20018, 0x2468)
+                out.append((a, e, p))
+    return out
+
+
+@test
+def wk_nowalk():
+    """(TLB_EN = 1, TLB_WALK = 0 builds only) MFSR / MTSR of 0x35-0x37 are
+    ILLEGAL (the handler steps over each), TLBVEC (0x34) is not; the
+    software TLB path works as before: a miss takes TLB_MISS_LD, and the
+    TB's walker counters stay 0.  (CPU_FEATURES[25] = 0: run.py socwalk)"""
+    if NOEXC or not NOWALK:
+        return []
+    a = Asm()
+    _xsetup(a)
+    a.setr(1, 0x1234)
+    for sr in ('tlb_ptb', 'tlb_walk', 'tlb_wcnt'):
+        a.mfsr(1, sr); a.mtsr(sr, 1)
+    a.mfsr(2, 'tlbvec'); a.mtsr('tlbvec', 1)
+    a.setr(5, 0x77)
+    a.halt()
+    _xhandler(a)
+    exp = {'end': 'park', 'kind': '0', 'r1': 0x1234, 'r5': 0x77, m(XD + 32): 6, m(XD): X_ILL,
+           'wk_n': '0', 'wk_s': '0'}
+    out = [(a, exp, [])]
+    def body(b):
+        b.setr(9, 0x02000008); b.ld(64, 4, 9)
+    b, e, p = _te_prog(body, False, {'r4': 0, 'wk_n': '0', 'wk_s': '0', 'wk_rd': '0'},
+                       logs=[(X_TLB_LD, 0x02000008)])
+    out.append((b, e, p))
+    return out
+
+
+# the TLB_WALK = 0 build has no walker: only wk_nowalk applies there
+if NOWALK:
+    for _n in [n for n in ALL if n.startswith('wk_') and n != 'wk_nowalk']:
+        del ALL[_n]

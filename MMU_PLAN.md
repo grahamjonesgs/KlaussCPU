@@ -1500,6 +1500,21 @@ emulator, `doc/EMULATOR_ISA_SEMANTICS.md`):
 - A debugger single step over a walked instruction re-halts at that
   instruction (the walk itself counts as the step); the next step executes
   it.
+- **A PC breakpoint on an instruction whose access walks fires twice on a
+  plain resume.** The resume skips the breakpoint for one dispatch (the
+  resume instruction); the walk's restart refetches the same pc, which
+  matches the breakpoint again and halts a second time; the second resume
+  then executes the instruction. It is the same as the old software refill
+  (the IRET back to the instruction re-hits the breakpoint) and as the
+  klausscc emulator (`cc309a6`); GDB's step-over (step, then re-insert)
+  hides it. Single-stepping (the rule above) is unaffected. The sim's
+  `wk_debug` checks the two halts at the same pc.
+- **`park_pc` / `park_op` (DMI 0x06, debug register 17) are updated at WB
+  for every walk-eligible miss with `EVEC` = 0, even when the walk then
+  succeeds** (the walk's outcome is not known at WB). They are meaningful
+  only while the core is parked (kind 2) or debug-halted on that
+  fallback; after a successful walk they hold the walked instruction's pc
+  and op, and a debugger must not read them as "the last park".
 - **Re-execution.** The RTL re-executes the whole instruction after a walk;
   the emulator re-translates only the access that missed. That is the same
   architecturally (nothing of the instruction has happened, both pages are
@@ -1573,7 +1588,7 @@ wrap, the 48-bit wrap, a refill evicting the code page), `wk_asid`,
 `wk_uitlb_evict` (a refill overwriting the micro-ITLB's entry: 3 walks,
 which shows the discard), `wk_coherent` (PTE / directory stores still
 posted or queued at the miss; a PTE written after a fallback; latencies 1 /
-3 / 7, with and without the hit-pipe model), `wk_user` (user load / store /
+3 / 7, with and without the hit-pipe model), `wk_coherent_sq` (a warm loop: the PTE or directory store is on the port or in the store queue when the walk starts, `wk_post` / `wk_sq` counters), `wk_df_fallback` / `wk_df_ok` (DOUBLE_FAULT after a fallback with a bad kernel SP; no double fault after a successful walk), `wk_tlbvec` (fallbacks through a nonzero TLBVEC), `wk_stack_ops` (PUSH / POP / CALL / RET / ENTER / LEAVE on walked stack pages), `wk_dt_same` (D and T read the same doubleword), `wk_nowalk` (`VSIM_TLB_WALK=0`: SRs 0x35–0x37 ILLEGAL), `wk_user` (user load / store /
 fetch; supervisor copy_to_user; a walked read-only page then ACCESS_STORE),
 `wk_irq` (a TLBINV loop with a timer IRQ whose handler is walked too; the
 TB counts IRQs taken right after a walk, `wk_irq`), `wk_evec0`, `wk_debug`

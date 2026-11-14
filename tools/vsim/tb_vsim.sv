@@ -18,7 +18,8 @@
 `timescale 1ns/1ps
 module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                  parameter bit MPU_EN = 1'b1,    // (MPU_EN: only with +define+HAS_MPU)
-                 parameter int TLB_N = 32);      // (TLB_N: only with +define+HAS_TLBN)
+                 parameter int TLB_N = 32,       // (TLB_N: only with +define+HAS_TLBN)
+                 parameter bit TLB_WALK = 1'b1); // (TLB_WALK: only with +define+HAS_WALK)
    logic clk = 0, rst = 1, start = 0;
    logic [31:0]  start_pc = 32'h20;
    logic [31:0]  m_addr;
@@ -72,6 +73,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
 `ifdef HAS_TLBN
       , .TLB_N(TLB_N)
+`endif
+`ifdef HAS_WALK
+      , .TLB_WALK(TLB_WALK)
 `endif
    ) dut (
       .clk, .rst, .ce(1'b1), .start, .start_pc,
@@ -234,6 +238,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
             dbg_gap <= 0;
             dbg_i.resume <= 1'b1;
             if (dbg_stepped < dbg_steps) begin dbg_i.step <= 1'b1; dbg_stepped <= dbg_stepped + 1; end
+            else if (dbg_plain_done < dbg_plain) dbg_plain_done <= dbg_plain_done + 1;   // plain resume, bp stays
             else dbg_i.bp_en[0] <= 1'b0;                // done: run freely
          end
       end
@@ -248,6 +253,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    // wk_irq: an IRQ taken at the restart boundary right after a successful
    // walk (before the faulting instruction re-executes)
    longint wk_s = 0, wk_n = 0, wk_cyc = 0, wk_irq = 0;
+   // wk_post / wk_sq / wk_pend: walks that start with a store still in
+   // st_post / the store queue (sq_v) / either; wk_rd: walker reads issued;
+   // wk_same: walks whose T read is the same doubleword as its D read
+   longint sq_cyc = 0;      // cycles with a queued store (sq_v), whatever the core is doing
+   longint wk_post = 0, wk_sq = 0, wk_pend = 0, wk_rd = 0, wk_same = 0;
+   logic [31:0] wk_da = '0;
+   logic wkr_q = 1'b0;
 `ifdef HAS_WALK
    logic wk_q = 1'b0, wkf_q = 1'b0, ia_q = 1'b0;
    always @(posedge clk) if (!rst) begin
@@ -257,9 +269,24 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.wk_fin) wkf_q <= 1'b1;
       else if (dut.id_valid) wkf_q <= 1'b0;
       if (wkf_q && dut.irq_active && !ia_q && !dut.exc_ent) wk_irq++;
-      if (dut.wk && !wk_q) wk_s++;
+      if (dut.wk && !wk_q) begin
+         wk_s++;
+         // a store still posted / queued when the miss reaches the walker
+         // (the walk then waits for it to drain)
+         if (dut.st_post) wk_post++;
+         if (dut.sq_v)    wk_sq++;
+         if (dut.st_post || dut.sq_v) wk_pend++;
+      end
+      // the walker's reads: D then T (wk_ph 0 / 1); the same doubleword?
+      if (dut.wk && dut.irq_xc && m_read_DV && !wkr_q) begin
+         wk_rd++;
+         if (dut.wk_ph == 2'd0) wk_da <= m_addr;
+         else if (dut.wk_ph == 2'd1 && m_addr[31:3] == wk_da[31:3]) wk_same++;
+      end
+      wkr_q <= dut.wk && dut.irq_xc && m_read_DV;
       if (dut.wk_fin) wk_n++;
       if (dut.wk) wk_cyc++;
+      if (dut.sq_v) sq_cyc++;
    end
 `endif
    // LCD strobes (a wrong-path LCD op must not send)
@@ -275,6 +302,19 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    // each waiting for the re-halt), then a plain resume
    bit     dbg_drv = 0;
    int     dbg_steps = 0, dbg_stepped = 0, dbg_gap = 0;
+   int     dbg_plain = 0, dbg_plain_done = 0;     // +DBG_PLAIN=<n>: n plain resumes with the breakpoint still set
+   // debug halts (park_kind 4): count, and each one's pc:cause (first 8)
+   int     dh_n = 0;
+   string  dh_s [0:7];
+   logic   dh_q = 1'b0, dh_p = 1'b0;
+   always @(posedge clk) if (!rst) begin
+      dh_q <= parked && park_kind == 3'd4;
+      dh_p <= parked && park_kind == 3'd4 && !dh_q;      // one cycle after the halt: pc / cause settled
+      if (dh_p) begin
+         if (dh_n < 8) dh_s[dh_n] = $sformatf("%08x:%0d", park_pc, dbg_o.cause);
+         dh_n++;
+      end
+   end
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -336,6 +376,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       f = $fopen(out_name, "w");
       $fdisplay(f, "end=%s kind=%0d pc=%08x op=%08x", why, park_kind, park_pc, park_op);
       $fdisplay(f, "dbg_cause=%0d watch_addr=%08x", dbg_o.cause, dbg_o.watch_addr);
+      $fdisplay(f, "debug_en=%0d", DEBUG_EN);
+      $fdisplay(f, "dh_n=%0d", dh_n);
+      for (int i = 0; i < 8 && i < dh_n; i++) $fdisplay(f, "dh%0d=%s", i, dh_s[i]);
       $fdisplay(f, "cycles=%0d instrs=%0d irqs=%0d", cyc, icount, irq_acks);
       for (int i = 0; i < 16; i++) $fdisplay(f, "r%0d=%016x", i, dbg_r[i]);
       $fdisplay(f, "sp=%08x", dbg_sp);
@@ -353,6 +396,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
 `ifdef HAS_WALK
       $fdisplay(f, "wk_s=%0d wk_n=%0d wk_cyc=%0d wk_irq=%0d", wk_s, wk_n, wk_cyc, wk_irq);
+      $fdisplay(f, "wk_post=%0d wk_sq=%0d wk_pend=%0d wk_rd=%0d wk_same=%0d sq_cyc=%0d", wk_post, wk_sq, wk_pend, wk_rd, wk_same, sq_cyc);
 `endif
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)
@@ -376,6 +420,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          if ($value$plusargs("DBG_BP0=%h", bpa)) begin
             dbg_drv = 1;  dbg_i.bp_en[0] = 1'b1;  dbg_i.bp_addr[0] = bpa;
             void'($value$plusargs("DBG_STEPS=%d", dbg_steps));
+            void'($value$plusargs("DBG_PLAIN=%d", dbg_plain));
          end
       end
       void'($value$plusargs("PARK_HOLD=%d", park_hold));

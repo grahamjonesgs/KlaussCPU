@@ -31,8 +31,9 @@ def build(rev=None, quiet=True):
     noexc = os.environ.get('VSIM_EXC_EN') == '0'     # elaborate EXC_EN=0 (core 2's MMU-less core)
     mpu = os.environ.get('VSIM_MPU_EN') == '1'       # elaborate MPU_EN=1 (off on the A7)
     tlbn = os.environ.get('VSIM_TLB_N', '')         # elaborate TLB_N=<n> (default: the core's, 32)
+    nowalk = os.environ.get('VSIM_TLB_WALK') == '0'  # elaborate TLB_EN=1, TLB_WALK=0 (MMU_PLAN §11.8: no walker)
     tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '') + \
-          (f'_tlb{tlbn}' if tlbn else '')
+          (f'_tlb{tlbn}' if tlbn else '') + ('_nowalk' if nowalk else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -47,7 +48,7 @@ def build(rev=None, quiet=True):
     core = core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
-    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn).encode()).hexdigest()
+    h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn + str(nowalk)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -63,6 +64,8 @@ def build(rev=None, quiet=True):
         defs += ['+define+HAS_MPU', '-GMPU_EN=1']
     if tlbn and 'parameter int TLB_N' in core:
         defs += ['+define+HAS_TLBN', f'-GTLB_N={int(tlbn)}']
+    if nowalk and 'parameter bit TLB_WALK' in core:
+        defs.append('-GTLB_WALK=0')
     if 'm_rdata_dram' in core:
         defs.append('+define+HAS_RDATA_DRAM')
     if 'input  logic [63:0]  h_dword' in core:
@@ -117,12 +120,42 @@ def patch_core(core):
     return core.replace("for (int i = 0; i < 16; i++) rf[i] <= 64'b0;", "rf <= '{default:64'b0};")
 
 
-def build_soc(rev=None, crypto_full=False):
+
+# tb_soc probe (sim copy only): what the walker's two reads meet in the
+# D-cache (mem_read_write), sampled when each read's DV rises.  One WKEV line
+# per read: ph (0 = D, 1 = T), addr, hit (a line of that address is cached),
+# dirty (that line is dirty), vdirty (a miss whose LRU victim is dirty),
+# shadow (the cache is in an EVICT_SHADOW_* writeback), same (that writeback
+# is this very line)
+WK_PROBE = r"""
+   // ---- walker / D-cache probe (tools/vsim/run.py) ----
+   logic wkp_q = 1'b0;
+   always @(posedge dut.i_Clk) begin
+      wkp_q <= dut.pipeline_core_i.wk && dut.pipeline_core_i.irq_xc && dut.pipeline_core_i.m_read_DV;
+      if (dut.pipeline_core_i.wk && dut.pipeline_core_i.irq_xc && dut.pipeline_core_i.m_read_DV && !wkp_q) begin
+         automatic logic [31:0] ad = dut.pipeline_core_i.m_addr;
+         automatic int ix = ad[14:5];
+         automatic logic h0 = dut.mem_read_write.cache_val_addr_way0[ix] == {1'b1, ad[31:15]};
+         automatic logic h1 = dut.mem_read_write.cache_val_addr_way1[ix] == {1'b1, ad[31:15]};
+         automatic logic lru = dut.mem_read_write.cache_lru[ix];
+         automatic logic vd = lru ? dut.mem_read_write.cache_dirty_way1[ix] : dut.mem_read_write.cache_dirty_way0[ix];
+         automatic logic sh = (dut.mem_read_write.state == 16'd16) || (dut.mem_read_write.state == 16'd32);
+         // (a dirty victim is "in flight" from its miss: the refill, then the writeback)
+         automatic logic ev = dut.mem_read_write.r_do_evict && (sh || dut.mem_read_write.state == 16'd4096);
+         $display("WKEV ph=%0d addr=%08x hit=%b dirty=%b vdirty=%b shadow=%b same=%b", dut.pipeline_core_i.wk_ph, ad,
+                  h0 | h1, (h0 & dut.mem_read_write.cache_dirty_way0[ix]) | (h1 & dut.mem_read_write.cache_dirty_way1[ix]),
+                  !(h0 | h1) & vd, sh, ev && dut.mem_read_write.r_evict_ddr_addr_r[31:5] == ad[31:5]);
+      end
+   end
+"""
+
+
+def build_soc(rev=None, crypto_full=False, nowalk=False):
     """full SoC (sim_1/new/tb_soc.sv: behavioural DDR, real cache / bus /
     MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
     crypto_full: KlaussCPU with every optional crypto block (the default
     build is the lean A7 one)."""
-    tag = (rev or 'wt') + ('_cfull' if crypto_full else '')
+    tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '')
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -155,6 +188,12 @@ def build_soc(rev=None, crypto_full=False):
         assert tb.count('KlaussCPU dut (') == 1
         tb = tb.replace('KlaussCPU dut (', "KlaussCPU #(.CRYPTO_AES_EN(1'b1), .CRYPTO_GCM_EN(1'b1), "
                         ".CRYPTO_SHA_EN(1'b1), .CRYPTO_HMAC_EN(1'b1)) dut (")
+    if nowalk:       # TLB_EN = 1, TLB_WALK = 0 on core 1 (CPU_FEATURES[25] = 0)
+        assert tb.count('KlaussCPU dut (') == 1
+        tb = tb.replace('KlaussCPU dut (', "KlaussCPU #(.CORE1_TLB_WALK(1'b0)) dut (")
+    if rev is None and 'wk_fin' in allsrc:
+        k = tb.rindex('endmodule')
+        tb = tb[:k] + WK_PROBE + tb[k:]
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -252,7 +291,10 @@ def check(st, exp):
 def cmd_test(a):
     import tests
     exe = build(a.rev)
-    names = a.names or [n for n in tests.ALL]
+    import fnmatch
+    names = [n for n in tests.ALL if not a.names or any(fnmatch.fnmatch(n, g) for g in a.names)]
+    if a.names and not names:
+        raise SystemExit('no test matches ' + ' '.join(a.names))
     fails = 0
     for n in names:
         fn = tests.ALL[n]
@@ -1056,6 +1098,159 @@ def cmd_socdcbz(a):
 
 
 
+# ---- the walker through the real D-cache (tb_soc): MMU_PLAN §11.8 ----------
+SW_PTB, SW_TA, SW_TOLD = 0x224000, 0x232000, 0x234000      # directory, new table, stale table
+SW_NEW, SW_OLD = 0x28, 0x29                                # frames (PA 0x28_0000 / 0x29_0000)
+SW_K = 0x80000000
+
+
+def _sw_prog(kind, pad=0):
+    """one SoC walker program.  Tables: D[2] and D[3] -> the stale table TOLD
+    (PTE 0 / 5 -> frame OLD, whose data is stale), the image's TA table has
+    PTE 5 -> NEW (kinds s3t) or is absent.  Registers at HALT:
+      dirty : D[3] -> TA and the PTEs rewritten by kseg stores (D and T lines
+              dirty in the D-cache when walked; the image holds only the
+              stale ones): r4 = 0x600D (NEW), r5 = 0x7777
+      vict  : the sets of D's and T's lines hold two dirty lines each (A / B):
+              the walk reads miss with a dirty victim; the victims are then
+              read back from DDR (r6..r9)
+      s3t   : the PTE line is dirty (PTE rewritten to NEW), evicted by two
+              other lines of its set, then walked at once: its read meets the
+              eviction writeback in flight
+      s3d   : the same for the directory line (D[3] rewritten to TA)"""
+    from kasm import Asm, TLB_V, TLB_R, TLB_W
+    import tests
+    from tests import _te_on, _wk_on, _wk_pte, WK_JD
+    pte = lambda fr: _wk_pte(fr, TLB_V | TLB_R | TLB_W)
+    ptb = 0x242010 if kind == 's3t' else SW_PTB      # s3t: D[3] shares a cache set with the PTE line
+    a = Asm()
+    # the image can hold 256 KiB only: the page tables and data are stored
+    # (physical, TE = 0) and written back to DDR (CACHE_CTRL INVALIDATE: the
+    # D-cache is then empty and clean), then the program starts
+    def init(addr, val):
+        a.setr(8, addr); a.setr64(3, val); a.st(64, 3, 8)
+    dirs = {2: WK_JD | SW_TOLD | 1, 3: WK_JD | SW_TOLD | 1}
+    if kind != 'dirty':
+        dirs[3] = WK_JD | SW_TA | 1
+    for i, v in dirs.items():
+        init(ptb + 8 * i, v)
+    init(SW_TOLD + 8 * 5, pte(SW_OLD)); init(SW_TOLD + 8 * 0, pte(SW_OLD))
+    init(SW_TA + 8 * 5, pte(SW_NEW if kind in ('vict', 's3d') else SW_OLD))
+    init((SW_NEW << 16) | 8, 0x600D); init((SW_OLD << 16) | 8, 0xDEAD)
+    init((SW_NEW << 16) | 0x10, 0x7777); init((SW_OLD << 16) | 0x10, 0xBAD2)
+    a.setr(8, 0xF0050000); a.setr(3, 4); a.st(64, 3, 8)              # INVALIDATE
+    a.label('pl'); a.ld(64, 3, 8, 0x10); a.fbr('ne', 3, 0, 'pl', imm=True)    # CACHE_STATUS.MNT_BUSY
+    _te_on(a)
+    _wk_on(a, 8, 1, ptb=ptb)
+    a.setr(1, 0); a.mtsr('tlb_wcnt', 1)
+    def st64(addr, val, ra=8, rv=3):
+        a.setr(ra, SW_K | addr); a.setr64(rv, val); a.st(64, rv, ra)
+    def ldk(addr, rd, ra=11):
+        a.setr(ra, SW_K | addr); a.ld(64, rd, ra)
+    if kind == 'dirty':
+        st64(SW_PTB + 8 * 3, WK_JD | SW_TA | 1)
+        st64(SW_TA + 8 * 5, pte(SW_NEW))
+        st64(SW_TOLD + 8 * 0, pte(SW_NEW))
+        a.setr(9, 0x0C050008); a.ld(64, 4, 9)
+        a.setr(9, 0x08000010); a.ld(64, 5, 9)
+    elif kind == 'vict':
+        vals = [0x1111000000000001, 0x2222000000000002, 0x3333000000000003, 0x4444000000000004]
+        for ad, v in zip((0x204018, 0x20C018, 0x202028, 0x20A028), vals):
+            st64(ad, v)
+        a.setr(9, 0x0C050008); a.ld(64, 4, 9)
+        for rd, ad in zip((6, 7, 8, 9), (0x204018, 0x20C018, 0x202028, 0x20A028)):
+            ldk(ad, rd)
+    elif kind in ('s3t', 's3d'):
+        # sub: two loads (r11, r12: the evicting misses), pad NOPs, then the
+        # access that walks (r9).  Called once beforehand with harmless
+        # operands so that its code is in the I-cache (no fetch fills in the
+        # window), then for real.
+        a.setr(11, SW_K | 0x300040); a.setr(12, SW_K | 0x308040); a.setr(9, 0x00000008)    # (a mapped page: no walk)
+        a.call('sub')
+        if kind == 's3t':
+            # the PTE line P (set 0x101) dirty and LRU behind one more line X
+            # of its set; D[3] is in that set too: the walk's D read misses,
+            # evicts P (refill first, writeback in the shadow), and the T read
+            # of P comes right behind it
+            st64(SW_TA + 8 * 5, pte(SW_NEW))
+            a.setr(11, SW_K | 0x20A028); a.setr(12, SW_K | 0x20A028)
+        else:
+            st64(ptb + 8 * 3, WK_JD | SW_TA | 1)  # the directory line dirty
+            a.setr(11, SW_K | 0x20C018); a.setr(12, SW_K | 0x214018)
+        a.setr(9, 0x0C050008)
+        a.call('sub')
+        a.jmp('end')
+        a.label('sub')
+        a.ld(64, 6, 11); a.ld(64, 7, 12)
+        for _ in range(pad):
+            a.nop()
+        a.ld(64, 4, 9)
+        a.ret()
+        a.label('end')
+    a.mfsr(10, 'tlb_wcnt')
+    a.halt()
+    return a, vals if kind == 'vict' else None
+
+
+def _sw_events(log):
+    return [dict(kv.split('=') for kv in l.split()[1:]) for l in log.splitlines() if l.startswith('WKEV ')]
+
+
+def cmd_socwalk(a):
+    """the hardware walker through the real D-cache / bus / behavioural DDR
+    (tb_soc), and CPU_FEATURES[25] with TLB_WALK = 0.  Each program's result
+    registers, and the walker's events (the tb_soc probe, WKEV): D / T lines
+    dirty in the cache, the walk reads missing with a dirty victim, and the
+    read meeting the eviction writeback of its own line"""
+    exe = build_soc(None)
+    fails = 0
+
+    def report(name, ok, msg=''):
+        nonlocal fails
+        fails += not ok
+        print(f'{"pass" if ok else "FAIL"} {name} {msg}')
+
+    # 1. D and T lines dirty in the D-cache
+    prog, _ = _sw_prog('dirty')
+    r = run_soc(exe, prog, 'sw_dirty', trace=True)
+    g = _soc_regs(r); ev = _sw_events(r['log'])
+    nd = {ph: sum(1 for e in ev if e['ph'] == ph and e['dirty'] == '1') for ph in '01'}
+    ok = bool(g) and g.get('r4') == 0x600D and g.get('r5') == 0x7777 and g.get('r10') == 2 and nd['0'] and nd['1']
+    report('dirty D / T lines', ok, f'regs={g and {k: hex(g[k]) for k in ("r4", "r5", "r10")}} dirty reads D/T={nd["0"]}/{nd["1"]}')
+    # 2. a walk read missing with a dirty victim, and the victims' data in DDR
+    prog, vals = _sw_prog('vict')
+    r = run_soc(exe, prog, 'sw_vict', trace=True)
+    g = _soc_regs(r); ev = _sw_events(r['log'])
+    nv = {ph: sum(1 for e in ev if e['ph'] == ph and e['vdirty'] == '1') for ph in '01'}
+    ok = bool(g) and g.get('r4') == 0x600D and g.get('r10') == 1 and nv['0'] and nv['1'] and \
+        all(g.get(f'r{6 + i}') == vals[i] for i in range(4))
+    report('dirty victim', ok, f'regs={g and {k: hex(g[k]) for k in ("r4", "r6", "r7", "r8", "r9", "r10")}} dirty-victim reads D/T={nv["0"]}/{nv["1"]}')
+    # 3. the PTE / directory line in its eviction writeback when the walk reads it
+    for kind, ph in (('s3t', '1'), ('s3d', '0')):
+        seen = []
+        allok = True
+        for pad in (0, 1, 2, 3, 4, 6, 8, 12):
+            prog, _ = _sw_prog(kind, pad)
+            r = run_soc(exe, prog, f'sw_{kind}_{pad}', trace=True)
+            g = _soc_regs(r); ev = _sw_events(r['log'])
+            good = bool(g) and g.get('r4') == 0x600D and g.get('r10') == 1
+            allok &= good
+            if any(e['ph'] == ph and e['same'] == '1' for e in ev):
+                seen.append(pad)
+            if not good or a.verbose:
+                print(f'  {kind} pad={pad}: r4={g and hex(g.get("r4", -1))} r10={g and g.get("r10")} events={ev}')
+        report(f'evict shadow {kind}', allok and bool(seen), f'read met its own line in the writeback at pad={seen}')
+    # 4. CPU_FEATURES[25] with TLB_WALK = 0 (and 1 for reference)
+    from kasm import Asm
+    for nw, want in ((False, 0x03F0200D), (True, 0x01F0200D)):
+        f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
+        g = _soc_regs(run_soc(build_soc(None, nowalk=nw), f, f'sw_feat{int(nw)}', trace=True))
+        report(f'CPU_FEATURES {"TLB_WALK=0" if nw else "default"}', bool(g) and g.get('r2') == want,
+               f'{g and hex(g.get("r2"))} want {want:#x}')
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def cmd_soceth(a):
     """ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3) through the real SoC bus
     (bus_splitter -> eth_mmio_bridge; tb_soc stubs liteeth_core, the RX slot
@@ -1144,6 +1339,7 @@ def main():
     sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
     sz.add_argument('--seed0', type=int, default=1)
     sub.add_parser('socsd')
+    sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
@@ -1179,6 +1375,8 @@ def main():
         sys.exit(cmd_dcbzdiff(a))
     elif a.cmd == 'socdcbz':
         sys.exit(cmd_socdcbz(a))
+    elif a.cmd == 'socwalk':
+        sys.exit(cmd_socwalk(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
     elif a.cmd == 'soceth':

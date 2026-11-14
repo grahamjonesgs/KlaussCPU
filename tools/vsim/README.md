@@ -22,7 +22,9 @@ python3 tools/vsim/run.py diff --base master --seeds 40 --lats 1 3 7
 python3 tools/vsim/run.py diff --base master --seeds 30 --lats 2 5 --irq
 python3 tools/vsim/run.py socdiff --base master --seeds 30   # full SoC (tb_soc.sv)
 python3 tools/vsim/run.py socsd                    # native SD MMIO through the SoC bus
-VSIM_DEBUG_EN=1 python3 tools/vsim/run.py test        # elaborate DEBUG_EN=1
+VSIM_DEBUG_EN=1 python3 tools/vsim/run.py test        # elaborate DEBUG_EN=1 (wk_debug checks the halt log only here)
+VSIM_TLB_WALK=0 python3 tools/vsim/run.py test 'wk_*' 'tlb_*'   # TLB_EN=1, TLB_WALK=0 (test names take globs)
+python3 tools/vsim/run.py socwalk                  # the hardware TLB walker through the real D-cache (tb_soc)
 python3 tools/vsim/run.py dcbzdiff --seeds 200     # DCBZ programs vs 4-store references (core TB)
 python3 tools/vsim/run.py socdcbz --seeds 20       # DCBZ through the SoC: counters, DDR traffic, SMC, random
 ```
@@ -39,6 +41,14 @@ python3 tools/vsim/run.py socdcbz --seeds 20       # DCBZ through the SoC: count
   checks the cache counters, that a DCBZ miss reads nothing from DDR
   (tb_soc prints `DDR reads= writes=` at HALTED), the trace record, and a
   zeroed-then-patched code line.
+- **`socwalk`** (MMU_PLAN §11.8): directed SoC programs for the walker
+  through `mem_read_write`: PTE / directory lines dirty in the D-cache when
+  walked, walk reads missing with a dirty victim, a walk read meeting the
+  eviction writeback of its own line (D and T), and `CPU_FEATURES[25]` with
+  `CORE1_TLB_WALK = 0`. The page tables are stored by the program (the boot
+  image holds 256 KiB) and written back with CACHE_CTRL INVALIDATE. A probe
+  appended to the sim copy of tb_soc prints one `WKEV` line per walker read
+  (what it found in the cache), which the runner checks.
 - **`socdiff`** builds `sim_1/new/tb_soc.sv` (real cache, bus splitter, MMIO,
   HCF, behavioural DDR) and boots each program through the boot-ROM path. It
   compares retire traces and reports PIPE_RUN cycles. That model reproduces
