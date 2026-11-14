@@ -4817,7 +4817,8 @@ module pipeline_core
             else $fatal(1, "ex_ta + ex_tb %h + %h != hit-pipe EA %h (pc %h)", ex_ta, ex_tb,
                         exo_iaddr, ex_pc);
       // ... and f_pgeq is the page compare
-      always_ff @(posedge clk) if (ce && !rst)
+      // (4-state sims: ex_ta / ex_tb / ex_tc / mem_eaddr are unreset, skip while X)
+      always_ff @(posedge clk) if (ce && !rst && !$isunknown({ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]}))
          assert (f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]) ==
                  (((ex_ta + ex_tb) >> 16) == {16'd0, mem_eaddr[31:16]}))
             else $fatal(1, "f_pgeq: %h + %h vs %h", ex_ta, ex_tb, mem_eaddr[31:16]);
@@ -4871,15 +4872,15 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && parked && running)
       assert (fetch_halt) else $fatal(1, "parked with fetch running: kind=%0d", park_kind);
    // the parallel WB-forward zero bit equals the zero test of the value
-   always_ff @(posedge clk) if (!rst)
+   always_ff @(posedge clk) if (!rst && !$isunknown(wb_fwd_v))
       assert (wbz_fwd == f_wz(id_w, wb_fwd_v))
          else $fatal(1, "wbz_fwd form: mdir=%b ld=%b v=%h", wb_mdir, wb_ld, wb_fwd_v);
    // a direct MUL in WB: the early-selected product equals the late select
-   always_ff @(posedge clk) if (!rst)
+   always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
          else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
    // ex_b_zero tracks ex_b exactly (both its write sites set it)
-   always_ff @(posedge clk) if (!rst)
+   always_ff @(posedge clk) if (!rst && !$isunknown({ex_b_zero, ex_b}))
       assert (ex_b_zero == (ex_b == 64'd0))
          else $fatal(1, "ex_b_zero stale: ex_b=%h", ex_b);
    // ras_miss's compare-then-select form equals ret_actual != mem_pred_tgt
@@ -4887,14 +4888,18 @@ module pipeline_core
       assert (ret_ne == (ret_actual != mem_pred_tgt))
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
-   always_ff @(posedge clk) if (!rst)
+   always_ff @(posedge clk) if (!rst && !$isunknown({mem_xsq, mem_xs2, mem_xs2_x, mem_xs_tm, mem_xs_tm_x, mem_xs_tlb, mem_xs_tlb_x}))
       assert (!mem_xsq || (mem_xs2 == mem_xs2_x && mem_xs_tm == mem_xs_tm_x && mem_xs_tlb == mem_xs_tlb_x))
          else $fatal(1, "MEM fault kind: xs2 %b/%b tm %b/%b tlb %b/%b", mem_xs2, mem_xs2_x,
                      mem_xs_tm, mem_xs_tm_x, mem_xs_tlb, mem_xs_tlb_x);
-   always_ff @(posedge clk) if (!rst)
-      assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2) &&
-              sn_pra == mem_iaddr[IC_IDXW+3:5])
+   always_ff @(posedge clk) if (!rst && !$isunknown({ex_mok, ex_mph, ex_ufault, ex_dn1, ex_dn2}))
+      assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2))
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
+   // the snoop shadow's read address is the MEM op's I-line index (both
+   // unreset: skipped while X in 4-state sims)
+   always_ff @(posedge clk) if (!rst && !$isunknown({sn_pra, mem_iaddr[IC_IDXW+3:5]}))
+      assert (sn_pra == mem_iaddr[IC_IDXW+3:5])
+         else $fatal(1, "sn_pra %h != mem_iaddr index %h", sn_pra, mem_iaddr[IC_IDXW+3:5]);
    // (§11.9) the dispatch-time page-crossing bit is ex_xpg
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
       assert (ex_txpg == ex_xpg)
@@ -4964,7 +4969,7 @@ module pipeline_core
       // idle port on that edge (st_spec_now needs !st_post)
       if (sq_spec)
          assert (st_post || sq_v) else $fatal(1, "sq_spec with the port idle: pc=%h", mem_pc);
-      if (running && !fetch_halt)
+      if (running && !fetch_halt && !$isunknown(w_op))
          assert (w_is_ei == (EN_DIEI && w_dec.uop == U_EI))
             else $fatal(1, "EI raw-bit predecode drift: op=%h", w_op);
       if (id_valid)

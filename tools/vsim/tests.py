@@ -5167,6 +5167,230 @@ def tx_stlf():
     return out
 
 
+# ---- review fix-ups (2026-11-14): supervisor kmap, two-access priority, STLF partial cover, hit-pipe watchpoint
+TX_KM = {0xC001: 0x005, 0xC002: 0x003}          # kmap VA page -> frame (alias PA windows already preloaded)
+
+
+def _tx_kmsetup(a):
+    _tx_setup(a)
+    for i, (vp, f) in enumerate(sorted(TX_KM.items())):
+        _tlb_set(a, 7 + i, vp, f, TLB_V | TLB_R | TLB_W, g=1)
+
+
+def _tx_kpa(va):
+    """PA of a supervisor VA in the tx windows (useg, kseg, kmap)"""
+    va &= 0xFFFFFFFF
+    if 0x80000000 <= va < 0x88000000:
+        return va - 0x80000000
+    if (va >> 16) in TX_KM:
+        return (TX_KM[va >> 16] << 16) | (va & 0xFFFF)
+    return _tx_pa(va)
+
+
+def _tx_krd(mem, va, n):
+    return sum(mem[_tx_kpa(va + i)] << (8 * i) for i in range(n))
+
+
+@test
+def tx_kmap():
+    """TE = 1, supervisor: kmap (0xC000_0000-0xEFFF_FFFF, TLB-translated)
+    accesses whose base is in another segment (useg, kseg, MMIO) and the
+    reverse (kmap base, EA in useg / kseg / MMIO); faults: kmap EA in an
+    unmapped page (TLB miss), kmap base with an EA in the 0x8800_0000 hole
+    (ACCESS), a store through one segment read back through another"""
+    if NOEXC:
+        return []
+    out = []
+    for plus, dist in [(pl, d) for pl in ([], ['+HIT=70', '+LAT=1'], ['+HIT=100']) for d in (0, 1, 3)]:
+        mem = _tx_init()
+        logs = []
+        vals = []
+        def body(a):
+            a.setr(5, 0)
+            def fold(v):
+                a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, 7); vals.append(v)
+            def rr(op, base, ea, fault=None, val=None):
+                off = (ea - base) & 0xFFFFFFFF
+                if op == 'st':
+                    a.setr64(7, val)
+                a.setr(9, base); a.setr(11, off)
+                for _ in range(dist):
+                    a.nop()
+                (a.ld_rr if op == 'ld' else a.st_rr)(64, 7, 9, 11)
+                if fault:
+                    logs.append((fault, ea))
+                elif op == 'ld':
+                    fold(_tx_krd(mem, ea, 8) if val is None else val)
+                else:
+                    for i in range(8):
+                        mem[_tx_kpa(ea) + i] = (val >> (8 * i)) & 0xFF
+            K1, K2 = 0xC001FF00, 0xC0020000
+            rr('ld', 0x0100FF00, 0xC001FF00)               # useg base -> kmap EA
+            rr('ld', 0x8005FF00, 0xC001FFF8)               # kseg base -> kmap
+            rr('ld', 0xF0000000, 0xC0020008)               # MMIO base -> kmap (page 2)
+            rr('ld', 0x01010000, 0xC001FFF8)               # useg -> kmap, just below the P1/P2 split
+            rr('ld', K1, 0x0100FF00)                       # kmap base -> useg
+            rr('ld', K1, 0x8005FF08)                       # kmap base -> kseg
+            rr('ld', K2 - 8, 0x01010000)                   # kmap base -> useg page 1
+            rr('ld', K1, 0xF0010010, val=2)                # kmap base -> MMIO (UART status)
+            rr('ld', 0xF0000000, 0xC001FF00)               # MMIO base -> kmap
+            rr('ld', K1, 0xC0020000 + 0x10)                # kmap -> kmap, next page
+            rr('ld', 0x0100FF00, 0xC0000000, fault=X_TLB_LD)    # kmap page 0xC000 unmapped
+            rr('ld', K1, 0xC0030008, fault=X_TLB_LD)            # next kmap page unmapped
+            rr('ld', 0x80000000, 0xEFFFFFF8, fault=X_TLB_LD)    # kseg base -> unmapped kmap end
+            rr('ld', K1, 0xBFFFFFF8, fault=X_ACC_LD)            # kmap base -> the hole
+            rr('ld', 0x7FFFFFF8, 0xBFFFFFF8, fault=X_ACC_LD)    # useg base -> the hole
+            rr('st', 0x0100FF00, 0xC001FF18, val=0xA5A5)        # store through kmap from useg ...
+            rr('ld', 0x80000000, 0x8005FF18, val=0xA5A5)        # ... read through kseg
+            rr('st', 0x8005FF20, 0xC0020028, val=0x5A5A)        # store through kmap from kseg
+            rr('ld', K1, 0xC0020028, val=0x5A5A)                # ... read through kmap
+            rr('ld', 0x8005FF20, 0xC0020028, val=0x5A5A)        # (a different base: the load forwards / reads)
+            rr('st', 0xC0030000, 0x0100FF38, val=0x7777)        # store, kmap base -> useg
+            rr('ld', 0x8005FF38, 0xC001FF38, val=0x7777)
+        a, e, p = _te_prog(body, False, None, logs=logs, setup=_tx_kmsetup, plus=plus)
+        _tx_preload(a)
+        acc = 0
+        for v in vals:
+            acc = _rol(acc) ^ v
+        e['r5'] = acc
+        out.append((a, e, p))
+    return out
+
+
+@test
+def tx_pair():
+    """TE = 1: a two-access op (spanning MEMGET32, LEAVERET) whose first
+    doubleword faults on the segment and the second on the TLB, and the
+    reverse; both are translated before either access, the fault of the lowest
+    faulting byte wins (the 1st access's, whatever its kind; EADDR = the raw
+    EA for MEMGET32).  User and
+    supervisor; operands from the register file / 1 / 3 instructions
+    before"""
+    if NOEXC:
+        return []
+    out = []
+    for user, plus, dist in [(u, pl, d) for u in (False, True) for pl in ([], ['+HIT=70', '+LAT=1'])
+                             for d in (0, 1, 3)]:
+        logs = []
+        def body(a):
+            def ld32(ea, fault, eaddr):
+                a.setr(9, ea)
+                for _ in range(dist):
+                    a.nop()
+                a.ld(32, 7, 9)
+                logs.append((fault, eaddr))
+            def lr(sp, fault, eaddr):
+                a.setr(15, sp)
+                for _ in range(dist):
+                    a.nop()
+                a.leaveret()
+                logs.append((fault, eaddr))
+            if user:
+                ld32(0x7FFFFFFD, X_TLB_LD, 0x7FFFFFFD)   # 1st: TLB (0x7FFF unmapped), 2nd: segment; the lowest byte's fault wins
+                ld32(0xFFFFFFFD, X_ACC_LD, 0xFFFFFFFD)   # 1st: segment, 2nd: page 0 (wraps; TLB)
+                lr(0x7FFFFFF8, X_TLB_LD, 0x7FFFFFF8)
+                lr(0xFFFFFFF8, X_ACC_LD, 0xFFFFFFF8)
+                ld32(0xEFFFFFFD, X_ACC_LD, 0xEFFFFFFD)   # both: segment
+                ld32(0x0103FFFD, X_TLB_LD, 0x01040000)  # 1st mapped, 2nd TLB (control)
+            else:
+                ld32(0xBFFFFFFD, X_ACC_LD, 0xBFFFFFFD)   # 1st: the hole, 2nd: kmap page 0xC000 unmapped
+                lr(0xBFFFFFF8, X_ACC_LD, 0xBFFFFFF8)
+                ld32(0x7FFFFFFD, X_TLB_LD, 0x7FFFFFFD)   # 1st: TLB, 2nd: kseg (fine)
+                ld32(0xC002FFFD, X_TLB_LD, 0xC0030000)  # 1st kmap mapped, 2nd unmapped
+                ld32(0x87FFFFFD, X_ACC_LD, 0x88000000)  # kseg 1st, 2nd the hole
+                # (not tested: a supervisor MEMGET32 at 0xFFFFFFFD, whose 2nd dword wraps to VA 0, takes no
+                # TLB fault on db67f3f or master; MMU_PLAN §11.9)
+        a, e, p = _te_prog(body, user, None, logs=logs, setup=_tx_kmsetup, plus=plus)
+        _tx_preload(a)
+        out.append((a, e, p))
+    return out
+
+
+@test
+def tx_stlf_part():
+    """TE = 1 store-to-load forwarding where the store covers only part of
+    the load's doubleword (the load must wait for the store and merge it),
+    with the store's and the load's EAs equal but their bases (and the
+    offsets' split between page-crossing base and offset) different: sizes
+    1 / 2 / 4 at every offset in a dword near the page boundaries, then a
+    full-cover store with a narrower load (forwarded and shifted)"""
+    if NOEXC:
+        return []
+    import random
+    out = []
+    for plus in ([], ['+HIT=100'], ['+HIT=70', '+LAT=1'], ['+HIT=100', '+LAT=7']):
+        rnd = random.Random(len(plus) * 31 + 5)
+        mem = _tx_init()
+        vals = []
+        def body(a):
+            a.setr(5, 0)
+            def fold(v):
+                a.shift_n('rol', 5, 5, 1); a.alu('xor', 5, 5, 7); vals.append(v)
+            cases = []
+            for D in (0x0101FFF8, 0x01020000, 0x0102FFF8, 0x0100FFF8, 0x0101FF00):
+                for sz in (1, 2, 4):
+                    for k in range(0, 8, sz):
+                        cases.append((D, sz, k))
+            rnd.shuffle(cases)
+            for n, (D, sz, k) in enumerate(cases[:36]):
+                v = rnd.getrandbits(8 * sz) | 1
+                sb = rnd.choice([D + 0x10000, D - 0x10000, D + 0x30000, D - 0x7F000000, 0x80000000, 0])
+                lb = rnd.choice([D - 0x20000, D + 0x10000, D + 0x50000, 0x7FFF0000, D])
+                a.setr64(3, v)
+                a.setr(9, sb & 0xFFFFFFFF); a.setr(11, (D + k - sb) & 0xFFFFFFFF)
+                a.setr(10, lb & 0xFFFFFFFF); a.setr(13, (D - lb) & 0xFFFFFFFF)
+                a.st_rr(sz * 8, 3, 9, 11)
+                if n % 3 == 2:
+                    a.nop()
+                a.ld_rr(64, 7, 10, 13)
+                for i in range(sz):
+                    mem[_tx_pa(D + k + i)] = (v >> (8 * i)) & 0xFF
+                fold(_tx_rd(mem, D, 8))
+            # a full-cover store, then a narrower load (forwarded, shifted)
+            a.setr64(3, 0x1122334455667788)
+            a.setr(9, 0x0102FFF8 + 0x10000); a.setr(11, 0xFFFF0000)
+            a.st_rr(64, 3, 9, 11)
+            for i in range(8):
+                mem[_tx_pa(0x0102FFF8) + i] = (0x1122334455667788 >> (8 * i)) & 0xFF
+            a.setr(10, 0x0102FFF8 + 0x20000); a.setr(13, 0xFFFE0004)
+            a.ld_rr(32, 7, 10, 13); fold(_tx_rd(mem, 0x0102FFFC, 4))
+        a, e, p = _te_prog(body, False, None, setup=_tx_setup, plus=plus)
+        _tx_preload(a)
+        acc = 0
+        for v in vals:
+            acc = _rol(acc) ^ v
+        e['r5'] = acc
+        out.append((a, e, p))
+    return out
+
+
+@test
+def tx_wp():
+    """TE = 1: a read watchpoint (on the PA) fires on a hit-pipe load whose
+    base is in another page than its EA (DEBUG_EN builds; without the debug
+    module it completes)"""
+    dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
+    out = []
+    for plus in (['+HIT=100'], ['+HIT=100', '+LAT=7']):
+        mem = _tx_init()
+        pa = _tx_pa(0x0101FFF8)
+        def body(a):
+            a.setr(9, 0x01020000 + 0x20000); a.setr(11, 0xFFFDFFF8 & 0xFFFFFFFF)
+            for _ in range(4):
+                a.nop()
+            a.ld_rr(64, 6, 9, 11)           # EA 0x0101FFF8 through a base 3 pages up
+            a.setr(7, 0x77)
+        a, e, p = _te_prog(body, False, None, setup=_tx_setup, plus=plus + ['+WP0RD=%x' % pa])
+        _tx_preload(a)
+        if dbg:
+            e.update({'kind': '4', 'dbg_cause': '3', 'watch_addr': '%08x' % pa, 'r6': _tx_pat(pa)})
+            e[m(XD + 32)] = 0
+        else:
+            e.update({'r6': _tx_pat(pa), 'r7': 0x77})
+        out.append((a, e, p))
+    return out
+
+
 @test
 def tx_walk():
     """TE = 1 with the walker: the walked page is the EA's, not the base's:

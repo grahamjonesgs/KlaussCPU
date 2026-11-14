@@ -1819,6 +1819,31 @@ one that ignores the hit pipe's carry candidate fails `socx`.
   tier 1 (+0.032). Successive placements of this design varied by about
   ±0.3 ns, so the margin is thin.
 
+**Deferred to the next build** (review fix-ups after `db67f3f`; the release
+bitstream is not rebuilt for these, so only simulation-only code changed:
+the new assertions are X-safe in 4-state simulators, and `tx_kmap`,
+`tx_pair`, `tx_stlf_part` and `tx_wp` were added).
+- `f_sf_ln` / `f_sf_dw` (`pipeline_core.sv`, the store-forward line and dword
+  compares) read `ex_ta`, `ex_tb` and `ex_tlo5` / `ex_tlo3` implicitly, and
+  `sf_a` / `sf_b` / `sf_c` are continuous assigns calling them: against the
+  file's own rule (no helper function reading module signals in an assign,
+  at the interlocks). An event-driven simulator need not re-evaluate the
+  assign when `ex_tlo5` / `ex_tlo3` settle. Synthesis and Verilator are
+  correct (the netlist is the combinational function, and Verilator orders
+  it statically). **It does bite xsim**: the SoC testbench (`tb_soc`) running
+  `perf/m5a/hello.mem` to HALTED ends after 53,145 retired instructions with a
+  corrupted UART line (the `[test] ...` line is missing), against the golden
+  (56,639 instructions, exact UART text) on master and on this tree with
+  `sf_a` / `sf_b` / `sf_c` as `always_comb`. Fix in the next build: pass
+  `ex_ta`, `ex_tb`, `ex_tlo5` / `ex_tlo3` to the functions as arguments, or
+  make the three `always_comb`. (Until then xsim A/B runs of this branch
+  against emulator goldens are not trustworthy; use Verilator, `tools/vsim`.)
+- Observation, not a regression (same on master): a supervisor `MEMGET32` at
+  `0xFFFF_FFFD` (its 2nd doubleword wraps to VA 0) raises no fault with
+  TE = 1, where page 0 is unmapped. User mode faults on the 1st doubleword's
+  segment, as it should. Not covered by `tx_pair`; decide the architectural
+  answer (wrap faults, or the access is undefined) before changing anything.
+
 ---
 
 ## 12. Review outcome (runtime session, 2026-11-09)

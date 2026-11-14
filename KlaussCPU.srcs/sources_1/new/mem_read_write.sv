@@ -616,7 +616,9 @@ module mem_read_write (
     // the selected candidate is i_h_addr's tag
     logic [TAG_BITS-1:0] r_h_tagx;
     always_ff @(posedge i_Clk) r_h_tagx <= i_h_addr[31:5+INDEX_BITS];
-    always_ff @(posedge i_Clk)
+    // (4-state sims: skipped while any of them is X — the first cycle, or a
+    // bench that leaves the hit-pipe inputs unconnected)
+    always_ff @(posedge i_Clk) if (!$isunknown({r_h_tag, r_h_tag1, r_h_c1, r_h_tagx}))
         assert ((r_h_c1 ? r_h_tag1 : r_h_tag) == r_h_tagx)
             else $fatal(1, "hit-pipe tag candidates %h / %h (c1 %b) != %h", r_h_tag, r_h_tag1, r_h_c1, r_h_tagx);
 `endif
