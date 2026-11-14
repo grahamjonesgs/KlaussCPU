@@ -2785,12 +2785,19 @@ module pipeline_core
    // offset — -8 for a push (PUSH / CALL / ENTER), the imm32 for [rs1+imm] /
    // [imm], rs2 for [rs1+rs2], else 0.  Loaded with the operand latches
    // (!mem_busy && !ex_busy).  (Only the stack, load and store uops use them.)
-   wire t_sp  = dec.uop == U_PUSH || dec.uop == U_CALL || dec.uop == U_ENTER ||
-                dec.uop == U_POP  || dec.uop == U_RET  || dec.uop == U_IRET;
-   wire t_m8  = dec.uop == U_PUSH || dec.uop == U_CALL || dec.uop == U_ENTER;
-   wire t_ls  = dec.uop == U_LOAD || dec.uop == U_STORE;
-   wire t_lr  = dec.uop == U_LEAVERET;
-   wire t_l32 = dec.uop == U_LOAD32;
+   // (timing: the selects are from id_op's raw fields, not f_decode's uop —
+   // exact for every legal memory op, which is the only kind that uses
+   // them: class 6 / 7 loads, stores, MEMGET32, LR/SC, DCBZ by MODE; class
+   // 8 CALL; class 9 PUSH / POP / RET / IRET / ENTER on SP, LEAVE /
+   // LEAVERET (aluop 9 / 10) on rs1 = R15)
+   wire [3:0] t_cls = id_op[29:26];
+   wire [3:0] t_alu = id_op[25:22];
+   wire [1:0] t_md  = id_op[22:21];
+   wire t_mem = t_cls == 4'h6 || t_cls == 4'h7;
+   wire t_sp  = t_cls == 4'h8 || (t_cls == 4'h9 && t_alu != 4'd9 && t_alu != 4'd10);
+   wire t_m8  = t_cls == 4'h8 || (t_cls == 4'h9 && (t_alu == 4'd0 || t_alu == 4'd1 || t_alu == 4'd8));
+   wire t_lr  = t_cls == 4'h9 && t_alu == 4'd10;                                   // LEAVERET
+   wire t_l32 = t_cls == 4'h6 && id_op[25:23] == 3'b100 && t_md == 2'b00 && !id_op[12];   // MEMGET32
    // ex_xpg's test on a candidate rs1 value: a LEAVERET, or a MEMGET32
    // spanning two doublewords, whose 2nd doubleword is in the next page
    function automatic logic f_xpg(logic lr, logic l32, logic [15:0] v);
@@ -2798,13 +2805,13 @@ module pipeline_core
    endfunction
    wire [31:0] t_ta_d = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
                               : (wb_valid && wb_sp_we)   ? wb_sp_new : sp)
-                      : (t_ls && dec.mmode == 2'b10) ? 32'd0
+                      : (t_mem && t_md == 2'b10) ? 32'd0
                       : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
                       : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v[31:0]
                       : rf[id_rs1][31:0];
    wire [31:0] t_tb_d = t_m8 ? 32'hFFFF_FFF8
-                      : (!t_ls || dec.mmode == 2'b00) ? 32'd0
-                      : (dec.mmode != 2'b11) ? id_var1
+                      : (!t_mem || t_md == 2'b00) ? 32'd0
+                      : (t_md != 2'b11) ? id_var1
                       : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
                       : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v[31:0]
                       : rf[dec.rs2][31:0];
@@ -4785,7 +4792,7 @@ module pipeline_core
       assert (ex_mok == ex_mph)
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
    // (§11.9) the dispatch-time page-crossing bit is ex_xpg
-   always_ff @(posedge clk) if (!rst && ex_valid)
+   always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
       assert (ex_txpg == ex_xpg)
          else $fatal(1, "ex_txpg stale: pc=%h a=%h", ex_pc, ex_a);
    always_ff @(posedge clk) if (!rst && running) begin
@@ -5164,24 +5171,42 @@ module mmu_tlb
    always_ff @(posedge clk)
       if (rst) d_ok <= '0;
       else if (ce) for (int n = 0; n < N; n++) d_ok[n] <= e_v[n] && (e_g[n] || e_asid[n] == asid);
-   logic [N-1:0] dm;
+   // (timing) bit 16's carry is selected at the outputs, not in each
+   // entry's match: every entry matches twice, assuming the page offset's
+   // carry c15 is 0 (dm0) or 1 (dm1), into two PFN / XWR / hit muxes, and
+   // c15 — a 16-bit carry chain on the one low-half copy — picks between
+   // them last (in the first build c15's chain and its route to the
+   // entries led the failing CAM paths)
+   logic [N-1:0] dm0, dm1;
+   (* keep = "true" *) logic [15:0] q_alo;
+   (* keep = "true" *) logic [15:0] q_blo;
+   always_ff @(posedge clk) if (ce && !rst) begin
+      if (d_ld)        begin q_alo <= d_ta[15:0];  q_blo <= d_tb[15:0];  end
+      else if (d_step) begin q_alo <= '0;          q_blo <= '0;          end
+   end
+   wire [16:0] q_lo = {1'b0, q_alo} + {1'b0, q_blo};
+   wire        d_c15 = q_lo[16];
    logic [NQ-1:0] d_kok;                // (sim) each copy's page equals d_vpn
    for (genvar q = 0; q < NQ; q++) begin : g_dq
-      (* keep = "true" *) logic [31:0] q_a;
-      (* keep = "true" *) logic [31:0] q_b;
+      (* keep = "true" *) logic [15:0] q_a;    // the operands' page halves, [31:16]
+      (* keep = "true" *) logic [15:0] q_b;
       always_ff @(posedge clk) if (ce && !rst) begin
-         if (d_ld)        begin q_a <= d_ta;  q_b <= d_tb;  end
-         else if (d_step) begin q_a <= {q_a[31:16] + 16'd1, 16'h0000};  q_b <= '0;  end
+         if (d_ld)        begin q_a <= d_ta[31:16];  q_b <= d_tb[31:16];  end
+         else if (d_step) begin q_a <= q_a + 16'd1;  q_b <= '0;           end
       end
-      wire [16:0] q_lo = {1'b0, q_a[15:0]} + {1'b0, q_b[15:0]};
       for (genvar e = 0; e < NE; e++) begin : g_de
-         assign dm[q * NE + e] = d_ok[q * NE + e] && f_pgeq(q_a, q_b, q_lo[16], e_vpn[q * NE + e]);
+         localparam int n = q * NE + e;
+         wire r  = d_ok[n] && f_sum_hi(q_a, q_b, e_vpn[n]);
+         wire x0 = q_a[0] ^ q_b[0] ^ e_vpn[n][0];      // the carry bit 16 needs
+         assign dm0[n] = r && !x0;
+         assign dm1[n] = r && x0;
       end
 `ifndef SYNTHESIS
-      wire [31:0] q_sum = q_a + q_b;
-      assign d_kok[q] = q_sum[31:16] == d_vpn;
+      wire [15:0] q_sum = q_a + q_b + 16'(d_c15);
+      assign d_kok[q] = q_sum == d_vpn;
 `endif
    end
+   wire [N-1:0] dm = d_c15 ? dm1 : dm0;   // (sim checks; the outputs select late)
 `ifndef SYNTHESIS
    // the exact match (the core checks it equals dm where it is used)
    wire [N-1:0] dm_exact = f_match(d_vpn, asid);
@@ -5191,14 +5216,18 @@ module mmu_tlb
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
    wire [N-1:0] fm = f_match(f_vpn, f_asid);
    assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
+   logic [10:0] d_pfn0, d_pfn1;  logic [2:0] d_xwr0, d_xwr1;
    always_comb begin
-      d_pfn = '0;  d_xwr = '0;  f_pfn = '0;  f_xwr = '0;
+      d_pfn0 = '0;  d_xwr0 = '0;  d_pfn1 = '0;  d_xwr1 = '0;  f_pfn = '0;  f_xwr = '0;
       for (int n = 0; n < N; n++) begin
-         d_pfn |= dm[n] ? e_pfn[n] : 11'd0;  d_xwr |= dm[n] ? e_xwr[n] : 3'd0;
+         d_pfn0 |= dm0[n] ? e_pfn[n] : 11'd0;  d_xwr0 |= dm0[n] ? e_xwr[n] : 3'd0;
+         d_pfn1 |= dm1[n] ? e_pfn[n] : 11'd0;  d_xwr1 |= dm1[n] ? e_xwr[n] : 3'd0;
          f_pfn |= fm[n] ? e_pfn[n] : 11'd0;  f_xwr |= fm[n] ? e_xwr[n] : 3'd0;
       end
    end
-   assign d_hit = |dm;
+   assign d_pfn = d_c15 ? d_pfn1 : d_pfn0;
+   assign d_xwr = d_c15 ? d_xwr1 : d_xwr0;
+   assign d_hit = d_c15 ? |dm1 : |dm0;
    assign f_hit = |fm;
 
    // (timing) TLBWI / TLBINV write the entries the cycle AFTER they commit:
