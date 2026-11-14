@@ -17,8 +17,9 @@
 //   +LDLY=<n> / +LDLYR=<n>  (32 B I-cache lines, HW_PERF_PLAN §5) the 32 B
 //                   line answer (m_line_v) of a DRAM read comes n (+ random
 //                   0..n-1) cycles after its ready, as after a D-cache miss's
-//                   early restart; no request is accepted meanwhile (the
-//                   cache is busy installing).  Default 0: with the ready.
+//                   early restart; no DRAM request is accepted meanwhile
+//                   (the cache is busy installing; MMIO is).  Default 0: with
+//                   the ready.
 //===========================================================================
 `timescale 1ns/1ps
 module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
@@ -157,6 +158,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    string       uart_s = "";
    longint      n_rd = 0, n_wr = 0, n_mmio_wr = 0, n_mmio_rd = 0;
 
+   logic [31:0] poke_a = '0;
+   longint      n_poke = 0;
    task automatic apply_write(input logic [31:0] a, input logic [63:0] wd, input logic [7:0] be);
       logic [63:0] cur, nxt;
       if (a[31:28] == 4'hF) begin
@@ -168,6 +171,14 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) begin
             mask_wr    <= 1'b1;
             mask_wdata <= wd[3:0];
+         end
+         // a non-coherent writer (DMA / core 2): 0xF0FE_0000 = the address,
+         // 0xF0FE_0008 = a dword written there behind the core's back (no
+         // I-cache snoop: the core sees an MMIO store)
+         if (a[27:16] == 12'h0FE && a[15:0] == 16'h0000) poke_a = wd[31:0];
+         if (a[27:16] == 12'h0FE && a[15:0] == 16'h0008) begin
+            if (poke_a < 32'(LO_DW*8)) mem_lo[poke_a[31:3]] = wd;
+            n_poke++;
          end
       end else begin
          cur = rd_dw(a);
@@ -184,7 +195,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    endfunction
    int          ldly = 0, ldly_r = 0, ld_cnt = 0;
    logic        ld_pend = 1'b0;
-   logic [31:0] ld_addr;
+   logic [255:0] ld_line;
    longint      n_line = 0;
    always @(posedge clk) begin
       m_ready <= 1'b0;
@@ -193,7 +204,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (!rst && ld_pend) begin
          if (ld_cnt > 1) ld_cnt <= ld_cnt - 1;
          else begin
-            m_line   <= rd_line(ld_addr);
+            m_line   <= ld_line;          // as read (a poke since then is not in it)
             m_line_v <= 1'b1;
             ld_pend  <= 1'b0;
             n_line++;
@@ -202,7 +213,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (rst) begin
          in_flight <= 1'b0;
          ld_pend   <= 1'b0;
-      end else if (!in_flight && !m_ready && !ld_pend && (m_read_DV || m_write_DV)) begin
+      end else if (!in_flight && !m_ready && (!ld_pend || m_addr[31:28] == 4'hF) &&
+                   (m_read_DV || m_write_DV)) begin
+         // (an MMIO access is not held behind the cache's line install: the
+         // splitter sends it to the MMIO side)
          in_flight <= 1'b1;
          q_addr <= m_addr;  q_wr <= m_write_DV;  q_wdata <= m_wdata;  q_be <= m_be;
          q_zl <= m_write_DV && m_zl;
@@ -233,7 +247,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                      m_line_v <= 1'b1;
                      n_line++;
                   end else begin
-                     ld_pend <= 1'b1;  ld_cnt <= dl;  ld_addr <= q_addr;
+                     ld_pend <= 1'b1;  ld_cnt <= dl;  ld_line <= rd_line(q_addr);
                   end
                end
             end
@@ -340,6 +354,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    longint ic_inst = 0, ic_drop = 0, ic_vdefer = 0, ic_sweeps = 0;
 `ifdef HAS_ICLB
    logic sw_q = 1'b0;
+   logic [63:0] bt_q = '0;
+   always @(posedge clk) bt_q <= dut.bt_v;
    bit   icdbg = 0;   // +ICDBG: print each miss issue, line install and sweep
    initial icdbg = $test$plusargs("ICDBG");
    always @(posedge clk) if (!rst && icdbg) begin
@@ -347,6 +363,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.li_now) $display("ICDBG t=%0d inst idx=%0d pa=%08x", cyc, dut.li_idx, {dut.lp_pa, 5'b0});
       if (dut.lp_ev && dut.lp_wrh) $display("ICDBG t=%0d drop pa=%08x", cyc, {dut.lp_pa, 5'b0});
       if (dut.ic_sw && !sw_q) $display("ICDBG t=%0d sweep", cyc);
+      if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
+      if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
    always @(posedge clk) if (!rst) begin
       if (dut.li_now) ic_inst++;

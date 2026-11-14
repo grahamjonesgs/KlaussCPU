@@ -306,6 +306,10 @@ def check(st, exp):
             want = v
         if got is None and k.startswith('m') and int(want, 16) == 0:
             continue                      # the TB dumps only non-zero dwords
+        if isinstance(v, tuple):          # (lo, hi): an inclusive range (rN / mN: of the hex value)
+            if got is None or not (v[0] <= int(got, 16 if k[0] in 'rm' else 10) <= v[1]):
+                bad.append(f'{k}: got {got} want {v[0]}..{v[1]}')
+            continue
         if want == 'nonzero':
             if got is None or int(got, 16) == 0:
                 bad.append(f'{k}: got {got} want nonzero')

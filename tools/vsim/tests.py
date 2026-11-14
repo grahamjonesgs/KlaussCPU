@@ -3954,6 +3954,451 @@ def ic16_smc_fill():
     return out
 
 
+# ================================ HW_PERF_PLAN §5: 32 B I-cache lines
+# The default geometry is 2048 x 32 B = 64 KiB (VSIM_IC=1024x16 runs the
+# same programs on the 16 KiB / 16 B I-cache, with its own counts).  LDLYS:
+# how long after the fill's ready the tb answers with the line (+LDLY): 0 =
+# a D-cache hit, else a miss whose ready was the early restart.
+LDLYS = (0, 3, 8)
+POKE_A, POKE_D = 0xF0FE0000, 0xF0FE0008      # tb_vsim's non-coherent writer
+
+
+def _ic_lines(lo, hi):
+    """I-cache lines spanned by the bytes [lo, hi)"""
+    return (hi - 1) // IC_LB - lo // IC_LB + 1
+
+
+def _ic_dm_misses(seq):
+    """direct-mapped misses of a sequence of byte addresses (one per line
+    visit), with this geometry"""
+    tags = {}
+    n = 0
+    for addr in seq:
+        ln = addr // IC_LB
+        if tags.get(ln % IC_LINES) != ln:
+            tags[ln % IC_LINES] = ln
+            n += 1
+    return n
+
+
+@test
+def ic32_fill_dw():
+    """a cold line entered at each of its four dwords (a CALL to L + 8k), run
+    to its end, then the whole line from its start: one miss fills the 32 B
+    line, so the second call does not miss (16 B lines: the half before the
+    entry point misses then).  The line answer comes with the ready or
+    LDLY cycles after it (the early restart of a D-cache miss)."""
+    out = []
+    L = 0x1000
+    for k in range(4):
+        for lat in (1, 4):
+            for ld in LDLYS:
+                a = Asm()
+                a.setr(1, 0)
+                a.call(f'T{k}')
+                a.call('T0')
+                a.halt()                       # main: 5 words in [0x20, 0x34)
+                _ic_pad(a, L)
+                for w in range(8):
+                    if w % 2 == 0:
+                        a.label(f'T{w // 2}')
+                    a.inc(1)
+                a.ret()                        # the next line
+                # misses: main, the line(s) of L, the RET's line.  (16 B
+                # lines, per-dword valid: an odd entry installs only its own
+                # dword of the half, so the second call misses on the rest)
+                miss = _ic_lines(0x20, 0x34) + (1 if IC32 else (2, 4, 2, 3)[k]) + 1
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 16 - 2 * k,
+                                'ic_miss': str(miss)}, [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+def _ic_straight(n, reg):
+    return lambda s: ([s.inc(reg) for _ in range(n)], s.jmpr(10))
+
+
+def _ic_incs(s, n):
+    """n increments alternating r3 / r12 (no back-to-back dependency)"""
+    for i in range(n):
+        s.inc(3 if i % 2 == 0 else 12)
+
+
+@test
+def ic32_prefetch():
+    """straight 1-word code through 32 B line boundaries and a 64 KiB page
+    boundary, three passes: only the first pass misses, and a warm pass runs
+    at about one instruction per cycle (the prefetch stays a line ahead
+    across lines and pages).  TE = 1: the two VA pages map to frames that are
+    not adjacent; the frame after the first holds other code (r4) — fetching
+    it would be a wrong translation."""
+    out = []
+    # words before / after the page boundary: the code after it stays in the
+    # boundary's own (16 or 32 B) line — index 0, which main (0x20 on) does
+    # not use, so the passes cannot evict each other
+    n0, n1 = 64, 2
+    for te in (False, True):
+        if te and NOEXC:
+            continue
+        for lat in (1, 3, 6):
+            for ld in (0, 5):
+                va = (0x00510000 if te else 0x00030000) - 4 * n0
+                fr = {va >> 16: 0x2, (va >> 16) + 1: 0x4} if te else None
+                pa = (lambda v: (fr[v >> 16] << 16) | (v & 0xFFFF)) if te else (lambda v: v)
+
+                def body(a):
+                    a.setr(3, 0); a.setr(12, 0); a.setr(4, 0); a.setr(11, 3)
+                    a.label('it')
+                    a.mfsr(6, 'cycle')
+                    a.setr(9, va); a.leapc(10, 'back'); a.jmpr(9)
+                    a.label('back')
+                    a.mfsr(7, 'cycle')
+                    a.addi_s(11, 11, -1)
+                    a.fbr('ne', 11, 0, 'it', imm=True)
+                    a.alu('sub', 8, 7, 6)          # the last (warm) pass's cycles
+                exp = {'r3': 3 * (n0 + n1) // 2, 'r12': 3 * (n0 + n1) // 2, 'r4': 0,
+                       # n0 + n1 incs, the jumps there and back (an indirect
+                       # JMPR each way) and the MFSRs: ~1 cycle per inc warm
+                       'r8': (n0 + n1 + 8, n0 + n1 + 30)}
+                if te:
+                    a, e, p = _te_prog(body, False, exp, setup=lambda a: (
+                        _tlb_set(a, 2, va >> 16, 0x2, TLB_V | TLB_X),
+                        _tlb_set(a, 3, (va >> 16) + 1, 0x4, TLB_V | TLB_X)))
+                    # the frame after 0x2 (a wrong translation would run it)
+                    _place(a, 0x30000, _ic_straight(n1, 4))
+                else:
+                    a = Asm()
+                    body(a)
+                    a.halt()
+                    e, p = dict(exp, end='park', kind='0'), []
+                _wk_snip(a, va, pa, lambda s: (_ic_incs(s, n0 + n1), s.jmpr(10)))
+                # first pass only: the code's lines (its VA page offsets
+                # index the I-cache; both frames' lines are distinct)
+                if te:
+                    # (perf_ic[0] also counts each micro-ITLB refill cycle
+                    # with TE = 1 — as on master — so count the installs:
+                    # the code's lines plus the program's own, first pass only)
+                    if IC32:
+                        e['ic_inst'] = (_ic_lines(va, va + 4 * (n0 + n1 + 1)),
+                                        _ic_lines(va, va + 4 * (n0 + n1 + 1)) + 12)
+                else:
+                    main_end = a.labels['back'] + 16
+                    e['ic_miss'] = str(_ic_lines(0x20, main_end + 8) +
+                                       _ic_lines(va, va + 4 * (n0 + n1 + 1)))
+                out.append((a, e, p + [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_snoop_half():
+    """a warm function F filling one 32 B line (7 x addi r1,1; ret) patched
+    at word j — either 16 B half — by a 64 / 32 / 8-bit store: the next call
+    runs the new word.  Then a data store into the second half of a line
+    whose first half is code G: the snoop drops the whole 32 B line (G misses
+    once more; on 16 B lines it does not) and G runs correctly."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    F = 0x1000
+    for size in (64, 32, 8):
+        for j in (0, 3, 4, 6):
+            for lat, ld in ((1, 0), (4, 5), (2, 9)):
+                a = Asm()
+                a.setr(1, 0)
+                a.call('F'); a.call('F')
+                a.setr(2, F + 4 * j)
+                if size == 64:
+                    a.setr(2, F + 8 * (j // 2))
+                    a.ld(64, 4, 2)
+                    keep = 0xFFFFFFFF00000000 if j % 2 == 0 else 0x00000000FFFFFFFF
+                    a.setr64(8, keep)
+                    a.alu('and', 4, 4, 8)
+                    a.setr64(8, new << (32 * (j % 2)))
+                    a.alu('or', 4, 4, 8)
+                    a.st(64, 4, 2)
+                elif size == 32:
+                    a.setr(3, new); a.st(32, 3, 2)
+                else:                              # imm8 is byte 2: 1 -> 0x11
+                    a.setr(3, (new >> 16) & 0xFF); a.st(8, 3, 2, 2)
+                a.call('F')
+                a.halt()
+                _ic_pad(a, F)
+                a.label('F')
+                for _ in range(7):
+                    a.alui_s('add', 1, 1, 1)
+                a.ret()
+                inc = 0x11 if size == 8 else 16
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 14 + 6 + inc},
+                            [f'+LAT={lat}', f'+LDLY={ld}']))
+    G = 0x2000
+    for lat, ld in ((1, 0), (3, 6)):
+        a = Asm()
+        a.setr(7, 0); a.setr(9, G + 0x18); a.setr(5, 0x5A)
+        a.call('G'); a.call('G')
+        a.st(64, 5, 9)                             # data in G's line, other half
+        a.call('G')
+        a.ld(64, 6, 9)
+        a.halt()
+        main_end = a.pc
+        _ic_pad(a, G)
+        a.label('G')
+        a.inc(7); a.inc(7); a.inc(7); a.ret()
+        miss = _ic_lines(0x20, main_end) + (2 if IC32 else 1)
+        out.append((a, {'end': 'park', 'kind': '0', 'r7': 9, 'r6': 0x5A, 'ic_miss': str(miss)},
+                    [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_dcbz():
+    """DCBZ over cached code: a warm function F in either 16 B half of its
+    line, the line zeroed through any address in it; the next call executes
+    the zeros (ILLEGAL at F).  Line answers with and without delay."""
+    out = []
+    if NOEXC:
+        return out
+    for half in (0, 16):
+        for ea_off in range(0, 32, 4):
+            ea_off |= (ea_off >> 2) & 3          # some unaligned EAs too
+            for lat, ld in ((1, 0), (4, 6)):
+                a = Asm()
+                a.setr(1, 0)
+                a.leapc(2, 'F')
+                a.call('F'); a.call('F')
+                a.alui('and', 3, 2, ~31 & 0xFFFFFFFF, sgn=False)
+                a.addi_s(3, 3, ea_off)
+                a.dcbz(3)
+                a.call('F')
+                a.halt()
+                a.nop()
+                while (a.pc & 31) != 0:
+                    a.nop()
+                for _ in range(half // 4):
+                    a.nop()
+                a.label('F')
+                a.inc(1)
+                a.ret()
+                out.append((a, {'end': 'park', 'kind': '2', 'pc': a.labels['F'], 'op': 0, 'r1': 2},
+                            [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_icinv():
+    """ICACHE_INV against a non-coherent writer (tb_vsim's poke device, which
+    the store snoop does not see): a warm function P's first word is
+    rewritten in DRAM; the next call still runs the cached old code, the one
+    after ICACHE_INV the new.  Then the fence executed while another line's
+    install is pending (its line answer LDLY cycles late, as read before
+    the fence): that install must not survive it."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 2, 2, 16))
+    P = 0x3000
+    for lat, ld in ((1, 0), (3, 4), (5, 9)):
+        a = Asm()
+        a.setr(2, 0)
+        a.call('P'); a.call('P')
+        a.setr(8, POKE_A); a.setr(9, P); a.st(64, 9, 8)
+        a.setr(9, P + 8); a.ld(64, 4, 9)           # P's second dword ...
+        a.setr(9, P); a.ld(64, 3, 9)               # ... and its first
+        a.setr64(7, 0xFFFFFFFF00000000); a.alu('and', 3, 3, 7)
+        a.setr(7, new); a.alu('or', 3, 3, 7)
+        a.setr(8, POKE_D); a.st(64, 3, 8)          # P's first word, behind the snoop
+        a.call('P')                                # old code: +1
+        a.setr(1, 0xF0050000); a.setr(3, 8); a.st(32, 3, 1)    # ICACHE_INV
+        a.call('P')                                # new code: +16
+        a.halt()
+        _ic_pad(a, P)
+        a.label('P'); a.inc(2); a.ret()
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': 19}, [f'+LAT={lat}', f'+LDLY={ld}']))
+    # the fence meets a pending install: a cold line A is entered at its
+    # last dword (a JMP to the warm R); R rewrites A's first dword behind
+    # the snoop while A's line answer is still to come, fences, waits out
+    # the sweep, then calls A + 0: it must run the new code (the install
+    # read before the fence would bring back the old)
+    A = 0x5000
+    newdw = _word(lambda t: t.alui_s('add', 2, 2, 16)) | (_word(lambda t: t.ret()) << 32)
+    # (LDLY 80 / 100: A's line arrives after the sweep — the case only
+    # dropping the pending install at the fence covers; with an earlier
+    # answer the re-fetch's install after the fence replaces A's deferred
+    # valid set anyway)
+    for lat, ld in ((1, 0), (3, 20), (2, 30), (1, 80), (3, 100)):
+        a = Asm()
+        a.setr(2, 0); a.setr(1, 0xF0050000); a.setr(3, 8); a.setr(5, 0)
+        a.setr(8, POKE_A); a.setr(7, POKE_D); a.setr(9, A); a.setr64(6, newdw)
+        a.call('R')                    # warm R (r5 = 0: it only returns)
+        a.setr(5, 1)
+        a.call('A3')
+        a.halt()
+        a.label('R')
+        a.fbr('eq', 5, 0, 'rr', imm=True)
+        a.st(64, 9, 8); a.st(64, 6, 7)             # poke A's first dword
+        a.st(32, 3, 1)                             # ICACHE_INV
+        a.setr(4, 60)
+        a.label('rd')
+        a.addi_s(4, 4, -1)
+        a.fbr('ne', 4, 0, 'rd', imm=True)          # > 64 cycles: the sweep is over
+        a.call('A')
+        a.label('rr')
+        a.ret()
+        _ic_pad(a, A)
+        a.label('A')
+        a.alui_s('add', 2, 2, 1); a.ret()          # (old code: +1)
+        for _ in range(4):
+            a.nop()
+        a.label('A3')
+        a.jmp('R'); a.nop()
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': 16}, [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_smc_pending():
+    """self-modifying code against a pending install: a cold function F
+    whose first instruction stores into a later word of F's own 32 B line
+    (the other 16 B half, or the same) while F's line answer is still to
+    come — the install must be dropped (or cleared by the store's snoop),
+    the BTIC window captured from the fill killed, and F runs the new word,
+    now and on two later calls."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    F = 0x21000          # (above 64 KiB: the shadow's power-up tag 0 would match it)
+    for p in (2, 5, 6):
+        for lat in (1, 3, 5):
+            for ld in (0, 1, 2, 3, 5, 8, 12):
+                a = Asm()
+                a.setr(1, 0); a.setr(2, F + 4 * p); a.setr(3, new)
+                a.call('F')
+                a.setr(2, DATA + 0x100)
+                a.call('F')                    # the store now writes data: F as patched
+                a.call('F')
+                a.halt()
+                _ic_pad(a, F)
+                a.label('F')
+                a.st(32, 3, 2)
+                for _ in range(p - 1):
+                    a.nop()
+                a.alui_s('add', 1, 1, 1)       # F + 4p
+                a.ret()
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 3 * 16},
+                            [f'+LAT={lat}', f'+LDLY={ld}']))
+    # (the first call's CALL captured F's first window in the BTIC from the
+    # fill — before the store; the store must kill it, also when it drops
+    # the pending install, or the later calls run the old word from it)
+    return out
+
+
+
+@test
+def ic32_smc_btic():
+    """the BTIC window of a line whose install is pending: one CALL site
+    calls F three times.  The first call (cold: F's line filled, its first
+    window captured in the BTIC) branches at once to the warm G, which
+    patches F's word 2 — inside that window — while F's line answer is still
+    to come; the later calls hit the BTIC entry, which the store must have
+    killed (the dropped install does not), so they run the new word."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    F, G = 0x21000, 0x22000
+    for lat in (1, 3):
+        for ld in (0, 6, 12, 20):
+            a = Asm()
+            a.setr(1, 0); a.setr(5, 0); a.setr(2, DATA + 0x100); a.setr(3, new)
+            a.call('G')                        # warm G (its store: data)
+            a.setr(2, F + 8); a.setr(5, 1); a.setr(11, 3)
+            a.label('lp')
+            a.call('F')                        # one call site: one BTIC entry
+            a.addi_s(11, 11, -1)
+            a.fbr('ne', 11, 0, 'lp', imm=True)
+            a.halt()
+            _ic_pad(a, F)
+            a.label('F')
+            a.fbr('ne', 5, 0, 'G', imm=True)   # (first call: to G)
+            while a.pc != F + 8:
+                a.nop()
+            a.alui_s('add', 1, 1, 1)           # F + 8: patched to +16
+            a.ret()
+            _ic_pad(a, G)
+            a.label('G')
+            a.st(32, 3, 2)
+            a.setr(5, 0)
+            a.ret()
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 32}, [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+@test
+def ic32_remap():
+    """TE = 1: code at a VA re-mapped by TLBWI to another frame (other code)
+    and back; then the same through the hardware walker (PTE rewritten,
+    TLBINV, the walk refills): each call runs the current frame's code, with
+    line installs delayed so one is pending at the discard"""
+    out = []
+    if NOEXC:
+        return out
+    VA = 0x00501000
+    for lat, ld in ((1, 0), (3, 4), (2, 10)):
+        def body(a):
+            for k, fr in enumerate((2, 3, 2)):
+                if k:
+                    _tlb_set(a, 2, VA >> 16, fr, TLB_V | TLB_X)
+                a.setr(9, VA); a.leapc(10, f'b{k}'); a.jmpr(9)
+                a.label(f'b{k}')
+                a.mov(6 + k, 5)
+        a, e, p = _te_prog(body, False, {'r6': 0x111, 'r7': 0x222, 'r8': 0x111},
+                           setup=lambda a: _tlb_set(a, 2, VA >> 16, 2, TLB_V | TLB_X))
+        _place(a, 0x21000, lambda s: (s.setr(5, 0x111), s.jmpr(10)))
+        _place(a, 0x31000, lambda s: (s.setr(5, 0x222), s.jmpr(10)))
+        out.append((a, e, p + [f'+LAT={lat}', f'+LDLY={ld}']))
+    if NOWALK:
+        return out
+    for lat, ld in ((1, 0), (3, 7)):
+        ptes = {VA >> 16: _wk_pte(2, TLB_V | TLB_X)}
+        pte_a = WK_TAB[0] + 8 * (VA >> 16)
+        def body(a):
+            for k, fr in enumerate((2, 3, 2)):
+                if k:
+                    # (the PTE through kseg: with TE = 1 a useg store is translated)
+                    a.setr(1, 0x80000000 + pte_a); a.setr64(4, _wk_pte(fr, TLB_V | TLB_X)); a.st(64, 4, 1)
+                    a.tlbinv()
+                a.setr(9, VA); a.leapc(10, f'b{k}'); a.jmpr(9)
+                a.label(f'b{k}')
+                a.mov(6 + k, 5)
+        a, e, p = _wk_prog(body, ptes, {'r6': 0x111, 'r7': 0x222, 'r8': 0x111})
+        _place(a, 0x21000, lambda s: (s.setr(5, 0x111), s.jmpr(10)))
+        _place(a, 0x31000, lambda s: (s.setr(5, 0x222), s.jmpr(10)))
+        out.append((a, e, p + [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_loop48k():
+    """a 48 KiB loop (> 16 and > 32 KiB, < 64 KiB) after 1, 2 and 4 passes:
+    with 64 KiB only the first pass misses; smaller I-caches miss again on
+    every pass (the counts are those of a direct-mapped cache of this
+    geometry over the loop's lines)"""
+    out = []
+    for passes in (1, 2, 4):
+        a = Asm()                      # (_ic_loop's FBR back reaches 16 KiB only)
+        a.setr(1, passes); a.setr(2, 0)
+        while a.pc & 31:
+            a.nop()
+        a.label('l')
+        for _ in range(48 * 1024 // 4 - 4):
+            a.nop()
+        a.inc(2)
+        a.addi_s(1, 1, -1)
+        a.fbr('eq', 1, 0, 'x', imm=True)
+        a.jmp('l')
+        a.label('x')
+        a.halt()
+        lo, x = a.labels['l'], a.labels['x']
+        # setup (main's first line(s)), the passes (up to the JMP), then the
+        # exit (the HALT's line, fetched once)
+        seq = list(range(0x20, lo, IC_LB)) + \
+              [v for _ in range(passes) for v in range(lo - lo % IC_LB, x, IC_LB)] + [x]
+        out.append((a, {'end': 'park', 'kind': '0', 'r2': passes, 'r1': 0,
+                        'ic_miss': str(_ic_dm_misses(seq))}, ['+LAT=2']))
+    return out
+
+
 # ================================ MMU_PLAN §11.8: the hardware TLB walker
 # Page tables (the Linux format, arch/klausscpu tlbex.S): TLB_PTB -> 32
 # directory dwords (VA[30:26]); D[0] = present, D & 0x07FF_E000 = an 8 KiB
