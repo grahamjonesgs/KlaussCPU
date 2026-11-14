@@ -436,6 +436,7 @@ fail:
 | 0x08 | `CYCLE` | R **in user mode too** | 64-bit core-cycle counter (§3.1, §5); MTSR to it is ILLEGAL |
 | 0x10–0x2F | `MPU_BASEn` / `MPU_LIMITn` | supervisor | stage 2 (§10.1) |
 | 0x30–0x34 | `TLB_HI`, `TLB_LO`, `TLB_INDEX`, `ASID`, `TLBVEC` | supervisor | stage 3 (§11.3) |
+| 0x35–0x37 | `TLB_PTB`, `TLB_WALK`, `TLB_WCNT` | supervisor | the hardware TLB walker (§11.8); ILLEGAL where it is not built |
 
 `STATUS` is readable in user mode so that code like Zephyr's
 `arch_is_user_context()` can test the mode without a syscall. `TP` serves
@@ -470,6 +471,7 @@ bitstream.
 | `[22]` | DCBZ (HW_PERF_PLAN.md §1; branch `perf-hw`) |
 | `[23]` | `STATUS[10]` MAL64 (HW_PERF_PLAN.md §4; branch `perf-hw`) |
 | `[24]` | `ETH_RX_SLOTS` at `0xF007_0000`: LiteEth built with 8 RX slots, software chooses 2..8 (HW_PERF_PLAN.md §3, MMIO_MAP.md Ethernet) |
+| `[25]` | the hardware TLB walker, SRs 0x35–0x37 (§11.8; branch `tlbwalk`) |
 
 If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's MMIO window reads 0, ignores writes and
 completes in the normal MMIO time (MMIO_MAP.md).
@@ -480,7 +482,9 @@ crypto configuration reads `0x001F_100D`. With the native SD controller
 (`mmu-sd`), `[21]` is also set: `0x0030_100D` lean, `0x003F_100D` full.
 With DCBZ, MAL64 and `ETH_RX_SLOTS` (`perf-hw`), `[24:22]` too: `0x01F0_100D` lean,
 `0x01FF_100D` full. With the 32-entry TLB (`tlb32`, 2026-11-11, §11.5)
-`[15:8]` = 32: **`0x01F0_200D`** lean, `0x01FF_200D` full.
+`[15:8]` = 32: **`0x01F0_200D`** lean, `0x01FF_200D` full. With the
+hardware TLB walker (`tlbwalk`, §11.8) `[25]` too: **`0x03F0_200D`** lean,
+`0x03FF_200D` full.
 
 ---
 
@@ -1081,7 +1085,8 @@ sets V = 0 in every entry.
 
 Replacement is software's choice: `TLB_INDEX` is plain software state,
 typically a round-robin counter. To invalidate a single ASID, software
-walks the entries with TLBR/TLBWI.
+walks the entries with TLBR/TLBWI. (Where the hardware walker is built,
+§11.8, its refills use their own round-robin index `TLB_WALK.RR`.)
 
 **Faults.**
 - A useg or kmap access with no matching entry raises TLB_MISS_LOAD /
@@ -1246,7 +1251,7 @@ base in EX, with the MEM replay above".
   2.68× faster than 16. Linux's refill handler already masks its
   round-robin index with 31, so no kernel change was needed. 32 entries
   met timing in the standard flow once the data CAM was shortened
-  (§11.7). No walker, no shared CAM: the only software-visible change is
+  (§11.7). No walker (until §11.8), no shared CAM: the only software-visible change is
   CPU_FEATURES[15:8] = 32 and TLB_INDEX using 5 bits (§11.3).
   *History (2026-11-09, superseded):* 16 entries. With 32 the core then
   missed timing by about 0.3 ns after every design-level fix: the stage 3
@@ -1431,6 +1436,175 @@ counts):
   (28 pages hit with no refill after warm-up). The tests read the entry
   count (`tests.TLB_N`; `VSIM_TLB_N` elaborates another), and `tlbdiff
   --k 32` refills over all 32 entries.
+
+### 11.8 Hardware TLB walker (2026-11-14, branch `tlbwalk`)
+
+**Why.** Native clang under Linux on the board spent 31–36 % of its
+executed instructions in the 32-instruction software refill handler
+(klausscpu-runtime `arch/klausscpu/mm/tlbex.S`), about 20 M refills per
+2.1 G instructions. The walker does that handler's useg path in hardware:
+no trap, no handler, no IRET.
+
+**Interface (spec v1, agreed with the runtime session; klausscc models it
+from `da7b41f`, Linux uses it from runtime `dc07cb5`, gated on
+`CPU_FEATURES[25]`).** Three SRs, supervisor only (user MFSR / MTSR is
+PRIVILEGED, as for the other TLB SRs); where the walker is not built they
+are ILLEGAL like any unknown SR:
+
+| SR | Name | Contents |
+|---|---|---|
+| `0x35` | `TLB_PTB` | `[26:3]` PA of the current useg page directory. Other bits ignored on write, read 0. |
+| `0x36` | `TLB_WALK` | `[0]` EN; `[12:8]` RR = the entry the next walker refill writes (log2 N bits; the bits above read 0). MTSR writes EN and RR together. |
+| `0x37` | `TLB_WCNT` | `[47:0]` successful walker refills (wraps at 2^48), zero-extended on read; MTSR sets it. |
+
+All three are 0 after reset and on program load. `CPU_FEATURES[25]` = 1
+(the A7 bitstream reads `0x03F0_200D`, §6.3).
+
+**Walk.** A data access or fetch that would raise TLB_MISS_LOAD / _STORE /
+_FETCH (no matching entry) walks first when `TLB_WALK.EN` = 1, `TE` = 1 and
+the missing VA is useg (VA[31] = 0). VA is exactly what `EADDR` would get:
+the data VA; the PC; the next page's start for a fetch straddling into a
+missing page; for a two-access op the faulting doubleword's address (§11.3:
+the lower doubleword's fault first).
+
+1. D = the 64-bit word at PA `TLB_PTB` + VA[30:26]·8. If D[0] = 0: fall back.
+2. T = the 64-bit word at PA (D & `0x07FF_E000`) + VA[25:16]·8. If T[4]
+   (PRESENT) = 0 or T[0] (V) = 0: fall back.
+3. entry[RR] ← {VPN = VA[31:16], G = 0, ASID = the `ASID` SR, PFN =
+   T[26:16], X/W/R/V = T[3:0]}; RR ← RR + 1 mod N; `TLB_WCNT` += 1. The
+   faulting instruction then re-executes: it hits, or takes an ordinary
+   ACCESS fault if the entry lacks the permission.
+
+Both reads are physical (never translated, never MMIO: `{5'b0, PA[26:3],
+3'b0}`, inside the 128 MiB of DDR by construction), go through the D-cache
+(coherent with the write-back cache the kernel writes PTEs through) and are
+issued only after every older store has drained (posted and queued stores
+included). A successful walk is invisible apart from the new entry, RR and
+`TLB_WCNT`: no exception, no frame, `ECAUSE` / `EADDR` / `TLB_HI` /
+`TLB_LO` / `TLB_INDEX` unchanged, no debug halt. It has `TLBWI`'s side
+effects: the fetch side's virtual copies (window, NLB, prefetch, BTIC,
+micro-ITLB) are discarded and the LR/SC reservation is cleared.
+**Fallback** is exactly the behaviour without the walker: the TLB_MISS_*
+exception with `ECAUSE`, `EADDR` and `TLB_HI` loaded and `TLBVEC` / `EVEC`
+chosen as before, or, with `EVEC` = 0, today's park (kind 2) or debug halt;
+RR and `TLB_WCNT` unchanged. A kmap VA (≥ `0xC000_0000`) always falls back;
+permission faults (ACCESS_*) never involve the walker.
+
+**Decisions where the spec was silent** (the same as the klausscc
+emulator, `doc/EMULATOR_ISA_SEMANTICS.md`):
+- The walker runs whatever `EVEC` says and whether or not a debugger is
+  attached; only the fallback follows the park / debug-halt rules.
+- A pending interrupt is taken at the boundary right after a successful
+  walk, before the faulting instruction re-executes (frame PC = that
+  instruction), or after it — either is precise. The sim counts both.
+- A debugger single step over a walked instruction re-halts at that
+  instruction (the walk itself counts as the step); the next step executes
+  it.
+- **Re-execution.** The RTL re-executes the whole instruction after a walk;
+  the emulator re-translates only the access that missed. That is the same
+  architecturally (nothing of the instruction has happened, both pages are
+  translated before either access), with one corner: if the walk's RR
+  happens to point at the entry holding the instruction's *other* page
+  (the first doubleword of a two-access op, or the first word of a
+  straddling fetch), the RTL loses that entry and walks it again (one more
+  refill, RR / `TLB_WCNT` one higher), or, if that page has no PTE (mapped
+  only by a software `TLBWI`), takes TLB_MISS on it where the emulator
+  would not. With Linux every user page has a PTE, so only the counts can
+  differ, and only in that 2-in-N coincidence.
+
+**Pipeline (as built).** The walker lives in the exception entry sequencer
+(`irq_active` / `exc_ent`), not on any hit path:
+- At WB, a TLB-miss exception op whose walk is eligible (`wb_wk`: cause
+  11–13, `EN`, `TE`, VA[31] = 0 — registers only) starts the entry as
+  before, plus `wk`. Everything the entry already does is reused: younger
+  work is gone, fetch is halted, IRQ and debug boundaries are not taken,
+  fills are not issued, and the drain condition (pipe empty, no posted /
+  queued store, no outstanding load, port idle) is the frame push's.
+- Instead of the frame push, the sequencer issues D's read on the port
+  (`irq_xc` marks it, so every port user and `bus_idle` see it), then T's
+  after a DV-low cycle (the two may share an address). Each completion
+  only registers its result (`wk_a`, `wk_t`, `wk_ph`, `wk_fin`); every
+  decision is taken the cycle after, from registers.
+- Success (`wk_fin`, one cycle): `pc` ← the EPC, `fetch_halt` ← 0,
+  `irq_active` / `exc_ent` ← 0, the reservation cleared, `tlb_discard`
+  (TLBWI's discard), and `mmu_tlb`'s refill port: the entry is written the
+  cycle after through TLBWI's (delayed) write path, whose data now comes
+  from a register set `wd_*` loaded from `TLB_HI` / `TLB_LO` / `TLB_INDEX`
+  or from the walker (so the entries keep a single write source). The next
+  lookup that can see the entries is at least two cycles later, as for
+  TLBWI. `e_copy` (TLBR's LUTRAM) is written at `wd_idx` and read at
+  `TLB_INDEX`.
+- Fallback (`wk_ph` = 3): `wk` ← 0 and the entry continues exactly as
+  before (double-fault check, frame push, `ECAUSE` / `EADDR` / `TLB_HI`,
+  `TLBVEC` / `EVEC`); with `EVEC` = 0 it parks (kind 2, `park_pc` /
+  `park_op` set at WB) or debug-halts.
+- No change to the EX CAM path, the hit pipe, `mem_h` / `mem_fq` or the ID
+  predecode (the SR legality range is a constant). New `pc` and `m_addr`
+  legs are register-selected and register-valued; `tlb_discard` gains a
+  register term.
+- **Compatibility.** With `TLB_WALK.EN` = 0, and with `TE` = 0, the core is
+  cycle-identical to master `166885e`: `diff` (40 seeds × latencies 1/3/7;
+  30 × 2/5 with IRQs; `+HIT=70`; `DEBUG_EN`; `MPU_EN`; `EXC_EN = 0`, core
+  2's shape), `socdiff` (30 seeds and 20 with a 64 B span), `socmmio`, and
+  TE = 1 with the software refill (180 `tlbdiff` programs with and without
+  IRQs, and the directed `tlb_*` tests run on both): identical retire traces
+  and cycle counts.
+
+**Cost per refill** (64 loads to distinct unmapped pages, against the same
+loop hitting one page):
+
+| Model | Walker | Software handler (tlbex.S useg path at TLBVEC) |
+|---|---|---|
+| tb_vsim, memory latency 1 / 3 / 5 | 19.9 / 23.3 / 26.9 cycles (9 / 13 / 17 of them in the walker) | 129 / 145 / 167 cycles |
+| tb_soc (real D-cache, bus, behavioural DDR) | **27.3 cycles** | **140.1 cycles** |
+
+The rest of a walk's cost is the refetch of the faulting instruction (the
+micro-ITLB refill and I-cache lookup).
+
+**Tests** (`tools/vsim`): `wk_sr` (reset values, writable bits, user
+PRIVILEGED), `wk_load_store` (SR sentinels unchanged, entries via TLBR,
+RR / WCNT), `wk_fetch` (a jump into an unmapped page, a straddle into one
+from a mapped page, a straddle with both pages unmapped, frames not
+adjacent), `wk_two_access` (LEAVERET's 2nd page; a spanning MEMGET32 with
+both pages unmapped), `wk_fallback` (EN = 0, D[0] = 0, PRESENT = 0, V = 0,
+kmap with a D / T a VA[31]-blind walker would use: today's exception state,
+RR / WCNT / the entry unchanged), `wk_fallback_fetch`, `wk_rr_wcnt` (RR
+wrap, the 48-bit wrap, a refill evicting the code page), `wk_asid`,
+`wk_uitlb_evict` (a refill overwriting the micro-ITLB's entry: 3 walks,
+which shows the discard), `wk_coherent` (PTE / directory stores still
+posted or queued at the miss; a PTE written after a fallback; latencies 1 /
+3 / 7, with and without the hit-pipe model), `wk_user` (user load / store /
+fetch; supervisor copy_to_user; a walked read-only page then ACCESS_STORE),
+`wk_irq` (a TLBINV loop with a timer IRQ whose handler is walked too; the
+TB counts IRQs taken right after a walk, `wk_irq`), `wk_evec0`, `wk_debug`
+(attached debugger, single steps). `tlbdiff --walk` runs the random user
+programs on page tables (CVP → frame 0, identity elsewhere) with an empty
+TLB and the walker on, `--absent p` leaves a fraction of PTEs absent for
+the software handler, `--span 0x80000` spreads the data over 8 pages; with
+`VSIM_TLB_N` = 2 / 4 / 8 that forces evictions. All runs equal the physical
+run, with and without IRQs. The RTL asserts (sim) that the walker runs only
+inside a drained entry, owns the port while a read is out, reads below 128
+MiB, and that a TLB miss parks as kind 2.
+
+**Build** (standard `build_fast -resynth`):
+
+| Build | Commit | Change | Tier 1 WNS / WHS | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|
+| `tlb32_b1` (master) | `a92ce08` | — | +0.019 / +0.022 | 35,718 | 24,626 | 80.5 |
+| **`tlbwalk_b1`** | **`de0694d`** | the walker | **+0.032 / +0.036** | 35,845 | 24,819 | 80.5 |
+
+- **Bitstream** `~/.cache/kbuild/tlbwalk_de0694d.bit` (md5 `7e7d16fb…`),
+  build dir `~/.cache/kbuild/tlbwalk_b1`, standard `build_fast -resynth`,
+  **tier 1 met** (no tier 2, no alternate placement), 8 min 47 s. 3,465
+  LUTs as memory, 19 DSPs; no Synth 8-4767. CPU_FEATURES `0x03F0_200D`.
+  Not yet run on the board.
+- The walker costs +127 LUTs and +193 FFs placed (post-synthesis +292 /
+  +173: 33,575 / 21,879 against 33,283 / 21,706). BRAM unchanged (a
+  synth-only check ran first, as for every change that touches a memory's
+  write port; `e_copy` stays LUTRAM with its new write address).
+- The worst paths are the long-standing families: `m_addr` →
+  bus_splitter's READY → `pos` (+0.032) and the shifter → `ex_b_zero`
+  (+0.034). Nothing in the worst 30 goes through the walker.
 
 ---
 

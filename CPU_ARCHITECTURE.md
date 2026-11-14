@@ -649,6 +649,9 @@ gate loads / stores / fetches in both modes. TLB entries map DDR only, so
 | `0x32` | `TLB_INDEX` | `[4:0]` index (log2 N bits; with 16 entries `[4]` is ignored and reads 0); `[31]` P = the last TLBP missed |
 | `0x33` | `ASID` | `[7:0]` |
 | `0x34` | `TLBVEC` | vector for TLB_MISS_*; 0 = use `EVEC` |
+| `0x35` | `TLB_PTB` | hardware walker (`CPU_FEATURES[25]`): `[26:3]` PA of the useg page directory |
+| `0x36` | `TLB_WALK` | walker: `[0]` EN, `[12:8]` RR (log2 N bits) = the entry its next refill writes |
+| `0x37` | `TLB_WCNT` | walker: `[47:0]` successful refills (MTSR sets it) |
 
 Instructions (privileged, serializing): `TLBWI` (entry[INDEX] ← HI/LO),
 `TLBR` (HI/LO ← entry[INDEX]), `TLBP` (search for HI's VPN/ASID: INDEX
@@ -674,6 +677,19 @@ micro-ITLB) and clear the LR/SC reservation; the caches are physically
 tagged and stay. Code written through a different mapping than it runs
 from (a kernel writing user text through kseg) needs ICACHE_INV.
 Debugger memory accesses and watchpoints use physical addresses.
+
+**Hardware walker** (`CPU_FEATURES[25]`, MMU_PLAN.md §11.8). With
+`TLB_WALK.EN` = 1 and TE = 1, a useg access (VA[31] = 0) that would raise
+TLB_MISS_* first walks a two-level table in physical memory: D = mem64[
+`TLB_PTB` + VA[30:26]·8]; if D[0], T = mem64[(D & `0x07FF_E000`) +
+VA[25:16]·8]; if T[4] (PRESENT) and T[0] (V), entry[RR] ← {VPN = VA[31:16],
+G = 0, `ASID`, PFN = T[26:16], X/W/R/V = T[3:0]}, RR += 1, `TLB_WCNT` += 1,
+and the instruction re-executes. Nothing else is visible (no exception, no
+SR change but RR / WCNT; the TLBWI side effects: fetch-side discard, the
+reservation cleared). Otherwise (EN = 0, kmap, D[0] = 0, T[4] = 0, T[0] =
+0) the miss is the ordinary TLB_MISS exception. The reads go through the
+D-cache after every older store. About 27 cycles per refill, against ~140
+for the software handler.
 
 Implementation (MMU_PLAN.md §11.4): the I-cache and D-cache are VIPT (64
 KiB pages keep every index bit untranslated). Data accesses are

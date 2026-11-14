@@ -863,13 +863,15 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[22]` | DCBZ (HW_PERF_PLAN.md §1; `CNT_ZERO_LINES` at `0xF005_0070`) |
 | `[23]` | `STATUS[10]` MAL64, the opt-in misaligned 64-bit trap (HW_PERF_PLAN.md §4) |
 | `[24]` | `ETH_RX_SLOTS` (`0xF007_0000`): up to 8 LiteEth RX slots, see the Ethernet section |
+| `[25]` | the hardware TLB walker (SRs `TLB_PTB` / `TLB_WALK` / `TLB_WCNT`, MMU_PLAN.md §11.8) |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
 `0x001F_100D`. With the native SD controller (branch `mmu-sd`) `[21]` is set
 too: `0x0030_100D` lean, `0x003F_100D` full; with DCBZ, MAL64 and `ETH_RX_SLOTS` (branch
 `perf-hw`, `[24:22]`) `0x01F0_100D` lean, `0x01FF_100D` full; with the 32-entry
-TLB (branch `tlb32`, `[15:8]` = 32) **`0x01F0_200D`** lean, `0x01FF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+TLB (branch `tlb32`, `[15:8]` = 32) `0x01F0_200D` lean, `0x01FF_200D` full; with the
+hardware TLB walker (branch `tlbwalk`, `[25]`) **`0x03F0_200D`** lean, `0x03FF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
