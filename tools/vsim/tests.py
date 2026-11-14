@@ -4141,7 +4141,9 @@ def ic32_snoop_half():
         _ic_pad(a, G)
         a.label('G')
         a.inc(7); a.inc(7); a.inc(7); a.ret()
-        miss = _ic_lines(0x20, main_end) + (2 if IC32 else 1)
+        # (16 B lines: G's half and the run-ahead fill of the next half,
+        # which the data store's snoop drops instead of G)
+        miss = _ic_lines(0x20, main_end) + 2
         out.append((a, {'end': 'park', 'kind': '0', 'r7': 9, 'r6': 0x5A, 'ic_miss': str(miss)},
                     [f'+LAT={lat}', f'+LDLY={ld}']))
     return out
@@ -4394,8 +4396,11 @@ def ic32_loop48k():
         # exit (the HALT's line, fetched once)
         seq = list(range(0x20, lo, IC_LB)) + \
               [v for _ in range(passes) for v in range(lo - lo % IC_LB, x, IC_LB)] + [x]
+        n = _ic_dm_misses(seq)
+        # (16 B lines: per-dword valid — the exit's dword can be missing
+        # from a line an odd fill brought in: one miss more)
         out.append((a, {'end': 'park', 'kind': '0', 'r2': passes, 'r1': 0,
-                        'ic_miss': str(_ic_dm_misses(seq))}, ['+LAT=2']))
+                        'ic_miss': str(n) if IC32 else (n, n + 1)}, ['+LAT=2']))
     return out
 
 
