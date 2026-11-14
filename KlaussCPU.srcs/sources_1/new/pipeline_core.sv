@@ -162,6 +162,9 @@ module pipeline_core
    // shared-port fill (event)  [1] fill in flight (cycle) — splits IF_MISS
    // into I-cache refill vs window bubbles
    output logic [1:0]   perf_ic,
+   // micro-ITLB refills (event; HW_PERF_PLAN §5: perf_ic[0] no longer counts
+   // their cycles)
+   output logic         perf_itlb,
    // park (drained stop)
    output logic         parked,
    output logic [2:0]   park_kind,   // 0=HALT 1=TRAP 2=ILLEGAL 3=WAIT 4=debug 5=MISALIGNED
@@ -2898,11 +2901,13 @@ module pipeline_core
    assign perf_br_taken = ex_bcvt_t[0];   // = exo_taken whenever perf_br (a JMP)
    assign perf_fbr_taken = fbr_tk ||      // MEM ops always commit: counted when taken
                            r_perf_fbr_ex; // 2b-lite: EX-resolved (registered)
-   // (mirrors the if_look miss-issue condition in the fill engine)
-   assign perf_ic[0] = !if_xc && if_look && ic_rd_current && !ic_hit &&
-                       !mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld &&
-                       !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted)) && !(IC32 && (lp_v || li_q));
+   // [0] (HW_PERF_PLAN §5) a demand fill that puts a read on the port,
+   // registered at its issue (was a mirror of the issue condition, which
+   // also counted every micro-ITLB refill cycle with TE = 1, and fake fills)
+   logic r_perf_icm = 1'b0, r_perf_itlb = 1'b0;
+   assign perf_ic[0] = r_perf_icm;
    assign perf_ic[1] = if_xc;
+   assign perf_itlb  = r_perf_itlb;
 
    // ================= M12 Stage D: into-MEM 2-cycle shifter ==================
    // The 64-bit barrel LEAVES the EX cluster (exo_result's U_SHIFT leg is a
@@ -3848,6 +3853,8 @@ module pipeline_core
          // ic_tag BRAM -> tag compare -> 170-fanout enable path.)
          // (§5: and while a completed fill's line is still to come, lp_v —
          // they hold its address for the install; no fill issues meanwhile)
+         r_perf_icm  <= 1'b0;                 // (perf_ic[0]: set by the issue below)
+         r_perf_itlb <= EN_TLB && it_ref && !tlb_psel;   // a micro-ITLB refill (ut_refill)
          if (!if_xc && !(IC32 && lp_v)) begin
             if_req_dw <= miss_dw;             // old base+data captured together
             r_ifq_p1  <= miss_dw + 29'd1;     // M12: for the fill pos update
@@ -3976,6 +3983,7 @@ module pipeline_core
                   // ACCESS_FETCH.  (Steers only these D inputs: off the
                   // ic_hit serve chain.)
                   m_read_DV <= !(w_ufz || (EN_TLB && te && !r_look_ok));
+                  r_perf_icm <= !(w_ufz || (EN_TLB && te && !r_look_ok));
                   rdy_armed <= !m_ready;
                   // (if_req_dw, r_ifq_p1, if_tghi, if_fflt, if_fmiss,
                   // if_fake, if_rebase: loaded on every cycle without a fill

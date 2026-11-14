@@ -463,6 +463,7 @@ module KlaussCPU #(
    logic [47:0] r_perf_mem_wait;       // 0xE8 MEM port wait cycles
    logic [47:0] r_perf_ic_miss;        // 0xF0 I-cache miss fills (events)
    logic [47:0] r_perf_ic_fill;        // 0xF8 I-cache fill-in-flight cycles
+   logic [47:0] r_perf_itlb;           // 0x110 micro-ITLB refills (events; HW_PERF_PLAN §5)
    // Bus-wedge flight recorder (0xF00D_0100/0108, RO; cleared by PERF_CTRL
    // bit 0 like the counters, so a snapshot SURVIVES a program reload). If a
    // CPU bus transaction holds its DV for 2^20 cycles (~10.5 ms — no legal
@@ -691,6 +692,7 @@ module KlaussCPU #(
    wire         pip_perf_id_empty;
    wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
    wire [1:0]   pip_perf_ic;
+   wire         pip_perf_itlb;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
    // "MMIO store wins" ordering is preserved inside pipeline_core.
    wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
@@ -767,6 +769,7 @@ module KlaussCPU #(
       .perf_br_taken (pip_perf_br_taken),
       .perf_fbr_taken (pip_perf_fbr_taken),
       .perf_ic    (pip_perf_ic),
+      .perf_itlb  (pip_perf_itlb),
       .ret_valid  (pip_ret_valid),
       .ret_pc     (pip_ret_pc),
       .ret_op     (pip_ret_op),
@@ -1334,6 +1337,7 @@ module KlaussCPU #(
                // bus-wedge flight recorder (bit map at the r_wedge_* decl)
                16'h0100: r_mmio_read_data_comb = r_wedge_snap0;
                16'h0108: r_mmio_read_data_comb = r_wedge_snap1;
+               16'h0110: r_mmio_read_data_comb = {16'b0, r_perf_itlb};   // PERF_ITLB_REFILL
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -2768,7 +2772,7 @@ rams_sp_nc rams_sp_nc1 (
          r_perf_stall_flags <= 48'd0; r_perf_stall_sp <= 48'd0;
          r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
          r_perf_if_miss <= 48'd0;     r_perf_mem_wait <= 48'd0;
-         r_perf_ic_miss <= 48'd0;     r_perf_ic_fill  <= 48'd0;
+         r_perf_ic_miss <= 48'd0;     r_perf_ic_fill  <= 48'd0;     r_perf_itlb <= 48'd0;
       end else begin
          // M6 pipeline hazard attribution
          if (w_perf_st[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
@@ -2781,6 +2785,7 @@ rams_sp_nc rams_sp_nc1 (
          if (w_perf_st[7]) r_perf_mem_wait      <= r_perf_mem_wait      + 48'd1;
          if (pip_perf_ic[0])    r_perf_ic_miss       <= r_perf_ic_miss       + 48'd1;
          if (pip_perf_ic[1])    r_perf_ic_fill       <= r_perf_ic_fill       + 48'd1;
+         if (pip_perf_itlb)     r_perf_itlb          <= r_perf_itlb          + 48'd1;
          // EX-resolved conditional jumps + MEM-resolved fused branches (v3 B);
          // both can land on the same cycle.
          if (r_perf_br_tk || r_perf_fbr_tk)

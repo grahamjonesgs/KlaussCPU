@@ -476,11 +476,12 @@ run, read.
 | 0x00D8 | `PERF_BRANCH_FLUSH`     | R  | 48    | Pipeline: taken-redirect EVENTS (each costs ~2 fetch bubbles). |
 | 0x00E0 | `PERF_IF_MISS`          | R  | 48    | Pipeline: fetch-window miss cycles (IF engine filling; nothing to dispatch). |
 | 0x00E8 | `PERF_MEM_WAIT`         | R  | 48    | Pipeline: MEM-port wait cycles (loads/stores/stack in flight; front frozen). |
-| 0x00F0 | `PERF_IC_MISS`          | R  | 48    | Pipeline: I-cache demand misses that issue a shared-port fill (EVENTS). |
+| 0x00F0 | `PERF_IC_MISS`          | R  | 48    | Pipeline: I-cache demand misses that put a fill on the port (EVENTS). Since HW_PERF_PLAN.md §5 (branch `icache`) exactly those: earlier bitstreams also counted each cycle of a micro-ITLB refill with `STATUS.TE` = 1 (about 3 per micro-ITLB miss) and fake fills (refused pages), so roughly half of a TE = 1 count was micro-ITLB cycles. |
 | 0x00F8 | `PERF_IC_FILL_CYC`      | R  | 48    | Pipeline: cycles with an I-cache fill in flight. `PERF_IF_MISS` minus these is the window-bubble / lookup part. |
 | **Bus-wedge flight recorder** | | | | |
 | 0x0100 | `WEDGE_SNAP0`           | R  | 64    | Latched ONCE when a CPU bus DV has been held 2^20 cycles (~10.5 ms — no legal transaction is that long): `[31:0]` stuck address, `[39:32]` reserved, `[40]` read_DV, `[41]` write_DV, `[42]` cpu ready, `[43]` mmio read strobe, `[44]` mmio read dv delayed, `[45]` mmio ready, `[46]` eth ready, `[47]` dram ready, `[48]` pipe owns bus, `[49]` timer pending, `[50]` irq_ready, `[51]` mem_busy, `[52]` if_miss, `[53]` pip_bus_idle, `[63]` snapshot valid. Survives program reloads (cleared by `PERF_CTRL[0]` only) — reload `perf/m5a/wedge_dump.kla` after a hang and decode with `perf/m5a/decode_wedge.py`. Diagnosed the Zephyr `irq_lock` MMIO ready-edge deadlock. |
 | 0x0108 | `WEDGE_SNAP1`           | R  | 64    | Companion context: `[31:0]` PERF_CYCLES at latch, `[35:32]` int_mask, `[36]` irq_src0 (timer), `[37]` irq_src1 (blitter), `[63:38]` timer counter [25:0]. |
+| 0x0110 | `PERF_ITLB_REFILL`      | R  | 48    | Pipeline: micro-ITLB refills from the main TLB's fetch port (EVENTS; `STATUS.TE` = 1 only). Each holds the fetch lookup a few cycles. HW_PERF_PLAN.md §5; reads 0 on older bitstreams. |
 
 **Mix invariant.** Each retired instruction is classified into exactly one of
 the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or

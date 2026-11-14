@@ -38,6 +38,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic         m_next_valid = 1'b0, m_ready = 1'b0;
    logic [255:0] m_line = '0;       // HW_PERF_PLAN §5: the 32 B line answer
    logic         m_line_v = 1'b0;
+   logic         perf_itlb;         // micro-ITLB refills (event)
+   longint       n_itlb = 0;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
    logic [7:0]   perf_stall;
    logic         perf_br, perf_br_taken, perf_fbr_taken;
@@ -105,7 +107,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
       .m_rdata_next, .m_next_valid, .m_ready,
 `ifdef HAS_ICLB
-      .m_line, .m_line_v,
+      .m_line, .m_line_v, .perf_itlb,
 `endif
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
       .irq_ready, .irq_sel, .irq_vector, .irq_ack, .irq_ack_sel, .int_mask_o,
@@ -429,6 +431,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (perf_ic[0]) n_ic_miss++;
       if (perf_ic[1]) n_ic_fill++;
 `endif
+`ifdef HAS_ICLB
+      if (perf_itlb) n_itlb++;
+`endif
    end
 
    always @(negedge clk) begin
@@ -480,7 +485,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
 `ifdef HAS_ICLB
-      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line);
+      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb);
 `endif
 `ifdef HAS_WALK
       $fdisplay(f, "wk_s=%0d wk_n=%0d wk_cyc=%0d wk_irq=%0d", wk_s, wk_n, wk_cyc, wk_irq);
