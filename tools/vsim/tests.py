@@ -4404,6 +4404,97 @@ def ic32_loop48k():
     return out
 
 
+# ============ HW_PERF_PLAN §5: the 4-entry micro-ITLB (tagged by TLB index)
+UT_N = 4
+
+
+@test
+def ut_pingpong():
+    """TE = 1: calls round-robin through k code pages (TLBWI-mapped, frames
+    not adjacent) ten times.  With k + 1 pages (main's included) <= 4 the
+    micro-ITLB refills once per page and never after warm-up; with 5 it
+    thrashes (round-robin), with the right code every time"""
+    out = []
+    if NOEXC:
+        return out
+    for k in (1, 2, 3, 4):
+        vas = [0x00500100 + 0x10000 * j for j in range(k)]
+        frs = [0x2 + 2 * j for j in range(k)]
+
+        def setup(a, vas=vas, frs=frs):
+            for j, (va, fr) in enumerate(zip(vas, frs)):
+                _tlb_set(a, 2 + j, va >> 16, fr, TLB_V | TLB_X)
+
+        def body(a, vas=vas):
+            a.setr(3, 0); a.setr(11, 10)
+            a.label('it')
+            for j, va in enumerate(vas):
+                a.setr(9, va); a.leapc(10, f'r{j}'); a.jmpr(9)
+                a.label(f'r{j}')
+            a.addi_s(11, 11, -1)
+            a.fbr('ne', 11, 0, 'it', imm=True)
+        exp = {'r3': 10 * sum(1 << j for j in range(k))}
+        if k + 1 <= UT_N:
+            exp['itlb_ref'] = str(k + 1)        # page 0 (after TE on) + each code page once
+        else:
+            exp['itlb_ref'] = (10 * (k + 1) - 5, 10 ** 6)
+        a, e, p = _te_prog(body, False, exp, setup=setup)
+        for j, (va, fr) in enumerate(zip(vas, frs)):
+            _place(a, (fr << 16) | (va & 0xFFFF), lambda s, j=j: (s.addi_s(3, 3, 1 << j), s.jmpr(10)))
+        out.append((a, e, p))
+    return out
+
+
+@test
+def ut_walk_evict():
+    """the walker refills code pages A, B (TLB entries 8, 9) and the micro-
+    ITLB holds them; a walk of an unrelated data page (entry 10) and a TLBWI
+    to an unrelated entry drop neither (no refill: the ping-pong goes on);
+    a walk that overwrites A's entry 8 drops only A's micro-ITLB entry: A is
+    walked again (to entry 12), B is not refilled; a TLBWI that remaps B's
+    entry takes effect on B's next fetch"""
+    out = []
+    if NOEXC or NOWALK:
+        return out
+    A, B = 0x00600100, 0x00610100
+    D1, D2 = 0x01000000, 0x01010000
+    ptes = {A >> 16: _wk_pte(5, TLB_V | TLB_X), B >> 16: _wk_pte(6, TLB_V | TLB_X),
+            D1 >> 16: _wk_pte(7, TLB_V | TLB_R), D2 >> 16: _wk_pte(8, TLB_V | TLB_R)}
+
+    def pp(a, tag, n=3):
+        a.setr(11, n)
+        a.label(tag)
+        a.setr(9, A); a.leapc(10, tag + 'a'); a.jmpr(9); a.label(tag + 'a')
+        a.setr(9, B); a.leapc(10, tag + 'b'); a.jmpr(9); a.label(tag + 'b')
+        a.addi_s(11, 11, -1)
+        a.fbr('ne', 11, 0, tag, imm=True)
+
+    def body(a):
+        a.setr(3, 0)
+        pp(a, 'w0')                                      # walks A -> 8, B -> 9
+        a.setr(1, D1); a.ld(64, 4, 1)                    # walk -> 10
+        _tlb_set(a, 20, 0x0123, 0x009, TLB_V | TLB_R)    # TLBWI to an unrelated entry
+        pp(a, 'w1')
+        a.setr(1, (8 << 8) | 1); a.mtsr('tlb_walk', 1)   # RR = 8: A's entry
+        a.setr(1, D2); a.ld(64, 5, 1)                    # walk -> 8 (A's gone)
+        a.setr(1, (12 << 8) | 1); a.mtsr('tlb_walk', 1)  # RR = 12
+        pp(a, 'w2')                                      # A walked again -> 12
+        _tlb_set(a, 9, B >> 16, 0xB, TLB_V | TLB_X)      # B's entry -> frame 0xB
+        pp(a, 'w3', 1)
+    # r3: A adds 1, B adds 0x10 (frame 6) / 0x100 (frame 0xB)
+    exp = {'r3': 9 * 0x11 + 1 + 0x100, 'wk_n': '5',
+           # page 0 after TE on; A, B (each: refill = TLB miss, then the
+           # walk's refill); after the D1 walk / TLBWI 20: none; after the
+           # D2 walk: A (miss + refill after its walk) only; B's remap: 1
+           'itlb_ref': str(1 + 2 + 2 + 2 + 1)}
+    a, e, p = _wk_prog(body, ptes, exp)
+    _place(a, 0x50100, lambda s: (s.addi_s(3, 3, 1), s.jmpr(10)))
+    _place(a, 0x60100, lambda s: (s.alui_s('add', 3, 3, 0x10), s.jmpr(10)))
+    _place(a, 0xB0100, lambda s: (s.setr(7, 0x100), s.alu('add', 3, 3, 7), s.jmpr(10)))
+    out.append((a, e, p))
+    return out
+
+
 # ================================ MMU_PLAN §11.8: the hardware TLB walker
 # Page tables (the Linux format, arch/klausscpu tlbex.S): TLB_PTB -> 32
 # directory dwords (VA[30:26]); D[0] = present, D & 0x07FF_E000 = an 8 KiB

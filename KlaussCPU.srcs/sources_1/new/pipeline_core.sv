@@ -475,7 +475,7 @@ module pipeline_core
    assign tlb_d_hit = tlb_d_c15 ? tlb_d_hit1 : tlb_d_hit0;
    assign tlb_d_pfn = tlb_d_c15 ? tlb_d_pfn1 : tlb_d_pfn0;
    assign tlb_d_pok = tlb_d_c15 ? tlb_d_pok1 : tlb_d_pok0;
-   logic        mtsr_commit, tlbi_commit, tlb_discard, sr_ent_we;   // (assigned at the end)
+   logic        mtsr_commit, tlbi_commit, tlb_discard, tlb_wsel, sr_ent_we;   // (assigned at the end)
    wire         tlb_psel;        // a TLBP in MEM or WB: the fetch port is the probe's
    wire         tlb_pload;       // a TLBP in MEM: load its key into it_vpn / it_asid
    logic [15:0] tlb_hi_vpn_o;
@@ -825,15 +825,33 @@ module pipeline_core
    // MMU stage 3 (TE = 1): VIPT.  The index (VA[13:4] at 16 KiB) is
    // untranslated; the tag is PA[31:14] = {PA[31:16], VA[15:14]} (in
    // general {PA[31:16], VA[15:IC_IDXW+4]}: the index stays inside the
-   // 64 KiB page, so those VA bits are PA bits).  A one-entry micro-ITLB
-   // (ut_*) holds one page's translation and fetch verdict (for the fetch
+   // 64 KiB page, so those VA bits are PA bits).  A micro-ITLB (ut_*)
+   // holds UT_N pages' translations and fetch verdicts (each for a fetch
    // mode ut_um); it is read alongside the BRAM, into r_look_*, so the tag
    // compare reads registers only.  A lookup whose page it does not cover
-   // stalls while it_ref refills it from the main TLB's fetch port (one
-   // cycle); a refused page is served as a fake fill with a fault tag, so
-   // no untranslated or faulting address ever reaches the port.
-   logic        ut_v, ut_um, ut_ok, ut_miss;
-   logic [15:0] ut_vpn, ut_pa;
+   // stalls while it_ref refills an entry from the main TLB's fetch port
+   // (one cycle; the entry already holding that page and mode, else an
+   // empty one, else round-robin); a refused page is served as a fake fill
+   // with a fault tag, so no untranslated or faulting address ever reaches
+   // the port.
+   // HW_PERF_PLAN §5 (was one entry, emptied by every TLB write): an entry
+   // filled from a main-TLB hit carries that entry's index (ut_ti); a TLBWI
+   // or a walker refill writing index i drops only the entries tagged i,
+   // and the negative ones (ut_neg: a useg / kmap page the TLB did not
+   // hold — a write may now map it).  kseg / MMIO / segment-fault verdicts
+   // do not depend on the TLB.  TLBINV, MTSR ASID / STATUS, program load and
+   // debugger resume drop them all.  So no entry ever holds a translation
+   // the main TLB no longer holds.
+   localparam int UT_N = 4;
+   localparam int UT_W = $clog2(UT_N);
+   logic [UT_N-1:0] ut_v, ut_um, ut_ok, ut_miss, ut_tl, ut_neg;
+   logic [15:0]     ut_vpn [0:UT_N-1];
+   logic [15:0]     ut_pa  [0:UT_N-1];
+   logic [4:0]      ut_ti  [0:UT_N-1];
+   logic [UT_W-1:0] ut_rp;            // the next entry to refill
+   logic            ut_q = 1'b0;      // a refill landed on the last edge
+   logic [4:0]      tlb_f_idx;        // the fetch port's matching entry (mmu_tlb)
+   logic [4:0]      tlb_w_idx;        // the entry a TLBWI / walk writes (mmu_tlb, at its discard)
    logic        it_ref;
    logic [15:0] it_vpn;
    logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
@@ -876,10 +894,20 @@ module pipeline_core
       if (EN_TLB) begin
          r_look_vpn  <= look_vpn;
          r_look_um   <= fe_um;
-         r_look_hit  <= ut_v && ut_vpn == look_vpn && ut_um == fe_um;
-         r_look_pa   <= ut_pa;
-         r_look_ok   <= ut_ok;
-         r_look_miss <= ut_miss;
+         // (at most one entry matches: a refill reuses the matching one)
+         begin : ut_look
+            logic [UT_N-1:0] mk;
+            logic [15:0]     pa;
+            pa = '0;
+            for (int k = 0; k < UT_N; k++) begin
+               mk[k] = ut_v[k] && ut_vpn[k] == look_vpn && ut_um[k] == fe_um;
+               pa |= mk[k] ? ut_pa[k] : 16'h0;
+            end
+            r_look_hit  <= |mk;
+            r_look_pa   <= pa;
+            r_look_ok   <= |(mk & ut_ok);
+            r_look_miss <= |(mk & ut_miss);
+         end
       end
    end
    // hit once the registered read has caught up to the (stable, stalled) miss_dw
@@ -3172,7 +3200,9 @@ module pipeline_core
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0; wb_rfch <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
-         ut_v <= 1'b0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_vpn <= '0; ut_pa <= '0; ut_um <= 1'b0; ut_ok <= 1'b0; ut_miss <= 1'b0;
+         ut_v <= '0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_um <= '0; ut_ok <= '0; ut_miss <= '0; ut_rp <= '0;
+         ut_tl <= '0; ut_neg <= '0;
+         for (int k = 0; k < UT_N; k++) begin ut_vpn[k] <= '0; ut_pa[k] <= '0; ut_ti[k] <= '0; end
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
          ex_mok <= 1'b0; ex_txpg <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
@@ -3236,7 +3266,7 @@ module pipeline_core
             ifb_val <= 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
-            ut_v <= 1'b0;  it_ref <= 1'b0;    // (stage 3: the micro-ITLB)
+            ut_v <= '0;  it_ref <= 1'b0;      // (stage 3: the micro-ITLB)
             // invalidate-all: a fresh program image may reuse code addresses
             ic_lv <= '0;
             if (DEBUG_EN) begin
@@ -3952,7 +3982,9 @@ module pipeline_core
                end else if (EN_TLB && te && !lk_cov) begin
                   // MMU stage 3: the micro-ITLB does not cover this page (in
                   // this fetch mode): refill it, then look again
-                  if (!it_ref && !tlb_psel) begin
+                  // (§5: not in the cycle after a refill — this lookup was
+                  // registered before it; it covers the page next cycle)
+                  if (!it_ref && !tlb_psel && !ut_q) begin
                      it_ref <= 1'b1;  it_vpn <= miss_dw[28:13];  it_asid <= tlb_asid;
                   end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
@@ -4650,21 +4682,37 @@ module pipeline_core
          // is for the fetch mode now (ut_um): user at 0x8000_0000+ and the
          // supervisor hole are segment faults; useg / kmap go through the
          // TLB and need X; kseg is direct; MMIO is identity.
-         if (EN_TLB && it_ref && !tlb_psel) begin : ut_refill
+         // (§5: not on a TLB write's discard edge — the port still sees the
+         // old entry and the invalidation below checks the old ut_*; the
+         // discard drops it_ref, the lookup asks again)
+         if (EN_TLB && it_ref && !tlb_psel && !tlb_discard) begin : ut_refill
             logic f_useg, f_kseg, f_kmap, f_seg, f_tlbs;
+            logic [UT_W-1:0] w;
             f_useg = !it_vpn[15];
             f_kseg = it_vpn[15:11] == 5'b10000;
             f_kmap = it_vpn[15:14] == 2'b11 && it_vpn[15:12] != 4'hF;
             f_seg  = fe_um ? it_vpn[15] : (it_vpn[15:14] == 2'b10 && !f_kseg);
             f_tlbs = f_useg || f_kmap;
-            ut_v    <= 1'b1;
-            ut_vpn  <= it_vpn;
-            ut_um   <= fe_um;
-            ut_ok   <= !f_seg && (!f_tlbs || (tlb_f_hit && tlb_f_xwr[2]));
-            ut_miss <= !f_seg && f_tlbs && !tlb_f_hit;
-            ut_pa   <= f_tlbs ? {5'b0, tlb_f_pfn} : f_kseg ? {5'b0, it_vpn[10:0]} : it_vpn;
+            // (the entry already holding this page and mode, else an empty
+            // one, else round-robin)
+            w = ut_rp;
+            for (int k = UT_N - 1; k >= 0; k--)
+               if (!ut_v[k]) w = UT_W'(k);
+            for (int k = 0; k < UT_N; k++)
+               if (ut_v[k] && ut_vpn[k] == it_vpn && ut_um[k] == fe_um) w = UT_W'(k);
+            ut_v[w]    <= 1'b1;
+            ut_vpn[w]  <= it_vpn;
+            ut_um[w]   <= fe_um;
+            ut_ok[w]   <= !f_seg && (!f_tlbs || (tlb_f_hit && tlb_f_xwr[2]));
+            ut_miss[w] <= !f_seg && f_tlbs && !tlb_f_hit;
+            ut_pa[w]   <= f_tlbs ? {5'b0, tlb_f_pfn} : f_kseg ? {5'b0, it_vpn[10:0]} : it_vpn;
+            ut_tl[w]   <= !f_seg && f_tlbs && tlb_f_hit;
+            ut_neg[w]  <= !f_seg && f_tlbs && !tlb_f_hit;
+            ut_ti[w]   <= tlb_f_idx;
+            if (w == ut_rp) ut_rp <= ut_rp + 1'b1;
             it_ref  <= 1'b0;
          end
+         ut_q <= EN_TLB && it_ref && !tlb_psel && !tlb_discard;
          // a TLBP takes the fetch port: its key (TLB_HI, final — TLBP
          // serializes) is loaded as it sits in MEM; a pending refill is
          // dropped and the lookup asks again afterwards
@@ -4674,7 +4722,14 @@ module pipeline_core
          // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
          // virtual copies (the I-cache, physically tagged, is kept)
          if (tlb_discard) begin
-            ut_v <= 1'b0;  it_ref <= 1'b0;
+            // (§5: a TLBWI / walk drops only the micro-ITLB entries of the
+            // index it writes, and the negative ones)
+            if (tlb_wsel) begin
+               for (int k = 0; k < UT_N; k++)
+                  if (ut_neg[k] || (ut_tl[k] && ut_ti[k] == tlb_w_idx)) ut_v[k] <= 1'b0;
+            end else
+               ut_v <= '0;
+            it_ref <= 1'b0;
             m_vav <= 1'b0;  sq_vav <= 1'b0;   // (STLF: their VAs may now map elsewhere)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;
@@ -4916,6 +4971,8 @@ module pipeline_core
    // LR/SC reservation (MMU_PLAN.md §11.3)
    // (§11.8: a successful walk too — it overwrote entry[RR], which the
    // micro-ITLB may hold, and the refused page may sit in the window)
+   // (§5: of these, a TLBWI and a walk write one entry, tlb_w_idx)
+   assign tlb_wsel    = EN_TLB && ((tlbi_commit && wb_op[21:16] == 6'd9) || (EN_WALK && wk_fin));
    assign tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
                                  (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)) ||
                                  (EN_WALK && wk_fin));
@@ -5026,7 +5083,7 @@ module pipeline_core
          .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_pok0 (tlb_d_pok0),
          .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_pok1 (tlb_d_pok1), .d_c15 (tlb_d_c15),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
-         .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr),
+         .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr), .f_idx (tlb_f_idx), .w_idx (tlb_w_idx),
          // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
          .wk_we    (EN_WALK && wk_fin), .wk_vpn (exc_addr_q[31:16]),
          .wk_pfn   (wk_t[14:4]), .wk_xwrv (wk_t[3:0]),
@@ -5060,6 +5117,7 @@ module pipeline_core
       assign tlb_d_hit0 = 1'b0;  assign tlb_d_pfn0 = '0;  assign tlb_d_pok0 = 1'b0;
       assign tlb_d_hit1 = 1'b0;  assign tlb_d_pfn1 = '0;  assign tlb_d_pok1 = 1'b0;  assign tlb_d_c15 = 1'b0;
       assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
+      assign tlb_f_idx = '0;  assign tlb_w_idx = '0;
       assign tlb_hi_vpn_o = '0;  assign tlb_hi_asid_o = '0;
       assign tlb_wk_en = 1'b0;  assign tlb_ptb = '0;
    end endgenerate
@@ -5455,6 +5513,8 @@ module mmu_tlb
    output logic        f_hit,
    output logic [10:0] f_pfn,
    output logic [2:0]  f_xwr,
+   output logic [4:0]  f_idx,         // (HW_PERF_PLAN §5) the matching entry (the micro-ITLB's tag)
+   output logic [4:0]  w_idx,         // the entry a TLBWI (op_wi) / walk (wk_we) writes
    // §11.8 walker: a successful walk's refill of entry[RR] (a pulse; the
    // entry is written the cycle after, as for TLBWI), RR + 1, WCNT + 1
    input  logic        wk_we,
@@ -5573,6 +5633,8 @@ module mmu_tlb
    assign d_hit0 = |dm0;
    assign d_hit1 = |dm1;
    assign f_hit = |fm;
+   assign f_idx = 5'(f_enc(fm));
+   assign w_idx = 5'((WALK && wk_we) ? rr : idx);
 
    // (timing) TLBWI / TLBINV write the entries the cycle AFTER they commit:
    // the commit waits on the bus, and its enable fanned out to every

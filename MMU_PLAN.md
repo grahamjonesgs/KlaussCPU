@@ -1216,8 +1216,16 @@ base in EX, with the MEM replay above".
   it, STLF was off with TE and every POP / LEAVE behind a PUSH / ENTER on a
   kseg stack (always VA ≠ PA) waited for the store: +5.1 % instead of
   +1.5 %.
-- **Fetch: a one-entry micro-ITLB.** {VPN, fetch mode, PA[31:16], verdict,
-  miss}. It is read alongside the I-cache BRAM into `r_look_*`, so the
+- **Fetch: a one-entry micro-ITLB.** *(Since HW_PERF_PLAN §5, branch
+  `icache`: four entries, each tagged with the main-TLB index it was filled
+  from; a TLBWI or walker refill of index i drops only the entries tagged
+  i and the negative ones (a useg / kmap page the TLB did not hold);
+  TLBINV, MTSR ASID / STATUS, program load and debugger resume drop all.
+  Refill into the entry already holding the page and mode, else an empty
+  one, else round-robin; no second refill request in the cycle after a
+  refill.  The lookup stays registers-to-registers into `r_look_*`.)*
+  {VPN, fetch mode, PA[31:16], verdict, miss}. It is read alongside the
+  I-cache BRAM into `r_look_*`, so the
   I-cache tag compare (`r_look_pa` = PA[31:16], the whole tag, against the
   stored PA tag with the 64 KiB I-cache of HW_PERF_PLAN §5; {`r_look_pa`,
   VA[15:14]} with the 16 KiB one of §2, VA[15:13] with the 8 KiB one before)

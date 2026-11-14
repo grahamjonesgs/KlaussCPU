@@ -365,6 +365,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.li_now) $display("ICDBG t=%0d inst idx=%0d pa=%08x", cyc, dut.li_idx, {dut.lp_pa, 5'b0});
       if (dut.lp_ev && dut.lp_wrh) $display("ICDBG t=%0d drop pa=%08x", cyc, {dut.lp_pa, 5'b0});
       if (dut.ic_sw && !sw_q) $display("ICDBG t=%0d sweep", cyc);
+      if (dut.it_ref && !dut.tlb_psel && !dut.tlb_discard)
+         $display("ICDBG t=%0d itlb refill vpn=%04x hit=%b idx=%0d", cyc, dut.it_vpn, dut.tlb_f_hit, dut.tlb_f_idx);
+      if (dut.tlb_discard) $display("ICDBG t=%0d tlb discard sel=%b w_idx=%0d", cyc, dut.tlb_wsel, dut.tlb_w_idx);
       if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
       if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
