@@ -2735,7 +2735,10 @@ module pipeline_core
    wire [26:0]        lp_pa   = {if_tghi, if_req_dw[12:2]};
    wire               lp_dram = if_tghi[15:12] != 4'hF;
    wire               lp_fill = IC32 && if_xc && !(EN_EXC && if_fake) && w_mrdy && lp_dram;
-   wire               lp_ev   = IC32 && ce && !rst && m_line_v && (lp_v || lp_fill);
+   // (no rst / ce here: the main block's install runs under them, and the
+   // valid bits' block covers a reset edge with a sweep — timing: the
+   // top's reset is late and this feeds the BTIC kill compare)
+   wire               lp_ev   = IC32 && m_line_v && (lp_v || lp_fill);
    wire               lp_wrh  = (m_write_DV && m_addr[31:5] == lp_pa) ||
                                 (EN_SQ && sq_v && sq_addr[31:5] == lp_pa);
    wire               li_now  = lp_ev && !lp_wrh;
@@ -2793,7 +2796,10 @@ module pipeline_core
          (* ram_style = "distributed" *) logic m [0:VB_D-1];
          initial for (int i = 0; i < VB_D; i++) m[i] = 1'b0;
          wire we = ic_sw || ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
-         always_ff @(posedge clk) if (ce && !rst && we) m[wa] <= wd;
+         // (no rst: a valid set on a reset edge — an install of a fill
+         // completing then — sets vl_any, and the reset / start sweep
+         // clears it)
+         always_ff @(posedge clk) if (ce && we) m[wa] <= wd;
          assign bl[b] = m[ic_look_li[VB_AW-1:0]];
          assign bs[b] = m[sn_pra[VB_AW-1:0]];
       end
@@ -2801,7 +2807,8 @@ module pipeline_core
       assign vl_rd_sn   = bs[sn_pra >> VB_AW];
       always_ff @(posedge clk)
          if (rst) begin
-            ic_sw <= vl_any;  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+            ic_sw <= vl_any || (vreq && !vdrop && !snoop_q);  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+            if (ce && !ic_sw && vreq && !vdrop && !snoop_q) vl_any <= 1'b1;
          end else if (ce) begin
             if (ic_sw) begin
                ic_swa <= ic_swa + 1'b1;
@@ -3203,7 +3210,10 @@ module pipeline_core
          // end of this block. Same-process sampling — no mirrors, no drift.
          ev_disp = 1'b0; ev_slide = 1'b0; ev_rebase = 1'b0;
          ev_fill = 1'b0; ev_pcz = 1'b0; ev_adv = 2'd0; ev_bp = 1'b0; ev_misal = 1'b0;
-         ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = '0;
+         // (§5: with 32 B lines the install index is li_idx whenever there
+         // is one — a register — so the BTIC kill compares start at
+         // registers and only ev_icinst is late)
+         ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = IC32 ? li_idx : '0;
          ev_mload = 1'b0;
 
          // MMU stage 1: a program load starts in supervisor mode with no
