@@ -75,6 +75,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_PERF_IC')
     if 'output logic         m_zl' in core:
         defs.append('+define+HAS_DCBZ')
+    if 'parameter bit TLB_WALK' in core and not noexc:
+        defs.append('+define+HAS_WALK')
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-O2', '-Wno-fatal', '-Wno-lint',
            '-Wno-style', '-Wno-MULTIDRIVEN', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_vsim',
            '-Mdir', os.path.join(d, 'obj'), *defs,
@@ -542,7 +544,11 @@ def cmd_mpudiff(a):
     return 1 if fails else 0
 
 
-def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
+WK_PTB = 0x300000                  # tlbdiff --walk: the directory (PA) ...
+WK_TABS = (0x302000, 0x304000)     # ... and the PTE tables for D[0] / D[1]
+
+
+def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0, walk=False, p_absent=0.0, span=0x800):
     """MMU stage 3: randprog `seed` in user mode with TE = 1, its code run
     through a non-identity VA (page CVP -> frame 0), starting from an empty
     TLB.  A kseg refill handler at TLBVEC maps CVP -> 0 and every other
@@ -552,7 +558,12 @@ def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
     its wrap.  The handler runs a TLBP first, which must miss.  With IRQs, the TB's handler at 0x0010_0000 runs translated
     in supervisor mode and is refilled the same way.  Every instruction
     runs once with its full effect, so the final state must equal the
-    plain physical run's."""
+    plain physical run's.
+
+    walk (MMU_PLAN §11.8): page tables in memory (CVP -> frame 0, every
+    other page below 0x0800_0000 to itself, a fraction p_absent of them
+    not PRESENT) and the hardware walker on; the software handler stays
+    for the walker's fallbacks (absent PTEs)."""
     import random, randprog
     from kasm import Asm
     from tests import _tlb_set, HALT_W, KSP, USP, TLB_RWX, TLB_N
@@ -574,6 +585,9 @@ def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
             self.mtsr('evec', 1); self.mtsr('tlbvec', 1)
             self.setr(1, KSP); self.setsp(1)
             _tlb_set(self, 0, 0x0000, 0x000, TLB_RWX, g=1)
+            if walk:
+                self.setr(1, WK_PTB); self.mtsr('tlb_ptb', 1)
+                self.setr(1, 1); self.mtsr('tlb_walk', 1)  # EN, RR = 0
             self.setr(1, 0x200); self.mtsr('status', 1)  # TE (through the identity entry)
             self.leapc(1, 'kz'); self.setr(2, 0x80000000); self.alu('or', 1, 1, 2); self.jmpr(1)
             self.label('kz')                                # now in kseg
@@ -595,7 +609,7 @@ def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
     old = randprog.Asm
     randprog.Asm = TlbAsm
     try:
-        asm = randprog.gen(seed, irq=irq)
+        asm = randprog.gen(seed, irq=irq, span=span)
     finally:
         randprog.Asm = old
     asm.inj = False
@@ -636,20 +650,30 @@ def _tlb_variant(seed, p_sys=0.04, irq=False, k_force=0):
     asm.label('h_ret')
     asm.mfsr(13, 'scratch0'); asm.mfsr(14, 'scratch1')
     asm.iret()
-    return asm, (K, CVP, asm.n_inj)
+    n_abs = 0
+    if walk:
+        for d, t in enumerate(WK_TABS):
+            asm.dword(WK_PTB + 8 * d, 0xA5A50000F8001FFE | t | 1)
+        for vp in range(0x800):
+            absent = rnd.random() < p_absent
+            n_abs += absent
+            pte = 0x5A5A0000F800FFE0 | ((0 if vp == CVP else vp) << 16) | (0 if absent else 0x10) | TLB_RWX
+            asm.dword(WK_TABS[vp >> 10] + 8 * (vp & 0x3FF), pte)
+    return asm, (K, CVP, asm.n_inj) + ((n_abs,) if walk else ())
 
 
 def cmd_tlbdiff(a):
     import randprog
     exe = build(None)
-    fails = n_exc = 0
+    fails = n_exc = n_wk = 0
     for s in range(a.seed0, a.seed0 + a.seeds):
         for lat in a.lats:
             plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
-            sa, _ = run(exe, randprog.gen(s, irq=a.irq), f'ta{s}_{lat}', plus)
-            asm, info = _tlb_variant(s, irq=a.irq, k_force=a.k)
+            sa, _ = run(exe, randprog.gen(s, irq=a.irq, span=a.span), f'ta{s}_{lat}', plus)
+            asm, info = _tlb_variant(s, irq=a.irq, k_force=a.k, walk=a.walk, p_absent=a.absent, span=a.span)
             sb, _ = run(exe, asm, f'tb{s}_{lat}', plus)
             n_exc += int(sb.get('exc_n', 0))
+            n_wk += int(sb.get('wk_n', 0))
             keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
                    sorted({k for k in list(sa) + list(sb) if re.fullmatch(r'm[0-9a-f]{8}', k) and k != 'm00180000'})
             bad = [k for k in keys if sa.get(k) != sb.get(k)]
@@ -659,10 +683,11 @@ def cmd_tlbdiff(a):
             if not ok:
                 fails += 1
             if not ok or a.verbose:
-                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} K,CVP,sys={info} exc={sb.get("exc_n")} '
+                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} K,CVP,sys[,absent]={info} '
+                      f'exc={sb.get("exc_n")} walks={sb.get("wk_n")}/{sb.get("wk_s")} '
                       f'cycles {sa.get("cycles")}/{sb.get("cycles")} end {sa.get("end")}/{sb.get("end")} '
                       f'kind {sb.get("kind")} {bad[:4]}')
-    print(f'{fails} differing; {n_exc} exception entries')
+    print(f'{fails} differing; {n_exc} exception entries; {n_wk} walker refills')
     return 1 if fails else 0
 
 
@@ -681,14 +706,14 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x01F0_100D = stage 1
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x03F0_200D = stage 1
     # + LR/SC + the 32-entry TLB, no MPU, lean crypto (TRNG only), native SD,
-    # DCBZ, STATUS.MAL64, ETH_RX_SLOTS: the A7
+    # DCBZ, STATUS.MAL64, ETH_RX_SLOTS, the TLB walker ([25]): the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=0000000001f0200d' not in last:
+    if 'r2=0000000003f0200d' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -1105,6 +1130,10 @@ def main():
     tl.add_argument('--irq', action='store_true'); tl.add_argument('-v', '--verbose', action='store_true')
     tl.add_argument('--plus', nargs='*', default=[])
     tl.add_argument('--k', type=int, default=0, help='refill over K entries (a power of two <= TLB_N; default: random 2/4/16)')
+    tl.add_argument('--walk', action='store_true', help='page tables + the hardware walker (MMU_PLAN §11.8)')
+    tl.add_argument('--absent', type=float, default=0.0, help='--walk: fraction of PTEs not PRESENT (software refill)')
+    tl.add_argument('--span', type=lambda v: int(v, 0), default=0x800,
+                    help='data footprint (e.g. 0x80000: 8 pages, for evictions with a small VSIM_TLB_N)')
     tp = sub.add_parser('tlbpage'); tp.add_argument('--seeds', type=int, default=30)
     tp.add_argument('--seed0', type=int, default=1); tp.add_argument('--lats', type=int, nargs='+', default=[3])
     tp.add_argument('--irq', action='store_true'); tp.add_argument('--hit', type=int)

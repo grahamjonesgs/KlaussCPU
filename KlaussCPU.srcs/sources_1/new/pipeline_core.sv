@@ -54,6 +54,10 @@ module pipeline_core
    // its entry count (a power of two, 2-32): 32 on the xc7a100t (MMU_PLAN.md
    // §11.5, 2026-11-11); TLB_INDEX uses the low $clog2(TLB_N) bits
    parameter int TLB_N = 32,
+   // MMU_PLAN.md §11.8: the hardware page-table walker (TLB_PTB / TLB_WALK
+   // / TLB_WCNT, SRs 0x35-0x37; needs TLB_EN).  0 = those SRs are illegal
+   // and a TLB miss always raises TLB_MISS_* (core 2: off, with the TLB).
+   parameter bit TLB_WALK = 1'b1,
    // HW_PERF_PLAN.md §1: DCBZ (zero a D-cache line without fetching it;
    // needs EXC_EN and a cache that serves m_zl).  0 = its encoding is
    // ILLEGAL (core 2: no D-cache) and m_zl stays 0.
@@ -326,6 +330,7 @@ module pipeline_core
    localparam bit EN_EXC = EXC_EN;
    localparam bit EN_MPU = EXC_EN && MPU_EN;   // MMU stage 2 (MPU)
    localparam bit EN_TLB = EXC_EN && TLB_EN;   // MMU stage 3 (TLB, TE)
+   localparam bit EN_WALK = EN_TLB && TLB_WALK; // MMU_PLAN.md §11.8 walker
    // HW_PERF_PLAN.md §1: DCBZ [rs1] (0x5F00_2000 | rs1 << 4) — a U_STORE
    // with .zl: the EA is aligned down to the line, the data is 0 with byte
    // enables FF, and every store-tracking compare (STLF / hit-pipe block,
@@ -435,7 +440,7 @@ module pipeline_core
    logic        mal64;           // STATUS[10] (HW_PERF_PLAN.md §4)
    logic [7:0]  tlb_asid;
    logic [31:0] tlb_vec;         // TLBVEC
-   logic [31:0] tlb_rdata;       // MFSR of a TLB SR
+   logic [63:0] tlb_rdata;       // MFSR of a TLB SR (TLB_WCNT: 48 bits)
    logic        tlb_hi_load;     // exception entry: TLB_HI <- {VPN(EADDR), 0, ASID}
    logic [15:0] tlb_hi_vpn;
    logic [15:0] tlb_d_vpn, tlb_f_vpn;   // lookup ports: data / fetch (+ TLBP)
@@ -459,6 +464,20 @@ module pipeline_core
    logic [31:0] exc_vec_q;       // (stage 3, timing) the vector, chosen as the exception is latched
    logic        exc_guard_q;     // ECAUSE[8]
    logic        exc_tlb_q;       // (stage 3) TLB-related: TLB_HI auto-load
+   // MMU_PLAN.md §11.8 hardware walker.  It runs inside the exception entry
+   // sequencer (irq_active / exc_ent set, so fetch, dispatch, IRQs and
+   // fills are held exactly as for an entry): wk = this entry is a walk
+   // attempt; wk_ph 0 = read the directory entry D, 1 = read the PTE T,
+   // 3 = fall back to the entry (or the park) it replaced; wk_fin = the
+   // one-cycle success step (TLB write, discard, restart at the EPC);
+   // wk_a = the next read's PA[26:3]; wk_pk = fall back by parking (EVEC
+   // was 0); wk_t = the PTE's {PFN, X, W, R, V}.
+   logic        wk, wk_fin, wk_pk;
+   logic [1:0]  wk_ph;
+   logic [23:0] wk_a;
+   logic [14:0] wk_t;
+   logic        tlb_wk_en;       // TLB_WALK.EN (mmu_tlb)
+   logic [23:0] tlb_ptb;         // TLB_PTB[26:3] (mmu_tlb)
    // the frame push address of an entry (the kernel SP after any swap)
    wire [31:0]  push_va = ((EN_EXC && umode) ? sp_alt : sp) - 32'd8;
    logic [31:0] exc_addr_q, exc_epc_q;
@@ -1203,12 +1222,12 @@ module pipeline_core
                // the SR at WB, serializing.
                if (!op[21] && op[7:4] == 4'h0 &&
                    (op[19:12] <= 8'd8 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
-                    (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= 8'h34))) begin
+                    (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)))) begin
                   d.legal = 1'b1; d.wreg = 1'b1;
                   d.uop = (op[19:12] == 8'd0) ? U_GETST : U_MOV64;
                end else if (op[21] && op[11:8] == 4'h0 &&
                             (op[19:12] <= 8'd7 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
-                             (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= 8'h34))) begin
+                             (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)))) begin
                   d.legal = 1'b1; d.uop = U_UNARY; d.sub = 4'd0; d.use_rs1 = 1'b1;
                   d.mtsr = 1'b1; d.serialize = 1'b1;
                end
@@ -2243,6 +2262,10 @@ module pipeline_core
                     !(DEBUG_EN && dbg_i.attached && !dbg_i.exc_pass &&
                       (wb_xcause == X_ILL || wb_xcause == X_TRAP ||
                        wb_xcause == X_MISAL_LD || wb_xcause == X_MISAL_ST));
+   // MMU_PLAN.md §11.8: the WB exception op is a TLB miss the walker tries
+   // first (TLB_WALK.EN, TE, a useg VA), whatever EVEC says (registers only)
+   wire wb_wk = EN_WALK && wb_xc && tlb_wk_en && te && !wb_xaddr[31] &&
+                (wb_xcause == X_TLB_LD || wb_xcause == X_TLB_ST || wb_xcause == X_TLB_FE);
 
    // mul/div operand B mux happens at dispatch: ex_b holds rs2 (len1) or
    // the sign/zero-extended imm32 (len2) — see the dispatch below.
@@ -2826,6 +2849,7 @@ module pipeline_core
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
          id_fx2 <= 1'b0; id_fxg <= 1'b0; id_fxm <= 1'b0; id_fxl <= 1'b0; wb_xguard <= 1'b0; exc_guard_q <= 1'b0; ex_mph <= 1'b0;
          ex_mph2 <= 1'b0; ex_mok <= 1'b0; exc_tlb_q <= 1'b0; wb_xtlb <= 1'b0;
+         wk <= 1'b0; wk_fin <= 1'b0; wk_pk <= 1'b0; wk_ph <= 2'd0;
          mem_dis_we <= 1'b0; wb_dis_we <= 1'b0; mem_misal <= 1'b0;
          st_post <= 1'b0; st_post_ok <= 1'b0; ld_out <= 1'b0; wb_ld <= 1'b0; st_spec <= 1'b0; sq_v <= 1'b0;
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
@@ -2872,6 +2896,7 @@ module pipeline_core
          if (EN_EXC && start) begin
             umode <= 1'b0;                 // (EVEC / ECAUSE / EADDR: mmu_sr)
             res_valid <= 1'b0; exc_ent <= 1'b0;
+            wk <= 1'b0;  wk_fin <= 1'b0;   // (§11.8: unreachable on core 1, as exc_ent)
          end
          if (start || (dbg_halted && dbg_i.resume)) begin
             ev_pcz = 1'b1;
@@ -2939,8 +2964,24 @@ module pipeline_core
          end
 
          // ---------------- IRQ entry sequencer ----------------
+         if (EN_WALK) wk_fin <= 1'b0;
          if (irq_active) begin
-            if (!irq_xc) begin
+            if (EN_WALK && wk_fin) begin
+               // MMU_PLAN.md §11.8: a successful walk.  mmu_tlb writes
+               // entry[RR] (the cycle after, as for TLBWI) and bumps RR /
+               // WCNT; the fetch side's virtual copies are discarded and the
+               // reservation cleared (tlb_discard, as TLBWI); no frame, no
+               // ECAUSE / EADDR / TLB_HI; the faulting instruction is
+               // refetched at its PC (an interrupt may be taken first, at
+               // that boundary, with the frame PC = the EPC).
+               ev_pcz      = 1'b1;
+               pc          <= exc_epc_q;
+               fetch_halt  <= 1'b0;
+               res_valid   <= 1'b0;
+               irq_active  <= 1'b0;
+               exc_ent     <= 1'b0;
+               wk          <= 1'b0;
+            end else if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
                    && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !ld_out) begin
@@ -2955,6 +2996,34 @@ module pipeline_core
                   if (!(EN_EXC && exc_ent) && (!irq_ready || (EN_DIEI && irq_dis))) begin
                      // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
+                  end else if (EN_WALK && wk) begin
+                     // MMU_PLAN.md §11.8 walker: every older store has
+                     // drained (the port is free, nothing posted / queued),
+                     // so a read through the port (the D-cache) sees them.
+                     // Physical, never MMIO (PA[31:27] = 0).
+                     if (wk_ph == 2'd3) begin
+                        // fall back: the exception entry proceeds next cycle
+                        // exactly as without the walker — or, with EVEC = 0,
+                        // the park (park_pc / park_op were set at WB)
+                        wk <= 1'b0;
+                        if (wk_pk) begin
+                           irq_active <= 1'b0;
+                           exc_ent    <= 1'b0;
+                           parked     <= 1'b1;
+                           park_kind  <= 3'd2;
+                           if (DEBUG_EN && dbg_i.attached) begin
+                              park_kind <= 3'd4;  running <= 1'b0;  dbg_cause <= f_dbg_park_cause(3'd2);
+                              dbg_stepping <= 1'b0;  dbg_step_done <= 1'b0;
+                           end
+                        end
+                     end else begin
+                        m_addr     <= {5'b0, wk_a, 3'b000};
+                        m_be       <= 8'hFF;  m_zl <= 1'b0;
+                        m_read_DV  <= 1'b1;
+                        m_vav      <= 1'b0;
+                        rdy_armed  <= !m_ready;
+                        irq_xc     <= 1'b1;
+                     end
                   end else if (EN_TLB && te && push_va[31:27] != 5'b10000) begin
                      // MMU stage 3: with TE = 1 the frame push needs SP - 8 in
                      // kseg — otherwise DOUBLE_FAULT: park 6 (debug halt when
@@ -2992,6 +3061,22 @@ module pipeline_core
                      rdy_armed  <= !m_ready;
                      irq_xc     <= 1'b1;
                   end
+               end
+            end else if (EN_WALK && wk && w_mrdy) begin
+               // §11.8: a walker read completes (DV drops: the next read
+               // goes out after a DV-low cycle, so D and T may even share
+               // an address).  Decisions are registered (wk_ph / wk_fin).
+               m_read_DV <= 1'b0;
+               irq_xc    <= 1'b0;
+               if (wk_ph == 2'd0) begin
+                  // D: bit 0 = present; [26:13] = the PTE table's PA
+                  wk_a  <= {m_rdata[26:13], exc_addr_q[25:16]};
+                  wk_ph <= m_rdata[0] ? 2'd1 : 2'd3;
+               end else begin
+                  // T: [4] PRESENT and [0] V, or fall back
+                  wk_t <= {m_rdata[26:16], m_rdata[3:0]};
+                  if (m_rdata[4] && m_rdata[0]) wk_fin <= 1'b1;
+                  else                          wk_ph  <= 2'd3;
                end
             end else if (w_mrdy) begin
                m_write_DV          <= 1'b0;
@@ -3065,13 +3150,24 @@ module pipeline_core
                if (wb_um_new) sp_alt <= wb_spalt_new;
                res_valid <= 1'b0;
             end
-            if (wb_park && wb_exc_go) begin
+            if (wb_park && (wb_exc_go || (EN_WALK && wb_wk))) begin
                // MMU stage 1: the exception op commits nothing and retires
                // no trace line; everything younger is already gone (it
                // serialized or squashed), fetch is halted.  The IRQ entry
                // sequencer pushes the frame and vectors to EVEC.
+               // (MMU_PLAN.md §11.8: a TLB miss the walker may refill runs
+               // the walk first in the same sequencer; the record below is
+               // the fallback's.  With EVEC = 0 the fallback is today's park.)
                irq_active  <= 1'b1;
                exc_ent     <= 1'b1;
+               if (EN_WALK) begin
+                  wk    <= wb_wk;
+                  wk_ph <= 2'd0;
+                  wk_pk <= !wb_exc_go;
+                  // D's PA: TLB_PTB + VA[30:26] * 8, inside the 128 MiB DDR
+                  wk_a  <= tlb_ptb + {19'b0, wb_xaddr[30:26]};
+                  if (!wb_exc_go) begin park_pc <= wb_pc;  park_op <= wb_op; end
+               end
                exc_cause_q <= wb_xcause;
                // (an older MTSR to EVEC / TLBVEC has committed: both are final)
                exc_vec_q   <= (EN_TLB && wb_xcause >= X_TLB_LD && wb_xcause <= X_TLB_FE &&
@@ -4441,8 +4537,11 @@ module pipeline_core
    // MMU stage 3: TLBWI, TLBINV, MTSR ASID and MTSR STATUS discard the fetch
    // side's virtual copies (window, NLB, BTIC, the micro-ITLB) and clear the
    // LR/SC reservation (MMU_PLAN.md §11.3)
+   // (§11.8: a successful walk too — it overwrote entry[RR], which the
+   // micro-ITLB may hold, and the refused page may sit in the window)
    assign tlb_discard = EN_TLB && ((tlbi_commit && (wb_op[21:16] == 6'd9 || wb_op[21:16] == 6'd12)) ||
-                                 (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)));
+                                 (mtsr_commit && (wb_op[19:12] == 8'h33 || wb_op[19:12] == 8'h00)) ||
+                                 (EN_WALK && wk_fin));
    wire sr_mtsr_we  = mtsr_commit && wb_op[19:16] == 4'h0;     // SRs 0-8 (mmu_sr)
    // HW_PERF_PLAN.md §4: STATUS[10] MAL64, written by MTSR STATUS as it
    // commits (serializing: the refetch puts no memory op in EX before it
@@ -4453,11 +4552,11 @@ module pipeline_core
          if (EN_MAL64 && mtsr_commit && wb_op[19:12] == 8'h00) mal64 <= wb_value[10];
          if (start) mal64 <= 1'b0;
       end
-   assign sr_ent_we = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent;
+   assign sr_ent_we = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent && !(EN_WALK && wk);
    logic [63:0] sr_rdata;
    // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
    // would alias 0-8)
-   assign id_srv = (EN_TLB && id_op[19:16] == 4'h3) ? {32'b0, tlb_rdata}
+   assign id_srv = (EN_TLB && id_op[19:16] == 4'h3) ? tlb_rdata
                  : (EN_MPU && id_op[19:16] != 4'h0) ? {32'b0, mpu_rdata} : sr_rdata;
    generate if (EN_EXC) begin : g_sr
       (* keep_hierarchy = "yes" *)
@@ -4527,12 +4626,12 @@ module pipeline_core
    assign tlb_pload   = EN_TLB && mem_valid && mem_d.tlbi && mem_op[21:16] == 6'd11;
    generate if (EN_TLB) begin : g_tlb
       (* keep_hierarchy = "yes" *)
-      mmu_tlb #(.N(TLB_N)) tlb_i (
+      mmu_tlb #(.N(TLB_N), .WALK(EN_WALK)) tlb_i (
          .clk, .rst, .ce,
          .clr      (start),
          .sr_we    (mtsr_commit && wb_op[19:16] == 4'h3),
          .sr_widx  (wb_op[14:12]),
-         .sr_wdata (wb_value[31:0]),
+         .sr_wdata (wb_value[47:0]),
          .te_we    (mtsr_commit && wb_op[19:12] == 8'h00),
          .te_wd    (wb_value[9]),
          .sr_ridx  (id_op[14:12]),
@@ -4547,7 +4646,11 @@ module pipeline_core
          .d_vstep  (ex_mpu_hold && ex_xpg_q && !mem_busy),
          .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
-         .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr));
+         .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr),
+         // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
+         .wk_we    (EN_WALK && wk_fin), .wk_vpn (exc_addr_q[31:16]),
+         .wk_pfn   (wk_t[14:4]), .wk_xwrv (wk_t[3:0]),
+         .wk_en    (tlb_wk_en), .ptb (tlb_ptb));
 `ifndef SYNTHESIS
       // the data CAM's registered VPN copy and d_ok (timing) give the exact
       // lookup wherever its result is used: an op in its 2nd / 3rd EX cycle
@@ -4561,6 +4664,7 @@ module pipeline_core
       assign tlb_d_hit = 1'b0;  assign tlb_d_pfn = '0;  assign tlb_d_xwr = '0;
       assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
       assign tlb_hi_vpn_o = '0;  assign tlb_hi_asid_o = '0;
+      assign tlb_wk_en = 1'b0;  assign tlb_ptb = '0;
    end endgenerate
 
 `ifndef SYNTHESIS
@@ -4693,6 +4797,24 @@ module pipeline_core
       if (id_valid)
          assert (id_ser == (dec.serialize || id_eiser))
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
+   end
+   // MMU_PLAN §11.8 walker: it runs only inside an exception entry with the
+   // pipe drained and fetch halted, and owns the port while a read is out;
+   // its EVEC = 0 fallback parks as kind 2, which every TLB miss parks as
+   always_ff @(posedge clk) if (!rst && EN_WALK) begin
+      if (wk || wk_fin)
+         assert (irq_active && exc_ent && fetch_halt)
+            else $fatal(1, "walker outside an entry: wk=%b fin=%b", wk, wk_fin);
+      // (from its first read on; before that the sequencer waits for the drain)
+      if ((wk && (irq_xc || wk_ph != 2'd0)) || wk_fin)
+         assert (!id_valid && !ex_valid && !mem_valid && !wb_valid && mem_xc == 2'd0 && !if_xc &&
+                 !st_post && !sq_v && !ld_out)
+            else $fatal(1, "walker with the pipe or port busy: wk=%b fin=%b", wk, wk_fin);
+      if (wk_fin) assert (wk && !irq_xc) else $fatal(1, "walker: wk_fin without wk");
+      if (wb_valid && !wb_wait && wb_park && wb_wk)
+         assert (wb_park_kind == 3'd2) else $fatal(1, "walker: TLB miss parks as kind %0d", wb_park_kind);
+      if (irq_xc && wk) assert (m_read_DV && !m_write_DV && m_addr[31:27] == 5'b0)
+         else $fatal(1, "walker read: %h", m_addr);
    end
 `endif
 
@@ -4880,10 +5002,13 @@ endmodule
 // ASID: d_* (data) and f_* (fetch; with op_p it is TLBP's probe of
 // TLB_HI's VPN / ASID).  An entry matches when V, VPN equal, and G or its
 // ASID equals the lookup's.  TLBR reads a LUTRAM copy of the entry fields
-// (V from the flops); the CAMs read the flops.
+// (V from the flops); the CAMs read the flops.  With WALK (MMU_PLAN.md
+// §11.8) it also holds the walker's SRs (TLB_PTB 0x35, TLB_WALK 0x36,
+// TLB_WCNT 0x37) and takes its refill (wk_we) through TLBWI's write path.
 //===========================================================================
 module mmu_tlb #(
-   parameter int N = 16              // entries (a power of two, 2-32)
+   parameter int N = 16,             // entries (a power of two, 2-32)
+   parameter bit WALK = 1'b0         // the §11.8 walker's SRs and refill port
 ) (
    input  logic        clk,
    input  logic        rst,
@@ -4891,11 +5016,11 @@ module mmu_tlb #(
    input  logic        clr,           // program load: as reset
    input  logic        sr_we,         // MTSR to 0x30-0x34 commits
    input  logic [2:0]  sr_widx,
-   input  logic [31:0] sr_wdata,
+   input  logic [47:0] sr_wdata,      // ([47:32]: TLB_WCNT only)
    input  logic        te_we,         // MTSR STATUS commits
    input  logic        te_wd,         //   its [9]
    input  logic [2:0]  sr_ridx,
-   output logic [31:0] sr_rdata,
+   output logic [63:0] sr_rdata,
    output logic        te,
    output logic [7:0]  asid,
    output logic [31:0] tlbvec,
@@ -4915,7 +5040,15 @@ module mmu_tlb #(
    output logic [7:0]  hi_asid_o,
    output logic        f_hit,
    output logic [10:0] f_pfn,
-   output logic [2:0]  f_xwr
+   output logic [2:0]  f_xwr,
+   // §11.8 walker: a successful walk's refill of entry[RR] (a pulse; the
+   // entry is written the cycle after, as for TLBWI), RR + 1, WCNT + 1
+   input  logic        wk_we,
+   input  logic [15:0] wk_vpn,
+   input  logic [10:0] wk_pfn,
+   input  logic [3:0]  wk_xwrv,       // {X, W, R, V} = PTE[3:0]
+   output logic        wk_en,         // TLB_WALK.EN
+   output logic [23:0] ptb            // TLB_PTB[26:3]
 );
    localparam int IW = $clog2(N);    // TLB_INDEX bits; the rest of [4:0] ignored, read 0
    logic [N-1:0]  e_v, e_g;
@@ -4929,6 +5062,9 @@ module mmu_tlb #(
    logic [10:0] lo_pfn; logic [2:0] lo_xwr; logic lo_v;   // TLB_LO
    logic [IW-1:0] idx;  logic idx_p;                       // TLB_INDEX
    logic [29:0] vec;
+   // §11.8: TLB_WALK {RR, EN}, TLB_WCNT (0 and unused without WALK)
+   logic [IW-1:0] rr;
+   logic [47:0]   wcnt;
 
    function automatic logic [N-1:0] f_match(logic [15:0] vpn, logic [7:0] a);
       logic [N-1:0] m;
@@ -4990,13 +5126,31 @@ module mmu_tlb #(
    // that can see the entries (a refill or the next instruction's access)
    // is at least two cycles after the commit, and TLB_HI / TLB_LO /
    // TLB_INDEX cannot change in between (MTSR serializes behind them).
+   // (§11.8, WALK) the write is from wd_*: TLB_HI / TLB_LO / TLB_INDEX as
+   // they are at the TLBWI's commit (final: they cannot change before the
+   // write), or the walker's refill at RR.  Without WALK, wd_* are those SRs.
    logic wi_q, inv_q;
-   always_ff @(posedge clk) if (ce && wi_q) e_copy[idx] <= {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};
+   logic [IW-1:0] wd_idx;
+   logic [38:0]   wd_e;               // {VPN, G, ASID, PFN, XWR}
+   logic          wd_v;
+   if (WALK) begin : g_wd
+      always_ff @(posedge clk) if (ce) begin
+         if (wk_we) begin
+            wd_idx <= rr;  wd_e <= {wk_vpn, 1'b0, asid, wk_pfn, wk_xwrv[3:1]};  wd_v <= wk_xwrv[0];
+         end else begin
+            wd_idx <= idx; wd_e <= {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};          wd_v <= lo_v;
+         end
+      end
+   end else begin : g_nowd
+      assign wd_idx = idx;  assign wd_e = {hi_v, hi_g, hi_a, lo_pfn, lo_xwr};  assign wd_v = lo_v;
+   end
+   always_ff @(posedge clk) if (ce && wi_q) e_copy[wd_idx] <= wd_e;
    wire [38:0] rd = e_copy[idx];
 
    always_ff @(posedge clk) begin
       if (rst || (ce && clr)) begin
          te <= 1'b0;  asid <= '0;  vec <= '0;  e_v <= '0;  wi_q <= 1'b0;  inv_q <= 1'b0;
+         ptb <= '0;  wk_en <= 1'b0;  rr <= '0;  wcnt <= '0;
          if (rst) begin
             hi_v <= '0; hi_g <= 1'b0; hi_a <= '0; lo_pfn <= '0; lo_xwr <= '0; lo_v <= 1'b0;
             idx <= '0; idx_p <= 1'b0;
@@ -5008,15 +5162,19 @@ module mmu_tlb #(
             3'd2: begin idx <= sr_wdata[IW-1:0]; idx_p <= sr_wdata[31]; end
             3'd3: asid <= sr_wdata[7:0];
             3'd4: vec <= sr_wdata[31:2];
+            3'd5: if (WALK) ptb <= sr_wdata[26:3];
+            3'd6: if (WALK) begin wk_en <= sr_wdata[0];  rr <= sr_wdata[8 +: IW]; end
+            3'd7: if (WALK) wcnt <= sr_wdata[47:0];
             default: ;
          endcase
          if (te_we) te <= te_wd;
          if (hi_load) begin hi_v <= hi_vpn; hi_g <= 1'b0; hi_a <= asid; end
-         wi_q  <= op_wi;
+         wi_q  <= op_wi || (WALK && wk_we);
          inv_q <= op_inv;
+         if (WALK && wk_we) begin rr <= rr + 1'b1;  wcnt <= wcnt + 48'd1; end
          if (wi_q) begin
-            e_v[idx] <= lo_v;  e_vpn[idx] <= hi_v;  e_g[idx] <= hi_g;  e_asid[idx] <= hi_a;
-            e_pfn[idx] <= lo_pfn;  e_xwr[idx] <= lo_xwr;
+            e_v[wd_idx] <= wd_v;  e_vpn[wd_idx] <= wd_e[38:23];  e_g[wd_idx] <= wd_e[22];
+            e_asid[wd_idx] <= wd_e[21:14];  e_pfn[wd_idx] <= wd_e[13:3];  e_xwr[wd_idx] <= wd_e[2:0];
          end
          if (op_r) begin
             {hi_v, hi_g, hi_a, lo_pfn, lo_xwr} <= rd;
@@ -5031,12 +5189,16 @@ module mmu_tlb #(
    end
    always_comb begin
       case (sr_ridx)
-         3'd0:    sr_rdata = {hi_v, 7'b0, hi_g, hi_a};
-         3'd1:    sr_rdata = {5'b0, lo_pfn, 12'b0, lo_xwr, lo_v};
-         3'd2:    sr_rdata = {idx_p, 31'(idx)};
-         3'd3:    sr_rdata = {24'b0, asid};
-         3'd4:    sr_rdata = {vec, 2'b00};
-         default: sr_rdata = 32'b0;
+         3'd0:    sr_rdata = {32'b0, hi_v, 7'b0, hi_g, hi_a};
+         3'd1:    sr_rdata = {32'b0, 5'b0, lo_pfn, 12'b0, lo_xwr, lo_v};
+         3'd2:    sr_rdata = {32'b0, idx_p, 31'(idx)};
+         3'd3:    sr_rdata = {56'b0, asid};
+         3'd4:    sr_rdata = {32'b0, vec, 2'b00};
+         // §11.8 (WALK; else the decode makes these SRs illegal)
+         3'd5:    sr_rdata = WALK ? {37'b0, ptb, 3'b000} : 64'b0;
+         3'd6:    sr_rdata = WALK ? {51'b0, 5'(rr), 7'b0, wk_en} : 64'b0;
+         3'd7:    sr_rdata = WALK ? {16'b0, wcnt} : 64'b0;
+         default: sr_rdata = 64'b0;
       endcase
    end
    assign tlbvec = {vec, 2'b00};

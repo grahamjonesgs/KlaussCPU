@@ -31,7 +31,8 @@ SR.update({f'mpu_base{n}': 0x10 + 2 * n for n in range(16)})
 SR.update({f'mpu_limit{n}': 0x11 + 2 * n for n in range(16)})
 MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G = 1, 2, 4, 8, 16     # MPU_BASEn [4:0]
 # MMU stage 3
-SR.update({'tlb_hi': 0x30, 'tlb_lo': 0x31, 'tlb_index': 0x32, 'asid': 0x33, 'tlbvec': 0x34})
+SR.update({'tlb_hi': 0x30, 'tlb_lo': 0x31, 'tlb_index': 0x32, 'asid': 0x33, 'tlbvec': 0x34,
+           'tlb_ptb': 0x35, 'tlb_walk': 0x36, 'tlb_wcnt': 0x37})   # (0x35-0x37: MMU_PLAN §11.8)
 TLB_V, TLB_R, TLB_W, TLB_X = 1, 2, 4, 8                  # TLB_LO [3:0]
 
 

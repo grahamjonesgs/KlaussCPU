@@ -242,6 +242,26 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `ifdef HAS_EXC
    always @(posedge clk) if (!rst && dut.sr_ent_we) exc_n++;
 `endif
+   // MMU_PLAN §11.8 walker (+define+HAS_WALK): walks started (wk_s), the
+   // successful ones (wk_n), and the cycles from the faulting op's WB edge
+   // to the successful walk's restart (wk_cyc)
+   // wk_irq: an IRQ taken at the restart boundary right after a successful
+   // walk (before the faulting instruction re-executes)
+   longint wk_s = 0, wk_n = 0, wk_cyc = 0, wk_irq = 0;
+`ifdef HAS_WALK
+   logic wk_q = 1'b0, wkf_q = 1'b0, ia_q = 1'b0;
+   always @(posedge clk) if (!rst) begin
+      wk_q <= dut.wk;
+      ia_q <= dut.irq_active;
+      // (wkf_q: a walk finished and nothing has dispatched since)
+      if (dut.wk_fin) wkf_q <= 1'b1;
+      else if (dut.id_valid) wkf_q <= 1'b0;
+      if (wkf_q && dut.irq_active && !ia_q && !dut.exc_ent) wk_irq++;
+      if (dut.wk && !wk_q) wk_s++;
+      if (dut.wk_fin) wk_n++;
+      if (dut.wk) wk_cyc++;
+   end
+`endif
    // LCD strobes (a wrong-path LCD op must not send)
    longint lcd_n = 0, lcdrst_n = 0;
    always @(posedge clk) if (!rst) begin if (lcd_dv) lcd_n++; if (lcd_rst_wr) lcdrst_n++; end
@@ -330,6 +350,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "uart_n=%0d lcd_n=%0d lcdrst_n=%0d", uart_n, lcd_n, lcdrst_n);
 `ifdef HAS_EXC
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
+`endif
+`ifdef HAS_WALK
+      $fdisplay(f, "wk_s=%0d wk_n=%0d wk_cyc=%0d wk_irq=%0d", wk_s, wk_n, wk_cyc, wk_irq);
 `endif
       // data window 0x10000..0x10800 (dword 0x2000..0x20FF) and IRQ counter
       for (int i = 'h2000; i < 'h2100; i++)

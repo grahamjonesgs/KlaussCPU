@@ -40,6 +40,9 @@ module KlaussCPU #(
     parameter bit CORE1_TLB_EN = 1'b1,
     // its entry count: 32 on this part (MMU_PLAN.md §11.5, 2026-11-11)
     parameter int CORE1_TLB_N = 32,
+    // the hardware TLB walker (MMU_PLAN.md §11.8; needs the TLB): its SRs
+    // 0x35-0x37 and the refill of useg misses.  CPU_FEATURES[25].
+    parameter bit CORE1_TLB_WALK = 1'b1,
     // core 1's fetch I-cache: lines of 16 B, direct-mapped (HW_PERF_PLAN.md
     // §2): 1024 = 16 KiB.  ICACHE_INFO (0xF005_0018) reports it.
     parameter int CORE1_IC_LINES = 1024,
@@ -705,7 +708,7 @@ module KlaussCPU #(
    end endgenerate
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
-                   .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N),
+                   .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N), .TLB_WALK(CORE1_TLB_WALK),
                    .IC_LINES(CORE1_IC_LINES)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
@@ -1260,7 +1263,8 @@ module KlaussCPU #(
                // these bits, where every crypto block is present), [21] the
                // native SD controller (SD_NATIVE_PLAN.md), [22] DCBZ and
                // [23] STATUS.MAL64 (HW_PERF_PLAN.md §1 / §4; both need
-               // stage 1).
+               // stage 1), [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3), [25]
+               // the hardware TLB walker (MMU_PLAN.md §11.8).
                // Reads 0 on earlier bitstreams (a reserved offset).
                16'h0048: r_mmio_read_data_comb = {40'b0, CORE1_EXC_EN, CORE1_EXC_EN,
                                                   1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
@@ -1268,7 +1272,8 @@ module KlaussCPU #(
                                                   (CORE1_EXC_EN && CORE1_MPU_EN) ? 4'd15 : 4'd0,
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
                                                   CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN}
-                                                 | 64'h0100_0000;  // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
+                                                 | 64'h0100_0000   // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
+                                                 | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0};
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;

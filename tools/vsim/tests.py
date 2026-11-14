@@ -3928,3 +3928,538 @@ def ic16_smc_fill():
             for lat in (1, 2, 3, 5, 7):
                 out.append(_smc(dist, 32, False, lat, pad_align=pad))
     return out
+
+
+# ================================ MMU_PLAN §11.8: the hardware TLB walker
+# Page tables (the Linux format, arch/klausscpu tlbex.S): TLB_PTB -> 32
+# directory dwords (VA[30:26]); D[0] = present, D & 0x07FF_E000 = an 8 KiB
+# table of 1024 PTEs (VA[25:16]); a PTE is TLB_LO's layout plus [4] PRESENT.
+# The junk bits must be ignored by the walker.
+WK_PTB = 0x20000                      # the directory (PA)
+WK_TAB = (0x22000, 0x24000)           # the tables for D[0] / D[1] (VA < 0x0800_0000)
+WK_PRES = 0x10
+WK_JD = 0xA5A50000F8001FFE            # junk in a directory entry (bits the walker ignores)
+WK_JT = 0x5A5A0000F800FFE0            # junk in a PTE
+WK_OUT = DATA + 0x600                 # result dwords (dumped; below ELOG, above FLOG)
+
+
+def _wk_pte(pfn, xwrv, present=True):
+    return WK_JT | (pfn << 16) | (WK_PRES if present else 0) | xwrv
+
+
+def _wk_tables(a, ptes, dirs=None):
+    """ptes: {va_page: pte}; dirs: {index: dword} (default: D[0], D[1]
+    present); identity RWX PTEs for pages 0 and 1 (code / data window)
+    unless given"""
+    d = {0: WK_JD | WK_TAB[0] | 1, 1: WK_JD | WK_TAB[1] | 1}
+    d.update(dirs or {})
+    for i, v in d.items():
+        a.dword(WK_PTB + 8 * i, v)
+    p = {0x0000: _wk_pte(0, TLB_RWX), 0x0001: _wk_pte(1, TLB_RWX)}
+    p.update(ptes)
+    for vp, v in p.items():
+        if v is not None:
+            a.dword(WK_TAB[vp >> 10] + 8 * (vp & 0x3FF), v)
+
+
+def _wk_on(a, rr=8, en=1, ptb=WK_PTB):
+    a.setr(1, ptb | 0xF8000007); a.mtsr('tlb_ptb', 1)      # (ignored bits set)
+    a.setr(1, (rr << 8) | en | 0xFFFF00FE & ~(0x1F << 8)); a.mtsr('tlb_walk', 1)
+
+
+SENT = {'ecause': 0x55, 'eaddr': 0x66, 'tlb_hi': 0x77770011, 'tlb_lo': 0x0123000F, 'tlb_index': 3}
+
+
+def _wk_sent(a):
+    """sentinels in the SRs a walk must not touch"""
+    for sr, v in SENT.items():
+        a.setr(1, v); a.mtsr(sr, 1)
+
+
+def _wk_dump(a, slot0=0, entries=()):
+    """WK_OUT + 8*slot: ECAUSE, EADDR, TLB_HI, TLB_LO, TLB_INDEX, TLB_WALK,
+    TLB_WCNT, then TLBR of each entry index: TLB_HI, TLB_LO (r1 / r2)"""
+    a.setr(2, WK_OUT + 8 * slot0)
+    for k, sr in enumerate(('ecause', 'eaddr', 'tlb_hi', 'tlb_lo', 'tlb_index', 'tlb_walk', 'tlb_wcnt')):
+        a.mfsr(1, sr); a.st(64, 1, 2, 8 * k)
+    for j, i in enumerate(entries):
+        a.setr(1, i); a.mtsr('tlb_index', 1); a.tlbr()
+        a.mfsr(1, 'tlb_hi'); a.st(64, 1, 2, 56 + 16 * j)
+        a.mfsr(1, 'tlb_lo'); a.st(64, 1, 2, 64 + 16 * j)
+
+
+def _wk_exp(walk, wcnt, entries=(), sent=True, slot0=0):
+    """entries: [(hi, lo)] as _wk_dump read them"""
+    e = {}
+    o = WK_OUT + 8 * slot0
+    if sent:
+        for k, sr in enumerate(('ecause', 'eaddr', 'tlb_hi', 'tlb_lo', 'tlb_index')):
+            e[m(o + 8 * k)] = SENT[sr]
+    e[m(o + 40)] = walk
+    e[m(o + 48)] = wcnt
+    for j, (hi, lo) in enumerate(entries):
+        e[m(o + 56 + 16 * j)] = hi
+        e[m(o + 64 + 16 * j)] = lo
+    return e
+
+
+def _wk_prog(body, ptes, exp, user=False, logs=(), plus=(), dirs=None, rr=8, en=1, setup=None,
+             evec=True):
+    """_te_prog with page tables and the walker on (TLB_WALK.RR = rr)"""
+    def su(a):
+        _wk_tables(a, ptes, dirs)
+        _wk_on(a, rr, en)
+        if setup:
+            setup(a)
+    a, e, p = _te_prog(body, user, exp, logs=logs, plus=plus, setup=su)
+    return a, e, p
+
+
+def _wk_ret(va, pfn, xwrv, asid=0):
+    """an entry as TLBR reads it after a walk"""
+    return ((va >> 16) << 16) | asid, (pfn << 16) | xwrv
+
+
+@test
+def wk_sr():
+    """§11.8 SRs: reset 0; writable bits (TLB_PTB [26:3], TLB_WALK [12:8]
+    (log2 N bits) and [0], TLB_WCNT [47:0]); user MFSR / MTSR of them is
+    PRIVILEGED"""
+    if NOEXC:
+        return []
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, DATA); a.setr(3, 0)
+    for sr in ('tlb_ptb', 'tlb_walk', 'tlb_wcnt'):
+        a.mfsr(2, sr); a.alu('or', 3, 3, 2)
+    a.st(64, 3, 12, 24); a.setr(3, 0x77); a.st(64, 3, 12, 32)
+    a.setr64(1, -1)
+    for i, sr in enumerate(('tlb_ptb', 'tlb_walk', 'tlb_wcnt')):
+        a.mtsr(sr, 1); a.mfsr(2, sr); a.st(64, 2, 12, 8 * i)
+    a.setr(1, 0)
+    for sr in ('tlb_ptb', 'tlb_walk', 'tlb_wcnt'):
+        a.mtsr(sr, 1)
+    _to_user(a, 'u')
+    a.label('u')
+    for sr in ('tlb_ptb', 'tlb_walk', 'tlb_wcnt'):
+        a.mfsr(1, sr); a.mtsr(sr, 1)
+    a.halt()
+    _uhandler(a)
+    exp = {'end': 'park', 'kind': '0', m(DATA + 24): 0, m(DATA + 32): 0x77, m(DATA): 0x07FFFFF8,
+           m(DATA + 8): ((TLB_N - 1) << 8) | 1, m(DATA + 16): 0xFFFFFFFFFFFF, m(XD + 32): 7}
+    for i in range(7):
+        exp[m(XLOG + 8 * i)] = X_PRIV
+    return a, exp, []
+
+
+@test
+def wk_load_store():
+    """a load and a store to unmapped useg pages are refilled by the walker:
+    no exception; ECAUSE / EADDR / TLB_HI / TLB_LO / TLB_INDEX unchanged;
+    entry[RR] = {VPN, G 0, ASID, PFN, XWRV}; RR + 1 per walk; WCNT counts.
+    Data visible at the frames; the 2nd access to each page hits"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R), 0x0471: _wk_pte(4, TLB_V | TLB_R | TLB_W)}
+    def body(a):
+        _wk_sent(a)
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)                 # walk 1 (entry 8)
+        a.setr(9, 0x0471FFF0); a.setr(3, 0xBEEF); a.st(64, 3, 9)   # walk 2 (entry 9)
+        a.ld(64, 5, 9)
+        a.setr(9, 0x02000010); a.ld(64, 6, 9)                 # hits
+        _wk_dump(a, 0, (8, 9))
+    exp = {'r4': 0x1122334455667788, 'r5': 0xBEEF, 'r6': 0x99, m(XD + 32): 0}
+    exp.update(_wk_exp((10 << 8) | 1, 2, [_wk_ret(0x02000000, 3, TLB_V | TLB_R),
+                                          _wk_ret(0x04710000, 4, TLB_V | TLB_R | TLB_W)]))
+    a, e, p = _wk_prog(body, ptes, exp)
+    a.dword(0x30008, 0x1122334455667788); a.dword(0x30010, 0x99)
+    return a, e, p
+
+
+def _wk_snip(a, va, pa_of, emit):
+    """assemble emit(sub) at VA va (dword-aligned start below it) and store
+    each dword at PA pa_of(dword VA): code that may straddle pages mapped to
+    non-adjacent frames"""
+    b0 = va & ~7
+    sub = Asm(base=b0)
+    if va & 4:
+        sub.nop()
+    emit(sub)
+    ws = sub.assemble()
+    ws += [0x6C000000] * (len(ws) & 1)
+    for i in range(0, len(ws), 2):
+        a.dword(pa_of(b0 + 4 * i), ws[i] | (ws[i + 1] << 32))
+    return sub
+
+
+@test
+def wk_fetch():
+    """fetch misses refilled by the walker: a jump into an unmapped code
+    page; an instruction straddling from a mapped page into an unmapped one
+    (frames not adjacent); one straddling with both pages unmapped (two
+    walks); then the same snippets again (hits)"""
+    if NOEXC:
+        return []
+    ptes = {0x0060: _wk_pte(5, TLB_V | TLB_X), 0x0061: _wk_pte(6, TLB_V | TLB_X),
+            0x0062: _wk_pte(9, TLB_V | TLB_X), 0x0071: _wk_pte(0xB, TLB_V | TLB_X),
+            0x0072: _wk_pte(0xD, TLB_V | TLB_X)}
+    def setup(a):
+        _tlb_set(a, 2, 0x0071, 0xB, TLB_V | TLB_X)            # 0x0071 mapped, 0x0072 not
+    def body(a):
+        _wk_sent(a)
+        a.setr(3, 0); a.setr(11, 2)
+        a.label('it')
+        for k, va in enumerate((0x00600100, 0x0061FFFC, 0x0071FFFC)):
+            a.setr(9, va); a.leapc(10, f'r{k}'); a.jmpr(9)
+            a.label(f'r{k}')
+        a.addi_s(11, 11, -1)
+        a.fbr('ne', 11, 0, 'it', imm=True)
+        _wk_dump(a, 0, (8, 9, 10, 11))
+    exp = {'r3': 2 * (0x1 + 0x12345678 + 0x10 + 0x1234567), m(XD + 32): 0, 'wk_n': '4'}
+    exp.update(_wk_exp((12 << 8) | 1, 4, [_wk_ret(0x00600000, 5, TLB_V | TLB_X),
+                                          _wk_ret(0x00610000, 6, TLB_V | TLB_X),
+                                          _wk_ret(0x00620000, 9, TLB_V | TLB_X),
+                                          _wk_ret(0x00720000, 0xD, TLB_V | TLB_X)]))
+    a, e, p = _wk_prog(body, ptes, exp, setup=setup)
+    fr = {0x0060: 5, 0x0061: 6, 0x0062: 9, 0x0071: 0xB, 0x0072: 0xD}
+    pa = lambda va: (fr[va >> 16] << 16) | (va & 0xFFFF)
+    _wk_snip(a, 0x00600100, pa, lambda s: (s.addi_s(3, 3, 1), s.jmpr(10)))
+    _wk_snip(a, 0x0061FFFC, pa, lambda s: (s.setr(7, 0x12345678), s.alu('add', 3, 3, 7), s.jmpr(10)))
+    _wk_snip(a, 0x0071FFFC, pa, lambda s: (s.setr(7, 0x1234567), s.alu('add', 3, 3, 7),
+                                           s.addi_s(3, 3, 0x10), s.jmpr(10)))
+    return a, e, p
+
+
+@test
+def wk_two_access():
+    """a LEAVERET whose 2nd doubleword is in an unmapped page (the 1st
+    mapped): one walk, of the 2nd page; a spanning MEMGET32 with both pages
+    unmapped: two walks; the values come from non-adjacent frames"""
+    if NOEXC:
+        return []
+    ptes = {0x0102: _wk_pte(0xA, TLB_V | TLB_R), 0x0106: _wk_pte(0xC, TLB_V | TLB_R),
+            0x0107: _wk_pte(0xE, TLB_V | TLB_R)}
+    def setup(a):
+        _tlb_set(a, 2, 0x0101, 0x002, TLB_V | TLB_R | TLB_W)
+    def body(a):
+        _wk_sent(a)
+        a.setr(15, 0x0101FFF8); a.leaveret()                  # R15 <- [p 0x0101 FFF8], PC <- [0x0102_0000]
+        a.setr(4, 0xBAD)
+        a.label('back')
+        a.mov(5, 15); a.getsp(6)
+        a.setr(1, KSP); a.setsp(1)
+        a.setr(9, 0x0106FFFD); a.ld(32, 7, 9)                 # 3 bytes of 0x0106, 1 of 0x0107
+        _wk_dump(a, 0, (8, 9, 10))
+    exp = {'r5': 0x1122334455667788, 'r6': 0x01020008, 'r4': 0, 'r7': 0xAB112233, m(XD + 32): 0}
+    exp.update(_wk_exp((11 << 8) | 1, 3, [_wk_ret(0x01020000, 0xA, TLB_V | TLB_R),
+                                          _wk_ret(0x01060000, 0xC, TLB_V | TLB_R),
+                                          _wk_ret(0x01070000, 0xE, TLB_V | TLB_R)]))
+    a, e, p = _wk_prog(body, ptes, exp, setup=setup)
+    a.dword(0x2FFF8, 0x1122334455667788)
+    a.dword(0xA0000, a.labels['back'])
+    a.dword(0xCFFF8, 0x1122330000000000)
+    a.dword(0xE0000, 0xAB)
+    return a, e, p
+
+
+def _wk_fb(kind):
+    """one fallback case: (ptes, dirs, en, va, cause, op) — op 'ld' / 'st'"""
+    return {
+        'en0':   ({0x0200: _wk_pte(3, TLB_RWX)}, None, 0, 0x02000008, X_TLB_LD, 'ld'),
+        'd0':    ({}, {2: WK_JD & ~1 | WK_TAB[0]}, 1, 0x08000008, X_TLB_LD, 'ld'),
+        'tpres': ({0x0200: _wk_pte(3, TLB_RWX, present=False)}, None, 1, 0x02000010, X_TLB_ST, 'st'),
+        'tv':    ({0x0200: _wk_pte(3, TLB_RWX & ~TLB_V)}, None, 1, 0x02000018, X_TLB_LD, 'ld'),
+        # kmap: a D / T that a walker ignoring VA[31] would use
+        'kmap':  ({0x0200: _wk_pte(3, TLB_RWX)}, {16: WK_JD | WK_TAB[0] | 1}, 1, 0xC2000008, X_TLB_LD, 'ld'),
+    }[kind]
+
+
+@test
+def wk_fallback():
+    """each fallback reason (TLB_WALK.EN = 0, D[0] = 0, PTE PRESENT = 0,
+    PTE V = 0, a kmap VA) raises today's TLB_MISS_* (ECAUSE, EADDR,
+    TLB_HI = {VPN, 0, ASID}) through the handler; RR and WCNT unchanged,
+    no entry written"""
+    if NOEXC:
+        return []
+    out = []
+    for kind in ('en0', 'd0', 'tpres', 'tv', 'kmap'):
+        ptes, dirs, en, va, cause, op = _wk_fb(kind)
+        def body(a, va=va, op=op):
+            a.setr(1, 0x12345); a.mtsr('tlb_wcnt', 1)
+            a.setr(1, 0x33); a.mtsr('asid', 1)
+            a.setr(9, va); a.setr(3, 0x77)
+            if op == 'ld':
+                a.ld(64, 4, 9)
+            else:
+                a.st(64, 3, 9)
+            a.mfsr(5, 'tlb_hi')
+            a.setr(1, 0); a.mtsr('asid', 1)
+            _wk_dump(a, 0, (8,))
+        exp = {'r4': 0, 'r5': (va & 0xFFFF0000) | 0x33, m(0x30000 | (va & 0xFFF8)): 0}
+        e = _wk_exp((8 << 8) | en, 0x12345, [(0, 0)], sent=False)
+        e[m(WK_OUT)] = cause; e[m(WK_OUT + 8)] = va           # (ECAUSE / EADDR as the handler left them)
+        exp.update(e)
+        a, ee, p = _wk_prog(body, ptes, exp, logs=[(cause, va)], dirs=dirs, en=en)
+        ee['wk_n'] = '0'
+        ee['wk_s'] = '0' if kind in ('en0', 'kmap') else '1'
+        out.append((a, ee, p))
+    return out
+
+
+@test
+def wk_fallback_fetch():
+    """a fetch whose PTE is absent falls back to TLB_MISS_FETCH (EADDR = the
+    target); a straddle whose 2nd page's PTE is absent: the 1st page is
+    walked, the 2nd falls back with EADDR = its start"""
+    if NOEXC:
+        return []
+    ptes = {0x0061: _wk_pte(6, TLB_V | TLB_X), 0x0062: _wk_pte(9, TLB_V | TLB_X, present=False)}
+    def body(a):
+        a.setr(9, 0x00600100); a.leapc(10, 'r0'); a.jmpr(9)
+        a.label('r0')
+        a.setr(9, 0x0061FFFC); a.leapc(10, 'r1'); a.jmpr(9)
+        a.label('r1')
+        a.mfsr(5, 'tlb_hi')
+        _wk_dump(a, 0, (8,))
+    exp = {'r5': 0x00620000}
+    e = _wk_exp((9 << 8) | 1, 1, [_wk_ret(0x00610000, 6, TLB_V | TLB_X)], sent=False)
+    exp.update(e)
+    a, e, p = _wk_prog(body, ptes, exp, logs=[(X_TLB_FE, 0x00600100), (X_TLB_FE, 0x00620000)])
+    e['wk_n'] = '1'; e['wk_s'] = '3'
+    _wk_snip(a, 0x0061FFFC, lambda va: 0x60000 | (va & 0xFFFF), lambda s: (s.setr(7, 0x12345678), s.jmpr(10)))
+    return a, e, p
+
+
+@test
+def wk_rr_wcnt():
+    """RR wraps (N - 1 -> 0, entry N - 1 written); WCNT is 48 bits: MTSR
+    sets [47:0], it counts every successful walk and wraps"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R), 0x0300: _wk_pte(4, TLB_V | TLB_R)}
+    def body(a):
+        _wk_sent(a)
+        a.setr64(1, 0xABCDFFFFFFFFFFFF); a.mtsr('tlb_wcnt', 1)
+        a.setr(9, 0x02000000); a.ld(64, 4, 9)
+        a.setr(9, 0x03000000); a.ld(64, 4, 9)
+        _wk_dump(a, 0, (TLB_N - 1, 0))
+    # walks: 0x0200 -> entry N-1, 0x0300 -> entry 0, which held the code
+    # page: it is refetched through a walk -> entry 1 (the data window's),
+    # whose page the dump then walks -> entry 2.  WCNT: 2^48 - 1 + 4 wraps.
+    exp = {m(XD + 32): 0, 'wk_n': '4'}
+    exp.update(_wk_exp((3 << 8) | 1, 3, [_wk_ret(0x02000000, 3, TLB_V | TLB_R),
+                                         _wk_ret(0x03000000, 4, TLB_V | TLB_R)]))
+    return _wk_prog(body, ptes, exp, rr=TLB_N - 1)
+
+
+@test
+def wk_asid():
+    """the refill takes the ASID SR (G = 0): under another ASID the same VA
+    walks again; back under the first, its entry still hits"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R)}
+    def body(a):
+        _wk_sent(a)
+        for asid in (5, 6, 5):
+            a.setr(1, asid); a.mtsr('asid', 1)
+            a.setr(9, 0x02000008); a.ld(64, 4, 9)
+        a.setr(1, 0); a.mtsr('asid', 1)
+        _wk_dump(a, 0, (8, 9))
+    exp = {'r4': 0x42, m(XD + 32): 0, 'wk_n': '2'}
+    exp.update(_wk_exp((10 << 8) | 1, 2, [_wk_ret(0x02000000, 3, TLB_V | TLB_R, asid=5),
+                                          _wk_ret(0x02000000, 3, TLB_V | TLB_R, asid=6)]))
+    a, e, p = _wk_prog(body, ptes, exp)
+    a.dword(0x30008, 0x42)
+    return a, e, p
+
+
+@test
+def wk_uitlb_evict():
+    """RR = 0: the first walk overwrites entry 0, the code page the
+    micro-ITLB holds.  The walk discards the micro-ITLB (as TLBWI), so the
+    next fetch misses and walks the code page (entry 1, evicting the data
+    window's), and the dump's first store walks that (entry 2): 3 walks.
+    Without the discard the code would run on through the stale micro-ITLB
+    copy (2 walks)"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R)}
+    def body(a):
+        _wk_sent(a)
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)
+        _wk_dump(a, 0, (0, 1, 2))
+    exp = {'r4': 0x42, m(XD + 32): 0, 'wk_n': '3'}
+    exp.update(_wk_exp((3 << 8) | 1, 3, [_wk_ret(0x02000000, 3, TLB_V | TLB_R),
+                                         _wk_ret(0x00000000, 0, TLB_RWX),
+                                         _wk_ret(0x00010000, 1, TLB_RWX)]))
+    a, e, p = _wk_prog(body, ptes, exp, rr=0)
+    a.dword(0x30008, 0x42)
+    return a, e, p
+
+
+@test
+def wk_coherent():
+    """the walker sees the newest page-table contents: a PTE and a
+    directory entry written by stores (through kseg) right before the access,
+    still posted / queued when the access misses; a PTE first absent (the
+    access falls back: TLB_MISS), then written, and the retried access walks
+    (the Linux page-fault path).  Several latencies"""
+    if NOEXC:
+        return []
+    out = []
+    for lat in ('+LAT=1', '+LAT=3', '+LAT=7'):
+        for hit in ([], ['+HIT=70']):
+            def body(a):
+                a.setr(8, 0x80000000 | (WK_TAB[0] + 8 * 0x200))
+                a.setr64(3, _wk_pte(3, TLB_V | TLB_R)); a.st(64, 3, 8)
+                a.setr(9, 0x02000008); a.ld(64, 4, 9)            # PTE store still posted
+                a.setr(8, 0x80000000 | (WK_PTB + 8 * 3))         # D[3] (VA 0x0C00_0000+), new table
+                a.setr(7, 0x80000000 | (0x26000 + 8 * 0x005))
+                a.setr64(3, _wk_pte(4, TLB_V | TLB_R)); a.st(64, 3, 7)
+                a.setr64(3, WK_JD | 0x26000 | 1); a.st(64, 3, 8)
+                a.setr(9, 0x0C050010); a.ld(64, 5, 9)            # both stores in flight
+                a.setr(9, 0x02100018); a.ld(64, 6, 9)            # absent: TLB_MISS_LD (handler steps over)
+                a.setr(8, 0x80000000 | (WK_TAB[0] + 8 * 0x210))
+                a.setr64(3, _wk_pte(4, TLB_V | TLB_R)); a.st(64, 3, 8)
+                a.ld(64, 6, 9)                                   # walks now
+                a.mfsr(10, 'tlb_wcnt')
+            exp = {'r4': 0x42, 'r5': 0x4343, 'r6': 0x4444, 'r10': 3, 'wk_n': '3', 'wk_s': '4'}
+            a, e, p = _wk_prog(body, {}, exp, logs=[(X_TLB_LD, 0x02100018)], plus=[lat] + hit)
+            a.dword(0x30008, 0x42); a.dword(0x40010, 0x4343); a.dword(0x40018, 0x4444)
+            out.append((a, e, p))
+    return out
+
+
+@test
+def wk_user():
+    """user-mode load, store and fetch misses are walked (the entries are
+    useg, no G); then in supervisor mode a copy_to_user-like store to a
+    useg page walks too, and a read-only page's store is ACCESS_STORE after
+    its walk (permission faults are not the walker's)"""
+    if NOEXC:
+        return []
+    ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R | TLB_W), 0x0300: _wk_pte(4, TLB_V | TLB_R),
+            0x0060: _wk_pte(5, TLB_V | TLB_X), 0x0400: _wk_pte(6, TLB_V | TLB_R | TLB_W)}
+    def body(a):
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)
+        a.setr(3, 0x77); a.st(64, 3, 9, 8)
+        a.setr(9, 0x00600100); a.leapc(10, 'r0'); a.jmpr(9)
+        a.label('r0')
+        a.setr(9, 0x03000000); a.st(64, 3, 9)                    # walk, then ACCESS_STORE
+        a.setr(9, 0x02000010); a.ld(64, 6, 9)
+    a, e, p = _wk_prog(body, ptes, {'r4': 0x42, 'r5': 0x55, 'r6': 0x77},
+                       user=True, logs=[(X_ACC_ST, 0x03000000)])
+    a.dword(0x30008, 0x42)
+    _wk_snip(a, 0x00600100, lambda va: 0x50000 | (va & 0xFFFF), lambda s: (s.setr(5, 0x55), s.jmpr(10)))
+    out = [(a, dict(e, wk_n='3'), p)]
+    # supervisor: copy_to_user-like
+    def sbody(a):
+        a.setr(9, 0x04000020); a.setr(3, 0x99); a.st(64, 3, 9)
+        a.setr(9, 0x03000000); a.st(64, 3, 9)
+        a.setr(9, 0x04000020); a.ld(64, 6, 9)
+    a, e, p = _wk_prog(sbody, ptes, {'r6': 0x99, 'wk_n': '2'}, logs=[(X_ACC_ST, 0x03000000)])
+    out.append((a, e, p))
+    return out
+
+
+@test
+def wk_irq():
+    """interrupts while walking: a loop that TLBINVs and then touches a data
+    page and its own code page (two walks per pass), with a timer IRQ whose
+    handler (at 0x100000, logging its frame PCs at ELOG) is walked too.  An
+    IRQ pending at a walk is taken at the faulting instruction (frame PC =
+    it), before or after it re-executes; the sum and the logs are exact"""
+    if NOEXC:
+        return []
+    out = []
+    for per, lat in ((140, '+LAT=1'), (161, '+LAT=3'), (297, '+LAT=7'), (153, '+LAT=2')):
+        ptes = {0x0200: _wk_pte(3, TLB_V | TLB_R), 0x0010: _wk_pte(0x10, TLB_V | TLB_X)}
+        def body(a):
+            a.setr(1, 0); a.mtsr('ecause', 1)
+            a.set_int_mask(1)
+            a.setr(3, 0); a.setr(11, 40)
+            a.label('lp')
+            a.tlbinv()
+            a.setr(9, 0x02000008); a.ld(64, 4, 9); a.alu('add', 3, 3, 4)
+            a.addi_s(11, 11, -1)
+            a.fbr('ne', 11, 0, 'lp', imm=True)
+            a.set_int_mask(0)
+            a.mfsr(10, 'tlb_wcnt'); a.mfsr(6, 'ecause')
+        a, e, p = _wk_prog(body, ptes, {'r3': 40 * 5, 'r6': 0, m(XD + 32): 0, 'r10': 'nonzero'},
+                           plus=['+NO_IRQ_HANDLER', f'+IRQ_PERIOD={per}', lat])
+        a.dword(0x30008, 5)
+        _irq_logger(a)
+        e[m(ELOG)] = 'nonzero'
+        e['wk_irq'] = 'nonzero'          # (IRQs taken at a walk's restart boundary)
+        out.append((a, e, p))
+    return out
+
+
+@test
+def wk_evec0():
+    """EVEC = 0: a walk that succeeds runs on (no park); one that falls back
+    parks as today (kind 2 at the instruction, ECAUSE / EADDR / TLB_HI not
+    written); with TLB_WALK.EN = 0 the same park"""
+    if NOEXC:
+        return []
+    out = []
+    for en in (1, 0):
+        a = Asm()
+        _wk_tables(a, {0x0200: _wk_pte(3, TLB_V | TLB_R)})
+        _te_on(a)
+        _wk_on(a, 8, en)
+        a.setr(1, 0x55); a.mtsr('ecause', 1)
+        a.setr(9, 0x02000008); a.ld(64, 4, 9)
+        a.setr(9, 0x02100008)
+        at = a.ld(64, 5, 9)
+        a.halt()
+        a.dword(0x30008, 0x42)
+        e = {'end': 'park', 'kind': '2', 'ecause': '055', 'eaddr': '00000000', 'wk_n': str(en)}
+        if en:
+            e.update({'pc': at, 'op': a.words[(at - a.base) // 4], 'r4': 0x42})
+        else:
+            e['pc'] = a.insn_starts[a.insn_starts.index(at) - 2]   # the first load
+        out.append((a, e, []))
+    return out
+
+
+@test
+def wk_debug():
+    """DEBUG_EN builds (else these just run): with a debugger attached and
+    EVEC = 0 a successful walk does not halt, a fallback debug-halts as
+    today's park would (cause ILL, at the instruction); single-stepping
+    over a walked load (the step re-halts at the load, the next step
+    executes it) gives the plain run's result"""
+    if NOEXC:
+        return []
+    dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
+    out = []
+    a = Asm()
+    _wk_tables(a, {0x0200: _wk_pte(3, TLB_V | TLB_R)})
+    _te_on(a)
+    _wk_on(a, 8, 1)
+    a.setr(9, 0x02000008); a.ld(64, 4, 9)
+    a.setr(9, 0x02100008)
+    at = a.ld(64, 5, 9)
+    a.halt()
+    a.dword(0x30008, 0x42)
+    e = {'end': 'park', 'pc': at, 'r4': 0x42, 'wk_n': '1'}
+    e.update({'kind': '4', 'dbg_cause': '5'} if dbg else {'kind': '2'})
+    out.append((a, e, ['+DBG_ATTACHED']))
+    for steps in (1, 2, 3, 5):
+        a = Asm()
+        _xsetup(a)
+        _wk_tables(a, {0x0200: _wk_pte(3, TLB_V | TLB_R)})
+        _te_on(a)
+        _wk_on(a, 8, 1)
+        a.setr(9, 0x02000008)
+        a.label('b')
+        a.ld(64, 4, 9); a.addi_s(4, 4, 1); a.setr(10, 0x55)
+        a.halt()
+        _mpuhandler(a)
+        a.dword(0x30008, 0x42)
+        out.append((a, {'end': 'park', 'kind': '0', 'r4': 0x43, 'r10': 0x55, 'wk_n': '1', m(XD + 32): 0},
+                    ['+DBG_BP0=%x' % a.labels['b'], f'+DBG_STEPS={steps}', '+LAT=3']))
+    return out
