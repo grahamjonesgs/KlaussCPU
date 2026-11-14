@@ -1773,6 +1773,8 @@ one that ignores the hit pipe's carry candidate fails `socx`.
 | `tlbx_b3` | `cc02d52` | the carry select in the core, merged with `h_addr` / `mem_iaddr` | −0.150 / +0.016 | −0.021 | 37,710 | 25,031 |
 | `tlbx_b4` | `e9c4c80` | STLF compares carry-free on `ex_ta` / `ex_tb` | −0.421 / +0.031 | (−0.4) | 38,465 | 25,293 |
 | `tlbx_b5` | `298b933` | the hit pipe registers both carry candidates' tags; R / W folded per entry (`pok`) | −0.040 / +0.034 | −0.040 | 37,357 | 25,171 |
+| **`tlbx_b6`** | **`fc4b1e8`** | the hit pipe's index from `ex_ta + ex_tb`; the fault bit as one select of `pok`; `ex_b_zero`'s reduces kept | −0.112 / +0.022 (one endpoint) | **+0.037 / +0.022** | 37,549 | 25,114 |
+| `tlbx_b7` | `f52d93d` | the I-cache snoop's tag shadow back in block RAM (its own read-address register) | −0.194 / +0.021 | −0.108 | | |
 
 - **What failed and why.** `tlbx_b1`: the operand copies' selects came
   through `f_decode`'s uop (15 levels from `id_op`), and every CAM path

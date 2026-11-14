@@ -2274,8 +2274,31 @@ module pipeline_core
    // same test from the register alone, off the EA adder)
    wire ex_uf_early = EN_EXC && umode && (ex_a[31:28] == 4'hF || ex_a[31:3] == 29'h1DFF_FFFF);
    logic mem_xsq;       // the MEM op is an access fault (no access; squash EX / ID)
-   logic mem_xs_st, mem_xs2, mem_xs_g;   // ... a store / 2nd dword only / GUARD
-   logic mem_xs_tm, mem_xs_tlb;          // ... a TLB miss / TLB-related (stage 3)
+   logic mem_xs_st, mem_xs_g;            // ... a store / GUARD
+   // (§11.9 timing) only mem_xsq is needed as the op enters MEM; which
+   // dword faulted, and whether a TLB miss / TLB-related, are read at
+   // MEM -> WB, so they are decided in MEM from the EX terms registered
+   // (mem_q*) instead of on the CAM -> EX -> MEM edge
+   logic mem_qu1, mem_qu2, mem_qx3, mem_qtchk, mem_qtseg, mem_qttlbs, mem_qmdn1;
+   logic mem_qt1dn, mem_qt1seg, mem_qt1miss, mem_qt1tlb;
+   logic mem_qhit0, mem_qhit1, mem_qpok0, mem_qpok1, mem_qc15;
+`ifndef SYNTHESIS
+   logic mem_xs2_x, mem_xs_tm_x, mem_xs_tlb_x;    // (sim: the EX-time forms)
+`endif
+   wire  mq_hit   = mem_qc15 ? mem_qhit1 : mem_qhit0;
+   wire  mq_pok   = mem_qc15 ? mem_qpok1 : mem_qpok0;
+   wire  mq_tmiss = mem_qttlbs && !mq_hit;
+   wire  mq_ttlb  = mem_qttlbs && !mq_pok;                  // miss or TLB permission
+   wire  mq_d1dn  = mem_qx3 ? mem_qt1dn   : (mem_qtseg || mq_ttlb);
+   wire  mq_d1seg = mem_qx3 ? mem_qt1seg  : mem_qtseg;
+   wire  mq_d1mis = mem_qx3 ? mem_qt1miss : mq_tmiss;
+   wire  mq_d1tlb = mem_qx3 ? mem_qt1tlb  : mq_ttlb;
+   wire  mq_dn1   = mem_qu1 || (mem_qtchk ? mq_d1dn : mem_qmdn1);
+   wire  mem_xs2    = !mq_dn1;                                 // only the 2nd dword faulted
+   wire  mem_xs_tm  = mem_qtchk && (mq_dn1 ? (!mem_qu1 && !mq_d1seg && mq_d1mis)
+                                           : (!mem_qu2 && !mem_qtseg && mq_tmiss));
+   wire  mem_xs_tlb = mem_qtchk && (mq_dn1 ? (!mem_qu1 && !mq_d1seg && mq_d1tlb)
+                                           : (!mem_qu2 && !mem_qtseg && mq_ttlb));
    logic [15:0] mem_pa2hi;               // (stage 3) the 2nd page's PA[31:16]
    logic        mem_xpg;                 // ... the op crosses a page
    // MEM -> WB exception record: wb_xc = the WB op is an exception op
@@ -4105,10 +4128,17 @@ module pipeline_core
                // first MEM cycle it squashes EX / ID (mem_xsq_go).
                mem_xsq    <= ex_ufault;
                mem_xs_st  <= ex_mst;               // direction (cause)
-               mem_xs2    <= !ex_dn1;              // only the 2nd dword faulted
                mem_xs_g   <= ex_xg;                // GUARD denial (stage 2, ECAUSE[8])
-               mem_xs_tm  <= ex_xtm;               // TLB miss (stage 3)
-               mem_xs_tlb <= ex_xtlb;              // TLB-related (TLB_HI auto-load)
+               // (the terms of mem_xs2 / mem_xs_tm / mem_xs_tlb, decided in MEM)
+               mem_qu1    <= ex_u1;    mem_qu2   <= ex_u2;    mem_qx3 <= ex_x3;
+               mem_qtchk  <= ex_tchk;  mem_qtseg <= t_seg;    mem_qttlbs <= t_tlbs;
+               mem_qmdn1  <= ex_mchk && mpu_d1;
+               mem_qt1dn  <= t1_dn;    mem_qt1seg <= t1_seg;  mem_qt1miss <= t1_miss;  mem_qt1tlb <= t1_tlb;
+               mem_qhit0  <= tlb_d_hit0;  mem_qhit1 <= tlb_d_hit1;
+               mem_qpok0  <= tlb_d_pok0;  mem_qpok1 <= tlb_d_pok1;  mem_qc15 <= tlb_d_c15;
+`ifndef SYNTHESIS
+               mem_xs2_x  <= !ex_dn1;  mem_xs_tm_x <= ex_xtm;  mem_xs_tlb_x <= ex_xtlb;
+`endif
                mem_dis_we <= ex_valid && (ex_d.uop == U_DI || ex_d.uop == U_EI);
                mem_dis_new<= (ex_d.uop == U_DI) ? 1'b1 : !ex_a[0];
 
@@ -4857,6 +4887,10 @@ module pipeline_core
       assert (ret_ne == (ret_actual != mem_pred_tgt))
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
+   always_ff @(posedge clk) if (!rst)
+      assert (!mem_xsq || (mem_xs2 == mem_xs2_x && mem_xs_tm == mem_xs_tm_x && mem_xs_tlb == mem_xs_tlb_x))
+         else $fatal(1, "MEM fault kind: xs2 %b/%b tm %b/%b tlb %b/%b", mem_xs2, mem_xs2_x,
+                     mem_xs_tm, mem_xs_tm_x, mem_xs_tlb, mem_xs_tlb_x);
    always_ff @(posedge clk) if (!rst)
       assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2) &&
               sn_pra == mem_iaddr[IC_IDXW+3:5])
