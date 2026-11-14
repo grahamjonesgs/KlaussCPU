@@ -4421,6 +4421,56 @@ def ic32_fill_cyc():
 
 
 @test
+def sh_bz_form():
+    """the shifter's zero test for ex_b_zero (bz_mem) from the stage-1
+    registers' byte-zero flags: every shift kind (SHL / SHR / SAR / ROL /
+    ROR, BTS / BTR / BTC, BTSTRR), immediate and register counts, on sparse
+    random values, each followed at once by a consumer of its result that
+    tests 32 bits (SETCC W: id_w) or 64, or by a DIV / MOD dividing by it.  pipeline_core asserts the
+    byte-flag form equal to the 64-bit test every cycle (and ex_b_zero
+    equal to ex_b == 0); the DIVs check the divide-by-zero results."""
+    import random
+    out = []
+    rnd = random.Random(5)
+    for v in range(10):
+        a = Asm()
+        a.setr(12, 0)
+        for _ in range(200):
+            sub = rnd.choice((0, 1, 2, 3, 4, 8, 9, 10, 11))
+            n = rnd.randrange(64)
+            val = 0
+            r = rnd.random()
+            if r < 0.5:      # one non-zero byte: often the BT ops' own bit
+                val = rnd.choice((1 << (n % 8), 1 << (n % 8), rnd.randrange(1, 256))) << (8 * rnd.randrange(8))
+                if rnd.random() < 0.5:
+                    val = rnd.choice((1 << (n % 8), rnd.randrange(1, 256))) << (8 * (n // 8))
+            elif r < 0.75:
+                for b in range(8):
+                    if rnd.random() < 0.35:
+                        val |= rnd.choice((1, 0x80, rnd.randrange(256))) << (8 * b)
+            a.setr64(1, val)
+            if sub == 11 or rnd.random() < 0.5:
+                a.setr(2, n)
+                a.emit(H(1, 4) | sub << 22 | 3 << 8 | 1 << 4 | 2)          # rd 3 = r1 op r2
+            else:
+                a.emit(H(1, 4) | sub << 22 | 1 << 21 | n << 15 | 3 << 8 | 1 << 4)
+            c = rnd.randrange(3)
+            if c == 0:                     # (id_w: a 32-bit compare / FBR reads rs2)
+                a.setcc('eq', 4, 0, 3, w=True)
+                a.alu('add', 6, 0, 3)
+            elif c == 1:
+                a.alu('add', 4, 0, 3)
+                a.setcc('eq', 6, 0, 3, w=True)
+            else:
+                a.setr(5, 1000003)
+                a.div(4, 5, 3, sgn=rnd.random() < 0.5)
+            a.alu('add', 12, 12, 4)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0'}, [f'+LAT={1 + v % 3}']))
+    return out
+
+
+@test
 def ic32_vdefer_snoop():
     """a deferred valid set met by the snoop of a store to its own line
     (g_vl's vdrop): a cold function L stores first into the line J — in the
@@ -4494,7 +4544,10 @@ def ic32_sweep_snoop():
                 a.label('L2')
                 a.alui_s('add', 1, 1, 1)
                 a.ret()
-                out.append((a, {'end': 'park', 'kind': '0', 'r1': 16, 'ic_sweeps': (1, 9)},
+                e = {'end': 'park', 'kind': '0', 'r1': 16}
+                if IC32:
+                    e['ic_sweeps'] = (1, 9)        # (16 B lines: a one-cycle flash clear)
+                out.append((a, e,
                             [f'+LAT={lat}', f'+LDLY={ld}', '+LDLYA=%x' % a.labels['back'],
                              f'+LDLYN={mn}']))
     return out

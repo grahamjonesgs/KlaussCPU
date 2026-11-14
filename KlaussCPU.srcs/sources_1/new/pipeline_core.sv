@@ -3022,10 +3022,10 @@ module pipeline_core
    // mem_wdata, the pick registered in EX; CPI-free like the shifter's 2nd
    // stage: a producer in EX already gives its consumer one bubble)
    logic mem_mmq, mem_mmpick;
-   wire [63:0] mem_result_eff = mem_is_sh ? w_sh2
-                              : mem_mmq ? (mem_mmpick ? mem_result : mem_wdata)
+   wire [63:0] mem_res_nsh    = mem_mmq ? (mem_mmpick ? mem_result : mem_wdata)
                               : mem_d.w32 ? {{32{mem_result[31]}}, mem_result[31:0]}
                               : mem_result;
+   wire [63:0] mem_result_eff = mem_is_sh ? w_sh2 : mem_res_nsh;
 
    // load-value extraction (f_ld_idx / f_memget32 lane math)
    logic [63:0] mem_ldval;
@@ -3160,7 +3160,38 @@ module pipeline_core
                       : (wb_ld_ea[2] ? &wbz_ld[7:4] : &wbz_ld[3:0]);
    // (timing, §11.9 builds: kept, so synthesis does not fold ex_b_zero back
    // into a zero test of ex_b's forwarding mux — tlbx_b5's worst path)
-   (* keep = "true" *) wire bz_mem = f_wz(id_w, mem_result_eff);
+   // (timing, §5 b4: the shifter's part of bz_mem from byte-zero flags of
+   // its stage-1 registers, selected by the stage-2 byte shift — no barrel
+   // stage and no 64-bit zero chain after r_shhi; was r_shhi -> w_sh2 ->
+   // carry-chain zero test -> ex_b_zero, the b4 tier-1 worst path.
+   // = f_wz(id_w, w_sh2), asserted.)  sh_rz[j]: byte j of w_sh2 is zero.
+   logic [7:0] sh_rz;
+   always_comb begin : sh_zero
+      logic [7:0] zl, zr, zs, zol, zor, za, zan, zx;
+      logic [2:0] k;
+      zl  = f_bz(r_shl1);  zr  = f_bz(r_shr1);  zs = f_bz(r_sar1);
+      zol = f_bz(r_rol1);  zor = f_bz(r_ror1);  za = f_bz(r_sha_op);
+      for (int i = 0; i < 8; i++) begin
+         zan[i] = (r_sha_op[8*i +: 8] & ~r_oh1[7:0]) == 8'd0;   // byte i with the bit cleared
+         zx[i]  = (r_sha_op[8*i +: 8] ^  r_oh1[7:0]) == 8'd0;   //  ... flipped
+      end
+      k = r_shhi;
+      for (int j = 0; j < 8; j++) begin
+         case (r_shsub)
+            4'd0:  sh_rz[j] = (j >= k) ? zl[3'(j - k)] : 1'b1;              // SHL
+            4'd1:  sh_rz[j] = (j + k <= 7) ? zr[3'(j + k)] : 1'b1;          // SHR
+            4'd2:  sh_rz[j] = (j + k <= 7) ? zs[3'(j + k)] : !r_sar1[63];   // SAR
+            4'd3:  sh_rz[j] = zol[3'(j - k)];                               // ROL
+            4'd4:  sh_rz[j] = zor[3'(j + k)];                               // ROR
+            4'd8:  sh_rz[j] = (3'(j) == k) ? 1'b0 : za[j];                 // BTS
+            4'd9:  sh_rz[j] = (3'(j) == k) ? zan[j] : za[j];               // BTR
+            4'd10: sh_rz[j] = (3'(j) == k) ? zx[j] : za[j];                // BTC
+            default: sh_rz[j] = (j != 0) || !r_btr1[{r_bthi, 3'b000}];     // BTSTRR
+         endcase
+      end
+   end
+   wire bz_sh = id_w ? &sh_rz[3:0] : &sh_rz;
+   (* keep = "true" *) wire bz_mem = mem_is_sh ? bz_sh : f_wz(id_w, mem_res_nsh);
    (* keep = "true" *) wire bz_rf  = f_wz(id_w, rf[dec.rs2]);
    (* keep = "true" *)
    wire       wbz_fwd = (EN_MUL2 && wb_mdir) ? wbz_mul
@@ -5209,6 +5240,10 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
          else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
+   // bz_mem's byte-flag form of the shifter's zero test equals the real one
+   always_ff @(posedge clk) if (!rst && !$isunknown({bz_mem, mem_result_eff, id_w}))
+      assert (bz_mem == f_wz(id_w, mem_result_eff))
+         else $fatal(1, "bz_mem form: sub=%0d hi=%0d w=%b v=%h", r_shsub, r_shhi, id_w, mem_result_eff);
    // CE_TIED: the instance really ties ce high (§5, IC_LB = 32)
    always_ff @(posedge clk) if (!rst && CE_TIED)
       assert (ce === 1'b1) else $fatal(1, "pipeline_core: CE_TIED = 1 but ce = %b", ce);
