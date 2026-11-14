@@ -93,6 +93,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_DCBZ')
     if 'parameter bit TLB_WALK' in core and not noexc:
         defs.append('+define+HAS_WALK')
+    if 'output logic         perf_itlb' in core:
+        defs.append('+define+HAS_PERF_ITLB')
     if 'parameter int IC_LB' in core:
         defs.append('+define+HAS_ICLB')
         if ic:

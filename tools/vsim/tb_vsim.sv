@@ -107,7 +107,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
       .m_rdata_next, .m_next_valid, .m_ready,
 `ifdef HAS_ICLB
-      .m_line, .m_line_v, .perf_itlb,
+      .m_line, .m_line_v,
+`endif
+`ifdef HAS_PERF_ITLB
+      .perf_itlb,
 `endif
       .lcd_byte, .lcd_dc, .lcd_dv, .lcd_rst_n, .lcd_rst_wr, .lcd_ready(1'b1),
       .irq_ready, .irq_sel, .irq_vector, .irq_ack, .irq_ack_sel, .int_mask_o,
@@ -365,9 +368,11 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.li_now) $display("ICDBG t=%0d inst idx=%0d pa=%08x", cyc, dut.li_idx, {dut.lp_pa, 5'b0});
       if (dut.lp_ev && dut.lp_wrh) $display("ICDBG t=%0d drop pa=%08x", cyc, {dut.lp_pa, 5'b0});
       if (dut.ic_sw && !sw_q) $display("ICDBG t=%0d sweep", cyc);
+`ifdef HAS_PERF_ITLB
       if (dut.it_ref && !dut.tlb_psel && !dut.tlb_discard)
          $display("ICDBG t=%0d itlb refill vpn=%04x hit=%b idx=%0d", cyc, dut.it_vpn, dut.tlb_f_hit, dut.tlb_f_idx);
       if (dut.tlb_discard) $display("ICDBG t=%0d tlb discard sel=%b w_idx=%0d", cyc, dut.tlb_wsel, dut.tlb_w_idx);
+`endif
       if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
       if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
@@ -434,7 +439,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (perf_ic[0]) n_ic_miss++;
       if (perf_ic[1]) n_ic_fill++;
 `endif
-`ifdef HAS_ICLB
+`ifdef HAS_PERF_ITLB
       if (perf_itlb) n_itlb++;
 `endif
    end
