@@ -691,16 +691,21 @@ reservation cleared). Otherwise (EN = 0, kmap, D[0] = 0, T[4] = 0, T[0] =
 D-cache after every older store. About 27 cycles per refill, against ~140
 for the software handler.
 
-Implementation (MMU_PLAN.md §11.4): the I-cache and D-cache are VIPT (64
-KiB pages keep every index bit untranslated). Data accesses are
-translated in the same extra EX cycle the MPU uses (a third for a
-two-access op crossing a page); fetch goes through a one-entry micro-ITLB
-refilled from the TLB in one cycle, and a refused page is served as a
-fault-tagged window, so no untranslated or faulting address ever reaches
-memory. With TE = 1 a fetch never reads MMIO. Cost while TE = 1: about
-+1.5–2.5 % cycles on random code with every page mapped (the extra EX
-cycle, no early load issue), plus the refills software does. With TE = 0,
-timing is as before. `CPU_FEATURES[2]` = 1, `[15:8]` = 16 (the entry
+Implementation (MMU_PLAN.md §11.5, §11.9): the I-cache and D-cache are
+VIPT (64 KiB pages keep every index bit untranslated). Data accesses are
+translated in their first EX cycle: the CAM matches the page of the EA's
+two operands (base + offset, registered at dispatch) with a carry-free
+compare, so no adder sits in front of it and a memory instruction costs
+nothing extra. Only a MEMGET32 or LEAVERET whose second doubleword is in
+the next page takes one extra EX cycle, to translate that page. Fetch goes
+through a one-entry micro-ITLB refilled from the TLB in one cycle, and a
+refused page is served as a fault-tagged window, so no untranslated or
+faulting address ever reaches memory. With TE = 1 a fetch never reads
+MMIO. Cost while TE = 1: about +0.4–0.8 % cycles on random code with every
+page mapped (MEMGET32, LEAVERET and IRET lose their early issue; a
+page-crossing two-access op), plus the refills (+1.5–2.4 % before
+§11.9, when every memory instruction spent an extra EX cycle). With TE =
+0, timing is as before. `CPU_FEATURES[2]` = 1, `[15:8]` = 32 (the entry
 count). Reset clears TE,
 ASID, TLBVEC and every V.
 
@@ -743,6 +748,11 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 | DELAY, LCD | occupy EX until done / port ready |
 | Straight-line fetch | 1-word ops 1/cycle; 2-word ops ~1.25 cycles each; 3-word ops ~2.5 |
 | Unaligned MEMGET32 or LEAVERET whose second dword is in another line | one extra memory read |
+| Translation on (TE = 1): loads, stores, stack ops | none (the data TLB lookup runs in the instruction's first EX cycle, MMU_PLAN §11.9) |
+| TE = 1: MEMGET32 / LEAVERET whose second dword is in the next 64 KiB page | +1 EX cycle (the second page's lookup) |
+| TE = 1: MEMGET32 / LEAVERET / IRET | no early issue: the read goes out from MEM, a cycle later |
+| TE = 1: a fetch from a code page other than the last one (micro-ITLB miss) | 3 cycles |
+| MPU on (MPU_EN = 1, TE = 0): every memory instruction | +1 EX cycle (the region check), and no early issue |
 
 Practical rules:
 - Put 1 independent instruction between a load and an ALU/compare/FBR use,

@@ -447,6 +447,15 @@ module pipeline_core
    logic        tlb_d_hit, tlb_f_hit;
    logic [10:0] tlb_d_pfn, tlb_f_pfn;
    logic [2:0]  tlb_d_xwr, tlb_f_xwr;   // {X, W, R}
+   // (§11.9) the data port's two candidate results (bit 16's carry 0 / 1)
+   // and that carry: the select is the core's, so it can merge with the
+   // h_addr / mem_iaddr / fault logic behind it (mmu_tlb is a kept hierarchy)
+   logic        tlb_d_hit0, tlb_d_hit1, tlb_d_c15;
+   logic [10:0] tlb_d_pfn0, tlb_d_pfn1;
+   logic [2:0]  tlb_d_xwr0, tlb_d_xwr1;
+   assign tlb_d_hit = tlb_d_c15 ? tlb_d_hit1 : tlb_d_hit0;
+   assign tlb_d_pfn = tlb_d_c15 ? tlb_d_pfn1 : tlb_d_pfn0;
+   assign tlb_d_xwr = tlb_d_c15 ? tlb_d_xwr1 : tlb_d_xwr0;
    logic        mtsr_commit, tlbi_commit, tlb_discard, sr_ent_we;   // (assigned at the end)
    wire         tlb_psel;        // a TLBP in MEM or WB: the fetch port is the probe's
    wire         tlb_pload;       // a TLBP in MEM: load its key into it_vpn / it_asid
@@ -2516,7 +2525,11 @@ module pipeline_core
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    // (stage 3: with TE = 1 the tag bits [31:16] are the PA — the cache
    // indexes with the VA bits [14:5] it always used: VIPT, 64 KiB pages)
-   assign h_addr     = (EN_TLB && te) ? {t_pahi, exo_iaddr[15:0]} : exo_iaddr;
+   // (timing, §11.9: written as one select of the TLB's PFN over a value
+   // that does not depend on it, = (EN_TLB && te) ? {t_pahi, VA[15:0]} : exo_iaddr)
+   wire        h_tsel     = EN_TLB && te && t_tlbs;
+   wire [15:0] h_alt      = (EN_TLB && te) ? (t_kseg ? {5'b0, tva[26:16]} : tva[31:16]) : exo_iaddr[31:16];
+   assign h_addr     = {h_tsel ? {5'b0, tlb_d_pfn} : h_alt, exo_iaddr[15:0]};
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
@@ -4028,7 +4041,12 @@ module pipeline_core
                mem_eaddr  <= exo_eaddr;
                // (stage 3: with TE = 1 the port address is the PA; the page
                // offset is the VA's)
-               mem_iaddr  <= (EN_TLB && te) ? {d1_pahi, exo_iaddr[15:0]} : exo_iaddr;
+               // (timing, §11.9: one select of the TLB's PFN, as h_addr)
+               mem_iaddr  <= {(EN_TLB && te && !ex_x3 && t_tlbs) ? {5'b0, tlb_d_pfn}
+                             : !(EN_TLB && te) ? exo_iaddr[31:16]
+                             : ex_x3 ? t1_pahi
+                             : t_kseg ? {5'b0, tva[26:16]} : tva[31:16],
+                              exo_iaddr[15:0]};
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
                mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
                mem_xpg    <= ex_x3;
@@ -4699,7 +4717,8 @@ module pipeline_core
          .d_vpn    (tlb_d_vpn), .d_ta (t_ta_d), .d_tb (t_tb_d),
          .d_ld     (!mem_busy && !ex_busy),
          .d_step   (ex_mpu_hold && !ex_mph && te_q && ex_txpg && !mem_busy),
-         .d_hit (tlb_d_hit), .d_pfn (tlb_d_pfn), .d_xwr (tlb_d_xwr),
+         .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_xwr0 (tlb_d_xwr0),
+         .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_xwr1 (tlb_d_xwr1), .d_c15 (tlb_d_c15),
          .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr),
          // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
@@ -4726,7 +4745,8 @@ module pipeline_core
 `endif
    end else begin : g_notlb
       assign te = 1'b0;  assign tlb_asid = '0;  assign tlb_vec = '0;  assign tlb_rdata = '0;
-      assign tlb_d_hit = 1'b0;  assign tlb_d_pfn = '0;  assign tlb_d_xwr = '0;
+      assign tlb_d_hit0 = 1'b0;  assign tlb_d_pfn0 = '0;  assign tlb_d_xwr0 = '0;
+      assign tlb_d_hit1 = 1'b0;  assign tlb_d_pfn1 = '0;  assign tlb_d_xwr1 = '0;  assign tlb_d_c15 = 1'b0;
       assign tlb_f_hit = 1'b0;  assign tlb_f_pfn = '0;  assign tlb_f_xwr = '0;
       assign tlb_hi_vpn_o = '0;  assign tlb_hi_asid_o = '0;
       assign tlb_wk_en = 1'b0;  assign tlb_ptb = '0;
@@ -5102,9 +5122,10 @@ module mmu_tlb
    input  logic [31:0] d_ta, d_tb,    // §11.9: the EA's operands at dispatch (the core's
    input  logic        d_ld,          //   ex_ta / ex_tb), loaded with the operand latches;
    input  logic        d_step,        //   stepped to the next page for a crossing op's 2nd cycle
-   output logic        d_hit,
-   output logic [10:0] d_pfn,
-   output logic [2:0]  d_xwr,
+   output logic        d_hit0, d_hit1,  // the match assuming bit 16's carry is 0 / 1,
+   output logic [10:0] d_pfn0, d_pfn1,  //   and that carry (the core selects; §11.9)
+   output logic [2:0]  d_xwr0, d_xwr1,
+   output logic        d_c15,
    input  logic [15:0] f_vpn,         // registers: the micro-ITLB refill, or TLB_HI for a TLBP
    input  logic [7:0]  f_asid,
    output logic [15:0] hi_vpn_o,      // TLB_HI's VPN / ASID (the TLBP's search key)
@@ -5175,7 +5196,8 @@ module mmu_tlb
    // entry's match: every entry matches twice, assuming the page offset's
    // carry c15 is 0 (dm0) or 1 (dm1), into two PFN / XWR / hit muxes, and
    // c15 — a 16-bit carry chain on the one low-half copy — picks between
-   // them last (in the first build c15's chain and its route to the
+   // them last, in the core, merged with its h_addr / mem_iaddr / fault
+   // selects (in the first build c15's chain and its route to the
    // entries led the failing CAM paths)
    logic [N-1:0] dm0, dm1;
    (* keep = "true" *) logic [15:0] q_alo;
@@ -5185,7 +5207,7 @@ module mmu_tlb
       else if (d_step) begin q_alo <= '0;          q_blo <= '0;          end
    end
    wire [16:0] q_lo = {1'b0, q_alo} + {1'b0, q_blo};
-   wire        d_c15 = q_lo[16];
+   assign      d_c15 = q_lo[16];
    logic [NQ-1:0] d_kok;                // (sim) each copy's page equals d_vpn
    for (genvar q = 0; q < NQ; q++) begin : g_dq
       (* keep = "true" *) logic [15:0] q_a;    // the operands' page halves, [31:16]
@@ -5216,7 +5238,6 @@ module mmu_tlb
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
    wire [N-1:0] fm = f_match(f_vpn, f_asid);
    assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
-   logic [10:0] d_pfn0, d_pfn1;  logic [2:0] d_xwr0, d_xwr1;
    always_comb begin
       d_pfn0 = '0;  d_xwr0 = '0;  d_pfn1 = '0;  d_xwr1 = '0;  f_pfn = '0;  f_xwr = '0;
       for (int n = 0; n < N; n++) begin
@@ -5225,9 +5246,8 @@ module mmu_tlb
          f_pfn |= fm[n] ? e_pfn[n] : 11'd0;  f_xwr |= fm[n] ? e_xwr[n] : 3'd0;
       end
    end
-   assign d_pfn = d_c15 ? d_pfn1 : d_pfn0;
-   assign d_xwr = d_c15 ? d_xwr1 : d_xwr0;
-   assign d_hit = d_c15 ? |dm1 : |dm0;
+   assign d_hit0 = |dm0;
+   assign d_hit1 = |dm1;
    assign f_hit = |fm;
 
    // (timing) TLBWI / TLBINV write the entries the cycle AFTER they commit:
