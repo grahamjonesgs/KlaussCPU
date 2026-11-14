@@ -451,6 +451,15 @@ package klauss_pkg;
          ok = ok & ((a[i] ^ b[i] ^ k[i]) == ((a[i-1] & b[i-1]) | ((a[i-1] | b[i-1]) & ~k[i-1])));
       return ok;
    endfunction
+   // bits [n-1:0] of a + b + cin equal k[n-1:0] (n <= 16), carry-free
+   function automatic logic f_sum_eq(logic [15:0] a, logic [15:0] b, logic cin, logic [15:0] k, int n);
+      logic ok;
+      ok = ((a[0] ^ b[0] ^ k[0]) == cin);
+      for (int i = 1; i < 16; i++)
+         if (i < n)
+            ok = ok & ((a[i] ^ b[i] ^ k[i]) == ((a[i-1] & b[i-1]) | ((a[i-1] | b[i-1]) & ~k[i-1])));
+      return ok;
+   endfunction
    // (a + b)[31:16] == k, given c15 = the carry out of a[15:0] + b[15:0]
    function automatic logic f_pgeq(logic [31:0] a, logic [31:0] b, logic c15, logic [15:0] k);
       return f_sum_hi(a[31:16], b[31:16], k) && ((a[16] ^ b[16] ^ k[0]) == c15);

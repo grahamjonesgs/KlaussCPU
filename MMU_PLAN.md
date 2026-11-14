@@ -1123,9 +1123,10 @@ today. Debugger memory accesses use physical addresses.
 
 ### 11.4 Pipeline approach
 
-*As built (§11.5), the data lookup runs off the registered EA in the MPU's
+*As built (§11.5), the data lookup ran off the registered EA in the MPU's
 extra EX cycle instead of the base-register lookup with a MEM replay below;
-§11.5 says why.*
+§11.5 says why. Since §11.9 it runs in the op's first EX cycle on the EA's
+operands, with a carry-free compare (no adder, no replay).*
 
 **Decision (2026-11-09): look up the base register, not the EA.** In an
 out-of-context Vivado experiment on xc7a100t at 10 ns (32 entries; VPN,
@@ -1183,6 +1184,9 @@ base in EX, with the MEM replay above".
 ### 11.5 Pipeline (as built, stage 3: `7670218` onwards)
 
 - **Data lookup: the MPU's extra EX cycle, not the base-register replay.**
+  *(Superseded by §11.9 (2026-11-14): the lookup runs in the op's first EX
+  cycle on the EA's dispatch-time operands, with a carry-free CAM; only a
+  LEAVERET / MEMGET32 crossing a page takes one extra cycle.)*
   §11.4 chose a base-register lookup with a MEM replay on a page crossing.
   Stage 2 then built the extra EX cycle (`ex_mpu_hold`): the EA is
   registered (`ex_ea_q`) in the first cycle and the checks run from that
@@ -1283,6 +1287,8 @@ base in EX, with the MEM replay above".
 - **Cost** (60 randprog seeds, every page mapped; STATUS the only
   difference): TE = 1 +1.52 % supervisor, +1.87 % user; +2.17 % / +2.42 %
   with the hit-pipe model. MPU_EN = 1 on the same programs: +1.36 %.
+  Since §11.9 (`run.py tecost`, the same measurement): +0.43 % supervisor,
+  +0.66 % user (it measures +1.54 % / +1.90 % on `1dc3a55`).
 - **Tests**: `tests.py` `tlb_*` (SRs and ops, privilege, each segment,
   misses / permissions / ASID / G, TLBVEC, TLB_HI auto-load, two-access
   ops across pages, DOUBLE_FAULT, fetch through kseg / kmap / useg and its
@@ -1620,6 +1626,133 @@ MiB, and that a TLB miss parks as kind 2.
 - The worst paths are the long-standing families: `m_addr` →
   bus_splitter's READY → `pos` (+0.032) and the shifter → `ex_b_zero`
   (+0.034). Nothing in the worst 30 goes through the walker.
+
+
+### 11.9 Data TLB lookup in the first EX cycle (2026-11-14, branch `tlbx`)
+
+**Why.** With TE = 1 every memory instruction spent a second EX cycle
+(§11.5: the EA registered in `ex_ea_q`, the data CAM run from it in the
+next cycle). Native clang under Linux on the board (a zlib compile) showed
+`PERF_STALL_MULDIV` — which is `ex_busy` — at 987 M of 11.0 G cycles,
+nearly all of it that hold, against 826 M loads and stores.
+
+**Options.**
+- *Base-register lookup with a MEM replay on a page crossing* (§11.4). The
+  replay lives in MEM (the port engine, the hit pipe, posted and queued
+  stores, STLF: the tightest logic), and it is not rare: `a[i]` through
+  `[rs1 + rs2]` over an array larger than a page, or a large immediate,
+  crosses on every access past the first page.
+- *A micro-DTLB* keyed by the EA: still the EA adder in front of a compare
+  and a hit decision before the EX → MEM edge, and a micro-miss needs
+  either the extra cycle (on `ex_busy`, from that compare) or a replay.
+- *Translate in MEM, alongside the VIPT read*: the hit pipe's tag compare
+  in its first MEM cycle would wait for the CAM, and access faults must be
+  a registered bit at MEM entry (§7.1).
+- **Chosen: match the page of the EA's operands, carry-free.** The EA is
+  base + offset, both of which are known at dispatch. For a fixed entry
+  VPN `k`, "the page of a + b is k" needs no carry propagation: bit i of the
+  sum equals `k[i]` iff the carry into bit i is `a[i] ^ b[i] ^ k[i]`, and
+  with the sum known to be `k`, the carry out of bit i is
+  `(a[i] & b[i]) | ((a[i] | b[i]) & ~k[i])`, a function of bit i alone. So
+  page bits 17–31 are each one 6-input test (one LUT6) of `a`, `b` and `k`
+  at bits i and i − 1, and only bit 16 needs the page offset's carry c15
+  (`klauss_pkg::f_sum_hi` / `f_pgeq`). The CAM then has the depth of a
+  plain compare from registers.
+
+**Timing experiment** (out of context, xc7a100t-1 at 10 ns, as §11.4's:
+32 entries, VPN + registered `d_ok`, PFN and permission muxes into flops;
+data path, logic levels, LUTs; one placement each, about ±0.4 ns of noise):
+
+| Key | Data path | Levels | LUTs |
+|---|---|---|---|
+| a registered EA page (as built, §11.7) | 7.07 ns | 7 | 541 |
+| the EA adder in front (a + b → CAM) | 8.77 ns | 13 | 605 |
+| carry-free, c15 in each entry's match, 2 copies | 8.10 ns | 10 | 1,012 |
+| ... 4 copies | 7.75 ns | 10 | 1,053 |
+| carry-free, c15 selecting between two PFN muxes, 2 / 4 copies | 8.08 / 8.20 ns | 7 | 1,264 / 1,336 |
+
+The carry-free CAM is within about 0.7–1 ns of the registered key, the adder
+form 1.7 ns behind it. In every carry-free variant the worst path started
+at c15's carry chain.
+
+**As built.**
+- **Operands.** At dispatch (with the operand latches, `!mem_busy &&
+  !ex_busy`) the core registers the EA's base — SP for PUSH / POP / CALL /
+  RET / IRET / ENTER, 0 for `[imm]`, else rs1 (R15 for LEAVE / LEAVERET) —
+  and offset — −8 for PUSH / CALL / ENTER, the imm32 for `[rs1 + imm]` /
+  `[imm]`, rs2 for `[rs1 + rs2]`, else 0 — through the same forwarding as
+  `ex_a` / `ex_b` / `ex_sp` (`t_ta_d` / `t_tb_d`). The selects are id_op's
+  raw class / aluop / MODE fields, exact for every legal memory op (the
+  first build took them from `f_decode`'s uop: 15 levels). The core keeps
+  `ex_ta` / `ex_tb` (STLF); `mmu_tlb` keeps four copies of the page halves
+  (8 entries each) and one of the offset halves, for c15. Sub-word stores,
+  loads and DCBZ align down within the page, so base + offset has the
+  access's page. Simulation asserts `ex_ta + ex_tb` against the EA and the
+  CAM against the exact match on `tva`.
+- **CAM.** Each entry matches twice, assuming c15 = 0 and 1 (`dm0` / `dm1`),
+  into two PFN / XWR / hit muxes; `mmu_tlb` outputs both and c15 (a 16-bit
+  carry chain), and the core selects, merged with the segment and TE
+  selects of `h_addr` and `mem_iaddr`. `d_ok` stays registered (§11.7): the
+  first lookup after a TLB change is still several cycles later.
+- **EX.** `ex_mpu_hold` = MPU on (`mpu_q`: MPU_EN and TE = 0, all memory
+  ops, as before) or TE = 1 and `ex_txpg`: a LEAVERET or spanning MEMGET32
+  whose 2nd doubleword is in the next page. `ex_txpg` is registered at
+  dispatch from the rs1 forwarding candidates in parallel (the `ex_b_zero`
+  pattern; asserted equal to `ex_xpg`), so `ex_busy` still reads registers
+  only. Such an op translates its first page in its first cycle (kept in
+  `t1_*`) and, with the CAM copies and `ex_ea_q` stepped to the next page,
+  its second page in the second — one extra cycle instead of two. The
+  segment checks read the EA adder in the first cycle and `ex_ea_q` in the
+  second (`tva`). Faults, `mem_iaddr`, `mem_pa2hi` and the §7.1 fault slot
+  are as before.
+- **STLF.** The VA-page compares (the MEM store's `mem_eaddr`, `m_vahi`,
+  `sq_vahi` against the load's page) use the same carry-free form on
+  `ex_ta` / `ex_tb`, not `ex_ea_q`.
+- **Unchanged.** TE = 0 (and EXC_EN = 0) is cycle-identical to master
+  `1dc3a55`; the MPU keeps its extra cycle (MPU_EN = 1, off on the A7);
+  MEMGET32, LEAVERET and IRET still lose their early issue while TE = 1
+  (`!xlt_q`: the issue decision is on the EX → MEM enables, and a TLB fault
+  must not reach them); the walker, the fault priorities, EADDR, TLB_HI and
+  the two-access rule (both pages translated before either access).
+
+**Cost** (`run.py tecost`: 60 randprog seeds, every page mapped with global
+identity entries, STATUS the only difference; tb_vsim, latency 3):
+
+| | before (`1dc3a55`) | after | `+HIT=70` before | after |
+|---|---|---|---|---|
+| supervisor | +1.54 % | **+0.43 %** | +1.90 % | **+0.41 %** |
+| user | +1.90 % | **+0.66 %** | +2.21 % | **+0.84 %** |
+
+Of the remaining +0.43 %, about 0.27 points are MEMGET32 / LEAVERET / IRET's
+lost early issue (measured by forcing it on in simulation) and the rest the
+micro-ITLB and the final trap. With only crossing LEAVERET / MEMGET32 held,
+and those at a page's last doubleword, the hold is practically gone; on the
+board's clang run it was ~9 % of cycles.
+
+**Tests** (`tools/vsim/tests.py`): `tx_battery` (30 programs: random loads
+and stores at EAs within 0x100 of page boundaries through bases anywhere —
+other pages, several pages away, across 2^31 and 2^32 — in every mode and
+size, MEMGET32 at any alignment, operands produced 0 / 1 / 2+ instructions
+before, back-to-back runs; supervisor and user, latency 1 / 3 / 7 and the
+hit-pipe model; r5 folds every loaded value, r6 sweeps the windows through
+kseg), `tx_stack` (PUSH / POP / CALL / RET / ENTER / LEAVE with SP at a page
+start, LEAVERET crossing and not with R15 from an ALU op, a load or long
+before, MEMGET32 at each offset of a page's last doubleword), `tx_faults`
+(misses and permission faults in the EA's page with the base's mapped, an
+unmapped base page, kseg base into useg and the hole, useg base into kseg
+and MMIO in user mode, LEAVERET / MEMGET32 2nd and 1st page), `tx_stlf`
+(forwarding through other bases, same offset in another page, VA aliases,
+store runs), `tx_walk` (the walker refills the EA's page, not the base's).
+All pass on master too (they test the architecture); a mutation that drops
+c15 fails all of `tx_battery`, one that drops a push's −8 fails `tx_stack`.
+
+**Build** (standard `build_fast -resynth`):
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs |
+|---|---|---|---|---|---|---|
+| `tlbwalk_b1` (master) | `de0694d` | — | +0.032 / +0.036 | | 35,845 | 24,819 |
+| `tlbx_b1` | `ecffd7a` | carry-free CAM, c15 in each entry, selects from `f_decode` | −0.856 | (stopped) | | |
+| `tlbx_b2` | `cdffde2` | c15 selecting two PFN muxes; raw-field selects | −0.341 / +0.036 | −0.147 | 36,719 | 25,068 |
 
 ---
 

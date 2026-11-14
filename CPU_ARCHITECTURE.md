@@ -858,6 +858,9 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
   TLB with 64 KiB pages, kseg / kmap / useg, ASIDs and `TLBVEC` (§13.4).
   Off on core 2. With TE = 0, cycle-identical to stage 2 for code that does
   not write STATUS / ASID or execute TLB ops.
+- **Data TLB lookup in the first EX cycle (2026-11-14, branch `tlbx`):**
+  with TE = 1 a memory instruction no longer spends an extra EX cycle; the
+  CAM matches the page of base + offset carry-free (MMU_PLAN.md §11.9).
 - **Little-endian conversion fixes (April 2026, FSM era):** SETR64/PUSHV64
   high-word selection, LDIDX/STIDX 8/16/32 lane and byte-enable inversions,
   and null-terminated TXSTRMEM. The `.vh` task files they referred to are

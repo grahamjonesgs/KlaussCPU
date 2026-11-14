@@ -2478,10 +2478,25 @@ module pipeline_core
    // load.  A store to the SAME dword that does not cover keeps the load on
    // the slow path; a store to another dword of the line no longer does (it
    // changes only its own dword; the cache flags its line-write cycle).
+   // (timing, §11.9: every address compare below is carry-free on the EA's
+   // dispatch-time operands ex_ta / ex_tb, off the EA adder and the EA's
+   // uop mux — this was the core's worst path family, EA adder -> store-
+   // forward compare -> mem_h / mem_fq / mem_hok.  For the hit-pipe loads
+   // (LOAD / POP / LEAVE / RET, the only ones it serves) exo_iaddr[31:3] =
+   // (ex_ta + ex_tb)[31:3], asserted; the line / dword / page parts take the
+   // carries into bits 5, 3 and 16 of the operands' sum.)
+   wire [5:0]  ex_tlo5    = {1'b0, ex_ta[4:0]} + {1'b0, ex_tb[4:0]};
+   wire [3:0]  ex_tlo3    = {1'b0, ex_ta[2:0]} + {1'b0, ex_tb[2:0]};
+   function automatic logic f_sf_ln(logic [15:0] k);     // EA[15:5] == k[15:5]
+      return f_sum_eq({5'b0, ex_ta[15:5]}, {5'b0, ex_tb[15:5]}, ex_tlo5[5], {5'b0, k[15:5]}, 11);
+   endfunction
+   function automatic logic f_sf_dw(logic [15:0] k);     // EA[4:3] == k[4:3]
+      return f_sum_eq({14'b0, ex_ta[4:3]}, {14'b0, ex_tb[4:3]}, ex_tlo3[3], {14'b0, k[4:3]}, 2);
+   endfunction
    wire [7:0]  ex_ldmask  = (ex_d.uop != U_LOAD || ex_d.msz == 2'd3) ? 8'hFF
-                          : (ex_d.msz == 2'd2) ? (exo_iaddr[2] ? 8'hF0 : 8'h0F)
-                          : (ex_d.msz == 2'd1) ? (8'h03 << {exo_iaddr[2:1], 1'b0})
-                          :                      (8'h01 << exo_iaddr[2:0]);
+                          : (ex_d.msz == 2'd2) ? (ex_tlo3[2] ? 8'hF0 : 8'h0F)
+                          : (ex_d.msz == 2'd1) ? (8'h03 << {ex_tlo3[2:1], 1'b0})
+                          :                      (8'h01 << ex_tlo3[2:0]);
    // (stage 3, TE = 1: a store's port address is a PA and the load's a VA.
    // The block compares the page offset only — conservative for aliases.
    // A forward needs the youngest such store's VA page to equal the
@@ -2495,16 +2510,16 @@ module pipeline_core
    wire        sf_te      = EN_TLB && te;
    // (HW_PERF_PLAN §1: a DCBZ matches every dword of its line — it writes
    // them all — and, its data being 0 with byte enables FF, forwards zeros)
-   wire        sf_a       = mem_valid && mem_port_wr && mem_iaddr[15:5] == exo_iaddr[15:5] &&
-                            ((EN_DCBZ && mem_d.zl) || mem_iaddr[4:3] == exo_iaddr[4:3]) &&
-                            (sf_te || mem_iaddr[31:16] == exo_iaddr[31:16]);
-   wire        sf_b       = m_write_DV && m_addr[15:5] == exo_iaddr[15:5] &&
-                            ((EN_DCBZ && m_zl) || m_addr[4:3] == exo_iaddr[4:3]) &&
-                            (sf_te || m_addr[31:16] == exo_iaddr[31:16]);
+   wire        sf_a       = mem_valid && mem_port_wr && f_sf_ln(mem_iaddr[15:0]) &&
+                            ((EN_DCBZ && mem_d.zl) || f_sf_dw(mem_iaddr[15:0])) &&
+                            (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, mem_iaddr[31:16]));
+   wire        sf_b       = m_write_DV && f_sf_ln(m_addr[15:0]) &&
+                            ((EN_DCBZ && m_zl) || f_sf_dw(m_addr[15:0])) &&
+                            (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, m_addr[31:16]));
    // EN_SQ: the queued store (younger than the posted one on the port)
-   wire        sf_c       = EN_SQ && sq_v && sq_addr[15:5] == exo_iaddr[15:5] &&
-                            ((EN_DCBZ && sq_zl) || sq_addr[4:3] == exo_iaddr[4:3]) &&
-                            (sf_te || sq_addr[31:16] == exo_iaddr[31:16]);
+   wire        sf_c       = EN_SQ && sq_v && f_sf_ln(sq_addr[15:0]) &&
+                            ((EN_DCBZ && sq_zl) || f_sf_dw(sq_addr[15:0])) &&
+                            (sf_te || f_pgeq(ex_ta, ex_tb, ex_tc, sq_addr[31:16]));
    // (TE = 1) the youngest offset-matching store's VA page = the load's
    wire        sf_vaa     = f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]);
    wire        sf_vab     = m_vav && f_pgeq(ex_ta, ex_tb, ex_tc, m_vahi);
@@ -4737,6 +4752,11 @@ module pipeline_core
          assert (((ex_ta + ex_tb) >> 16) == {16'd0, exo_eaddr[31:16]})
             else $fatal(1, "ex_ta + ex_tb %h + %h != EA %h (pc %h uop %0d)", ex_ta, ex_tb,
                         exo_eaddr, ex_pc, ex_d.uop);
+      // ... and, for a hit-pipe load, its [31:3] (STLF's operand compares)
+      always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld)
+         assert ((32'(ex_ta + ex_tb) >> 3) == (exo_iaddr >> 3) && ex_tlo3[2:0] == exo_eaddr[2:0])
+            else $fatal(1, "ex_ta + ex_tb %h + %h != hit-pipe EA %h (pc %h)", ex_ta, ex_tb,
+                        exo_iaddr, ex_pc);
       // ... and f_pgeq is the page compare
       always_ff @(posedge clk) if (ce && !rst)
          assert (f_pgeq(ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]) ==
