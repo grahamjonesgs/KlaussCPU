@@ -560,6 +560,55 @@ RAMB18, `ic_tagsh` 1 RAMB36, the valid banks 32 × 2 RAM64M, `ic_tag`
   master, closure is in tier 2 and the margin is thin.  Not run on the
   board (the supervisor coordinates the board).
 
+### §5 additions from the emulator sweep (separate commits)
+
+The runtime session's sweep (klausscc `f8f9d95`) found two small items;
+they are separate commits after the I-cache, so either can be dropped.
+
+1. **`PERF_IC_MISS` (`3b96669`).**  `perf_ic[0]` mirrored the fill-issue
+   condition, so with TE = 1 it also counted each cycle of a micro-ITLB
+   refill (about 3 per micro-ITLB miss: roughly half the board's count)
+   and fake fills.  It is now registered at the issue that raises
+   `m_read_DV`.  New `PERF_ITLB_REFILL` (`0xF00D_0110`, MMIO_MAP): one
+   event per micro-ITLB refill.
+2. **Micro-ITLB, 4 entries tagged by TLB index (`112fc8b`).**  One entry,
+   emptied by every TLB write (every walker refill included), gave 53–60
+   micro-ITLB misses per 1k instructions; the model gave −30…55 % with 4
+   entries not emptied by unrelated writes.  Each entry filled from a
+   main-TLB hit carries that entry's index (`mmu_tlb` `f_idx`); a TLBWI or
+   walk writing index i (`w_idx`, known at its discard edge) drops only the
+   entries tagged i and the negative ones (a useg / kmap page the TLB did
+   not hold); TLBINV, MTSR ASID / STATUS, start and resume drop all, so no
+   entry outlives its main-TLB entry.  The drop happens on the discard edge
+   (the next registered lookup must see it) and a refill on that edge is
+   suppressed (it would read the old entry).  Refill into the entry holding
+   the page and mode, else an empty one, else round-robin; no second
+   request in the cycle after a refill (the old design refilled each miss
+   twice).  The lookup is still registers → four compares → `r_look_*`;
+   the I-cache tag compare reads registers only.  Tests: `ut_pingpong`
+   (2–4 code pages + main: one refill per page, none after warm-up; 5
+   pages thrash), `ut_walk_evict` (a walk to an unrelated entry and a
+   TLBWI to another index drop nothing; a walk overwriting A's entry
+   drops only A; a TLBWI remapping B takes effect on its next fetch), and
+   `ic32_remap`.  `ic32_prefetch` with TE = 1: 20 → 6 refills.  TE = 0 is
+   cycle-identical to `5bcf24e` (`diff` with `+TRACECYC`).
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| **`icache_b3`** | **`112fc8b`** | + items 1 and 2 | **+0.070 / +0.011** | — | 36,706 | 24,686 | 91 |
+
+- **Bitstream `112fc8b`** (`~/.cache/kbuild/icache_112fc8b.bit`, md5
+  `39fc03946d18cb1dbb6f7d2f26cf6c77`), build dir `~/.cache/kbuild/icache_b3`,
+  standard flow, **met in tier 1** (no tier 2, no alternate placement),
+  15 min 57 s, no Synth 8-4767.  The items cost +157 LUTs, +143 FFs.  Worst
+  paths: the hit pipe's H2 (`r_h_tag` → `wb_hext`, +0.070) and, new, the
+  valid bits' write enable (`if_req_dw` → `li_idx` → bank decode → a
+  bank's LUTRAM WE, +0.071): if it ever fails, set every valid bit through
+  the registered `vs_pend` path (one cycle later; `li_q` would then hold
+  the lookup two cycles).  The tier-1 / tier-2 difference between b2 and
+  b3 is placement, not the items (b2's violators were the MEM shifter
+  forward).
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -664,3 +713,7 @@ Decisions taken while implementing the frozen text above:
   ICACHE_INFO `0x0001_0000_2008_0001`); the §11.9 `f_sf_*` fix; standard
   flow tier 2 WNS +0.013 / WHS +0.021, `~/.cache/kbuild/icache_5bcf24e.bit`.
   Not yet run on the board.
+- 2026-11-15: §5 additions (PERF_IC_MISS fix + PERF_ITLB_REFILL; the
+  4-entry tagged micro-ITLB) on `icache`: `112fc8b`, standard flow tier 1
+  WNS +0.070 / WHS +0.011, `~/.cache/kbuild/icache_112fc8b.bit`.  Not yet
+  run on the board.

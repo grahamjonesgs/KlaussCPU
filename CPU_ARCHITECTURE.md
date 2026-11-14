@@ -751,7 +751,7 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 | Translation on (TE = 1): loads, stores, stack ops | none (the data TLB lookup runs in the instruction's first EX cycle, MMU_PLAN §11.9) |
 | TE = 1: MEMGET32 / LEAVERET whose second dword is in the next 64 KiB page | +1 EX cycle (the second page's lookup) |
 | TE = 1: MEMGET32 / LEAVERET / IRET | no early issue: the read goes out from MEM, a cycle later |
-| TE = 1: a fetch from a code page the micro-ITLB does not hold (micro-ITLB miss) | 3 cycles |
+| TE = 1: a fetch from a code page the micro-ITLB does not hold (micro-ITLB miss; 4 entries since HW_PERF_PLAN §5) | 3 cycles |
 | MPU on (MPU_EN = 1, TE = 0): every memory instruction | +1 EX cycle (the region check), and no early issue |
 
 Practical rules:
