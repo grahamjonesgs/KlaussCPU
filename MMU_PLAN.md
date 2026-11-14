@@ -1218,8 +1218,9 @@ base in EX, with the MEM replay above".
   +1.5 %.
 - **Fetch: a one-entry micro-ITLB.** {VPN, fetch mode, PA[31:16], verdict,
   miss}. It is read alongside the I-cache BRAM into `r_look_*`, so the
-  I-cache tag compare ({`r_look_pa`, VA[15:14]} against the stored PA tag;
-  VA[15:13] with the 8 KiB I-cache before HW_PERF_PLAN §2)
+  I-cache tag compare (`r_look_pa` = PA[31:16], the whole tag, against the
+  stored PA tag with the 64 KiB I-cache of HW_PERF_PLAN §5; {`r_look_pa`,
+  VA[15:14]} with the 16 KiB one of §2, VA[15:13] with the 8 KiB one before)
   reads registers only; the prefetch's compare too. A lookup whose page it
   does not cover (in the current fetch mode) stalls while `it_ref` refills
   it from the TLB's second (fetch) port in one cycle — a TLBP committing
@@ -1838,6 +1839,10 @@ the new assertions are X-safe in 4-state simulators, and `tx_kmap`,
   `ex_ta`, `ex_tb`, `ex_tlo5` / `ex_tlo3` to the functions as arguments, or
   make the three `always_comb`. (Until then xsim A/B runs of this branch
   against emulator goldens are not trustworthy; use Verilator, `tools/vsim`.)
+  **Done** on branch `icache` (HW_PERF_PLAN §5): the operands and carries
+  are arguments; the xsim `hello` run halts with the exact UART text, and
+  the same tree with the old functions reproduces the failure (53,187
+  instructions, UART differs).
 - Observation, not a regression (same on master): a supervisor `MEMGET32` at
   `0xFFFF_FFFD` (its 2nd doubleword wraps to VA 0) raises no fault with
   TE = 1, where page 0 is unmapped. User mode faults on the 1st doubleword's

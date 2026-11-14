@@ -738,7 +738,7 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 | SP user right after an SP writer (PUSH/POP/CALL/RET/ADDSP/…) | 1 bubble (the new SP is forwarded from MEM/WB) |
 | **MUL** | occupies EX 2 cycles; its result is usable 4 cycles after it issues |
 | DIV/MOD | occupies EX: setup + up to 64 steps (leading zeros of the dividend are skipped) |
-| Branch predicted **taken**, target in the branch-target cache | about 2 cycles beyond the branch's own slot; ~1 more when the target is the last word of a 16 B line |
+| Branch predicted **taken**, target in the branch-target cache | about 2 cycles beyond the branch's own slot; ~1 more when the target is the last word of a 32 B line (of a 16 B line before HW_PERF_PLAN §5) |
 | Branch predicted taken, target not cached | about 3–4 cycles (I-cache lookup) |
 | Branch predicted **not taken** | none |
 | Branch **mispredicted** | resolved in EX (JMPcc/CALL) or MEM (FBR): younger work squashed, ~6–7 cycles |
@@ -751,14 +751,15 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 | Translation on (TE = 1): loads, stores, stack ops | none (the data TLB lookup runs in the instruction's first EX cycle, MMU_PLAN §11.9) |
 | TE = 1: MEMGET32 / LEAVERET whose second dword is in the next 64 KiB page | +1 EX cycle (the second page's lookup) |
 | TE = 1: MEMGET32 / LEAVERET / IRET | no early issue: the read goes out from MEM, a cycle later |
-| TE = 1: a fetch from a code page other than the last one (micro-ITLB miss) | 3 cycles |
+| TE = 1: a fetch from a code page the micro-ITLB does not hold (micro-ITLB miss) | 3 cycles |
 | MPU on (MPU_EN = 1, TE = 0): every memory instruction | +1 EX cycle (the region check), and no early issue |
 
 Practical rules:
 - Put 1 independent instruction between a load and an ALU/compare/FBR use,
   2 before any other use.
 - Prefer 1-word forms in hot straight-line code (2-word ops cost ~0.25 extra).
-- Keep hot loop tops and branch targets off the last word of a 16 B line.
+- Keep hot loop tops and branch targets off the last word of a 32 B line
+  (of a 16 B line on the 16 KiB I-cache before HW_PERF_PLAN §5).
 - Prefer the fused branch to CMP + Jcc.
 - Don't put a narrow store and a wider load of the same doubleword within 2
   instructions of each other.
@@ -778,9 +779,17 @@ Practical rules:
 - **Return stack.** 4 entries. A taken CALL pushes its return address; a
   RET/LEAVERET with a non-empty stack is predicted and checked against the
   stack when the RET reaches MEM.
+- **I-cache.** 64 KiB direct-mapped, 32 B lines (2048 sets; index
+  VA[15:5], tag PA[31:16] — VIPT with 64 KiB pages), installed whole from
+  the D-cache's line answer; one valid bit per line; stores are snooped
+  per line (a store or DCBZ to a line holding code drops the whole line).
+  ICACHE_INV clears it in a 64-cycle sweep. `ICACHE_INFO` (MMIO_MAP.md)
+  reports the geometry. (HW_PERF_PLAN.md §2 / §5; 16 KiB of 16 B lines
+  before §5, core 2: 8 KiB of 16 B lines.)
 - **Fetch.** A 16 B window slides a dword per cycle from a 2-entry
-  next-line buffer that a background I-cache prefetch keeps one line ahead.
-  A BTIC-hit redirect starts the prefetch of the target's next line at once.
+  next-line buffer (16 B entries) that a background I-cache prefetch keeps
+  a line ahead. A BTIC-hit redirect starts the prefetch of the target's next
+  line at once.
 - **Load-hit pipe.** A DRAM load (LOAD/POP/LEAVE/RET) looks itself up in a
   read-only copy of the D-cache arrays as it enters MEM. A hit leaves MEM
   after one cycle with its data. A miss, or a conflict with a cache write in
@@ -858,6 +867,9 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
   TLB with 64 KiB pages, kseg / kmap / useg, ASIDs and `TLBVEC` (§13.4).
   Off on core 2. With TE = 0, cycle-identical to stage 2 for code that does
   not write STATUS / ASID or execute TLB ops.
+- **64 KiB I-cache with 32 B lines (2026-11-14, branch `icache`):** was
+  16 KiB of 16 B lines; lines installed whole from the D-cache; LUTRAM
+  valid bits cleared by a sweep (HW_PERF_PLAN.md §5).
 - **Data TLB lookup in the first EX cycle (2026-11-14, branch `tlbx`):**
   with TE = 1 a memory instruction no longer spends an extra EX cycle; the
   CAM matches the page of base + offset carry-free (MMU_PLAN.md §11.9).

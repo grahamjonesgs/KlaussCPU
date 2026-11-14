@@ -377,6 +377,189 @@ not be followed literally or left a detail open:
 - **MAL64 = 0.** Unchanged: a 64-bit access uses the doubleword aligned down.
 - **Feature bit.** `CPU_FEATURES[23]` = 1 means STATUS.MAL64 is implemented.
 
+## 5. I-cache 64 KiB direct-mapped, 32 B lines (2026-11-14, branch `icache`)
+
+**Why.** On native clang under Linux, instruction-fetch miss cycles were
+51–60 % of all cycles on the 16 KiB / 16 B I-cache.  The runtime session's
+emulator sweep (klausscc `f8f9d95`, the NLB modelled from `e242c1d`) chose
+64 KiB direct-mapped with 32 B lines: demand misses −65 % / −58 % on deflate /
+cxx, bytes filled −31 % / −16 %; 2-way was not worth its timing risk.
+
+**Geometry.** `pipeline_core` takes `IC_LINES` and `IC_LB` (16 or 32 bytes
+a line); core 1 is 2048 × 32 B (`CORE1_IC_LINES` = 2048, `CORE1_IC_LB` = 32
+in `KlaussCPU`; 1024 × 32 B = 32 KiB also elaborates and passes).  Index
+VA[15:5], tag PA[31:16] — at 64 KiB the tag is the PFN itself, and the
+index is the page offset, so VIPT needs nothing new (MMU_PLAN §11.1).
+`IC_LB` = 16 is the §2 design unchanged: core 2 (512 × 16 B) passes
+`IC_LB(16)` and its netlist is the same; `1024 × 16` is cycle-identical to
+master `e242c1d` (below).
+
+**ICACHE_INFO** (`0xF005_0018`, `CACHE_INFO`'s format) already has a
+line-size field (`[31:24]`): it reads `0x0001_0000_2008_0001` (64 KiB,
+32 B lines, 2048 sets, 1 way).  No format change.
+
+### §5 design
+
+- **Sub-lines.**  The front end — the 2-dword window, the two 16 B NLB
+  entries, the prefetch, the BTIC windows and the M12 position tracker —
+  keeps working in 16 B sub-lines (`ic_look_idx`, `ic_rd_idx`, `pf_line`);
+  only the arrays are indexed by the 32 B line (`ic_look_li`).  The
+  registered read holds the whole line, so a lookup of either half of the
+  line just read is current at once (`ic_rd_current` compares lines), a
+  hit serves the port's own triple for a 32 B line (the dword at
+  `miss_dw[1:0]` and the next one unless it is dword 3 — on 16 B lines an
+  odd dword had no successor), and a prefetch takes the half `pf_line[0]`
+  (`pf_rd_half`).  With NLB2 the prefetch still runs one 16 B entry, then
+  the next, ahead of the window: one new 32 B line ahead; the second
+  half of a line it has just read needs no new RAM read.
+- **Whole-line installs.**  A fill still asks the port for `miss_dw` and
+  serves the window from the port's answer (the D-cache's early restart on
+  a miss).  The I-cache installs the whole line from the D-cache's **line
+  answer**: `mem_read_write` registers the 32 B line of every CPU read it
+  answers (`o_cpu_line`, `o_cpu_line_v`): with the ready on a hit (CHECK),
+  or on a miss when the line has arrived (READ_WAIT's install — after the
+  early-restart ready).  It goes straight to the core (`m_line` /
+  `m_line_v`, no splitter select).  The core installs the first line
+  answer at or after its fill's ready (the cache is in order, so an earlier
+  request's answer always comes before that ready, a later one after).
+  Between the ready and the line (`lp_v`), the fill's own registers
+  (`if_req_dw`, `if_tghi`) hold its address, and no new fill issues
+  (`!lp_v`, and one cycle more after the install, `li_q`, so a held lookup
+  re-reads the line it missed instead of fetching it again).  MMIO and
+  fake fills install nothing.
+- **Writes racing an install.**  A store issued after the fill's ready
+  reaches the D-cache after the line was read.  So (a) the install is
+  dropped when a write to its PA line is on the port or in the store queue
+  as the line arrives (`lp_wrh`, registers only); (b) a store to the
+  pending line's PA is a snoop hit at issue (`sn_rc`): it clears that index
+  (covering an install landing on the store's own issue edge), kills the
+  BTIC entries of the line (a CALL's capture of the window served by the
+  fill — `ic32_smc_btic` fails without it), and does not post.
+  ICACHE_INV, `start` and debugger resume drop a pending install (a line
+  read before the fence).
+- **Valid bits: LUTRAM, one per line, flash clear by sweep.**  Every
+  install writes the whole line, so one bit per line says everything (no
+  per-dword presence).  2048 flip-flops with a one-cycle clear (the §2
+  design scaled) would have been ~3k LUTs of decode and read muxes and a
+  2048-way clear fanout — §2's tier-1 family.  Instead 32 banks of 64 × 1
+  LUTRAM (`g_vl`: RAM64M × 2 each, 256 LUTs), the bank = the index's high
+  bits, one shared write address and a write enable per bank, two
+  asynchronous reads (the lookup's, registered; the snoop's at `sn_pra`).
+  One write a cycle, by priority: the **sweep** (every bank at `ic_swa`, 0),
+  a **snoop clear** (`snoop_q`), a **valid set** (an install's, or a
+  deferred one, `vs_pend`).  A set that meets a clear of the same line is
+  dropped; one that meets another clear, or the sweep, waits (the latest
+  one).  The flash clear (reset, `start` / resume, ICACHE_INV) is a
+  64-cycle sweep during which every lookup misses; it is skipped when no
+  bit has been set since the last one (`vl_any`; configuration leaves the
+  LUTRAM 0).  Lines filled during a sweep miss once per 16 B half.
+- **Snoop.**  One tag shadow, `ic_tagsh` (2048 × 16, one RAMB36), read at
+  `sn_pra` = the store's line index; a store and a DCBZ each cover exactly
+  one I-cache line, so the §2 even / odd banks are gone and `f_snm` is an
+  equality.  Stores to the other half of a line holding code now drop the
+  whole line (it is refetched on next use).  The tag-shadow guard (`ri_v`)
+  tracks the line installs.
+- **BTIC.**  Entries record 32 B line indices; slot 1 is kept when it is in
+  the same 32 B line (base dword ≠ 3, was: even base).
+- **Unchanged.**  The micro-ITLB, its refill and the fake fills; the
+  walker / TLBWI discards (an install in flight still lands, physically
+  tagged); the window / NLB / ID / EX SMC checks; DCBZ's line semantics.
+
+### §5 deferred §11.9 fix
+
+`f_sf_ln` / `f_sf_dw` take `ex_ta`, `ex_tb` and the carries as arguments
+(MMU_PLAN §11.9's deferred note; netlist identical).  The xsim SoC run of
+`perf/m5a/hello` (`run_m5d_soc.sh`, which also gains `sd_native.sv`) now
+halts with the exact UART text; the same tree with the old functions
+halts after 53,187 instructions with a corrupted UART stream, as noted
+there.
+
+### §5 verification (tools/vsim)
+
+- **Cycle identity of the 16 B path.**  `VSIM_IC=1024x16` (the 16 KiB /
+  16 B I-cache) against master `e242c1d`: `diff` 40 seeds × latency 1 / 3 /
+  7 with `+TRACECYC` (every retire stamped with its cycle: identical), 30 ×
+  2 / 5 with IRQs, `+HIT=70`, `DEBUG_EN`, `MPU_EN`, `EXC_EN = 0` (core 2's
+  shape); `socdiff` 30 seeds and 20 with a 64 B span (identical traces and
+  PIPE_RUN cycles); and all 1379 master tests with identical cycle counts.
+- **New knobs.**  `VSIM_IC=<lines>x<bytes>` (tb_vsim and tb_soc);
+  tb_vsim answers each DRAM read with its line (`m_line_v`), with the
+  ready or `+LDLY` (+ random `+LDLYR`) cycles later, the line as it was
+  read, holding later DRAM requests meanwhile (MMIO passes); a
+  non-coherent writer at `0xF0FE_0000` / `_0008` (poke address / dword);
+  `+ICDBG` prints misses, installs, drops, sweeps and BTIC events; the
+  `.out` file has `ic_inst`, `ic_drop`, `ic_vdefer`, `ic_sweeps`; expected
+  values may be ranges.
+- **Directed tests** (`ic32_*`, all also run at 1024 × 32 and 1024 × 16):
+  `ic32_fill_dw` (a cold line entered at each dword, then from its start:
+  one miss a line); `ic32_prefetch` (straight code through 32 B lines and a
+  64 KiB page boundary, TE = 0 and TE = 1 with non-adjacent frames and a
+  decoy frame; a warm pass costs 80 cycles for 66 increments, 83 on 16 B
+  lines; TE = 1: 92 / 94); `ic32_snoop_half` (a 64 / 32 / 8-bit patch in
+  either half; a data store into the other half of a code line drops the
+  line); `ic32_dcbz` (any EA in the line, code in either half);
+  `ic32_icinv` (a non-coherent writer: old code until ICACHE_INV, the new
+  after; a fence meeting a pending install whose line arrives after the
+  sweep — fails if the fence keeps the install); `ic32_smc_pending` (a cold
+  function patching its own line before its line answer: fails without
+  `lp_wrh`); `ic32_smc_btic` (above: fails without the pending-line snoop);
+  `ic32_remap` (TLBWI and walker remaps of a code page, installs pending
+  at the discard); `ic32_loop48k` (below).  The §2 `ic16_*` tests and
+  `ic_counters` take geometry-dependent counts.
+- **Large footprint**: a 48 KiB loop, I-cache demand misses after 1 / 2 / 4
+  passes — 64 KiB / 32 B: 1538 / 1538 / 1538; 32 KiB / 32 B: 1538 / 2562 /
+  4610; 16 KiB / 16 B: 3076 / 6148 / 12292 (each equal to a direct-mapped
+  model of the geometry over the loop's lines).
+- **Random programs** against master (traces identical; tb_vsim at a fixed
+  memory latency, so every saved fill counts fully): `diff` −21 %
+  cycles, with IRQs −21 %, `+HIT=70` −22 %, `socdiff` (the real D-cache)
+  −17 % (−18 % with a 64 B data span) — these short programs are mostly
+  cold misses, half as many with 32 B lines.  The rest of the set
+  (`socmmio`, `socwalk`, `socx`, `socdcbz`, `tlbdiff` incl. `--walk`,
+  `--absent`, `--span`, `--irq`, TLB_N 4 / 8, `tlbpage`, `dcbzdiff` 200
+  seeds, `mpudiff`, `excdiff`, `dmtest`; `test` with DEBUG_EN, MPU_EN,
+  TLB_N = 16, TLB_WALK = 0, and with `+LDLY=3` / `+LDLY=1 +LDLYR=12
+  +HIT=50`) passes.  Under `+LDLY` two count/timing-only tests differ:
+  `exc_di_irq` livelocks at its fixed 60-cycle IRQ period when every read
+  is slower (master does the same at `+LAT=8`), and `ic16_icinv.1`'s
+  sweep-dependent miss count (517 / 518) is specified at the default timing.
+- **Mutation checks**: dropping ICACHE_INV's `lp_v` clear fails
+  `ic32_icinv` (a late line answer); dropping `lp_wrh` fails 18 SMC
+  tests; dropping the pending-line snoop (`sn_rc`) fails `ic32_smc_btic`.
+
+### §5 build (standard `build_fast -resynth`)
+
+A synth-only check came first (no Synth 8-4767; `ic_data` 14 RAMB36 + 1
+RAMB18, `ic_tagsh` 1 RAMB36, the valid banks 32 × 2 RAM64M, `ic_tag`
+192 RAM64M).
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `tlbx_b8` (master) | `db67f3f` | — | −0.014 / +0.017 | +0.018 / +0.017 | 37,200 | 25,192 | 80.5 |
+| `icache_b1` | `8939eb2` | 64 KiB / 32 B as first written | −0.176 / +0.023 | −0.011 (not met) | 36,944 | 24,615 | 91 |
+| **`icache_b2`** | **`5bcf24e`** | the core's reset off the install; the install index unconditional | −0.047 / +0.021 | **+0.013 / +0.021** | 36,549 | 24,543 | 91 |
+
+- **`icache_b1`.**  Tier 1's worst (−0.176, six of eight endpoints) was the
+  new logic: the top's reset (`w_pip_hold_rst`, fanout 2225) → `li_now`
+  (it carried `ce && !rst` for the valid-bit block) → `ev_icinst_idx`'s mux
+  → the 64 BTIC kill compares → `bt_v`.  Fixed by design in `5bcf24e`
+  (identical behaviour): `li_now` reads neither, and `ev_icinst_idx` is
+  `li_idx` (registers) whenever lines are 32 B.  The rest was the
+  long-standing shifter → `ex_b_zero` path, where tier 2 stopped (−0.011).
+- **Release bitstream `5bcf24e`** (`~/.cache/kbuild/icache_5bcf24e.bit`,
+  md5 `6a7daffb7c3f711803fdb8bf95f4a71f`), build dir
+  `~/.cache/kbuild/icache_b2`: tier 1 −0.047 (two endpoints, the MEM
+  shifter → multiplier-input forward), **tier 2 AlternateFlowWithRetiming
+  WNS +0.013 / TNS 0, WHS +0.021 / THS 0**, 20 min 3 s; no alternate
+  placement.  36,549 LUTs (3,849 as memory), 24,543 FFs, **91 BRAM tiles
+  (+10.5 over master's 80.5)**, 19 DSPs.  −651 LUTs and −649 FFs against
+  master: the 1024 per-line valid flip-flops and their decode went to 256
+  LUTs of LUTRAM; +384 LUTs as memory (the 2048-entry fetch tag).  Worst
+  paths left: the MEM shifter → `mul_pipe1` input (+0.013), the hit pipe's
+  H2 `r_h_tag1` → `wb_hext` (+0.068) — none through the I-cache.  As for
+  master, closure is in tier 2 and the margin is thin.  Not run on the
+  board (the supervisor coordinates the board).
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -476,3 +659,8 @@ Decisions taken while implementing the frozen text above:
   `a5d20f2` (EI raw-bit match, the core's ready off the ownership mux):
   tier 1 WNS +0.016 / WHS +0.024, `~/.cache/kbuild/perf-hw_a5d20f2.bit`
   (§2 timing after the CALL-squash fix). Not yet run on the board.
+- 2026-11-14: §5 64 KiB I-cache with 32 B lines on branch `icache`
+  (pipeline_core, mem_read_write, KlaussCPU, core2_subsys parameters;
+  ICACHE_INFO `0x0001_0000_2008_0001`); the §11.9 `f_sf_*` fix; standard
+  flow tier 2 WNS +0.013 / WHS +0.021, `~/.cache/kbuild/icache_5bcf24e.bit`.
+  Not yet run on the board.

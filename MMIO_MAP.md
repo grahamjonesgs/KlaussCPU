@@ -320,7 +320,7 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | 0x0000  | `CACHE_CTRL`         | W  | 4     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). `[3]` ICACHE_INV — fence.i: the core drops its whole I-cache, prefetch buffer and fetch window and refetches everything after the store (see below). Reads as 0. |
 | 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_2004_0002` (2 ways, 1024 sets, 32 B/line, 64 KB total). |
 | 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
-| 0x0018  | `ICACHE_INFO`        | R  | 64    | Read-only geometry of core 1's fetch I-cache, in `CACHE_INFO`'s format (`[7:0]` ways, `[23:8]` sets, `[31:24]` line bytes, `[63:32]` total bytes). Current build: `64'h0000_4000_1004_0001` (direct-mapped, 1024 sets, 16 B/line, 16 KiB; HW_PERF_PLAN.md §2). Reads 0 on older bitstreams (8 KiB I-cache, 512 sets). Build parameter `CORE1_IC_LINES`. |
+| 0x0018  | `ICACHE_INFO`        | R  | 64    | Read-only geometry of core 1's fetch I-cache, in `CACHE_INFO`'s format (`[7:0]` ways, `[23:8]` sets, `[31:24]` line bytes, `[63:32]` total bytes). Current build: `64'h0001_0000_2008_0001` (direct-mapped, 2048 sets, 32 B/line, 64 KiB; HW_PERF_PLAN.md §5). The 16 KiB bitstreams (HW_PERF_PLAN.md §2) read `64'h0000_4000_1004_0001` (1024 sets, 16 B/line). Reads 0 on older bitstreams (8 KiB I-cache, 512 sets, 16 B lines). Build parameters `CORE1_IC_LINES`, `CORE1_IC_LB`. Software that walks code by I-cache line must take the line size from `[31:24]`. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line (including DCBZ hits). |
@@ -338,7 +338,10 @@ to manage rollover. Reset values: all zero. Counters are not affected by
 completing store with bit 3 set: it invalidates every fetch-side code copy
 (I-cache, next-line prefetch buffer, fetch window) and squashes/refetches
 every younger in-flight instruction, so the instruction after the store
-already sees memory as written. CPU stores are snooped into the I-cache per
+already sees memory as written. (With the 64 KiB I-cache, HW_PERF_PLAN.md
+§5, the I-cache's valid bits are cleared by a 64-cycle sweep, during which
+fetch runs uncached from the D-cache; it is skipped when nothing is
+cached.) CPU stores are snooped into the I-cache per
 line anyway; use the fence when code arrives from a **non-snooping writer**
 (blitter or LiteEth DMA, core 2) and as a loader's final step before jumping
 to new code. For DMA-written code, also make the data cache consistent first
