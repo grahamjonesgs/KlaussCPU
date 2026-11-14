@@ -1690,10 +1690,17 @@ at c15's carry chain.
   access's page. Simulation asserts `ex_ta + ex_tb` against the EA and the
   CAM against the exact match on `tva`.
 - **CAM.** Each entry matches twice, assuming c15 = 0 and 1 (`dm0` / `dm1`),
-  into two PFN / XWR / hit muxes; `mmu_tlb` outputs both and c15 (a 16-bit
-  carry chain), and the core selects, merged with the segment and TE
-  selects of `h_addr` and `mem_iaddr`. `d_ok` stays registered (§11.7): the
-  first lookup after a TLB change is still several cycles later.
+  into two PFN muxes and two "grants the access" ORs (R or W folded per
+  entry with `d_st` = `ex_mst`, so the fault logic reads one bit per
+  candidate: `t_dn` = `t_seg` ∨ (`t_tlbs` ∧ ¬`pok`)); `mmu_tlb` outputs
+  both and c15 (a 16-bit carry chain on one low-half copy), and the core
+  selects, merged with the segment and TE selects of `h_addr` and
+  `mem_iaddr`. The hit pipe takes both candidate pages (`h_pg0` /
+  `h_pg1`) and the carry (`h_c1`): `mem_read_write` registers both tags,
+  compares both with the tag it reads, and the carry selects the result
+  inside the valid bit's AND (no extra level after the tag read). `d_ok`
+  stays registered (§11.7): the first lookup after a TLB change is still
+  several cycles later.
 - **EX.** `ex_mpu_hold` = MPU on (`mpu_q`: MPU_EN and TE = 0, all memory
   ops, as before) or TE = 1 and `ex_txpg`: a LEAVERET or spanning MEMGET32
   whose 2nd doubleword is in the next page. `ex_txpg` is registered at
@@ -1705,9 +1712,15 @@ at c15's carry chain.
   segment checks read the EA adder in the first cycle and `ex_ea_q` in the
   second (`tva`). Faults, `mem_iaddr`, `mem_pa2hi` and the §7.1 fault slot
   are as before.
-- **STLF.** The VA-page compares (the MEM store's `mem_eaddr`, `m_vahi`,
-  `sq_vahi` against the load's page) use the same carry-free form on
-  `ex_ta` / `ex_tb`, not `ex_ea_q`.
+- **STLF.** Every address compare of store-to-load forwarding is carry-free
+  on `ex_ta` / `ex_tb`: the line (`[15:5]`, with the carry into bit 5),
+  the dword (`[4:3]`, carry into bit 3), with TE = 0 the page (c15), with
+  TE = 1 the VA-page checks against `mem_eaddr` / `m_vahi` / `sq_vahi`, and
+  the load's byte mask (`[2:0]`). Neither the EA adder nor the uop's EA
+  mux is on them any more — that path, EA adder → store-forward compare →
+  `mem_h` / `mem_fq` / `mem_hok`, was master's worst family (§11.7) and
+  the worst in `tlbx_b3`. Exact for the hit-pipe loads (the only ones
+  that forward; asserted); TE = 0 cycle-identical.
 - **Unchanged.** TE = 0 (and EXC_EN = 0) is cycle-identical to master
   `1dc3a55`; the MPU keeps its extra cycle (MPU_EN = 1, off on the A7);
   MEMGET32, LEAVERET and IRET still lose their early issue while TE = 1
@@ -1742,9 +1755,13 @@ before, MEMGET32 at each offset of a page's last doubleword), `tx_faults`
 unmapped base page, kseg base into useg and the hole, useg base into kseg
 and MMIO in user mode, LEAVERET / MEMGET32 2nd and 1st page), `tx_stlf`
 (forwarding through other bases, same offset in another page, VA aliases,
-store runs), `tx_walk` (the walker refills the EA's page, not the base's).
+store runs), `tx_walk` (the walker refills the EA's page, not the base's);
+`run.py socx` runs `tx_battery` through tb_soc (real D-cache and hit pipe)
+with the windows stored at TE = 0 first, so the translated loads hit
+cached lines through both carry candidates' tags.
 All pass on master too (they test the architecture); a mutation that drops
-c15 fails all of `tx_battery`, one that drops a push's −8 fails `tx_stack`.
+c15 fails all of `tx_battery`, one that drops a push's −8 fails `tx_stack`,
+one that ignores the hit pipe's carry candidate fails `socx`.
 
 **Build** (standard `build_fast -resynth`):
 
@@ -1753,6 +1770,25 @@ c15 fails all of `tx_battery`, one that drops a push's −8 fails `tx_stack`.
 | `tlbwalk_b1` (master) | `de0694d` | — | +0.032 / +0.036 | | 35,845 | 24,819 |
 | `tlbx_b1` | `ecffd7a` | carry-free CAM, c15 in each entry, selects from `f_decode` | −0.856 | (stopped) | | |
 | `tlbx_b2` | `cdffde2` | c15 selecting two PFN muxes; raw-field selects | −0.341 / +0.036 | −0.147 | 36,719 | 25,068 |
+| `tlbx_b3` | `cc02d52` | the carry select in the core, merged with `h_addr` / `mem_iaddr` | −0.150 / +0.016 | −0.021 | 37,710 | 25,031 |
+| `tlbx_b4` | `e9c4c80` | STLF compares carry-free on `ex_ta` / `ex_tb` | −0.421 / +0.031 | (−0.4) | 38,465 | 25,293 |
+| `tlbx_b5` | `298b933` | the hit pipe registers both carry candidates' tags; R / W folded per entry (`pok`) | −0.040 / +0.034 | −0.040 | 37,357 | 25,171 |
+
+- **What failed and why.** `tlbx_b1`: the operand copies' selects came
+  through `f_decode`'s uop (15 levels from `id_op`), and every CAM path
+  started with c15's carry chain and a 2 ns route to the entries. `b2`:
+  the CAM → two PFN muxes → select → `t_pahi` → `h_addr` → the hit pipe's
+  `r_h_tag` in `mem_read_write` (a long route to the cache's arrays).
+  `b3`: master's worst family, EA adder → the uop's EA mux → the
+  store-forward line compare → `mem_hok`, pushed over by the extra area,
+  and `r_h_tag` again. `b4` (the STLF family gone) placed worse in
+  general: CAM → `mem_xs_tlb` / `r_h_tag`, `mem_result`, `ex_b_zero`,
+  the dispatch copies, the hit pipe's H2 — the spread between placements
+  of near-identical netlists is about ±0.3 ns here. `b5`: three paths
+  within 0.04 ns: the long-standing WB forward → `ex_b_zero` (synthesis
+  had folded the zero test back onto `ex_b`'s forwarding mux), CAM →
+  `mem_xsq`, and EA adder → the uop's EA mux → the hit pipe's array index
+  (`r_h_tq1`).
 
 ---
 

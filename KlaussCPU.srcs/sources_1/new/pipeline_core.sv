@@ -2255,7 +2255,14 @@ module pipeline_core
    wire [15:0] d1_pahi = ex_x3 ? t1_pahi : t_pahi;
    wire ex_dn1   = ex_u1 || (ex_tchk ? d1_dn : (ex_mchk && mpu_d1));
    wire ex_dn2   = ex_u2 || (ex_tchk ? (ex_x3 && t_dn) : (ex_mchk && ex_x2c && mpu_d2));
-   wire ex_ufault = ex_dn1 || ex_dn2;
+   // (§11.9 timing: = ex_dn1 || ex_dn2, written as CAM-independent terms
+   // and one use of the TLB's 'grants' bit, so the carry select and the
+   // fault OR can share the last LUT)
+   wire ex_fa    = ex_u1 || ex_u2 ||
+                   (ex_tchk ? (ex_x3 ? (t1_dn || t_seg) : t_seg)
+                            : (ex_mchk && (mpu_d1 || (ex_x2c && mpu_d2))));
+   wire ex_fb    = ex_tchk && t_tlbs;
+   wire ex_ufault = ex_fa || (ex_fb && !(tlb_d_c15 ? tlb_d_pok1 : tlb_d_pok0));
    wire ex_xg    = !ex_tchk &&
                    (ex_dn1 ? (!ex_u1 && ex_mchk && mpu_dg1) : (!ex_u2 && ex_mchk && ex_x2c && mpu_dg2));
    // the reported access's kind: a TLB miss (cause 11/12), and whether it
@@ -2548,7 +2555,11 @@ module pipeline_core
    // that does not depend on it, = (EN_TLB && te) ? {t_pahi, VA[15:0]} : exo_iaddr)
    wire        h_tsel     = EN_TLB && te && t_tlbs;
    wire [15:0] h_alt      = (EN_TLB && te) ? (t_kseg ? {5'b0, tva[26:16]} : tva[31:16]) : exo_iaddr[31:16];
-   assign h_addr     = {h_tsel ? {5'b0, tlb_d_pfn} : h_alt, exo_iaddr[15:0]};
+   // (§11.9 timing: the page offset — the hit pipe's array index — from the
+   // operands' own 16-bit add, ex_tlo, off the EA's uop mux; = exo_iaddr's
+   // for the hit-pipe loads, asserted; [2:0] are unused there)
+   wire [15:0] h_off      = {ex_tlo[15:3], exo_iaddr[2:0]};
+   assign h_addr     = {h_tsel ? {5'b0, tlb_d_pfn} : h_alt, h_off};
    assign h_pg0      = h_tsel ? {5'b0, tlb_d_pfn0} : h_alt;
    assign h_pg1      = h_tsel ? {5'b0, tlb_d_pfn1} : h_alt;
    assign h_c1       = tlb_d_c15;
@@ -2867,6 +2878,11 @@ module pipeline_core
                       : (wb_ld_msz == 2'd0) ? wbz_ld[wb_ld_ea]
                       : (wb_ld_msz == 2'd1) ? (wbz_ld[{wb_ld_ea[2:1], 1'b0}] && wbz_ld[{wb_ld_ea[2:1], 1'b1}])
                       : (wb_ld_ea[2] ? &wbz_ld[7:4] : &wbz_ld[3:0]);
+   // (timing, §11.9 builds: kept, so synthesis does not fold ex_b_zero back
+   // into a zero test of ex_b's forwarding mux — tlbx_b5's worst path)
+   (* keep = "true" *) wire bz_mem = f_wz(id_w, mem_result_eff);
+   (* keep = "true" *) wire bz_rf  = f_wz(id_w, rf[dec.rs2]);
+   (* keep = "true" *)
    wire       wbz_fwd = (EN_MUL2 && wb_mdir) ? wbz_mul
                       : (EN_LD_FWD && wb_ld) ? wbz_ldx : f_wz(id_w, wb_value);
    flags_t wb_fval_eff;
@@ -4132,9 +4148,9 @@ module pipeline_core
                // each candidate reduced in parallel, the same select picks
                ex_b_zero  <= id_b_one ? 1'b0
                            : id_b_imm ? (id_var1 == 32'd0)
-                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? f_wz(id_w, mem_result_eff)
+                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? bz_mem
                            : (b_wb       && wb_rd    == dec.rs2) ? wbz_fwd
-                           : f_wz(id_w, rf[dec.rs2]);
+                           : bz_rf;
 
                // EX redirect: taken branch/call, RESET
                if (ex_valid && ex_redir) begin
@@ -4837,7 +4853,7 @@ module pipeline_core
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst)
-      assert (ex_mok == ex_mph)
+      assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2))
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
    // (§11.9) the dispatch-time page-crossing bit is ex_xpg
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
