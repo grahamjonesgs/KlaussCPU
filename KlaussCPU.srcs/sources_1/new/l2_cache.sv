@@ -41,9 +41,20 @@
 // when an entry is free.
 //////////////////////////////////////////////////////////////////////////////
 
+`ifndef L2_SPEC_DEF
+`define L2_SPEC_DEF 1'b1
+`endif
+`ifndef L2_XTRA_DEF
+`define L2_XTRA_DEF 0
+`endif
 module l2_cache #(
     parameter int WAYS   = 4,
-    parameter int L2_KIB = 128
+    parameter int L2_KIB = 128,
+    // measurement knobs (HW_PERF_PLAN §6; the defaults are the design):
+    // SPEC_EN = 0 drops the speculative lookup (hits in 4 cycles, not 3);
+    // HIT_XTRA adds cycles to every hit
+    parameter bit SPEC_EN  = `L2_SPEC_DEF,
+    parameter int HIT_XTRA = `L2_XTRA_DEF
 ) (
     inout  [15:0] ddr2_dq,
     inout  [ 1:0] ddr2_dqs_n,
@@ -303,6 +314,7 @@ module l2_cache #(
     endfunction
 
     logic r_served = 1'b0;              // ready given; ignore DV until it drops
+    logic [3:0] r_hx = '0;              // HIT_XTRA count
     wire  w_dv     = i_mem_read_DV | i_mem_write_DV;
 
     // decode registers (F_DEC)
@@ -413,7 +425,7 @@ module l2_cache #(
                     end
             F_DEC, F_VC0, F_VC1, F_VC2: begin
                         ta_addr = c_set;
-                        da_addr = {c_set, (f_st == F_DEC) ? 1'b0 : 1'b1};
+                        da_addr = {c_set, (f_st == F_DEC) ? ((HIT_XTRA > 0 && w_rd_hit) ? q_sec : 1'b0) : 1'b1};
                     end
             F_WK0, F_WK1, F_WK2: begin
                         ta_addr = r_walk_set;
@@ -551,7 +563,7 @@ module l2_cache #(
         ra_addr <= ra_next;
         // (a data-array write to the set read on this edge, or landing on
         // it, would make its data stale: the lookup is redone)
-        ra_ok   <= (f_st == F_IDLE) && f_in_ddr(ra_next) && r_en &&
+        ra_ok   <= SPEC_EN && (f_st == F_IDLE) && f_in_ddr(ra_next) && r_en &&
                    !(|db_we   && db_addr[SETW:1]   == ra_next[6 +: SETW]) &&
                    !(|r_db_we && r_db_addr[SETW:1] == ra_next[6 +: SETW]);
 
@@ -635,7 +647,10 @@ module l2_cache #(
 
             F_DEC: begin
                 if (!q_wr) begin
-                    if (w_rd_hit) begin
+                    if (w_rd_hit && HIT_XTRA > 0 && r_hx != 4'(HIT_XTRA)) begin
+                        r_hx <= r_hx + 4'd1;                  // (measurement only)
+                    end else if (w_rd_hit) begin
+                        r_hx <= 4'd0;
                         // read hit: the sector from the data output register
                         o_mem_read_data <= q_wide ? d_mux
                                                   : {2{d_mux[255 - 128*q_addr[4] -: 128]}};

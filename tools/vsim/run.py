@@ -302,7 +302,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     l2, l2w = l2_cfg()
     tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '') + \
           (f'_ic{ic[0]}x{ic[1]}' if ic else '') + ('' if l2 else '_nol2') + (f'_l2w{l2w}' if l2w != 4 else '') + \
-          ('_tbwt' if tb_wt else '')
+          ('_tbwt' if tb_wt else '') + \
+          ''.join(f'_{k}{os.environ[k]}' for k in ('VSIM_L2_SPEC', 'VSIM_L2_XTRA') if k in os.environ)
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -380,6 +381,10 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
         SOC_PROBED.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
+    # measurement knobs (HW_PERF_PLAN §6): VSIM_L2_SPEC=0 (4-cycle hits),
+    # VSIM_L2_XTRA=<n> (n more cycles a hit)
+    kn = [f'+define+L2_SPEC_DEF={os.environ["VSIM_L2_SPEC"]}'] if 'VSIM_L2_SPEC' in os.environ else []
+    kn += [f'+define+L2_XTRA_DEF={os.environ["VSIM_L2_XTRA"]}'] if 'VSIM_L2_XTRA' in os.environ else []
     if beh_ddr:
         defs = []
     elif 'CORE1_L2_EN' not in allsrc:
@@ -389,7 +394,7 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \
-          [os.path.join(src, n) for n in SOC_FILES if n in present] + \
+          kn + [os.path.join(src, n) for n in SOC_FILES if n in present] + \
           ([] if beh_ddr else [os.path.join(src, 'mig_model.sv')]) + \
           [os.path.join(src, 'tb_soc.sv'), os.path.join(src, 'unisim_stubs.v')]
     r = subprocess.run(cmd, capture_output=True, text=True)
