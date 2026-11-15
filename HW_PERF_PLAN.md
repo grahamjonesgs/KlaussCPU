@@ -1086,6 +1086,38 @@ RAMB36 + 18 RAMB18 as in `823b5ea`.  Then the standard `build_fast
   `20acd72938f9480b5df82303f4e0240f`), build dir `~/.cache/kbuild/btic_b3`.
   Not run on the board.
 
+### Review of review 3 (2026-11-15)
+
+- **Result**: no critical or major findings; board validation passed; QSPI
+  written 2026-11-15 (`btic_079d686`).
+- **Deferred minor 1 (latent, reasoned only).**  A branch that arms after
+  a non-speculative store's snoop of its own line, and is captured before
+  the store completes, records the old bytes.  Unreachable today: EN_ST1
+  stores are speculative and are squashed at the snoop by `sq_spec`, and a
+  non-speculative store is chained behind a load, so the branch arms
+  first.  A probe over 4,100 non-speculative snooping stores saw 0 such
+  arms.  Planned hardening for the next RTL build: a 1-bit "snoop
+  outstanding until `smc_st`" that blocks `bt_cap`, or a testbench
+  assertion.
+- **Deferred minor 2 (16 B lines only).**  The 16 B NLB kill has no
+  `pf_ik` equivalent, so a same-edge prefetch capture may stay valid.  Not
+  constructible (0 in 354 `btfuzz` runs).
+- **Monitor gaps.**  There is no content check of `bt_d0` / `bt_d1`
+  against memory (planned); the `ba_*` arm lookup matches by tag only.
+- **Gating fixes (tools only, no RTL change).**  (1) `tests.py`'s
+  `import run` (`short_cmprvw`) made a second copy of the module, so its
+  runs bypassed the BTIC gate; `main()` now registers this module as `run`
+  for every command (as 064cc78 did for `tlbpage`).  (2) Vacuity gates:
+  a command fails when BTIC hits happened but the coverage monitor checked
+  zero entries and skipped none for an unknown PA (runs with no BTIC
+  activity, e.g. `BTIC_EN=0` or tiny tests, have hits = 0 and are
+  unaffected; aggregated over the command, since one short run may hit
+  without a checkable entry).  `build_soc` now fails if the tb_soc probe's
+  signal-name test fails on the current sources (it was a silent skip),
+  and a probed `tb_soc` run that prints no `BTPROBE` line fails.
+  `btic_pau` (entries skipped because TE = 1 and the PA is unknown) is in
+  the printed summary and the tb_soc `BTPROBE` line.
+
 
 ## CPU_FEATURES additions
 

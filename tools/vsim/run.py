@@ -187,7 +187,7 @@ BTIC_PROBE = r"""
    // ---- BTIC check probe (tools/vsim/run.py) ----
    localparam int BTP_LW = %(lw)d;
    localparam int BTP_TS = %(ts)d;
-   longint btp_unc = 0, btp_chk = 0, btp_hits = 0, btp_stale = 0, btp_noarm = 0;
+   longint btp_unc = 0, btp_pau = 0, btp_chk = 0, btp_hits = 0, btp_stale = 0, btp_noarm = 0;
    logic [28:0] btp_pt [0:63], btp_pb [0:63], btp_pl [0:63];
    logic [28:0] btp_vt [0:63], btp_vb [0:63], btp_vl [0:63];
    logic [63:0] btp_pk = '0, btp_mv = '0;
@@ -226,7 +226,7 @@ BTIC_PROBE = r"""
             btp_pt[k] = pt[28:0];  btp_pb[k] = pb[28:0];  btp_pl[k] = pl[28:0];
             btp_vt[k] = %(c)s.bt_base[k];  btp_vb[k] = %(c)s.bt_tag[k][29:1];  btp_vl[k] = vl;
             btp_pk[k] = ok_t && ok_b && ok_l;
-            if (btp_pk[k]) btp_chk++;
+            if (btp_pk[k]) btp_chk++; else btp_pau++;
          end
          btp_mv[k] = %(c)s.bt_v[k];  btp_mb[k] = %(c)s.bt_base[k];  btp_mt[k] = %(c)s.bt_tag[k];
          if (%(c)s.bt_v[k] && btp_pk[k] &&
@@ -241,7 +241,7 @@ BTIC_PROBE = r"""
       end
    end
    final begin
-      $display("BTPROBE btic_chk=%%0d btic_hits=%%0d", btp_chk, btp_hits);
+      $display("BTPROBE btic_chk=%%0d btic_hits=%%0d btic_pau=%%0d", btp_chk, btp_hits, btp_pau);
       if (btp_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%%0d (a valid BTIC entry's line not in the tag shadow)", btp_unc);
       if (btp_stale != 0) $display("TB: FATAL BTIC currency: btic_stale=%%0d (a BTIC hit's window not at the branch's target)", btp_stale);
       if (btp_noarm != 0) $display("TB: FATAL BTIC check: btic_noarm=%%0d (an entry written without its arm)", btp_noarm);
@@ -249,10 +249,11 @@ BTIC_PROBE = r"""
 """
 
 BTIC_FAILS = []      # runs whose BTIC coverage check failed (main() exits non-zero)
-BTIC_STATS = {'runs': 0, 'chk': 0, 'hits': 0}   # what the checks saw (printed at exit)
+BTIC_STATS = {'runs': 0, 'chk': 0, 'hits': 0, 'pau': 0}   # what the checks saw (printed at exit)
 # a run fails the BTIC gate on: the coverage count, the currency count, an
 # entry without its arm (the TB's FATAL lines), or the core's own BTIC
 # assertion (it stops the run: no result file)
+SOC_PROBED = set()   # tb_soc executables built with the BTIC probe (a run of one must print BTPROBE)
 BTIC_FATAL = ('FATAL BTIC', 'BTIC base != target', 'pos0 unsound')
 
 
@@ -266,6 +267,7 @@ def _btic_note(name, st, log, gate=True):
         BTIC_STATS['runs'] += 1
         BTIC_STATS['chk'] += int(st.get('btic_chk', 0))
         BTIC_STATS['hits'] += int(st.get('btic_hits', 0))
+        BTIC_STATS['pau'] += int(st.get('btic_pau', 0))
         if bad:
             BTIC_FAILS.append(name)
     return bad and gate
@@ -323,16 +325,24 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     if rev is None and 'wk_fin' in allsrc:
         k = tb.rindex('endmodule')
         tb = tb[:k] + WK_PROBE + tb[k:]
+    probed = False
     lines, lb = ic if ic else (2048, 32)
     if 'lp_pa' in allsrc and 'ic_tagsh' in allsrc:      # (review 3: both line sizes)
         k = tb.rindex('endmodule')
         lw = 2 if lb == 32 else 1
         tb = tb[:k] + BTIC_PROBE % {'c': 'dut.pipeline_core_i', 'lw': lw, 'ts': (lines - 1).bit_length() + lw} + tb[k:]
+        probed = True
+    elif rev is None and 'bt_base' in allsrc:
+        # the current revision has a BTIC but the signal-name test failed
+        # (a renamed signal): a silent skip would make every BTIC check vacuous
+        raise SystemExit('tb_soc BTIC probe skipped: lp_pa / ic_tagsh not found in the current sources')
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_soc')
     stamp = os.path.join(d, 'stamp')
+    if probed:
+        SOC_PROBED.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
@@ -363,9 +373,12 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True):
     args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
     r = subprocess.run(args, capture_output=True, text=True, cwd=d, timeout=timeout)
     st = {}
-    m = re.search(r'BTPROBE btic_chk=(\d+) btic_hits=(\d+)', r.stdout)
+    m = re.search(r'BTPROBE btic_chk=(\d+) btic_hits=(\d+) btic_pau=(\d+)', r.stdout)
     if m:
-        st = {'btic_chk': m.group(1), 'btic_hits': m.group(2)}
+        st = {'btic_chk': m.group(1), 'btic_hits': m.group(2), 'btic_pau': m.group(3)}
+    elif exe in SOC_PROBED and gate and r.returncode == 0 and 'HALTED' in r.stdout:
+        # the probe was built in but printed nothing: its checks did not run
+        BTIC_FAILS.append(name + ' (no BTPROBE line)')
     if _btic_note(name, st, r.stdout + r.stderr, gate):
         print(f'FAIL {name}: BTIC check (tb_soc probe)')
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
@@ -1835,11 +1848,22 @@ def main():
         # expectation of every run with 32 B lines (tb_vsim and tb_soc)
         if BTIC_STATS['runs']:
             print(f'BTIC checks: {BTIC_STATS["chk"]} entries checked, {BTIC_STATS["hits"]} hits checked '
-                  f'in {BTIC_STATS["runs"]} gated run(s)')
+                  f'in {BTIC_STATS["runs"]} gated run(s); {BTIC_STATS["pau"]} entries skipped (TE=1, PA unknown)')
+        # Vacuity rule: BTIC hits happened but the coverage monitor checked no
+        # entry at all (and none was skipped for an unknown PA, which is the one
+        # legitimate reason).  Runs with no BTIC activity (BTIC_EN=0, tiny
+        # tests: hits == 0) are not affected.  Aggregated over the command, as
+        # a single short run may hit without a checkable entry.
+        if BTIC_STATS['hits'] > 0 and BTIC_STATS['chk'] == 0 and BTIC_STATS['pau'] == 0:
+            print('BTIC gate: hits but zero entries checked (vacuous coverage check)')
+            sys.stdout.flush(); os._exit(1)
         if BTIC_FAILS:
             print(f'BTIC coverage check failed in {len(BTIC_FAILS)} run(s): {" ".join(BTIC_FAILS[:10])}')
-            os._exit(1)
+            sys.stdout.flush(); os._exit(1)
     atexit.register(_btic_gate)
+    # tests.py's (and tlbpage's) `import run` must get THIS module, not a second copy run as __main__
+    # that would bypass the BTIC gate state (BTIC_FAILS / BTIC_STATS)
+    sys.modules.setdefault('run', sys.modules[__name__])
     if a.cmd == 'build':
         print(build(a.rev))
     elif a.cmd == 'test':
