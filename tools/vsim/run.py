@@ -23,7 +23,8 @@ sys.path.insert(0, HERE)
 
 def git_show(rev, path):
     rel = os.path.relpath(path, ROOT)
-    return subprocess.check_output(['git', '-C', ROOT, 'show', f'{rev}:{rel}'], text=True)
+    return subprocess.check_output(['git', '-C', ROOT, 'show', f'{rev}:{rel}'], text=True,
+                                   stderr=subprocess.DEVNULL)
 
 
 def ic_geom():
@@ -124,7 +125,19 @@ SOC_FILES = ['klauss_pkg.sv', 'membus_if.sv', 'mmio_if.sv', 'pipeline_core.sv', 
              'aes_sbox.sv', 'ghash.sv', 'sha256_core.sv', 'trng.sv', 'blitter_dma.sv',
              'eth_mmio_bridge.sv', 'Seven_seg_LED_Display_Controller.sv', 'SPI_Master.sv',
              'SPI_Master_With_Single_CS.sv', 'RGB_LED.sv', 'vga_timing.sv', 'vga_scanout.sv',
-             'vga_ctrl.sv', 'uart_tx.sv', 'KlaussCPU.sv']
+             'vga_ctrl.sv', 'uart_tx.sv', 'ddr2_control.sv', 'l2_cache.sv', 'KlaussCPU.sv']
+# HW_PERF_PLAN §6: tb_soc's DDR is the behavioural MIG behind the real
+# ddr2_control / l2_cache (older revisions' tb_soc has a behavioural
+# ddr2_control instead: then neither ddr2_control.sv nor the MIG model)
+SIM_MIG = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'mig_model.sv')
+# a run whose tb_soc consistency checker saw a wrong read answer
+CONS_FATAL = 'FATAL consistency'
+
+
+def l2_cfg():
+    """VSIM_L2=0: build tb_soc without the L2 (CORE1_L2_EN = 0, ddr2_control);
+    VSIM_L2_WAYS=<n>: the L2's ways (HW_PERF_PLAN §6)"""
+    return os.environ.get('VSIM_L2', '1') != '0', int(os.environ.get('VSIM_L2_WAYS', '4'))
 ODDR_STUB = '''module STARTUPE2 #(parameter PROG_USR = "FALSE", parameter real SIM_CCLK_FREQ = 0.0)
    (output CFGCLK, output CFGMCLK, output EOS, output PREQ, input CLK, input GSR, input GTS,
     input KEYCLEARB, input PACK, input USRCCLKO, input USRCCLKTS, input USRDONEO, input USRDONETS);
@@ -253,6 +266,8 @@ BTIC_STATS = {'runs': 0, 'chk': 0, 'hits': 0, 'pau': 0}   # what the checks saw 
 # a run fails the BTIC gate on: the coverage count, the currency count, an
 # entry without its arm (the TB's FATAL lines), or the core's own BTIC
 # assertion (it stops the run: no result file)
+CONS_FAILS = []
+CONS_STATS = {'runs': 0, 'n': 0}
 SOC_PROBED = set()   # tb_soc executables built with the BTIC probe (a run of one must print BTPROBE)
 BTIC_FATAL = ('FATAL BTIC', 'BTIC base != target', 'pos0 unsound')
 
@@ -279,8 +294,9 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     crypto_full: KlaussCPU with every optional crypto block (the default
     build is the lean A7 one)."""
     ic = ic_geom()
+    l2, l2w = l2_cfg()
     tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '') + \
-          (f'_ic{ic[0]}x{ic[1]}' if ic else '')
+          (f'_ic{ic[0]}x{ic[1]}' if ic else '') + ('' if l2 else '_nol2') + (f'_l2w{l2w}' if l2w != 4 else '')
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -304,6 +320,13 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         allsrc += t
     tbp = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'tb_soc.sv')
     tb = git_show(rev, tbp) if rev else open(tbp).read()
+    beh_ddr = 'module ddr2_control' in tb          # an older tb_soc: its own DDR model
+    if beh_ddr:
+        present = [n for n in present if n not in ('ddr2_control.sv', 'l2_cache.sv')]
+    else:
+        mig = git_show(rev, SIM_MIG) if rev else open(SIM_MIG).read()
+        open(os.path.join(src, 'mig_model.sv'), 'w').write(mig)
+        allsrc += mig
     # report the cycle count at HALTED (for real-cache A/B timing)
     tb = tb.replace('$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);',
                     '$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes, t=%0d", icount, uart_n, runcyc);')
@@ -317,6 +340,10 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     ic = ic_geom()   # VSIM_IC (HW_PERF_PLAN §5): core 1's I-cache geometry
     if ic and 'CORE1_IC_LB' in allsrc:
         ov.append(f'.CORE1_IC_LINES({ic[0]}), .CORE1_IC_LB({ic[1]})')
+    if 'CORE1_L2_EN' in allsrc:
+        ov.append(f".CORE1_L2_EN(1'b{int(l2)}), .CORE1_L2_WAYS({l2w})")
+    elif not l2 and not beh_ddr:
+        raise SystemExit('VSIM_L2=0 on a revision without CORE1_L2_EN')
     elif ic and ic != (1024, 16):
         raise SystemExit(f'VSIM_IC={ic[0]}x{ic[1]}: this revision has only the 16 KiB / 16 B I-cache')
     if ov:
@@ -345,10 +372,12 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         SOC_PROBED.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
+    defs = [] if (beh_ddr or l2) else ['+define+DDRPATH=g_ddr.ddr2_control']
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
-           '-I' + src, '-Mdir', os.path.join(d, 'obj')] + \
+           '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \
           [os.path.join(src, n) for n in SOC_FILES if n in present] + \
+          ([] if beh_ddr else [os.path.join(src, 'mig_model.sv')]) + \
           [os.path.join(src, 'tb_soc.sv'), os.path.join(src, 'unisim_stubs.v')]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -358,7 +387,7 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     return exe
 
 
-def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True):
+def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True, plus=()):
     """image: an Asm (assembled into a boot image) or a .mem path"""
     d = os.path.join(WORK, 'socruns', name)
     os.makedirs(d, exist_ok=True)
@@ -370,7 +399,8 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True):
     # The retire trace is ~400 B per instruction: only when asked for (a
     # long program's trace once filled the disk).
     tr = f'{d}/soc.trace' if trace else '/dev/null'
-    args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
+    args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else []) + \
+        list(plus or ()) + [x for x in os.environ.get('VSIM_SOC_PLUS', '').split() if x]
     r = subprocess.run(args, capture_output=True, text=True, cwd=d, timeout=timeout)
     st = {}
     m = re.search(r'BTPROBE btic_chk=(\d+) btic_hits=(\d+) btic_pau=(\d+)', r.stdout)
@@ -381,6 +411,14 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True):
         BTIC_FAILS.append(name + ' (no BTPROBE line)')
     if _btic_note(name, st, r.stdout + r.stderr, gate):
         print(f'FAIL {name}: BTIC check (tb_soc probe)')
+    if gate and CONS_FATAL in r.stdout + r.stderr:
+        # HW_PERF_PLAN §6: the memory-consistency checker (L2 + DDR = memory)
+        CONS_FAILS.append(name)
+        print(f'FAIL {name}: memory consistency (tb_soc checker)')
+    m = re.search(r'consistency checks=(\d+)', r.stdout)
+    if m and gate:
+        CONS_STATS['runs'] += 1
+        CONS_STATS['n'] += int(m.group(1))
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
             'uart': open(os.path.join(d, 'soc.uart'), 'rb').read().decode('latin-1')}
 
@@ -917,19 +955,21 @@ def cmd_socmmio(a):
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
-    if 'r2=0000000003f0200d' not in last:
+    l2, l2w = l2_cfg()
+    if f'r2=00000000{0x07F0200D if l2 else 0x03F0200D:08x}' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
     # §5: 1 way, 2048 sets, 32 B lines, 64 KiB — or VSIM_IC's geometry);
-    # 0xF005_0020 reads 0
+    # L2_INFO 0xF005_0020 and L2_CTRL 0xF005_0028 (§6; 0 without the L2)
     f = Asm(); f.setr(1, 0xF0050000)
-    f.ld(64, 2, 1, 8); f.ld(64, 3, 1, 0x18); f.ld(64, 4, 1, 0x20); f.halt()
+    f.ld(64, 2, 1, 8); f.ld(64, 3, 1, 0x18); f.ld(64, 4, 1, 0x20); f.ld(64, 5, 1, 0x28); f.halt()
     rf = run_soc(new, f, 'icinfo', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
     n, b = ic_geom() or (2048, 32)
     ici = f'{n * b:08x}{b:02x}{n:04x}01'
-    for want in ('r2=0001000020040002', f'r3={ici}', 'r4=0000000000000000'):
+    l2i = f'0002000040{128 * 1024 // 64 // l2w:04x}{l2w:02x}' if l2 else '0' * 16
+    for want in ('r2=0001000020040002', f'r3={ici}', f'r4={l2i}', f'r5={int(l2):016x}'):
         if want not in last:
             fails += 1
             print(f'CACHE_INFO / ICACHE_INFO: want {want}: ' + last[:200])
@@ -1692,19 +1732,36 @@ def cmd_soceth(a):
     return 1 if bad or not last else 0
 
 
+class _env:
+    """temporarily set environment variables (KEY=VAL strings)"""
+    def __init__(self, kvs):
+        self.kv = dict(x.split('=', 1) for x in (kvs or []))
+    def __enter__(self):
+        self.old = {k: os.environ.get(k) for k in self.kv}
+        os.environ.update(self.kv)
+    def __exit__(self, *e):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def cmd_socdiff(a):
     """random programs through the full SoC (real cache / bus splitter):
-    base rev vs working tree, retire traces must be identical"""
+    base rev vs working tree, retire traces must be identical.  --base wt:
+    the working tree as the base (with --base-env, e.g. VSIM_L2=0)"""
     import randprog
-    base = build_soc(a.base)
+    with _env(a.base_env):
+        base = build_soc(None if a.base == 'wt' else a.base)
     new = build_soc(None)
     fails = 0
     tb = tn = 0
     hits = {'base': 0, 'new': 0}      # BTIC hits (the probe's count)
     for sd in range(a.seed0, a.seed0 + a.seeds):
         asm = randprog.gen(sd, span=a.span)
-        rb = run_soc(base, asm, f'sd_b{sd}', trace=True, gate=False)
-        rn = run_soc(new, asm, f'sd_n{sd}', trace=True)
+        rb = run_soc(base, asm, f'sd_b{sd}', trace=True, gate=a.base == 'wt', plus=a.plus)
+        rn = run_soc(new, asm, f'sd_n{sd}', trace=True, plus=a.plus)
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
         t = [int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
@@ -1838,6 +1895,8 @@ def main():
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
+    sd.add_argument('--base-env', action='append', help='KEY=VAL for the base build (with --base wt)')
+    sd.add_argument('--plus', action='append', default=[], help='tb_soc plusarg for both runs (e.g. +MIGLAT=20)')
     sd.add_argument('--span', type=lambda v: int(v, 0), default=0x800,
                     help='data footprint of the random loads/stores (e.g. 64: same-line hazards)')
     a = p.parse_args()
@@ -1856,6 +1915,11 @@ def main():
         # a single short run may hit without a checkable entry.
         if BTIC_STATS['hits'] > 0 and BTIC_STATS['chk'] == 0 and BTIC_STATS['pau'] == 0:
             print('BTIC gate: hits but zero entries checked (vacuous coverage check)')
+            sys.stdout.flush(); os._exit(1)
+        if CONS_STATS['runs']:
+            print(f'Consistency checks: {CONS_STATS["n"]} answers checked in {CONS_STATS["runs"]} tb_soc run(s)')
+        if CONS_FAILS:
+            print(f'memory consistency check failed in {len(CONS_FAILS)} run(s): {" ".join(CONS_FAILS[:10])}')
             sys.stdout.flush(); os._exit(1)
         if BTIC_FAILS:
             print(f'BTIC coverage check failed in {len(BTIC_FAILS)} run(s): {" ".join(BTIC_FAILS[:10])}')

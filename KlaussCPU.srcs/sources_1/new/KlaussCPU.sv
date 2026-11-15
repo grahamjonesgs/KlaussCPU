@@ -50,6 +50,13 @@ module KlaussCPU #(
     // reports it.
     parameter int CORE1_IC_LINES = 2048,
     parameter int CORE1_IC_LB    = 32,
+    // the unified L2 between the D-cache's DDR arbiter and the MIG
+    // (l2_cache.sv, HW_PERF_PLAN.md §6): 128 KiB, 64 B lines of two 32 B
+    // sectors, CORE1_L2_WAYS ways (4 or 8).  L2_INFO (0xF005_0020), L2_CTRL
+    // (0xF005_0028), CPU_FEATURES[26], perf counters 0xF00D_0118 .. 0x0168.
+    // 0 = ddr2_control directly, the design before the L2.
+    parameter bit CORE1_L2_EN    = 1'b1,
+    parameter int CORE1_L2_WAYS  = 4,
     // Crypto blocks (CRYPTO_PLAN.md), optional build features; the TRNG is
     // always built.  An absent block's window reads 0 and ignores writes in
     // the normal MMIO time, and contributes no logic.  GCM needs AES, HMAC
@@ -425,6 +432,21 @@ module KlaussCPU #(
                                 && w_mmio_write_data[2];
    wire        w_cache_mnt_busy;
 
+   // L2_CTRL (0xF005_0028, HW_PERF_PLAN.md §6): [0] EN, [1] WBINV; a write
+   // (first cycle of the store's DV, byte 0 enabled) goes to the L2, which
+   // ignores it while BUSY.  CPU reset and program load re-enable it.
+   wire        w_l2_ctrl_dec = w_mmio_write_DV
+                             && (w_mmio_addr[27:16] == 12'h005)
+                             && (w_mmio_addr[15:0]  == 16'h0028)
+                             && w_mmio_byte_en[0];
+   logic       r_l2_ctrl_dec = 1'b0;
+   always_ff @(posedge i_Clk) r_l2_ctrl_dec <= w_l2_ctrl_dec;
+   wire        w_l2_ctrl_wr = w_l2_ctrl_dec && !r_l2_ctrl_dec;
+   wire        w_l2_en, w_l2_busy;
+   wire [63:0] w_l2_info;
+   wire [10:0] w_l2_ev;
+   logic [47:0] r_perf_l2 [11];      // 0xF00D_0118 + 8k (MMIO_MAP "L2 counters")
+
    // -------------------------------------------------------------------------
    // Performance counters (Tier 0/1/2) — exposed via MMIO 0xF00D_xxxx (see
    // MMIO_MAP.md "Performance counters"). Free-running; cleared by writing
@@ -637,12 +659,14 @@ module KlaussCPU #(
    wire [63:0] pip_m_wdata;
    wire [7:0]  pip_m_be;
    wire        pip_m_zl;
+   wire        pip_m_if;      // the port carries an I-cache fill (L2 counters)
    assign cpu_mem.write_DV      = w_pipe_owns ? pip_m_write_DV : st.mem_write_DV;
    assign cpu_mem.read_DV       = w_pipe_owns ? pip_m_read_DV  : st.mem_read_DV;
    assign cpu_mem.addr          = w_pipe_owns ? pip_m_addr     : st.mem_addr;
    assign cpu_mem.write_data    = w_pipe_owns ? pip_m_wdata    : st.mem_write_data;
    assign cpu_mem.byte_en       = w_pipe_owns ? pip_m_be       : st.mem_byte_en;
    assign cpu_mem.zero_line     = w_pipe_owns && pip_m_zl;
+   assign cpu_mem.ifetch        = w_pipe_owns && pip_m_if;
    assign w_mem_read_data       = cpu_mem.read_data;
    assign w_mem_read_data_next  = cpu_mem.read_data_next;
    assign w_mem_next_valid      = cpu_mem.next_valid;
@@ -732,6 +756,7 @@ module KlaussCPU #(
       .m_wdata    (pip_m_wdata),
       .m_be       (pip_m_be),
       .m_zl       (pip_m_zl),
+      .m_if       (pip_m_if),
       .m_rdata    (w_mem_read_data),
       .m_rdata_dram (dram_mem.read_data),
       .h_addr     (w_h_addr),
@@ -1246,6 +1271,8 @@ module KlaussCPU #(
                16'h0008: r_mmio_read_data_comb = w_cache_info;
                16'h0010: r_mmio_read_data_comb = {63'b0, w_cache_mnt_busy}; // CACHE_STATUS
                16'h0018: r_mmio_read_data_comb = LP_ICACHE_INFO;            // ICACHE_INFO
+               16'h0020: r_mmio_read_data_comb = w_l2_info;                 // L2_INFO (0 without the L2)
+               16'h0028: r_mmio_read_data_comb = {55'b0, w_l2_busy, 7'b0, w_l2_en};   // L2_CTRL
                16'h0040: r_mmio_read_data_comb = w_cnt_read_hits;
                16'h0048: r_mmio_read_data_comb = w_cnt_read_misses;
                16'h0050: r_mmio_read_data_comb = w_cnt_write_hits;
@@ -1293,7 +1320,8 @@ module KlaussCPU #(
                                                   CORE1_EXC_EN, CORE1_EXC_EN && CORE1_TLB_EN,
                                                   CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN}
                                                  | 64'h0100_0000   // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
-                                                 | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0};
+                                                 | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0}
+                                                 | {37'b0, CORE1_L2_EN, 26'b0};   // [26] the L2 (HW_PERF_PLAN.md §6)
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;
@@ -1338,6 +1366,22 @@ module KlaussCPU #(
                16'h0100: r_mmio_read_data_comb = r_wedge_snap0;
                16'h0108: r_mmio_read_data_comb = r_wedge_snap1;
                16'h0110: r_mmio_read_data_comb = {16'b0, r_perf_itlb};   // PERF_ITLB_REFILL
+               // L2 (HW_PERF_PLAN.md §6): 0x118 I hits, 0x120 I misses, 0x128
+               // D hits, 0x130 D misses, 0x138 writeback hits, 0x140
+               // writeback misses, 0x148 DDR read beats, 0x150 DDR write
+               // beats, 0x158 write-buffer-full cycles, 0x160 DMA hits,
+               // 0x168 DMA misses
+               16'h0118: r_mmio_read_data_comb = {16'b0, r_perf_l2[0]};
+               16'h0120: r_mmio_read_data_comb = {16'b0, r_perf_l2[1]};
+               16'h0128: r_mmio_read_data_comb = {16'b0, r_perf_l2[2]};
+               16'h0130: r_mmio_read_data_comb = {16'b0, r_perf_l2[3]};
+               16'h0138: r_mmio_read_data_comb = {16'b0, r_perf_l2[4]};
+               16'h0140: r_mmio_read_data_comb = {16'b0, r_perf_l2[5]};
+               16'h0148: r_mmio_read_data_comb = {16'b0, r_perf_l2[6]};
+               16'h0150: r_mmio_read_data_comb = {16'b0, r_perf_l2[7]};
+               16'h0158: r_mmio_read_data_comb = {16'b0, r_perf_l2[8]};
+               16'h0160: r_mmio_read_data_comb = {16'b0, r_perf_l2[9]};
+               16'h0168: r_mmio_read_data_comb = {16'b0, r_perf_l2[10]};
                default:  r_mmio_read_data_comb = 64'h0;
             endcase
          end
@@ -1366,7 +1410,7 @@ module KlaussCPU #(
    // flag a redeclaration; the boot-ROM block below consumes it.
    wire        w_calib_done;
 
-   mem_read_write mem_read_write (
+   mem_read_write #(.L2_EN(CORE1_L2_EN), .L2_WAYS(CORE1_L2_WAYS)) mem_read_write (
        .i_Clk_board(i_Clk_board),   // board oscillator -> clk_wiz -> MIG 200MHz ref
        .o_ui_clk(w_ui_clk),         // MIG ui_clk (100MHz) -> drives i_Clk for the whole CPU
        .ddr2_dq(ddr2_dq),
@@ -1449,7 +1493,14 @@ module KlaussCPU #(
        .o_h_ok(w_h_ok),
        .o_h_dword(w_h_dword),
        .o_cpu_line(w_cpu_line),
-       .o_cpu_line_v(w_cpu_line_v)
+       .o_cpu_line_v(w_cpu_line_v),
+       .i_l2_ctrl_wr(w_l2_ctrl_wr),
+       .i_l2_ctrl_wdata(w_mmio_write_data[1:0]),
+       .i_l2_ctrl_en(w_reset_H || r_load_pulse),
+       .o_l2_en(w_l2_en),
+       .o_l2_busy(w_l2_busy),
+       .o_l2_info(w_l2_info),
+       .o_l2_ev(w_l2_ev)
    );
 
    // ==========================================================================
@@ -2773,7 +2824,9 @@ rams_sp_nc rams_sp_nc1 (
          r_perf_stall_muldiv <= 48'd0; r_perf_branch_flush <= 48'd0;
          r_perf_if_miss <= 48'd0;     r_perf_mem_wait <= 48'd0;
          r_perf_ic_miss <= 48'd0;     r_perf_ic_fill  <= 48'd0;     r_perf_itlb <= 48'd0;
+         for (int k = 0; k < 11; k++) r_perf_l2[k] <= 48'd0;
       end else begin
+         for (int k = 0; k < 11; k++) if (w_l2_ev[k]) r_perf_l2[k] <= r_perf_l2[k] + 48'd1;
          // M6 pipeline hazard attribution
          if (w_perf_st[0]) r_perf_stall_data    <= r_perf_stall_data    + 48'd1;
          if (w_perf_st[1]) r_perf_stall_loaduse <= r_perf_stall_loaduse + 48'd1;

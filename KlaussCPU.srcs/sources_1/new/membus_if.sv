@@ -25,13 +25,14 @@ interface membus_if;
    logic [63:0] write_data;      // write data
    logic [ 7:0] byte_en;         // byte enables (8'hFF = full doubleword)
    logic        zero_line;       // DCBZ: the write zeroes the whole line (addr = line base)
+   logic        ifetch;          // the read is an I-cache fill (L2 counters, HW_PERF_PLAN.md §6)
    logic [63:0] read_data;       // read data
    logic [63:0] read_data_next;  // next consecutive doubleword in the same cache line
    logic        next_valid;      // 1 when read_data_next is valid (offset == 0)
    logic        ready;           // transaction complete
 
-   modport master (output write_DV, read_DV, addr, write_data, byte_en, zero_line,
+   modport master (output write_DV, read_DV, addr, write_data, byte_en, zero_line, ifetch,
                    input  read_data, read_data_next, next_valid, ready);
-   modport slave  (input  write_DV, read_DV, addr, write_data, byte_en, zero_line,
+   modport slave  (input  write_DV, read_DV, addr, write_data, byte_en, zero_line, ifetch,
                    output read_data, read_data_next, next_valid, ready);
 endinterface : membus_if

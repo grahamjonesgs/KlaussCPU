@@ -19,7 +19,12 @@
 // cpu.ready.
 //////////////////////////////////////////////////////////////////////////////////
 
-module mem_read_write (
+module mem_read_write #(
+    // HW_PERF_PLAN.md §6: the unified L2 (l2_cache) in place of ddr2_control,
+    // below the DDR arbiter.  0 = ddr2_control, the design before the L2.
+    parameter bit L2_EN   = 1'b0,
+    parameter int L2_WAYS = 4
+) (
     input         i_Clk_board,   // 100 MHz board oscillator — feeds clk_wiz (MIG 200MHz ref)
     inout  [15:0] ddr2_dq,
     inout  [ 1:0] ddr2_dqs_n,
@@ -172,8 +177,23 @@ module mem_read_write (
     // before its ready and before any later request's; same layout as the
     // arrays (dword k at [255-64k -: 64]).  Writes give none.
     output logic [255:0] o_cpu_line = '0,
-    output logic         o_cpu_line_v = 1'b0
+    output logic         o_cpu_line_v = 1'b0,
+
+    // HW_PERF_PLAN.md §6 L2 (L2_EN): L2_CTRL (0xF005_0028) write strobe and
+    // data ([0] EN, [1] WBINV), the CPU-reset / program-load enable, its
+    // state, L2_INFO, and the perf event strobes (MMIO_MAP 0xF00D_0118..)
+    input             i_l2_ctrl_wr,
+    input      [ 1:0] i_l2_ctrl_wdata,
+    input             i_l2_ctrl_en,
+    output            o_l2_en,
+    output            o_l2_busy,
+    output     [63:0] o_l2_info,
+    output     [10:0] o_l2_ev
 );
+
+    // DV-low settle before a shadow / walk writeback: ddr2_control's IDLE
+    // needs two; the L2 accepts after one low cycle
+    localparam logic [3:0] WB_GAP = L2_EN ? 4'd0 : 4'd2;
 
     parameter  CACHE_SIZE = 1_024;              // number of sets — 2 ways × 1024 sets = 2048 total lines × 32 B = 64 KB
     localparam INDEX_BITS = $clog2(CACHE_SIZE); // 10
@@ -398,6 +418,7 @@ module mem_read_write (
     logic [7:0]            r_byte_en;       // byte enables (8'hFF = full doubleword write)
     logic [63:0]           r_write_data;
     logic                  r_is_write;
+    logic                  r_is_ifetch = 1'b0;   // an I-cache fill (L2 counters)
     // HW_PERF_PLAN.md §1 DCBZ: the latched write zeroes the whole line —
     // a hit overwrites it with zeros, a miss installs a zero line, both
     // dirty, with no DDR read (a dirty victim still goes out through the
@@ -708,6 +729,7 @@ module mem_read_write (
                     r_byte_en           <= cpu.byte_en;
                     r_write_data        <= cpu.write_data;
                     r_is_write          <= cpu.write_DV;
+                    r_is_ifetch         <= cpu.read_DV && cpu.ifetch;
                     r_zero_line         <= cpu.write_DV && cpu.zero_line;
                     r_computed_ddr_addr <= w_computed_ddr_addr;
                     r_miss_served       <= cpu.write_DV;  // writes: served right here
@@ -932,7 +954,7 @@ module mem_read_write (
                         o_ddr_mem_write_DV   <= 1;
                         state                <= EVICT_SHADOW_WAIT;
                     end else if (r_do_evict) begin
-                        r_gap_count <= 4'd2;
+                        r_gap_count <= WB_GAP;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
                         state       <= WAIT;   // served-DV guard absorbs the DV tail
@@ -1001,7 +1023,7 @@ module mem_read_write (
                     end
 
                     if (r_do_evict) begin
-                        r_gap_count <= 4'd2;
+                        r_gap_count <= WB_GAP;
                         state       <= EVICT_SHADOW_GAP;
                     end else begin
                         state       <= WAIT;   // served-DV guard absorbs the DV tail
@@ -1090,7 +1112,7 @@ module mem_read_write (
                     MS_W0_WAIT: begin
                         if (w_cache_ddr_ready) begin
                             o_ddr_mem_write_DV <= 1'b0;
-                            r_gap_count        <= 4'd2;   // CDC settle, hold addr
+                            r_gap_count        <= WB_GAP;   // CDC settle, hold addr
                             r_mnt_sub          <= MS_W0_GAP;
                         end
                     end
@@ -1115,7 +1137,7 @@ module mem_read_write (
                     MS_W1_WAIT: begin
                         if (w_cache_ddr_ready) begin
                             o_ddr_mem_write_DV <= 1'b0;
-                            r_gap_count        <= 4'd2;
+                            r_gap_count        <= WB_GAP;
                             r_mnt_sub          <= MS_W1_GAP;
                         end
                     end
@@ -1314,6 +1336,54 @@ module mem_read_write (
         .resetn (resetn)
     );
 
+    generate if (L2_EN) begin : g_l2
+    l2_cache #(.WAYS(L2_WAYS)) l2_cache (
+        .ddr2_dq          (ddr2_dq),
+        .ddr2_dqs_n       (ddr2_dqs_n),
+        .ddr2_dqs_p       (ddr2_dqs_p),
+        .ddr2_addr        (ddr2_addr),
+        .ddr2_ba          (ddr2_ba),
+        .ddr2_ras_n       (ddr2_ras_n),
+        .ddr2_cas_n       (ddr2_cas_n),
+        .ddr2_we_n        (ddr2_we_n),
+        .ddr2_ck_p        (ddr2_ck_p),
+        .ddr2_ck_n        (ddr2_ck_n),
+        .ddr2_cke         (ddr2_cke),
+        .ddr2_cs_n        (ddr2_cs_n),
+        .ddr2_dm          (ddr2_dm),
+        .ddr2_odt         (ddr2_odt),
+        .resetn           (resetn),
+        .sys_clk_i        (sys_clk_i),
+        .i_mem_write_DV   (mig_write_DV),
+        .i_mem_read_DV    (mig_read_DV),
+        .i_mem_addr       (mig_addr),
+        .i_mem_wide       (mig_wide),        // 1 = cache 32 B (2 pipelined bursts); 0 = blitter 128 b
+        .i_mem_dw_off     (mig_dw_off),      // CWF: requested dword (wide reads; VGA = 0)
+        .i_mem_write_data (mig_write_data),
+        .i_app_wdf_mask   (mig_wdf_mask),
+        .o_mem_read_data  (i_ddr_mem_read_data),
+        .o_mem_ready      (i_ddr_mem_ready),
+        .o_mem_rd_dw      (w_ddr_rd_dw),
+        .o_mem_rd_dw_next (w_ddr_rd_dw_next),
+        .o_mem_dw_next_ok (w_ddr_dw_next_ok),
+        .o_mem_dw_ready   (w_ddr_dw_ready),
+        .o_calib_done     (o_calib_done),
+        .o_ui_clk         (w_ui_clk),
+        .i_dma            (r_grant_blit | r_grant_c2 | r_grant_vga),
+        .i_ifetch         (r_is_ifetch),
+        // the speculative lookup: this cache's request in its CHECK cycle
+        .i_spec_v         (state == CHECK),
+        .i_spec_addr      (r_computed_ddr_addr),
+        .i_ctrl_wr        (i_l2_ctrl_wr),
+        .i_ctrl_wdata     (i_l2_ctrl_wdata),
+        .i_ctrl_en        (i_l2_ctrl_en),
+        .o_en             (o_l2_en),
+        .o_busy           (o_l2_busy),
+        .o_ev             (o_l2_ev)
+    );
+    // L2_INFO, CACHE_INFO's format: 128 KiB, 64 B lines, sets, ways
+    assign o_l2_info = {32'(128 * 1024), 8'd64, 16'(128 * 1024 / 64 / L2_WAYS), 8'(L2_WAYS)};
+    end else begin : g_ddr
     ddr2_control ddr2_control (
         .ddr2_dq          (ddr2_dq),
         .ddr2_dqs_n       (ddr2_dqs_n),
@@ -1347,5 +1417,10 @@ module mem_read_write (
         .o_calib_done     (o_calib_done),
         .o_ui_clk         (w_ui_clk)
     );
+    assign o_l2_en   = 1'b0;
+    assign o_l2_busy = 1'b0;
+    assign o_l2_info = 64'h0;
+    assign o_l2_ev   = '0;
+    end endgenerate
 
 endmodule

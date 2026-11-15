@@ -104,6 +104,9 @@ module pipeline_core
    // HW_PERF_PLAN.md §1 DCBZ: with m_write_DV, the request zeroes the whole
    // cache line at m_addr (m_addr is the line base, m_wdata 0, m_be 8'hFF)
    output logic         m_zl,
+   // the port's request is an I-cache fill (if_xc; for the L2's I / D
+   // counters, HW_PERF_PLAN.md §6)
+   output logic         m_if,
    input  logic [63:0]  m_rdata,
    input  logic [63:0]  m_rdata_next,   // next sequential dword, same line
    // 1a: the DRAM side's read data (the cache's registered output, before
@@ -3035,6 +3038,7 @@ module pipeline_core
    // held lookup's re-read), except a lookup's hit cycle — the wait for the
    // rest of a cold line is fill time, as the whole fill was on 16 B lines
    logic r_perf_icm = 1'b0, r_perf_itlb = 1'b0, r_perf_lpw = 1'b0;
+   assign m_if = if_xc;
    assign perf_ic[0] = r_perf_icm;
    assign perf_ic[1] = if_xc || r_perf_lpw;
    assign perf_itlb  = r_perf_itlb;
