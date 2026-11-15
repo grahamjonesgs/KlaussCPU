@@ -5788,7 +5788,9 @@ module mmu_tlb
    // TLBINV (written the cycle after commit), MTSR ASID and program load,
    // all serializing and refetching, so the next data lookup is several
    // cycles later (the core asserts d_ok's lookups equal the exact ones).
-   localparam int NQ = (N >= 16) ? 4 : (N >= 4) ? 2 : 1;
+   // (§5 review 3 timing: 8 copies at 32 entries — the key bits' first
+   // route, fanout ~17 with 4, led every CAM path of the release build)
+   localparam int NQ = (N >= 32) ? 8 : (N >= 16) ? 4 : (N >= 4) ? 2 : 1;
    localparam int NE = N / NQ;
    logic [N-1:0] d_ok;
    always_ff @(posedge clk)
