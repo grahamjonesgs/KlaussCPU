@@ -22,7 +22,7 @@
 
 Custom 64-bit RISC-style CPU on a Xilinx 7-series FPGA (Nexys A7), with
 128 MiB of DDR2 SDRAM behind a 2-way set-associative write-back data cache
-(64 KB, 32-byte lines). Memory is **little-endian**. Addresses are 32 bits
+(64 KB, 32-byte lines) and a unified 128 KiB L2 (§14.1). Memory is **little-endian**. Addresses are 32 bits
 (byte-addressed); registers are 64 bits. Execution is a 5-stage in-order
 pipeline (IF, ID, EX, MEM, WB) at 100 MHz, synchronous with the DDR2
 controller (2:1 MIG ui_clk). Instruction fetch has its own I-cache in front
@@ -67,9 +67,16 @@ and the crash dump; it does not execute programs.
   at `0x0020`; `0x0000–0x001F` (four doublewords) is the heap header used by
   the runtime — do not place code there.
 - **Stack** lives at the top of DDR2 and grows downward.
-- All data accesses go through the data cache (32-byte lines; fills are two
-  pipelined BL8 bursts with critical-word-first early restart). The core has
-  **one** memory port, shared by fetch and the MEM stage; MEM has priority.
+- All data accesses go through the data cache (32-byte lines, filled
+  critical-word-first with early restart). The core has **one** memory port,
+  shared by fetch and the MEM stage; MEM has priority.
+- Below the data cache, a unified **L2** (128 KiB, 4-way, 64 B lines of two
+  32 B sectors; HW_PERF_PLAN.md §6) sits in front of DDR for every master
+  (the data cache with the I-cache's fills, the blitter, core 2, VGA). It is
+  invisible to software: the L2 and DDR always act as one memory, so DMA
+  coherence is still only a matter of the data cache (`CACHE_CTRL`, §3.2).
+  `L2_CTRL` (`0xF005_0028`) can disable it for A/B measurements
+  (MMIO_MAP.md).
 
 ### 3.2 Instruction fetch and code coherence
 
@@ -727,9 +734,10 @@ Costs relative to the ideal one instruction per cycle (master with ldbyp,
 |-----------|------|
 | ALU result used by the **next** instruction | 1 bubble (forwarded from MEM) |
 | **Load** (LOAD/POP/LEAVE/RET) **hit** | 1 issue slot; independent loads issue every cycle (the load-hit pipe, §14.1) |
+| Data-cache miss that hits the **L2** | about 3 cycles from the miss decision to the critical dword (and the whole 32 B line) at the core; ~6–7 in all for a load |
 | Load result used by an **ALU / compare / fused-branch** op (ADD…XOR, CMP, INC/DEC, SETcc, MIN/MAX, FBR; rs1, or rs2 when a register) | the consumer issues 2 cycles after the load (1 bubble if it is the very next instruction) — LOAD/POP/LEAVE from DRAM only |
 | Load result used by anything else (shifts, MUL/DIV, MOV/LEA, an address or store-data operand, JMPR), or a MEMGET32 / LEAVERET / RET result | the consumer issues 3 cycles after the load |
-| Load **miss** | the DRAM time; the request goes out as the load leaves MEM |
+| Load **miss** (L2 miss too) | the DRAM time (~44 cycles); the request goes out as the load leaves MEM |
 | **Store** | 1 issue slot (posted; a second store waits in a queue entry behind it); only 3+ stores back to back are limited by the cache's write rate, ~2 cycles each |
 | Load after a store to the **same doubleword** whose bytes the store covers | none (store-to-load forwarding) |
 | Load after a store to the same doubleword it only **partly** overlaps | +2 to +3 within 2 instructions of the store |
@@ -799,6 +807,18 @@ Practical rules:
 - **Stores.** A DRAM store leaves MEM as it issues (posted). If it turns out
   to overwrite code the front end holds (self-modifying code), everything
   younger is refetched.
+- **L2** (HW_PERF_PLAN.md §6). Unified, physically indexed and tagged,
+  4-way tree pseudo-LRU, write-back, non-inclusive; 64 B lines of two 32 B
+  sectors, each with its own valid and dirty bit. A data-cache read (a load
+  or store miss, or an I-cache fill) looks it up: the L2 reads its arrays
+  already while the data cache decides its miss, so a hit returns the line
+  about 3 cycles after the miss; a miss fetches the whole line from DDR,
+  the requested sector (and dword) first, and the data cache restarts on the
+  critical dword as before. A data-cache victim that misses the L2 allocates
+  its sector without a fetch. Dirty L2 victims drain to DDR through a
+  2-entry write buffer. DMA (blitter, core 2, VGA) goes through the L2
+  without allocating. `L2_INFO` / `L2_CTRL` and the `PERF_L2_*` counters:
+  MMIO_MAP.md.
 - **Store-to-load forwarding.** A load whose doubleword matches the youngest
   in-flight store, and whose bytes that store covers, takes the store's data
   directly.
@@ -872,6 +892,9 @@ Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 - **64 KiB I-cache with 32 B lines (2026-11-14, branch `icache`):** was
   16 KiB of 16 B lines; lines installed whole from the D-cache; LUTRAM
   valid bits cleared by a sweep (HW_PERF_PLAN.md §5).
+- **Unified L2 (2026-11-15, branch `l2`):** 128 KiB, 4-way, 64 B sectored
+  lines below the DDR arbiter; `L2_INFO`, `L2_CTRL`, `CPU_FEATURES[26]`, the
+  `PERF_L2_*` counters (HW_PERF_PLAN.md §6).
 - **Data TLB lookup in the first EX cycle (2026-11-14, branch `tlbx`):**
   with TE = 1 a memory instruction no longer spends an extra EX cycle; the
   CAM matches the page of base + offset carry-free (MMU_PLAN.md §11.9).

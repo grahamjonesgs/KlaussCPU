@@ -549,7 +549,11 @@ module l2_cache #(
          ev_rd_beat, ev_wr_beat, ev_wbfull, ev_dma_hit, ev_dma_miss} <= '0;
         if (!w_dv) r_served <= 1'b0;
         ra_addr <= ra_next;
-        ra_ok   <= (f_st == F_IDLE) && !(|db_we) && !(|r_db_we) && f_in_ddr(ra_next) && r_en;
+        // (a data-array write to the set read on this edge, or landing on
+        // it, would make its data stale: the lookup is redone)
+        ra_ok   <= (f_st == F_IDLE) && f_in_ddr(ra_next) && r_en &&
+                   !(|db_we   && db_addr[SETW:1]   == ra_next[6 +: SETW]) &&
+                   !(|r_db_we && r_db_addr[SETW:1] == ra_next[6 +: SETW]);
 
         // ---------------- control ----------------
         // L2_CTRL writes are ignored while a walk runs (BUSY); the CPU reset

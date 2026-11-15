@@ -1119,6 +1119,145 @@ RAMB36 + 18 RAMB18 as in `823b5ea`.  Then the standard `build_fast
   the printed summary and the tb_soc `BTPROBE` line.
 
 
+## 6. Unified L2 (2026-11-15, branch `l2`)
+
+**Why.**  HW performance item 3, approved by Graham.  The design point comes
+from the runtime session's timed model (klausscc `442306f`,
+`src/emu/cachesim/l2t.rs`: the board's L1s, I fills through the D-cache, a
+blocking memory unit, one DDR transaction at a time, `rc` = 44 cycles from a
+D-cache miss to its critical dword today): 128 KiB, 64 B lines of two 32 B
+sectors, 4-way, a 2-entry write buffer, hit latency `h` = 6 gives −19 % /
+−22 % cycles on deflate / cxx-hello, each cycle of `h` about one point
+(`H4`).  The model assumes separate data ports for fills and hits and a
+take-back of write-buffer lines (both below).
+
+### §6 survey: where the L2 sits, and every path to DDR
+
+- **Clock.**  There is no DDR clock crossing in the fabric to remove: since
+  MEM_CLOCK_PLAN P3 / P4 the whole CPU runs on the MIG's 100 MHz `ui_clk`
+  (2:1 PHY), so the D-cache ↔ MIG interface is one domain.  The ~44 cycles
+  of a miss are the MIG controller and PHY.  The L2 is in the same domain;
+  a hit skips the MIG.
+- **The one funnel.**  `mem_read_write` holds the DDR arbiter: master A (the
+  D-cache, which also serves every I-cache fill and every core access: the
+  pipeline, the boot-ROM copy and UART loader FSM, the HCF dump, the
+  debugger's memory access through the core), B (the blitter), C (core 2;
+  `EN_CORE2` = 0 in the release build) and D (VGA scanout, read-only).  The
+  arbiter's output is the only user of `ddr2_control`.  Nothing else reaches
+  DDR: the native SD controller has no DMA (`SDM_DMA_ADDR` reserved),
+  LiteEth uses its own slot SRAM (the CPU copies), QSPI and crypto are MMIO.
+- **Coherence model (unchanged).**  Flush by software: the D-cache is
+  write-back, DMA does not snoop it, and software uses `CACHE_CTRL` FLUSH /
+  INVALIDATE (full-cache walks) around DMA and ICACHE_INV for DMA-written
+  code.  The I-cache snoops core stores above the D-cache; DCBZ is a D-cache
+  operation (no DDR read).
+- **Decision: the L2 replaces `ddr2_control` below the arbiter**
+  (`l2_cache.sv`, instantiated by `mem_read_write` when `L2_EN`; it drives the
+  MIG UI itself).  Every master's DDR access goes through it, so the L2 and
+  DDR are one memory for all of them, and the software contract does not
+  change: flushing the D-cache makes data visible to DMA (it lands in the
+  L2, which DMA reads), invalidating it after DMA makes the CPU re-read the
+  L2 / DDR.  "Blitter output needs no flush" for VGA stays true.  No L2
+  flush is needed by any existing path:
+  - DMA **reads** (blitter, core 2: 16 B; VGA: 32 B) are served from the L2
+    when the sector is valid (clean or dirty), else from DDR; they never
+    allocate and never touch the PLRU (VGA's frames would flush the L2).
+  - DMA **writes** (16 B, byte-masked) merge into a valid L2 sector with byte
+    enables and mark it dirty; otherwise they are posted to DDR through the
+    write buffer.
+  - **Every DDR read first drains any write-buffer entry of its line** (the
+    MIG is configured `Ordering = Strict`, so a read after the drained write
+    sees it).  This is the "ordered correctly" option for a demand miss on a
+    buffered line (the model takes the line back; measured cost below).
+  - D-cache FLUSH / INVALIDATE walks write their dirty lines into the L2 (or
+    the buffer): the DMA that follows reads them there.  DCBZ, the I-cache
+    snoop, the debugger's accesses, the boot and UART loaders all work above
+    the D-cache and are unaffected.  The I-cache's `ICACHE_INV` rule for
+    DMA-written code is unchanged.
+  - **The sub-line hazard** (MMIO_MAP "Cache controller") is unchanged: a
+    D-cache line is still written back whole, now into a 32 B L2 sector.
+- **Outside DDR.**  Tags cover PA[26:6] (all 128 MiB).  An access with
+  PA[31:27] ≠ 0 bypasses the L2 (no lookup, no allocation; writes posted,
+  reads from DDR); the write buffer compares PA[27:6], the bits the MIG
+  address uses, so it orders aliases conservatively.  MMIO never reaches
+  `mem_read_write`.
+- **Not inclusive, no back-invalidation**: the L1s are never told about L2
+  evictions (none needed: L1 data is newer or equal).
+
+### §6 design
+
+- **Geometry** (`l2_cache` parameters `WAYS` 2 / 4 / 8, `L2_KIB`): 128 KiB,
+  512 sets × 4 ways (256 × 8), 64 B lines of two 32 B sectors with a valid
+  and a dirty bit each; tag PA[26:15] (4-way); tree pseudo-LRU (an invalid
+  way first).  `KlaussCPU` parameters `CORE1_L2_EN` (1) and `CORE1_L2_WAYS`.
+- **Arrays.**  Data: one memory per way of (sets × 2) × 256 bits, a sector
+  per word in the D-cache's line layout; port A reads the sector of every
+  way at once (BRAM latch + output register), port B writes one way with
+  byte enables, from registers (a write is decided a cycle before it lands).
+  Tags: one word per set {PLRU, way × {tag, V[1:0], D[1:0]}} (67 bits at 4
+  ways), port A read with no output register, port B written by the front
+  end only.  32 + 1 RAMB36.  Write buffer: 2 entries × (64 B in LUTRAM, a
+  64-bit byte mask, the line).
+- **Front end** (one request at a time; posted writes — a write is acked on
+  its accept edge, like the D-cache's write-ack-at-latch).  While idle, the
+  port-A address is the D-cache's request in its CHECK cycle (`i_spec_*`,
+  its latched `r_computed_ddr_addr`): when that becomes a miss, the L2's
+  tags are already read as its DV arrives.  Hit timeline (E0 = the D-cache's
+  CHECK edge that raises the read DV): E0 the L2 arrays latch the address;
+  cycle 1 the tags are compared (the request accepted), E1 the decode is
+  registered and the data output register holds every way's sector; cycle 2
+  the 4:1 way mux; E2 `o_mem_ready` with the 32 B sector; E3 the D-cache's
+  `cpu.ready` with the critical dword (its fallback path, which also
+  installs the line).  **h = 3** (the model's `h` = 6; without the
+  speculative read — the L2 busy at E0 — 4).  An L2 miss issues the DDR
+  command in the same cycle as `ddr2_control` did (no added latency); the
+  critical burst first, the D-cache restarts on the early dword channel as
+  before, then the rest of the requested sector; the other sector follows
+  in the background (requests to the set wait for it).
+- **Allocation.**  A read miss allocates the whole line (both sectors
+  fetched: 4 BL8 bursts) — or, when the line is there without that sector,
+  fetches the sector only.  A D-cache victim (32 B) that misses allocates
+  its sector without a fetch (the other sector invalid), and one that hits
+  the line writes in place.  A dirty L2 victim's dirty sectors are copied to
+  a write-buffer entry (2 port-A reads) before the fill can overwrite them
+  (asserted).
+- **DDR engine** (one transaction at a time): a read of 1 / 2 / 4 bursts,
+  the critical one first, assembling sectors and writing them through port
+  B; or the drain of the oldest buffer entry (command + beat 0, then beat
+  1, per burst with any byte to write; FIFO).  Priority: a demand read
+  issues first; the buffer drains when the engine is idle — except (VGA,
+  below) — and a full buffer drains first in effect, since an allocation
+  with a dirty victim waits for a free entry.  I vs D priority does not
+  arise: the D-cache serialises them (one memory port).
+- **VGA scanout (real time).**  Its reads now pass the L2 lookup and could
+  wait behind drains.  While VGA requests the bus (`i_rt_req` = its req) or
+  any DMA master holds the grant: no drain starts unless the front end waits
+  on the buffer (full, or a line match) or a walk is finishing, and a demand
+  miss fetches only its own sector (2 bursts, as `ddr2_control`), so the L2
+  adds no DDR traffic in VGA's window.  Measured below.
+- **`L2_CTRL`** (MMIO_MAP): write 1 = enable (instant: a disabled L2 holds no
+  line); 3 = write back and invalidate, stay enabled; 0 = write back,
+  invalidate, then bypass.  BUSY is set on the write's own edge, so the next
+  read sees it.  **A write while BUSY is ignored** (the runtime session's
+  driver polls BUSY; requested 2026-11-15).  The walk visits every set
+  (tags read, each dirty way's sectors copied to the buffer, the tag word
+  written 0), yielding to requests between sets and while the buffer is
+  full; during a walk nothing allocates, hits are served, and writes that
+  miss are posted to DDR, so no data is lost or reordered.  It ends when the
+  buffer is empty.  A write of 0 / 3 to a disabled L2 only drains the
+  buffer, so BUSY = 0 always means DDR holds every write.  CPU reset and
+  program load enable the L2 (a disable walk then running ends as a plain
+  write-back-and-invalidate).  `L2_INFO` = `0x0002_0000_4002_0004`,
+  `CPU_FEATURES[26]`, counters `0xF00D_0118` … `0x0168` (I / D / writeback
+  hits and misses, DDR read and write beats, write-buffer-full cycles, DMA
+  hits and misses); the I / D split comes from a new port bit `m_if`
+  (= the core's `if_xc`) through `membus_if.ifetch`.
+- **`L2_EN` = 0** builds `ddr2_control` exactly as before (a `generate`);
+  the only shared-RTL changes are dead without the L2: `membus_if.ifetch`,
+  `pipeline_core.m_if`, the D-cache's shadow-writeback DV gap (a parameter:
+  2 with `ddr2_control`, 0 with the L2, which needs one DV-low cycle), the
+  `L2_CTRL` decode and the counters (constant 0, read 0 as before).
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -1126,6 +1265,7 @@ RAMB36 + 18 RAMB18 as in `823b5ea`.  Then the standard `build_fast
 | `[22]` | DCBZ (§1) |
 | `[23]` | STATUS.MAL64 (§4) |
 | `[24]` | `ETH_RX_SLOTS` (§3) |
+| `[26]` | the unified L2 (§6) |
 
 ## Implementation notes (§1 and §4, 2026-11-11)
 
