@@ -242,6 +242,29 @@ module tb_soc;
       end
    end
 
+   // ---------------- VGA scanout probe (HW_PERF_PLAN.md §6) ----------------
+   // +VGA_V0=<line>: 2000 cycles into PIPE_RUN, move the raster to <line>
+   // (a sim shortcut to the next vblank, where the scanout configuration
+   // latches).  Reported at HALTED: lines fetched, the worst fetch time of a
+   // line (cycles from its start; a native 640-px line has 3200 before it is
+   // shown) and the display lines that starved.
+   int vga_v0 = -1, vga_lines = 0, vga_under = 0;
+   int vga_age_max = 0;
+   initial begin
+      if ($value$plusargs("VGA_V0=%d", vga_v0)) begin
+         wait (dut.st.SM == PIPE_RUN);
+         repeat (2000) @(posedge dut.i_Clk);
+         dut.vga_ctrl_i.timing.r_v = 10'(vga_v0);
+      end
+   end
+   always @(posedge dut.i_Clk) begin
+      if (dut.vga_ctrl_i.scanout.r_wcnt == 3'd1 && dut.vga_ctrl_i.scanout.r_wlast) begin
+         vga_lines++;
+         if (int'(dut.vga_ctrl_i.scanout.r_age) > vga_age_max) vga_age_max = int'(dut.vga_ctrl_i.scanout.r_age);
+      end
+      if (dut.vga_ctrl_i.scanout.o_underflow) vga_under++;
+   end
+
    // ---------------- end / progress ----------------
    longint last_i = -1;
    int     idle_n = 0;
@@ -253,6 +276,7 @@ module tb_soc;
          $display("TB_SOC: MIG bursts rd=%0d wr=%0d; consistency checks=%0d errors=%0d",
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_rd,
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_wr, cc_n, cc_err);
+         $display("TB_SOC: VGA lines=%0d max_fetch=%0d underflows=%0d", vga_lines, vga_age_max, vga_under);
          $display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);
          $fclose(uart_f); $fclose(trace_f);
          $finish;

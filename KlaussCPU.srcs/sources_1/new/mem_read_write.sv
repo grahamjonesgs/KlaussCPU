@@ -1371,6 +1371,7 @@ module mem_read_write #(
         .o_ui_clk         (w_ui_clk),
         .i_dma            (r_grant_blit | r_grant_c2 | r_grant_vga),
         .i_ifetch         (r_is_ifetch),
+        .i_rt_req         (i_vga_req),
         // the speculative lookup: this cache's request in its CHECK cycle
         .i_spec_v         (state == CHECK),
         .i_spec_addr      (r_computed_ddr_addr),

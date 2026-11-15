@@ -134,6 +134,11 @@ SIM_MIG = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'mig_model.sv')
 CONS_FATAL = 'FATAL consistency'
 
 
+def _l2bit():
+    """CPU_FEATURES[26] (the L2) of the tb_soc build"""
+    return (1 << 26) if l2_cfg()[0] else 0
+
+
 def l2_cfg():
     """VSIM_L2=0: build tb_soc without the L2 (CORE1_L2_EN = 0, ddr2_control);
     VSIM_L2_WAYS=<n>: the L2's ways (HW_PERF_PLAN §6)"""
@@ -288,7 +293,7 @@ def _btic_note(name, st, log, gate=True):
     return bad and gate
 
 
-def build_soc(rev=None, crypto_full=False, nowalk=False):
+def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     """full SoC (sim_1/new/tb_soc.sv: behavioural DDR, real cache / bus /
     MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
     crypto_full: KlaussCPU with every optional crypto block (the default
@@ -296,7 +301,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     ic = ic_geom()
     l2, l2w = l2_cfg()
     tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '') + \
-          (f'_ic{ic[0]}x{ic[1]}' if ic else '') + ('' if l2 else '_nol2') + (f'_l2w{l2w}' if l2w != 4 else '')
+          (f'_ic{ic[0]}x{ic[1]}' if ic else '') + ('' if l2 else '_nol2') + (f'_l2w{l2w}' if l2w != 4 else '') + \
+          ('_tbwt' if tb_wt else '')
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
     os.makedirs(src, exist_ok=True)
@@ -319,12 +325,14 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         open(os.path.join(src, n), 'w').write(t)
         allsrc += t
     tbp = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'tb_soc.sv')
-    tb = git_show(rev, tbp) if rev else open(tbp).read()
+    # tb_wt: the working tree's tb_soc (and MIG model) around rev's RTL — an
+    # older revision then runs on the same DDR model as the working tree
+    tb = git_show(rev, tbp) if rev and not tb_wt else open(tbp).read()
     beh_ddr = 'module ddr2_control' in tb          # an older tb_soc: its own DDR model
     if beh_ddr:
         present = [n for n in present if n not in ('ddr2_control.sv', 'l2_cache.sv')]
     else:
-        mig = git_show(rev, SIM_MIG) if rev else open(SIM_MIG).read()
+        mig = git_show(rev, SIM_MIG) if rev and not tb_wt else open(SIM_MIG).read()
         open(os.path.join(src, 'mig_model.sv'), 'w').write(mig)
         allsrc += mig
     # report the cycle count at HALTED (for real-cache A/B timing)
@@ -342,14 +350,14 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         ov.append(f'.CORE1_IC_LINES({ic[0]}), .CORE1_IC_LB({ic[1]})')
     if 'CORE1_L2_EN' in allsrc:
         ov.append(f".CORE1_L2_EN(1'b{int(l2)}), .CORE1_L2_WAYS({l2w})")
-    elif not l2 and not beh_ddr:
+    elif not l2 and not beh_ddr and not tb_wt:
         raise SystemExit('VSIM_L2=0 on a revision without CORE1_L2_EN')
     elif ic and ic != (1024, 16):
         raise SystemExit(f'VSIM_IC={ic[0]}x{ic[1]}: this revision has only the 16 KiB / 16 B I-cache')
     if ov:
         assert tb.count('KlaussCPU dut (') == 1
         tb = tb.replace('KlaussCPU dut (', 'KlaussCPU #(' + ', '.join(ov) + ') dut (')
-    if rev is None and 'wk_fin' in allsrc:
+    if (rev is None or tb_wt) and 'wk_fin' in allsrc and 'WKEV' not in tb:
         k = tb.rindex('endmodule')
         tb = tb[:k] + WK_PROBE + tb[k:]
     probed = False
@@ -372,7 +380,12 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         SOC_PROBED.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
-    defs = [] if (beh_ddr or l2) else ['+define+DDRPATH=g_ddr.ddr2_control']
+    if beh_ddr:
+        defs = []
+    elif 'CORE1_L2_EN' not in allsrc:
+        defs = ['+define+DDRPATH=ddr2_control']          # a pre-L2 revision under the current tb_soc
+    else:
+        defs = [] if l2 else ['+define+DDRPATH=g_ddr.ddr2_control']
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \
@@ -1014,7 +1027,7 @@ def cmd_soccrypto(a):
             want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF200D}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x01F0200D}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x03F0200D | _l2bit()}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
@@ -1038,7 +1051,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x01F0200D, 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -1669,7 +1682,7 @@ def cmd_socwalk(a):
         report(f'evict shadow {kind}', allok and bool(seen), f'read met its own line in the writeback at pad={seen}')
     # 4. CPU_FEATURES[25] with TLB_WALK = 0 (and 1 for reference)
     from kasm import Asm
-    for nw, want in ((False, 0x03F0200D), (True, 0x01F0200D)):
+    for nw, want in ((False, 0x03F0200D | _l2bit()), (True, 0x01F0200D | _l2bit())):
         f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
         g = _soc_regs(run_soc(build_soc(None, nowalk=nw), f, f'sw_feat{int(nw)}', trace=True))
         report(f'CPU_FEATURES {"TLB_WALK=0" if nw else "default"}', bool(g) and g.get('r2') == want,
@@ -1705,6 +1718,66 @@ def cmd_socx(a):
     return 1 if fails else 0
 
 
+def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000):
+    """HW_PERF_PLAN §6: 640 x 480 RGB565 scanout of a framebuffer at 4 MiB
+    under heavy CPU traffic: a strided walk over `span` bytes (D-cache and L2
+    misses, dirty victims on both levels, so the L2's write buffer drains),
+    and every `wbinv_every` iterations an L2 write-back-and-invalidate (L2_CTRL =
+    3, BUSY polled; skipped without the L2); runs `lines` x ~3200 cycles.
+    r1 = VGA_STATUS at the end (underflows [63:48])."""
+    from kasm import Asm
+    a = Asm()
+    a.setr(15, 0xF0110000)
+    a.setr(1, 0x400000); a.st(64, 1, 15, 0x08)          # FB_BASE
+    a.setr(1, 1280); a.st(64, 1, 15, 0x10)              # STRIDE
+    a.setr(1, 480); a.st(64, 1, 15, 0x38)               # HEIGHT
+    a.setr(1, 0); a.st(64, 1, 15, 0x28)                 # VSTART
+    a.setr(1, 4); a.st(64, 1, 15, 0x18)                 # clear the underflow count
+    a.setr(1, 1); a.st(64, 1, 15, 0x00)                 # SCANOUT_EN, RGB565, native
+    a.setr(14, 0xF0050000)
+    a.setr(10, 0x100000)                                # data base
+    a.setr(9, (lines * 3200) // 40)                     # iterations (~40 cycles each at best)
+    a.setr(8, 0)                                        # offset
+    a.setr(7, wbinv_every)
+    a.label('top')
+    a.alu('add', 11, 10, 8)
+    a.ld(64, 2, 11, 0); a.addi_s(2, 2, 1); a.st(64, 2, 11, 0)
+    a.ld(64, 3, 11, 0x1000); a.st(64, 3, 11, 0x1008)
+    a.setr(12, 37 * 64); a.alu('add', 8, 8, 12)
+    a.setr(12, span - 1); a.alu('and', 8, 8, 12)
+    a.dec(7)
+    a.fbr('ne', 7, 0, 'nowrap', imm=True)
+    a.setr(7, wbinv_every)
+    a.setr(1, 3); a.st(64, 1, 14, 0x28)                 # L2_CTRL: WBINV (ignored without the L2)
+    a.label('poll')
+    a.ld(64, 1, 14, 0x28); a.setr(12, 0x100); a.alu('and', 1, 1, 12)
+    a.fbr('ne', 1, 0, 'poll', imm=True)
+    a.label('nowrap')
+    a.dec(9)
+    a.fbr('ne', 9, 0, 'top', imm=True)
+    a.ld(64, 1, 15, 0x18)                               # VGA_STATUS
+    a.halt()
+    return a
+
+
+def cmd_socvga(a):
+    """HW_PERF_PLAN §6: VGA scanout keeps its deadline through the L2 (and
+    without it) under CPU miss / writeback traffic and L2 WBINV walks, at
+    the given MIG timing (--plus).  Fails on any starved display line or on
+    a fetch that did not run."""
+    exe = build_soc(None)
+    prog = _vga_prog(a.lines, a.wbinv_every, span=a.span)
+    r = run_soc(exe, prog, f'vga_{os.environ.get("VSIM_L2", "1")}', timeout=7200,
+                plus=['+VGA_V0=478'] + a.plus)
+    m = re.search(r'VGA lines=(\d+) max_fetch=(\d+) underflows=(\d+)', r['log'])
+    g = re.search(r'PIPE_RUN|t=(\d+)', r['log'])
+    l2 = re.findall(r'TB_SOC: (MIG bursts.*)', r['log'])
+    ok = bool(m) and int(m.group(1)) >= a.lines // 2 and int(m.group(3)) == 0 and 'HALTED' in r['log']
+    print(f'{"pass" if ok else "FAIL"} socvga lines={m and m.group(1)} max_fetch={m and m.group(2)} '
+          f'(of 3200) underflows={m and m.group(3)} {l2[0] if l2 else ""} {" ".join(a.plus)}')
+    return 0 if ok else 1
+
+
 def cmd_soceth(a):
     """ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3) through the real SoC bus
     (bus_splitter -> eth_mmio_bridge; tb_soc stubs liteeth_core, the RX slot
@@ -1722,7 +1795,7 @@ def cmd_soceth(a):
     a.ld(64, 7, 15, 0x08)                                              # 0
     a.setr(3, 1); a.st(64, 3, 15, 0x00); a.ld(64, 8, 15, 0x00)         # 1 -> 2
     a.halt()
-    exp = {'r1': 0x01F0200D, 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
+    exp = {'r1': 0x03F0200D | _l2bit(), 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
     r = run_soc(exe, a, 'soceth', trace=True)
     last = open(r['trace']).read().strip().splitlines()[-1] if 'HALTED' in r['log'] else ''
     regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
@@ -1753,14 +1826,14 @@ def cmd_socdiff(a):
     the working tree as the base (with --base-env, e.g. VSIM_L2=0)"""
     import randprog
     with _env(a.base_env):
-        base = build_soc(None if a.base == 'wt' else a.base)
+        base = build_soc(None if a.base == 'wt' else a.base, tb_wt=a.base_tb_wt)
     new = build_soc(None)
     fails = 0
     tb = tn = 0
     hits = {'base': 0, 'new': 0}      # BTIC hits (the probe's count)
     for sd in range(a.seed0, a.seed0 + a.seeds):
         asm = randprog.gen(sd, span=a.span)
-        rb = run_soc(base, asm, f'sd_b{sd}', trace=True, gate=a.base == 'wt', plus=a.plus)
+        rb = run_soc(base, asm, f'sd_b{sd}', trace=True, gate=a.base == 'wt' or a.base_tb_wt, plus=a.plus)
         rn = run_soc(new, asm, f'sd_n{sd}', trace=True, plus=a.plus)
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
@@ -1877,6 +1950,10 @@ def main():
     sub.add_parser('socsd')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
+    vg = sub.add_parser('socvga'); vg.add_argument('--lines', type=int, default=120)
+    vg.add_argument('--wbinv-every', type=int, default=1500)
+    vg.add_argument('--span', type=lambda v: int(v, 0), default=0x80000)
+    vg.add_argument('--plus', action='append', default=[])
     sx = sub.add_parser('socx'); sx.add_argument('--seeds', type=int, default=4)
     sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
@@ -1896,6 +1973,8 @@ def main():
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
     sd.add_argument('--base-env', action='append', help='KEY=VAL for the base build (with --base wt)')
+    sd.add_argument('--base-tb-wt', action='store_true',
+                    help="the base revision's RTL under the working tree's tb_soc / MIG model")
     sd.add_argument('--plus', action='append', default=[], help='tb_soc plusarg for both runs (e.g. +MIGLAT=20)')
     sd.add_argument('--span', type=lambda v: int(v, 0), default=0x800,
                     help='data footprint of the random loads/stores (e.g. 64: same-line hazards)')
@@ -1958,6 +2037,8 @@ def main():
         sys.exit(cmd_socx(a))
     elif a.cmd == 'soceth':
         sys.exit(cmd_soceth(a))
+    elif a.cmd == 'socvga':
+        sys.exit(cmd_socvga(a))
     elif a.cmd == 'tlbdiff':
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':

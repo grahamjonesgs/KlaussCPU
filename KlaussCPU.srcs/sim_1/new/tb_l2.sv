@@ -27,6 +27,7 @@ module tb_l2;
    logic [255:0] wdata = 0;
    logic [15:0] mask = 0;
    logic        spec_v = 0;
+   logic        rt_req = 0;       // random in TEST=random (+RT=1)
    logic [31:0] spec_a = 0;
    logic        ctrl_wr = 0, ctrl_en = 0;
    logic [1:0]  ctrl_wd = 0;
@@ -44,7 +45,7 @@ module tb_l2;
       .o_mem_read_data(rdata), .o_mem_ready(ready), .o_mem_rd_dw(rd_dw),
       .o_mem_rd_dw_next(rd_dw_next), .o_mem_dw_next_ok(next_ok), .o_mem_dw_ready(dw_ready),
       .o_calib_done(calib), .o_ui_clk(),
-      .i_dma(dma), .i_ifetch(ifetch), .i_spec_v(spec_v), .i_spec_addr(spec_a),
+      .i_dma(dma), .i_ifetch(ifetch), .i_rt_req(rt_req), .i_spec_v(spec_v), .i_spec_addr(spec_a),
       .i_ctrl_wr(ctrl_wr), .i_ctrl_wdata(ctrl_wd), .i_ctrl_en(ctrl_en),
       .o_en(en), .o_busy(busy), .o_ev(ev));
 
@@ -192,6 +193,10 @@ module tb_l2;
          else begin b[node] = 1; node = 2 * node; end
       end
    endtask
+
+   // the VGA-request input: toggled at random in TEST=random (+RT=0: off)
+   int rt_rand = 0;
+   always @(negedge clk) if (rt_rand && $urandom_range(63, 0) == 0) rt_req = !rt_req;
 
    string test = "random";
    int seed = 1, nx = 2000;
@@ -405,7 +410,9 @@ module tb_l2;
          // ---------------------------------------------------------------
          default: begin
             // random: all masters, all kinds, a few hot sets (conflicts),
-            // spec right and wrong, L2_CTRL writes at random
+            // spec right and wrong, L2_CTRL writes at random, the VGA request
+            rt_rand = 1;
+            void'($value$plusargs("RT=%d", rt_rand));
             for (int i = 0; i < nx; i++) begin
                int kind = $urandom_range(99, 0);
                int k = $urandom_range(9, 0), s = $urandom_range(3, 0);

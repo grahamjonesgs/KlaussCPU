@@ -81,6 +81,8 @@ module l2_cache #(
 
     input             i_dma,            // the request is a DMA master's (not the D-cache's)
     input             i_ifetch,         // a D-cache read for an I-cache fill
+    input             i_rt_req,         // the real-time master (VGA scanout) wants DDR:
+                                        // fetch demand sectors only, no background drains
     // speculative lookup: the D-cache's request in its CHECK cycle
     input             i_spec_v,
     input      [31:0] i_spec_addr,
@@ -295,7 +297,7 @@ module l2_cache #(
     logic            r_hit;             // the sector is valid in a matching way
     logic            r_many;            // the line is present (some sector)
     logic [WAYW-1:0] r_mway, r_vic;
-    logic [WAYS-1:0] r_msel;            // data output mux (one-hot)
+    logic [WAYW-1:0] r_msel;            // data output mux (the way)
 
     // ---------------------------------------------------------------------
     // write buffer state
@@ -308,6 +310,9 @@ module l2_cache #(
     wire  [1:0]  wb_n    = {1'b0, wb_v[0]} + {1'b0, wb_v[1]};
     wire         wb_full = (wb_v == 2'b11);
     wire         wb_tail = wb_v[wb_h] ? !wb_h : wb_h;
+    // the entry the engine drains: the oldest (FIFO — a later entry of the
+    // same line holds newer bytes)
+    wire         wb_dh   = wb_h;
     function automatic logic f_wbm(input logic [21:0] ln);
         return (wb_v[0] && wb_line[0] == ln) || (wb_v[1] && wb_line[1] == ln);
     endfunction
@@ -349,15 +354,15 @@ module l2_cache #(
     wire eng_bwr = (e_st == E_RD) && e_alloc && rb_sec_done;
 
     // drain beat data
-    wire [1:0]  dr_s  = {wb_h, e_p[1]};
+    wire [1:0]  dr_s  = {wb_dh, e_p[1]};
     wire [127:0] dr_chunk = wbd_q[255 - 128*e_p[0] -: 128];
-    wire [31:0] dr_m  = wb_m[wb_h][32*e_p[1] +: 32];
+    wire [31:0] dr_m  = wb_m[wb_dh][32*e_p[1] +: 32];
     wire [7:0]  dr_m0 = dr_m[16 - 16*e_p[0] +: 8];
     wire [7:0]  dr_m1 = dr_m[24 - 16*e_p[0] +: 8];
     function automatic logic [3:0] f_bursts(input logic [63:0] m);
         for (int p = 0; p < 4; p++) f_bursts[p] = |m[32*p[1] + 16 - 16*p[0] +: 16];
     endfunction
-    wire [3:0] wb_hb = f_bursts(wb_m[wb_h]);
+    wire [3:0] wb_hb = f_bursts(wb_m[wb_dh]);
     function automatic logic [1:0] f_first(input logic [3:0] bm);
         f_first = bm[0] ? 2'd0 : bm[1] ? 2'd1 : bm[2] ? 2'd2 : 2'd3;
     endfunction
@@ -406,11 +411,7 @@ module l2_cache #(
     wire [31:0] ra_next = (f_st == F_IDLE && (w_dv || !i_spec_v)) ? i_mem_addr : i_spec_addr;
 
     // data output mux
-    logic [255:0] d_mux;
-    always_comb begin
-        d_mux = '0;
-        for (int w = 0; w < WAYS; w++) if (r_msel[w]) d_mux = d_mux | da_q[w];
-    end
+    wire [255:0] d_mux = da_q[r_msel];
 
     // decoded r_tw fields
     logic [TAGW-1:0] r_ttag [WAYS];
@@ -444,6 +445,9 @@ module l2_cache #(
     // a read miss that allocates: a cache read, looked up, allocation on
     wire       w_rd_alloc = w_alloc && q_lk && !q_dma;
     wire       w_rd_newline = w_rd_alloc && !r_many;
+    // the whole line, or (while VGA is fetching: DDR time is its deadline)
+    // only the requested sector
+    wire       w_rd_both = w_rd_newline && !i_rt_req;
     wire       w_rd_needslot = w_rd_newline && (r_vd != 2'b00);
     wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full);
     // writes
@@ -489,7 +493,9 @@ module l2_cache #(
                         tb_din = r_many ? f_plru_tw(f_setway(r_tw, r_mway, q_tag,
                                                            r_tv[r_mway] | (q_sec ? 2'b10 : 2'b01),
                                                            r_td[r_mway]), r_mway)
-                                        : f_plru_tw(f_setway(r_tw, r_vic, q_tag, 2'b11, 2'b00), r_vic);
+                                        : f_plru_tw(f_setway(r_tw, r_vic, q_tag,
+                                                             w_rd_both ? 2'b11 : (q_sec ? 2'b10 : 2'b01),
+                                                             2'b00), r_vic);
                     end
                 end else if (!eng_bwr) begin
                     if (w_wr_cache_hit) begin
@@ -543,13 +549,13 @@ module l2_cache #(
             r_en_tgt <= i_ctrl_wdata[0];
             if (!i_ctrl_wdata[0] || i_ctrl_wdata[1]) begin
                 // 0: write back, invalidate, then bypass; 3: write back and
-                // invalidate, stay enabled.  A disabled L2 holds no line.
-                if (r_en) begin
-                    r_walking  <= 1'b1;
-                    r_walk_end <= 1'b0;
-                    r_walk_set <= '0;
-                    r_dis_pend <= !i_ctrl_wdata[0];
-                end else if (i_ctrl_wdata[0]) r_en <= 1'b1;
+                // invalidate, stay enabled.  A disabled L2 holds no line: it
+                // only drains the write buffer (BUSY = 0 always means DDR
+                // holds every write), then enables or stays disabled.
+                r_walking  <= 1'b1;
+                r_walk_end <= !r_en;
+                r_walk_set <= '0;
+                r_dis_pend <= !i_ctrl_wdata[0];
             end else r_en <= 1'b1;   // 1: enable (instant)
         end
 
@@ -584,7 +590,7 @@ module l2_cache #(
                         r_many <= |t_match;
                         r_mway <= t_mway;
                         r_vic  <= t_vic;
-                        r_msel <= t_match;
+                        r_msel <= t_mway;
                         f_st   <= F_DEC;
                     end else begin
                         f_st   <= F_LOOK;
@@ -594,7 +600,8 @@ module l2_cache #(
                 end else if (r_walk_end && wb_v == 2'b00 && e_st == E_IDLE) begin
                     r_walking  <= 1'b0;
                     r_walk_end <= 1'b0;
-                    if (r_dis_pend) begin r_en <= 1'b0; r_dis_pend <= 1'b0; end
+                    r_en       <= !r_dis_pend;
+                    r_dis_pend <= 1'b0;
                 end
             end
 
@@ -604,7 +611,7 @@ module l2_cache #(
                 r_many <= |t_match;
                 r_mway <= t_mway;
                 r_vic  <= t_vic;
-                r_msel <= t_match;
+                r_msel <= t_mway;
                 f_st   <= F_DEC;
             end
 
@@ -630,7 +637,7 @@ module l2_cache #(
                         if (w_rd_needslot) begin
                             // copy the victim's dirty sectors to the buffer
                             c_way <= r_vic; c_sec <= r_vd; c_e <= wb_tail;
-                            r_msel <= WAYS'(1) << r_vic;
+                            r_msel <= r_vic;
                             wb_v[wb_tail]    <= 1'b1;
                             wb_rdy[wb_tail]  <= 1'b0;
                             wb_line[wb_tail] <= {1'b0, r_ttag[r_vic], q_set};
@@ -655,7 +662,7 @@ module l2_cache #(
                         end else if (!wb_full) begin
                             ev_w_miss <= 1'b1;
                             c_way <= r_vic; c_sec <= r_vd; c_e <= wb_tail;
-                            r_msel <= WAYS'(1) << r_vic;
+                            r_msel <= r_vic;
                             wb_v[wb_tail]    <= 1'b1;
                             wb_rdy[wb_tail]  <= 1'b0;
                             wb_line[wb_tail] <= {1'b0, r_ttag[r_vic], q_set};
@@ -705,7 +712,7 @@ module l2_cache #(
                     if (!wb_full) begin
                         c_way <= r_wk_way; c_sec <= r_td[r_wk_way]; c_e <= wb_tail;
                         c_set <= r_walk_set;
-                        r_msel <= WAYS'(1) << r_wk_way;
+                        r_msel <= r_wk_way;
                         wb_v[wb_tail]    <= 1'b1;
                         wb_rdy[wb_tail]  <= 1'b0;
                         wb_line[wb_tail] <= {1'b0, r_ttag[r_wk_way], r_walk_set};
@@ -749,7 +756,7 @@ module l2_cache #(
                     e_c     <= w_cburst;
                     e_alloc <= w_rd_alloc;
                     e_way   <= r_many ? r_mway : r_vic;
-                    e_n     <= !q_wide ? 3'd1 : (w_rd_newline ? 3'd4 : 3'd2);
+                    e_n     <= !q_wide ? 3'd1 : (w_rd_both ? 3'd4 : 3'd2);
                     e_k     <= 3'd0;
                     e_bc    <= 3'd0;
                     e_wide  <= q_wide;
@@ -759,7 +766,12 @@ module l2_cache #(
                     app_en   <= 1'b1;
                     app_cmd  <= CMD_READ;
                     app_addr <= {q_line, w_cburst, 3'b000};
-                end else if (wb_v[wb_h] && wb_rdy[wb_h] && !(f_st == F_DEC && !q_wr && !w_rd_hit && w_rd_can)) begin
+                end else if (wb_v[wb_dh] && wb_rdy[wb_dh] && !(f_st == F_DEC && !q_wr && !w_rd_hit && w_rd_can) &&
+                             (!(i_dma || i_rt_req) || f_st != F_IDLE || r_walk_end)) begin
+                    // (no drain starts in the gaps of a DMA tenure, nor
+                    // while VGA waits for the bus — its reads would wait
+                    // them out — unless the front end waits on the buffer:
+                    // full, or an entry of its line)
                     e_st  <= E_WR;
                     e_bm  <= wb_hb;
                     e_p   <= f_first(wb_hb);
@@ -795,7 +807,7 @@ module l2_cache #(
                     2'd0: if (app_rdy && app_wdf_rdy && !app_en && !app_wdf_wren) begin
                         app_en       <= 1'b1;
                         app_cmd      <= CMD_WRITE;
-                        app_addr     <= {wb_line[wb_h], e_p, 3'b000};
+                        app_addr     <= {wb_line[wb_dh], e_p, 3'b000};
                         app_wdf_data <= dr_chunk[63:0];
                         app_wdf_mask <= ~dr_m0;
                         app_wdf_wren <= 1'b1;
@@ -818,9 +830,9 @@ module l2_cache #(
                         if (!(app_wdf_wren && !app_wdf_rdy) && !(app_en && !app_rdy)) begin
                             // both accepted (or accepted on this edge)
                             if ((e_bm & ~(4'b1 << e_p)) == 4'b0) begin
-                                wb_v[wb_h]   <= 1'b0;
-                                wb_rdy[wb_h] <= 1'b0;
-                                wb_h         <= !wb_h;
+                                wb_v[wb_dh]   <= 1'b0;
+                                wb_rdy[wb_dh] <= 1'b0;
+                                wb_h          <= !wb_dh;
                                 e_st         <= E_IDLE;
                             end else begin
                                 e_bm  <= e_bm & ~(4'b1 << e_p);
