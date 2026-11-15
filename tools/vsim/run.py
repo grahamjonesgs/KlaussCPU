@@ -1778,6 +1778,282 @@ def cmd_socvga(a):
     return 0 if ok else 1
 
 
+M64 = (1 << 64) - 1
+
+
+def _l2_loop(a, label, n_reg, n):
+    a.setr(n_reg, n); a.label(label)
+
+
+def _l2_ctrl_prog(K=400):
+    """HW_PERF_PLAN §6, L2_CTRL semantics through the SoC (MMIO_MAP):
+    96 KiB of stores (the D-cache's victims make the L2 dirty), then a write
+    of 0: BUSY must read 1 at once (r2 = 0x100); a write of 1 during the walk
+    is ignored; K stores (+ loads) spread over every L2 set run during the
+    walk (walked and not-yet-walked sets); BUSY polled to 0; L2_CTRL then
+    reads 0 (r4: disabled), a write of 1 enables (r5 = 1); r11 = the sum of
+    the region's dwords, read back through the D-cache (bypass L2), r12 =
+    the same after re-enabling and a WBINV (3)."""
+    from kasm import Asm
+    R, SZ, K1, K2, ST = 0x200000, 96 * 1024, 0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x2348
+    mem = {}
+    a = Asm()
+    a.setr(15, 0xF0050000)
+    a.setr(10, R); a.setr(8, 0); a.setr64(7, K1); a.setr(12, 32)
+    _l2_loop(a, 'f1', 9, SZ // 32)
+    a.st(64, 8, 10, 0); a.alu('add', 8, 8, 7); a.alu('add', 10, 10, 12)
+    a.dec(9); a.fbr('ne', 9, 0, 'f1', imm=True)
+    v = 0
+    for i in range(SZ // 32):
+        mem[R + 32 * i] = v; v = (v + K1) & M64
+    a.setr(1, 0); a.st(64, 1, 15, 0x28)          # disable: write back, invalidate, bypass
+    a.ld(64, 2, 15, 0x28)                         # BUSY at once
+    a.setr(1, 1); a.st(64, 1, 15, 0x28)           # ignored (BUSY)
+    a.setr(10, R); a.setr(8, 0); a.setr64(6, 5); a.setr64(7, K2); a.setr(13, SZ); a.setr(12, ST)
+    _l2_loop(a, 'w1', 9, K)
+    a.alu('add', 11, 10, 8); a.st(64, 6, 11, 0); a.ld(64, 3, 11, 8)
+    a.alu('add', 6, 6, 7); a.alu('add', 8, 8, 12)
+    a.fbr('ult', 8, 13, 'w1n'); a.alu('sub', 8, 8, 13)
+    a.label('w1n')
+    a.dec(9); a.fbr('ne', 9, 0, 'w1', imm=True)
+    off, v = 0, 5
+    for j in range(K):
+        mem[R + off] = v; v = (v + K2) & M64; off += ST
+        if off >= SZ:
+            off -= SZ
+    a.label('poll'); a.ld(64, 4, 15, 0x28); a.setr(1, 0x100); a.alu('and', 4, 4, 1)
+    a.fbr('ne', 4, 0, 'poll', imm=True)
+    a.ld(64, 4, 15, 0x28)                         # 0: disabled, idle
+    a.setr(1, 1); a.st(64, 1, 15, 0x28); a.ld(64, 5, 15, 0x28)   # 1
+    for k, lab in ((11, 's1'), (12, 's2')):
+        if k == 12:
+            a.setr(1, 3); a.st(64, 1, 15, 0x28)
+            a.label('poll2'); a.ld(64, 1, 15, 0x28); a.setr(3, 0x100); a.alu('and', 1, 1, 3)
+            a.fbr('ne', 1, 0, 'poll2', imm=True)
+        a.setr(10, R); a.setr(k, 0); a.setr(13, 8)
+        _l2_loop(a, lab, 9, SZ // 8)
+        a.ld(64, 3, 10, 0); a.alu('add', k, k, 3); a.alu('add', 10, 10, 13)
+        a.dec(9); a.fbr('ne', 9, 0, lab, imm=True)
+    a.halt()
+    csum = sum(mem.values()) & M64
+    return a, {'r2': 0x100, 'r4': 0, 'r5': 1, 'r11': csum, 'r12': csum}
+
+
+def _l2_blit_prog():
+    """HW_PERF_PLAN §6, DMA ordering through the SoC: the CPU writes 8 rows
+    of 64 B, FLUSH (its writeback reaches the L2 / write buffer), the
+    blitter FILLs bytes 8..23 of each row (the same bytes), INVALIDATE, the
+    CPU reads.  Three rounds: L2 on (the writeback allocates, the blitter's
+    write merges), L2 off (both posted to the write buffer: order kept), L2
+    on again with the reverse order (blitter first, then CPU stores, FLUSH,
+    then a blitter COPY of the rows reads the L2's dirty data).  r11..r13 =
+    per-round sums of the rows (r13: of the COPY's destination)."""
+    from kasm import Asm
+    B, C = 0x300000, 0x340000
+    a = Asm()
+    a.setr(15, 0xF0050000); a.setr(14, 0xF00E0000)
+
+    def wait_flush():
+        lb = f'wf{len(a.labels)}'
+        a.label(lb); a.ld(64, 1, 15, 0x10); a.fbr('ne', 1, 0, lb, imm=True)
+
+    def blit(op, dst, src=0):
+        a.setr(1, dst); a.st(64, 1, 14, 0x10); a.setr(1, 64); a.st(64, 1, 14, 0x18)
+        a.setr(1, src); a.st(64, 1, 14, 0x20); a.setr(1, 64); a.st(64, 1, 14, 0x28)
+        a.setr(1, 8 if op == 0 else 32); a.st(64, 1, 14, 0x30); a.setr(1, 8); a.st(64, 1, 14, 0x38)
+        a.setr(1, 0x1234); a.st(64, 1, 14, 0x40)
+        a.setr(1, 1 | op << 1); a.st(64, 1, 14, 0x00)
+        lb = f'bw{len(a.labels)}'
+        a.label(lb); a.ld(64, 1, 14, 0x08); a.setr(2, 2); a.alu('and', 1, 1, 2)
+        a.fbr('eq', 1, 0, lb, imm=True)
+        a.setr(1, 2); a.st(64, 1, 14, 0x08)
+
+    def cpu_rows(seed):
+        for r in range(8):
+            for k in range(8):
+                a.setr64(1, (seed * 0x1000193 + r * 8 + k + 1) * 0x9E3779B97F4A7C15 & M64)
+                a.st(64, 1, 10, r * 64 + 8 * k, mode='long')
+
+    def sum_rows(base, reg):
+        a.setr(10, base); a.setr(reg, 0)
+        for r in range(8):
+            for k in range(8):
+                a.ld(64, 1, 10, r * 64 + 8 * k, mode='long'); a.alu('add', reg, reg, 1)
+
+    def exp_rows(seed, fill_after):
+        t = 0
+        for r in range(8):
+            for k in range(8):
+                v = (seed * 0x1000193 + r * 8 + k + 1) * 0x9E3779B97F4A7C15 & M64
+                if fill_after and k in (1, 2):
+                    v = 0x1234123412341234
+                t += v
+        return t & M64
+
+    exp = {}
+    for rnd, reg in ((0, 11), (1, 12)):
+        if rnd == 1:
+            a.setr(1, 0); a.st(64, 1, 15, 0x28)
+            lb = 'dis'; a.label(lb); a.ld(64, 1, 15, 0x28); a.setr(2, 0x100); a.alu('and', 1, 1, 2)
+            a.fbr('ne', 1, 0, lb, imm=True)
+        a.setr(10, B + 0x1000 * rnd)
+        cpu_rows(rnd + 1)
+        a.setr(1, 2); a.st(64, 1, 15, 0x00); wait_flush()          # FLUSH
+        blit(0, B + 0x1000 * rnd + 8)                                 # FILL bytes 8..23
+        a.setr(1, 4); a.st(64, 1, 15, 0x00); wait_flush()          # INVALIDATE
+        sum_rows(B + 0x1000 * rnd, reg)
+        exp[f'r{reg}'] = exp_rows(rnd + 1, True)
+    # round 3: L2 on; blitter fill, then CPU rows over it, FLUSH, COPY to C
+    a.setr(1, 1); a.st(64, 1, 15, 0x28)
+    blit(0, B + 0x2000 + 8)
+    a.setr(10, B + 0x2000); cpu_rows(3)
+    a.setr(1, 2); a.st(64, 1, 15, 0x00); wait_flush()
+    blit(1, C, B + 0x2000)
+    a.setr(1, 4); a.st(64, 1, 15, 0x00); wait_flush()
+    sum_rows(C, 13)
+    exp['r13'] = exp_rows(3, False)
+    a.halt()
+    return a, exp
+
+
+def _l2_cnt_prog():
+    """HW_PERF_PLAN §6: the L2 counters (0xF00D_0118 ..) over two read
+    passes of a cold 96 KiB region (32 B stride): pass 1 misses once per
+    64 B line (the other sector arrives with it), pass 2 (the D-cache
+    thrashes, the L2 holds it all) hits; r1..r11 = the counter deltas,
+    r12 / r13 = PERF_CYCLES of pass 1 / pass 2."""
+    from kasm import Asm
+    R, SZ = 0x200000, 96 * 1024
+    a = Asm()
+    a.setr(15, 0xF00D0000)
+    a.setr(1, 1); a.st(64, 1, 15, 0x00)
+    for p, reg in ((0, 12), (1, 13)):
+        a.ld(64, 14, 15, 0x08)
+        a.setr(10, R); a.setr(12 if p == 0 else 13, 0); a.setr(11, 32)
+        _l2_loop(a, f'p{p}', 9, SZ // 32)
+        a.ld(64, 2, 10, 0); a.alu('add', 10, 10, 11)
+        a.dec(9); a.fbr('ne', 9, 0, f'p{p}', imm=True)
+        a.ld(64, reg, 15, 0x08); a.alu('sub', reg, reg, 14)
+    for k in range(11):
+        a.ld(64, 1 + k, 15, 0x118 + 8 * k)
+    a.halt()
+    return a
+
+
+def cmd_socl2(a):
+    """HW_PERF_PLAN §6: the L2 through the SoC — L2_CTRL semantics with
+    stores during the walk, DMA (blitter) ordering against D-cache
+    writebacks, the counters.  Every run also under the consistency
+    checker."""
+    exe = build_soc(None)
+    l2 = l2_cfg()[0]
+    fails = 0
+
+    def report(name, ok, msg=''):
+        nonlocal fails
+        fails += not ok
+        print(f'{"pass" if ok else "FAIL"} {name} {msg}')
+
+    if l2:
+        prog, exp = _l2_ctrl_prog()
+        g = _soc_regs(run_soc(exe, prog, 'l2_ctrl', trace=True, plus=a.plus))
+        bad = {k: hex(g.get(k, -1)) for k in exp if g.get(k) != exp[k]} if g else {'halt': 0}
+        report('ctrl', not bad, str(bad))
+    prog, exp = _l2_blit_prog()
+    g = _soc_regs(run_soc(exe, prog, 'l2_blit', trace=True, plus=a.plus))
+    bad = {k: hex(g.get(k, -1)) for k in exp if g.get(k) != exp[k]} if g else {'halt': 0}
+    report('blit', not bad, str(bad))
+    if l2:
+        g = _soc_regs(run_soc(exe, _l2_cnt_prog(), 'l2_cnt', trace=True, plus=a.plus))
+        if g is None:
+            report('counters', False, 'no halt')
+        else:
+            c = [g[f'r{1 + k}'] for k in range(11)]
+            names = ['i_hit', 'i_miss', 'd_hit', 'd_miss', 'w_hit', 'w_miss', 'rd_beat', 'wr_beat',
+                     'wbfull', 'dma_hit', 'dma_miss']
+            # (w_hit / w_miss: dirty lines of the boot image leaving the D-cache)
+            ok = (c[3] == 1536 and 4600 <= c[2] <= 4620 and c[4] + c[5] <= 64 and c[9] == c[10] == 0 and
+                  c[6] == 8 * (c[1] + c[3]) and c[7] == 0)
+            report('counters', ok, ' '.join(f'{n}={v}' for n, v in zip(names, c)) +
+                   f' cycles pass1={g["r12"]} pass2={g["r13"]} ({g["r12"] / 3072:.1f} / {g["r13"] / 3072:.1f} a load)')
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
+def _bench_progs():
+    """HW_PERF_PLAN §6: footprints between the L1s (64 KiB each) and the
+    L2 (128 KiB): (name, Asm, check register) — each ends with r1 = a
+    checksum that must not depend on the memory system"""
+    import random
+    from kasm import Asm
+    out = []
+    # data: 4 passes of load + add + store over 96 KiB (dwords at 16 B stride)
+    a = Asm(); R, SZ = 0x200000, 96 * 1024
+    a.setr(1, 0); a.setr(12, 16); a.setr(8, 4)
+    a.label('dp')
+    a.setr(10, R); a.setr(9, SZ // 16)
+    a.label('dl'); a.ld(64, 2, 10, 0); a.alu('add', 1, 1, 2); a.addi_s(2, 2, 3); a.st(64, 2, 10, 0)
+    a.alu('add', 10, 10, 12); a.dec(9); a.fbr('ne', 9, 0, 'dl', imm=True)
+    a.dec(8); a.fbr('ne', 8, 0, 'dp', imm=True)
+    a.halt()
+    out.append(('data96k', a))
+    # code: 96 functions of ~1 KiB, called in turn, 3 passes
+    a = Asm(); rnd = random.Random(7)
+    a.setr(1, 0); a.setr(8, 3)
+    a.label('cp')
+    for f in range(96):
+        a.call(f'f{f}')
+    a.dec(8); a.fbr('ne', 8, 0, 'cp', imm=True)
+    a.halt()
+    for f in range(96):
+        while a.pc % 32:
+            a.nop()
+        a.label(f'f{f}')
+        for _ in range(250):
+            r = rnd.randrange(2, 8)
+            a.alu(rnd.choice(['add', 'xor']), 1, 1, r) if rnd.random() < 0.5 else a.addi_s(r, r, rnd.randrange(1, 9))
+        a.ret()
+    out.append(('code96k', a))
+    # pointer chase: a random cycle through 112 KiB of 64 B nodes, 4 laps
+    a = Asm(); R, N = 0x280000, 112 * 1024 // 64
+    perm = list(range(N)); rnd.shuffle(perm)
+    a.setr(10, R + 64 * perm[0])
+    nxt = {perm[i]: perm[(i + 1) % N] for i in range(N)}
+    # build the list with stores (node k -> next), then chase
+    a.setr(12, R)
+    for k in range(N):
+        a.setr(2, R + 64 * nxt[k]); a.setr(11, R + 64 * k); a.st(64, 2, 11, 0)
+    a.setr(1, 0); a.setr(9, 4 * N)
+    a.label('pc'); a.ld(64, 10, 10, 0); a.alu('add', 1, 1, 10); a.dec(9); a.fbr('ne', 9, 0, 'pc', imm=True)
+    a.halt()
+    out.append(('chase112k', a))
+    return out
+
+
+def cmd_socbench(a):
+    """HW_PERF_PLAN §6: PIPE_RUN cycles of the large-footprint programs with
+    and without the L2 (VSIM_L2=0 build), same MIG model; registers equal"""
+    with _env(['VSIM_L2=0']):
+        off = build_soc(None)
+    on = build_soc(None)
+    fails = 0
+    for name, prog in _bench_progs():
+        res = []
+        for tag, exe in (('off', off), ('on', on)):
+            r = run_soc(exe, prog, f'bench_{name}_{tag}', trace=True, plus=a.plus, timeout=7200)
+            t = int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0
+            res.append((t, _soc_regs(r)))
+            try:
+                os.remove(r['trace'])
+            except OSError:
+                pass
+        same = res[0][1] is not None and res[0][1] == res[1][1]
+        fails += not same
+        print(f'{"same" if same else "DIFF"} {name}: cycles {res[0][0]} -> {res[1][0]} '
+              f'({100.0 * (res[1][0] - res[0][0]) / max(1, res[0][0]):+.1f}%) {" ".join(a.plus)}')
+    return 1 if fails else 0
+
+
 def cmd_soceth(a):
     """ETH_RX_SLOTS (0xF007_0000, HW_PERF_PLAN.md §3) through the real SoC bus
     (bus_splitter -> eth_mmio_bridge; tb_soc stubs liteeth_core, the RX slot
@@ -1950,6 +2226,8 @@ def main():
     sub.add_parser('socsd')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
+    bp = sub.add_parser('socbench'); bp.add_argument('--plus', action='append', default=[])
+    l2p = sub.add_parser('socl2'); l2p.add_argument('--plus', action='append', default=[])
     vg = sub.add_parser('socvga'); vg.add_argument('--lines', type=int, default=120)
     vg.add_argument('--wbinv-every', type=int, default=1500)
     vg.add_argument('--span', type=lambda v: int(v, 0), default=0x80000)
@@ -2037,6 +2315,10 @@ def main():
         sys.exit(cmd_socx(a))
     elif a.cmd == 'soceth':
         sys.exit(cmd_soceth(a))
+    elif a.cmd == 'socbench':
+        sys.exit(cmd_socbench(a))
+    elif a.cmd == 'socl2':
+        sys.exit(cmd_socl2(a))
     elif a.cmd == 'socvga':
         sys.exit(cmd_socvga(a))
     elif a.cmd == 'tlbdiff':
