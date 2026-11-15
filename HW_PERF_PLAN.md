@@ -609,6 +609,159 @@ they are separate commits after the I-cache, so either can be dropped.
   b3 is placement, not the items (b2's violators were the MEM shifter
   forward).
 
+### §5 review fix-ups (2026-11-15)
+
+**The finding (major): a dropped install left BTIC entries no store could
+kill.**  BTIC entries die by line index only (`ev_icinst`, the store snoop
+`snoop_q`, ICACHE_INV / TLB discard, start / resume).  That is safe only
+if every captured window's line sits in the snoop's tag shadow at the
+entry's `bt_lidx` (or is the pending install, `sn_rc`), so that a later
+store to it is a snoop hit.  A dropped install (`lp_ev && lp_wrh`) left
+the shadow with the old line's tag and fired no `ev_icinst`: a capture
+taken from the window the fill's early restart served, after the
+dropping store's pending-line snoop, would have survived every later
+store to its line — a snoop-coherent patch of a <= 16 B loop could then
+run stale from a BTIC hit taken before the next fill's install.
+
+- **Reproduction.**  `tools/vsim` gained an invariant check in tb_vsim
+  (`btic_unc` in the `.out` file: cycles in which a valid BTIC entry's
+  line is neither in the shadow at its `bt_lidx` nor the pending install;
+  32 B lines, TE = 0).  The review's scenario (`ic32_drop_btic`: a cold
+  16 B loop storing into its line's other half, `+LDLY` 4–16, patched
+  without ICACHE_INV, re-entered under a late line) does **not** fail on
+  `112fc8b`, and the check stays 0 there: the dropping write is always
+  issued after the fill's ready (a fill needs an idle port and an empty
+  store queue, a store issue needs no fill in flight), so it is a store
+  posted speculatively (EN_ST1, or queued, EN_SQ) whose post check fails
+  on `sn_rc`; the cycle after, its squash empties the window together
+  with the snoop's BTIC kill, and a capture on that edge is blocked.  A
+  non-speculative store issue during `lp_v` would have to chain onto a
+  load's answer, which the D-cache cannot give while it installs the
+  line.  The check also stayed 0 over every directed test at `+LDLY` 1 /
+  2 / 4 / 6 / 9 / 12 (~10k runs), with EN_ST1 = 0 in a sim copy (~8k
+  runs), and over 3,600 runs of a cold-line SMC fuzzer (patches of
+  code words in other functions' lines, stores into the own line, loops,
+  calls; `+LAT` 1–5, `+LDLY` 1–16, `+LDLYR`, `+HIT`; EN_ST1 on and off; on
+  average 0.8 drops a run).  The one writer that broke the invariant on
+  `112fc8b` is the **debugger**: its memory write does not snoop, so the
+  CALL's capture from a fill whose install it drops stayed live and
+  uncovered (`ic32_dbg_write`: `btic_unc` 9 / 11 cycles at `+LDLY` 12 /
+  30) until the resume emptied the BTIC — harmless, but only through the
+  resume.
+- **Fix: install-invalid.**  A dropped install writes `ic_data`, `ic_tag`
+  and `ic_tagsh` and fires `ev_icinst` exactly like an install; only its
+  valid bit is written 0 (`g_vl`: the request is `lp_ev`, the data bit
+  `!lpi`; it cancels a deferred set and is never deferred itself — when a
+  clear or the sweep owns the write its bit is 0 already: the dropping
+  store's `sn_rc` snoop cleared the index, nothing set it since, and a
+  debugger write is followed by the resume's sweep).  Firing `ev_icinst`
+  alone would not do: a capture after the drop would still be uncovered.
+- **Why the invariant now holds for every copy.**  A window is filled from
+  (a) a lookup hit — the line is installed, so in the shadow; (b) a fill
+  F of line L — until L's answer `sn_rc` covers L (pending), and at the
+  answer the shadow gets L whether installed or dropped, while
+  `ev_icinst` kills every entry captured before at that index; (c) a
+  BTIC hit — a copy of a covered entry; (d) the NLB or a slide — copies
+  of valid I-cache lines.  The shadow at an index changes only with an
+  `ev_icinst`, which kills every entry at that index, so a covered entry
+  stays covered until it dies.  A pending install that never arrives is
+  dropped only by ICACHE_INV, start and resume, which empty the BTIC.
+  NLB / prefetch copies do not depend on the shadow: the prefetch captures
+  only lines whose valid bit it read (an install-invalid leaves it 0), and
+  the NLB entries are killed by the stores' line-address compares at issue
+  and completion.  The window itself is covered by the dword compares
+  (post check, completion squashes) and the EN_ST1 squash.
+- **Minor: `PERF_ITLB_REFILL`** counts `it_ref && !tlb_psel &&
+  !tlb_discard`, ut_refill's condition (a refill pending on a discard
+  edge is not done; the lookup asks again).  tb_vsim now checks every
+  cycle that `perf_itlb` equals the refills done (FATAL otherwise) and
+  counts the dropped ones (`itlb_disc`); no test reaches that case (TLB
+  writes and walks serialise the fetch), so the fix is by inspection.
+- **Minor: `PERF_IC_FILL_CYC`** (`perf_ic[1]`) is `if_xc` or, registered,
+  a fetch-miss cycle (`perf_stall[6]`) while `lp_v` or `li_q`, except a
+  lookup's hit cycle (MMIO_MAP).  Straight code through 40 cold lines at
+  `+LAT=3`: the bubble part (`PERF_IF_MISS` − fill) was 84 / 125 / 249 /
+  577 cycles at `+LDLY` 0 / 4 / 8 / 16, now 84 / 123 / 123 / 123
+  (`ic32_fill_cyc`).
+- **Minor: clock enable.**  `pipeline_core` takes `CE_TIED` (default 1);
+  `IC_LB` = 32 with `CE_TIED` = 0 is an elaboration error (the one-cycle
+  `m_line_v` pulse is taken under `ce`, so one in a `ce` = 0 cycle would be
+  lost and `lp_v` would stick), and a simulation assertion checks `ce`
+  stays 1 when `CE_TIED` = 1.  Core 2 passes `CE_TIED(0)` with `IC_LB(16)`.
+- **Tests for the review's gaps** (each also at 1024 × 32 and 1024 × 16):
+  `ic32_vdefer_snoop` (a set deferred behind one store's snoop, met by a
+  second store's snoop of its own line on the next edge — `vdrop`);
+  `ic32_sweep_snoop` (a line installed during a sweep, then a snooped
+  store into it; the return's line answers after the sweep, `+LDLYA`, so
+  no other install replaces the waiting set); `ic32_inv_defer` (ICACHE_INV
+  restarting a sweep while a set waits — `swgo`'s `vs_pend <= 0`);
+  `ic32_sweep_restart` (fences 0–70 cycles apart, refills between);
+  `ic32_dbg_write` (DEBUG_EN: a debugger write to code while the install
+  is pending; requires `btic_unc` = 0).  tb_vsim gained `+DBG_MW` /
+  `+DBG_MD` (a debugger memory write at the first halt) and `+LDLYA` /
+  `+LDLYN` (one line's answer delay).
+- **Mutation checks.**  `vdrop` = 0 fails `ic32_vdefer_snoop` (3 variants)
+  and `ic32_sweep_snoop` (6); without `swgo`'s `vs_pend <= 0`,
+  `ic32_inv_defer` fails (6); reverting the install-invalid (install only
+  on `li_now`) fails `ic32_dbg_write` (`btic_unc`, 4 variants, DEBUG_EN);
+  writing the drop's valid bit as 1 fails `ic32_smc_pending` (18),
+  `ic32_vdefer_snoop` (12) and `ic32_smc_btic` (4).
+- **Regression** (`bb23b01`; 2048 × 32, 1024 × 32 and 1024 × 16): `test`
+  (also DEBUG_EN, MPU_EN, TLB_N = 16, TLB_WALK = 0), the `ic*` / `ut_*`
+  tests at `+LDLY` 6 and 11 + `+HIT=50` and under DEBUG_EN, `diff` (incl.
+  `--irq`, `+HIT`, `+LDLY`, DEBUG_EN, EXC_EN = 0), `socdiff` (incl. a 64 B
+  span), `socmmio`, `socwalk`, `socx`, `socdcbz`, `tlbdiff` (all variants),
+  `tlbpage`, `dcbzdiff` 200 seeds, `mpudiff`, `excdiff`, `dmtest`: all pass.
+  Under a global `+LDLY` only count / timing-specified expectations
+  differ: `exc_di_irq` and `ic16_icinv.1` as before, `ic_counters`'
+  `ic_fill` (it now counts the line wait — at 1024 × 16 it differs under
+  `+LDLYR` on `112fc8b` too) and `ic32_fill_cyc` under a random `+LDLYR`.
+  **1024 × 16** is cycle-identical to `112fc8b` on all 1,703 tests both
+  pass, and trace- and cycle-identical to master `e242c1d` on `diff`
+  (`+TRACECYC`: 40 seeds × 1 / 3 / 7, `+HIT=70`, DEBUG_EN, MPU_EN,
+  EXC_EN = 0; `--irq`) and `socdiff` (30 seeds, 20 with a 64 B span);
+  against `e242c1d`, 112 variants of 35 TE = 1 tests differ in cycles,
+  all since `112fc8b`'s micro-ITLB (not this round).
+
+### §5 review fix-ups: timing
+
+- **`icache_b4` (`c1834a8`, the fixes)**: no Synth 8-4767, the memories as
+  before (82 RAMB36 + 18 RAMB18, the valid banks 32 × 2 RAM64M).  Standard
+  flow **not met**: tier 1 −0.107 (two endpoints: the MEM shifter →
+  `ex_b_zero`, `r_shhi` → `w_sh2` → a 64-bit carry-chain zero test, 17
+  levels; and `wb_hok` → a TLB entry), tier 2 −0.023.  The valid-bit
+  LUTRAM write enable — the near-critical path of `112fc8b` (+0.071) — is
+  at +0.646 (its enable no longer depends on `lp_wrh`).  An alternate
+  placement (ExtraPostPlacementOpt) met at +0.008 (cross-check only; not
+  kept).
+- **Design fix (`bb23b01`)**: `bz_mem`'s shift case (the forward into
+  `ex_b_zero`) comes from byte-zero flags of the shifter's stage-1
+  registers, selected per result byte by the stage-2 byte shift — no
+  barrel and no carry chain after `r_shhi`.  Combinationally equal
+  (asserted every cycle), CPI-free; `sh_bz_form` (every shift kind, both
+  count forms, 32 / 64-bit and DIV consumers) fails under each of nine
+  single-term mutations of the flag form.
+- **`icache_b5` (`bb23b01`)**: standard `build_fast -resynth`, tier 1
+  −0.138 (now the D-cache hit pipe's TLB → `r_h_tag`, the family that was
+  `112fc8b`'s worst at +0.070, and two shifter forwards), **tier 2
+  AggressiveExplore WNS +0.007 / WHS +0.050: met**, 15 min 43 s, no
+  alternate placement.  Worst paths after tier 2: TLB → `r_h_tag` (+0.007),
+  `ex_sp` → `mem_xsq` (+0.042), `m_addr` → `pc` (+0.051), the shifter →
+  multiplier input (+0.053); the valid banks' data input +0.834; nothing
+  of this round's logic is near-critical.
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `icache_b4` | `c1834a8` | review fix-ups | −0.107 / +0.023 | −0.023 (not met) | — | — | 91 |
+| **`icache_b5`** | **`bb23b01`** | + the shifter's zero test from byte flags | −0.138 / +0.050 | **+0.007 / +0.050** | 37,118 | 24,700 | 91 |
+
+- **Bitstream `bb23b01`** (`~/.cache/kbuild/icache_bb23b01.bit`, md5
+  `fe6a53c97092e2dfd782c0743f565fcd`), build dir `~/.cache/kbuild/icache_b5`:
+  +412 LUTs and +14 FFs against `112fc8b` (3,849 LUTs as memory, 91 BRAM
+  tiles, as before).  The margin is thin, as it was at `5bcf24e` (tier 2
+  +0.013); the tier-1 misses of b4 and b5 are placement-sensitive core
+  paths outside the I-cache.  Not run on the board.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -717,3 +870,8 @@ Decisions taken while implementing the frozen text above:
   4-entry tagged micro-ITLB) on `icache`: `112fc8b`, standard flow tier 1
   WNS +0.070 / WHS +0.011, `~/.cache/kbuild/icache_112fc8b.bit`.  Not yet
   run on the board.
+- 2026-11-15: §5 review fix-ups (install-invalid on a dropped install,
+  PERF_IC_FILL_CYC / PERF_ITLB_REFILL, CE_TIED, new directed tests) and
+  the shifter zero-test timing fix: `bb23b01`, standard flow tier 2 WNS
+  +0.007 / WHS +0.050, `~/.cache/kbuild/icache_bb23b01.bit`.  Not yet run
+  on the board.
