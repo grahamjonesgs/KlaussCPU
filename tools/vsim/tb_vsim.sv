@@ -394,13 +394,23 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
       if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
-   // The BTIC coverage invariant (32 B lines): every valid BTIC entry's
-   // window line sits in the snoop's tag shadow at its line index (bt_lidx),
-   // or is the pending install's line — so a later store to it is a snoop
-   // hit and kills the entry — and so does the line of its branch (bt_tag,
-   // at bt_blidx: an entry also dies with its branch's line, which is what
-   // makes "a tag match is the same branch, hence the same target" true).
-   // btic_unc counts the cycles an entry is uncovered (either line; +BTICCHK
+   // The BTIC coverage invariant: every valid BTIC entry's window line sits
+   // in the snoop's tag shadow at its line index, or is the pending
+   // install's line — so a later store to it is a snoop hit and kills the
+   // entry — and so do the lines of its branch (an entry also dies with its
+   // branch's line, which is what makes "a tag match is the same branch,
+   // hence the same target" true): the line of its first word (bt_tag, at
+   // bt_blidx) and (review 3) the line of its last word — a 2-word branch
+   // at a line's last word keeps its target in the next line.  The core
+   // records no index for that line (it does not capture such a branch), so
+   // the check takes it from the arm that wrote the entry (the branch's
+   // id_last_dw).  The line indices are the check's own (from the VA), not
+   // the core's bt_lidx / bt_blidx — and a line is covered only at an index
+   // the core's kills compare for that entry (bt_lidx / bt_blidx): a line
+   // in the shadow that no kill compare names (a branch's last word in the
+   // next line) is not.  Both line sizes (review 3): with 16 B lines the
+   // shadow is the pair banks ic_tagff_e / _o.
+   // btic_unc counts the cycles an entry is uncovered (any line; +BTICCHK
    // prints them); a run with btic_unc > 0 ends with a FATAL line, which
    // run.py's result checks catch for every test and random diff.
    // TE = 1: the shadow holds PA tags.  An entry's PA lines are taken when
@@ -408,15 +418,26 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    // translation cannot change during the entry's life: a TLB discard, and
    // a TE / ASID change, empty the BTIC); btic_pau counts entries whose page
    // the micro-ITLB no longer held then (not checked).
+   // Currency (review 3): a BTIC hit's window must be at the ID op's own
+   // (current) predicted target — btic_stale counts the cycles it is not
+   // (the core's "BTIC base != target" assertion stops the run first when
+   // it is compiled in; this count does not depend on it).
+   // btic_chk / btic_hits: the entries checked (written with a known PA)
+   // and the BTIC hits checked — a run with none checked nothing.
    localparam int BTN = 64;
-   localparam int BT_TS = $clog2(IC_LINES) + 2;    // the tag: a PA dword's bits [28:BT_TS]
-   longint      btic_unc = 0, btic_pau = 0;
+   localparam int BT_LW = (IC_LB == 32) ? 2 : 1;          // log2(dwords per line)
+   localparam int BT_TS = $clog2(IC_LINES) + BT_LW;    // the tag: a PA dword's bits [28:BT_TS]
+   longint      btic_unc = 0, btic_pau = 0, btic_chk = 0, btic_hits = 0, btic_stale = 0, btic_noarm = 0;
    bit          bticchk = 0;
-   logic [28:0] bt_pt [0:BTN-1], bt_pb [0:BTN-1];  // the target window's / the branch's PA dword
+   logic [28:0] bt_pt [0:BTN-1], bt_pb [0:BTN-1], bt_pl [0:BTN-1];  // target window / branch / branch's last word: PA dword
+   logic [28:0] bt_vt [0:BTN-1], bt_vb [0:BTN-1], bt_vl [0:BTN-1];  // ... VA dword (the line index)
    logic [BTN-1:0] bt_pk = '0;                      // ...known
    logic [BTN-1:0] btm_v = '0;
    logic [28:0] btm_base [0:BTN-1];
    logic [29:0] btm_tag [0:BTN-1];
+   logic [29:0] ba_tag [0:1];                      // the last two arms: the branch's pc[31:2] ...
+   logic [28:0] ba_last [0:1];                     // ... and its last word's dword
+   logic [1:0]  ba_v = '0;
    initial bticchk = $test$plusargs("BTICCHK");
    function automatic logic [29:0] bt_pa(input logic [28:0] vdw, output logic ok);
       ok = 1'b1;
@@ -426,30 +447,63 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       ok = 1'b0;
       return '0;
    endfunction
-   always @(posedge clk) if (!rst && IC_LB == 32) begin
+   // is the line of PA dword p (VA dword v: the index) covered for entry k:
+   // in the shadow (or the pending install), at an index the core's kills
+   // for that entry compare (its bt_lidx or bt_blidx)?
+   function automatic logic bt_cov(input logic [28:0] p, input logic [28:0] v, input int k);
+      automatic int ix = int'(v[BT_TS-1:BT_LW]);
+      automatic logic [28:0] sh = (IC_LB == 32) ? 29'(dut.ic_tagsh[ix])
+                                : ix[0] ? 29'(dut.ic_tagff_o[ix >> 1]) : 29'(dut.ic_tagff_e[ix >> 1]);
+      return (sh == 29'(p[28:BT_TS]) || (dut.lp_v && dut.lp_pa == p[28:2])) &&
+             (ix == int'(dut.bt_lidx[k]) || ix == int'(dut.bt_blidx[k]));
+   endfunction
+   always @(posedge clk) if (!rst) begin
       for (int k = 0; k < BTN; k++) begin
          // (the state after the last edge: an entry written then is new)
          if (dut.bt_v[k] && (!btm_v[k] || dut.bt_base[k] != btm_base[k] || dut.bt_tag[k] != btm_tag[k])) begin
-            automatic logic ok_t, ok_b;
-            automatic logic [29:0] pt = bt_pa(dut.bt_base[k], ok_t);
-            automatic logic [29:0] pb = bt_pa(dut.bt_tag[k][29:1], ok_b);
-            bt_pt[k] = pt[28:0];  bt_pb[k] = pb[28:0];  bt_pk[k] = ok_t && ok_b;
-            if (!(ok_t && ok_b)) btic_pau++;
+            automatic logic ok_t, ok_b, ok_l;
+            automatic logic [28:0] vl = {dut.bt_tag[k][29:1]};
+            automatic logic [29:0] pt, pb, pl;
+            // the arm that wrote it (the capture uses the latest arm before
+            // its edge; an arm on the capture's own edge is the newer one)
+            if (ba_v[0] && ba_tag[0] == dut.bt_tag[k])      vl = ba_last[0];
+            else if (ba_v[1] && ba_tag[1] == dut.bt_tag[k]) vl = ba_last[1];
+            else btic_noarm++;
+            pt = bt_pa(dut.bt_base[k], ok_t);
+            pb = bt_pa(dut.bt_tag[k][29:1], ok_b);
+            pl = bt_pa(vl, ok_l);
+            bt_pt[k] = pt[28:0];  bt_pb[k] = pb[28:0];  bt_pl[k] = pl[28:0];
+            bt_vt[k] = dut.bt_base[k];  bt_vb[k] = dut.bt_tag[k][29:1];  bt_vl[k] = vl;
+            bt_pk[k] = ok_t && ok_b && ok_l;
+            if (!bt_pk[k]) btic_pau++;
+            else btic_chk++;
          end
          btm_v[k] = dut.bt_v[k];  btm_base[k] = dut.bt_base[k];  btm_tag[k] = dut.bt_tag[k];
          if (dut.bt_v[k] && bt_pk[k]) begin
-            automatic logic ct = dut.ic_tagsh[dut.bt_lidx[k]] == bt_pt[k][28:BT_TS] ||
-                                 (dut.lp_v && dut.lp_pa == bt_pt[k][28:2]);
-            automatic logic cb = dut.ic_tagsh[dut.bt_blidx[k]] == bt_pb[k][28:BT_TS] ||
-                                 (dut.lp_v && dut.lp_pa == bt_pb[k][28:2]);
-            if (!ct || !cb) begin
+            automatic logic ct = bt_cov(bt_pt[k], bt_vt[k], k);
+            automatic logic cb = bt_cov(bt_pb[k], bt_vb[k], k);
+            automatic logic cl = bt_cov(bt_pl[k], bt_vl[k], k);
+            if (!ct || !cb || !cl) begin
                btic_unc++;
-               if (bticchk) $display("BTICCHK t=%0d entry %0d base=%08x br=%08x lidx=%0d blidx=%0d shadow=%04x/%04x %s%s",
-                                     cyc, k, {dut.bt_base[k], 3'b0}, {dut.bt_tag[k], 2'b0}, dut.bt_lidx[k],
-                                     dut.bt_blidx[k], dut.ic_tagsh[dut.bt_lidx[k]], dut.ic_tagsh[dut.bt_blidx[k]],
-                                     ct ? "" : "target", cb ? "" : " branch");
+               if (bticchk) $display("BTICCHK t=%0d entry %0d base=%08x br=%08x last=%08x lidx=%0d blidx=%0d %s%s%s",
+                                     cyc, k, {dut.bt_base[k], 3'b0}, {dut.bt_tag[k], 2'b0}, {bt_vl[k], 3'b0},
+                                     dut.bt_lidx[k], dut.bt_blidx[k],
+                                     ct ? "" : "target", cb ? "" : " branch", cl ? "" : " last-word");
             end
          end
+      end
+      // currency: a hit's window is at the ID op's predicted target
+      if (dut.id_valid && dut.id_bp_tk && dut.bt_hit && dut.id_bt_base != dut.id_bp_tgt[31:3]) begin
+         btic_stale++;
+         if (bticchk) $display("BTICCHK t=%0d stale hit pc=%08x base=%08x target=%08x", cyc, dut.id_pc,
+                               {dut.id_bt_base, 3'b0}, dut.id_bp_tgt);
+      end
+      if (dut.id_early_rd && !dut.start && dut.bt_hit) btic_hits++;
+      // (after the check above: an entry written on this edge is from an
+      // older arm)
+      if (dut.id_early_rd && !dut.start && !dut.bt_hit) begin
+         ba_tag[1] = ba_tag[0];  ba_last[1] = ba_last[0];  ba_v[1] = ba_v[0];
+         ba_tag[0] = dut.id_pc[31:2];  ba_last[0] = dut.id_last_dw;  ba_v[0] = 1'b1;
       end
    end
    always @(posedge clk) if (!rst) begin
@@ -584,7 +638,10 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `endif
 `ifdef HAS_ICLB
       $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d btic_pau=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc, btic_pau);
+      $fdisplay(f, "btic_chk=%0d btic_hits=%0d btic_stale=%0d btic_noarm=%0d", btic_chk, btic_hits, btic_stale, btic_noarm);
       if (btic_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%0d (a valid BTIC entry's line not in the tag shadow)", btic_unc);
+      if (btic_stale != 0) $display("TB: FATAL BTIC currency: btic_stale=%0d (a BTIC hit's window not at the branch's target)", btic_stale);
+      if (btic_noarm != 0) $display("TB: FATAL BTIC check: btic_noarm=%0d (an entry written without its arm)", btic_noarm);
 `ifdef HAS_PERF_ITLB
       $fdisplay(f, "itlb_disc=%0d", itlb_disc);
 `endif

@@ -4939,6 +4939,225 @@ def ic32_btic_br_alias():
     return out
 
 
+# ---- HW_PERF_PLAN §5 review 3: BTIC soundness (both line sizes) ----
+@test
+def btic_strad():
+    """review 3, a branch across a line end: a 2-word JMP / CALL abs at a
+    line's last word (A + 28: the last word of a 32 B and of a 16 B line)
+    keeps its target in the next line.  It runs once (to T1), then a store
+    rewrites that target word (a snoop of the NEXT line, not of the
+    branch's) and it runs again: it must reach T2 (r1 = 1 + 16).  A BTIC
+    entry {A + 28 -> T1} that survived the store would replay T1's window
+    at the new target."""
+    out = []
+    for A, T1, T2 in ((0x21000, 0x22000, 0x23000), (0x21040, 0x22100, 0x23200)):
+        for kind in ('jmp', 'call'):
+            for lat in (1, 3):
+                for extra in ([], ['+LDLY=4'], ['+LDLY=9']):
+                    a = Asm()
+                    a.setr(1, 0); a.setr(12, 0); a.setr(6, T2); a.setr(7, A + 32)
+                    a.jmp('A28')
+                    a.label('back')
+                    a.fbr('ne', 12, 0, 'dn', imm=True)
+                    a.setr(12, 1)
+                    a.st(32, 6, 7)                              # rewrite the word in the next line
+                    a.jmp('A28')
+                    a.label('dn')
+                    a.halt()
+                    _ic_pad(a, A + 28)
+                    a.label('A28')
+                    if kind == 'jmp':
+                        a.jmp_abs(T1)
+                    elif kind == 'call':
+                        a.jmp_abs(T1, link=True)
+                        a.jmp('back')                           # (A + 36: the return)
+                    _ic_pad(a, T1)
+                    a.label('T1')
+                    a.alui_s('add', 1, 1, 1)
+                    a.ret() if kind == 'call' else a.jmp('back')
+                    _ic_pad(a, T2)
+                    a.label('T2')
+                    a.alui_s('add', 1, 1, 16)
+                    a.ret() if kind == 'call' else a.jmp('back')
+                    out.append((a, {'end': 'park', 'kind': '0', 'r1': 17,
+                                    'btic_unc': '0', 'btic_stale': '0'}, [f'+LAT={lat}'] + extra))
+    return out
+
+
+def _btic_pend_prog(P, T1, T3, gap, patch, new=False, pdw=0):
+    """review 3, a pending capture across a squash: J at P (`jmp T1`) arms
+    the capture {P -> T1} on its first ID cycle; an older patch rewrites P
+    to `fbr ne r12, 0, T3` and squashes J (`patch(a)`: an SMC store, or a
+    non-coherent write and ICACHE_INV).  The refetched P falls through to
+    a JMPR to T1 (no arm): a capture then would pair the new P with T1's
+    window, which the BTIC replays at T3 once the PHT says taken.  T3 runs
+    6 times: r1 = 1 + 6 * 16.  (new: the program as patched; pdw: the
+    patched dword at P & ~7, for the non-coherent writer.)"""
+    t = Asm(base=P)
+    t.fbr('ne', 12, 0, T3, imm=True)
+    neww = t.assemble()[0]
+    a = Asm()
+    a.setr(1, 0); a.setr(12, 0); a.setr(13, 0); a.setr(6, neww); a.setr(7, P); a.setr(8, T1)
+    a.setr64(9, pdw)
+    a.setr(10, 0xF0FE0000); a.setr(11, 0xF0050000); a.setr(14, 8)
+    a.jmp('S')
+    pt = Asm()
+    patch(pt)
+    _ic_pad(a, P - 4 * (gap + len(pt.assemble())))
+    a.label('S')
+    patch(a)
+    for _ in range(gap):
+        a.nop()
+    assert a.pc == P
+    a.label('P')
+    if new:
+        a.fbr('ne', 12, 0, T3, imm=True)
+    else:
+        a.jmp(T1)                 # J: unconditional, predicted taken -> arm {P, T1}
+    a.jmpr(8)                     # P + 4: indirect to T1 (no arm)
+    _ic_pad(a, T3)
+    a.label('T3')
+    a.alui_s('add', 1, 1, 16); a.addi_s(13, 13, 1); a.fbr('eq', 13, 6, 'fin', imm=True); a.jmp('P')
+    a.label('fin')
+    a.halt()
+    _ic_pad(a, T1)
+    a.label('T1')
+    a.alui_s('add', 1, 1, 1); a.setr(12, 1); a.jmp('P')
+    return a
+
+
+def _btic_pend(patch, gaps, places, lats, extras=([], ['+LDLY=4'], ['+LDLY=9'])):
+    out = []
+    for P, T1, T3 in places:
+        for gap in gaps:
+            n = _btic_pend_prog(P, T1, T3, gap, patch, new=True)
+            ws = n.assemble()
+            i = ((P & ~7) - n.base) // 4
+            pdw = ws[i] | ws[i + 1] << 32
+            for lat in lats:
+                for extra in extras:
+                    a = _btic_pend_prog(P, T1, T3, gap, patch, pdw=pdw)
+                    out.append((a, {'end': 'park', 'kind': '0', 'r1': 97, 'btic_unc': '0', 'btic_stale': '0'},
+                                [f'+LAT={lat}'] + extra))
+    return out
+
+
+@test
+def btic_pend_snoop():
+    """review 3: the pending capture across an SMC squash (a coherent store
+    S, `gap` NOPs before J, rewrites J)"""
+    def patch(a):
+        a.st(32, 6, 7)
+    return _btic_pend(patch, range(0, 4), ((0x21010, 0x24000, 0x21800), (0x21018, 0x24040, 0x21800)),
+                      (1, 2, 3, 5))
+
+
+@test
+def btic_pend_inv():
+    """review 3: the pending capture across ICACHE_INV — J is rewritten
+    behind the core's back (tb_vsim's non-coherent writer: no snoop, no
+    SMC squash), then ICACHE_INV, older than J, squashes J and refetches"""
+    def patch(a):
+        a.st(32, 7, 10)                   # the writer's address: P
+        a.st(64, 9, 10, 8)                # the new dword at P & ~7
+        a.st(32, 14, 11)                  # ICACHE_INV
+    # (P + 0x1C: ICACHE_INV and J in one 16 B line; a long memory latency:
+    # with 32 B lines the refetches during ICACHE_INV's sweep install no
+    # valid line, and a later install of P's line would kill the entry)
+    return _btic_pend(patch, range(0, 4), ((0x21010, 0x24000, 0x21800), (0x21018, 0x24040, 0x21800),
+                                           (0x2101C, 0x24040, 0x21800)), (1, 3, 40, 70), ([], ['+LDLY=4']))
+
+
+@test
+def btic_oddfill():
+    """review 3, 16 B lines: a fill at a 32 B line's dword 1 (X = L + 8)
+    returns the next dword too, the first of the other 16 B line (J at
+    L + 16), into window slot 1 — but installs only X's line.  J (`jmp T`)
+    runs from that copy; a store then rewrites it to `jmp T2` (no snoop
+    hit: J's line is not in the I-cache) and A, at L's index, evicts X's
+    line; X then misses again and J comes from slot 1 again.  A BTIC entry
+    {J -> T} captured the first time would survive both (its lines' indices
+    see no snoop, no install) and replay T at T2: r1 = 1 + 16.  (With 32 B
+    lines the fill installs J's line too: the same program, the ordinary
+    snoop.)"""
+    out = []
+    for L, T, T2 in ((0x21000, 0x22000, 0x23000), (0x21040, 0x22100, 0x23200)):
+        A = L + IC_BYTES
+        for lat in (1, 3):
+            for extra in ([], ['+LDLY=4']):
+                t = Asm(base=L + 16)
+                t.jmp(T2)
+                neww = t.assemble()[0]
+                a = Asm()
+                a.setr(1, 0); a.setr(12, 0); a.setr(6, neww); a.setr(7, L + 16)
+                a.jmp('X')
+                a.label('back')
+                a.fbr('ne', 12, 0, 'dn', imm=True)
+                a.setr(12, 1)
+                a.st(32, 6, 7)                       # J now jumps to T2
+                a.jmp('A')                           # evict X's line, then X again
+                a.label('dn')
+                a.halt()
+                _ic_pad(a, L + 8)
+                a.label('X')
+                a.nop(); a.nop()
+                a.label('J')
+                a.jmp(T)                             # L + 16
+                _ic_pad(a, T)
+                a.label('T')
+                a.alui_s('add', 1, 1, 1); a.jmp('back')
+                _ic_pad(a, T2)
+                a.label('T2')
+                a.alui_s('add', 1, 1, 16); a.jmp('back')
+                _ic_pad(a, A)
+                a.label('A')
+                a.jmp('X')
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 17, 'btic_unc': '0', 'btic_stale': '0'},
+                            [f'+LAT={lat}'] + extra))
+    return out
+
+
+@test
+def btic_nlb_inst():
+    """review 3, 16 B lines: the NLB outlives the install that replaces its
+    line.  Pass 1 runs L0 and O (= L0 + 16, J: `jmp T`) once.  Pass 2: L0's
+    window is served and the prefetch takes O into the NLB; L0's JMPR then
+    goes to B, O's alias (O + the I-cache size), whose fill replaces O; B
+    jumps back to L0 + 8, whose slot 1 is O from the NLB — J's capture
+    would leave its line uncovered (the coverage check; no wrong result
+    here: a store to O kills the NLB copy).  (32 B lines: the same class,
+    review M1's NLB kill.)"""
+    out = []
+    for L0, T in ((0x21000, 0x22000), (0x21040, 0x22100), (0x21020, 0x22200)):
+        B = L0 + 16 + IC_BYTES
+        for lat in (1, 2, 3):
+            for extra in ([], ['+LDLY=4'], ['+HIT=50']):
+                a = Asm()
+                a.setr(1, 0); a.setr(12, 0); a.setr(9, L0 + 8)
+                a.jmp('L0')
+                _ic_pad(a, L0)
+                a.label('L0')
+                a.jmpr(9)                              # pass 1: L0 + 8; pass 2: B
+                a.nop()
+                a.label('L8')
+                a.nop(); a.nop()
+                a.jmp(T)                               # J at O = L0 + 16
+                _ic_pad(a, T)
+                a.label('T')
+                a.alui_s('add', 1, 1, 1)
+                a.fbr('ne', 12, 0, 'dn', imm=True)
+                a.setr(12, 1); a.setr(9, B)
+                a.jmp('L0')
+                a.label('dn')
+                a.halt()
+                _ic_pad(a, B)
+                a.label('B')
+                a.jmp('L8')
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 2, 'btic_unc': '0', 'btic_stale': '0'},
+                            [f'+LAT={lat}'] + extra))
+    return out
+
+
 @test
 def ic32_remap():
     """TE = 1: code at a VA re-mapped by TLBWI to another frame (other code)

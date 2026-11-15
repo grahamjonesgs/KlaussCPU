@@ -775,7 +775,9 @@ Practical rules:
 - **Branch-target instruction cache (BTIC).** 64 entries, indexed by
   pc[7:2] ^ pc[13:8]. Each holds the first fetch window at a taken branch's
   target, so the redirect does not wait for the I-cache. It is invalidated
-  with the I-cache lines it was captured from.
+  with the I-cache lines it was captured from. A branch whose last word is
+  in the next I-cache line (a 2-word branch at a line's last word) is never
+  cached.
 - **Return stack.** 4 entries. A taken CALL pushes its return address; a
   RET/LEAVERET with a non-empty stack is predicted and checked against the
   stack when the RET reaches MEM.

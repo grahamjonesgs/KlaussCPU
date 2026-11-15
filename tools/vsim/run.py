@@ -175,19 +175,27 @@ WK_PROBE = r"""
 """
 
 
-# tb_soc probe (sim copy only): tb_vsim's BTIC coverage check (HW_PERF_PLAN
-# §5 review M1) on core 1 — every valid BTIC entry's target and branch lines
-# are in the I-cache tag shadow or the pending install; TE = 1 through the
-# micro-ITLB as the entry is written.  A violation prints a FATAL line at
-# the end of the run, which run_soc turns into a failure of every command.
+# tb_soc probe (sim copy only): tb_vsim's BTIC checks (HW_PERF_PLAN §5
+# review M1 / review 3) on core 1 — every valid BTIC entry's target line and
+# its branch's lines (first and last word: the last word's dword from the
+# arm that wrote the entry) are in the I-cache tag shadow (16 B lines: the
+# pair banks) or the pending install, at an index the entry's kills compare; TE = 1 through the micro-ITLB as the
+# entry is written; a BTIC hit's window is at the ID op's target.  A
+# violation prints a FATAL line at the end of the run, which run_soc turns
+# into a failure of every command; BTPROBE gives the counts checked.
 BTIC_PROBE = r"""
-   // ---- BTIC coverage probe (tools/vsim/run.py) ----
+   // ---- BTIC check probe (tools/vsim/run.py) ----
+   localparam int BTP_LW = %(lw)d;
    localparam int BTP_TS = %(ts)d;
-   longint btp_unc = 0;
-   logic [28:0] btp_pt [0:63], btp_pb [0:63];
+   longint btp_unc = 0, btp_chk = 0, btp_hits = 0, btp_stale = 0, btp_noarm = 0;
+   logic [28:0] btp_pt [0:63], btp_pb [0:63], btp_pl [0:63];
+   logic [28:0] btp_vt [0:63], btp_vb [0:63], btp_vl [0:63];
    logic [63:0] btp_pk = '0, btp_mv = '0;
    logic [28:0] btp_mb [0:63];
    logic [29:0] btp_mt [0:63];
+   logic [29:0] btp_at [0:1];
+   logic [28:0] btp_al [0:1];
+   logic [1:0]  btp_av = '0;
    function automatic logic [29:0] btp_pa(input logic [28:0] vdw, output logic ok);
       ok = 1'b1;
       if (!%(c)s.te) return {1'b0, vdw};
@@ -196,27 +204,71 @@ BTIC_PROBE = r"""
       ok = 1'b0;
       return '0;
    endfunction
+   function automatic logic btp_cov(input logic [28:0] p, input logic [28:0] v, input int k);
+      automatic int ix = int'(v[BTP_TS-1:BTP_LW]);
+      automatic logic [28:0] sh = (BTP_LW == 2) ? 29'(%(c)s.ic_tagsh[ix])
+                                : ix[0] ? 29'(%(c)s.ic_tagff_o[ix >> 1]) : 29'(%(c)s.ic_tagff_e[ix >> 1]);
+      return (sh == 29'(p[28:BTP_TS]) || (%(c)s.lp_v && %(c)s.lp_pa == p[28:2])) &&
+             (ix == int'(%(c)s.bt_lidx[k]) || ix == int'(%(c)s.bt_blidx[k]));
+   endfunction
    always @(posedge %(c)s.clk) if (!%(c)s.rst) begin
       for (int k = 0; k < 64; k++) begin
          if (%(c)s.bt_v[k] && (!btp_mv[k] || %(c)s.bt_base[k] != btp_mb[k] || %(c)s.bt_tag[k] != btp_mt[k])) begin
-            automatic logic ok_t, ok_b;
-            automatic logic [29:0] pt = btp_pa(%(c)s.bt_base[k], ok_t);
-            automatic logic [29:0] pb = btp_pa(%(c)s.bt_tag[k][29:1], ok_b);
-            btp_pt[k] = pt[28:0];  btp_pb[k] = pb[28:0];  btp_pk[k] = ok_t && ok_b;
+            automatic logic ok_t, ok_b, ok_l;
+            automatic logic [28:0] vl = %(c)s.bt_tag[k][29:1];
+            automatic logic [29:0] pt, pb, pl;
+            if (btp_av[0] && btp_at[0] == %(c)s.bt_tag[k])      vl = btp_al[0];
+            else if (btp_av[1] && btp_at[1] == %(c)s.bt_tag[k]) vl = btp_al[1];
+            else btp_noarm++;
+            pt = btp_pa(%(c)s.bt_base[k], ok_t);
+            pb = btp_pa(%(c)s.bt_tag[k][29:1], ok_b);
+            pl = btp_pa(vl, ok_l);
+            btp_pt[k] = pt[28:0];  btp_pb[k] = pb[28:0];  btp_pl[k] = pl[28:0];
+            btp_vt[k] = %(c)s.bt_base[k];  btp_vb[k] = %(c)s.bt_tag[k][29:1];  btp_vl[k] = vl;
+            btp_pk[k] = ok_t && ok_b && ok_l;
+            if (btp_pk[k]) btp_chk++;
          end
          btp_mv[k] = %(c)s.bt_v[k];  btp_mb[k] = %(c)s.bt_base[k];  btp_mt[k] = %(c)s.bt_tag[k];
          if (%(c)s.bt_v[k] && btp_pk[k] &&
-             !((%(c)s.ic_tagsh[%(c)s.bt_lidx[k]] == btp_pt[k][28:BTP_TS] ||
-                (%(c)s.lp_v && %(c)s.lp_pa == btp_pt[k][28:2])) &&
-               (%(c)s.ic_tagsh[%(c)s.bt_blidx[k]] == btp_pb[k][28:BTP_TS] ||
-                (%(c)s.lp_v && %(c)s.lp_pa == btp_pb[k][28:2]))))
+             !(btp_cov(btp_pt[k], btp_vt[k], k) && btp_cov(btp_pb[k], btp_vb[k], k) && btp_cov(btp_pl[k], btp_vl[k], k)))
             btp_unc++;
       end
+      if (%(c)s.id_valid && %(c)s.id_bp_tk && %(c)s.bt_hit && %(c)s.id_bt_base != %(c)s.id_bp_tgt[31:3]) btp_stale++;
+      if (%(c)s.id_early_rd && !%(c)s.start && %(c)s.bt_hit) btp_hits++;
+      if (%(c)s.id_early_rd && !%(c)s.start && !%(c)s.bt_hit) begin
+         btp_at[1] = btp_at[0];  btp_al[1] = btp_al[0];  btp_av[1] = btp_av[0];
+         btp_at[0] = %(c)s.id_pc[31:2];  btp_al[0] = %(c)s.id_last_dw;  btp_av[0] = 1'b1;
+      end
    end
-   final if (btp_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%%0d (a valid BTIC entry's line not in the tag shadow)", btp_unc);
+   final begin
+      $display("BTPROBE btic_chk=%%0d btic_hits=%%0d", btp_chk, btp_hits);
+      if (btp_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%%0d (a valid BTIC entry's line not in the tag shadow)", btp_unc);
+      if (btp_stale != 0) $display("TB: FATAL BTIC currency: btic_stale=%%0d (a BTIC hit's window not at the branch's target)", btp_stale);
+      if (btp_noarm != 0) $display("TB: FATAL BTIC check: btic_noarm=%%0d (an entry written without its arm)", btp_noarm);
+   end
 """
 
 BTIC_FAILS = []      # runs whose BTIC coverage check failed (main() exits non-zero)
+BTIC_STATS = {'runs': 0, 'chk': 0, 'hits': 0}   # what the checks saw (printed at exit)
+# a run fails the BTIC gate on: the coverage count, the currency count, an
+# entry without its arm (the TB's FATAL lines), or the core's own BTIC
+# assertion (it stops the run: no result file)
+BTIC_FATAL = ('FATAL BTIC', 'BTIC base != target', 'pos0 unsound')
+
+
+def _btic_note(name, st, log, gate=True):
+    """HW_PERF_PLAN §5 review M2 / review 3: the BTIC checks of one run.
+    gate=False: a base revision's run in an A/B (only the revision under
+    test is gated).  Returns True if the run failed them."""
+    bad = any(st.get(k, '0') not in ('0', None) for k in ('btic_unc', 'btic_stale', 'btic_noarm')) or \
+        any(f in log for f in BTIC_FATAL)
+    if gate:
+        BTIC_STATS['runs'] += 1
+        BTIC_STATS['chk'] += int(st.get('btic_chk', 0))
+        BTIC_STATS['hits'] += int(st.get('btic_hits', 0))
+        if bad:
+            BTIC_FAILS.append(name)
+    return bad and gate
 
 
 def build_soc(rev=None, crypto_full=False, nowalk=False):
@@ -272,9 +324,10 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
         k = tb.rindex('endmodule')
         tb = tb[:k] + WK_PROBE + tb[k:]
     lines, lb = ic if ic else (2048, 32)
-    if 'lp_pa' in allsrc and 'ic_tagsh' in allsrc and lb == 32:
+    if 'lp_pa' in allsrc and 'ic_tagsh' in allsrc:      # (review 3: both line sizes)
         k = tb.rindex('endmodule')
-        tb = tb[:k] + BTIC_PROBE % {'c': 'dut.pipeline_core_i', 'ts': (lines - 1).bit_length() + 2} + tb[k:]
+        lw = 2 if lb == 32 else 1
+        tb = tb[:k] + BTIC_PROBE % {'c': 'dut.pipeline_core_i', 'lw': lw, 'ts': (lines - 1).bit_length() + lw} + tb[k:]
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -295,7 +348,7 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     return exe
 
 
-def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False):
+def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True):
     """image: an Asm (assembled into a boot image) or a .mem path"""
     d = os.path.join(WORK, 'socruns', name)
     os.makedirs(d, exist_ok=True)
@@ -309,9 +362,12 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False):
     tr = f'{d}/soc.trace' if trace else '/dev/null'
     args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
     r = subprocess.run(args, capture_output=True, text=True, cwd=d, timeout=timeout)
-    if 'FATAL BTIC coverage' in r.stdout:
-        BTIC_FAILS.append(name)
-        print(f'FAIL {name}: BTIC coverage (tb_soc probe)')
+    st = {}
+    m = re.search(r'BTPROBE btic_chk=(\d+) btic_hits=(\d+)', r.stdout)
+    if m:
+        st = {'btic_chk': m.group(1), 'btic_hits': m.group(2)}
+    if _btic_note(name, st, r.stdout + r.stderr, gate):
+        print(f'FAIL {name}: BTIC check (tb_soc probe)')
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
             'uart': open(os.path.join(d, 'soc.uart'), 'rb').read().decode('latin-1')}
 
@@ -326,7 +382,7 @@ def parse_out(path):
     return res
 
 
-def run(exe, asm, name, plus=(), trace=False):
+def run(exe, asm, name, plus=(), trace=False, gate=True):
     d = os.path.join(WORK, 'runs')
     os.makedirs(d, exist_ok=True)
     mem = os.path.join(d, name + '.mem')
@@ -342,11 +398,11 @@ def run(exe, asm, name, plus=(), trace=False):
     r = subprocess.run(args, capture_output=True, text=True, timeout=600)
     if not os.path.exists(out):
         print(r.stdout[-3000:], r.stderr[-3000:])
+        _btic_note(name, {}, r.stdout + r.stderr, gate)
         return {'end': 'crash', 'log': r.stdout + r.stderr}, tr
     st = parse_out(out)
     st['log'] = r.stdout + r.stderr
-    if st.get('btic_unc', '0') != '0':
-        BTIC_FAILS.append(name)
+    _btic_note(name, st, st['log'], gate)
     return st, tr
 
 
@@ -412,11 +468,12 @@ def cmd_diff(a):
     new = build(None)
     fails = 0
     tot = {'base': 0, 'new': 0}
+    hits = {'base': 0, 'new': 0}      # BTIC hits (tb_vsim's count; a base without it: 0)
     for s in range(a.seed0, a.seed0 + a.seeds):
         for lat in a.lats:
             asm = randprog.gen(s, **({'irq': True} if a.irq else {}))
             plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={97 + s % 50}'] if a.irq else []) + a.plus
-            sb, tb = run(base, asm, f'rb{s}_{lat}', plus, trace=True)
+            sb, tb = run(base, asm, f'rb{s}_{lat}', plus, trace=True, gate=False)
             sn, tn = run(new, asm, f'rn{s}_{lat}', plus, trace=True)
             same = sb.get('end') == 'park' and sb.get('kind') == '0' and open(tb).read() == open(tn).read()
             if a.irq:
@@ -429,6 +486,7 @@ def cmd_diff(a):
             if 'fatal' in (sb['log'] + sn['log']).lower():
                 same = False
             tot['base'] += int(sb.get('cycles', 0)); tot['new'] += int(sn.get('cycles', 0))
+            hits['base'] += int(sb.get('btic_hits', 0)); hits['new'] += int(sn.get('btic_hits', 0))
             tag = 'same' if same else 'DIFF'
             if not same:
                 fails += 1
@@ -436,7 +494,8 @@ def cmd_diff(a):
                 print(f'{tag} seed={s} lat={lat} cycles {sb.get("cycles")} -> {sn.get("cycles")} '
                       f'instrs {sb.get("instrs")}/{sn.get("instrs")} end {sb.get("end")}/{sn.get("end")}')
     print(f'{fails} differing; total cycles base={tot["base"]} new={tot["new"]} '
-          f'({100.0 * (tot["new"] - tot["base"]) / max(1, tot["base"]):+.2f}%)')
+          f'({100.0 * (tot["new"] - tot["base"]) / max(1, tot["base"]):+.2f}%); '
+          f'BTIC hits base={hits["base"]} new={hits["new"]}')
     return 1 if fails else 0
 
 
@@ -831,7 +890,7 @@ def cmd_socmmio(a):
     fails = 0
     for sd in range(a.seed0, a.seed0 + a.seeds):
         asm = _mmio_prog(sd)
-        rb = run_soc(base, asm, f'mm_b{sd}', trace=True)
+        rb = run_soc(base, asm, f'mm_b{sd}', trace=True, gate=False)
         rn = run_soc(new, asm, f'mm_n{sd}', trace=True)
         tb_ = open(rb['trace']).read()
         same = 'HALTED' in rb['log'] and 'HALTED' in rn['log'] and tb_ == open(rn['trace']).read()
@@ -1074,39 +1133,128 @@ def cmd_dcbzdiff(a):
 
 
 def _btfuzz_prog(seed):
-    """HW_PERF_PLAN §5 review M1: random code over I-cache aliases.  4-8
-    small functions in slots 64 KiB apart (and 64 B apart within a region),
-    so many share an index; bodies mix a signature add to r1 (the patch
-    target, the function's first word), tight loops inside one window, a
-    load (it waits behind a pending line answer), calls to higher-numbered
-    functions, and snoop-coherent stores rewriting a function's signature.
-    Deterministic: its result must not depend on timing or on the BTIC."""
+    """HW_PERF_PLAN §5 review M1 / review 3: random code over I-cache
+    aliases.  4-8 small functions in slots 64 KiB apart (and 128 B apart
+    within a region), so many share an index; bodies mix a signature add
+    to r1 (the patch target, the function's first word), tight loops inside
+    one window, a load (it waits behind a pending line answer), calls to
+    higher-numbered functions, and snoop-coherent stores rewriting a
+    function's signature.  Review 3: branch SITES — a forward branch over
+    1-4 signature adds, 1-word (JMP, or an FBR on r5 = DATA_BASE: always /
+    never taken) or 2-word (JMP abs, or a 2-word FBR whose word 1 is the
+    same address), placed at random, at a 32 B or a 16 B line's last word
+    (a 2-word site then crosses into the next line) or in a tight loop —
+    and stores that patch them: a site's target (its offset, or the JMP
+    abs's address word) and its kind (unconditional / conditional, taken /
+    not), from anywhere or right before the site runs (the site, fetched
+    and predicted before the store, is squashed and refetched).  A 2-word
+    site's address word names a label in its skip or a far trampoline
+    (ZBASE: another line, at the functions' indices) back to its end.
+    Deterministic: its result must not depend on timing or on the
+    BTIC."""
     import random
     from kasm import Asm
     from tests import _word
     rnd = random.Random(seed)
     add = lambda c: _word(lambda t: t.alui_s('add', 1, 1, c))
+    # 1-word site words (position-independent: the offset is in words)
+    def w1(kind, k):             # k: the target is the site + 4 k (1 <= k <= n + 1)
+        t = Asm(base=0)
+        if kind == 'jmp':
+            t.jmp(4 * k)
+        else:
+            t.fbr('ne' if kind == 'fbr_t' else 'eq', 5, 0, 4 * k, imm=True)
+        return t.assemble()[0]
+    def w0_2(kind, k):           # word 0 of a 2-word site (target the site + 4 k, 2 <= k <= n + 2)
+        t = Asm(base=0)
+        if kind == 'jabs':
+            t.jmp_abs(0)
+        else:
+            t.fbr_imm32('ne' if kind == 'fbr32_t' else 'eq', 5, 0, 4 * k)
+        return t.assemble()[0]
     while True:
-        slots = [0x21000 + j * 0x10000 + o * 0x40 for j in range(3) for o in range(4)]
+        slots = [0x21000 + j * 0x10000 + o * 0x80 for j in range(3) for o in range(4)]
         rnd.shuffle(slots)
         nf = rnd.randint(4, 8)
         fa = slots[:nf]                            # function k at fa[k]
         body = {}
+        sites = []                                 # (func, n, words, skip)
         for k in range(nf):
             ops = [('sig', rnd.randint(1, 9))]
-            for _ in range(rnd.randint(1, 4)):
+            for _ in range(rnd.randint(1, 5)):
                 r = rnd.random()
-                if r < 0.2:
-                    ops.append(('loop', rnd.randint(1, 12)))
-                elif r < 0.4 and k + 1 < nf:
+                if r < 0.15:
+                    ls = None
+                    if rnd.random() < 0.4:             # a site in the loop
+                        ls = (len(sites), rnd.choice((1, 2)), rnd.randint(1, 3))
+                        sites.append((k, ls[1], ls[2]))
+                    ops.append(('loop', rnd.randint(1, 12), ls))
+                elif r < 0.3 and k + 1 < nf:
                     ops.append(('call', rnd.randrange(k + 1, nf)))
-                elif r < 0.55:
+                elif r < 0.4:
                     ops.append(('ld',))
-                elif r < 0.8:
+                elif r < 0.55:
                     ops.append(('patch', rnd.randrange(nf), rnd.randint(1, 9)))
+                elif r < 0.75:
+                    sw = rnd.choice((1, 2))
+                    sk = rnd.randint(1, 4)
+                    al = rnd.choice((None, 28, 12, 24, 4))
+                    if rnd.random() < 0.35:            # patched right before it runs (an SMC squash)
+                        ops.append(('bpatch', len(sites)))
+                    ops.append(('site', len(sites), sw, sk, al))
+                    sites.append((k, sw, sk))
+                elif r < 0.9:
+                    ops.append(('bpatch',))            # (resolved below: needs the site list)
                 else:
                     ops.append(('add', rnd.randint(1, 9)))
             body[k] = ops
+
+        def tgt2(n, sk):
+            """a 2-word site's address word: a label in its skip, or a far
+            trampoline (Z<n>_<m>: another line, the straddle class)"""
+            if rnd.random() < 0.5:
+                return f'Z{n}_{rnd.randint(0, 1)}'
+            return f'S{n}_t{rnd.randint(2, sk + 2)}'
+
+        def bpatch(a, n=None):
+            """a store (or two) rewriting a site (n, else a random one): target and / or kind"""
+            if not sites:
+                return
+            if n is None:
+                n = rnd.randrange(len(sites))
+            _, sw, sk = sites[n]
+            if sw == 1:
+                kind = rnd.choice(('jmp', 'fbr_t', 'fbr_n'))
+                a.setr(3, w1(kind, rnd.randint(1, sk + 1))); a.leapc(4, f'S{n}'); a.st(32, 3, 4)
+            else:
+                what = rnd.random()
+                if what < 0.6:                     # the address word (JMP abs's target)
+                    a.leapc(3, tgt2(n, sk)); a.leapc(4, f'S{n}'); a.st(32, 3, 4, 4)
+                if what >= 0.3:                    # the kind (and an FBR's offset)
+                    kind = rnd.choice(('jabs', 'fbr32_t', 'fbr32_n'))
+                    a.setr(3, w0_2(kind, rnd.randint(2, sk + 2))); a.leapc(4, f'S{n}'); a.st(32, 3, 4)
+
+        def site(a, n, sw, sk, al):
+            if al is not None:
+                while a.pc % 32 != al:
+                    a.nop()
+            a.label(f'S{n}')
+            if sw == 1:
+                a.raw(w1(rnd.choice(('jmp', 'fbr_t', 'fbr_n')), rnd.randint(1, sk + 1)))
+                for j in range(sk):
+                    a.label(f'S{n}_t{j + 1}')
+                    a.alui_s('add', 1, 1, 1 << j)
+                a.label(f'S{n}_t{sk + 1}')
+            else:
+                kind = rnd.choice(('jabs', 'fbr32_t', 'fbr32_n'))
+                a.raw(w0_2(kind, rnd.randint(2, sk + 2)))
+                tl = tgt2(n, sk)
+                a.emit(lambda pc, tl=tl: a.labels[tl])
+                for j in range(sk):
+                    a.label(f'S{n}_t{j + 2}')
+                    a.alui_s('add', 1, 1, 1 << j)
+                a.label(f'S{n}_t{sk + 2}')
+
         a = Asm()
         a.setr(1, 0); a.setr(5, DATA_BASE)
         for _ in range(rnd.randint(3, 6)):
@@ -1114,6 +1262,8 @@ def _btfuzz_prog(seed):
                 a.call(f'F{rnd.randrange(nf)}')
             if rnd.random() < 0.5:
                 a.setr(3, add(rnd.randint(1, 9))); a.setr(4, fa[rnd.randrange(nf)]); a.st(32, 3, 4)
+            if rnd.random() < 0.5:
+                bpatch(a)
         a.halt()
         fit = True
         for k in sorted(range(nf), key=lambda k: fa[k]):
@@ -1132,6 +1282,10 @@ def _btfuzz_prog(seed):
                     a.call(f'F{op[1]}')
                 elif op[0] == 'patch':
                     a.setr(3, add(op[2])); a.setr(4, fa[op[1]]); a.st(32, 3, 4)
+                elif op[0] == 'bpatch':
+                    bpatch(a, *op[1:])
+                elif op[0] == 'site':
+                    site(a, *op[1:])
                 elif op[0] == 'loop':
                     a.setr(2, op[1])
                     while a.pc % 8:
@@ -1139,14 +1293,27 @@ def _btfuzz_prog(seed):
                     lb = f'F{k}_l{n}'
                     a.label(lb)
                     a.alui_s('add', 1, 1, 1)
+                    if op[2]:
+                        site(a, *op[2], None)
                     a.addi_s(2, 2, -1)
                     a.fbr('ne', 2, 0, lb, imm=True)
             a.ret()
-        if fit:
+        # the 2-word sites' far targets: back to the end of the site's skip
+        if fit and a.pc <= ZBASE:
+            while a.pc < ZBASE:
+                a.nop()
+            for n, (_, sw, sk) in enumerate(sites):
+                if sw == 2:
+                    for m in range(2):
+                        a.label(f'Z{n}_{m}')
+                        a.alui_s('add', 1, 1, 16 << m)
+                        a.jmp(f'S{n}_t{sk + 2}')
+        if fit and all(f'S{n}' in a.labels for n in range(len(sites))):
             return a, fa
 
 
 DATA_BASE = 0x10000
+ZBASE = 0x51040          # btfuzz: the 2-word sites' far targets
 
 
 def cmd_btfuzz(a):
@@ -1520,19 +1687,24 @@ def cmd_socdiff(a):
     new = build_soc(None)
     fails = 0
     tb = tn = 0
+    hits = {'base': 0, 'new': 0}      # BTIC hits (the probe's count)
     for sd in range(a.seed0, a.seed0 + a.seeds):
         asm = randprog.gen(sd, span=a.span)
-        rb = run_soc(base, asm, f'sd_b{sd}', trace=True)
+        rb = run_soc(base, asm, f'sd_b{sd}', trace=True, gate=False)
         rn = run_soc(new, asm, f'sd_n{sd}', trace=True)
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
         t = [int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
         tb += t[0]; tn += t[1]
+        for k, r in (('base', rb), ('new', rn)):
+            m = re.search(r'BTPROBE btic_chk=\d+ btic_hits=(\d+)', r['log'])
+            hits[k] += int(m.group(1)) if m else 0
         if not same:
             fails += 1
         if not same or a.verbose:
             print(f'{"same" if same else "DIFF"} seed={sd} cycles {t[0]} -> {t[1]}  {rb["log"].strip().splitlines()[-2][:60]}')
-    print(f'{fails} differing; PIPE_RUN cycles base={tb} new={tn} ({100.0 * (tn - tb) / max(1, tb):+.2f}%)')
+    print(f'{fails} differing; PIPE_RUN cycles base={tb} new={tn} ({100.0 * (tn - tb) / max(1, tb):+.2f}%); '
+          f'BTIC hits base={hits["base"]} new={hits["new"]}')
     return 1 if fails else 0
 
 
@@ -1661,6 +1833,9 @@ def main():
     def _btic_gate():
         # HW_PERF_PLAN §5 review M2: the BTIC coverage check is a default
         # expectation of every run with 32 B lines (tb_vsim and tb_soc)
+        if BTIC_STATS['runs']:
+            print(f'BTIC checks: {BTIC_STATS["chk"]} entries checked, {BTIC_STATS["hits"]} hits checked '
+                  f'in {BTIC_STATS["runs"]} gated run(s)')
         if BTIC_FAILS:
             print(f'BTIC coverage check failed in {len(BTIC_FAILS)} run(s): {" ".join(BTIC_FAILS[:10])}')
             os._exit(1)
