@@ -44,8 +44,10 @@ def build(rev=None, quiet=True):
     tlbn = os.environ.get('VSIM_TLB_N', '')         # elaborate TLB_N=<n> (default: the core's, 32)
     nowalk = os.environ.get('VSIM_TLB_WALK') == '0'  # elaborate TLB_EN=1, TLB_WALK=0 (MMU_PLAN §11.8: no walker)
     ic = ic_geom()                                   # VSIM_IC=<lines>x<bytes>, e.g. 1024x16 (HW_PERF_PLAN §5)
+    nobtic = os.environ.get('VSIM_BTIC_EN') == '0'   # elaborate BTIC_EN=0 (btfuzz's reference)
     tag = (rev or 'wt') + ('_dbg' if dbg else '') + ('_noexc' if noexc else '') + ('_mpu' if mpu else '') + \
-          (f'_tlb{tlbn}' if tlbn else '') + ('_nowalk' if nowalk else '') + (f'_ic{ic[0]}x{ic[1]}' if ic else '')
+          (f'_tlb{tlbn}' if tlbn else '') + ('_nowalk' if nowalk else '') + (f'_ic{ic[0]}x{ic[1]}' if ic else '') + \
+          ('_nobtic' if nobtic else '')
     d = os.path.join(WORK, 'build_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     os.makedirs(d, exist_ok=True)
     srcs = {}
@@ -61,7 +63,7 @@ def build(rev=None, quiet=True):
     srcs['pipeline_core.sv'] = core
     tb = open(os.path.join(HERE, 'tb_vsim.sv')).read()
     h = hashlib.sha1((srcs['klauss_pkg.sv'] + core + tb + str(dbg) + str(noexc) + str(mpu) + tlbn + str(nowalk) +
-                      str(ic)).encode()).hexdigest()
+                      str(ic) + str(nobtic)).encode()).hexdigest()
     exe = os.path.join(d, 'obj', 'Vtb_vsim')
     stamp = os.path.join(d, 'stamp')
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
@@ -69,6 +71,8 @@ def build(rev=None, quiet=True):
     for n, s in srcs.items():
         open(os.path.join(d, n), 'w').write(s)
     defs = ['-GDEBUG_EN=1'] if dbg else []
+    if nobtic:
+        defs.append('+define+HAS_NOBTIC')
     if 'parameter bit EXC_EN' in core:
         defs.append('+define+HAS_EXC')
         if noexc:
@@ -171,6 +175,50 @@ WK_PROBE = r"""
 """
 
 
+# tb_soc probe (sim copy only): tb_vsim's BTIC coverage check (HW_PERF_PLAN
+# §5 review M1) on core 1 — every valid BTIC entry's target and branch lines
+# are in the I-cache tag shadow or the pending install; TE = 1 through the
+# micro-ITLB as the entry is written.  A violation prints a FATAL line at
+# the end of the run, which run_soc turns into a failure of every command.
+BTIC_PROBE = r"""
+   // ---- BTIC coverage probe (tools/vsim/run.py) ----
+   localparam int BTP_TS = %(ts)d;
+   longint btp_unc = 0;
+   logic [28:0] btp_pt [0:63], btp_pb [0:63];
+   logic [63:0] btp_pk = '0, btp_mv = '0;
+   logic [28:0] btp_mb [0:63];
+   logic [29:0] btp_mt [0:63];
+   function automatic logic [29:0] btp_pa(input logic [28:0] vdw, output logic ok);
+      ok = 1'b1;
+      if (!%(c)s.te) return {1'b0, vdw};
+      for (int u = 0; u < $bits(%(c)s.ut_v); u++)
+         if (%(c)s.ut_v[u] && %(c)s.ut_vpn[u] == vdw[28:13]) return {1'b0, %(c)s.ut_pa[u], vdw[12:0]};
+      ok = 1'b0;
+      return '0;
+   endfunction
+   always @(posedge %(c)s.clk) if (!%(c)s.rst) begin
+      for (int k = 0; k < 64; k++) begin
+         if (%(c)s.bt_v[k] && (!btp_mv[k] || %(c)s.bt_base[k] != btp_mb[k] || %(c)s.bt_tag[k] != btp_mt[k])) begin
+            automatic logic ok_t, ok_b;
+            automatic logic [29:0] pt = btp_pa(%(c)s.bt_base[k], ok_t);
+            automatic logic [29:0] pb = btp_pa(%(c)s.bt_tag[k][29:1], ok_b);
+            btp_pt[k] = pt[28:0];  btp_pb[k] = pb[28:0];  btp_pk[k] = ok_t && ok_b;
+         end
+         btp_mv[k] = %(c)s.bt_v[k];  btp_mb[k] = %(c)s.bt_base[k];  btp_mt[k] = %(c)s.bt_tag[k];
+         if (%(c)s.bt_v[k] && btp_pk[k] &&
+             !((%(c)s.ic_tagsh[%(c)s.bt_lidx[k]] == btp_pt[k][28:BTP_TS] ||
+                (%(c)s.lp_v && %(c)s.lp_pa == btp_pt[k][28:2])) &&
+               (%(c)s.ic_tagsh[%(c)s.bt_blidx[k]] == btp_pb[k][28:BTP_TS] ||
+                (%(c)s.lp_v && %(c)s.lp_pa == btp_pb[k][28:2]))))
+            btp_unc++;
+      end
+   end
+   final if (btp_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%%0d (a valid BTIC entry's line not in the tag shadow)", btp_unc);
+"""
+
+BTIC_FAILS = []      # runs whose BTIC coverage check failed (main() exits non-zero)
+
+
 def build_soc(rev=None, crypto_full=False, nowalk=False):
     """full SoC (sim_1/new/tb_soc.sv: behavioural DDR, real cache / bus /
     MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
@@ -223,6 +271,10 @@ def build_soc(rev=None, crypto_full=False, nowalk=False):
     if rev is None and 'wk_fin' in allsrc:
         k = tb.rindex('endmodule')
         tb = tb[:k] + WK_PROBE + tb[k:]
+    lines, lb = ic if ic else (2048, 32)
+    if 'lp_pa' in allsrc and 'ic_tagsh' in allsrc and lb == 32:
+        k = tb.rindex('endmodule')
+        tb = tb[:k] + BTIC_PROBE % {'c': 'dut.pipeline_core_i', 'ts': (lines - 1).bit_length() + 2} + tb[k:]
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -257,6 +309,9 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False):
     tr = f'{d}/soc.trace' if trace else '/dev/null'
     args = [exe, f'+TRACE={tr}', f'+UARTF={d}/soc.uart'] + ([f'+MAXI={maxi}'] if maxi else [])
     r = subprocess.run(args, capture_output=True, text=True, cwd=d, timeout=timeout)
+    if 'FATAL BTIC coverage' in r.stdout:
+        BTIC_FAILS.append(name)
+        print(f'FAIL {name}: BTIC coverage (tb_soc probe)')
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
             'uart': open(os.path.join(d, 'soc.uart'), 'rb').read().decode('latin-1')}
 
@@ -290,6 +345,8 @@ def run(exe, asm, name, plus=(), trace=False):
         return {'end': 'crash', 'log': r.stdout + r.stderr}, tr
     st = parse_out(out)
     st['log'] = r.stdout + r.stderr
+    if st.get('btic_unc', '0') != '0':
+        BTIC_FAILS.append(name)
     return st, tr
 
 
@@ -1016,6 +1073,120 @@ def cmd_dcbzdiff(a):
     return 1 if fails else 0
 
 
+def _btfuzz_prog(seed):
+    """HW_PERF_PLAN §5 review M1: random code over I-cache aliases.  4-8
+    small functions in slots 64 KiB apart (and 64 B apart within a region),
+    so many share an index; bodies mix a signature add to r1 (the patch
+    target, the function's first word), tight loops inside one window, a
+    load (it waits behind a pending line answer), calls to higher-numbered
+    functions, and snoop-coherent stores rewriting a function's signature.
+    Deterministic: its result must not depend on timing or on the BTIC."""
+    import random
+    from kasm import Asm
+    from tests import _word
+    rnd = random.Random(seed)
+    add = lambda c: _word(lambda t: t.alui_s('add', 1, 1, c))
+    while True:
+        slots = [0x21000 + j * 0x10000 + o * 0x40 for j in range(3) for o in range(4)]
+        rnd.shuffle(slots)
+        nf = rnd.randint(4, 8)
+        fa = slots[:nf]                            # function k at fa[k]
+        body = {}
+        for k in range(nf):
+            ops = [('sig', rnd.randint(1, 9))]
+            for _ in range(rnd.randint(1, 4)):
+                r = rnd.random()
+                if r < 0.2:
+                    ops.append(('loop', rnd.randint(1, 12)))
+                elif r < 0.4 and k + 1 < nf:
+                    ops.append(('call', rnd.randrange(k + 1, nf)))
+                elif r < 0.55:
+                    ops.append(('ld',))
+                elif r < 0.8:
+                    ops.append(('patch', rnd.randrange(nf), rnd.randint(1, 9)))
+                else:
+                    ops.append(('add', rnd.randint(1, 9)))
+            body[k] = ops
+        a = Asm()
+        a.setr(1, 0); a.setr(5, DATA_BASE)
+        for _ in range(rnd.randint(3, 6)):
+            for _ in range(rnd.randint(2, 5)):
+                a.call(f'F{rnd.randrange(nf)}')
+            if rnd.random() < 0.5:
+                a.setr(3, add(rnd.randint(1, 9))); a.setr(4, fa[rnd.randrange(nf)]); a.st(32, 3, 4)
+        a.halt()
+        fit = True
+        for k in sorted(range(nf), key=lambda k: fa[k]):
+            if a.pc > fa[k]:
+                fit = False                        # the previous body ran into this slot: again
+                break
+            while a.pc < fa[k]:
+                a.nop()
+            a.label(f'F{k}')
+            for n, op in enumerate(body[k]):
+                if op[0] in ('sig', 'add'):
+                    a.alui_s('add', 1, 1, op[1])
+                elif op[0] == 'ld':
+                    a.ld(64, 6, 5); a.alui_s('add', 6, 6, 1)
+                elif op[0] == 'call':
+                    a.call(f'F{op[1]}')
+                elif op[0] == 'patch':
+                    a.setr(3, add(op[2])); a.setr(4, fa[op[1]]); a.st(32, 3, 4)
+                elif op[0] == 'loop':
+                    a.setr(2, op[1])
+                    while a.pc % 8:
+                        a.nop()
+                    lb = f'F{k}_l{n}'
+                    a.label(lb)
+                    a.alui_s('add', 1, 1, 1)
+                    a.addi_s(2, 2, -1)
+                    a.fbr('ne', 2, 0, lb, imm=True)
+            a.ret()
+        if fit:
+            return a, fa
+
+
+DATA_BASE = 0x10000
+
+
+def cmd_btfuzz(a):
+    """HW_PERF_PLAN §5 review M1: _btfuzz_prog seeds under several line /
+    memory timings, against the same program on a BTIC_EN = 0 build (same
+    final registers and data window), with tb_vsim's BTIC coverage check
+    (btic_unc = 0, the global gate)"""
+    old = os.environ.get('VSIM_BTIC_EN')
+    os.environ['VSIM_BTIC_EN'] = '0'
+    try:
+        ref = build(None)
+    finally:
+        if old is None:
+            del os.environ['VSIM_BTIC_EN']
+        else:
+            os.environ['VSIM_BTIC_EN'] = old
+    exe = build(a.rev)
+    plus_sets = [['+LAT=1'], ['+LAT=3', '+LDLY=3'], ['+LAT=2', '+LDLY=8'], ['+LAT=1', '+LDLY=1', '+LDLYR=12'],
+                 ['+LAT=4', '+LDLYR=20'], ['+LAT=2', '+LDLY=5', '+HIT=50'], ['+LAT=1', '+LDLY=16']]
+    fails = n_unc = 0
+    for sd in range(a.seed0, a.seed0 + a.seeds):
+        prog, _ = _btfuzz_prog(sd)
+        sr, _ = run(ref, prog, 'bfr', ['+LAT=1'])        # (fixed names: ~1 MB images)
+        keys = [f'r{i}' for i in range(16)] + ['end', 'kind'] + \
+               sorted(k for k in sr if re.fullmatch(r'm[0-9a-f]{8}', k))
+        for pi, plus in enumerate(plus_sets):
+            st, _ = run(exe, prog, f'bf_{pi}', plus)
+            bad = [k for k in keys if st.get(k) != sr.get(k)]
+            unc = int(st.get('btic_unc', 0))
+            n_unc += unc > 0
+            ok = sr.get('end') == 'park' and sr.get('kind') == '0' and not bad and unc == 0 and \
+                'fatal' not in (st['log'] + sr['log']).lower()
+            fails += not ok
+            if not ok or a.verbose:
+                print(f'{"same" if ok else "DIFF"} seed={sd} {" ".join(plus)} r1={st.get("r1")}/{sr.get("r1")} '
+                      f'btic_unc={unc} cycles={st.get("cycles")} {bad[:4]}')
+    print(f'{fails} failing ({n_unc} with btic_unc > 0)')
+    return 1 if fails else 0
+
+
 def _soc_regs(r):
     """registers of the last retire line (the HALT) of a tb_soc run"""
     if 'HALTED' not in r['log']:
@@ -1473,6 +1644,9 @@ def main():
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
     x.add_argument('-v', '--verbose', action='store_true')
     x.add_argument('--plus', nargs='*', default=[])
+    bf = sub.add_parser('btfuzz'); bf.add_argument('--seeds', type=int, default=200)
+    bf.add_argument('--seed0', type=int, default=1); bf.add_argument('--rev')
+    bf.add_argument('-v', '--verbose', action='store_true')
     tc = sub.add_parser('tecost'); tc.add_argument('--seeds', type=int, default=60)
     tc.add_argument('--seed0', type=int, default=1); tc.add_argument('--rev')
     tc.add_argument('--plus', nargs='*', default=[])
@@ -1482,6 +1656,15 @@ def main():
     sd.add_argument('--span', type=lambda v: int(v, 0), default=0x800,
                     help='data footprint of the random loads/stores (e.g. 64: same-line hazards)')
     a = p.parse_args()
+    import atexit
+
+    def _btic_gate():
+        # HW_PERF_PLAN §5 review M2: the BTIC coverage check is a default
+        # expectation of every run with 32 B lines (tb_vsim and tb_soc)
+        if BTIC_FAILS:
+            print(f'BTIC coverage check failed in {len(BTIC_FAILS)} run(s): {" ".join(BTIC_FAILS[:10])}')
+            os._exit(1)
+    atexit.register(_btic_gate)
     if a.cmd == 'build':
         print(build(a.rev))
     elif a.cmd == 'test':
@@ -1517,6 +1700,8 @@ def main():
         sys.exit(cmd_socmmio(a))
     elif a.cmd == 'tecost':
         sys.exit(cmd_tecost(a))
+    elif a.cmd == 'btfuzz':
+        sys.exit(cmd_btfuzz(a))
     else:
         sys.exit(cmd_diff(a))
 

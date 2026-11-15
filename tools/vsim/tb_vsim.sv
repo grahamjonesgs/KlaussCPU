@@ -90,6 +90,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `ifdef HAS_WALK
       , .TLB_WALK(TLB_WALK)
 `endif
+`ifdef HAS_NOBTIC
+      , .BTIC_EN(1'b0)
+`endif
 `ifdef HAS_ICLB
       , .IC_LINES(IC_LINES), .IC_LB(IC_LB)
 `endif
@@ -391,22 +394,63 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.bt_v != bt_q) $display("ICDBG t=%0d btic %h -> %h", cyc, bt_q, dut.bt_v);
       if (dut.id_early_rd && dut.bt_hit) $display("ICDBG t=%0d btic hit base=%08x", cyc, {dut.id_bt_base, 3'b0});
    end
-   // The BTIC coverage invariant (32 B lines, TE = 0): every valid BTIC
-   // entry's window line sits in the snoop's tag shadow at its line index
-   // (bt_lidx), or is the pending install's line — so a later store to it
-   // is a snoop hit and kills the entry.  btic_unc counts the cycles an
-   // entry is uncovered (+BTICCHK prints them).
-   longint btic_unc = 0;
-   bit     bticchk = 0;
+   // The BTIC coverage invariant (32 B lines): every valid BTIC entry's
+   // window line sits in the snoop's tag shadow at its line index (bt_lidx),
+   // or is the pending install's line — so a later store to it is a snoop
+   // hit and kills the entry — and so does the line of its branch (bt_tag,
+   // at bt_blidx: an entry also dies with its branch's line, which is what
+   // makes "a tag match is the same branch, hence the same target" true).
+   // btic_unc counts the cycles an entry is uncovered (either line; +BTICCHK
+   // prints them); a run with btic_unc > 0 ends with a FATAL line, which
+   // run.py's result checks catch for every test and random diff.
+   // TE = 1: the shadow holds PA tags.  An entry's PA lines are taken when
+   // it is written, from the micro-ITLB entry holding its page (the
+   // translation cannot change during the entry's life: a TLB discard, and
+   // a TE / ASID change, empty the BTIC); btic_pau counts entries whose page
+   // the micro-ITLB no longer held then (not checked).
+   localparam int BTN = 64;
+   localparam int BT_TS = $clog2(IC_LINES) + 2;    // the tag: a PA dword's bits [28:BT_TS]
+   longint      btic_unc = 0, btic_pau = 0;
+   bit          bticchk = 0;
+   logic [28:0] bt_pt [0:BTN-1], bt_pb [0:BTN-1];  // the target window's / the branch's PA dword
+   logic [BTN-1:0] bt_pk = '0;                      // ...known
+   logic [BTN-1:0] btm_v = '0;
+   logic [28:0] btm_base [0:BTN-1];
+   logic [29:0] btm_tag [0:BTN-1];
    initial bticchk = $test$plusargs("BTICCHK");
-   always @(posedge clk) if (!rst && IC_LB == 32 && !dut.te) begin
-      for (int k = 0; k < $bits(dut.bt_v); k++)
-         if (dut.bt_v[k] && dut.ic_tagsh[dut.bt_lidx[k]] != dut.bt_base[k][28:$clog2(IC_LINES)+2] &&
-             !(dut.lp_v && dut.lp_pa == dut.bt_base[k][28:2])) begin
-            btic_unc++;
-            if (bticchk) $display("BTICCHK t=%0d entry %0d base=%08x lidx=%0d shadow=%04x", cyc, k,
-                                  {dut.bt_base[k], 3'b0}, dut.bt_lidx[k], dut.ic_tagsh[dut.bt_lidx[k]]);
+   function automatic logic [29:0] bt_pa(input logic [28:0] vdw, output logic ok);
+      ok = 1'b1;
+      if (!dut.te) return {1'b0, vdw};
+      for (int u = 0; u < $bits(dut.ut_v); u++)
+         if (dut.ut_v[u] && dut.ut_vpn[u] == vdw[28:13]) return {1'b0, dut.ut_pa[u], vdw[12:0]};
+      ok = 1'b0;
+      return '0;
+   endfunction
+   always @(posedge clk) if (!rst && IC_LB == 32) begin
+      for (int k = 0; k < BTN; k++) begin
+         // (the state after the last edge: an entry written then is new)
+         if (dut.bt_v[k] && (!btm_v[k] || dut.bt_base[k] != btm_base[k] || dut.bt_tag[k] != btm_tag[k])) begin
+            automatic logic ok_t, ok_b;
+            automatic logic [29:0] pt = bt_pa(dut.bt_base[k], ok_t);
+            automatic logic [29:0] pb = bt_pa(dut.bt_tag[k][29:1], ok_b);
+            bt_pt[k] = pt[28:0];  bt_pb[k] = pb[28:0];  bt_pk[k] = ok_t && ok_b;
+            if (!(ok_t && ok_b)) btic_pau++;
          end
+         btm_v[k] = dut.bt_v[k];  btm_base[k] = dut.bt_base[k];  btm_tag[k] = dut.bt_tag[k];
+         if (dut.bt_v[k] && bt_pk[k]) begin
+            automatic logic ct = dut.ic_tagsh[dut.bt_lidx[k]] == bt_pt[k][28:BT_TS] ||
+                                 (dut.lp_v && dut.lp_pa == bt_pt[k][28:2]);
+            automatic logic cb = dut.ic_tagsh[dut.bt_blidx[k]] == bt_pb[k][28:BT_TS] ||
+                                 (dut.lp_v && dut.lp_pa == bt_pb[k][28:2]);
+            if (!ct || !cb) begin
+               btic_unc++;
+               if (bticchk) $display("BTICCHK t=%0d entry %0d base=%08x br=%08x lidx=%0d blidx=%0d shadow=%04x/%04x %s%s",
+                                     cyc, k, {dut.bt_base[k], 3'b0}, {dut.bt_tag[k], 2'b0}, dut.bt_lidx[k],
+                                     dut.bt_blidx[k], dut.ic_tagsh[dut.bt_lidx[k]], dut.ic_tagsh[dut.bt_blidx[k]],
+                                     ct ? "" : "target", cb ? "" : " branch");
+            end
+         end
+      end
    end
    always @(posedge clk) if (!rst) begin
       if (dut.li_now) ic_inst++;
@@ -539,7 +583,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
 `ifdef HAS_ICLB
-      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc);
+      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d btic_pau=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc, btic_pau);
+      if (btic_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%0d (a valid BTIC entry's line not in the tag shadow)", btic_unc);
 `ifdef HAS_PERF_ITLB
       $fdisplay(f, "itlb_disc=%0d", itlb_disc);
 `endif

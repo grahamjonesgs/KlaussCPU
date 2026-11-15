@@ -4660,6 +4660,285 @@ def ic32_dbg_write():
                          '+DBG_MW=%x' % (X + 8), '+DBG_MD=%x' % newdw]))
     return out
 
+
+@test
+def ic32_btic_inst_edge():
+    """review M1: a BTIC capture landing on an install edge.  O (warm) and L
+    (cold) share an I-cache index (64 KiB apart).  L's fill serves the
+    window, a CALL to O misses the BTIC, O's window is served from the
+    cache (O still valid), and L's line answer (+LDLYA / +LDLYN, swept)
+    lands around the capture: on its edge (the review's case), on the
+    edge O's window is served (the capture is the next edge), or on the
+    edge O's line is read (served after it).  The install overwrites the
+    tag shadow with L, so an entry captured from O's window would survive
+    every later store to O.  O's first word is then patched (snoop-coherent
+    store, no ICACHE_INV) and the CALL run again: it must run the new word,
+    and btic_unc (tb_vsim's coverage check) must stay 0.  The CALL is L's
+    own (direct: then it and O share the index) or B's (via: L jumps to B,
+    warm, at another index).  wr: a store into L's other half while L is
+    pending (install-invalid, the review's scenario)."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    nops = _word(lambda t: (t.nop(), t.nop()))
+    O, L, B = 0x21000, 0x31000, 0x24000
+    for via in (False, True):
+        for wr in (False, True):
+            for lat in (1, 3):
+                for mn in range(0, 15 if not via else 21):
+                    a = Asm()
+                    a.setr(1, 0); a.setr(12, 0); a.setr(6, new); a.setr(7, O); a.setr(9, L + 24)
+                    a.setr64(3, nops | nops << 32)
+                    a.call('O')                        # O warm: +1
+                    a.call('Bw')                       # B warm
+                    a.jmp('L')
+                    a.label('after')
+                    a.setr(12, 1)
+                    a.st(32, 6, 7)                     # patch O + 0: +16
+                    a.jmp('L')
+                    a.label('done')
+                    a.halt()
+                    _ic_pad(a, O)
+                    a.label('O')
+                    a.alui_s('add', 1, 1, 1)
+                    a.ret()
+                    _ic_pad(a, B)
+                    a.label('B')
+                    a.call('O')                        # (via) the capture of O's window
+                    a.jmp('L2')
+                    a.label('Bw')
+                    a.ret()
+                    _ic_pad(a, L)
+                    a.label('L')
+                    if wr:
+                        a.st(64, 3, 9)                 # L + 24, unchanged (pending: install-invalid)
+                    else:
+                        a.nop()                        # (the CALL's ID latch is not the JMP's capture edge)
+                    if via:
+                        a.jmp('B')
+                    else:
+                        a.call('O')                    # the capture of O's window
+                        a.jmp('L2')
+                    _ic_pad(a, L + 32)                 # (L + 24: two NOPs, the stored dword)
+                    a.label('L2')
+                    a.fbr('ne', 12, 0, 'dn', imm=True)
+                    a.jmp('after')
+                    a.label('dn')
+                    a.jmp('done')
+                    out.append((a, {'end': 'park', 'kind': '0', 'r1': 18, 'btic_unc': '0'},
+                                [f'+LAT={lat}', '+LDLYA=%x' % L, f'+LDLYN={mn}']))
+    return out
+
+
+@test
+def ic32_btic_win_loop():
+    """review M1, generalised: the window outlives the install that replaces
+    its line.  L (cold, its line late: +LDLY) calls O, a 16 B loop in one
+    window at O's index; the loop runs from that window (no refetch) while
+    L's install replaces O, so the loop branch's BTIC capture — every one
+    after the install kills the earlier — copies a line the shadow no
+    longer holds.  O's first word is then patched (snoop-coherent) and the
+    loop entered again at O + 4 (O refetched, its line late): a BTIC hit
+    taken before that install must not run the old word."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    O, L = 0x21000, 0x31000
+    for lat in (1, 3):
+        for ld in (2, 4, 6, 9, 12, 16, 20, 28):
+            a = Asm()
+            a.setr(1, 0); a.setr(6, new); a.setr(7, O)
+            a.setr(2, 4); a.call('O')                  # O warm, the branch trained: +4
+            a.setr(2, 40); a.jmp('L')                  # +40
+            a.label('after')
+            a.st(32, 6, 7)                             # patch O + 0: +16
+            a.setr(2, 2); a.call('O4')                 # +16 (one pass from O + 0)
+            a.halt()
+            _ic_pad(a, O)
+            a.label('O')
+            a.alui_s('add', 1, 1, 1)
+            a.label('O4')
+            a.addi_s(2, 2, -1)
+            a.fbr('ne', 2, 0, 'O', imm=True)           # O + 8
+            a.ret()
+            _ic_pad(a, L)
+            a.label('L')
+            a.nop()
+            a.call('O')
+            a.jmp('after')
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 4 + 40 + 16, 'btic_unc': '0'},
+                        [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_btic_nlb():
+    """review M1, generalised: the NLB outlives the install that replaces its
+    line.  L (cold, its line late: +LDLY) calls O; O's window is served
+    and the prefetch takes O's other half (O + 16) into the NLB; a load
+    (held behind L's line answer) stalls O until after L's install, then
+    O's JMP to O + 16 is served from the NLB and captured.  O + 16 is then
+    patched (snoop-coherent) and O's JMP entered again from its own dword
+    (O refetched, its line late): a BTIC hit taken before that install
+    must not run the old word.  Second form: the JMP is in A2, the half
+    line before O (another index), and the NLB holds O itself."""
+    out = []
+    new = _word(lambda t: t.alui_s('add', 1, 1, 16))
+    O, L = 0x21000, 0x31000
+    for lat in (1, 3):
+        for ld in (2, 4, 6, 9, 12, 16, 20):
+            a = Asm()
+            a.setr(1, 0); a.setr(6, new); a.setr(7, O + 16); a.setr(5, DATA)
+            a.call('O')                                # O warm: +1
+            a.jmp('L')                                 # +1
+            a.label('after')
+            a.st(32, 6, 7)                             # patch O + 16: +16
+            a.call('O8')                               # +16
+            a.halt()
+            _ic_pad(a, O)
+            a.label('O')
+            a.ld(64, 4, 5)
+            a.alui_s('add', 4, 4, 1)                   # (waits for the load)
+            a.label('O8')
+            a.jmp('O16')                               # O + 8
+            a.nop()
+            a.label('O16')
+            a.alui_s('add', 1, 1, 1)                   # O + 16
+            a.ret()
+            _ic_pad(a, L)
+            a.label('L')
+            a.nop()
+            a.call('O')
+            a.jmp('after')
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 18, 'btic_unc': '0'},
+                        [f'+LAT={lat}', f'+LDLY={ld}']))
+    # the branch elsewhere: A2, the second half of the line before O (warm),
+    # jumps to O, which the NLB took as the line after A2's window (or, from
+    # the first half, A2 - 16: as the line after that, the second entry)
+    for back in (16, 32):
+        A2 = O - back
+        for lat in (1, 3):
+            for ld in (2, 4, 6, 9, 12, 16, 20):
+                a = Asm()
+                a.setr(1, 0); a.setr(6, new); a.setr(7, O); a.setr(5, DATA)
+                a.call('A2')                               # A2 and O warm: +1
+                a.jmp('L')                                 # +1
+                a.label('after')
+                a.st(32, 6, 7)                             # patch O + 0: +16
+                a.call('A2')                               # +16
+                a.halt()
+                _ic_pad(a, A2)
+                a.label('A2')
+                a.ld(64, 4, 5)
+                a.alui_s('add', 4, 4, 1)                   # (waits for the load)
+                a.jmp('O')                                 # A2 + 8
+                _ic_pad(a, O)
+                a.label('O')
+                a.alui_s('add', 1, 1, 1)
+                a.ret()
+                _ic_pad(a, L)
+                a.label('L')
+                a.nop()
+                a.call('A2')
+                a.jmp('after')
+                out.append((a, {'end': 'park', 'kind': '0', 'r1': 18, 'btic_unc': '0'},
+                            [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_btic_br_win():
+    """review M1, the branch's line from a window the install has replaced:
+    L (cold, its line late: +LDLY) calls O; O's window is served, a load
+    held behind L's line answer stalls the op after it in ID, so O's JMP to
+    P (another index, warm) enters ID after L's install replaced O — from
+    the window that still holds O.  Its capture (P's window: covered) would
+    leave the branch's line uncovered.  O's JMP is then rewritten to jump
+    to Q (not a snoop hit: O is out) and O entered again, its line late: a
+    BTIC hit by the JMP's pc before that install would run P's code at Q."""
+    out = []
+    O, L, P, Q = 0x21000, 0x31000, 0x22000, 0x23000
+    for lat in (1, 3):
+        for ld in (2, 4, 6, 9, 12, 16, 20):
+            t = Asm(base=O + 8)
+            t.jmp(Q)
+            neww = t.assemble()[0]
+            a = Asm()
+            a.setr(1, 0); a.setr(6, neww); a.setr(7, O + 8); a.setr(5, DATA); a.setr(12, 0)
+            a.call('O')                                # O and P warm: +1
+            a.jmp('L')                                 # P: +1
+            a.label('after')
+            a.setr(12, 1)
+            a.st(32, 6, 7)                             # O's JMP now jumps to Q
+            a.call('O')                                # Q: +16
+            a.halt()
+            _ic_pad(a, O)
+            a.label('O')
+            a.ld(64, 4, 5)
+            a.alui_s('add', 4, 4, 1)                   # (waits for the load)
+            a.jmp('P')                                 # O + 8
+            _ic_pad(a, P)
+            a.label('P')
+            a.alui_s('add', 1, 1, 1)
+            a.ret()
+            _ic_pad(a, Q)
+            a.label('Q')
+            a.alui_s('add', 1, 1, 16)
+            a.ret()
+            _ic_pad(a, L)
+            a.label('L')
+            a.nop()
+            a.call('O')
+            a.jmp('after')
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 18, 'btic_unc': '0'},
+                        [f'+LAT={lat}', f'+LDLY={ld}']))
+    return out
+
+
+@test
+def ic32_btic_br_alias():
+    """review M1, the branch's line: a CALL at the end of L to O, 64 KiB
+    away at L's index.  O's fill replaces L, so the CALL's capture (of O's
+    window) is of a branch whose line the shadow no longer holds, and the
+    return lands in the next line (L stays out).  The CALL is then
+    rewritten to call X (a store to L: not a snoop hit) and run again from
+    a fill of L whose line is late: a BTIC hit by the CALL's pc before that
+    install would run O's code at X."""
+    out = []
+    O, L, X = 0x21000, 0x31000, 0x22000
+    for lat in (1, 3):
+        for mn in (0, 2, 4, 8, 16):
+            t = Asm(base=L + 28)
+            t.call(X)
+            neww = t.assemble()[0]
+            a = Asm()
+            a.setr(1, 0); a.setr(12, 0); a.setr(6, neww); a.setr(7, L + 28)
+            a.jmp('L24')                               # O: +1
+            a.label('after')
+            a.setr(12, 1)
+            a.st(32, 6, 7)                             # the CALL now calls X
+            a.jmp('L24')                               # X: +16
+            a.label('done')
+            a.halt()
+            _ic_pad(a, O)
+            a.label('O')
+            a.alui_s('add', 1, 1, 1)
+            a.ret()
+            _ic_pad(a, X)
+            a.label('X')
+            a.alui_s('add', 1, 1, 16)
+            a.ret()
+            _ic_pad(a, L + 24)
+            a.label('L24')
+            a.nop()                                    # (the CALL's ID latch is not the JMP's capture edge)
+            a.call('O')                                # L + 28
+            a.fbr('ne', 12, 0, 'dn', imm=True)         # L + 32: the next line
+            a.jmp('after')
+            a.label('dn')
+            a.jmp('done')
+            out.append((a, {'end': 'park', 'kind': '0', 'r1': 17, 'btic_unc': '0'},
+                        [f'+LAT={lat}', '+LDLYA=%x' % L, f'+LDLYN={mn}']))
+    return out
+
+
 @test
 def ic32_remap():
     """TE = 1: code at a VA re-mapped by TLBWI to another frame (other code)

@@ -744,6 +744,7 @@ module pipeline_core
    logic               lp_v;
    logic               li_q = 1'b0;     // an install landed on the last edge (its lookup re-reads now)
    logic               vs_pend;         // a valid set deferred behind a snoop clear
+   logic               ic_rd_ik;        // (review M1) an install lands at the looked-up index (lp_ev)
    logic [IC_IDXW-1:0] vs_idx;
    // M12 snoop split: the tag compare runs at store issue and is registered
    // here; the ic_v* clear lands one cycle later (the one-cycle compare +
@@ -896,7 +897,10 @@ module pipeline_core
       ic_rd_tag   <= ic_tag [ic_look_li];
       if (IC32) begin
          // (a sweep in progress: nothing is valid)
-         ic_rd_lv32 <= vl_rd_look && !ic_sw && !snoop_kill32;
+         // (review M1: nor a line read on the edge an install at its index
+         // lands — the read has the line it replaces, which the tag shadow
+         // no longer holds; a lookup re-reads, a prefetch gives up)
+         ic_rd_lv32 <= vl_rd_look && !ic_sw && !snoop_kill32 && !ic_rd_ik;
       end else begin
          ic_rd_lv_e  <= ic_lv[{ic_look_pr, 1'b0}] && !snoop_kill_e;
          ic_rd_lv_o  <= ic_lv[{ic_look_pr, 1'b1}] && !snoop_kill_o;
@@ -1685,6 +1689,39 @@ module pipeline_core
    logic [IC_IDXW-1:0] id_bt_li, id_bt_bli, r_btk_ic, r_btk_sn;
    logic               r_btk_icv, r_btk_snv, r_btk_all;
    logic               r_btk_snpr = 1'b0;
+   // HW_PERF_PLAN §5 review M1 (IC_LB = 32): BTIC captures across a line
+   // install.  The BTIC kills go by line index only, so an entry must be
+   // captured only from lines the tag shadow holds (or the pending install)
+   // — its target window's line and its branch's line.  A line install at
+   // index i replaces the shadow's tag there, and with 32 B lines it lands
+   // after the fill's ready, so copies of the line it replaces (O, another
+   // VA line at i) can still be in the fetch side when or after it lands:
+   // the window, a registered read, the NLB, the branch in ID.  r_ii_*: an
+   // install (or install-invalid) on the last edge — its index and its
+   // fill's VA tag; f_iia(dw): dword dw's line is another VA line at that
+   // index, i.e. a copy of it taken before that edge is no longer covered.
+   // ifb_unc: the window may hold such a line (set the edge after the
+   // install, cleared by a whole-window load, sticky through slides and
+   // slot-1 top-ups); id_bunc: the op in ID came from such a window, or its
+   // line was replaced since.  (Registers only; see the capture below.)
+   logic               r_ii_v = 1'b0;
+   logic [IC_IDXW-1:0] r_ii_idx;
+   logic [IC_TAGW-1:0] r_ii_vt;
+   logic               ifb_unc = 1'b0, id_bunc = 1'b0;
+   function automatic logic f_iia(logic [28:0] dw, logic v, logic [IC_IDXW-1:0] idx, logic [IC_TAGW-1:0] vt);
+      return IC32 && v && dw[IC_IDXW+IC_LW-1:IC_LW] == idx && dw[28:IC_IDXW+IC_LW] != vt;
+   endfunction
+   wire                ifb_unc_now = IC32 && (ifb_unc || f_iia(ifb_base, r_ii_v, r_ii_idx, r_ii_vt) ||
+                                              f_iia(r_base_p1, r_ii_v, r_ii_idx, r_ii_vt));
+   wire                id_unc_now  = IC32 && (id_bunc || f_iia(id_pc[31:3], r_ii_v, r_ii_idx, r_ii_vt));
+   // the pending capture: its window may hold a replaced line (block: a
+   // later, whole new window at the target may still be captured); its
+   // branch's line was replaced, or the branch and the target are two lines
+   // at one index (they cannot both be in the shadow) — drop it
+   wire                bt_cap_blk  = IC32 && (ifb_unc || f_iia(r_bt_wbase, r_ii_v, r_ii_idx, r_ii_vt));
+   wire                bt_cap_drop = IC32 && (f_iia(r_bt_wtag[29:1], r_ii_v, r_ii_idx, r_ii_vt) ||
+                                              (r_bt_wblidx == r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW] &&
+                                               r_bt_wtag[29:IC_IDXW+IC_LW+1] != r_bt_wbase[28:IC_IDXW+IC_LW]));
    wire                bt_hit    = EN_BTIC && id_bt_hit && !r_btk_all &&
                                    !(r_btk_icv && (id_bt_li == r_btk_ic || id_bt_bli == r_btk_ic)) &&
                                    !(r_btk_snv && (f_snm(id_bt_li, r_btk_sn, r_btk_snpr) ||
@@ -2786,6 +2823,19 @@ module pipeline_core
    wire               li_now  = lp_ev && !lp_wrh;
    wire [IC_IDXW-1:0] li_idx  = if_req_dw[IC_IDXW+1:2];
    wire [IC_TAGW-1:0] li_tag  = IC_TAGW'({if_tghi, if_req_dw[12:0]} >> (IC_IDXW + IC_LW));
+   assign             ic_rd_ik = lp_ev && li_idx == ic_look_li;
+   // (review M1: and a prefetch capture on that edge, of a line read
+   // before it, at the install's index — written invalid)
+   wire               pf_ik    = lp_ev && pf_line[IC_IDXW:1] == li_idx;
+   // (review M1: and the BTIC capture on that edge, of a line the install
+   // replaces — the window's or the branch's: only the entry's valid bit
+   // reads it, as the install's arrival is late for the whole capture
+   // enable's fanout; see bt_cap_blk / bt_cap_drop)
+   wire               bt_cap_ii = lp_ev &&
+                                  ((li_idx == r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW] &&
+                                    if_req_dw[28:IC_IDXW+IC_LW] != r_bt_wbase[28:IC_IDXW+IC_LW]) ||
+                                   (li_idx == r_bt_wblidx &&
+                                    if_req_dw[28:IC_IDXW+IC_LW] != r_bt_wtag[29:IC_IDXW+IC_LW+1]));
    // (an install since mem_iaddr was loaded may be missing from the
    // shadow read: see ri_v — registers only, beside the RAM's compare)
    // (§5: a store to the PA line of a pending install is a snoop hit too:
@@ -3248,6 +3298,15 @@ module pipeline_core
    (* keep = "true" *) wire [28:0] k_bp_p3  = r_base_p2 + 29'd1;
    (* keep = "true" *) wire [27:0] k_bp1_wl = r_base_p1[28:1] + 28'd1;
 
+   // 2a: the BTIC capture (see "BTIC capture and invalidation" below)
+   wire bt_cap = EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
+                 !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
+                 !(EN_TLB && (ifb_ft[0] || (ifb_val[1] && ifb_ft[1]))) &&   // (stage 3: a refused page)
+                 pc_dw == r_bt_wbase && !sq_spec &&
+                 !(snoop_q && (f_snm(r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW], snoop_idx_q, snoop_pr_q) ||
+                               f_snm(r_bt_wblidx, snoop_idx_q, snoop_pr_q))) &&
+                 !bt_cap_blk && !bt_cap_drop;   // (review M1)
+
    // ================================================================== clocked
    always_ff @(posedge clk) begin
       if (rst) begin
@@ -3275,6 +3334,7 @@ module pipeline_core
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
          bt_v <= '0; r_bt_pend <= 1'b0; id_bt_hit <= 1'b0; id_rpend <= 1'b0;
+         r_ii_v <= 1'b0; ifb_unc <= 1'b0; id_bunc <= 1'b0;
          r_btk_icv <= 1'b0; r_btk_snv <= 1'b0; r_btk_all <= 1'b0;
          ex_bp_cnd <= 1'b0; mem_bp_fbr <= 1'b0;
          mul_cnt <= '0; div_ph <= MD_IDLE; dv <= '0;
@@ -3309,6 +3369,9 @@ module pipeline_core
          // registers and only ev_icinst is late)
          ev_btic = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = IC32 ? li_idx : '0;
          ev_mload = 1'b0;
+         // (review M1: the op in ID — its line replaced by the last edge's
+         // install; the IF -> ID latch below overrides)
+         if (IC32) id_bunc <= id_unc_now;
 
          // MMU stage 1: a program load starts in supervisor mode with no
          // vector (MMU_PLAN.md §3.1); a debugger resume keeps them
@@ -4149,6 +4212,10 @@ module pipeline_core
                ev_icinst = 1'b1;  ev_icinst_idx = li_idx;   // 2a: BTIC entries of this index die
             end
             li_q <= li_now;
+            // (review M1) this install, for the copies' checks next edge
+            r_ii_v <= lp_ev;  r_ii_idx <= li_idx;  r_ii_vt <= if_req_dw[28:IC_IDXW+IC_LW];
+            // (before the redirect below, which may arm a new capture)
+            if (EN_BTIC && bt_cap_drop) r_bt_pend <= 1'b0;
             if (lp_ev)        lp_v <= 1'b0;
             else if (lp_fill) lp_v <= 1'b1;
             if (start || (DEBUG_EN && dbg_halted && dbg_i.resume)) lp_v <= 1'b0;
@@ -4170,13 +4237,13 @@ module pipeline_core
                   if (EN_NLB2 && (nlb0_has_want || nlb0_has_wp1)) begin
                      nlb1_data <= pf_rd_half;
                      nlb1_line <= pf_line;
-                     nlb1_vhi  <= ic_rd_vhi;
-                     nlb1_vlo  <= ic_rd_vlo;
+                     nlb1_vhi  <= ic_rd_vhi && !pf_ik;
+                     nlb1_vlo  <= ic_rd_vlo && !pf_ik;
                   end else begin
                      nlb_data <= pf_rd_half;
                      nlb_line <= pf_line;
-                     nlb_vhi  <= ic_rd_vhi;
-                     nlb_vlo  <= ic_rd_vlo;
+                     nlb_vhi  <= ic_rd_vhi && !pf_ik;
+                     nlb_vlo  <= ic_rd_vlo && !pf_ik;
                   end
                end
                // EN_NLB2: pipelined — having captured the window's next line,
@@ -4232,7 +4299,7 @@ module pipeline_core
                ifb_ft     <= 2'b00;  ifb_fm <= 2'b00;
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
-               r_bt_pend   <= 1'b1;
+               r_bt_pend   <= !id_unc_now;   // (review M1: its line is not covered)
                r_bt_widx   <= id_pc[7:2] ^ id_pc[13:8];
                r_bt_wtag   <= id_pc[31:2];
                r_bt_wbase  <= id_bp_tgt[31:3];
@@ -4632,6 +4699,7 @@ module pipeline_core
                      id_rpend   <= 1'b1;
                      // 2a: BTIC lookup by this instruction's own pc
                      id_bt_hit  <= EN_BTIC && bt_v[bt_lidx_pc] && bt_tag[bt_lidx_pc] == pc[31:2];
+                     id_bunc    <= ifb_unc_now;
                      id_bt_idx  <= bt_lidx_pc;
                      id_bt_li   <= bt_lidx[bt_lidx_pc];  id_bt_bli <= bt_blidx[bt_lidx_pc];
                      id_bt_d0   <= bt_d0[bt_lidx_pc];   id_bt_d1  <= bt_d1[bt_lidx_pc];
@@ -4912,13 +4980,15 @@ module pipeline_core
          // window at the target installs it.
          // (MMU stage 1: never a window at 0xF... — in user mode that is a
          // zero-served window, not a copy of an I-cache line)
-         if (EN_BTIC && r_bt_pend && ifb_val[0] && pos[0] && ifb_base == r_bt_wbase &&
-             !(EN_EXC && r_bt_wbase[28:25] == 4'hF) &&
-             !(EN_TLB && (ifb_ft[0] || (ifb_val[1] && ifb_ft[1]))) &&   // (stage 3: a refused page)
-             pc_dw == r_bt_wbase && !sq_spec &&
-             !(snoop_q && (f_snm(r_bt_wbase[IC_IDXW+IC_LW-1:IC_LW], snoop_idx_q, snoop_pr_q) ||
-                           f_snm(r_bt_wblidx, snoop_idx_q, snoop_pr_q)))) begin
-            bt_v[r_bt_widx]    <= 1'b1;
+         // (§5 review M1, 32 B lines: both lines of an entry must be in the
+         // tag shadow when it is written — see r_ii_* — so neither from a
+         // window that may hold a line an install has replaced (bt_cap_blk:
+         // ifb_unc, or the install on the last edge), nor for a branch
+         // whose line was replaced or that shares its index with the target
+         // (bt_cap_drop).  On the install's own edge the entry is written
+         // invalid (bt_cap_ii).)
+         if (bt_cap) begin
+            bt_v[r_bt_widx]    <= !bt_cap_ii;
             bt_tag[r_bt_widx]  <= r_bt_wtag;
             bt_base[r_bt_widx] <= r_bt_wbase;
             bt_d0[r_bt_widx]   <= ifb_dw[0];
@@ -4931,6 +5001,19 @@ module pipeline_core
             bt_want[r_bt_widx] <= r_want_line;
             if (id_bt_idx == r_bt_widx) id_bt_hit <= 1'b0;   // its snapshot is stale
             r_bt_pend          <= 1'b0;
+         end
+         // (review M1) the window: a whole new one holds no replaced line
+         // (on the edge after an install the registered read of the edge
+         // itself is invalid, ic_rd_ik; the NLB lost that index below; BTIC
+         // entries and snapshots of it died); otherwise it may still hold
+         // one the install on the last edge replaced
+         if (IC32) ifb_unc <= !(ev_fill || ev_rebase || ev_btic) && ifb_unc_now;
+         // (review M1) the NLB loses the install's index (its copies there
+         // are of the line replaced: it never holds an invalid line; one
+         // captured on this edge is written invalid, pf_ik)
+         if (IC32 && lp_ev) begin
+            if (nlb_line[IC_IDXW:1] == li_idx)  begin nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  end
+            if (nlb1_line[IC_IDXW:1] == li_idx) begin nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0; end
          end
          // Invalidation (after the capture: NBA last wins): the entry's
          // I-cache line is re-installed or store-snooped; ICACHE_INV.
