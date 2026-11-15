@@ -762,6 +762,149 @@ run stale from a BTIC hit taken before the next fill's install.
   +0.013); the tier-1 misses of b4 and b5 are placement-sensitive core
   paths outside the I-cache.  Not run on the board.
 
+### §5 review 2: BTIC captures across a line install (2026-11-15)
+
+**The finding (M1, minor): a BTIC capture on an install edge was left
+uncovered.**  The capture was blocked on a store-snoop edge, not on an
+install edge; the install's kill compares the entries' old `bt_lidx`, so
+an entry captured on that edge survived while `ic_tagsh[li_idx]` took the
+installed line's tag.  Scenario: L pending, O at L's index (64 KiB apart)
+read valid, O's window served, the capture of O's target landing on L's
+`lp_ev` edge; a later store to O misses the shadow and a BTIC hit replays
+the old code.  It applies to every 32 B install (16 B lines installed on
+the fill's own edge).
+
+- **It is a class, not an edge.**  The invariant (§5 review fix-ups) is
+  that every valid entry's line is in the shadow at its index or is the
+  pending install.  It also needs the entry's *branch* line: an entry
+  dies with its branch's line too (a tag hit means "same branch, same
+  target"), and with 32 B lines a refetch of a patched branch reaches ID
+  before its line's install kills the entry.  And a 32 B install lands
+  after the fill's ready, so a copy of the line it replaces (O) can be in
+  the fetch side on and after its edge: the window, the registered read
+  sampled on the install edge, an NLB entry, the branch in ID.  A capture
+  from any of them was uncovered, as was every capture whose branch and
+  target are two lines at one index (a call to a 64 KiB alias of its own
+  line: they cannot both be in the shadow).
+- **Monitor (M2).**  tb_vsim's `btic_unc` now checks both lines of every
+  valid entry (target at `bt_lidx`, branch at `bt_blidx`), with TE = 1
+  too: the PA lines are taken when the entry is written, from the
+  micro-ITLB entry holding the page (a TLB discard or TE / ASID change
+  empties the BTIC, so the translation is fixed for the entry's life;
+  `btic_pau` counts entries whose page the micro-ITLB no longer held —
+  0 in every TE = 1 test).  A run with `btic_unc` > 0 ends with a FATAL
+  line, so every tb_vsim-based command fails on it (`test`, `diff`,
+  `excdiff`, `mpudiff`, `tlbdiff`, `tlbpage`, `dcbzdiff`, `tecost`), and
+  run.py exits non-zero on any violation.  tb_soc gets the same check as a
+  sim-copy probe (`socdiff`, `socmmio`, `socwalk`, `socx`, `socdcbz`).
+- **Reproduction** (each fails on `bb23b01` and passes after the fix; all
+  also run at 1024 × 32 and 1024 × 16):
+  `ic32_btic_inst_edge` (the review's scenario: L's line answer swept with
+  `+LDLYA` / `+LDLYN` across the capture of O's window — on its edge, on
+  the edge O's window is served, on the edge O's line is read; the CALL in
+  L or in a warm B at another index; with and without the store into L
+  that makes it an install-invalid): on `bb23b01` 66 of 144 variants
+  fail the check and **6 end with r1 = 3 instead of 18** (the patched O
+  never runs: the BTIC replays the old word); `ic32_btic_win_loop` (a
+  loop running from a window across the install that replaces its line;
+  4 of 16); `ic32_btic_nlb` (an NLB entry across the install, also from
+  the second entry; 18 of 42, **4 with r1 = 3**); `ic32_btic_br_win`
+  (the branch's line replaced while it comes from the window; 8 of 14);
+  and `ic32_btic_br_alias` (a CALL to an alias of its own line, then
+  rewritten while its line is out: 10 of 10, and in 6 the core's own
+  assertion "BTIC base != target" fires — O's code would run at the new
+  target).  The M1 edge itself is `ic32_btic_inst_edge`'s via form at the
+  matching `+LDLYN` (the direct form has CALL and O at one index).
+- **Fix** (`pipeline_core`, all under `IC32`; 16 B lines unchanged):
+  - the install on the last edge is registered (`r_ii_v`, its index, its
+    fill's VA tag); `f_iia(dw)`: dw's line is another VA line at that
+    index — a copy of it taken earlier is no longer covered;
+  - the registered read sampled on an install edge at its index is
+    invalid (`ic_rd_ik`: a lookup re-reads, a prefetch gives up), and a
+    prefetch capture on that edge at that index is written invalid
+    (`pf_ik`); the NLB loses the install's index;
+  - `ifb_unc`: the window may hold a replaced line — set the edge after
+    the install (`f_iia` of either slot's line), cleared by a whole-window
+    load (fill, serve, BTIC: their sources hold no replaced line after
+    the above), sticky through slides and slot-1 top-ups; `id_bunc`: the
+    op in ID came from such a window, or its line was replaced since;
+  - the capture is blocked while `ifb_unc` or `f_iia(target)`; dropped
+    if `f_iia(branch)`, or if branch and target are two lines at one
+    index; a branch with `id_bunc` arms no capture; on the install's own
+    edge the entry is written invalid (`bt_cap_ii` — only the valid bit
+    reads the late `lp_ev`, not the capture's write enable, so the
+    capture logic stays registers-only).  This replaces the review's
+    "kill on the next edge": that left the entry valid for one cycle,
+    which the monitor (rightly) counts.
+- **Mutations** (`ic32_btic_*`, failing variants with one part off):
+  `ifb_unc` 16, `ic_rd_ik` 10, `pf_ik` 2, the first NLB entry's kill 2,
+  `bt_cap_ii` 2, `f_iia(target)` 2, `f_iia(branch)` 2, `id_bunc` at the
+  redirect 16; the static alias rule with `f_iia(branch)` 72 (each covers
+  the other's cases in these tests).  No directed test isolates the
+  second NLB entry's kill (with `pf_ik` the second entry is only written
+  at an install edge in the tests that reach it) or the `id_bunc`
+  accumulation in ID (it needs a branch held in ID across an install);
+  both are kept by the invariant's argument.
+- **`btfuzz`** (new run.py command): random code in 4–8 functions placed
+  in slots 64 KiB apart (many share an index), with tight loops, loads,
+  calls and snoop-coherent stores rewriting functions' first words,
+  under 7 line / memory timings (`+LDLY`, `+LDLYR`, `+HIT`) against the
+  same program on a `BTIC_EN = 0` build, with the coverage check.  On
+  `bb23b01`: 250 of 2,100 runs (300 seeds × 7 timings) violate the invariant (no
+  register difference seen); after the fix 1,500 seeds × 7 timings, and
+  1,000 more in each 32 B regression, clean.
+- **Cost.**  Only alias cases change behaviour (a replaced line's copies
+  are refetched, captures not taken); `diff` / `socdiff` against
+  `bb23b01`: see the regression below.  An unrelated observation: the
+  capture's `id_bt_idx == r_bt_widx` snapshot kill compares the *old*
+  snapshot's index, so when a capture lands on the next instruction's
+  ID latch and the previous snapshot was the capturing branch's, the new
+  snapshot is dropped (a lost BTIC hit, never a wrong one; the tests
+  above place a NOP to avoid it).
+
+- **Regression** (`823b5ea`, every run under the new coverage gate;
+  2048 × 32 and 1024 × 32): `test` (default, DEBUG_EN, MPU_EN,
+  TLB_N = 16, TLB_WALK = 0; 1,900+ variants each), the `ic*` / `ut_*`
+  tests at `+LDLY=6`, `+LDLY=11 +HIT=50` and (DEBUG_EN) `+LDLY=1
+  +LDLYR=12`, `diff` against `bb23b01` (40 seeds × 1 / 3 / 7, `--irq`,
+  `+HIT=70`, `+LDLY=4 +LDLYR=8`, DEBUG_EN, MPU_EN, EXC_EN = 0), `excdiff`,
+  `tlbdiff` (plain, `--irq`, `--walk`, `--absent`, TLB_N 4 / 8, a 512 KiB
+  span), `tlbpage`, `dcbzdiff` 200 seeds, `mpudiff`, `dmtest`, `btfuzz`
+  1,000 seeds, `socdiff` (30 seeds, 20 with a 64 B span), `socmmio`,
+  `socwalk`, `socx`, `socdcbz`: all pass, and the random diffs' cycle
+  totals equal `bb23b01`'s (+0.00 % everywhere).  Under a global `+LDLY`
+  only the count / timing-specified expectations listed above differ
+  (`ic_counters`' `ic_fill`, `ic16_icinv.1`, `ic32_fill_cyc.1` under a
+  random `+LDLYR`).  **1024 × 16** is cycle-identical to `bb23b01`: every
+  test in the five configurations (1,864–1,962 variants each, identical
+  cycle counts), `diff` with `+TRACECYC` (40 seeds × 1 / 3 / 7, DEBUG_EN,
+  EXC_EN = 0) and `socdiff` 30 seeds.
+
+- **Build** (`icache_b6`, `823b5ea`): the synth-only check first (no
+  Synth 8-4767; 82 RAMB36 + 18 RAMB18, the memories as in `bb23b01`),
+  then the standard `build_fast -resynth`: **met in tier 1, WNS +0.017 /
+  WHS +0.024** (no tier 2, no alternate placement), 11 min 5 s.  Worst
+  paths: a TLB entry → `mem_xsq` (+0.017), `r_base_p1` → `ifb_dw` (+0.062),
+  QSPI (+0.063), the hit pipe's `wb_h` → multiplier input (+0.076), the
+  TLB → `t1_pahi` / `mem_pa2hi` / `r_h_tag` (+0.076 … +0.093); none ends
+  in the new logic (the capture enable stays registers-only; the late
+  `lp_ev` reaches only the BTIC valid bits, the NLB valid bits and
+  `ic_rd_lv32`).  38,318 LUTs (3,849 as memory), 24,903 FFs, 91 BRAM
+  tiles, 19 DSPs: +1,200 LUTs / +203 FFs against `bb23b01`'s build, of
+  which `pipeline_core` +849 / +130 — almost all in unrelated datapath
+  (`ex_a`, `mem_result`, `m_wdata`, `ex_c`: duplication / retiming choices
+  of this run; the new registers are ~30 FFs); post-synthesis the same
+  RTL varies by ~900 LUTs when any one part of the fix is removed, so this
+  is the tool's variance, not the fix's size.
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| **`icache_b6`** | **`823b5ea`** | review 2: BTIC captures across an install | **+0.017 / +0.024** | — | 38,318 | 24,903 | 91 |
+
+- **Bitstream `823b5ea`** (`~/.cache/kbuild/icache_823b5ea.bit`, md5
+  `b36021a5ae4343972d1ee7b176e20f81`), build dir `~/.cache/kbuild/icache_b6`.
+  Not run on the board.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -875,3 +1018,8 @@ Decisions taken while implementing the frozen text above:
   the shifter zero-test timing fix: `bb23b01`, standard flow tier 2 WNS
   +0.007 / WHS +0.050, `~/.cache/kbuild/icache_bb23b01.bit`.  Not yet run
   on the board.
+- 2026-11-15: §5 review 2 (M1: BTIC captures across a 32 B install, with
+  the branch-line and window / NLB / ID cases; M2: the BTIC coverage
+  check on every tb_vsim / tb_soc run, `btfuzz`): `823b5ea`, standard
+  flow tier 1 WNS +0.017 / WHS +0.024, `~/.cache/kbuild/icache_823b5ea.bit`.
+  Not yet run on the board.
