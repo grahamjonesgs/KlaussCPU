@@ -1258,6 +1258,132 @@ take-back of write-buffer lines (both below).
   2 with `ddr2_control`, 0 with the L2, which needs one DV-low cycle), the
   `L2_CTRL` decode and the counters (constant 0, read 0 as before).
 
+### §6 verification
+
+**Benches.**
+- **`tb_l2`** (Verilator, `sim_1/new/tb_l2.sv`): the L2 alone on the
+  behavioural MIG, driven with the arbiter's protocol by every kind of
+  master (the D-cache's 32 B reads with a critical dword and the
+  speculative lookup — right and wrong —, its 32 B victim writes, 16 B
+  masked DMA reads and writes, VGA's 32 B reads), `L2_CTRL` writes and the
+  VGA-request input at random.  **Memory-consistency checker:** a reference
+  memory takes every accepted write; every read answer and every early
+  critical dword must equal it; after each write-back-and-invalidate the
+  MIG's memory must equal it too.  Directed tests: `hit` (a miss fills the
+  line; the same sector hits 2 cycles after the DV with the speculative
+  lookup, 3 without; the other sector hits; an I-fill hit), `sector`
+  (a victim allocates its sector with no DDR read; the other sector then
+  fetches 32 B only), `evict` (WAYS + 2 dirty lines in a set: two whole
+  lines drained), `wbhit` (a demand read of a line still in the write
+  buffer waits for its drain; asserted not vacuous), `plru` (the victim
+  against a reference tree-PLRU over 40 rounds), `dma` (the D-cache's
+  dirty line read by DMA and VGA from the L2 with no DDR read; a DMA write
+  merged into a valid sector and read back by the D-cache; a missing DMA
+  write posted then read; **ordering**: a D-cache writeback then a DMA
+  write of the same bytes, and the reverse, with the L2 on, off — both in
+  the write buffer — and across both), `wbinv` (dirty lines in 240 sets,
+  WBINV with D-cache and DMA traffic to walked and not-yet-walked sets
+  during the walk; BUSY at once; DDR then equals the reference; every
+  later read misses), `toggle` (disable with dirty data, a write of 1
+  during the walk ignored, bypass traffic counts no lookups, DDR checked,
+  re-enable, the program-load enable cancelling a disable), `range`
+  (PA[31:27] ≠ 0: no lookup, no allocation).
+- **tb_soc**: DDR is now the behavioural MIG (`mig_model.sv`: Strict order,
+  `+MIGLAT` default 36 = the board's ~44-cycle miss, `+MIGJIT`, `+MIGRDY`,
+  `+MIGREF`) behind the real `ddr2_control` or `l2_cache`, with the same
+  consistency checker at the arbiter's port on every run (`FATAL
+  consistency` fails the command).  **Baseline check (the testbench change
+  hides nothing):** `CORE1_L2_EN` = 0 against `d7f3994`'s RTL under the same
+  new tb_soc (`socdiff --base-tb-wt`): identical traces **and PIPE_RUN
+  cycles** (30 seeds: 69,032 = 69,032; 20 with a 64 B span: 25,584 =
+  25,584), and the whole SoC set passes with `VSIM_L2=0`.  The RTL of an
+  `L2_EN` = 0 build differs from master only in logic with no load (the
+  `ifetch` bit, `m_if`, the counters and the `L2_CTRL` decode) and in a
+  parameter that keeps its old value (the DV gap, 2).
+- New SoC commands: `socl2` (L2_CTRL: BUSY reads 1 on the instruction
+  after a write of 0, a write of 1 during that walk is ignored, 400 stores
+  and loads across every set during the walk, BUSY polled, then EN = 0,
+  enable, the region's sum through the bypassed and the re-enabled L2;
+  the blitter's FILL over bytes a D-cache writeback just put in the L2 (L2
+  on), in the write buffer (L2 off), and the reverse order with a COPY that
+  must read the L2's dirty data; the counters), `socbench`, `socvga`.
+
+**Results** (final RTL; every run under the BTIC gates and the consistency
+checker):
+- `tb_l2`: every directed test and 12 random seeds × 3,000 transactions,
+  at 2, 4 and 8 ways, under four MIG timings (`+MIGLAT=4`; 36; 8 with
+  `+MIGJIT=20 +MIGRDY=30`; 60 with `+MIGREF=200 +MIGRDY=10`): SWEEP.
+- tb_soc, L2 on (4-way), also under `+MIGLAT=8 +MIGJIT=20 +MIGRDY=30`,
+  `+MIGLAT=60 +MIGREF=500`, with 8 ways and with `VSIM_L2=0`: `socdiff`
+  against `d7f3994` (30 seeds, 20 with a 64 B span: identical traces),
+  `socmmio` (`L2_INFO`, `L2_CTRL`, `CPU_FEATURES` = `0x07F0_200D`),
+  `socwalk`, `socx`, `socdcbz`, `socl2`, `socsd`, `soceth`: all pass.
+  (`socsd` and `soceth` expected `CPU_FEATURES` without the walker's bit
+  [25] and failed on master too; their constants are fixed.)
+- Core regression (`pipeline_core` gained only the `m_if` output):
+  `test` (default, DEBUG_EN, MPU_EN, TLB_N = 16, TLB_WALK = 0; 2,200
+  variants each), `diff` against `d7f3994` with `+TRACECYC` (40 seeds × 1 /
+  3 / 7: 169,092 = 169,092 cycles) and `--irq` (209,357 =), `excdiff`,
+  `mpudiff` (MPU_EN), `tlbdiff`, `tlbpage`, `dcbzdiff` 200 seeds, `dmtest`,
+  `btfuzz` 300 seeds × 7: all pass.
+
+**Cycles** (tb_soc, `+MIGLAT=36`, L2 off → on in the same tree; identical
+traces / registers):
+
+| Program | L2 off | L2 on | |
+|---|---|---|---|
+| `socdiff` randprog, 30 seeds | 69,032 | 61,458 | −11.0 % |
+| randprog, 64 B data span, 20 seeds | 25,584 | 24,613 | −3.8 % |
+| randprog at `+MIGLAT=8 +MIGJIT=20 +MIGRDY=30` (vs `d7f3994` there: same DDR model only for L2 on/off) | 44,120 (`MIGLAT=8`) | 41,996 | −4.8 % |
+| `data96k` (4 passes, load + store over 96 KiB) | 901,258 | 381,047 | −57.7 % |
+| `code96k` (96 × 1 KiB functions, 3 passes) | 311,576 | 142,666 | −54.2 % |
+| `chase112k` (dependent loads round a 112 KiB cycle) | 465,382 | 195,480 | −58.0 % |
+
+randprog's footprint fits the L1s: its gain is the posted D-cache
+writebacks and the 64 B fetch (a next-32 B prefetch).  The large-footprint
+programs are the L2's case (pass 2 of a 96 KiB read: 10.0 cycles a load
+including the loop, against 30.5 cold).  Latency checks: a dependent load
+chain that misses both levels costs 48.11 / 42.01 cycles a load (128 B /
+4 KiB stride) with and without the L2 — an L2 miss adds nothing.
+
+**Hit latency, each extra cycle** (L2 off = 100 %):
+
+| Hit | randprog | data96k | code96k | chase112k |
+|---|---|---|---|---|
+| **3 (design)** | **−10.97 %** | **−57.7 %** | **−54.2 %** | **−58.0 %** |
+| 4 (no speculative lookup, `SPEC_EN` = 0) | −9.70 % | −56.4 % | −52.9 % | −56.2 % |
+| 5 | −9.43 % | −55.2 % | −51.5 % | −54.8 % |
+| 6 (the model's `h`) | −9.18 % | −54.0 % | −50.2 % | −53.4 % |
+
+So the speculative lookup is worth ~1.3 points on randprog and 1.3–1.8 on
+the large footprints, and each further cycle ~1.2–1.4 points there,
+matching the model's "about 1 point a cycle".
+
+**VGA scanout** (`socvga`: 640 × 480 RGB565, CPU traffic, WBINV walks;
+starved display lines, from the scanout's `o_underflow` — the board's
+`VGA_STATUS[63:48]`; worst fetch of a line in cycles, of 3,200):
+
+VGATABLE
+
+Under the adversarial load (every access misses both levels, dirty
+victims everywhere) the scanout has almost no margin **without** the L2
+(3,185 of 3,200 cycles at the board's latency; it starves at `MIGLAT` 40+
+or with refresh-like stalls); with the L2 it starves no more than without
+in every setting.  Before the VGA rule (no background drains and
+sector-only fills while VGA fetches) the L2 build starved 2 lines at
+`MIGLAT=36` and 47 after a first, drain-only version of the rule; the
+whole-line fetches had raised DDR read traffic by 42 % in this load.  A
+scanout-side fix for the pre-existing margin (more line buffering, or
+pipelined reads) is outside this item.
+
+### §6 mutations
+
+`tools/vsim/l2mut.py`: one textual change of `l2_cache.sv` each, built into
+`tb_l2`, run on every directed test and 4 random seeds under two MIG
+timings (stopping at the first failing run):
+
+MUTTABLE
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |

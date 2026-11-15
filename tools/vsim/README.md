@@ -62,6 +62,36 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   usable A/B for core changes. `run.run_soc(exe, image_or_mem_path, name)`
   also boots any `netboot.mem`-format image (e.g. the real netboot).
 
+## The L2 (HW_PERF_PLAN.md §6)
+
+- **tb_soc's DDR** is the behavioural MIG (`sim_1/new/mig_model.sv`) behind
+  the real `ddr2_control` (`VSIM_L2=0`, `CORE1_L2_EN` = 0) or `l2_cache`
+  (default).  Plusargs (also through `VSIM_SOC_PLUS="..."` for every run, or
+  `--plus` where a command has it): `+MIGLAT=<n>` (default 36: ~44 cycles
+  from a D-cache miss to its critical dword, as on the board), `+MIGJIT`,
+  `+MIGRDY` (% of cycles app_rdy drops), `+MIGREF` (a 30-cycle stall every
+  n cycles).  Older revisions' tb_soc (a behavioural `ddr2_control`, 8
+  cycles a line) are built as they were; `socdiff --base <rev> --base-tb-wt`
+  runs an older revision's RTL under the current tb_soc instead (same DDR
+  model: cycle counts comparable).  `socdiff --base wt --base-env VSIM_L2=0`
+  compares the L2 off / on in the working tree.  `VSIM_L2_WAYS=8`;
+  `VSIM_L2_SPEC=0` / `VSIM_L2_XTRA=<n>` (measurement only: 4-cycle hits,
+  n more cycles a hit).
+- **Memory-consistency checker** (every tb_soc run): a reference memory at
+  the arbiter's port; a wrong read answer or early dword prints `FATAL
+  consistency` and the command fails.
+- **`socl2`**: L2_CTRL semantics (BUSY at once, writes ignored while BUSY,
+  stores during the walk), blitter ordering against D-cache writebacks
+  (L2 on, L2 off, reversed), the counters.  **`socbench`**: 96–112 KiB
+  footprints, L2 off vs on.  **`socvga`**: VGA scanout under CPU miss /
+  writeback traffic and WBINV walks (starved lines must be 0; `+VGA_V0`
+  moves the raster to the next vblank).
+- **`tb_l2`** (`sim_1/new/tb_l2.sv`): the L2 alone with the behavioural MIG,
+  all masters, a reference memory, directed tests (`+TEST=hit`, `sector`,
+  `evict`, `wbhit`, `plru`, `dma`, `wbinv`, `toggle`, `range`) and
+  `+TEST=random +SEED=<n> +N=<n>`; built with `+define+L2_WAYS=<n>`.
+  **`l2mut.py`**: the coherence mutations on it.
+
 ## Sim-copy patches (Verilator 5.020 limits)
 
 These are applied only to copies under `$VSIM_WORK`; the RTL is unchanged.
