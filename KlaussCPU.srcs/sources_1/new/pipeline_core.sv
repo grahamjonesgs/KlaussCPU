@@ -5003,8 +5003,10 @@ module pipeline_core
          // invalidation below compares the entries' OLD line indices, so a
          // capture landing on the snoop edge would survive it holding the
          // pre-store window.  Nor on an EN_ST1 squash edge (the window may
-         // predate the store).  The capture stays pending; a later, fresh
-         // window at the target installs it.
+         // predate the store).  Otherwise the capture stays pending and a
+         // later, fresh window at the target installs it; but a snoop or an
+         // sq_spec ends the pending capture (review 3), and the branch must
+         // be seen again.
          // (MMU stage 1: never a window at 0xF... — in user mode that is a
          // zero-served window, not a copy of an I-cache line)
          // (§5 review M1, 32 B lines: both lines of an entry must be in the
