@@ -933,6 +933,7 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[24]` | `ETH_RX_SLOTS` (`0xF007_0000`): up to 8 LiteEth RX slots, see the Ethernet section |
 | `[25]` | the hardware TLB walker (SRs `TLB_PTB` / `TLB_WALK` / `TLB_WCNT`, MMU_PLAN.md §11.8) |
 | `[26]` | the unified L2 (`L2_INFO` / `L2_CTRL` at `0xF005_0020` / `0x0028`, counters `0xF00D_0118` …, HW_PERF_PLAN.md §6) |
+| `[27]` | reserved (a later D-cache range clean / invalidate, with `CACHE_CTRL[5:4]` and `0xF005_0030` / `0x0038`); reads 0 |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
