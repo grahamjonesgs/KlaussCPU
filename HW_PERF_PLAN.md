@@ -905,6 +905,188 @@ the fill's own edge).
   `b36021a5ae4343972d1ee7b176e20f81`), build dir `~/.cache/kbuild/icache_b6`.
   Not run on the board.
 
+### §5 review 3: straddling branches, stale pending captures, 16 B lines (2026-11-15)
+
+Two findings of the review of review 2 (both pre-existing since 2a, and
+both seen as a wrong BTIC window, "BTIC base != target"), and three more
+that the coverage check found once it ran with 16 B lines.
+
+- **M1: a branch across a line end.**  An entry's kills compare its
+  target's line (`bt_lidx`) and its branch's first line (`bt_blidx`).  A
+  2-word JMP / CALL abs at a line's last word keeps its target word in the
+  next line, so a store rewriting it snooped a line no entry names, and the
+  next run of the branch hit the old target's window.  **Fix:** such a branch
+  arms no capture (`id_strad`, in `id_unc_now`: the op's last dword is at
+  most one past its first, so the line changes iff the index's low bit
+  does — a 1-bit compare of two registers).  The reviewer's other option, a
+  second branch-line index per entry, would add 64 × 11 flip-flops and two
+  more kill compares per entry.  Cost: only 2-word branches at a line's last
+  word (1 slot in 8 with 32 B lines) lose the BTIC; randprog and the SoC
+  programs have none (their cycle totals are unchanged, below).
+- **M2: a pending capture outlived squashes.**  `r_bt_pend` ended only at
+  the capture, reset / start and `bt_cap_drop`; a snoop blocked the
+  capture on its own edge only.  An older store rewriting `jmp T1` at P
+  into a conditional branch to T3 squashed J (armed {P, T1}); the refetched
+  P fell through to a JMPR to T1, whose window the still-pending capture
+  paired with P; once the PHT said taken, P's BTIC hit ran T1's code at T3.
+  ICACHE_INV (code written behind the core's back), exceptions, IRQs and
+  TLB / ASID changes were the same.  **Fix:** the pending capture is the
+  arm's own redirect's: it ends at the capture, at any other move of pc
+  (`ev_pcz`) or older squash (`ev_ovr`, which also cancels an arm on its
+  own edge), and at a snoop of its lines.  An arm on a capture's edge is
+  kept (the review's minor case: the capture's clear used to drop it).
+- **16 B lines** (the check ran only with 32 B lines before).  Three
+  coverage holes, the M1 class at 16 B: (a) the branch-and-target-at-one-
+  index drop rule was IC32-only (a CALL to a 16 KiB alias of its own line);
+  (b) the NLB, keyed by address, kept a copy of a line an install had
+  replaced — now an install drops the NLB entries at its index, as with
+  32 B lines; (c) a fill at a 32 B line's dword 1 also returns the next
+  dword, the other 16 B line's first, into window slot 1, but installs
+  only its own line — a branch latched from that copy was captured with its
+  line not in the I-cache, so a store to it snooped nothing, and after an
+  eviction and a refill through the same path the entry replayed the old
+  code (a wrong result).  Now `r_nx_*` remembers that dword until the next
+  whole-window load or redirect and a branch from it is `id_bunc`.  All
+  three are `!IC32` / `EN_BTIC` logic: none of it is in the release build.
+- **Checks** (tb_vsim, and the tb_soc probe):
+  - a line is covered only if it is in the shadow (or the pending install)
+    **at an index the entry's kills compare** (`bt_lidx` / `bt_blidx`); the
+    lines checked are the target's, the branch's and the branch's last
+    word's (from the arm that wrote the entry: tb records each arm's
+    `id_last_dw`; `btic_noarm` counts an entry with no arm, FATAL);
+  - both line sizes (16 B: the shadow is `ic_tagff_e` / `_o`);
+  - currency: `btic_stale` counts cycles a BTIC hit's window is not at the
+    ID op's predicted target — FATAL, independent of the core's assertion;
+  - `btic_chk` / `btic_hits`: entries and hits checked, printed for every
+    command (`BTIC checks: N entries checked, M hits checked in R gated
+    runs`), so a vacuous run shows; `diff` / `socdiff` print both
+    revisions' BTIC hits;
+  - every run fails on a FATAL line or the core's "BTIC base != target" /
+    "pos0 unsound" (also when it stops the run); the base revision's runs
+    in `diff` / `socdiff` / `socmmio` are not gated.
+- **`btfuzz`** now has patchable branch sites: a forward branch over 1-4
+  signature adds, 1-word (JMP, FBR on r5: always / never taken) or 2-word
+  (JMP abs; a 2-word FBR, word 1 its compare value), placed at random, at a
+  32 B or 16 B line's last word (a 2-word site then straddles) or in a
+  loop; stores patch a site's target (the offset, or the JMP abs's address
+  word — a label in its skip, or a far trampoline at the functions'
+  indices) and its kind, from anywhere or right before the site runs.
+
+**Reproduction** (the review's t_straddle / t_pendsnoop / t_pendinv, now
+tests.py; failing variants on `823b5ea` → after, at 2048 × 32 / 1024 × 32 /
+1024 × 16): `btic_strad` 24 / 24 / 24 of 24 → 0 (the JMP and the CALL abs
+forms; the core's assertion fires in 8 / 8 / 24, the rest are caught by the
+coverage check's kill-index rule); `btic_pend_snoop` 24 / 24 / 48 of 96 → 0;
+`btic_pend_inv` (the non-coherent writer and ICACHE_INV, older than J,
+with a long memory latency: the refetches during the 32 B sweep install no
+valid line) 12 / 12 / 8 of 96 → 0; `btic_oddfill` 0 / 0 / 8 of 8 → 0 (16 B
+(c), a wrong result); `btic_nlb_inst` 0 / 0 / 27 of 27 → 0 (16 B (b)); the
+review-2 `ic32_btic_*` tests at 1024 × 16: 104 variants fail the check on
+`823b5ea` (16 B (a)) → 0.  `btfuzz` (300 seeds × 7 timings) on `823b5ea`:
+181 of 2,100 runs fail at 2048 × 32 and at 1024 × 32 (28 seeds; 11 stop on
+the core's assertion, the rest fail the coverage check) and 833 at
+1024 × 16 (119 seeds; 7 on the assertion); after: 0 of 7,000 (1,000 seeds)
+in each geometry.
+
+**Mutations** (failing variants with one part off; directed = `btic_*` +
+`ic32_btic_*`, btfuzz = 300 seeds × 7):
+
+| Part off | 2048 × 32 | 1024 × 16 |
+|---|---|---|
+| `id_strad` | `btic_strad` 24 (8 of them also the core's assertion), btfuzz 177 | `btic_strad` 24, btfuzz 441 |
+| every new `r_bt_pend` clear (capture only, as before) | `btic_pend_snoop` 16, `btic_pend_inv` 12, btfuzz 4 | 48, 8, btfuzz 0 |
+| `ev_pcz` and `ev_ovr` (snoop kept) | `btic_pend_inv` 12 | `btic_pend_snoop` 24, `btic_pend_inv` 8 |
+| 16 B drop rule (IC32-only again) | — | `ic32_btic_*` 104, btfuzz 357 |
+| 16 B NLB kill | — | `btic_nlb_inst` 27, btfuzz 49 |
+| `r_nx` (`id_bunc` from it) | — | `btic_oddfill` 8, btfuzz 14 |
+
+`ev_pcz`, `ev_ovr`, the snoop clear and the arm-edge `ev_ovr` alone: 0
+everywhere — they overlap (every squash sets both `ev_pcz` and `ev_ovr`;
+ICACHE_INV and a TLB discard set both; an SMC squash and the snoop both
+see a patched branch that is in flight), and are kept as one rule: the
+pending capture is the arm's own redirect's.  The arm-on-a-capture-edge
+case changed no hit in any test or fuzz run.  The checks with the core's
+assertions off (`BTIC base != target`, `pos0..2 unsound`): `id_strad` off
+fails 24 of `btic_strad` on coverage and 8 on currency (each alone still
+catches its share); all pending clears off: currency catches every failing
+variant (28 at 32 B, 56 at 16 B), coverage only 12 / 24 — the stale entry's
+lines are all in the shadow, so currency is the check for M2.
+
+**Regression** (run on `af1a1c4` and again, with identical results, on
+the final RTL `079d686` (tools `064cc78`); every gated run under the new
+checks, in 2048 × 32, 1024 × 32 and 1024 × 16): `test` in the five configurations
+(default, DEBUG_EN, MPU_EN, TLB_N = 16, TLB_WALK = 0; 2,115–2,215 variants
+each); the `ic*` / `ut_*` tests at `+LDLY=6`, `+LDLY=11 +HIT=50` and
+(DEBUG_EN) `+LDLY=1 +LDLYR=12` (only the known count / timing expectations
+differ: `ic_counters`' `ic_fill`, and with 32 B lines `ic16_icinv.1` and,
+under `+LDLYR`, `ic32_fill_cyc.1`); `diff` against `823b5ea` (40 seeds ×
+1 / 3 / 7; `--irq` × 2 / 5; `+HIT=70`; `+LDLY=4 +LDLYR=8`; DEBUG_EN; MPU_EN;
+EXC_EN = 0), `excdiff` (and `--irq`), `mpudiff`, `dcbzdiff` 200 seeds,
+`tlbdiff` (plain, `--irq`, `--walk`, `--walk --absent 0.3`, TLB_N 4 / 8, a
+512 KiB span), `tlbpage`, `dmtest`, `btfuzz` 1,000 seeds × 7, `socdiff`
+(30 seeds, and 20 with a 64 B span), `socmmio`, `socwalk`, `socx`,
+`socdcbz`: all pass.  (On `af1a1c4` `tlbpage` ran outside the gate — its
+`import run` was a second copy of the module; fixed in `064cc78`, gated
+since.)
+
+| Cycles, `823b5ea` → `af1a1c4` / `079d686` | 2048 × 32 and 1024 × 32 | 1024 × 16 |
+|---|---|---|
+| `diff` × 1 / 3 / 7 (also DEBUG_EN, MPU_EN, EXC_EN = 0) | 169,092 = | 215,050 = |
+| `diff --irq` | 263,362 → 263,361 | 334,382 = |
+| `diff +HIT=70` | 154,538 = | 199,675 = |
+| `diff +LDLY=4 +LDLYR=8` | 202,874 = | 251,089 = |
+| `socdiff` / 64 B span (PIPE_RUN) | 38,442 = / 21,040 = | 46,497 = / 25,766 = |
+
+BTIC hits (both revisions under the same check) are identical everywhere
+except `diff --irq`: 883 → 882 at 32 B, 881 → 878 at 16 B (−0.1 % /
+−0.3 %; a capture pending across an IRQ entry is dropped).  (randprog, behind
+`diff` and `socdiff`, has no 2-word branch, so the straddle rule's cost is
+not in these numbers; it is one slot in 8 for 2-word JMP / CALL abs and
+2-word FBRs with 32 B lines.)
+
+**Build.**  Synth-only check first (`af1a1c4`): no Synth 8-4767, 82
+RAMB36 + 18 RAMB18 as in `823b5ea`.  Then the standard `build_fast
+-resynth`:
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `btic_b1` | `af1a1c4` | review 3 | −0.025 / +0.015 | −0.025 | 37,868 | 24,909 | 91 |
+| `btic_b2` | `9165799` | + the access-fault register as two | −0.171 / +0.051 | −0.005 | 37,075 | 24,815 | 91 |
+| **`btic_b3`** | **`079d686`** | + 8 TLB CAM key copies | **+0.062 / +0.014** | — | 37,519 | 24,846 | 91 |
+
+- b1 missed on one endpoint, a TLB CAM key copy → `d_pok0` → `t_dn` →
+  `ex_ufault` → `mem_xsq` (review 2's worst path, +0.017 in `icache_b6`;
+  nothing in it is new logic).  Every one of the 10 worst paths but two was
+  a TLB CAM path (key copy → page match → PFN / grants OR → `mem_pa2hi`,
+  `r_h_tag`, `t1_pahi`, `mem_xsq`), route-dominated (~85 %).
+- b2 (`9165799`): `mem_xsq` = `mem_xsa || mem_xsp`, two registers —
+  `mem_xsa <= ex_fa` (the CAM-independent terms), `mem_xsp <= ex_fb &&
+  !pok` — so the grants bit reaches a flip-flop through one LUT (b1's path
+  went through the shared `t_dn` LUT).  The placement moved: 10 CAM
+  endpoints failed in tier 1 (−0.171, CAM → `mem_pa2hi`), −0.005 after
+  tier 2 (CAM → `t1_pahi`).  Kept: it removes a level from that path.
+- b3 (`079d686`): the CAM's key copies (`q_a` / `q_b`) are 8 at 32 entries
+  (were 4: each key bit drove ~17 loads, and that first route led every
+  failing path).  Met in tier 1, **WNS +0.062 / WHS +0.014**, 12 min 16 s,
+  no tier 2, no alternate placement; the CAM paths now start at +0.257
+  (CAM → `r_h_tag`); the worst are the shifter's `r_shhi` → multiplier
+  operand pipeline (+0.062 … +0.23), `r_pipe_owns` → the D-cache tag
+  (+0.229), `ex_b_zero` (+0.250).  Both timing changes are
+  behaviour-identical (`diff` / `socdiff` against the previous commit:
+  identical traces and cycles; `test`, `excdiff`, `mpudiff`, `tlbdiff`,
+  `tlbpage`, `tecost`, `socwalk`, `socx`: pass).
+- Utilisation (b3): 37,519 LUTs (3,849 as memory), 24,846 FFs, 91 BRAM
+  tiles, 19 DSPs — −799 LUTs / −57 FFs against `823b5ea`'s build
+  (38,318 / 24,903); post-synthesis 35,165 LUTs at `af1a1c4` against
+  35,428 at `823b5ea` (the review-3 logic is a few LUTs and no flip-flop
+  with 32 B lines: `r_nx_*` is 16 B-only; the rest is run-to-run
+  variance); the four extra key copies are 128 FFs.
+
+- **Bitstream `079d686`** (`~/.cache/kbuild/btic_079d686.bit`, md5
+  `20acd72938f9480b5df82303f4e0240f`), build dir `~/.cache/kbuild/btic_b3`.
+  Not run on the board.
+
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -1022,4 +1204,11 @@ Decisions taken while implementing the frozen text above:
   the branch-line and window / NLB / ID cases; M2: the BTIC coverage
   check on every tb_vsim / tb_soc run, `btfuzz`): `823b5ea`, standard
   flow tier 1 WNS +0.017 / WHS +0.024, `~/.cache/kbuild/icache_823b5ea.bit`.
+  Not yet run on the board.
+- 2026-11-15: §5 review 3 (a branch across a line end arms no capture;
+  the pending capture ends at any other redirect / squash / snoop; three
+  16 B-line coverage holes; the checks cover the branch's last word, the
+  kill indices, 16 B lines and BTIC-hit currency; `btfuzz` branch sites)
+  and two TLB CAM timing changes: branch `btic-fix`, `079d686`, standard
+  flow tier 1 WNS +0.062 / WHS +0.014, `~/.cache/kbuild/btic_079d686.bit`.
   Not yet run on the board.
