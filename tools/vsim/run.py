@@ -1853,6 +1853,7 @@ def main():
     elif a.cmd == 'mpudiff':
         sys.exit(cmd_mpudiff(a))
     elif a.cmd == 'tlbpage':
+        sys.modules['run'] = sys.modules[__name__]   # (tlbpage's `import run`: this module, its BTIC gate)
         import tlbpage
         sys.exit(tlbpage.main(a.seed0, a.seeds, a.lats, a.hit, a.irq, a.plus))
     elif a.cmd == 'soccrypto':
