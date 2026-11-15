@@ -2467,7 +2467,12 @@ module pipeline_core
    // (for the early-issue ops — MEMGET32 [rs1], LEAVERET: EA = ex_a — the
    // same test from the register alone, off the EA adder)
    wire ex_uf_early = EN_EXC && umode && (ex_a[31:28] == 4'hF || ex_a[31:3] == 29'h1DFF_FFFF);
-   logic mem_xsq;       // the MEM op is an access fault (no access; squash EX / ID)
+   // the MEM op is an access fault (no access; squash EX / ID).  (review 3
+   // timing: two registers, ORed in MEM — the CAM's 'grants' bit then
+   // reaches its own flip-flop through one LUT (ex_fb && !pok), not through
+   // the shared fault OR: CAM -> mem_xsq was the release build's worst path)
+   logic mem_xsa, mem_xsp;
+   wire  mem_xsq = mem_xsa || mem_xsp;
    logic mem_xs_st, mem_xs_g;            // ... a store / GUARD
    // (§11.9 timing) only mem_xsq is needed as the op enters MEM; which
    // dword faulted, and whether a TLB miss / TLB-related, are read at
@@ -3333,7 +3338,7 @@ module pipeline_core
          id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
          flags <= '0; sp <= SP_RESET; int_mask <= 4'h0; irq_dis <= 1'b0;
          umode <= 1'b0; sp_alt <= '0;
-         res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsq <= 1'b0;
+         res_valid <= 1'b0; res_dw <= '0; exc_ent <= 1'b0; mem_xsa <= 1'b0; mem_xsp <= 1'b0;
          id_fx <= 1'b0; id_fxc <= 1'b0; id_mfsr <= 1'b0; wb_xc <= 1'b0; wb_mtsr <= 1'b0; wb_rfch <= 1'b0;
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
@@ -4549,7 +4554,8 @@ module pipeline_core
                // else at EX -> MEM depends on it).  The op enters MEM as it
                // is; MEM gates its port access, WB its commit, and in its
                // first MEM cycle it squashes EX / ID (mem_xsq_go).
-               mem_xsq    <= ex_ufault;
+               mem_xsa    <= ex_fa;                // (= ex_ufault, as two registers)
+               mem_xsp    <= ex_fb && !(tlb_d_c15 ? tlb_d_pok1 : tlb_d_pok0);
                mem_xs_st  <= ex_mst;               // direction (cause)
                mem_xs_g   <= ex_xg;                // GUARD denial (stage 2, ECAUSE[8])
                // (the terms of mem_xs2 / mem_xs_tm / mem_xs_tlb, decided in MEM)
