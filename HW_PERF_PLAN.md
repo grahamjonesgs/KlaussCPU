@@ -1363,7 +1363,13 @@ matching the model's "about 1 point a cycle".
 starved display lines, from the scanout's `o_underflow` — the board's
 `VGA_STATUS[63:48]`; worst fetch of a line in cycles, of 3,200):
 
-VGATABLE
+| Load, MIG | L2 off: starved / worst fetch | L2 on: starved / worst fetch |
+|---|---|---|
+| heavy (a 512 KiB stride walk, load + 2 stores a step; WBINV every 1,500 steps), `MIGLAT=36` | 0 / 3,185 | **0 / 3,178** |
+| heavy, `MIGLAT=36 +MIGREF=780 +MIGRDY=5` | 584 / — | 40 / — |
+| heavy, `MIGLAT=44` | 832 / — | 777 / — |
+| moderate (a 96 KiB walk: L2 hits; WBINV every 300), `MIGLAT=44` | 0 / 2,208 | **0 / 2,320** |
+| moderate, `MIGLAT=44 +MIGREF=780 +MIGRDY=5` | 0 / 2,251 | **0 / 2,406** |
 
 Under the adversarial load (every access misses both levels, dirty
 victims everywhere) the scanout has almost no margin **without** the L2
@@ -1382,7 +1388,97 @@ pipelined reads) is outside this item.
 `tb_l2`, run on every directed test and 4 random seeds under two MIG
 timings (stopping at the first failing run):
 
-MUTTABLE
+| Mutation | What it breaks | First failing run |
+|---|---|---|
+| `wbm` | a DDR read does not wait for a buffer entry of its line | `toggle` (+MIGLAT=20): narrow read 00010010: … want …_… |
+| `dma_rd_hit` | DMA reads ignore the L2 (always DDR) | `dma` (+MIGLAT=20): narrow read 00020250: … want …_… |
+| `dma_wr_hit` | a DMA write to a valid sector goes to DDR (the L2 copy stays stale) | `dma` (+MIGLAT=20): cache read 00020240 dw0: … want … |
+| `dma_wr_clean` | a DMA write merged into the L2 leaves the sector clean | `random` seed 1 (+MIGLAT=20): cache read 00028060 dw0: 0 want … (lost at eviction) |
+| `fill_set` | a request to the set a fill is writing is accepted | `evict` (+MIGLAT=20): cache read 000100e0 dw0: … want … |
+| `victim_drop` | an allocation's dirty victim is not written back | `evict` (+MIGLAT=20): evict: event 7 = 0 want 16 |
+| `walk_nocopy` | the walk invalidates dirty ways without writing them back | `dma` (+MIGLAT=20): dma: DDR 00020240 = … want … |
+| `walk_nodrain` | BUSY drops before the write buffer has drained | `wbinv` (+MIGLAT=8 +MIGJIT=20 +MIGRDY=30): wbinv: DDR 0002fee0 = … want … |
+| `walk_yield_skip` | a walk that yields mid-set moves on to the next set | `wbinv` (+MIGLAT=20): wbinv: DDR 00018000 = … want … |
+| `dis_nowalk` | a write of 0 disables at once (no write-back) | `dma` (+MIGLAT=20): dma: DDR 00020240 = … want … |
+| `alloc_both` | a sector allocation marks the other sector valid | `sector` (+MIGLAT=20): sector: event 3 = 0 want 1 |
+| `refetch_present` | a sector miss refetches the whole line (over the other sector's data) | `sector` (+MIGLAT=20): sector: event 6 = 8 want 4 |
+| `rt_valid` | a sector-only fill (VGA fetching) marks both sectors valid | `random` seed 1 (+MIGLAT=20): cache read 000300e0 dw0: 0 want … |
+| `wb_order` | the write buffer drains entry 0 first, not the oldest | `dma` (+MIGLAT=20): dma read 000302c0 dw2: … want … |
+| `spec_noaddr` | the speculative lookup is used for any address | `hit` (+MIGLAT=20): hit latency 2 want 3 |
+| `spec_wrcoll` | a speculative read next to a data-array write is used | `evict` (+MIGLAT=20): cache read 000100e0 dw0: … want … |
+| `acc_wrcoll` | a request is accepted while a write to its set is pending | `evict` (+MIGLAT=20): cache read 000100e0 dw0: … want … |
+| `early_beat` | the early critical dword is taken from the wrong beat | `evict` (+MIGLAT=20): early dw 000100c8: … want … |
+| `range` | an access outside DDR is looked up (aliases a DDR line) | `range` (+MIGLAT=20): range: looked up |
+| `busy_write` | L2_CTRL writes are taken while BUSY | `toggle` (+MIGLAT=20): write of 1 during the 0-walk was not ignored |
+
+All 20 killed (the unmutated bench: 0 of 26 runs fail).  `spec_noaddr` is
+caught first by the `hit` test's latency check (a stale tag word decided
+a request it was not read for).
+
+### §6 build (standard `build_fast -resynth`)
+
+A synth-only check came first (`d8b88fd`): no Synth 8-4767; the
+data arrays as 4 × 8 RAMB36 (1K × 256, read port with the output register),
+the tags 1 RAMB36 (512 × 67, no output register), the write buffer 43
+RAM32M + 64 RAM16X1D; BRAM tiles 91 → 124.
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Tier 2 | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `btic_b3` (master) | `079d686` | — | +0.062 / +0.014 | — | 37,519 | 24,846 | 91 |
+| `l2_b1` | `7cc10f7` | the L2 as first written | **+0.228 / +0.020** | — | 40,911 | 26,242 | 124 |
+| **`l2_b2`** | **`fba47c0`** | + the data arrays' write port from registers; the speculative lookup kept across other sets' fill writes | −0.022 / +0.020 (one endpoint) | **+0.030 / +0.020** (AggressiveExplore) | 40,586 | 26,581 | 124 |
+
+- **`l2_b1`** met in tier 1, but its post-place report had two L2 paths at
+  −0.30 (F_DEC's write decision → the 32 data BRAMs' write enables; the
+  fill-beat merge `e_bc` → their data inputs), fixed in `1e16603` by writing
+  the data arrays from registers one edge later (the accept, speculation
+  and walk guards cover the extra read-after-write edge;
+  mutations `spec_wrcoll`, `acc_wrcoll`).
+- **`l2_b2`** (`fba47c0`, the final RTL): tier 1 missed by 0.022 ns on
+  one endpoint, the core's load-hit pipe `wb_hext` → `mem_result` (13
+  levels; the hit-pipe family of §5 review 2 / 3), nothing of the L2;
+  tier 2 AggressiveExplore **WNS +0.030 / WHS +0.020**, 26 min 15 s, no
+  alternate placement.  The L2's own worst path is +0.36 ns
+  (`r_tw` → the drain's `e_wph`, 8 levels); the 3-cycle hit (tag BRAM
+  without output register → compare → `r_hit` / `r_msel`; then the
+  registered way mux) is not near critical, so the 4-cycle fallback was
+  not needed.
+- **Utilisation** (`l2_b2`): 40,586 LUTs (4,089 as memory), 26,581 FFs,
+  124 BRAM tiles (+33: 32 data + 1 tag), 19 DSPs — +3,067 LUTs, +1,735 FFs
+  against `btic_b3`.  Hierarchy (`l2_b1`): `l2_cache` 4,529 LUTs (236 as
+  memory) and 1,319 FFs of its own (the MIG beside it, 2.7k, was there
+  before inside `ddr2_control`); most of it is the 256-bit datapaths — the
+  4:1 way mux, the answer mux (hit / fill), the fill assembly and its
+  write-data mux, the write buffer's input mux and LUTRAM, the registered
+  write port.  If LUTs get short: assemble fills without the merged-beat
+  path (the line one cycle later; −~500), or a 128-bit internal datapath
+  (+1 cycle a hit).
+- **Bitstream `fba47c0`** (`~/.cache/kbuild/l2_fba47c0.bit`, md5
+  `73ae95fd1d690a8625f7e2ab97cfce41`), build dir `~/.cache/kbuild/l2_b2`.
+  Not run on the board.
+
+### §6 deferred / not done
+
+- **Board validation** (Graham arranges it): boot, the board suite, the
+  `PERF_L2_*` counters under Linux, `L2_CTRL` A/B (the runtime session's
+  `kernel/l2.c` uses these offsets), `VGA_STATUS` underflows with scanout
+  on under load.
+- **Write-buffer take-back.**  A demand miss on a line in the write buffer
+  waits for that entry's drain instead of taking it back (the model's
+  `wb_fwd`).  `tb_l2`'s `wbhit` shows the wait; its cost on real workloads
+  is unmeasured here.
+- **Hit-under-fill** of the same set, and fills on a second data port (the
+  model assumes separate ports): a request to the set a fill is still
+  writing waits for it (a few cycles after the critical sector).
+- **8 ways** builds and passes every test (`WAYS` = 8: 256 sets, 3 tag
+  BRAMs → 35 tiles) but was not built for timing; the model gives +1.5–1.8
+  points only if it adds no hit latency (the way mux becomes 8:1).
+- **VGA margin.**  The scanout itself has almost none under an
+  all-miss load at the board's latency (also without the L2); see above.
+- **Core 2** (`EN_CORE2` = 0 in the release build) is covered by `tb_l2`'s
+  DMA traffic (the same 16 B masked protocol as the blitter), not by a
+  SoC run.
+- No prefetcher (as specified).
 
 ## CPU_FEATURES additions
 
@@ -1510,3 +1606,10 @@ Decisions taken while implementing the frozen text above:
   and two TLB CAM timing changes: branch `btic-fix`, `079d686`, standard
   flow tier 1 WNS +0.062 / WHS +0.014, `~/.cache/kbuild/btic_079d686.bit`.
   Not yet run on the board.
+- 2026-11-15: §6 unified L2 (128 KiB, 4-way, 64 B lines of two 32 B
+  sectors, below the DDR arbiter: DMA goes through it), `L2_INFO`,
+  `L2_CTRL`, `CPU_FEATURES[26]`, the `PERF_L2_*` counters; tb_soc on a
+  behavioural MIG with a memory-consistency checker; `tb_l2`, `l2mut`,
+  `socl2`, `socbench`, `socvga`: branch `l2`, `fba47c0`, standard flow
+  tier 2 WNS +0.030 / WHS +0.020, `~/.cache/kbuild/l2_fba47c0.bit`.  Not
+  yet run on the board.
