@@ -61,8 +61,8 @@ MUTS = [
      "tb_din = f_plru_tw(f_setway(r_tw, r_vic, q_tag, q_sec ? 2'b10 : 2'b01,",
      "tb_din = f_plru_tw(f_setway(r_tw, r_vic, q_tag, 2'b11,"),
     ('refetch_present', "a sector miss refetches the whole line (over the other sector's data)",
-     "e_n     <= !q_wide ? 3'd1 : (w_rd_both ? 3'd4 : 3'd2);",
-     "e_n     <= !q_wide ? 3'd1 : (w_rd_alloc && !i_rt_req ? 3'd4 : 3'd2);"),
+     "e_n     <= !q_wide ? 3'd1 : (w_rd_both || w_strm_new ? 3'd4 : 3'd2);",
+     "e_n     <= !q_wide ? 3'd1 : (w_rd_alloc && !i_rt_req || w_strm_new ? 3'd4 : 3'd2);"),
     ('rt_valid', 'a sector-only fill (VGA fetching) marks both sectors valid',
      "w_rd_both ? 2'b11 : (q_sec ? 2'b10 : 2'b01),",
      "2'b11,"),
@@ -136,13 +136,24 @@ def build(name, l2src, ways):
     return d, exe
 
 
+LIVE = set()       # running simulations (killed once a mutant is caught)
+STOP = [False]
+
+
 def _one(exe, t, tm):
+    if STOP[0]:
+        return None
     args = [exe] + [f'+TEST={t.split()[0]}'] + t.split()[1:] + tm
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    LIVE.add(p)
     try:
-        r = run(args, timeout=1800)
-        out = r.stdout + r.stderr
+        out = p.communicate(timeout=1800)[0]
     except subprocess.TimeoutExpired:
+        p.kill(); p.communicate()
         out = 'TIMEOUT'
+    LIVE.discard(p)
+    if STOP[0]:
+        return None
     if 'TB_L2 PASS' in out:
         return None
     m = re.search(r'TB_L2 FAIL.*|Assertion.*|TIMEOUT|fatal.*', out)
@@ -158,6 +169,7 @@ def runs(exe, seeds, stop_first, timings=None, n=2000):
     jobs = [(t, tm) for tm in timings for t in TESTS] + \
            [(f'random +SEED={s} +N={n}', tm) for tm in timings for s in range(1, seeds + 1)]
     fails = []
+    STOP[0] = False
     with cf.ThreadPoolExecutor(int(os.environ.get('VSIM_JOBS', '12'))) as ex:
         fut = {ex.submit(_one, exe, t, tm): (t, tm) for t, tm in jobs}
         for f in cf.as_completed(fut):
@@ -165,8 +177,11 @@ def runs(exe, seeds, stop_first, timings=None, n=2000):
             if r:
                 fails.append(r)
                 if stop_first:
+                    STOP[0] = True
                     for g in fut:
                         g.cancel()
+                    for q in list(LIVE):
+                        q.kill()
     return fails, len(jobs)
 
 

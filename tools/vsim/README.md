@@ -68,9 +68,13 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   the real `ddr2_control` (`VSIM_L2=0`, `CORE1_L2_EN` = 0) or `l2_cache`
   (default).  Plusargs (also through `VSIM_SOC_PLUS="..."` for every run, or
   `--plus` where a command has it): `+MIGLAT=<n>` (default 36: ~44 cycles
-  from a D-cache miss to its critical dword, as on the board), `+MIGJIT`,
-  `+MIGRDY` (% of cycles app_rdy drops), `+MIGREF` (a 30-cycle stall every
-  n cycles).  Older revisions' tb_soc (a behavioural `ddr2_control`, 8
+  from a D-cache miss to its critical dword, as on the board, for a read to
+  a closed bank), `+MIGJIT`, `+MIGRDY` (% of cycles app_rdy drops),
+  `+MIGREF=<period>` (refresh, default 780; 0 = off), `+MIGRFC`,
+  `+MIGFREE=1` (the pre-review-1 model).  Since review 1 it models DDR2-400
+  bank / row / turnaround / write-recovery / refresh timing, ignores the
+  rank bit PA[27], and `$fatal`s when write data follows its command by
+  more than 2 cycles (UG586); see HW_PERF_PLAN §6 review 1.  Older revisions' tb_soc (a behavioural `ddr2_control`, 8
   cycles a line) are built as they were; `socdiff --base <rev> --base-tb-wt`
   runs an older revision's RTL under the current tb_soc instead (same DDR
   model: cycle counts comparable).  `socdiff --base wt --base-env VSIM_L2=0`
@@ -88,9 +92,18 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   moves the raster to the next vblank).
 - **`tb_l2`** (`sim_1/new/tb_l2.sv`): the L2 alone with the behavioural MIG,
   all masters, a reference memory, directed tests (`+TEST=hit`, `sector`,
-  `evict`, `wbhit`, `plru`, `dma`, `wbinv`, `toggle`, `range`) and
-  `+TEST=random +SEED=<n> +N=<n>`; built with `+define+L2_WAYS=<n>`.
-  **`l2mut.py`**: the coherence mutations on it.
+  `evict`, `wbhit`, `plru`, `dma`, `wbinv`, `toggle`, `alias`, `wbinvq`,
+  `wkturn`, `rtdrain`, `vgastream`) and `+TEST=random +SEED=<n> +N=<n>`;
+  built with `+define+L2_WAYS=<n>`; masters hold DV one cycle after ready
+  (`+DVTAIL=0`: not).  **`l2mut.py`**: the coherence mutations on it;
+  `l2mut.py --sweep`: every test at 2 / 4 / 8 ways under four MIG timings.
+- **`l2_regress.sh [section ...]`**: the whole L2 regression (tb_l2 sweep,
+  mutations, the SoC tests at `MIGLAT` 36 and 8, L2 off / 8 ways / other
+  timings, the `L2_EN` = 0 equivalence, the core regression).
+- tb_soc with the L2 also counts drains started in VGA's / DMA's window
+  with no request waiting on the buffer (`L2 rt drains bad=`: a gated run
+  fails on any); a gated run whose consistency checker checked nothing
+  fails.  `socvga --blit` adds a back-to-back blitter FILL.
 
 ## Sim-copy patches (Verilator 5.020 limits)
 

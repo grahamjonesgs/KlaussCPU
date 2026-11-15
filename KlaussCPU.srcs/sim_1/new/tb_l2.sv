@@ -128,6 +128,10 @@ module tb_l2;
    int dw_seen = 0;
    int dvtail = 1;
    bit tenure = 0;
+   // writes acknowledged after a walk ended (late_track): they may stay in
+   // the L2, so check_ddr skips their dwords
+   bit late_track = 0;
+   bit late_m [logic [31:0]];
    task automatic xact(input bit w, input bit d, input bit wd, input logic [31:0] a,
                        input logic [1:0] off, input logic [255:0] data, input logic [15:0] m,
                        input bit spec, input bit ifx);
@@ -167,6 +171,7 @@ module tb_l2;
       // check / apply at the ready (the L2 serialises; writes are posted);
       // the reference is indexed by the DDR address (PA[31:27] alias)
       a = fold(a);
+      if (w && late_track && !busy) for (int j = 0; j < 4; j++) late_m[a + 8 * j] = 1;
       if (w) begin
          if (wd) for (int j = 0; j < 4; j++) ref_m[a + 8 * j] = data[255 - 64 * j -: 64];
          else begin
@@ -210,11 +215,18 @@ module tb_l2;
       while (busy && n < 400000) begin @(negedge clk); n++; end
       if (busy) fail("walk hang");
    endtask
-   // the whole reference must be in the MIG's memory
+   // the whole reference must be in the MIG's memory.  Right after a walk
+   // with no traffic since the write that started it (BUSY = 0: DDR holds
+   // every write acknowledged before the walk's end); check_ddr_drained
+   // first waits for the write buffer (writes posted during the walk's end)
+   task automatic check_ddr_drained(input string tag);
+      for (int n = 0; n < 20000 && (dut.wb_v != 2'b00 || dut.e_st != 2'd0); n++) @(negedge clk);
+      check_ddr(tag);
+   endtask
    task automatic check_ddr(input string tag);
       // (writes the MIG accepted reach its memory at their CAS)
       for (int n = 0; n < 2000 && dut.mig_7series_0.cq.size() != 0; n++) @(negedge clk);
-      foreach (ref_m[a]) if (a < 32'h0080_0000 && mig_get(a) !== ref_m[a])
+      foreach (ref_m[a]) if (a < 32'h0080_0000 && !late_m.exists(a) && mig_get(a) !== ref_m[a])
          fail($sformatf("%s: DDR %08x = %h want %h", tag, a, mig_get(a), ref_m[a]));
    endtask
 
@@ -401,6 +413,7 @@ module tb_l2;
                xact(1, 0, 1, L(k, s * 13) + 32 * (s % 2), 0, rnd256(), 0, 0, 0);
             ctrl(2'b11);
             @(negedge clk); if (!busy) fail("BUSY not set right after the write");
+            late_track = 1;
             for (int i = 0; i < 300 && busy; i++) begin
                int s = $urandom_range(SETS - 1, 0);
                xact($urandom_range(1, 0), $urandom_range(3, 0) == 0, 1, L($urandom_range(5, 0), s / 64) + 32'(s) * 0 + 32 * $urandom_range(1, 0),
@@ -408,7 +421,9 @@ module tb_l2;
                xact(1, 0, 1, L(0, $urandom_range(SETS - 1, 0)), 0, rnd256(), 0, 0, 0);
             end
             wait_idle();
-            check_ddr("wbinv");
+            late_track = 0;
+            check_ddr_drained("wbinv");
+            late_m.delete();
             begin
                int m0 = evc[D_MISS];
                xact(0, 0, 1, L(0, 0), 0, 0, 0, 1, 0);
@@ -489,7 +504,7 @@ module tb_l2;
             n0 = evc[WR_BEAT];
             ctrl(2'b11);
             nr = 0;
-            while (busy && nr < 8 * SETS) begin
+            while (busy && nr < 3 * SETS * `L2_WAYS) begin
                int k = $urandom_range(`L2_WAYS + 3, 0), s = $urandom_range(SETS - 1, 0);
                if ($urandom_range(1, 0)) xact(0, 0, 1, L(k, s) + 32 * $urandom_range(1, 0), 2'($urandom), 0, 0, 1, 0);
                else                      xact(0, 1, $urandom_range(1, 0), L(k, s) + 16 * $urandom_range(3, 0), 0, 0, 0, 0, 0);
@@ -545,10 +560,17 @@ module tb_l2;
             repeat (20) @(negedge clk);
             if (evc[RD_BEAT] - b0 != 8) fail($sformatf("vgastream: %0d read beats want 8", evc[RD_BEAT] - b0));
             if (strm_hits != 1) fail("vgastream: no stream hit");
-            // a DMA write to sector 1 after the fetch
-            xact(0, 1, 1, L(6, 30), 0, 0, 0, 0, 0);
-            xact(1, 1, 0, L(6, 30) + 48, 0, rnd256(), 16'h0F0F, 0, 0);
-            xact(0, 1, 1, L(6, 30) + 32, 0, 0, 0, 0, 0);
+            // writes to sector 1 after the fetch (sector 1 in the buffer):
+            // a DMA write (posted), a D-cache writeback (allocated)
+            for (int r = 0; r < 4; r++) begin
+               xact(0, 1, 1, L(6, 30 + r), 0, 0, 0, 0, 0);
+               while (dut.e_st != 2'd0) @(negedge clk);
+               if (r % 2 == 0) xact(1, 1, 0, L(6, 30 + r) + 48, 0, rnd256(), 16'h0F0F, 0, 0);
+               else            xact(1, 0, 1, L(6, 30 + r) + 32, 0, rnd256(), 0, 0, 0);
+               repeat (40) @(negedge clk);       // (the posted write drains)
+               if (r % 2 == 1) begin ctrl(2'b11); wait_idle(); end   // (out of the L2 again)
+               xact(0, 1, 1, L(6, 30 + r) + 32, 0, 0, 0, 0, 0);
+            end
             // writes while sector 1 is on its way (DDR beats spread out)
             dut.mig_7series_0.jit = 40;
             h0 = strm_hits;
@@ -623,12 +645,14 @@ module tb_l2;
                   logic [1:0] v = 2'($urandom_range(3, 0));
                   ctrl(v == 2'b10 ? 2'b11 : v);
                end else if (kind < 94 && $urandom_range(19, 0) == 0) begin
-                  ctrl(2'b11); wait_idle(); check_ddr($sformatf("random #%0d", i));
+                  // (a walk a random write started may be running: the
+                  // new one must not be ignored)
+                  wait_idle(); ctrl(2'b11); wait_idle(); check_ddr($sformatf("random #%0d", i));
                end else begin
                   repeat ($urandom_range(30, 0)) @(negedge clk);
                end
             end
-            ctrl(2'b11); wait_idle(); ctrl(2'b01);
+            wait_idle(); ctrl(2'b11); wait_idle(); ctrl(2'b01);
             check_ddr("random end");
          end
       endcase

@@ -1176,11 +1176,13 @@ take-back of write-buffer lines (both below).
     DMA-written code is unchanged.
   - **The sub-line hazard** (MMIO_MAP "Cache controller") is unchanged: a
     D-cache line is still written back whole, now into a 32 B L2 sector.
-- **Outside DDR.**  Tags cover PA[26:6] (all 128 MiB).  An access with
-  PA[31:27] ≠ 0 bypasses the L2 (no lookup, no allocation; writes posted,
-  reads from DDR); the write buffer compares PA[27:6], the bits the MIG
-  address uses, so it orders aliases conservatively.  MMIO never reaches
-  `mem_read_write`.
+- **Aliases** (review 1).  Tags cover PA[26:6] (all 128 MiB).  PA[31:27]
+  alias PA[26:0] in DDR itself (`ddr2_control` drops PA[31:28], and the MIG,
+  with RANKS = 1, ignores `app_addr[26]` = PA[27]), so the L2 folds them the
+  same way: one line per DDR line whatever the alias, the write buffer and
+  the MIG address on PA[26:6].  (Before review 1 an access with PA[31:27] ≠
+  0 bypassed the L2, so an alias write could go to DDR under a dirty L2
+  copy of the same bytes.)  MMIO never reaches `mem_read_write`.
 - **Not inclusive, no back-invalidation**: the L1s are never told about L2
   evictions (none needed: L1 data is newer or equal).
 
@@ -1231,10 +1233,23 @@ take-back of write-buffer lines (both below).
   arise: the D-cache serialises them (one memory port).
 - **VGA scanout (real time).**  Its reads now pass the L2 lookup and could
   wait behind drains.  While VGA requests the bus (`i_rt_req` = its req) or
-  any DMA master holds the grant: no drain starts unless the front end waits
-  on the buffer (full, or a line match) or a walk is finishing, and a demand
-  miss fetches only its own sector (2 bursts, as `ddr2_control`), so the L2
-  adds no DDR traffic in VGA's window.  Measured below.
+  any DMA master holds the grant, a drain starts only for the request in
+  F_DEC that waits on the buffer (`w_fe_need`: a read miss of a buffered
+  line, or a full buffer in the way of an allocation's victim copy or of a
+  posted write), and a demand miss fetches only its own sector (2 bursts,
+  as `ddr2_control`).  So in VGA's window the L2 starts DDR traffic only
+  for a request in hand — its sector, the drain it is blocked on, or (VGA's
+  own) the stream fill below — never a background drain or a whole-line
+  fetch (review 1 M2; before, any front-end state but idle let a drain
+  start, including the F_LOOK every VGA read passes).
+- **VGA stream buffer** (review 1).  A VGA read (a wide DMA read) of sector
+  0 of a line the L2 does not hold fetches the whole 64 B line (4 bursts,
+  row hits); sector 1 is kept in a 256-bit register for the scanout's next
+  read (its addresses ascend), which it answers at hit latency with no DDR
+  round trip.  Any write accepted to that line (any master) drops it, also
+  while sector 1 is still on its way; a line the L2 holds (a sector there
+  may be dirty) never fills it.  It halves the scanout's DDR round trips:
+  the margin numbers below.
 - **`L2_CTRL`** (MMIO_MAP): write 1 = enable (instant: a disabled L2 holds no
   line); 3 = write back and invalidate, stay enabled; 0 = write back,
   invalidate, then bypass.  BUSY is set on the write's own edge, so the next
@@ -1242,10 +1257,17 @@ take-back of write-buffer lines (both below).
   driver polls BUSY; requested 2026-11-15).  The walk visits every set
   (tags read, each dirty way's sectors copied to the buffer, the tag word
   written 0), yielding to requests between sets and while the buffer is
-  full; during a walk nothing allocates, hits are served, and writes that
-  miss are posted to DDR, so no data is lost or reordered.  It ends when the
-  buffer is empty.  A write of 0 / 3 to a disabled L2 only drains the
-  buffer, so BUSY = 0 always means DDR holds every write.  CPU reset and
+  full; a copied way's dirty bits are cleared in the tag RAM at the copy,
+  so a set walked again after a yield copies only ways dirtied meanwhile
+  (review 1 M1).  The walk and the requests take turns: after a request
+  accepted during the walk, the next set goes first (review 1).  During a
+  walk nothing allocates, hits are served, and writes that miss are posted
+  to DDR, so no data is lost or reordered.  It ends when the buffer entries
+  present when the last set was done have drained (writes posted after
+  that are later writes: traffic that keeps the buffer busy cannot hold
+  BUSY up).  A write of 0 / 3 to a disabled L2 only drains the buffer, so
+  BUSY = 0 means DDR holds every write acknowledged before the walk's
+  end.  CPU reset and
   program load enable the L2 (a disable walk then running ends as a plain
   write-back-and-invalidate).  `L2_INFO` = `0x0002_0000_4002_0004`,
   `CPU_FEATURES[26]`, counters `0xF00D_0118` … `0x0168` (I / D / writeback
@@ -1307,6 +1329,11 @@ take-back of write-buffer lines (both below).
   the blitter's FILL over bytes a D-cache writeback just put in the L2 (L2
   on), in the write buffer (L2 off), and the reverse order with a COPY that
   must read the L2's dirty data; the counters), `socbench`, `socvga`.
+
+(Review 1 below replaced `range` by `alias`, made the DV tail the
+default, and gave the MIG model DRAM timing; the results and VGA numbers
+in this section are `fba47c0`'s on the earlier model, and review 1 gives
+them again.)
 
 **Results** (final RTL; every run under the BTIC gates and the consistency
 checker):
@@ -1473,12 +1500,205 @@ RAM32M + 64 RAM16X1D; BRAM tiles 91 → 124.
 - **8 ways** builds and passes every test (`WAYS` = 8: 256 sets, 3 tag
   BRAMs → 35 tiles) but was not built for timing; the model gives +1.5–1.8
   points only if it adds no hit latency (the way mux becomes 8:1).
-- **VGA margin.**  The scanout itself has almost none under an
-  all-miss load at the board's latency (also without the L2); see above.
+- **VGA margin.**  Without the L2 the scanout starves under an all-miss
+  load at the board's latency (review 1's DRAM model); with the L2 and its
+  stream buffer it holds to `MIGLAT` 44 (review 1).  A scanout-side fix
+  (pipelined reads, more buffering) would help both.
+- **Review 1 minors 5 / 6** (pre-existing, or performance only): the
+  orphaned-grant window of `mem_read_write`'s arbiter (a DMA master reset
+  mid-tenure holds the grant for 15 quiet cycles first), and a D-cache
+  shadow writeback that waits for the L2 fill of its own set before it is
+  accepted.
+- **Write combining.**  Each posted write takes a write-buffer entry of its
+  own (a blitter FILL of 16 B writes to lines the L2 does not hold drains
+  one burst per write); merging into the tail entry of the same line would
+  cut the drains.
 - **Core 2** (`EN_CORE2` = 0 in the release build) is covered by `tb_l2`'s
   DMA traffic (the same 16 B masked protocol as the blitter), not by a
   SoC run.
 - No prefetcher (as specified).
+
+### §6 review 1 (2026-11-16)
+
+An adversarial review of `fba47c0` found three majors and six minors, all
+fixed in `c9cadea` (RTL, benches, tools, MMIO_MAP; the bitstream's RTL).
+The commit after it changes only `tb_l2` (two test fixes, found by the
+8-way sweep and a surviving mutation) and the documentation.
+
+**Findings and fixes.**
+
+| # | Finding | Fix |
+|---|---|---|
+| M1 | The WBINV walk livelocked on a set with 3+ dirty ways: F_WK2 cleared a copied way's dirty bits only in `r_tw`, the tag RAM only when the set was done; on a full buffer the walk yielded to a request, restarted the set from its stale tags and copied ways 0 and 1 again, for as long as requests kept coming (the reviewer: set 0 for 300 VGA reads, ~2,400 duplicate write beats, a 64 B drain before every VGA read) | the copy writes the way's cleared dirty bits to the tag RAM (`tb_din` of F_WK2), so a restarted set copies only ways dirtied meanwhile |
+| M2 | "No background drains while VGA fetches" leaked: the guard was `f_st != F_IDLE`, true in F_LOOK (which every VGA read passes), F_DEC for hits and writes, F_WDAT, F_WRSP and the walk; a VGA read then waited in F_DEC for a drain it did not need (+3 to +11 cycles, hundreds per seed) | while VGA wants the bus or a DMA master holds it, a drain starts only for the request in F_DEC that waits on the buffer (`w_fe_need`: a read miss of a buffered line, a full buffer in the way of a victim copy or a posted write) |
+| M3 | `mig_model` was optimistic: writes free, fixed read latency, refresh only stalled `app_rdy`, PA[27] kept distinct, the UG586 write-data rule unchecked | DRAM timing (below); refresh closes the banks and holds queued commands, reads included; `app_addr[26]` ignored; a `$fatal` when write data comes more than 2 cycles after its command; `+MIGFREE=1` keeps the old model for comparison |
+| m1 | `tb_l2` dropped DV on the ready edge; real masters hold it one more cycle | the DV tail is the default (`+DVTAIL=0` for the old protocol); every ready must answer a request (a tail taken as a new request fails); mutation `served` |
+| m2 | The walk started only in an F_IDLE cycle with DV low: a master re-raising DV after one low cycle (write hits: the data write blocks that cycle) held BUSY for its whole tenure | the walk and requests take turns (`r_wk_turn`: after a request accepted during the walk, the next set goes first); and the walk's end waits only for the buffer entries present when its last set was done (`r_wk_fl`), so posted writes after that cannot hold BUSY up |
+| m3 | "Orders aliases conservatively" was wrong: the MIG ignores the rank bit, so PA[27] aliases, and a bypassed alias write could go to DDR under a dirty L2 copy | the L2 folds PA[31:27] (tags, write buffer and MIG address on PA[26:6]; no bypass) |
+| m4 | `run.py` passed a gated tb_soc run whose checker checked nothing | a gated run with no `consistency checks=` line, or 0 checks, fails |
+| m5 | tb_soc's default moved the old SoC tests from 8-cycle DDR to `MIGLAT=36` | `tools/vsim/l2_regress.sh` runs them at `+MIGLAT=8` too (section `soc8`) |
+| m6 | MMIO_MAP's SD DMA reservation said `SDM_CFG[1]` | the SD DMA spec v1.2 reservations: `SDM_CFG[16]` DMA_EN, `SDM_STATUS[5]` DMA_BUSY / `[27]` DMA_ERR, `SDM_CAPS[10]`, `CACHE_OP_ADDR` / `CACHE_OP_LEN` (32-bit, `0xF005_0030` / `0x0038`), `CACHE_CTRL[4]` RANGE_CLEAN / `[5]` RANGE_INV / `[6]` RANGE_IINV, `CPU_FEATURES[27]`; `SDM_CFG[1]` stays the HS edge (SD_NATIVE_PLAN) |
+
+The review's minors 5 and 6 (the orphaned-grant window; shadow writebacks
+waiting for the fill) are pre-existing or performance only: deferred
+(list above).
+
+**The DRAM model** (`mig_model.sv`; the board's MIG is `mig_c.prj`:
+MT47H64M16HR-25E at tCK = 5 ns — DDR2-400, CL 3, WL 2, BL8 — with
+ui_clk = 10 ns = 2 tCK; datasheet ns rounded up to ui cycles): T_RCD 2,
+T_RP 2, T_RAS 4, T_RRD 1, T_FAW 5; CAS to CAS 2 (a BL8 is 4 tCK of data
+bus); write-to-read T_WTR 4 (WL + BL/2 + tWTR = 8 tCK); read-to-write
+T_RTW 4 (RL + BL/2 + 2 − WL = 7 tCK); read-to-precharge 2; write recovery
+to precharge T_WR 5 (WL + BL/2 + tWR = 9 tCK); refresh every 780 (tREFI
+7.8 µs): all banks closed (each after its tRAS / tRTP / tWR), then T_RP +
+tRFC 13 (127.5 ns) with every queued command waiting.  ROW_BANK_COLUMN map
+(bank PA[13:11], row PA[26:14]); 4 bank machines open / close rows for the
+first 4 queued commands of different banks; a row stays open only while a
+queued command hits it (closed-page with lookahead, an approximation of the
+7-series controller).  `MIGLAT` (default 36) is still the latency of an
+isolated read to a closed bank (the board's ~44 cycles from a D-cache miss
+to its critical dword); row hits are 2 sooner, everything else later.  It
+reports activates, conflicts, refreshes and write-to-read turnarounds.
+
+**VGA under the new model: the L2 starved more, fixed with a stream
+buffer.**  With M1 / M2 fixed, the heavy `socvga` load (every access misses
+both levels, dirty victims, WBINV every 1,500 steps) starved in both builds
+at the default `MIGLAT=36` — 246 lines without the L2, **352 with it** (a 40-
+line run: 64 / 100).  The L2 makes the CPU faster, so its misses (and the
+scanout's yields to them) come more often, and a VGA read took 47.7 cycles
+against 45.2.  The fix (RTL) is the **VGA stream buffer** (design above): a
+VGA read of sector 0 of a line the L2 does not hold fetches the whole line
+and answers the next read from a register, so half of the scanout's reads
+have no DDR round trip (its average read latency 27 cycles against 45).
+
+Starved display lines of 120 frames' worth of program (`socvga`, raster
+moved to vblank; heavy = a 512 KiB stride walk, load + 2 stores a step;
+moderate = a 96 KiB walk (L2 hits), WBINV every 300; blit = the blitter
+FILLs a 640 × 64 rect (80 KiB of 16 B DMA writes) back to back; worst fetch
+of a line in cycles, of 3,200):
+
+| Load, MIG | L2 off: starved (worst fetch) | L2 on: starved (worst fetch) | VGA read latency off / on |
+|---|---|---|---|
+| heavy, `MIGLAT=36` (default, refresh on) | 246 | **0** (2,769) | 45.2 / 27.3 |
+| heavy + blit, 36 | 316 | **0** (2,784) | 45.2 / 26.8 |
+| heavy + blit, 36, `+MIGJIT=20 +MIGRDY=10` | 1,012 | 3 | 58.6 / 34.3 |
+| heavy, 44 | 834 | **0** (2,986) | 53.1 / 31.0 |
+| heavy + blit, 44 | 960 | **0** (3,009) | 53.1 / 30.5 |
+| heavy, 52 | 960 | 2 | 61.0 / 34.7 |
+| heavy + blit, 52 | — | 17 | — / 34.6 |
+| heavy, 60 | — | 259 | — / 38.6 |
+| moderate, 36 | 0 (1,907) | 0 (1,180) | 44.2 / 24.2 |
+| moderate, 44 | 0 (2,235) | 0 (1,335) | 52.2 / 28.3 |
+| moderate + blit, 44 | 0 (2,323) | 0 (1,418) | 52.2 / 28.6 |
+| moderate, 52 | 0 (2,564) | 0 (1,500) | 60.2 / 32.6 |
+
+The L2 build starves less than the L2-off build in every setting.  Its
+margin under the all-miss load is ~190–430 cycles of the 3,200 at
+`MIGLAT` 36–44 (blit included); it starts to starve at `MIGLAT` 52 (2
+lines; 17 with the blitter) and with jitter at 36, where the build without
+the L2 starves nearly every line.  Under the realistic (moderate) load the
+worst fetch is 1,180–1,500 cycles: over half the line time to spare.  The
+drain rule held in every run: the tb_soc probe counted 0 drains in VGA's /
+DMA's window without a request waiting on the buffer (and 7,044 that had
+one, in the heavy load: the CPU's own misses between VGA chunks).
+
+**Tests and checks added.**  `tb_l2`: `alias` (writes through one alias,
+reads through another, DMA and D-cache, then WBINV and DDR checked),
+`wbinvq` (every set fully dirty, WBINV with reads back to back during the
+walk: the walk must end within `3 × SETS × WAYS` requests and write
+exactly `SETS × WAYS × 8` beats — on `fba47c0` it stayed at set 0 after
+4,096 requests, 47,488 beats for 16,384), `wkturn` (DMA write hits re-raising DV after one low cycle in
+16-transaction tenures: BUSY must drop within `4 × SETS` requests — 514
+now; `fba47c0` stuck at set 128 after 2,048), `rtdrain` (a posted entry
+survives VGA hits and misses with VGA's request up, VGA hits keep their
+3-cycle latency, a VGA read of the buffered line gets exactly one drain —
+`fba47c0` drained during the VGA reads), `vgastream` (the stream buffer:
+one 8-beat fetch for two reads, the second at hit latency; a DMA write or
+a D-cache writeback after the fetch, and writes while sector 1 is still on
+its way under jittered DDR, drop it; a line held with only sector 1 dirty
+never fills it).  `wbinv` now leaves out of its DDR check the writes
+acknowledged after BUSY dropped (they may stay in the L2; the 8-way sweep
+caught the test assuming otherwise), and `random` waits out a walk a
+random `L2_CTRL` write started before its own WBINV (a write while BUSY is
+ignored).  Every `tb_l2` run checks that every ready answers a request and
+fails on any drain started in VGA's / DMA's window with no request waiting
+on the buffer (`rt_bad`); tb_soc counts the same (`L2 rt drains bad=`,
+built in with the L2, gated by `run.py`).  `socvga --blit` adds the
+blitter load and reports the scanout's read latency; `socbench --base`
+adds a revision's column.
+
+**Mutations** (`l2mut.py`, now 28: every directed test and 4 random seeds
+under two MIG timings, in parallel; the unmutated bench: 0 of 34 runs
+fail).  `range` became `alias_bypass`; `walk_nodrain` now drops the walk's
+final-drain condition.  The new ones:
+
+| Mutation | What it breaks | First failing run |
+|---|---|---|
+| `alias_bypass` | PA[31:27] ≠ 0 bypasses the L2 (the pre-review rule) | `alias`: early dw 18010100: 0 want … |
+| `walk_recopy` | the copy clears the dirty bits in `r_tw` only (M1) | `wbinvq`: walk still at set 0 after 6,144 requests (livelock) |
+| `rt_drain` | the pre-review drain guard (`f_st != F_IDLE`, M2) | `wbhit`: 3 drains started while VGA / DMA held the bus with no request waiting on the buffer |
+| `rt_need_wbm` | a read of a buffered line does not count as waiting on the buffer | `alias`: hang (a DMA read of its buffered line waits for a drain that never starts) |
+| `wk_noturn` | no turns between the walk and requests (minor 2) | `wkturn`: BUSY after 2,048 requests (walk at set 128) |
+| `strm_snoop` | a write to the line does not drop the stream buffer | `vgastream`: dma read 000407a0: 0 want … |
+| `strm_fill_snoop` | a write during a stream fill does not stop its capture | `vgastream`: dma read 000487e0: 0 want … |
+| `strm_any` | a stream fill also for a line the L2 holds (a dirty sector 1 there) | `vgastream`: dma read 00018a20: 0 want … |
+| `served` | a DV still high after its ready is taken as a new request (minor 1) | `hit`: hit latency 1 want 3 (the tail's phantom answer) |
+
+**28 of 28 killed** (on the final benches; the unmutated bench: 0 of 34
+runs fail).  `walk_nodrain` is now caught by `wbinvq` (16,376 beats for
+16,384 when BUSY drops: the last entry had not drained).  `strm_snoop`
+survived the first version of `vgastream` (its write came while sector 1
+was still on its way, which only `e_strm_ok` covers); the test now also
+writes after the fill.
+
+**Regression** (`tools/vsim/l2_regress.sh`, all on `c9cadea`'s RTL):
+- `tb_l2` sweep (`l2mut.py --sweep`): every directed test and 12 random
+  seeds × 3,000 transactions at 2, 4 and 8 ways under four MIG timings
+  (`+MIGLAT=4`; 36; 8 with `+MIGJIT=20 +MIGRDY=30`; 60 with `+MIGREF=200
+  +MIGRDY=10`): all 300 runs pass (13 directed tests and 12 seeds × 4
+  timings × 3 geometries).
+- SoC tests at `MIGLAT=36` (default): `socdiff` against `d7f3994` (30
+  seeds; 20 with a 64 B span), `socmmio`, `socwalk`, `socx`, `socdcbz`,
+  `socl2`, `socsd`, `soceth`, `socvga`; at `+MIGLAT=8` (minor 5) the same
+  pre-L2 set and `socl2`; and with the L2 off, with 8 ways, at `+MIGLAT=8
+  +MIGJIT=20 +MIGRDY=30` and at `+MIGLAT=60 +MIGREF=500`: all pass, every
+  run gated (BTIC probe, consistency checker with > 0 checks, the drain
+  probe).
+- `L2_EN` = 0 equivalence: `VSIM_L2=0` against `d7f3994` under the same
+  tb_soc: identical traces and PIPE_RUN cycles (30 seeds 69,249 = 69,249;
+  64 B span 25,610 = 25,610).
+- Core regression (`pipeline_core` is unchanged since `fba47c0`): `test` in
+  5 configurations (default, DEBUG_EN, MPU_EN, TLB_N = 16, TLB_WALK = 0),
+  `diff` against `d7f3994` with `+TRACECYC` (40 seeds × 1 / 3 / 7: 169,092
+  = 169,092) and `--irq` (107,709 =), `excdiff`, `mpudiff`, `tlbdiff`,
+  `tlbpage`, `dcbzdiff` 200 seeds, `dmtest`, `btfuzz` 300 seeds × 7: all
+  pass.
+
+**Cycles** (tb_soc, the new model at `MIGLAT=36`): `c9cadea` against
+`fba47c0` under the same tb_soc: **identical** on randprog (30 seeds 61,698
+= 61,698; 64 B span 24,645 = 24,645) and on `socbench` (data96k 382,024,
+code96k 142,666, chase112k 199,846, each = `fba47c0`) — the fixes act only
+with VGA / DMA traffic, walks or aliases.  L2 off → on under the new model:
+randprog 69,249 → 61,698 (−10.9 %), 64 B span 25,610 → 24,645 (−3.8 %),
+data96k 906,210 → 382,024 (−57.8 %), code96k 323,972 → 142,666 (−56.0 %),
+chase112k 475,595 → 199,846 (−58.0 %) — the same gains as on the old
+model.
+
+**Build** (standard `build_fast -resynth`; a synth-only check first: no
+new RAM inference, the same 32 + 1 RAMB36, 43 RAM32M):
+
+| Build | Commit | Tier 1 WNS / WHS | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|
+| `l2_b2` | `fba47c0` | −0.022 / +0.020 (tier 2 +0.030) | 40,586 | 26,581 | 124 |
+| **`l2_b3`** | **`c9cadea`** | **+0.040 / +0.010** (no tier 2, 15 min 21 s) | 40,740 (4,085 as memory) | 26,783 | 124 |
+
+The worst path is the core's (the TLB → the D-cache's `r_h_tag1`, 7
+levels); the L2's own worst is +0.474 (`e_c` → `o_mem_read_data`, the
+fill-beat answer mux), its review-1 logic nowhere near.  +154 LUTs and +202
+FFs, most of it the stream buffer's 256-bit register and answer mux.
+Bitstream `~/.cache/kbuild/l2_c9cadea.bit` (md5 `c4b1bd598877774ed65bf1a0aa360272`),
+build dir `~/.cache/kbuild/l2_b3` (`l2_b2` deleted).  Not run on the
+board.
 
 ## CPU_FEATURES additions
 
@@ -1613,3 +1833,9 @@ Decisions taken while implementing the frozen text above:
   `socl2`, `socbench`, `socvga`: branch `l2`, `fba47c0`, standard flow
   tier 2 WNS +0.030 / WHS +0.020, `~/.cache/kbuild/l2_fba47c0.bit`.  Not
   yet run on the board.
+- 2026-11-16: §6 review 1 (the WBINV walk livelock, drains in VGA's
+  window, the walk's turns and end, PA[27] aliases, a DRAM timing model
+  for the MIG with the UG586 check, a VGA stream buffer that made the L2
+  build starve less than the build without it): branch `l2`, `c9cadea`,
+  standard flow tier 1 WNS +0.040 / WHS +0.010,
+  `~/.cache/kbuild/l2_c9cadea.bit`.  Not yet run on the board.
