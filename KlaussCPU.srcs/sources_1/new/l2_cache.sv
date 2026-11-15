@@ -198,10 +198,23 @@ module l2_cache #(
 
     logic [SETW:0]    da_addr;         // port A {set, sector} (comb)
     logic [255:0]     da_q [WAYS];     // port A output register (DO_REG)
-    logic [WAYS-1:0]  db_we;           // port B: one way
+    logic [WAYS-1:0]  db_we;           // port B: one way (decided this cycle)
     logic [SETW:0]    db_addr;
     logic [255:0]     db_din;
     logic [31:0]      db_be;
+    // (timing) the write itself happens one edge later, from registers: a
+    // read of the same word must not be taken on that edge or the one
+    // before (w_acc_ok, ra_ok, the walk's start)
+    logic [WAYS-1:0]  r_db_we = '0;
+    logic [SETW:0]    r_db_addr;
+    logic [255:0]     r_db_din;
+    logic [31:0]      r_db_be;
+    always_ff @(posedge clk) begin
+        r_db_we   <= db_we;
+        r_db_addr <= db_addr;
+        r_db_din  <= db_din;
+        r_db_be   <= db_be;
+    end
 
     genvar gw;
     generate for (gw = 0; gw < WAYS; gw++) begin : g_way
@@ -212,9 +225,9 @@ module l2_cache #(
             da_q[gw]  <= lat;
         end
         always_ff @(posedge clk) begin
-            if (db_we[gw])
+            if (r_db_we[gw])
                 for (int i = 0; i < 32; i++)
-                    if (db_be[i]) dram[db_addr][i*8 +: 8] <= db_din[i*8 +: 8];
+                    if (r_db_be[i]) dram[r_db_addr][i*8 +: 8] <= r_db_din[i*8 +: 8];
         end
     end endgenerate
 
@@ -384,7 +397,8 @@ module l2_cache #(
     // accept: a new request (not one already served), not to the set a fill
     // is writing
     wire w_acc_ok = calib_done && w_dv && !r_served &&
-                    !(e_filling && i_mem_addr[6 +: SETW] == e_set);
+                    !(e_filling && i_mem_addr[6 +: SETW] == e_set) &&
+                    !(|r_db_we && i_mem_addr[6 +: SETW] == r_db_addr[SETW:1]);
     // the tags read on the last edge are this request's
     wire w_imm = ra_ok && (ra_addr[31:5] == i_mem_addr[31:5]);
 
@@ -535,7 +549,7 @@ module l2_cache #(
          ev_rd_beat, ev_wr_beat, ev_wbfull, ev_dma_hit, ev_dma_miss} <= '0;
         if (!w_dv) r_served <= 1'b0;
         ra_addr <= ra_next;
-        ra_ok   <= (f_st == F_IDLE) && !eng_bwr && f_in_ddr(ra_next) && r_en;
+        ra_ok   <= (f_st == F_IDLE) && !(|db_we) && !(|r_db_we) && f_in_ddr(ra_next) && r_en;
 
         // ---------------- control ----------------
         // L2_CTRL writes are ignored while a walk runs (BUSY); the CPU reset
@@ -595,7 +609,7 @@ module l2_cache #(
                     end else begin
                         f_st   <= F_LOOK;
                     end
-                end else if (r_walking && !r_walk_end && !e_filling) begin
+                end else if (r_walking && !r_walk_end && !e_filling && !(|r_db_we)) begin
                     f_st <= F_WK0;
                 end else if (r_walk_end && wb_v == 2'b00 && e_st == E_IDLE) begin
                     r_walking  <= 1'b0;
@@ -856,7 +870,8 @@ module l2_cache #(
 `ifndef SYNTHESIS
     // a fill must not overwrite a victim sector before it was copied
     always_ff @(posedge clk)
-        if (eng_bwr && (f_st == F_VC0 || f_st == F_VC1) && c_set == e_set && c_way == e_way)
+        if (|r_db_we && (f_st == F_VC0 || f_st == F_VC1 || f_st == F_VC2) &&
+            r_db_addr[SETW:1] == c_set && r_db_we[c_way])
             $fatal(1, "l2_cache: fill write overtook the victim copy (set %0d way %0d)", e_set, e_way);
     // the D-cache always writes whole sectors
     always_ff @(posedge clk)
