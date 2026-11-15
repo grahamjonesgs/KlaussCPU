@@ -19,8 +19,8 @@
 //          reads all ways at {set, sector} (BRAM latch + output register),
 //          port B writes one way with byte enables;
 //   tags : one word per set {plru, way[WAYS-1] .. way[0]}, way = {tag, V[1:0],
-//          D[1:0]}, tag = PA[26:6+SETW] (the whole 128 MiB of DDR; an access
-//          with PA[31:27] != 0 bypasses the L2); port A read (no output
+//          D[1:0]}, tag = PA[26:6+SETW] (the whole 128 MiB of DDR; PA[31:27]
+//          alias onto PA[26:0], as in the MIG); port A read (no output
 //          register), port B write;
 //   write buffer: 2 entries of 64 B + a 64-bit byte mask (LUTRAM data).
 //
@@ -291,6 +291,12 @@ module l2_cache #(
     logic r_walking  = 1'b0;     // a write-back-and-invalidate walk (incl. its final drain)
     logic r_walk_end = 1'b0;     // every set done; waiting for the buffer to drain
     logic r_dis_pend = 1'b0;     // the walk ends in bypass (EN written 0)
+    // the walk's end: the write-buffer entries present when it reached its
+    // end (r_wk_fl, taken in the next F_IDLE cycle) must drain; entries
+    // posted after that are later writes, so traffic that keeps the buffer
+    // busy cannot hold BUSY up
+    logic       r_wk_snap = 1'b0;
+    logic [1:0] r_wk_fl   = 2'b00;
     logic [SETW-1:0] r_walk_set = '0;
     assign o_en   = r_en_tgt;
     assign o_busy = r_walking;
@@ -300,7 +306,7 @@ module l2_cache #(
     // request
     // ---------------------------------------------------------------------
     logic         q_wr, q_wide, q_dma, q_if;
-    logic         q_lk;                 // looked up: enabled and inside DDR (PA[31:27] = 0)
+    logic         q_lk;                 // looked up (enabled)
     logic [31:0]  q_addr;
     logic [1:0]   q_dwoff;
     logic [255:0] q_wdata;
@@ -308,10 +314,11 @@ module l2_cache #(
     wire  [SETW-1:0] q_set  = q_addr[6 +: SETW];
     wire  [TAGW-1:0] q_tag  = q_addr[26:6+SETW];
     wire             q_sec  = q_addr[5];
-    wire  [21:0]     q_line = q_addr[27:6];      // the DDR line (write buffer, MIG address)
-    function automatic logic f_in_ddr(input logic [31:0] a);
-        return a[31:27] == 5'd0;
-    endfunction
+    // the DDR line (tags, write buffer, MIG address): PA[26:6].  PA[31:27]
+    // alias: ddr2_control dropped PA[31:28] and the MIG (RANKS = 1) ignores
+    // app_addr[26] = PA[27], so every PA is the DDR byte PA[26:0] — the L2
+    // folds them the same way (one line per DDR line, no bypass)
+    wire  [20:0]     q_line = q_addr[26:6];
 
     logic r_served = 1'b0;              // ready given; ignore DV until it drops
     logic [3:0] r_hx = '0;              // HIT_XTRA count
@@ -329,7 +336,7 @@ module l2_cache #(
     // ---------------------------------------------------------------------
     logic [1:0]  wb_v   = '0;           // allocated
     logic [1:0]  wb_rdy = '0;           // data complete (may drain)
-    logic [21:0] wb_line [2];
+    logic [20:0] wb_line [2];
     logic [63:0] wb_m    [2];           // byte mask {sector1[31:0], sector0[31:0]}
     logic        wb_h    = 1'b0;        // head (oldest)
     wire  [1:0]  wb_n    = {1'b0, wb_v[0]} + {1'b0, wb_v[1]};
@@ -338,7 +345,7 @@ module l2_cache #(
     // the entry the engine drains: the oldest (FIFO — a later entry of the
     // same line holds newer bytes)
     wire         wb_dh   = wb_h;
-    function automatic logic f_wbm(input logic [21:0] ln);
+    function automatic logic f_wbm(input logic [20:0] ln);
         return (wb_v[0] && wb_line[0] == ln) || (wb_v[1] && wb_line[1] == ln);
     endfunction
 
@@ -347,7 +354,7 @@ module l2_cache #(
     // ---------------------------------------------------------------------
     localparam logic [1:0] E_IDLE = 2'd0, E_RD = 2'd1, E_WR = 2'd2;
     logic [1:0]  e_st = E_IDLE;
-    logic [21:0] e_line;
+    logic [20:0] e_line;
     logic [1:0]  e_c;                   // first burst (pair index)
     logic [2:0]  e_n;                   // bursts: 1, 2, 4
     logic [2:0]  e_k;                   // commands issued
@@ -355,6 +362,15 @@ module l2_cache #(
     logic        e_alloc;
     logic [WAYW-1:0] e_way;
     logic        e_wide, e_early, e_rsp;   // e_rsp: the requester still waits for its answer
+    // VGA stream buffer (review 1): a VGA read (a wide DMA read) of sector 0
+    // of a line the L2 does not hold fetches the whole 64 B line; sector 1
+    // is kept here for the scanout's next read (its addresses ascend), which
+    // it answers at hit latency with no DDR round trip.  Any write accepted
+    // to that line meanwhile (from any master) drops it.
+    logic         e_strm, e_strm_ok;    // this read fills the stream buffer; no write to its line since
+    logic         s_v = 1'b0;
+    logic [21:0]  s_sec;                // PA[26:5]
+    logic [255:0] s_buf;
     logic [1:0]  e_dwoff;
     logic [255:0] e_buf;                // sector being assembled
     // drain
@@ -406,11 +422,20 @@ module l2_cache #(
     logic            c_e;                // copy: the write-buffer entry
     logic [SETW-1:0] c_set;
 
+    // a write accepted on this edge
+    wire w_wr_acc;
+    // the walk and the requests take turns: after a request accepted during
+    // a walk, the next set goes first (a master that re-raises DV after one
+    // low cycle cannot hold BUSY up for its whole tenure)
+    logic r_wk_turn = 1'b0;
+    wire  w_wk_on   = r_walking && !r_walk_end;
+    wire  w_wk_go   = w_wk_on && !e_filling && !(|r_db_we);
     // accept: a new request (not one already served), not to the set a fill
-    // is writing
-    wire w_acc_ok = calib_done && w_dv && !r_served &&
+    // is writing, not on the walk's turn
+    wire w_acc_ok = calib_done && w_dv && !r_served && !(r_wk_turn && w_wk_on) &&
                     !(e_filling && i_mem_addr[6 +: SETW] == e_set) &&
                     !(|r_db_we && i_mem_addr[6 +: SETW] == r_db_addr[SETW:1]);
+    assign w_wr_acc = (f_st == F_IDLE) && w_acc_ok && i_mem_write_DV;
     // the tags read on the last edge are this request's
     wire w_imm = ra_ok && (ra_addr[31:5] == i_mem_addr[31:5]);
 
@@ -474,6 +499,10 @@ module l2_cache #(
     // the whole line, or (while VGA is fetching: DDR time is its deadline)
     // only the requested sector
     wire       w_rd_both = w_rd_newline && !i_rt_req;
+    // VGA (wide DMA) reads: the stream buffer answers, or a sector-0 miss
+    // of an absent line fetches both sectors into it
+    wire       w_strm_hit = q_dma && q_wide && s_v && s_sec == q_addr[26:5];
+    wire       w_strm_new = q_dma && q_wide && !q_sec && !r_many;
     wire       w_rd_needslot = w_rd_newline && (r_vd != 2'b00);
     wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full);
     // writes
@@ -481,6 +510,13 @@ module l2_cache #(
     wire       w_wr_cache_alloc = w_alloc && q_lk && !q_dma && !r_many; // allocate the sector
     wire       w_wr_dma_hit = q_lk && q_dma && r_hit;
     wire       w_wr_post = !(w_wr_cache_hit || w_wr_cache_alloc || w_wr_dma_hit);
+
+    // the front end waits on the write buffer: a read miss of a buffered
+    // line, or a full buffer in the way of an allocation's victim copy or of
+    // a posted write
+    wire       w_fe_need = (f_st == F_DEC) &&
+                           (q_wr ? wb_full && ((w_wr_cache_alloc && r_vd != 2'b00) || w_wr_post)
+                                 : !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full)));
 
     // the first burst: the one holding the requested dword (a 32 B request
     // carries a line-aligned address and the dword in q_dwoff)
@@ -548,7 +584,17 @@ module l2_cache #(
             F_WDAT: if (!eng_bwr) db_we = WAYS'(1) << r_vic;
             F_VC1: begin wbd_we = 1'b1; wbd_wa = {c_e, 1'b0}; wbd_din = d_mux; end
             F_VC2: begin wbd_we = 1'b1; wbd_wa = {c_e, 1'b1}; wbd_din = d_mux; end
-            F_WK2: if (!r_wk_any) begin tb_we = 1'b1; tb_addr = r_walk_set; tb_din = '0; end
+            F_WK2: begin
+                // the set done: its tag word written 0; a way being copied:
+                // its dirty bits written 0 now (a walk that yields restarts
+                // the set from its tags and must not copy that way again)
+                tb_addr = r_walk_set;
+                if (!r_wk_any) begin
+                    tb_we = 1'b1; tb_din = '0;
+                end else if (!wb_full) begin
+                    tb_we = 1'b1; tb_din[r_wk_way*WW +: 2] = 2'b00;
+                end
+            end
             default: ;
         endcase
         wbd_ra = (e_st == E_WR) ? dr_s : {wb_h, 1'b0};
@@ -563,7 +609,7 @@ module l2_cache #(
         ra_addr <= ra_next;
         // (a data-array write to the set read on this edge, or landing on
         // it, would make its data stale: the lookup is redone)
-        ra_ok   <= SPEC_EN && (f_st == F_IDLE) && f_in_ddr(ra_next) && r_en &&
+        ra_ok   <= SPEC_EN && (f_st == F_IDLE) && r_en &&
                    !(|db_we   && db_addr[SETW:1]   == ra_next[6 +: SETW]) &&
                    !(|r_db_we && r_db_addr[SETW:1] == ra_next[6 +: SETW]);
 
@@ -581,9 +627,11 @@ module l2_cache #(
                 // 0: write back, invalidate, then bypass; 3: write back and
                 // invalidate, stay enabled.  A disabled L2 holds no line: it
                 // only drains the write buffer (BUSY = 0 always means DDR
-                // holds every write), then enables or stays disabled.
+                // holds every write acknowledged before the walk's end),
+                // then enables or stays disabled.
                 r_walking  <= 1'b1;
                 r_walk_end <= !r_en;
+                r_wk_snap  <= 1'b0;
                 r_walk_set <= '0;
                 r_dis_pend <= !i_ctrl_wdata[0];
             end else r_en <= 1'b1;   // 1: enable (instant)
@@ -605,13 +653,17 @@ module l2_cache #(
                                           : (i_mem_addr[4] ? {16'h0, ~i_app_wdf_mask}
                                                            : {~i_app_wdf_mask, 16'h0});
                     c_set   <= i_mem_addr[6 +: SETW];
-                    q_lk    <= r_en && f_in_ddr(i_mem_addr);
+                    q_lk    <= r_en;
+                    if (w_wk_on) r_wk_turn <= 1'b1;
                     if (i_mem_write_DV) begin
                         o_mem_ready <= 1'b1;          // posted
                         r_served    <= 1'b1;
+                        // (the stream buffer: a write to its line drops it)
+                        if (i_mem_addr[26:6] == s_sec[21:1]) s_v <= 1'b0;
+                        if (i_mem_addr[26:6] == e_line) e_strm_ok <= 1'b0;
                     end
-                    if (!r_en || !f_in_ddr(i_mem_addr)) begin
-                        // bypass (disabled, or outside DDR): no lookup
+                    if (!r_en) begin
+                        // bypass (disabled): no lookup
                         r_hit <= 1'b0; r_many <= 1'b0;
                         f_st  <= F_DEC;
                     end else if (w_imm) begin
@@ -625,13 +677,9 @@ module l2_cache #(
                     end else begin
                         f_st   <= F_LOOK;
                     end
-                end else if (r_walking && !r_walk_end && !e_filling && !(|r_db_we)) begin
-                    f_st <= F_WK0;
-                end else if (r_walk_end && wb_v == 2'b00 && e_st == E_IDLE) begin
-                    r_walking  <= 1'b0;
-                    r_walk_end <= 1'b0;
-                    r_en       <= !r_dis_pend;
-                    r_dis_pend <= 1'b0;
+                end else if (w_wk_go) begin
+                    f_st      <= F_WK0;
+                    r_wk_turn <= 1'b0;
                 end
             end
 
@@ -660,6 +708,14 @@ module l2_cache #(
                         else if (q_if) ev_i_hit <= 1'b1;
                         else ev_d_hit <= 1'b1;
                         f_st <= F_IDLE;
+                    end else if (w_strm_hit) begin
+                        // the stream buffer's sector (no DDR read)
+                        o_mem_read_data <= s_buf;
+                        o_mem_ready <= 1'b1;
+                        r_served    <= 1'b1;
+                        s_v         <= 1'b0;
+                        ev_dma_hit  <= 1'b1;
+                        f_st <= F_IDLE;
                     end else if (w_rd_can) begin
                         if (q_lk) begin
                             if (q_dma) ev_dma_miss <= 1'b1;
@@ -673,7 +729,7 @@ module l2_cache #(
                             r_msel <= r_vic;
                             wb_v[wb_tail]    <= 1'b1;
                             wb_rdy[wb_tail]  <= 1'b0;
-                            wb_line[wb_tail] <= {1'b0, r_ttag[r_vic], q_set};
+                            wb_line[wb_tail] <= {r_ttag[r_vic], q_set};
                             wb_m[wb_tail]    <= {{32{r_vd[1]}}, {32{r_vd[0]}}};
                             f_ret <= F_WRSP;
                             f_st  <= F_VC0;
@@ -698,7 +754,7 @@ module l2_cache #(
                             r_msel <= r_vic;
                             wb_v[wb_tail]    <= 1'b1;
                             wb_rdy[wb_tail]  <= 1'b0;
-                            wb_line[wb_tail] <= {1'b0, r_ttag[r_vic], q_set};
+                            wb_line[wb_tail] <= {r_ttag[r_vic], q_set};
                             wb_m[wb_tail]    <= {{32{r_vd[1]}}, {32{r_vd[0]}}};
                             f_ret <= F_WDAT;
                             f_st  <= F_VC0;
@@ -748,16 +804,17 @@ module l2_cache #(
                         r_msel <= r_wk_way;
                         wb_v[wb_tail]    <= 1'b1;
                         wb_rdy[wb_tail]  <= 1'b0;
-                        wb_line[wb_tail] <= {1'b0, r_ttag[r_wk_way], r_walk_set};
+                        wb_line[wb_tail] <= {r_ttag[r_wk_way], r_walk_set};
                         wb_m[wb_tail]    <= {{32{r_td[r_wk_way][1]}}, {32{r_td[r_wk_way][0]}}};
-                        r_tw[r_wk_way*WW +: 2] <= 2'b00;   // its dirty bits: copied
+                        r_tw[r_wk_way*WW +: 2] <= 2'b00;   // its dirty bits: copied (also in the tag RAM)
                         f_ret <= F_WK2;
                         f_st  <= F_VC0;
                     end else begin
                         ev_wbfull <= 1'b1;
                         // yield to a request while the buffer drains; the
-                        // set is walked again (a way copied already is
-                        // copied again: a later entry, so drained after)
+                        // set is walked again from its tags, where the ways
+                        // copied already are clean (a way a request dirtied
+                        // meanwhile is copied again: a later entry)
                         if (w_acc_ok) f_st <= F_IDLE;
                     end
                 end else begin
@@ -770,26 +827,43 @@ module l2_cache #(
             default: f_st <= F_IDLE;
         endcase
 
+        // ---------------- the walk's end ----------------
+        // (F_IDLE: no posted write is still on its way to the buffer)
+        if (r_walking && r_walk_end && !r_wk_snap && f_st == F_IDLE) begin
+            r_wk_snap <= 1'b1;
+            r_wk_fl   <= wb_v;
+        end
+        if (r_walking && r_walk_end && r_wk_snap && r_wk_fl == 2'b00) begin
+            r_walking  <= 1'b0;
+            r_walk_end <= 1'b0;
+            r_wk_turn  <= 1'b0;
+            r_wk_snap  <= 1'b0;
+            r_en       <= !r_dis_pend || i_ctrl_en;
+            r_dis_pend <= 1'b0;
+        end
+
         // ---------------- DDR engine ----------------
         if (app_en && app_rdy) begin
             if (e_st == E_RD) begin
                 if (e_k + 3'd1 < e_n) begin
                     e_k      <= e_k + 3'd1;
-                    app_addr <= {e_line, e_c ^ 2'(e_k + 3'd1), 3'b000};
+                    app_addr <= {1'b0, e_line, e_c ^ 2'(e_k + 3'd1), 3'b000};
                 end else app_en <= 1'b0;
             end else app_en <= 1'b0;
         end
 
         case (e_st)
             E_IDLE: begin
-                if (f_st == F_DEC && !q_wr && !w_rd_hit && w_rd_can) begin
+                if (f_st == F_DEC && !q_wr && !w_rd_hit && !w_strm_hit && w_rd_can) begin
                     // start the read: the first burst holds the requested dword
                     e_st    <= E_RD;
                     e_line  <= q_line;
                     e_c     <= w_cburst;
                     e_alloc <= w_rd_alloc;
                     e_way   <= r_many ? r_mway : r_vic;
-                    e_n     <= !q_wide ? 3'd1 : (w_rd_both ? 3'd4 : 3'd2);
+                    e_n     <= !q_wide ? 3'd1 : (w_rd_both || w_strm_new ? 3'd4 : 3'd2);
+                    e_strm  <= w_strm_new;
+                    e_strm_ok <= 1'b1;
                     e_k     <= 3'd0;
                     e_bc    <= 3'd0;
                     e_wide  <= q_wide;
@@ -798,13 +872,13 @@ module l2_cache #(
                     e_rsp   <= 1'b1;
                     app_en   <= 1'b1;
                     app_cmd  <= CMD_READ;
-                    app_addr <= {q_line, w_cburst, 3'b000};
-                end else if (wb_v[wb_dh] && wb_rdy[wb_dh] && !(f_st == F_DEC && !q_wr && !w_rd_hit && w_rd_can) &&
-                             (!(i_dma || i_rt_req) || f_st != F_IDLE || r_walk_end)) begin
-                    // (no drain starts in the gaps of a DMA tenure, nor
-                    // while VGA waits for the bus — its reads would wait
-                    // them out — unless the front end waits on the buffer:
-                    // full, or an entry of its line)
+                    app_addr <= {1'b0, q_line, w_cburst, 3'b000};
+                end else if (wb_v[wb_dh] && wb_rdy[wb_dh] && !(f_st == F_DEC && !q_wr && !w_rd_hit && !w_strm_hit && w_rd_can) &&
+                             (!(i_dma || i_rt_req) || w_fe_need)) begin
+                    // (no drain starts during a DMA tenure, nor while VGA
+                    // wants the bus — its reads would wait them out —
+                    // unless the request in F_DEC waits on the buffer:
+                    // w_fe_need)
                     e_st  <= E_WR;
                     e_bm  <= wb_hb;
                     e_p   <= f_first(wb_hb);
@@ -831,6 +905,13 @@ module l2_cache #(
                     r_served    <= 1'b1;
                     e_rsp       <= 1'b0;
                 end
+                if (rb_sec_done && !e_rsp && e_strm) begin
+                    // a stream read's sector 1 (no write to the line since
+                    // the read was issued, nor on this edge)
+                    s_buf <= rb_buf;
+                    s_sec <= {e_line, 1'b1};
+                    s_v   <= e_strm_ok && !(w_wr_acc && i_mem_addr[26:6] == e_line);
+                end
                 if (e_bc + 3'd1 == {e_n, 1'b0}) e_st <= E_IDLE;
             end
 
@@ -840,7 +921,7 @@ module l2_cache #(
                     2'd0: if (app_rdy && app_wdf_rdy && !app_en && !app_wdf_wren) begin
                         app_en       <= 1'b1;
                         app_cmd      <= CMD_WRITE;
-                        app_addr     <= {wb_line[wb_dh], e_p, 3'b000};
+                        app_addr     <= {1'b0, wb_line[wb_dh], e_p, 3'b000};
                         app_wdf_data <= dr_chunk[63:0];
                         app_wdf_mask <= ~dr_m0;
                         app_wdf_wren <= 1'b1;
@@ -864,6 +945,7 @@ module l2_cache #(
                             // both accepted (or accepted on this edge)
                             if ((e_bm & ~(4'b1 << e_p)) == 4'b0) begin
                                 wb_v[wb_dh]   <= 1'b0;
+                                r_wk_fl[wb_dh] <= 1'b0;
                                 wb_rdy[wb_dh] <= 1'b0;
                                 wb_h          <= !wb_dh;
                                 e_st         <= E_IDLE;
@@ -882,7 +964,7 @@ module l2_cache #(
         if (ui_rst) begin
             f_st <= F_IDLE; e_st <= E_IDLE;
             app_en <= 1'b0; app_wdf_wren <= 1'b0; app_wdf_end <= 1'b0;
-            wb_v <= '0; wb_rdy <= '0; e_rsp <= 1'b0;
+            wb_v <= '0; wb_rdy <= '0; e_rsp <= 1'b0; r_wk_fl <= '0; s_v <= 1'b0;
         end
     end
 

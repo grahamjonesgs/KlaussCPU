@@ -272,7 +272,8 @@ BTIC_STATS = {'runs': 0, 'chk': 0, 'hits': 0, 'pau': 0}   # what the checks saw 
 # entry without its arm (the TB's FATAL lines), or the core's own BTIC
 # assertion (it stops the run: no result file)
 CONS_FAILS = []
-CONS_STATS = {'runs': 0, 'n': 0}
+CONS_STATS = {'runs': 0, 'n': 0, 'rt_need': 0}
+SOC_BEH = set()      # tb_soc executables of an older tb (its own behavioural DDR: no consistency checker)
 SOC_PROBED = set()   # tb_soc executables built with the BTIC probe (a run of one must print BTPROBE)
 BTIC_FATAL = ('FATAL BTIC', 'BTIC base != target', 'pos0 unsound')
 
@@ -379,6 +380,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     stamp = os.path.join(d, 'stamp')
     if probed:
         SOC_PROBED.add(exe)
+    if beh_ddr:
+        SOC_BEH.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
     # measurement knobs (HW_PERF_PLAN §6): VSIM_L2_SPEC=0 (4-cycle hits),
@@ -390,7 +393,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     elif 'CORE1_L2_EN' not in allsrc:
         defs = ['+define+DDRPATH=ddr2_control']          # a pre-L2 revision under the current tb_soc
     else:
-        defs = [] if l2 else ['+define+DDRPATH=g_ddr.ddr2_control']
+        # (L2_PROBE: tb_soc's count of drains in VGA's / DMA's window, review 1 M2)
+        defs = ['+define+L2_PROBE'] if l2 else ['+define+DDRPATH=g_ddr.ddr2_control']
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \
@@ -434,9 +438,22 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True, plus
         CONS_FAILS.append(name)
         print(f'FAIL {name}: memory consistency (tb_soc checker)')
     m = re.search(r'consistency checks=(\d+)', r.stdout)
+    if gate and exe not in SOC_BEH and not (m and int(m.group(1)) > 0):
+        # review 1: a gated run whose checker checked nothing (no HALTED
+        # report, or zero answers) is not a pass
+        CONS_FAILS.append(name + (' (0 checks)' if m else ' (no consistency line)'))
+        print(f'FAIL {name}: consistency checker {"checked nothing" if m else "did not report"}')
     if m and gate:
         CONS_STATS['runs'] += 1
         CONS_STATS['n'] += int(m.group(1))
+    m = re.search(r'L2 rt drains bad=(\d+) need=(\d+)', r.stdout)
+    if m and gate:
+        CONS_STATS['rt_need'] += int(m.group(2))
+        if int(m.group(1)):
+            # review 1 M2: a drain started in VGA's / DMA's window with no
+            # request waiting on the buffer
+            CONS_FAILS.append(name + f' ({m.group(1)} drains in the VGA/DMA window)')
+            print(f'FAIL {name}: {m.group(1)} L2 drains started in the VGA / DMA window')
     return {'log': r.stdout + r.stderr, 'trace': os.path.join(d, 'soc.trace'),
             'uart': open(os.path.join(d, 'soc.uart'), 'rb').read().decode('latin-1')}
 
@@ -1723,13 +1740,15 @@ def cmd_socx(a):
     return 1 if fails else 0
 
 
-def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000):
+def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False):
     """HW_PERF_PLAN §6: 640 x 480 RGB565 scanout of a framebuffer at 4 MiB
     under heavy CPU traffic: a strided walk over `span` bytes (D-cache and L2
     misses, dirty victims on both levels, so the L2's write buffer drains),
     and every `wbinv_every` iterations an L2 write-back-and-invalidate (L2_CTRL =
     3, BUSY polled; skipped without the L2); runs `lines` x ~3200 cycles.
-    r1 = VGA_STATUS at the end (underflows [63:48])."""
+    blit (review 1): the blitter also FILLs a 640 x 64 rect at 5 MiB
+    (80 KiB of 16 B DMA writes) back to back (restarted from the loop as
+    soon as it is idle).  r1 = VGA_STATUS at the end (underflows [63:48])."""
     from kasm import Asm
     a = Asm()
     a.setr(15, 0xF0110000)
@@ -1744,10 +1763,20 @@ def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000):
     a.setr(9, (lines * 3200) // 40)                     # iterations (~40 cycles each at best)
     a.setr(8, 0)                                        # offset
     a.setr(7, wbinv_every)
+    if blit:
+        a.setr(13, 0xF00E0000)
+        for off, v in ((0x10, 0x500000), (0x18, 1280), (0x30, 640), (0x38, 64), (0x40, 0x1234)):
+            a.setr(1, v); a.st(64, 1, 13, off)
     a.label('top')
     a.alu('add', 11, 10, 8)
     a.ld(64, 2, 11, 0); a.addi_s(2, 2, 1); a.st(64, 2, 11, 0)
     a.ld(64, 3, 11, 0x1000); a.st(64, 3, 11, 0x1008)
+    if blit:
+        a.ld(64, 4, 13, 0x08); a.setr(12, 1); a.alu('and', 4, 4, 12)     # STATUS.BUSY
+        a.fbr('ne', 4, 0, 'noblit', imm=True)
+        a.setr(4, 2); a.st(64, 4, 13, 0x08)                              # DONE: clear
+        a.setr(4, 1); a.st(64, 4, 13, 0x00)                              # START, FILL
+        a.label('noblit')
     a.setr(12, 37 * 64); a.alu('add', 8, 8, 12)
     a.setr(12, span - 1); a.alu('and', 8, 8, 12)
     a.dec(7)
@@ -1771,15 +1800,23 @@ def cmd_socvga(a):
     the given MIG timing (--plus).  Fails on any starved display line or on
     a fetch that did not run."""
     exe = build_soc(None)
-    prog = _vga_prog(a.lines, a.wbinv_every, span=a.span)
-    r = run_soc(exe, prog, f'vga_{os.environ.get("VSIM_L2", "1")}', timeout=7200,
-                plus=['+VGA_V0=478'] + a.plus)
+    prog = _vga_prog(a.lines, a.wbinv_every, span=a.span, blit=a.blit)
+    tag = f'vga_{os.environ.get("VSIM_L2", "1")}_' + re.sub(r'[^A-Za-z0-9]', '', ''.join(a.plus)) + \
+        f'_{a.span:x}_{a.wbinv_every}{"_b" if a.blit else ""}'
+    r = run_soc(exe, prog, tag, timeout=14400, plus=['+VGA_V0=478'] + a.plus)
     m = re.search(r'VGA lines=(\d+) max_fetch=(\d+) underflows=(\d+)', r['log'])
-    g = re.search(r'PIPE_RUN|t=(\d+)', r['log'])
-    l2 = re.findall(r'TB_SOC: (MIG bursts.*)', r['log'])
+    l2 = re.findall(r'TB_SOC: (MIG bursts rd=\d+ wr=\d+)', r['log'])
+    rt = re.findall(r'TB_SOC: L2 rt (drains bad=\d+ need=\d+)', r['log'])
+    vr = re.search(r'VGA reads=(\d+) read_cycles=(\d+) grant_cyc=(\d+)', r['log'])
+    if vr:
+        n = max(1, int(vr.group(1)))
+        rt.append(f'vga_rd_lat={int(vr.group(2)) / n:.1f} gnt_wait/read={int(vr.group(3)) / n:.1f}')
+    t = re.search(r'\bt=(\d+)', r['log'])
     ok = bool(m) and int(m.group(1)) >= 20 and int(m.group(3)) == 0 and 'HALTED' in r['log']   # (the scanout ran)
     print(f'{"pass" if ok else "FAIL"} socvga lines={m and m.group(1)} max_fetch={m and m.group(2)} '
-          f'(of 3200) underflows={m and m.group(3)} {l2[0] if l2 else ""} {" ".join(a.plus)}')
+          f'(of 3200) underflows={m and m.group(3)} {l2[0] if l2 else ""} {" ".join(rt)} '
+          f'cycles={t and t.group(1)} {"blit " if a.blit else ""}{" ".join(a.plus)}')
+    shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
     return 0 if ok else 1
 
 
@@ -2041,21 +2078,25 @@ def cmd_socbench(a):
     with _env(['VSIM_L2=0']):
         off = build_soc(None)
     on = build_soc(None)
+    # --base REV: REV's RTL (L2 on) under the working tree's tb_soc / MIG
+    # model as a third column (review 1: cycle deltas against fba47c0)
+    cols = [('off', off), ('on', on)] + ([('base', build_soc(a.base, tb_wt=True))] if a.base else [])
     fails = 0
     for name, prog in _bench_progs():
         res = []
-        for tag, exe in (('off', off), ('on', on)):
+        for tag, exe in cols:
             r = run_soc(exe, prog, f'bench_{name}_{tag}', trace=True, plus=a.plus, timeout=7200)
-            t = int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0
+            t = int(re.search(r'\bt=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0
             res.append((t, _soc_regs(r)))
             try:
                 os.remove(r['trace'])
             except OSError:
                 pass
-        same = res[0][1] is not None and res[0][1] == res[1][1]
+        same = res[0][1] is not None and all(r[1] == res[0][1] for r in res)
         fails += not same
+        b = f'; {a.base}: {res[2][0]} ({100.0 * (res[1][0] - res[2][0]) / max(1, res[2][0]):+.2f}% now)' if a.base else ''
         print(f'{"same" if same else "DIFF"} {name}: cycles {res[0][0]} -> {res[1][0]} '
-              f'({100.0 * (res[1][0] - res[0][0]) / max(1, res[0][0]):+.1f}%) {" ".join(a.plus)}')
+              f'({100.0 * (res[1][0] - res[0][0]) / max(1, res[0][0]):+.1f}%){b} {" ".join(a.plus)}')
     return 1 if fails else 0
 
 
@@ -2118,7 +2159,7 @@ def cmd_socdiff(a):
         rn = run_soc(new, asm, f'sd_n{sd}', trace=True, plus=a.plus)
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
-        t = [int(re.search(r't=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
+        t = [int(re.search(r'\bt=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
         tb += t[0]; tn += t[1]
         for k, r in (('base', rb), ('new', rn)):
             m = re.search(r'BTPROBE btic_chk=\d+ btic_hits=(\d+)', r['log'])
@@ -2232,11 +2273,13 @@ def main():
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
     bp = sub.add_parser('socbench'); bp.add_argument('--plus', action='append', default=[])
+    bp.add_argument('--base', help='also REV (L2 on) under the current tb_soc / MIG model')
     l2p = sub.add_parser('socl2'); l2p.add_argument('--plus', action='append', default=[])
     vg = sub.add_parser('socvga'); vg.add_argument('--lines', type=int, default=120)
     vg.add_argument('--wbinv-every', type=int, default=1500)
     vg.add_argument('--span', type=lambda v: int(v, 0), default=0x80000)
     vg.add_argument('--plus', action='append', default=[])
+    vg.add_argument('--blit', action='store_true', help='the blitter FILLs back to back too (review 1)')
     sx = sub.add_parser('socx'); sx.add_argument('--seeds', type=int, default=4)
     sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
@@ -2279,7 +2322,8 @@ def main():
             print('BTIC gate: hits but zero entries checked (vacuous coverage check)')
             sys.stdout.flush(); os._exit(1)
         if CONS_STATS['runs']:
-            print(f'Consistency checks: {CONS_STATS["n"]} answers checked in {CONS_STATS["runs"]} tb_soc run(s)')
+            print(f'Consistency checks: {CONS_STATS["n"]} answers checked in {CONS_STATS["runs"]} tb_soc run(s); '
+                  f'{CONS_STATS["rt_need"]} L2 drains in the VGA/DMA window, each for a request waiting on the buffer')
         if CONS_FAILS:
             print(f'memory consistency check failed in {len(CONS_FAILS)} run(s): {" ".join(CONS_FAILS[:10])}')
             sys.stdout.flush(); os._exit(1)

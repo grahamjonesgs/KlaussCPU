@@ -2,7 +2,9 @@
 // tb_l2 — l2_cache unit bench (Verilator, HW_PERF_PLAN.md §6).
 //
 // Drives the L2's front port with mem_read_write's arbiter protocol (DV level
-// until ready, then DV low >= 1 cycle; one master at a time): the D-cache
+// until ready, held one more cycle — the masters drop it on the edge after
+// they see ready; +DVTAIL=0: dropped on that edge — then DV low >= 1 cycle;
+// one master at a time): the D-cache
 // (32 B reads with a critical dword and the speculative lookup, 32 B
 // victim writes), blitter / core 2 (16 B reads, 16 B masked writes) and VGA
 // (32 B reads), plus L2_CTRL writes.  The behavioural MIG (mig_model.sv)
@@ -11,6 +13,11 @@
 // Memory-consistency checker: a reference memory takes every accepted
 // write; every read answer (and every early critical dword) must equal it.
 // After a write-back-and-invalidate the MIG's memory must equal it too.
+// PA[31:27] alias PA[26:0] (the MIG's rank bit and the dropped high bits).
+// Every ready must answer a request (a DV tail must not be taken as a new
+// one).  VGA / DMA rule (review 1, M2): while the VGA request or a DMA
+// master is on the bus, a write-buffer drain may start only for a request
+// that waits on the buffer (rt_bad must stay 0).
 //
 // +TEST=<name> runs a directed test (see the case below); +TEST=random
 // (default) runs +N transactions from +SEED with random control writes.
@@ -51,8 +58,11 @@ module tb_l2;
 
    // ---------------- reference memory (dword granular) ----------------
    logic [63:0] ref_m [logic [31:0]];
+   function automatic logic [31:0] fold(input logic [31:0] a);
+      return {5'b0, a[26:0]};
+   endfunction
    function automatic logic [63:0] rget(input logic [31:0] a);
-      a = {a[31:3], 3'b0};
+      a = {5'b0, a[26:3], 3'b0};
       return ref_m.exists(a) ? ref_m[a] : 64'h0;
    endfunction
    int fails = 0;
@@ -79,13 +89,45 @@ module tb_l2;
    int wbm_wait = 0, spec_used = 0, walks = 0;
    always @(posedge clk) begin
       if (dut.f_st == 4'd2 && !dut.q_wr && !dut.w_rd_hit && dut.f_wbm(dut.q_line)) wbm_wait++;
-      if (dut.f_st == 4'd0 && dut.w_acc_ok && dut.r_en && dut.w_imm && dut.f_in_ddr(addr)) spec_used++;
+      if (dut.f_st == 4'd0 && dut.w_acc_ok && dut.r_en && dut.w_imm) spec_used++;
       if (ctrl_wr && !busy && (ctrl_wd != 2'b01)) walks++;
    end
+   // walk yields (F_WK2, dirty way, buffer full, a request taken instead)
+   int yields = 0;
+   always @(posedge clk)
+      if (dut.f_st == 4'd10 && dut.r_wk_any && dut.wb_full && dut.w_acc_ok) yields++;
+   // drains started while VGA / a DMA master is on the bus: rt_need when
+   // the request in F_DEC waited on the buffer (full, or its line in it),
+   // rt_bad otherwise (judged on the edge the drain starts)
+   int rt_bad = 0, rt_need = 0;
+   bit rt_pend = 0, rt_pneed = 0;
+   always @(posedge clk) begin
+      if (rt_pend && dut.e_st == 2'd2) begin
+         if (rt_pneed) rt_need++;
+         else begin
+            rt_bad++;
+            if (rt_bad <= 3) $display("TB_L2 rt drain at t=%0t f_st=%0d", $time, dut.f_st);
+         end
+      end
+      rt_pend  = dut.e_st == 2'd0 && (rt_req || dma);
+      rt_pneed = dut.f_st == 4'd2 && !(!dut.q_wr && dut.w_rd_hit) && (dut.wb_full || dut.f_wbm(dut.q_line));
+   end
+   // the VGA stream buffer: reads it answered; writes accepted to the line
+   // of a stream read still in flight
+   int strm_hits = 0, strm_snoops = 0;
+   always @(posedge clk) begin
+      if (dut.f_st == 4'd2 && !dut.q_wr && !dut.w_rd_hit && dut.w_strm_hit) strm_hits++;
+      if (dut.w_wr_acc && dut.e_st == 2'd1 && dut.e_strm && addr[26:6] == dut.e_line) strm_snoops++;
+   end
+   // every ready answers a request
+   int n_req = 0, n_rdy = 0;
+   always @(posedge clk) if (ready) n_rdy++;
 
    // ---------------- one transaction ----------------
    int lat_last = 0;
    int dw_seen = 0;
+   int dvtail = 1;
+   bit tenure = 0;
    task automatic xact(input bit w, input bit d, input bit wd, input logic [31:0] a,
                        input logic [1:0] off, input logic [255:0] data, input logic [15:0] m,
                        input bit spec, input bit ifx);
@@ -100,6 +142,11 @@ module tb_l2;
       end
       @(negedge clk);
       spec_v = 0;
+      if (n_rdy != n_req) begin
+         fail($sformatf("%0d readies for %0d requests (before %08x)", n_rdy, n_req, a));
+         n_rdy = n_req;
+      end
+      n_req++;
       wdv = w; rdv = !w; dma = d; wide = wd; addr = a; dwoff = off; wdata = data; mask = m;
       ifetch = ifx;
       t0 = 0; got_dw = 0;
@@ -117,7 +164,9 @@ module tb_l2;
          if (t0 > 20000) begin fail($sformatf("hang %s %08x", w ? "wr" : "rd", a)); break; end
       end
       lat_last = t0;
-      // check / apply at the ready (the L2 serialises; writes are posted)
+      // check / apply at the ready (the L2 serialises; writes are posted);
+      // the reference is indexed by the DDR address (PA[31:27] alias)
+      a = fold(a);
       if (w) begin
          if (wd) for (int j = 0; j < 4; j++) ref_m[a + 8 * j] = data[255 - 64 * j -: 64];
          else begin
@@ -139,7 +188,12 @@ module tb_l2;
                fail($sformatf("narrow read %08x: %h want %h_%h", a, rdata[127:0], rget(a), rget(a + 8)));
          end
       end
+      // the DV tail: the masters drop DV on the edge after the ready
+      if (dvtail) begin @(posedge clk); #1; end
       wdv = 0; rdv = 0;
+      // the DMA grant (i_dma) ends with the transaction, or (tenure = 1)
+      // stays for the next one, as a blitter's chunk of transactions
+      if (!tenure) dma = 0;
       // DV low at least one cycle
       @(negedge clk);
    endtask
@@ -158,6 +212,8 @@ module tb_l2;
    endtask
    // the whole reference must be in the MIG's memory
    task automatic check_ddr(input string tag);
+      // (writes the MIG accepted reach its memory at their CAS)
+      for (int n = 0; n < 2000 && dut.mig_7series_0.cq.size() != 0; n++) @(negedge clk);
       foreach (ref_m[a]) if (a < 32'h0080_0000 && mig_get(a) !== ref_m[a])
          fail($sformatf("%s: DDR %08x = %h want %h", tag, a, mig_get(a), ref_m[a]));
    endtask
@@ -204,6 +260,7 @@ module tb_l2;
       void'($value$plusargs("TEST=%s", test));
       void'($value$plusargs("SEED=%d", seed));
       void'($value$plusargs("N=%d", nx));
+      void'($value$plusargs("DVTAIL=%d", dvtail));
       void'($urandom(seed));
       wait (calib);
       repeat (3) @(negedge clk);
@@ -397,15 +454,151 @@ module tb_l2;
             if (!en || !dut.r_en) fail("program-load enable did not cancel the disable");
          end
          // ---------------------------------------------------------------
-         "range": begin
-            // outside DDR (PA[31:27] != 0): no lookup, no allocation
-            xact(0, 0, 1, 32'h0800_0040, 0, 0, 0, 1, 0);
-            xact(1, 0, 1, 32'h0800_0080, 0, rnd256(), 0, 0, 0);
-            xact(0, 0, 1, 32'h4000_0040, 0, 0, 0, 1, 0);
-            if (evc[D_HIT] + evc[D_MISS] + evc[W_HIT] + evc[W_MISS] != 0) fail("range: looked up");
-            for (int s = 0; s < SETS; s++)
-               if (dut.tag_ram[s] != '0) fail($sformatf("range: set %0d allocated", s));
-            ref_m.delete();    // (aliases of the model's memory: not checked)
+         "alias": begin
+            // PA[31:27] alias PA[26:0] (the MIG ignores the rank bit PA[27];
+            // PA[31:28] never reach it): one L2 line per DDR line, whatever
+            // the alias — writes through one alias, reads through another
+            for (int r = 0; r < 4; r++) begin
+               logic [31:0] h1 = 32'(r + 1) << 27, h2 = 32'((r * 5 + 3) % 32) << 27;
+               xact(1, 0, 1, L(0, 4 + r), 0, rnd256(), 0, 0, 0);               // dirty in the L2
+               xact(1, 1, 0, h1 | (L(0, 4 + r) + 16), 0, rnd256(), 16'h0FF0, 0, 0);
+               xact(0, 0, 1, h2 | L(0, 4 + r), 2'(r), 0, 0, 1, 0);
+               xact(0, 1, 1, h1 | L(0, 4 + r), 0, 0, 0, 0, 0);
+               xact(1, 0, 1, h1 | (L(1, 4 + r) + 32), 0, rnd256(), 0, 0, 0);   // allocated via an alias
+               xact(0, 0, 1, L(1, 4 + r) + 32, 2'd1, 0, 0, 1, 0);
+               xact(1, 1, 0, h2 | (L(2, 4 + r) + 48), 0, rnd256(), 16'h00FF, 0, 0);   // posted
+               xact(0, 1, 0, L(2, 4 + r) + 48, 0, 0, 0, 0, 0);
+               xact(0, 0, 1, h1 | (L(2, 4 + r) + 32), 2'd3, 0, 0, 1, 0);
+            end
+            if (evc[D_HIT] == 0 || evc[DMA_HIT] == 0) fail("alias: no hit through an alias");
+            ctrl(2'b11); wait_idle(); check_ddr("alias");
+         end
+         // ---------------------------------------------------------------
+         "wbinvq": begin
+            // review 1 M1: every set fully dirty (every way, both sectors),
+            // then WBINV with a request waiting at nearly every yield (reads
+            // back to back, one DV-low cycle apart): the walk must end, and
+            // write each dirty line exactly once (a yield must not make it
+            // copy a way again)
+            int n0, nr;
+            for (int k = 0; k < `L2_WAYS; k++) for (int s = 0; s < SETS; s++) begin
+               xact(1, 0, 1, L(k, s), 0, rnd256(), 0, 0, 0);
+               xact(1, 0, 1, L(k, s) + 32, 0, rnd256(), 0, 0, 0);
+            end
+            repeat (200) @(negedge clk);
+            n0 = evc[WR_BEAT];
+            ctrl(2'b11);
+            nr = 0;
+            while (busy && nr < 8 * SETS) begin
+               int k = $urandom_range(`L2_WAYS + 3, 0), s = $urandom_range(SETS - 1, 0);
+               if ($urandom_range(1, 0)) xact(0, 0, 1, L(k, s) + 32 * $urandom_range(1, 0), 2'($urandom), 0, 0, 1, 0);
+               else                      xact(0, 1, $urandom_range(1, 0), L(k, s) + 16 * $urandom_range(3, 0), 0, 0, 0, 0, 0);
+               nr++;
+            end
+            if (busy) fail($sformatf("wbinvq: walk still at set %0d after %0d requests (livelock)", dut.r_walk_set, nr));
+            wait_idle();
+            if (evc[WR_BEAT] - n0 != SETS * `L2_WAYS * 8)
+               fail($sformatf("wbinvq: %0d write beats want %0d (a line written twice)", evc[WR_BEAT] - n0, SETS * `L2_WAYS * 8));
+            if (yields == 0) fail("wbinvq: the walk never yielded (test vacuous)");
+            $display("TB_L2 wbinvq: %0d requests during the walk, %0d yields", nr, yields);
+            check_ddr("wbinvq");
+         end
+         // ---------------------------------------------------------------
+         "wkturn": begin
+            // review 1 minor 2: a master whose requests keep the front end
+            // busy (DMA write hits, DV re-raised after one low cycle) must
+            // not hold BUSY up for its whole tenure: the walk takes turns
+            // (the grant is held across 16 transactions, then dropped for
+            // a few cycles, as a blitter's tenure; without the turns the
+            // walk advanced only in those gaps)
+            int nr;
+            for (int s = 0; s < SETS; s += 16) xact(1, 0, 1, L(s % 3, s), 0, rnd256(), 0, 0, 0);
+            xact(1, 0, 1, L(0, SETS - 1), 0, rnd256(), 0, 0, 0);
+            ctrl(2'b11);
+            nr = 0;
+            tenure = 1;
+            while (busy && nr < 4 * SETS) begin
+               xact(1, 1, 0, L(0, SETS - 1) + 16 * (nr % 2), 0, rnd256(), 16'(nr * 7919), 0, 0);
+               nr++;
+               if (nr % 16 == 0) begin dma = 0; repeat (3) @(negedge clk); end
+            end
+            tenure = 0; dma = 0;
+            if (busy) fail($sformatf("wkturn: BUSY after %0d requests (walk at set %0d)", nr, dut.r_walk_set));
+            $display("TB_L2 wkturn: walk done after %0d requests", nr);
+            // (BUSY = 0: DDR holds the writes acknowledged before the walk's
+            // end; the stream's later ones go out with the next walk)
+            wait_idle(); ctrl(2'b11); wait_idle(); check_ddr("wkturn");
+         end
+         // ---------------------------------------------------------------
+         "vgastream": begin
+            // review 1 (VGA margin): a VGA read of sector 0 of a line the L2
+            // does not hold fetches the line; the next read (sector 1) is
+            // answered from the stream buffer at hit latency, no DDR read.
+            // A write to the line (after the fetch, or while sector 1 is
+            // still on its way) drops it.
+            int b0, h0;
+            b0 = evc[RD_BEAT];
+            xact(0, 1, 1, L(5, 30), 0, 0, 0, 0, 0);
+            while (dut.e_st != 2'd0) @(negedge clk);     // (sector 1 in)
+            xact(0, 1, 1, L(5, 30) + 32, 0, 0, 0, 0, 0);
+            if (lat_last > 3) fail($sformatf("vgastream: stream hit latency %0d", lat_last));
+            repeat (20) @(negedge clk);
+            if (evc[RD_BEAT] - b0 != 8) fail($sformatf("vgastream: %0d read beats want 8", evc[RD_BEAT] - b0));
+            if (strm_hits != 1) fail("vgastream: no stream hit");
+            // a DMA write to sector 1 after the fetch
+            xact(0, 1, 1, L(6, 30), 0, 0, 0, 0, 0);
+            xact(1, 1, 0, L(6, 30) + 48, 0, rnd256(), 16'h0F0F, 0, 0);
+            xact(0, 1, 1, L(6, 30) + 32, 0, 0, 0, 0, 0);
+            // writes while sector 1 is on its way (DDR beats spread out)
+            dut.mig_7series_0.jit = 40;
+            h0 = strm_hits;
+            for (int r = 0; r < 40; r++) begin
+               logic [31:0] b = L(7 + r % 3, 31 + r);
+               xact(0, 1, 1, b, 0, 0, 0, 0, 0);
+               if (r % 4 == 0)      xact(1, 1, 0, b + 32 + 16 * (r % 2), 0, rnd256(), 16'(r * 4099), 0, 0);
+               else if (r % 4 == 1) xact(1, 0, 1, b + 32, 0, rnd256(), 0, 0, 0);
+               else if (r % 4 == 2) xact(1, 1, 0, b + 16, 0, rnd256(), 16'(r * 977), 0, 0);
+               xact(0, 1, 1, b + 32, 0, 0, 0, 0, 0);
+            end
+            dut.mig_7series_0.jit = 0;
+            // a line the L2 holds with only sector 1 (dirty): a VGA read of
+            // sector 0 must not fill the stream buffer from DDR (stale
+            // sector 1), which a read after WBINV would then return
+            for (int r = 0; r < 4; r++) begin
+               xact(1, 0, 1, L(1, 40 + r) + 32, 0, rnd256(), 0, 0, 0);
+               xact(0, 1, 1, L(1, 40 + r), 0, 0, 0, 0, 0);
+               ctrl(2'b11); wait_idle();
+               xact(0, 1, 1, L(1, 40 + r) + 32, 0, 0, 0, 0, 0);
+            end
+            if (strm_snoops == 0) fail("vgastream: no write during a stream fill (test vacuous)");
+            if (strm_hits == h0) fail("vgastream: no stream hit in the second part");
+            $display("TB_L2 vgastream: %0d stream hits, %0d writes during a stream fill", strm_hits, strm_snoops);
+            ctrl(2'b11); wait_idle(); check_ddr("vgastream");
+         end
+         // ---------------------------------------------------------------
+         "rtdrain": begin
+            // review 1 M2: while VGA wants the bus no drain starts unless a
+            // request waits on the buffer.  A posted DMA write leaves an
+            // entry; VGA reads (a hit, a miss) do not drain it and keep
+            // their latency; a VGA read of the buffered line needs it
+            int h;
+            xact(1, 0, 1, L(0, 20), 0, rnd256(), 0, 0, 0);       // dirty in the L2
+            xact(0, 0, 1, L(1, 21), 0, 0, 0, 1, 0);              // clean in the L2
+            @(negedge clk); rt_req = 1;
+            xact(1, 1, 0, L(2, 22) + 16, 0, rnd256(), 16'h0FF0, 0, 0);   // posted: an entry
+            repeat (60) @(negedge clk);
+            if (dut.wb_v == 2'b00) fail("rtdrain: the entry drained while VGA wanted the bus");
+            for (int i = 0; i < 6; i++) begin
+               xact(0, 1, 1, L(i % 2, 20 + i % 2), 0, 0, 0, 0, 0);         // hits
+               if (lat_last > 3) fail($sformatf("rtdrain: VGA hit latency %0d", lat_last));
+               xact(0, 1, 1, L(3 + i, 23), 0, 0, 0, 0, 0);                // misses
+            end
+            if (dut.wb_v == 2'b00) fail("rtdrain: drained during VGA reads");
+            h = rt_need;
+            xact(0, 1, 1, L(2, 22), 0, 0, 0, 0, 0);              // its line: waits for the drain
+            if (rt_need != h + 1) fail($sformatf("rtdrain: %0d needed drains want 1", rt_need - h));
+            @(negedge clk); rt_req = 0;
+            ctrl(2'b11); wait_idle(); check_ddr("rtdrain");
          end
          // ---------------------------------------------------------------
          default: begin
@@ -440,9 +633,11 @@ module tb_l2;
          end
       endcase
       repeat (20) @(negedge clk);
-      $display("TB_L2 ev i_hit=%0d i_miss=%0d d_hit=%0d d_miss=%0d w_hit=%0d w_miss=%0d rd_beat=%0d wr_beat=%0d wbfull=%0d dma_hit=%0d dma_miss=%0d wbm_wait=%0d spec_used=%0d dw_seen=%0d",
+      if (n_rdy != n_req) fail($sformatf("%0d readies for %0d requests", n_rdy, n_req));
+      if (rt_bad != 0) fail($sformatf("%0d drains started while VGA / DMA held the bus with no request waiting on the buffer", rt_bad));
+      $display("TB_L2 ev i_hit=%0d i_miss=%0d d_hit=%0d d_miss=%0d w_hit=%0d w_miss=%0d rd_beat=%0d wr_beat=%0d wbfull=%0d dma_hit=%0d dma_miss=%0d wbm_wait=%0d spec_used=%0d dw_seen=%0d rt_need=%0d rt_bad=%0d",
                evc[0], evc[1], evc[2], evc[3], evc[4], evc[5], evc[6], evc[7], evc[8], evc[9], evc[10],
-               wbm_wait, spec_used, dw_seen);
+               wbm_wait, spec_used, dw_seen, rt_need, rt_bad);
       if (fails == 0) $display("TB_L2 PASS %s", test);
       else            $display("TB_L2 FAIL %s %0d errors: %s", test, fails, why);
       $finish;

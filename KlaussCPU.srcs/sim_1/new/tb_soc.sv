@@ -22,7 +22,11 @@
 // Memory-consistency checker (§6): a reference memory takes every write the
 // DDR side (L2 or ddr2_control) acknowledges at the arbiter's port, from any
 // master; every read answer, and every early critical dword, must equal it
-// (FATAL line otherwise).
+// (FATAL line otherwise).  Indexed by the DDR address: PA[31:27] alias
+// PA[26:0] (the MIG ignores its rank bit PA[27]; PA[31:28] never reach it).
+// With the L2 (+define+L2_PROBE): drains that start while VGA wants the bus
+// or a DMA master holds it, with no request waiting on the write buffer
+// (review 1 M2), are counted ("L2 rt drains bad=").
 //===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -186,10 +190,11 @@ module tb_soc;
    int cc_err = 0;
    logic [63:0] ref_m [logic [31:0]];
    function automatic logic [63:0] rget(input logic [31:0] a);
-      a = {a[31:3], 3'b0};
+      a = {5'b0, a[26:3], 3'b0};
       return ref_m.exists(a) ? ref_m[a] : 64'h0;
    endfunction
    function automatic bit in_model(input logic [31:0] a);
+      a = {5'b0, a[26:0]};
       return a < 32'h0080_0000 || (a >= 32'h07F0_0000 && a < 32'h0800_0000);
    endfunction
    task automatic cc_bad(input string s);
@@ -216,7 +221,7 @@ module tb_soc;
          logic [15:0] m;
          bit wd;
          wd = dut.mem_read_write.mig_wide;
-         a  = wd ? {dut.mem_read_write.mig_addr[31:5], 5'b0} : {dut.mem_read_write.mig_addr[31:4], 4'b0};
+         a  = wd ? {5'b0, dut.mem_read_write.mig_addr[26:5], 5'b0} : {5'b0, dut.mem_read_write.mig_addr[26:4], 4'b0};
          if (in_model(a)) begin
             cc_n++;
             if (dut.mem_read_write.mig_write_DV) begin
@@ -242,6 +247,26 @@ module tb_soc;
       end
    end
 
+   // ---------------- L2 drains in VGA's / DMA's window (review 1 M2) --------
+   int rt_bad = 0, rt_need = 0;
+`ifdef L2_PROBE
+   bit rt_pend = 0, rt_pneed = 0;
+   always @(posedge dut.i_Clk) begin
+      // a drain started on the last edge (E_IDLE -> E_WR): judged by that
+      // cycle's state — a request in F_DEC waiting on the buffer (full, or
+      // its line in it) or not
+      if (rt_pend && dut.mem_read_write.g_l2.l2_cache.e_st == 2'd2) begin
+         if (rt_pneed) rt_need++; else rt_bad++;
+      end
+      rt_pend  = dut.mem_read_write.g_l2.l2_cache.e_st == 2'd0 &&
+                 (dut.mem_read_write.g_l2.l2_cache.i_rt_req || dut.mem_read_write.g_l2.l2_cache.i_dma);
+      rt_pneed = dut.mem_read_write.g_l2.l2_cache.f_st == 4'd2 &&
+                 !(!dut.mem_read_write.g_l2.l2_cache.q_wr && dut.mem_read_write.g_l2.l2_cache.w_rd_hit) &&
+                 (dut.mem_read_write.g_l2.l2_cache.wb_full ||
+                  dut.mem_read_write.g_l2.l2_cache.f_wbm(dut.mem_read_write.g_l2.l2_cache.q_line));
+   end
+`endif
+
    // ---------------- VGA scanout probe (HW_PERF_PLAN.md §6) ----------------
    // +VGA_V0=<line>: 2000 cycles into PIPE_RUN, move the raster to <line>
    // (a sim shortcut to the next vblank, where the scanout configuration
@@ -249,6 +274,7 @@ module tb_soc;
    // line (cycles from its start; a native 640-px line has 3200 before it is
    // shown) and the display lines that starved.
    int vga_v0 = -1, vga_lines = 0, vga_under = 0;
+   longint vga_rd_cyc = 0, vga_rd_n = 0, vga_gnt_cyc = 0;
    int vga_age_max = 0;
    initial begin
       if ($value$plusargs("VGA_V0=%d", vga_v0)) begin
@@ -263,6 +289,11 @@ module tb_soc;
          if (int'(dut.vga_ctrl_i.scanout.r_age) > vga_age_max) vga_age_max = int'(dut.vga_ctrl_i.scanout.r_age);
       end
       if (dut.vga_ctrl_i.scanout.o_underflow) vga_under++;
+      // the scanout's reads: cycles with DV up (each read's latency) and
+      // cycles waiting for the grant
+      if (dut.vga_ctrl_i.scanout.o_dma_read_DV) vga_rd_cyc++;
+      if (dut.vga_ctrl_i.scanout.o_dma_read_DV && dut.vga_ctrl_i.scanout.i_dma_ready) vga_rd_n++;
+      if (dut.vga_ctrl_i.scanout.o_dma_req && !dut.vga_ctrl_i.scanout.i_dma_grant) vga_gnt_cyc++;
    end
 
    // ---------------- end / progress ----------------
@@ -276,7 +307,16 @@ module tb_soc;
          $display("TB_SOC: MIG bursts rd=%0d wr=%0d; consistency checks=%0d errors=%0d",
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_rd,
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_wr, cc_n, cc_err);
+         $display("TB_SOC: MIG activates=%0d conflicts=%0d refreshes=%0d wtr=%0d",
+                  dut.mem_read_write.`DDRPATH.mig_7series_0.n_act,
+                  dut.mem_read_write.`DDRPATH.mig_7series_0.n_conf,
+                  dut.mem_read_write.`DDRPATH.mig_7series_0.n_ref,
+                  dut.mem_read_write.`DDRPATH.mig_7series_0.n_wtr);
          $display("TB_SOC: VGA lines=%0d max_fetch=%0d underflows=%0d", vga_lines, vga_age_max, vga_under);
+         $display("TB_SOC: VGA reads=%0d read_cycles=%0d grant_cyc=%0d", vga_rd_n, vga_rd_cyc, vga_gnt_cyc);
+`ifdef L2_PROBE
+         $display("TB_SOC: L2 rt drains bad=%0d need=%0d", rt_bad, rt_need);
+`endif
          $display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);
          $fclose(uart_f); $fclose(trace_f);
          $finish;
