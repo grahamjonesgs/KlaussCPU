@@ -3313,18 +3313,74 @@ module pipeline_core
    function automatic logic f_xpg(logic lr, logic l32, logic [15:0] v);
       return (lr || (l32 && v[2:0] > 3'd4)) && v[15:3] == 13'h1FFF;
    endfunction
-   wire [31:0] t_ta_d = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
+   // (tmg timing) a shift in MEM forwards its stage-2 result w_sh2 as the
+   // LAST select of every ID -> EX operand (fs_a / fs_b / fs_c: the MEM
+   // forward is taken and the MEM op is a shift — registers only); the
+   // other candidates take mem_res_nsh, mem_result_eff's non-shift leg.
+   // Each operand = its old form with mem_result_eff (asserted).  (r_shhi
+   // -> the barrel's 2nd stage -> mem_result_eff -> the forward muxes ->
+   // ex_ta / the TLB keys / ex_a / the multiplier was tmg_b1's worst.)
+   wire fs_a = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rs1;
+   wire fs_b = mem_is_sh && mem_fwd_ok && mem_d.rd == dec.rs2;
+   wire fs_c = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rd;
+   wire [31:0] t_ta_n = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
                               : (wb_valid && wb_sp_we)   ? wb_sp_new : sp)
                       : (t_mem && t_md == 2'b10) ? 32'd0
-                      : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
+                      : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh[31:0]
                       : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v[31:0]
                       : rf[id_rs1][31:0];
-   wire [31:0] t_tb_d = t_m8 ? 32'hFFFF_FFF8
+   wire [31:0] t_tb_n = t_m8 ? 32'hFFFF_FFF8
                       : (!t_mem || t_md == 2'b00) ? 32'd0
                       : (t_md != 2'b11) ? id_var1
-                      : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
+                      : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh[31:0]
                       : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v[31:0]
                       : rf[dec.rs2][31:0];
+   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0] : t_ta_n;
+   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;
+   // the ID -> EX operand latches' D values (the forward muxes)
+   wire [63:0] ex_a_d = fs_a ? f_wsh(id_w, w_sh2)
+                      : f_wsh(id_w, (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh
+                                  : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
+                                  : rf[id_rs1]);
+   wire [63:0] ex_c_d = fs_c ? w_sh2
+                      : (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_res_nsh
+                      : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
+                      : rf[id_rd];
+   wire [63:0] ex_b_d = (fs_b && !id_b_one && !id_b_imm) ? f_wsh(id_w, w_sh2)
+                      : f_wsh(id_w,
+                          id_b_one ? 64'd1
+                        : id_b_imm
+                          ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                        : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh
+                        : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
+                        : rf[dec.rs2]);
+   wire        ex_txpg_d = fs_a ? f_xpg(t_lr, t_l32, w_sh2[15:0])
+                         : (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_res_nsh[15:0])
+                         : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                         : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({mem_result_eff, ex_a_d, ex_b_d, ex_c_d}))
+      assert (t_ta_d == (t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new : (wb_valid && wb_sp_we) ? wb_sp_new : sp)
+                         : (t_mem && t_md == 2'b10) ? 32'd0
+                         : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
+                         : (b_wb && wb_rd == id_rs1) ? wb_fwd_v[31:0] : rf[id_rs1][31:0]) &&
+              t_tb_d == (t_m8 ? 32'hFFFF_FFF8 : (!t_mem || t_md == 2'b00) ? 32'd0
+                         : (t_md != 2'b11) ? id_var1
+                         : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
+                         : (b_wb && wb_rd == dec.rs2) ? wb_fwd_v[31:0] : rf[dec.rs2][31:0]) &&
+              ex_a_d == f_wsh(id_w, (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
+                                  : (b_wb && wb_rd == id_rs1) ? wb_fwd_v : rf[id_rs1]) &&
+              ex_c_d == ((mem_fwd_ok && mem_d.rd == id_rd) ? mem_result_eff
+                         : (b_wb && wb_rd == id_rd) ? wb_fwd_v : rf[id_rd]) &&
+              ex_b_d == f_wsh(id_w, id_b_one ? 64'd1
+                                  : id_b_imm ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                                  : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
+                                  : (b_wb && wb_rd == dec.rs2) ? wb_fwd_v : rf[dec.rs2]) &&
+              ex_txpg_d == ((mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_result_eff[15:0])
+                            : (b_wb && wb_rd == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                            : f_xpg(t_lr, t_l32, rf[id_rs1][15:0])))
+         else $fatal(1, "shift-last forward form (pc %h)", id_pc);
+`endif
    // (timing) f_wz(id_w, wb_fwd_v) for ex_b_zero, from the sources' byte-
    // zero flags in parallel instead of after the MUL / load-extract selects:
    // a MUL's product halves (registers), a load's dword by its size / offset
@@ -4692,10 +4748,7 @@ module pipeline_core
                // flags -> taken cone.
                // M6 register-sourced forwarding at the operand-register
                // inputs: youngest writer wins (MEM over WB over rf).
-               ex_a       <= f_wsh(id_w,
-                             (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
-                           : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
-                           : rf[id_rs1]);
+               ex_a       <= ex_a_d;   // (tmg: the shift forward last)
                // EN_SPFWD: the youngest older SP writer's value (one in EX
                // holds this op back via sp_busy)
                ex_lb_a    <= id_use_rs1 && lb1;
@@ -4703,26 +4756,16 @@ module pipeline_core
                // (§11.9) ex_xpg from rs1 as it will be in EX: each forwarding
                // candidate tested in parallel, the same select picks (timing:
                // the ex_b_zero pattern; ex_busy reads the register)
-               ex_txpg    <= (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_result_eff[15:0])
-                           : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
-                           : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
+               ex_txpg    <= ex_txpg_d;
                ex_lb_b    <= id_use_rs2 && lb2;
                ex_w       <= id_w;
                ex_sp      <= (mem_valid && mem_sp_we) ? mem_sp_new
                            : (wb_valid && wb_sp_we)   ? wb_sp_new : sp;
-               ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
-                           : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
-                           : rf[id_rd];
+               ex_c       <= ex_c_d;
                // The b-operand fully resolves HERE (reg / extended imm32 /
                // constant 1 for INC-DEC / forwarded result) so EX's adder
                // and comparators read pure registers.
-               ex_b       <= f_wsh(id_w,
-                             id_b_one ? 64'd1
-                           : id_b_imm
-                             ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
-                           : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
-                           : rf[dec.rs2]);
+               ex_b       <= ex_b_d;
                // (timing) "ex_b == 0" for DIV's divide-by-zero, registered:
                // each candidate reduced in parallel, the same select picks
                ex_b_zero  <= id_b_one ? 1'b0
