@@ -95,8 +95,8 @@ MUTS = [
      "wire         w_rng_cvt = i_rng_go && (i_rng_n > 28'(RNG_MAX) || w_rng_pq || r_mnt_pending);",
      "wire         w_rng_cvt = i_rng_go && (w_rng_pq || r_mnt_pending);"),
     ('whole_wins', 'range bits with FLUSH / INVALIDATE also queue a range op', TOP, ['range_combo'],
-     "(w_mmio_write_data[5:4] != 2'b00) &&\n                                 !w_mmio_write_data[1] && !w_mmio_write_data[2] &&",
-     "(w_mmio_write_data[5:4] != 2'b00) &&"),
+     "   wire        w_cache_rng_go  = r_cc_go && (r_cc_d[5:4] != 2'b00) &&\n                                 !r_cc_d[1] && !r_cc_d[2] && r_cop_nz;",
+     "   wire        w_cache_rng_go  = r_cc_go && (r_cc_d[5:4] != 2'b00) && r_cop_nz;"),
     ('hit_pend', 'a load hits a line a pending RANGE_INV is about to drop (the hit pipe not held off)', MR, ['inv_hit_range'],
      "                    (r_rng_pend && r_rng_inv) || (r_mnt_pending && r_mnt_mode);",
      "                    (r_mnt_pending && r_mnt_mode);"),
@@ -107,8 +107,8 @@ MUTS = [
      "        end else if (w_whole_start) begin\n            // the walk starting on this edge owns the request\n            r_mnt_pending <= 1'b0;\n        end",
      "        end\n        if (w_whole_start) r_mnt_pending <= 1'b0;"),
     ('whole_level', "the whole-cache go is a level again (every whole op walks twice)", TOP, ['range_inv', 'range_combo'],
-     "   wire        w_cache_flush_go = w_cc_wr1 && w_mmio_write_data[1];",
-     "   wire        w_cache_flush_go = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h005) && (w_mmio_addr[15:0] == 16'h0000) && w_mmio_write_data[1];"),
+     "   wire        w_cache_flush_go = r_cc_go && r_cc_d[1];",
+     "   wire        w_cache_flush_go = w_cc_dec && w_mmio_write_data[1];"),
     # (not here: w_dma_seterr masked by w_dm_abort, review 1 nit — it
     # matters only when DMA_EN = 0 lands in the single M_CHK cycle of a
     # block that would leave DDR; fixed by inspection)

@@ -2987,9 +2987,15 @@ module pipeline_core
    // INVALIDATE, as ICACHE_INV is — SD DMA review 1; ignored with LEN = 0;
    // with ICACHE_INV the fence covers it).  Everything ICACHE_INV does but the valid bits: of those only the
    // range's (g_vl's range sweep; 16 B lines: all of them).
+   // (timing: LEN != 0 and the range's "whole cache" test registered — the
+   // SoC's CACHE_OP_LEN is written long before the CACHE_CTRL store)
+   logic       r_cop_nz = 1'b0, r_cop_full = 1'b0;
+   always_ff @(posedge clk) begin
+      r_cop_nz   <= cop_n != 28'd0;
+      r_cop_full <= cop_n >= 28'(IC_LINES);
+   end
    wire        icinv_r    = RIINV_EN && mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
-                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] &&
-                            cop_n != 28'd0;
+                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && r_cop_nz;
    wire        icinv      = icinv_f || icinv_r;
 
    // ------------- HW_PERF_PLAN §5: line valid bits (IC_LB = 32) -------------
@@ -3047,7 +3053,7 @@ module pipeline_core
       wire               swgo_x = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv_f;
       wire               swgo  = swgo_x || icinv;
       // the range: first / last line index, wrapping past the last line
-      wire               rk_full = cop_n >= 28'(IC_LINES);
+      wire               rk_full = r_cop_full;
       wire [IC_IDXW-1:0] rk_s  = cop_line[IC_IDXW-1:0];
       wire [IC_IDXW-1:0] rk_e  = rk_s + IC_IDXW'(cop_n - 28'd1);
       wire               rk_wr = (29'(rk_s) + 29'(cop_n) - 29'd1) >= 29'(IC_LINES);
@@ -3060,9 +3066,12 @@ module pipeline_core
          bhi = int'(e >> VB_AW) - ((a > e[VB_AW-1:0]) ? 1 : 0);
          for (int b = 0; b < VB_N; b++) f_rkm[b] = wrap ? (b >= blo || b <= bhi) : (b >= blo && b <= bhi);
       endfunction
-      wire [VB_AW-1:0]   sw_na = rk_go ? rk_s[VB_AW-1:0] : swst ? ic_swa + 1'b1 : ic_swa;
+      // (timing: both candidate masks from registers / the SoC's registered
+      // range; rk_go — the late store-completion decode — only selects)
+      wire [VB_N-1:0]    m_go  = f_rkm(rk_s[VB_AW-1:0], rk_s, rk_e, rk_wr);
+      wire [VB_N-1:0]    m_run = f_rkm(swst ? ic_swa + 1'b1 : ic_swa, r_rk_s, r_rk_e, r_rk_wrap);
       always_ff @(posedge clk) if (ce)
-         r_sw_mask <= rk_go ? f_rkm(sw_na, rk_s, rk_e, rk_wr) : f_rkm(sw_na, r_rk_s, r_rk_e, r_rk_wrap);
+         r_sw_mask <= rk_go ? m_go : m_run;
       assign rk_busy = ic_sw && r_sw_rk;
       logic [VB_N-1:0]   bl, bs;
       logic              vl_any = 1'b0;

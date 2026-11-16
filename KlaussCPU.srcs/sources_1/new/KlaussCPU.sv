@@ -420,14 +420,17 @@ module KlaussCPU #(
                                   && w_mmio_write_data[0];
 
    // CACHE_CTRL (0xF005_0000) bit1 = FLUSH, bit2 = INVALIDATE — one-cycle
-   // pulses (the write's first cycle, w_cc_wr1 below) into mem_read_write's
+   // pulses (the write's first cycle, registered: r_cc_go below) into mem_read_write's
    // maintenance FSM (full-cache walk).  (They were levels for the store's
    // whole strobe, which re-armed the request after its walk had started:
    // every whole-cache op walked twice — SD DMA review 1.)
    // o_mnt_busy (CACHE_STATUS 0xF005_0010 bit0) reads high during the walk.
-   wire        w_cc_wr1;
-   wire        w_cache_flush_go = w_cc_wr1 && w_mmio_write_data[1];
-   wire        w_cache_inval_go = w_cc_wr1 && w_mmio_write_data[2];
+   // (timing: every maintenance go is a register — the write's first cycle
+   // and its data bits, a cycle later: still cycles before the store's ready)
+   logic       r_cc_go = 1'b0;
+   logic [6:0] r_cc_d  = '0;
+   wire        w_cache_flush_go = r_cc_go && r_cc_d[1];
+   wire        w_cache_inval_go = r_cc_go && r_cc_d[2];
    wire        w_cache_mnt_busy;      // the D-cache: a walk pending or running
    wire        w_ic_rk_busy;          // core 1: a RANGE_IINV sweep running
 
@@ -458,10 +461,15 @@ module KlaussCPU #(
                           (w_mmio_addr[15:0] == 16'h0000) && w_mmio_byte_en[0];
    logic       r_cc_dec = 1'b0;
    always_ff @(posedge i_Clk) r_cc_dec <= w_cc_dec;
-   assign      w_cc_wr1 = w_cc_dec && !r_cc_dec;
-   wire        w_cache_rng_go  = w_cc_wr1 && (w_mmio_write_data[5:4] != 2'b00) &&
-                                 !w_mmio_write_data[1] && !w_mmio_write_data[2] && (r_cop_n != 28'd0);
-   wire        w_cache_rng_inv = w_mmio_write_data[5];
+   logic       r_cop_nz = 1'b0;
+   always_ff @(posedge i_Clk) begin
+      r_cc_go  <= w_cc_dec && !r_cc_dec;
+      r_cc_d   <= w_mmio_write_data[6:0];
+      r_cop_nz <= r_cop_n != 28'd0;
+   end
+   wire        w_cache_rng_go  = r_cc_go && (r_cc_d[5:4] != 2'b00) &&
+                                 !r_cc_d[1] && !r_cc_d[2] && r_cop_nz;
+   wire        w_cache_rng_inv = r_cc_d[5];
 
    // L2_CTRL (0xF005_0028, HW_PERF_PLAN.md §6): [0] EN, [1] WBINV; a write
    // (first cycle of the store's DV, byte 0 enabled) goes to the L2, which
