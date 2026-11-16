@@ -161,10 +161,18 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     endtask
 
     // ---------------- power ----------------
+    // (a power cut also ends a data transfer in progress and drops a command
+    // frame being received: pwr_gen)
+    int pwr_gen = 0;
+    bit rd_active = 0, wr_active = 0, wr_busy_phase = 0, stop_req = 0;
     always @(pwr) begin
         st = S_IDLE; app_next = 0; acmd41_n = 0; ocr_ready = 0; w4 = 0; rca = 0;
         first_cmd = 1; pwr_clk = 0;
         cmd_oe = 0; dat_oe = 0;
+        if (!pwr) begin
+            pwr_gen++;
+            if (rd_active || wr_active) begin stop_req = 1; wr_busy_phase = 0; end
+        end
     end
 
     // ---------------- responses ----------------
@@ -217,7 +225,6 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     endtask
 
     // ---------------- data: read ----------------
-    bit rd_active = 0, wr_active = 0, wr_busy_phase = 0, stop_req = 0;
 
     task automatic send_block(input logic [7:0] b[], input int len, input bit bad_crc, input bit bad_end);
         logic [15:0] c [4];
@@ -282,10 +289,11 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             rd_active = 1;
             fork
                 rd_sender(blk, multi, kind);
-                begin wait (stop_req); repeat (2) @(posedge clk); end
+                begin wait (stop_req); if (pwr) repeat (2) @(posedge clk); end
             join_any
             disable fork;
-            @(negedge clk); rel_dat(4'hF);
+            if (pwr) @(negedge clk);
+            rel_dat(4'hF);
             rd_active = 0;
             if (st == S_DATA) st = S_TRAN;
         end join_none
@@ -381,9 +389,11 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             @(posedge clk);
             if (pwr && !cmd_oe && cmd === 1'b0) begin
                 logic [47:0] f;
+                int g;
+                g = pwr_gen;
                 f[47] = 1'b0;
                 for (int i = 46; i >= 0; i--) begin @(posedge clk); f[i] = cmd; end
-                handle(f);
+                if (g == pwr_gen) handle(f);
             end
         end
     end

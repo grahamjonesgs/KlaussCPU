@@ -299,6 +299,10 @@ module sd_native #(
     logic [15:0] r_dm_nblk;
     logic        r_dd_pend;
     logic        w_a_busy;          // the bus adapter has a transaction (below)
+    logic        w_dma_adv;         // SDM_DMA_ADDR advances by w_dma_adv_n words (below)
+    logic [1:0]  w_dma_adv_n;
+    logic        w_dma_ddone;       // a DMA read's last block is in DDR (DATA_DONE)
+    logic        w_dma_seterr;      // DMA_ERR: a block would leave DDR
     logic        w_dm_wend;         // a write DMA ends this cycle (the card side is done)
     // DMA_BUSY: the engine owns the FIFO and DDR; 0 = every DMA write has
     // been accepted at the L2 / DDR and none will be issued (m1).  A write
@@ -954,10 +958,14 @@ module sd_native #(
     logic [1:0]   r_a_gap = 2'd0;
     logic         r_a_cpl = 1'b0;      // it completed on the last edge (a read's data in r_a_rdata)
     logic [127:0] r_a_rdata;
-    initial begin
-        o_dma_req = 1'b0; o_dma_done = 1'b0; o_dma_write_DV = 1'b0; o_dma_read_DV = 1'b0;
-        o_dma_addr = 32'h0; o_dma_write_data = '0; o_dma_wdf_mask = 16'h0;
-    end
+    // the port's registers (power-up values: the FPGA's register init)
+    logic         r_o_req = 1'b0, r_o_done = 1'b0, r_o_wdv = 1'b0, r_o_rdv = 1'b0;
+    logic [31:0]  r_o_addr = 32'h0;
+    logic [127:0] r_o_wdata = '0;
+    logic [15:0]  r_o_mask = 16'h0;
+    assign o_dma_req = r_o_req;   assign o_dma_done = r_o_done;
+    assign o_dma_write_DV = r_o_wdv;  assign o_dma_read_DV = r_o_rdv;
+    assign o_dma_addr = r_o_addr;  assign o_dma_write_data = r_o_wdata;  assign o_dma_wdf_mask = r_o_mask;
     assign w_a_busy = (r_a_st != A_IDLE);
 
     // ---------------- the engine ----------------
@@ -995,16 +1003,16 @@ module sd_native #(
                        (!w_d_active && !r_dd_pend && w_level < r_d_blkw));
     assign w_dm_wend = w_m_idle && r_dm_wr && (!r_dm_on || !w_d_active);
     // the strobes into the register / FIFO block above
-    wire  w_dma_ddone  = w_dm_rend;                                  // (DATA_DONE if r_dd_pend)
-    wire  w_dma_seterr = (r_m_st == M_CHK) && r_dm_on && !w_blk_ok && !w_dm_kill;
+    assign w_dma_ddone  = w_dm_rend;                                  // (DATA_DONE if r_dd_pend)
+    assign w_dma_seterr = (r_m_st == M_CHK) && r_dm_on && !w_blk_ok && !w_dm_kill;
     assign w_dma_pop   = (r_m_st == M_GATH) && r_head_v && !w_dm_kill;
     assign w_dma_push  = (r_m_st == M_PUSH) && !w_dm_kill;
     assign w_dma_pword = (r_x_lane ^ r_x_k[0]) ? r_a_rdata[63:0] : r_a_rdata[127:64];
     // SDM_DMA_ADDR advances past a transaction's words when they are in DDR
     // (its write accepted) or in the FIFO (the last one pushed)
     wire  w_x_last_push = (r_m_st == M_PUSH) && (2'(r_x_k + 2'd1) == r_x_n);
-    wire  w_dma_adv     = !w_dm_kill && (((r_m_st == M_WAIT) && r_a_cpl && r_x_own && !r_dm_wr) || w_x_last_push);
-    wire  [1:0] w_dma_adv_n = r_x_n;
+    assign w_dma_adv     = !w_dm_kill && (((r_m_st == M_WAIT) && r_a_cpl && r_x_own && !r_dm_wr) || w_x_last_push);
+    assign w_dma_adv_n   = r_x_n;
     wire  w_x_go        = (r_m_st == M_XFER) && !w_a_busy && !w_dm_kill && !i_rst;
 
     // the next transaction of the block: its lane and size from the address
@@ -1119,40 +1127,40 @@ module sd_native #(
     // until the done pulse; a write is accepted (posted at the L2) on its
     // ready, then the blitter's two-cycle settle before the release
     always_ff @(posedge i_Clk) begin
-        o_dma_done <= 1'b0;
+        r_o_done <= 1'b0;
         r_a_cpl    <= 1'b0;
         case (r_a_st)
             A_IDLE: if (w_x_go) begin
                 r_a_wr           <= !r_dm_wr;
-                o_dma_addr       <= {r_dma_addr[31:4], 4'b0000};
-                o_dma_write_data <= r_x_wd;
-                o_dma_wdf_mask   <= r_x_mask;
-                o_dma_req        <= 1'b1;
+                r_o_addr       <= {r_dma_addr[31:4], 4'b0000};
+                r_o_wdata <= r_x_wd;
+                r_o_mask   <= r_x_mask;
+                r_o_req        <= 1'b1;
                 r_a_st           <= A_REQ;
             end
             A_REQ: if (i_dma_grant) begin
-                if (r_a_wr) o_dma_write_DV <= 1'b1;
-                else        o_dma_read_DV  <= 1'b1;
+                if (r_a_wr) r_o_wdv <= 1'b1;
+                else        r_o_rdv  <= 1'b1;
                 r_a_st <= A_DRV;
             end
             A_DRV: if (i_dma_ready) begin
                 r_a_cpl <= 1'b1;
                 if (r_a_wr) begin
-                    o_dma_write_DV <= 1'b0;
+                    r_o_wdv <= 1'b0;
                     r_a_gap        <= 2'd2;
                     r_a_st         <= A_GAP;
                 end else begin
                     r_a_rdata     <= i_dma_read_data;
-                    o_dma_read_DV <= 1'b0;
-                    o_dma_done    <= 1'b1;
-                    o_dma_req     <= 1'b0;
+                    r_o_rdv <= 1'b0;
+                    r_o_done    <= 1'b1;
+                    r_o_req     <= 1'b0;
                     r_a_st        <= A_IDLE;
                 end
             end
             A_GAP: begin
                 if (r_a_gap == 2'd0) begin
-                    o_dma_done <= 1'b1;
-                    o_dma_req  <= 1'b0;
+                    r_o_done <= 1'b1;
+                    r_o_req  <= 1'b0;
                     r_a_st     <= A_IDLE;
                 end else r_a_gap <= r_a_gap - 2'd1;
             end
