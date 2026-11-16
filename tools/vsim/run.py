@@ -803,7 +803,13 @@ def _mpu_variant(seed, p_sys=0.05, irq=False):
     r13/r14) turns the MPU off on an ACCESS fault and retries the faulting
     instruction, and turns it on again on a SYSCALL.  So every instruction
     runs exactly once with its full effect, after faults at arbitrary
-    points: the final state must equal the plain program's."""
+    points: the final state must equal the plain program's.
+    (HW_PERF_PLAN §8) The handler counts the MPU faults it retried in TP,
+    data faults in [15:0] and fetch faults in [31:16] (the user HALT ends
+    with r13 = TP), and halts with r13 =
+    0xBAD00 | cause on any exception other than SYSCALL / ACCESS_*, so an
+    MPU that never denies, or a build without the MPU (its MPU registers are
+    ILLEGAL: the old handler retried them forever), cannot pass."""
     import random, randprog
     from kasm import Asm, MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G
     from tests import _xsetup, _to_user, _mpu_reg, _mpu_on, HALT_W
@@ -816,6 +822,7 @@ def _mpu_variant(seed, p_sys=0.05, irq=False):
             self.inj = False
             self.n_inj = 0
             _xsetup(self)
+            self.setr(1, 0); self.mtsr('tp', 1)              # the MPU-fault count
             for n in range(16):
                 if rnd.random() < 0.75:
                     lo, hi, guard_ok = rnd.choice(areas)
@@ -847,18 +854,30 @@ def _mpu_variant(seed, p_sys=0.05, irq=False):
     asm.label('h')
     asm.mtsr('scratch0', 13); asm.mtsr('scratch1', 14)
     asm.mfsr(13, 'eaddr'); asm.setr(14, HALT_W)
-    asm.fbr('ne', 13, 14, 'h_nh'); asm.halt()
+    asm.fbr('ne', 13, 14, 'h_nh')
+    asm.mfsr(13, 'tp'); asm.halt()                        # the user HALT: r13 = MPU faults
     asm.label('h_nh')
     asm.mfsr(13, 'ecause'); asm.alui('and', 13, 13, 0xFF, sgn=False)
-    asm.setr(14, 0x100)
-    asm.fbr('eq', 13, 4, 'h_set', imm=True)               # SYSCALL: MPU on
+    asm.fbr('eq', 13, 4, 'h_on', imm=True)                # SYSCALL: MPU on
+    asm.addi_s(14, 13, -7); asm.fbr('ule', 14, 2, 'h_acc', imm=True)   # ACCESS_LD / ST / FETCH
+    asm.alui('or', 13, 13, 0xBAD00, sgn=False); asm.halt()             # anything else: stop
+    asm.label('h_on')
+    asm.setr(14, 0x100); asm.jmp('h_set')
     # ACCESS_* on MMIO is the stage 1 user rule (with IRQs, randprog's
     # INT_MASK store): step over it; any other ACCESS_*: MPU off, retry
+    asm.label('h_acc')
     asm.mfsr(13, 'eaddr'); asm.shift_n('shr', 13, 13, 28); asm.setr(14, 15)
     asm.fbr('ne', 13, 14, 'h_off')
     asm.getsp(13); asm.ld(64, 14, 13); asm.addi_s(14, 14, 4); asm.st(64, 14, 13)
     asm.jmp('h_ret')
     asm.label('h_off')
+    asm.mfsr(13, 'ecause'); asm.alui('and', 13, 13, 0xFF, sgn=False)
+    X_FE = 9                                              # ACCESS_FETCH
+    asm.mfsr(14, 'tp'); asm.inc(14)                       # data faults: TP[15:0]
+    asm.addi_s(13, 13, -X_FE); asm.fbr('ne', 13, 0, 'h_cnt', imm=True)
+    asm.setr(13, 0xFFFF); asm.alu('add', 14, 14, 13)      # fetch faults: TP[31:16]
+    asm.label('h_cnt')
+    asm.mtsr('tp', 14)
     asm.setr(14, 0)
     asm.label('h_set')
     asm.mtsr('status', 14)
@@ -869,9 +888,13 @@ def _mpu_variant(seed, p_sys=0.05, irq=False):
 
 
 def cmd_mpudiff(a):
+    """MMU stage 2 (MMU_PLAN §10): _mpu_variant against the plain program.
+    The MPU is off on the A7 (CORE1_MPU_EN = 0), so this always elaborates
+    MPU_EN = 1 (as VSIM_MPU_EN=1 does), whatever the environment."""
     import randprog
-    exe = build(None)
-    fails = n_exc = 0
+    with _env(['VSIM_MPU_EN=1']):
+        exe = build(None)
+    fails = n_exc = n_mpu = n_mpuf = 0
     for s in range(a.seed0, a.seed0 + a.seeds):
         for lat in a.lats:
             plus = [f'+LAT={lat}'] + ([f'+IRQ_PERIOD={151 + s % 50}'] if a.irq else []) + a.plus
@@ -879,18 +902,28 @@ def cmd_mpudiff(a):
             asm, n = _mpu_variant(s, irq=a.irq)
             sb, _ = run(exe, asm, f'pb{s}_{lat}', plus)
             n_exc += int(sb.get('exc_n', 0))
+            nf = int(sb.get('r13', 'f' * 16), 16)
             keys = [f'r{i}' for i in list(range(1, 13)) + [15]] + \
                    sorted({k for k in list(sa) + list(sb) if re.fullmatch(r'm[0-9a-f]{8}', k) and k != 'm00180000'})
             bad = [k for k in keys if sa.get(k) != sb.get(k)]
+            if nf >> 8 == 0xBAD or nf >= 1 << 32:
+                bad.append(f'unexpected exception, cause {nf & 0xFF}' if nf >> 8 == 0xBAD else 'no fault count')
+            else:
+                n_mpu += nf & 0xFFFF
+                n_mpuf += nf >> 16
             ok = sa.get('end') == 'park' and sb.get('end') == 'park' and sb.get('kind') == '0' and not bad
             if 'fatal' in (sa['log'] + sb['log']).lower():
                 ok = False
             if not ok:
                 fails += 1
             if not ok or a.verbose:
-                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} exc={sb.get("exc_n")} '
+                print(f'{"same" if ok else "DIFF"} seed={s} lat={lat} exc={sb.get("exc_n")} mpu_faults={nf:#x} '
                       f'end {sa.get("end")}/{sb.get("end")} kind {sb.get("kind")} {bad[:4]}')
-    print(f'{fails} differing; {n_exc} exception entries')
+    if n_mpu == 0 or n_mpuf == 0:
+        # vacuity: no data (or fetch) MPU fault anywhere: those checks never denied
+        fails += 1
+        print(f'FAIL: MPU faults retried: {n_mpu} data, {n_mpuf} fetch (both must be > 0)')
+    print(f'{fails} differing; {n_exc} exception entries, MPU faults retried: {n_mpu} data, {n_mpuf} fetch')
     return 1 if fails else 0
 
 
