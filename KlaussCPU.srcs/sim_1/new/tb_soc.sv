@@ -132,6 +132,10 @@ module tb_soc;
       .ddr2_dm(ddr2_dm), .ddr2_odt()
    );
 
+   // the SD card on the native bus (sd_card_sync: the SD DMA tests; idle
+   // unless a program powers the slot and talks to it)
+   sd_card_sync sdcard (.clk(dut.i_Clk), .sck(o_SD_SCK), .pwr(!o_SD_RESET), .cmd(io_SD_CMD), .dat(io_SD_DAT));
+
    // silicon powers up with this at 0 (bitstream init); xsim needs the deposit
    initial dut.r_start_wait_counter = 32'h0;
 
@@ -248,6 +252,53 @@ module tb_soc;
       end
    end
 
+   // ---------------- SD DMA transactions (master E) ----------------
+   longint runcyc_all = 0;
+   always @(posedge dut.i_Clk) runcyc_all++;
+   // (SD_DMA_PROBE: run.py defines it for an RTL with master E)
+   int sd_dma_wr = 0, sd_dma_rd = 0;
+`ifdef SD_DMA_PROBE
+   always @(posedge dut.i_Clk) if (dut.mem_read_write.r_grant_sd && dut.mem_read_write.i_ddr_mem_ready) begin
+      if (dut.mem_read_write.mig_write_DV) sd_dma_wr++; else sd_dma_rd++;
+   end
+   // cache maintenance timing (SD DMA spec v1.2 walk timing): one line per
+   // D-cache walk ("WALK range|whole lines= dirty_wb= cycles=", from the
+   // WAIT -> MAINT edge to MNT_BUSY's drop, queue wait excluded) and per
+   // RANGE_IINV sweep ("RKSWEEP lines= cycles=", MNT_BUSY's share)
+   longint wk_t0 = 0, rk_t0 = 0;
+   int wk_wb = 0, wk_n = 0, rk_n = 0;
+   bit wk_q = 0, rk_q = 0, wk_rng = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.mem_read_write.r_mnt_active && !wk_q) begin
+         wk_t0 = runcyc_all; wk_wb = 0; wk_rng = dut.mem_read_write.r_mnt_rng;
+         wk_n = dut.mem_read_write.r_mnt_rng ? int'(dut.mem_read_write.r_rw_left) : 2048;
+      end
+      if (dut.mem_read_write.state == 16'd16384 && dut.mem_read_write.w_cache_ddr_ready) wk_wb++;
+      if (!dut.mem_read_write.r_mnt_active && wk_q)
+         $display("TB_SOC: WALK %s sets=%0d dirty_wb=%0d cycles=%0d", wk_rng ? "range" : "whole", wk_n, wk_wb, runcyc_all - wk_t0);
+      wk_q = dut.mem_read_write.r_mnt_active;
+      if (dut.w_ic_rk_busy && !rk_q) begin rk_t0 = runcyc_all; rk_n = int'(dut.r_cop_n); end
+      if (!dut.w_ic_rk_busy && rk_q)
+         $display("TB_SOC: RKSWEEP lines=%0d cycles=%0d", rk_n, runcyc_all - rk_t0);
+      rk_q = dut.w_ic_rk_busy;
+   end
+   // +DCP<k>=<hex PA> (k = 0..7): the D-cache's state of that line at HALTED
+   task automatic dcp_dump();
+      for (int k = 0; k < 8; k++) begin
+         logic [31:0] pa;
+         if ($value$plusargs($sformatf("DCP%0d=%%h", k), pa)) begin
+            automatic int ix = pa[14:5];
+            automatic logic h0 = dut.mem_read_write.cache_val_addr_way0[ix] == {1'b1, pa[31:15]};
+            automatic logic h1 = dut.mem_read_write.cache_val_addr_way1[ix] == {1'b1, pa[31:15]};
+            automatic logic d  = h0 ? dut.mem_read_write.cache_dirty_way0[ix] : h1 ? dut.mem_read_write.cache_dirty_way1[ix] : 1'b0;
+            $display("TB_SOC: DCP%0d %08x valid=%0d dirty=%0d", k, pa, h0 || h1, d);
+         end
+      end
+   endtask
+`else
+   task automatic dcp_dump(); endtask
+`endif
+
    // ---------------- L2 drains in VGA's / DMA's window (review 1 M2) --------
    int rt_bad = 0, rt_need = 0;
 `ifdef L2_PROBE
@@ -340,10 +391,20 @@ module tb_soc;
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_ref,
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_wtr);
          $display("TB_SOC: VGA lines=%0d max_fetch=%0d underflows=%0d", vga_lines, vga_age_max, vga_under);
+         $display("TB_SOC: SDC cmds=%0d rd_blocks=%0d wr_blocks=%0d wr_bad=%0d host_err=%0d rd_bad_sent=%0d sd_dma_wr=%0d sd_dma_rd=%0d",
+                  sdcard.n_cmds, sdcard.blocks_read, sdcard.blocks_written, sdcard.wr_bad, sdcard.host_err,
+                  sdcard.rd_bad_sent, sd_dma_wr, sd_dma_rd);
          $display("TB_SOC: VGA reads=%0d read_cycles=%0d grant_cyc=%0d", vga_rd_n, vga_rd_cyc, vga_gnt_cyc);
 `ifdef L2_PROBE
          $display("TB_SOC: L2 rt drains bad=%0d need=%0d", rt_bad, rt_need);
 `endif
+         dcp_dump();
+         // the final registers (runs without a retire trace)
+         begin
+            string rs = "TB_SOC: REGS";
+            for (int i = 0; i < 16; i++) rs = {rs, $sformatf(" r%0d=%016x", i, dut.pipeline_core_i.rf[i])};
+            $display("%s", rs);
+         end
          $display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);
          $fclose(uart_f); $fclose(trace_f);
          $finish;
