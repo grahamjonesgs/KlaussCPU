@@ -1236,6 +1236,32 @@ def cmd_socsddma(a):
     return 1 if fails else 0
 
 
+def cmd_socsdabort(a):
+    """runtime-96's stop budget (sddma.t_abort): DMA_EN = 0 / SDM_FIFO[31]
+    -> DMA_BUSY = 0 under VGA + blitter + CPU misses + WBINVs, reads and
+    writes, polling with traffic or tight, at each --miglat"""
+    import sddma
+    exe = build_soc(None)
+    fails = 0
+    for lat in a.miglat:
+        for write in (False, True):
+            for fifo in (False, True):
+                for tight in (False, True):
+                    prog = sddma.t_abort(a.rounds, write=write, fifo=fifo, tight=tight)
+                    tag = f'sdab_{lat}_{int(write)}{int(fifo)}{int(tight)}'
+                    r = run_soc(exe, prog, tag, timeout=14400, plus=['+VGA_V0=478', f'+MIGLAT={lat}'] + a.plus)
+                    m = re.search(r'SDABORT (.*)', r['log'])
+                    ok = 'HALTED' in r['log'] and m is not None
+                    fails += not ok
+                    print(f'{"pass" if ok else "FAIL"} MIGLAT={lat} {"write" if write else "read"} '
+                          f'{"FIFO reset" if fifo else "DMA_EN=0"} {"tight" if tight else "traffic"} poll: '
+                          f'{m.group(1) if m else ""} ' + ' '.join(re.findall(r'VGA lines=\d+ max_fetch=\d+ underflows=\d+', r['log'])))
+                    if ok:
+                        shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def cmd_socsdvga(a):
     """SD DMA alongside VGA scanout, CPU miss traffic, L2 WBINV walks and
     (--blit) the blitter (sddma.t_vga), against the same run without the SD
@@ -2437,6 +2463,8 @@ def main():
     ff.add_argument('--soc', type=int, default=0, help='also this many seeds through tb_soc')
     ff.add_argument('--plus', action='append', default=[])
     sub.add_parser('socsd')
+    sab = sub.add_parser('socsdabort'); sab.add_argument('--rounds', type=int, default=40)
+    sab.add_argument('--miglat', type=int, nargs='+', default=[36, 44]); sab.add_argument('--plus', action='append', default=[])
     sdv = sub.add_parser('socsdvga'); sdv.add_argument('--lines', type=int, default=120)
     sdv.add_argument('--wbinv-every', type=int, default=1500)
     sdv.add_argument('--miglat', type=int, nargs='+', default=[36, 44])
@@ -2535,6 +2563,8 @@ def main():
         sys.exit(cmd_socwalk(a))
     elif a.cmd == 'fwdfuzz':
         sys.exit(cmd_fwdfuzz(a))
+    elif a.cmd == 'socsdabort':
+        sys.exit(cmd_socsdabort(a))
     elif a.cmd == 'socsdvga':
         sys.exit(cmd_socsdvga(a))
     elif a.cmd == 'socsddma':

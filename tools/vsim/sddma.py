@@ -751,6 +751,71 @@ def t_vga(lines=120, wbinv_every=1500, sd=True, blit=False, sd_write=False, span
     return a
 
 
+def t_abort(rounds=40, write=False, fifo=False, tight=False, wbinv_every=150, blit=True):
+    """runtime-96's stop budget: DMA_EN = 0 (or, fifo, SDM_FIFO[31]) -> DMA_BUSY
+    = 0 under stress — VGA scanout, the blitter FILLing back to back, a
+    miss-heavy CPU loop with L2 WBINVs.  Each round starts an open-ended DMA
+    (a read stream into 6 MiB, or a write stream from it), runs a
+    pseudo-random number of traffic iterations (so the abort lands anywhere
+    in a block), aborts, then polls DMA_BUSY — between traffic iterations,
+    or (tight) in a tight loop as the kernel does — then CMD12 and a FIFO
+    reset.  tb_soc's SDABORT line has the latencies and the per-transaction
+    bus waits."""
+    a = SdAsm()
+    a.setr(15, SD); a.setr(14, CC); a.setr(12, 0)
+    SB = 0x00600000
+    a.setr(1, (1 << 18) | (1 << 17) | 0); a.st(64, 1, 15, 0); a.wr(15, SDM_CFG, 1)
+    a.setr(13, 0xF0110000)                      # VGA
+    for off, v in ((0x08, 0x400000), (0x10, 1280), (0x38, 480), (0x28, 0), (0x18, 4), (0x00, 1)):
+        a.setr(1, v); a.st(64, 1, 13, off)
+    if blit:
+        a.setr(13, 0xF00E0000)
+        for off, v in ((0x10, 0x500000), (0x18, 1280), (0x30, 640), (0x38, 64), (0x40, 0x1234)):
+            a.setr(1, v); a.st(64, 1, 13, off)
+    a.setr(10, 0x100000); a.setr(8, 0); a.setr(7, wbinv_every); a.setr64(6, 0x2545F4914F6CDD1D)
+    a.setr(4, rounds)
+    a.label('round')
+    a.dma(25 if write else 18, 2000, SB, 512, 0, 1 if write else 0)
+    # r9 = 40 + (lfsr >> 20) & 511 traffic iterations
+    a.setr64(1, 6364136223846793005); a.mul(6, 6, 1); a.setr(1, 1442695040888963407 & 0xFFFFFFFF); a.alu('add', 6, 6, 1)
+    a.shift_n('shr', 9, 6, 20); a.setr(1, 511); a.alu('and', 9, 9, 1); a.addi_s(9, 9, 40)
+    a.label('tr')
+    a.call('traffic')
+    a.dec(9); a.fbr('ne', 9, 0, 'tr', imm=True)
+    if fifo:
+        a.wr(15, SDM_FIFO, 0x80000000)
+    else:
+        a.wr(15, SDM_CFG, 1)                     # DMA_EN = 0
+    a.label('pw')
+    if not tight:
+        a.call('traffic')
+    a.ld(64, 1, 15, SDM_STATUS); a.setr(2, ST_DMA_BUSY); a.alu('and', 1, 1, 2)
+    a.fbr('ne', 1, 0, 'pw', imm=True)
+    a.stop()
+    a.wr(15, SDM_FIFO, 0x80000000)
+    a.dec(4); a.fbr('ne', 4, 0, 'round', imm=True)
+    a.halt()
+    # one traffic iteration (_vga_prog's): a strided miss / write-back walk,
+    # the blitter restarted when idle, an L2 WBINV every wbinv_every
+    a.label('traffic')
+    a.alu('add', 11, 10, 8)
+    a.ld(64, 2, 11, 0); a.addi_s(2, 2, 1); a.st(64, 2, 11, 0)
+    a.ld(64, 3, 11, 0x1000); a.st(64, 3, 11, 0x1008)
+    if blit:
+        a.ld(64, 2, 13, 0x08); a.setr(3, 1); a.alu('and', 2, 2, 3)
+        a.fbr('ne', 2, 0, 'nb', imm=True)
+        a.setr(2, 2); a.st(64, 2, 13, 0x08); a.setr(2, 1); a.st(64, 2, 13, 0x00)
+        a.label('nb')
+    a.setr(2, 37 * 64); a.alu('add', 8, 8, 2); a.setr(2, 0x80000 - 1); a.alu('and', 8, 8, 2)
+    a.dec(7); a.fbr('ne', 7, 0, 'nw', imm=True)
+    a.setr(7, wbinv_every)
+    a.setr(2, 3); a.st(64, 2, 14, 0x28)
+    a.label('wp'); a.ld(64, 2, 14, 0x28); a.setr(3, 0x100); a.alu('and', 2, 2, 3); a.fbr('ne', 2, 0, 'wp', imm=True)
+    a.label('nw')
+    a.ret()
+    return a
+
+
 def tests():
     return [
         ('rd_m3_nowait', *t_m3(False)),

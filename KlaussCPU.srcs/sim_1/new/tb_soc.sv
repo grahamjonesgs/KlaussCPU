@@ -274,6 +274,30 @@ module tb_soc;
       if (dut.vga_ctrl_i.scanout.o_dma_req && !dut.vga_ctrl_i.scanout.i_dma_grant) vga_gw++;
       else begin if (vga_gw > vga_gw_max) vga_gw_max = vga_gw; vga_gw = 0; end
    end
+   // SD DMA abort latency (runtime-96's stop budget): cycles from an
+   // SDM_CFG write with DMA_EN = 0 (or a FIFO reset) during DMA_BUSY to
+   // DMA_BUSY = 0, max per kind; and each 16 B transaction's wait for the
+   // bus (req -> grant), as a histogram
+   longint ab_t0 = -1; int ab_kind = 0; int ab_max[2] = '{0, 0}; int ab_n[2] = '{0, 0};
+   int bw = 0, bw_max = 0;
+   int bw_h[7] = '{0, 0, 0, 0, 0, 0, 0};        // < 16, < 64, < 256, < 1024, < 2048, < 4096, more
+   always @(posedge dut.i_Clk) begin
+      if (ab_t0 < 0 && dut.sd_spi_i.native_i.w_dma_busy &&
+          (dut.sd_spi_i.native_i.w_cfg_dma_off || dut.sd_spi_i.native_i.w_fifo_rs)) begin
+         ab_t0 = runcyc_all; ab_kind = dut.sd_spi_i.native_i.w_fifo_rs ? 1 : 0;
+      end else if (ab_t0 >= 0 && !dut.sd_spi_i.native_i.w_dma_busy) begin
+         if (int'(runcyc_all - ab_t0) > ab_max[ab_kind]) ab_max[ab_kind] = int'(runcyc_all - ab_t0);
+         ab_n[ab_kind]++;
+         ab_t0 = -1;
+      end
+      if (dut.w_sd_dma_req && !dut.w_sd_dma_grant) bw++;
+      else if (dut.w_sd_dma_req && dut.w_sd_dma_grant && bw >= 0) begin
+         bw_h[bw < 16 ? 0 : bw < 64 ? 1 : bw < 256 ? 2 : bw < 1024 ? 3 : bw < 2048 ? 4 : bw < 4096 ? 5 : 6]++;
+         if (bw > bw_max) bw_max = bw;
+         bw = -1;
+      end
+      if (!dut.w_sd_dma_req) bw = 0;
+   end
    // cache maintenance timing (SD DMA spec v1.2 walk timing): one line per
    // D-cache walk ("WALK range|whole lines= dirty_wb= cycles=", from the
    // WAIT -> MAINT edge to MNT_BUSY's drop, queue wait excluded) and per
@@ -438,6 +462,8 @@ module tb_soc;
                   sdcard.rd_bad_sent, sd_dma_wr, sd_dma_rd);
 `ifdef SD_DMA_PROBE
          $display("TB_SOC: SDLAT req_to_ready_max=%0d dv_to_ready_max=%0d vga_grant_wait_max=%0d", sd_lat_max, sd_dv_max, vga_gw_max);
+         $display("TB_SOC: SDABORT en_n=%0d en_max=%0d fifo_n=%0d fifo_max=%0d busw_max=%0d busw_hist=%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                  ab_n[0], ab_max[0], ab_n[1], ab_max[1], bw_max, bw_h[0], bw_h[1], bw_h[2], bw_h[3], bw_h[4], bw_h[5], bw_h[6]);
 `endif
          $display("TB_SOC: VGA reads=%0d read_cycles=%0d grant_cyc=%0d", vga_rd_n, vga_rd_cyc, vga_gnt_cyc);
 `ifdef L2_PROBE
