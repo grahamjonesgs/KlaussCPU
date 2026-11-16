@@ -36,7 +36,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic [63:0]  m_wdata, m_rdata = '0, m_rdata_next = '0;
    logic [7:0]   m_be;
    logic         m_zl = 1'b0;      // DCBZ: zero the whole 32 B line (HW_PERF_PLAN §1)
-   logic         m_next_valid = 1'b0, m_ready = 1'b0;
+   logic         m_next_valid = 1'b0, m_ready_q = 1'b0;
+   logic         m_ready;          // m_ready_q, or the MMIO hold below
    logic [255:0] m_line = '0;       // HW_PERF_PLAN §5: the 32 B line answer
    logic         m_line_v = 1'b0;
    logic         perf_itlb;         // micro-ITLB refills (event)
@@ -140,9 +141,16 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic [63:0] mem_lo [0:LO_DW-1];
    logic [63:0] mem_hi [0:HI_DW-1];
 
+   // an MMIO scratch RAM, 0xF0FD_0000..0xF0FD_00FF (32 dwords, byte enables):
+   // a device that reads back what was written, for stack frames popped
+   // from MMIO (HW_PERF_PLAN §8: RET / LEAVERET with the frame in MMIO)
+   logic [63:0] mmio_ram [0:31];
+   initial for (int i = 0; i < 32; i++) mmio_ram[i] = 64'h0;
+
    function automatic logic [63:0] rd_dw(input logic [31:0] a);
       if (a[31:28] == 4'hF) begin
          if (a[27:16] == 12'h001 && (a[15:0] & 16'hFFF8) == 16'h0010) rd_dw = 64'h2;
+         else if (a[27:16] == 12'h0FD && a[15:8] == 8'h00) rd_dw = mmio_ram[a[7:3]];
          else if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) rd_dw = {60'b0, int_mask_o};
          else rd_dw = 64'h0;
       end
@@ -187,6 +195,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          // a non-coherent writer (DMA / core 2): 0xF0FE_0000 = the address,
          // 0xF0FE_0008 = a dword written there behind the core's back (no
          // I-cache snoop: the core sees an MMIO store)
+         if (a[27:16] == 12'h0FD && a[15:8] == 8'h00)
+            for (int i = 0; i < 8; i++) if (be[i]) mmio_ram[a[7:3]][i*8 +: 8] = wd[i*8 +: 8];
          if (a[27:16] == 12'h0FE && a[15:0] == 16'h0000) poke_a = wd[31:0];
          if (a[27:16] == 12'h0FE && a[15:0] == 16'h0008) begin
             if (poke_a < 32'(LO_DW*8)) mem_lo[poke_a[31:3]] = wd;
@@ -211,10 +221,27 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic        ld_pend = 1'b0;
    logic [255:0] ld_line;
    longint      n_line = 0;
+   // The SoC's MMIO side answers one request per DV pulse: its ready is the
+   // request strobe delayed (KlaussCPU r_mmio_*_dv_d2), so it stays high for
+   // as long as DV does, and the Ethernet bridge waits in S_COOL for DV to
+   // drop.  mmio_hold models that: once the core has seen an MMIO ready, if
+   // it keeps DV up at an MMIO address in the next cycle (a new address or
+   // not), ready stays high and nothing new is accepted until DV drops
+   // (mmio_hold= counts those cycles: 0 for a core that follows the
+   // protocol).  A core that drops DV after the answer, or moves to DRAM,
+   // sees the old model's timing.  (+MMIOPULSE: the old model only.)
+   bit          mmio_pulse = 0;
+   logic        mmio_seen = 1'b0;      // an MMIO ready was visible last cycle (DV up)
+   wire         dv_mmio   = (m_read_DV || m_write_DV) && m_addr[31:28] == 4'hF;
+   wire         mmio_hold = mmio_seen && dv_mmio && !mmio_pulse;
+   assign m_ready = m_ready_q || mmio_hold;
+   longint      n_mmio_hold = 0;
    always @(posedge clk) begin
-      m_ready <= 1'b0;
+      m_ready_q <= 1'b0;
       m_line_v <= 1'b0;
       mask_wr <= 1'b0;
+      mmio_seen <= !rst && m_ready && dv_mmio;
+      if (!rst && mmio_hold) n_mmio_hold++;
       if (!rst && ld_pend) begin
          if (ld_cnt > 1) ld_cnt <= ld_cnt - 1;
          else begin
@@ -266,7 +293,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                   end
                end
             end
-            m_ready   <= 1'b1;
+            m_ready_q <= 1'b1;
             in_flight <= 1'b0;
          end
       end
@@ -632,7 +659,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       for (int i = 0; i < 8; i++) $fdisplay(f, "perf%0d=%0d", i, pst[i]);
       $fdisplay(f, "br=%0d br_taken=%0d fbr_taken=%0d ic_miss=%0d ic_fill=%0d", n_br, n_br_taken,
                 n_fbr_taken, n_ic_miss, n_ic_fill);
-      $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d mmio_rd=%0d", n_rd, n_wr, n_mmio_wr, n_mmio_rd);
+      $fdisplay(f, "bus_rd=%0d bus_wr=%0d mmio_wr=%0d mmio_rd=%0d mmio_hold=%0d", n_rd, n_wr, n_mmio_wr, n_mmio_rd,
+                n_mmio_hold);
       $fdisplay(f, "posted=%0d nopost_dram=%0d zero_lines=%0d", n_post, n_nopost_dram, n_zl);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
       $fdisplay(f, "uart_n=%0d lcd_n=%0d lcdrst_n=%0d", uart_n, lcd_n, lcdrst_n);
@@ -689,6 +717,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       void'($value$plusargs("MAXC=%d", maxc));
       void'($value$plusargs("EDW=%h", edw));
       void'($value$plusargs("HIT=%d", hit_pct));
+      mmio_pulse = $test$plusargs("MMIOPULSE");
       void'($value$plusargs("LDLY=%d", ldly));
       void'($value$plusargs("LDLYR=%d", ldly_r));
       void'($value$plusargs("LDLYA=%h", ldly_a));

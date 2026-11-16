@@ -562,6 +562,11 @@ def cmd_test(a):
             bad = check(st, exp)
             if 'fatal' in st.get('log', '').lower() or 'assert' in st.get('log', '').lower():
                 bad.append('simulator assertion: ' + st['log'][-500:])
+            if st.get('mmio_hold', '0') != '0':
+                # HW_PERF_PLAN §8: the core kept DV up at an MMIO address
+                # after the device's answer (the SoC's MMIO side never
+                # answers that: it deadlocks there)
+                bad.append(f'mmio_hold={st["mmio_hold"]}: DV held past an MMIO answer')
             if bad:
                 fails += 1
                 print(f'FAIL {tn}: ' + '; '.join(bad))
@@ -1927,6 +1932,71 @@ def cmd_socx(a):
     return 1 if fails else 0
 
 
+def _frame_progs():
+    """HW_PERF_PLAN §8 on the SoC: supervisor RET / LEAVERET popping their
+    frame from MMIO registers that read back (INT_VEC0 / 1 at 0xF00F_0010 /
+    0x18, 32 bits), RAS-predicted or not, and a MEMGET32 spanning two MMIO
+    dwords on the peripheral side (INT_VEC) and on the Ethernet bridge's
+    (ETH_RX_SLOTS at 0xF007_0000, 0x802 after the load; 0xF007_0008 reads
+    0).  LEAVERET and the spanning MEMGET32 read two MMIO dwords; before §8
+    the second read went out under the first's DV and deadlocked (the
+    peripheral side's ready stays high while DV does, the bridge waits in
+    S_COOL for DV low).  Each program stores r2 / r3 / r5 at 0x10000 and the
+    expected values are checked from the final registers."""
+    from kasm import Asm
+    DATA, GOOD, MB = 0x10000, 0x10300, 0xF00F0010
+    out = []
+    for kind in ('ret', 'leaveret'):
+        for called in (False, True):
+            a = Asm()
+            a.setr(12, DATA); a.setr(11, GOOD); a.setr(9, MB); a.getsp(13); a.setr(4, 0)
+            (a.call if called else a.jmp)('f')
+            a.label('back'); a.getsp(2); a.mov(3, 15); a.setsp(13)
+            a.halt()
+            a.label('f')
+            a.leapc(6, 'back'); a.st(32, 6, 9, 8); a.st(32, 11, 9, 0); a.setr(15, 0)
+            if kind == 'ret':
+                a.addi_s(10, 9, 8); a.setsp(10); a.ret()
+            else:
+                a.mov(15, 9); a.leaveret()
+            a.setr(4, 0xBAD); a.halt()
+            out.append((f'{kind}_{"called" if called else "jmp"}', a,
+                        {'r2': MB + 16, 'r3': GOOD if kind == 'leaveret' else 0, 'r4': 0}))
+    a = Asm()
+    a.setr(9, MB); a.setr(3, 0x11223344); a.st(32, 3, 9, 0); a.setr(3, 0x55667799); a.st(32, 3, 9, 8)
+    # (the MMIO decodes take the byte address: the 1st read, at +5, matches
+    # no register and reads 0 — its bytes 5..7 are 0 anyway)
+    a.addi_s(10, 9, 5); a.ld(32, 6, 10)        # MEMGET32 at +5: dword 0's bytes 5..7, dword 1's byte 0
+    a.halt()
+    out.append(('ld32_vec', a, {'r6': 0x99000000}))
+    a = Asm()
+    a.setr(9, 0xF0070000); a.setr(6, 0x77)
+    a.addi_s(10, 9, 6); a.ld(32, 6, 10)        # spans 0xF007_0000 / 0xF007_0008: 0
+    a.halt()
+    out.append(('ld32_eth', a, {'r6': 0}))
+    return out
+
+
+def cmd_socframe(a):
+    exe = build_soc(a.rev)
+    fails = 0
+    for name, prog, exp in _frame_progs():
+        r = run_soc(exe, prog, f'frame_{name}', timeout=600, trace=True)
+        g = _soc_regs(r) or {}
+        try:
+            os.remove(r['trace'])
+        except OSError:
+            pass
+        bad = [f'{k}={g.get(k) if g.get(k) is None else hex(g[k])} want {v:#x}' for k, v in exp.items()
+               if g.get(k) != v]
+        if not g:
+            bad.append('no HALTED: ' + ' '.join(l for l in r['log'].splitlines() if 'DEADLOCK' in l)[:200])
+        fails += bool(bad)
+        print(f'{"FAIL" if bad else "pass"} socframe {name} ' + ' '.join(bad))
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False):
     """HW_PERF_PLAN §6: 640 x 480 RGB565 scanout of a framebuffer at 4 MiB
     under heavy CPU traffic: a strided walk over `span` bytes (D-cache and L2
@@ -2484,6 +2554,7 @@ def main():
     vg.add_argument('--blit', action='store_true', help='the blitter FILLs back to back too (review 1)')
     sx = sub.add_parser('socx'); sx.add_argument('--seeds', type=int, default=4)
     sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
+    sfr = sub.add_parser('socframe'); sfr.add_argument('--rev', help="another revision's RTL (its own tb_soc)")
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
@@ -2571,6 +2642,8 @@ def main():
         sys.exit(cmd_socsddma(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
+    elif a.cmd == 'socframe':
+        sys.exit(cmd_socframe(a))
     elif a.cmd == 'socx':
         sys.exit(cmd_socx(a))
     elif a.cmd == 'soceth':

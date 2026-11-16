@@ -4207,6 +4207,15 @@ module pipeline_core
                      m_addr    <= mem_xpg ? {mem_pa2hi, 16'h0000} : {mem_iaddr[31:3], 3'b000} + 32'd8;
                      rdy_armed <= 1'b0;        // new request (DV held, addr changed)
                      mem_xc    <= 2'd2;        // settle cycle (f_memget32 shape)
+                     // (HW_PERF_PLAN §8: after an MMIO 1st read, DV drops for
+                     // the settle cycle.  The cache takes an address change
+                     // under a held DV as a new request; a device does not —
+                     // the SoC's MMIO ready is the strobe delayed (it stays
+                     // high while DV does: rdy_armed never re-armed) and the
+                     // Ethernet bridge waits for DV low — so a LEAVERET /
+                     // spanning MEMGET32 in MMIO deadlocked.  DRAM 1st reads
+                     // keep DV up: cycle-identical.)
+                     if (m_addr[31:28] == 4'hF) m_read_DV <= 1'b0;
                   end else begin
                      m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
                      mem_xc    <= 2'd0;
@@ -4224,7 +4233,10 @@ module pipeline_core
                   ld_out <= 1'b1;
                   mem_xc <= 2'd0;
                end
-               2'd2: mem_xc <= 2'd3;
+               2'd2: begin
+                  mem_xc    <= 2'd3;
+                  m_read_DV <= 1'b1;           // (the 2nd read; see the MMIO DV drop above)
+               end
                default: if (w_mrdy) begin     // 2'd3
                   m_read_DV <= 1'b0;
                   mem_xc    <= 2'd0;

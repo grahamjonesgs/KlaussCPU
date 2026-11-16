@@ -6821,3 +6821,87 @@ def tx_walk():
 if NOWALK:
     for _n in [n for n in ALL if n.startswith('wk_') and n != 'wk_nowalk']:
         del ALL[_n]
+
+
+
+# ------------------------------------- HW_PERF_PLAN §8: frames popped from MMIO
+MMIO_RAM = 0xF0FD0000      # tb_vsim's MMIO scratch RAM (32 dwords, reads back)
+
+
+def _mmio_frame(kind, called, n=1, plus=(), irq=False):
+    """supervisor RET / LEAVERET whose frame (return address, saved R15) is
+    in MMIO (tb_vsim's scratch RAM), and a MEMGET32 spanning two MMIO
+    dwords, n times in a loop.  LEAVERET and the spanning MEMGET32 read two
+    MMIO dwords: the second read must reach the device as a new request
+    (tb_vsim models the SoC's level MMIO ready, mmio_hold).  called: the
+    frame belongs to a CALL, so the return is RAS-predicted (and the
+    prediction right) — an MMIO return address still counts as a miss."""
+    a = Asm()
+    mb = MMIO_RAM + 0x80       # (room below for an IRQ frame + the handler's pushes)
+    if irq:
+        a.set_int_mask(1)
+    a.setr(12, DATA); a.setr(11, GOOD); a.setr(9, mb); a.getsp(13)
+    a.setr(8, 0); a.setr(7, n)
+    a.setr64(3, 0x8877665544332211); a.st(64, 3, 9, 0)
+    a.setr(3, 0x99); a.st(64, 3, 9, 8)
+    a.label('top')
+    if kind == 'ld32':
+        a.setr(5, 0)
+        a.addi_s(10, 9, 5); a.ld(32, 5, 10)     # MEMGET32: bytes 5..8, dword 0's top 3, dword 1's first
+        a.setr(3, 0x99887766)
+        a.fbr('ne', 5, 3, 'bad')
+    else:
+        if called:
+            a.call('f')
+            a.label('back')
+        else:
+            a.jmp('f')
+            a.label('back')
+        a.getsp(2); a.setsp(13)
+        a.setr(3, mb + 16); a.fbr('ne', 2, 3, 'bad')
+        if kind == 'leaveret':
+            a.fbr('ne', 15, 11, 'bad')
+    a.inc(8)
+    a.addi_s(7, 7, -1); a.fbr('ne', 7, 0, 'top', imm=True)
+    a.halt()
+    a.label('bad'); a.setr(4, 0xBAD); a.halt()
+    if kind != 'ld32':
+        a.label('f')
+        a.leapc(6, 'back'); a.st(64, 6, 9, 8); a.st(64, 11, 9, 0)
+        a.setr(15, 0)
+        if kind == 'ret':
+            a.addi_s(10, 9, 8); a.setsp(10); a.ret()
+        else:
+            a.mov(15, 9); a.leaveret()
+        a.setr(4, 0xBAD); a.halt()
+    exp = {'end': 'park', 'kind': '0', 'r4': 0, 'r8': n, 'mmio_hold': '0'}
+    return a, exp, list(plus)
+
+
+@test
+def mmio_frame():
+    """HW_PERF_PLAN §8: RET / LEAVERET popping their frame from MMIO and a
+    MEMGET32 spanning two MMIO dwords (supervisor), RAS-predicted or not, at
+    two latencies; LEAVERET and MEMGET32 deadlocked on the SoC (the second
+    MMIO read under a held DV)"""
+    out = []
+    for kind in ('ret', 'leaveret', 'ld32'):
+        for called in ((False, True) if kind != 'ld32' else (False,)):
+            for lat in (1, 3):
+                out.append(_mmio_frame(kind, called, 2, [f'+LAT={lat}']))
+    return out
+
+
+@test
+def mmio_frame_irq():
+    """mmio_frame in a loop under a timer IRQ (the IRQ frame may land in the
+    MMIO scratch too, while SP points there)"""
+    out = []
+    for kind in ('ret', 'leaveret', 'ld32'):
+        for called in ((False, True) if kind != 'ld32' else (False,)):
+            for per in (97, 151):
+                a, exp, plus = _mmio_frame(kind, called, 40, [f'+IRQ_PERIOD={per}', '+LAT=2', '+MAXC=200000'],
+                                           irq=True)
+                exp['m00180000'] = 'nonzero'
+                out.append((a, exp, plus))
+    return out
