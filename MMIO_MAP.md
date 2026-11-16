@@ -361,8 +361,15 @@ non-inclusive (it never invalidates the L1s), with tree pseudo-LRU and a
 - **During a walk** the core and every other master keep running: hits are
   served as usual, nothing is allocated, and a write that misses goes to DDR
   through the write buffer; no data is lost or reordered. The walk and the
-  waiting requests take turns (a request, then a set), so continuous
-  traffic cannot hold BUSY up.
+  waiting requests take turns (a request, then a step of the walk), and a
+  walk that waits for a free write-buffer slot is served like a waiting
+  request: the next drain is its own (also while VGA or a DMA master holds
+  the bus), and no posted write takes the slot that drain frees. So no
+  request stream — the CPU's, the blitter's, VGA's — can hold BUSY up: the
+  walk spends one step on each set, and each dirty line costs it at most
+  the DDR transaction in progress, one write-buffer drain and one request
+  (HW_PERF_PLAN.md §6 review 2 gives the bound; a WBINV of a fully dirty
+  L2 under back-to-back traffic takes a few hundred µs).
 - **A write while BUSY = 1 is ignored** (dropped, not queued). Poll BUSY = 0
   before writing, and again after a write of 0 or 3.
 - BUSY = 0 means DDR holds every write acknowledged before the walk's end
@@ -548,9 +555,14 @@ run, read.
 | 0x0140 | `PERF_L2_WB_MISS`       | R  | 48    | Data-cache writebacks that missed: the sector is allocated without a fetch (or, during a walk, written to DDR). |
 | 0x0148 | `PERF_L2_DDR_RD`        | R  | 48    | DDR read beats (8 B each; a 64 B line is 8), all masters. |
 | 0x0150 | `PERF_L2_DDR_WR`        | R  | 48    | DDR write beats (8 B each), all masters. |
-| 0x0158 | `PERF_L2_WBUF_FULL`     | R  | 48    | Cycles a request (or the walk) waited because the L2's write buffer was full. |
-| 0x0160 | `PERF_L2_DMA_HIT`       | R  | 48    | Blitter / core 2 / VGA accesses served by the L2 (a read of a valid sector, a write merged into one). |
+| 0x0158 | `PERF_L2_WBUF_FULL`     | R  | 48    | Cycles a request (or the walk) waited because the L2's write buffer was full (during a walk that waits for a slot, a posted write also waits while the buffer is not empty). |
+| 0x0160 | `PERF_L2_DMA_HIT`       | R  | 48    | Blitter / core 2 / VGA accesses served by the L2 (a read of a valid sector, a write merged into one). **Includes VGA's stream-buffer hits:** a scanout read of sector 0 of a line the L2 does not hold fetches the whole 64 B line (one `PERF_L2_DMA_MISS`) and the scanout's read of sector 1 is answered from a register (one `PERF_L2_DMA_HIT`), so a scanout over a framebuffer that is not in the L2 shows DMA hits = DMA misses. |
 | 0x0168 | `PERF_L2_DMA_MISS`      | R  | 48    | Blitter / core 2 / VGA accesses that went to DDR. |
+
+With the L2 disabled (`L2_CTRL[0]` = 0, bypass) no access is looked up:
+the I / D / writeback / DMA hit and miss counters stay 0 (only the DDR
+beat and write-buffer counters move), and VGA's stream buffer is off too
+(every scanout read goes to DDR, as before the L2).
 
 **Mix invariant.** Each retired instruction is classified into exactly one of
 the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or

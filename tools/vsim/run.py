@@ -275,6 +275,7 @@ CONS_FAILS = []
 CONS_STATS = {'runs': 0, 'n': 0, 'rt_need': 0}
 SOC_BEH = set()      # tb_soc executables of an older tb (its own behavioural DDR: no consistency checker)
 SOC_PROBED = set()   # tb_soc executables built with the BTIC probe (a run of one must print BTPROBE)
+SOC_L2P = set()      # tb_soc executables built with the L2 drain probe (a run of one must print its line)
 BTIC_FATAL = ('FATAL BTIC', 'BTIC base != target', 'pos0 unsound')
 
 
@@ -382,6 +383,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
         SOC_PROBED.add(exe)
     if beh_ddr:
         SOC_BEH.add(exe)
+    if l2 and not beh_ddr and 'CORE1_L2_EN' in allsrc:
+        SOC_L2P.add(exe)
     if os.path.exists(exe) and os.path.exists(stamp) and open(stamp).read() == h:
         return exe
     # measurement knobs (HW_PERF_PLAN §6): VSIM_L2_SPEC=0 (4-cycle hits),
@@ -447,6 +450,10 @@ def run_soc(exe, image, name, maxi=0, timeout=1800, trace=False, gate=True, plus
         CONS_STATS['runs'] += 1
         CONS_STATS['n'] += int(m.group(1))
     m = re.search(r'L2 rt drains bad=(\d+) need=(\d+)', r.stdout)
+    if gate and exe in SOC_L2P and not m:
+        # review 2: an L2-on gated run whose drain probe did not report
+        CONS_FAILS.append(name + ' (no L2 rt drains line)')
+        print(f'FAIL {name}: L2 drain probe did not report')
     if m and gate:
         CONS_STATS['rt_need'] += int(m.group(2))
         if int(m.group(1)):

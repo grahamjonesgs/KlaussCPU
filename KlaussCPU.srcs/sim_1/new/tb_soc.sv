@@ -25,8 +25,9 @@
 // (FATAL line otherwise).  Indexed by the DDR address: PA[31:27] alias
 // PA[26:0] (the MIG ignores its rank bit PA[27]; PA[31:28] never reach it).
 // With the L2 (+define+L2_PROBE): drains that start while VGA wants the bus
-// or a DMA master holds it, with no request waiting on the write buffer
-// (review 1 M2), are counted ("L2 rt drains bad=").
+// or a DMA master holds it, with no request (nor the WBINV walk) waiting on
+// the write buffer (review 1 M2, review 2), are counted ("L2 rt drains
+// bad="; the need spelled out as in tb_l2, not taken from the RTL).
 //===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -250,21 +251,41 @@ module tb_soc;
    // ---------------- L2 drains in VGA's / DMA's window (review 1 M2) --------
    int rt_bad = 0, rt_need = 0;
 `ifdef L2_PROBE
+`define L2C dut.mem_read_write.g_l2.l2_cache
+   // the need (tb_l2's rt_need_now): the request in F_DEC — a read miss of
+   // a buffered line, a cache read / write allocating over a dirty victim
+   // with the buffer full, a posted write with the buffer full (or not
+   // empty while the walk holds the next slot) — or the walk: a dirty way
+   // and the buffer full, or its end with entries left.  A DMA / VGA read
+   // miss needs no slot.
+   function automatic bit rt_need_now();
+      bit hit, many, lk, dmaq, alloc, vdirty, full, wbm, post;
+      hit   = `L2C.r_hit; many = `L2C.r_many; lk = `L2C.q_lk; dmaq = `L2C.q_dma;
+      alloc = `L2C.r_en && !`L2C.r_walking;
+      vdirty = `L2C.r_td[`L2C.r_vic] != 2'b00;
+      full  = `L2C.wb_v == 2'b11;
+      wbm   = (`L2C.wb_v[0] && `L2C.wb_line[0] == `L2C.q_addr[26:6]) ||
+              (`L2C.wb_v[1] && `L2C.wb_line[1] == `L2C.q_addr[26:6]);
+      post  = !(lk && !dmaq && many) && !(alloc && lk && !dmaq && !many) && !(lk && dmaq && hit);
+      if (`L2C.r_wk_wb && full) return 1;
+      if (`L2C.r_walk_end && `L2C.r_wk_snap && `L2C.r_wk_fl != 2'b00) return 1;
+      if (`L2C.f_st != 4'd2) return 0;
+      if (!`L2C.q_wr)
+         return !(lk && hit) && (wbm || (alloc && lk && !dmaq && !many && vdirty && full));
+      return (alloc && lk && !dmaq && !many && vdirty && full) ||
+             (post && (full || (`L2C.r_wk_wb && `L2C.wb_v != 2'b00)));
+   endfunction
    bit rt_pend = 0, rt_pneed = 0;
    always @(posedge dut.i_Clk) begin
       // a drain started on the last edge (E_IDLE -> E_WR): judged by that
-      // cycle's state — a request in F_DEC waiting on the buffer (full, or
-      // its line in it) or not
-      if (rt_pend && dut.mem_read_write.g_l2.l2_cache.e_st == 2'd2) begin
+      // cycle's state
+      if (rt_pend && `L2C.e_st == 2'd2) begin
          if (rt_pneed) rt_need++; else rt_bad++;
       end
-      rt_pend  = dut.mem_read_write.g_l2.l2_cache.e_st == 2'd0 &&
-                 (dut.mem_read_write.g_l2.l2_cache.i_rt_req || dut.mem_read_write.g_l2.l2_cache.i_dma);
-      rt_pneed = dut.mem_read_write.g_l2.l2_cache.f_st == 4'd2 &&
-                 !(!dut.mem_read_write.g_l2.l2_cache.q_wr && dut.mem_read_write.g_l2.l2_cache.w_rd_hit) &&
-                 (dut.mem_read_write.g_l2.l2_cache.wb_full ||
-                  dut.mem_read_write.g_l2.l2_cache.f_wbm(dut.mem_read_write.g_l2.l2_cache.q_line));
+      rt_pend  = `L2C.e_st == 2'd0 && (`L2C.i_rt_req || `L2C.i_dma);
+      rt_pneed = rt_need_now();
    end
+`undef L2C
 `endif
 
    // ---------------- VGA scanout probe (HW_PERF_PLAN.md §6) ----------------

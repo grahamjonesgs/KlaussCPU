@@ -22,7 +22,7 @@ SRC = os.path.join(ROOT, 'KlaussCPU.srcs')
 WORK = os.path.join(os.environ.get('VSIM_WORK', '/tmp/vsim'), 'l2mut')
 
 TESTS = ['hit', 'sector', 'evict', 'wbhit', 'plru', 'dma', 'wbinv', 'toggle', 'alias', 'wbinvq', 'wkturn', 'rtdrain',
-         'vgastream']
+         'vgastream', 'dmapost', 'cpupost', 'rtwalk', 'strmedge', 'wkset']
 TIMINGS = [['+MIGLAT=20'], ['+MIGLAT=8', '+MIGJIT=20', '+MIGRDY=30']]
 
 # (name, what it breaks, old text, new text)
@@ -70,7 +70,7 @@ MUTS = [
      "    wire         wb_dh   = wb_h;",
      "    wire         wb_dh   = !wb_v[0];"),
     ('spec_noaddr', 'the speculative lookup is used for any address',
-     "wire w_imm = ra_ok && (ra_addr[31:5] == i_mem_addr[31:5]);",
+     "wire w_imm = ra_ok && (ra_addr[26:5] == i_mem_addr[26:5]);",
      "wire w_imm = ra_ok;"),
     ('spec_wrcoll', 'a speculative read next to a data-array write is used',
      "                   !(|db_we   && db_addr[SETW:1]   == ra_next[6 +: SETW]) &&\n                   !(|r_db_we && r_db_addr[SETW:1] == ra_next[6 +: SETW]);",
@@ -104,14 +104,39 @@ MUTS = [
      "                        if (i_mem_addr[26:6] == e_line) e_strm_ok <= 1'b0;",
      "                        if (1'b0) e_strm_ok <= 1'b0;"),
     ('strm_any', 'a stream fill also for a line the L2 holds (its sector 1 may be dirty there)',
-     "wire       w_strm_new = q_dma && q_wide && !q_sec && !r_many;",
-     "wire       w_strm_new = q_dma && q_wide && !q_sec;"),
+     "wire       w_strm_new = q_lk && q_dma && q_wide && !q_sec && !r_many;",
+     "wire       w_strm_new = q_lk && q_dma && q_wide && !q_sec;"),
     ('served', "a DV still high after its ready is taken as a new request (the r_served guard)",
      "wire w_acc_ok = calib_done && w_dv && !r_served && !(r_wk_turn && w_wk_on) &&",
      "wire w_acc_ok = calib_done && w_dv && !(r_wk_turn && w_wk_on) &&"),
     ('busy_write', 'L2_CTRL writes are taken while BUSY',
      "end else if (i_ctrl_wr && !r_walking) begin",
      "end else if (i_ctrl_wr) begin"),
+    # review 2
+    ('wk_need_copy', 'the walk waiting on a full buffer is not a waiter (m-A: no drain for it in the VGA / DMA window)',
+     "assign     w_wk_need = (r_wk_wb && wb_full) ||",
+     "assign     w_wk_need = 1'b0 ||"),
+    ('wk_need_end', "the walk's final drain is not a waiter (m-A: BUSY held up in the VGA / DMA window)",
+     "|| (r_walk_end && r_wk_snap && r_wk_fl != 2'b00);",
+     "|| 1'b0;"),
+    ('wk_reserve', "a posted write takes the slot the walk waits for (m-A: the walk finds the buffer full again)",
+     "wire         wb_full_p = wb_full || (r_wk_wb && wb_v != 2'b00);",
+     "wire         wb_full_p = wb_full;"),
+    ('wk_rd_first', "a demand read starts before the drain the walk waits on",
+     " &&\n                          !(w_wk_need && wb_rdy[wb_dh]);",
+     ";"),
+    ('wk_set_wr', "a write to the set the walk waits in is accepted (it re-dirties a copied way: the walk stays there)",
+     " &&\n                    !(r_wk_wb && i_mem_write_DV && i_mem_addr[6 +: SETW] == r_walk_set);",
+     ";"),
+    ('rt_need_full', 'a DMA / VGA read miss counts as waiting on a full buffer (m-B: drains in the VGA window)',
+     ": !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full)));",
+     ": !w_rd_hit && (f_wbm(q_line) || wb_full));"),
+    ('strm_edge', 'a write accepted on the edge sector 1 is captured does not drop the stream buffer (m-C)',
+     "s_v   <= e_strm_ok && !(w_wr_acc && i_mem_addr[26:6] == e_line);",
+     "s_v   <= e_strm_ok;"),
+    ('strm_bypass', 'the stream buffer serves VGA while the L2 is disabled (bypass)',
+     "wire       w_strm_new = q_lk && q_dma && q_wide && !q_sec && !r_many;",
+     "wire       w_strm_new = q_dma && q_wide && !q_sec && !r_many;"),
 ]
 
 
