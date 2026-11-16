@@ -2122,8 +2122,11 @@ the 4 KiB FIFO absorbs it (the card's clock stops between blocks).
 configurations — default, DEBUG_EN, MPU, 16-entry TLB, no walker — diff /
 diff_irq / excdiff / mpudiff / tlbdiff / tlbpage / dcbzdiff / dmtest, btfuzz
 300 seeds), soc36, soc8, socvar (L2 off, 8 ways, jittered and slow MIG), eq
-(`L2_EN` = 0 against `c0bf7b2` under the same tb_soc), the tb_l2 sweep
-(120 of 120) and l2mut: all pass.  `tools/sdsim/run_sd_tb.sh`: tb_sd_native
+(`L2_EN` = 0 against `c0bf7b2` under the same tb_soc) and the tb_l2 sweep
+(120 of 120): all pass.  l2mut's inputs (`l2_cache.sv`, `tb_l2.sv`,
+`mig_model.sv`, `l2mut.py`) are byte-identical to `c0bf7b2` (36 of 36
+killed there); its first 7 mutants were re-run here (all killed) and the
+run was then stopped.  `tools/sdsim/run_sd_tb.sh`: tb_sd_native
 337 checks, tb_sd_spi_compat, tb_sd_dma seeds 1–17.  **DMA_EN = 0 is
 cycle-identical to `c0bf7b2`**: `socdiff --cycles` (identical retire traces
 *and* PIPE_RUN cycles, per program) over 30 randprog seeds with the L2 and
