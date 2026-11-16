@@ -1895,6 +1895,85 @@ the same day as a reference — the flow is deterministic, it reproduced
   with the larger L2.  Build dirs `~/.cache/kbuild/l2b_b1`, `l2b_b2`,
   `l2b_c9ref`.  Not run on the board.
 
+### §6 timing: the core / D-cache families restructured (2026-11-16, branch `tmg`)
+
+`l2b_b2` (`13be986`) missed tier 1 by 0.187 on core / D-cache paths that
+the L2 never touched; only alt-place closed it.  Branch `tmg` (from
+`c0bf7b2`) restructures those families so the standard flow meets with
+margin.  Every change is behaviour- and **cycle-identical** (one
+documented exception, unexercised: a RET popping its return address
+from MMIO); each has a simulation assertion of its old form.
+
+| Family (`l2b_b2` tier 1) | Fix | `tmg_b3` |
+|---|---|---|
+| D-cache line BRAM → hit-copy BRAM `DIADI` (−0.187): a write hit read-modified-wrote the whole line from the unregistered BRAM output (`cache_val_data` → merge → both arrays) | `mem_read_write`: the four data arrays are written with **byte write enables** from registers (`w_dwdata` / `w_dwe0` / `w_dwe1`): a write hit writes only the store's bytes (`{4{r_write_data}}`, the hit on the enables), DCBZ all 32 bytes of zeros, the installs every byte; the other bytes keep their contents, which is the old merge.  1 K × 256 now maps to 8 RAMB36 per array (was 7 + 1 RAMB18): +2 BRAM tiles | no such path; the data arrays' worst input +0.419 (tag → `WEA`) |
+| hit pipe `r_h_tq0` → `wb_hext` (−0.144) | `mem_read_write` exports each way's dword at the offset (`o_h_dw0` / `o_h_dw1`) and the way select (`o_h_sel0`); the core extracts the load-bypass value from both and from the captured / forwarded dword in parallel (three `f_ldext`), and `mem_h1` / the tag compare pick at the register | +0.124 |
+| TLB CAM → `r_h_tag` / `r_h_tag1` (−0.105) | none of its own: the hit pipe's H2 slack let the placer move the registers toward the TLB | +0.505 |
+| `wb_hok` → TLB key copies / `ex_a` (−0.102) | the WB forward value of a hit load is `wb_hext` (= `f_ldext(wb_hdw, …)`, registered on the same edge), so `wb_h && wb_hok` is the **last** select of `wb_ldval` instead of the first, ahead of the extraction | +0.848 |
+| `id_op` → `ex_d.uop` / the field clears (−0.042) | `id_legal` / `id_privop` decoded from `w_op` at the IF → ID latch (cones already there for `id_ser` / `w_xser`); `f_decode_q` = `f_decode` with those registers | +0.729 |
+| `ex_d.uop` → adder → `mem_result` (−0.001) | `ex_res_add` / `ex_res_cmp` and the adder's subtract / carry-in controls registered at dispatch; the sum and a compare's bit are the last select of `mem_result` | the family's worst is now UNARY's count ops, +0.061 |
+| `r_is_mmio` → read data → RAS compare → `pc` (+0.011) | the RET / LEAVERET return-address compare uses the DRAM side's data (`m_rdata_dram`, new `m_rdata_next_dram`), off the splitter's response select; a return address popped from **MMIO** (`m_addr` in 0xF…) always counts as mispredicted — the redirect goes to the real value, so it is correct, only a squash more (no program keeps its stack in MMIO; the RAS-miss counter would count it) | +0.834 |
+| `qspi` `r_div_cnt` → `r_tx` (+0.063) | the engine's buffer index no longer waits on the SCK tick (it only differs where the read byte is unused); `tb_qspi_ctrl` passes | +0.621 |
+| (new in `tmg_b1`, −0.310) `r_shhi` → barrel stage 2 → `mem_result_eff` → forward muxes → `ex_ta` / TLB keys / `ex_a` / the multiplier | a MEM shift's `w_sh2` is the **last** select of every ID → EX operand (`fs_a` / `fs_b` / `fs_c` from registers; the other candidates take `mem_res_nsh`) | +0.183 (`wb_zero`) |
+| (`tmg_b1` −0.046) `ifb_val` / `pos` → `in0` (fanout ~300) → `w_op` → predecode → `id_ser`, and the fetch engine | `in0 = ifb_val[0] && pos[0]` is a register, `r_in0` (`max_fanout` 48): `ifb_val` takes a blocking next value (`ifb_val_n`, the `ev_*` pattern) loaded with `pos` in `pos_track` | `id_ser` +0.139, `ifb_dw` / `pos` +0.336 |
+
+**Builds** (standard `build_fast -resynth`; placed utilisation):
+
+| Build | Commit | Tier 1 WNS / WHS | Final | LUTs | FFs | BRAM tiles |
+|---|---|---|---|---|---|---|
+| `l2b_b2` | `13be986` | −0.187 / +0.027 | tier 2 −0.001 (not met) | 40,915 | 26,849 | 124 |
+| `tmg_b1` | `2eae6a4` | −0.310 / +0.029 (the shifter forward) | tier 2 −0.045 (not met) | 41,263 | 26,865 | 126 |
+| `tmg_b2` | `831138e` | **+0.069 / +0.038** | tier 1 | 41,206 | 26,636 | 126 |
+| **`tmg_b3`** | **`2709e0a`** | **+0.061 / +0.014** | **tier 1** | **41,001** | **26,868** | **126** |
+| `tmg_b3` alt `ExtraPostPlacementOpt` | `2709e0a` | +0.024 / +0.020 (routed, met) | cross-check only | | | |
+
+- Utilisation against `l2b_b2`: **+86 LUTs, +19 FFs, +2 BRAM tiles**
+  (126 / 135); DSPs 19 as before; the cache arrays all RAM-inferred.
+- `tmg_b3`'s worst remaining paths: `ex_a` → UNARY POPCNT / CLZ / CTZ →
+  `mem_result` (+0.061, 12 LUT levels), the L2's `e_c` →
+  `o_mem_read_data` (+0.090), the hit pipe's BRAM → `wb_hext` (+0.124),
+  `r_in0` → `id_ser` (+0.139), `ex_lb_a` → `mem_result` (+0.171), the D-cache
+  `cpu.ready` → `ex_a` (+0.172), `r_shhi` → `wb_zero` (+0.183).  Hold:
+  +0.014 (`o_TX_LCD_Byte` → the LCD SPI master).
+- `tmg_b2` (without `r_in0`) and `tmg_b3` are two placements of nearly
+  the same netlist: +0.069 and +0.061, with different worst families
+  (`wb_hext` → `mem_result` vs the count ops) — the margin is no longer
+  carried by one lucky family.  The alt-place cross-check from `tmg_b3`'s
+  opt checkpoint (`ExtraPostPlacementOpt`, its own phys_opt / route
+  directives) met at only +0.024 — this time alt-place is the *worse*
+  placement — on the same two families: `ex_a` → `mem_result[0]`
+  (+0.024) and `r_shhi` → `wb_zero` (+0.025).  So the margin across three
+  placements is +0.02 … +0.07, and those two (the ALU's non-adder legs —
+  the count ops, MIN/MAX's compare — and the shifter's zero test into
+  `wb_zero`) are the next to restructure.  Its bitstream is not kept.
+
+**Verification** (`tools/vsim`, on `2709e0a`): the core regression in
+all five configurations, `diff` with `+TRACECYC` (169,092 = 169,092
+against `c0bf7b2`), `--irq` (107,709 =), `excdiff`, `mpudiff`,
+`tlbdiff`, `tlbpage`, `dcbzdiff` 200 seeds, `dmtest`, `btfuzz` 300 seeds
+× 7; `l2_regress.sh` `soc36`, `soc8`, `socvar` (L2 off, 8 ways, jittered,
+slow MIG) and `eq` (`VSIM_L2=0` against `d7f3994`, identical traces and
+cycles): all pass (`socvga` worst fetch 2,786 of 3,200, as at
+`13be986`).  `tb_qspi_ctrl` passes (Verilator, with the model's
+tri-state `miso` driven high in a sim copy).  The tb_l2 sweep was not
+rerun: nothing under the L2 changed.  The new assertions (the decode,
+the ALU legs, the shift-last forwards, `wb_hext` = the hit's extraction,
+the per-way dwords, `r_in0`, the RET compare) fire nowhere.
+
+**Cycles** against `c0bf7b2` (tb_soc, `MIGLAT=36`): **identical** —
+randprog 61,698 (30 seeds; 64 B span 24,645); `socbench`: data96k
+382,024, code96k 142,666, chase112k 199,846, each +0.00 %.
+
+- **Bitstream** `~/.cache/kbuild/tmg_2709e0a.bit` (md5
+  `b945088e944ec4d288c935df47b64cb1`), standard flow, tier 1, no tier 2,
+  no alternate placement.  Build dir `~/.cache/kbuild/tmg_b3`.  Not run
+  on the board.
+- Next candidates, if a feature tips them: the UNARY count ops (register
+  their result a stage later, as the shifter's, or select them last),
+  `wb_zero`'s reduce of the shift result (the byte-flag form `bz_sh`
+  already exists for `ex_b_zero`), the L2's `e_c` read mux, and the hit
+  pipe's BRAM → `wb_hext` data path.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
