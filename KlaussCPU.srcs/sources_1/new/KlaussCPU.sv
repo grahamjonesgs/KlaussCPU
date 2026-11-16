@@ -426,7 +426,15 @@ module KlaussCPU #(
    // every whole-cache op walked twice — SD DMA review 1.)
    // o_mnt_busy (CACHE_STATUS 0xF005_0010 bit0) reads high during the walk.
    // (timing: every maintenance go is a register — the write's first cycle
-   // and its data bits, a cycle later: still cycles before the store's ready)
+   // and its data bits, a cycle later.  Margin: with the write's DV in cycle
+   // t, r_cc_go is high in t+1, the pending flag it sets (mem_read_write's
+   // r_mnt_pending / r_rng_pend, which holds the loads: r_h_conf) is visible
+   // in t+2 = the cycle r_mmio_write_dv_d2 (the store's ready) is high, and the
+   // core completes the store in t+3, so the first later load already sees the
+   // flag.  Delaying the go by 1 more cycle still passes by luck; by 2 returns
+   // stale data after RANGE_INV / INVALIDATE (SD DMA review 1 MAJOR 1).  If the
+   // write-ack latency is ever shortened, this margin goes — the assertion
+   // after r_cc_dec below fires if the go is not high before the ready.)
    logic       r_cc_go = 1'b0;
    logic [6:0] r_cc_d  = '0;
    wire        w_cache_flush_go = r_cc_go && r_cc_d[1];
@@ -467,6 +475,23 @@ module KlaussCPU #(
       r_cc_d   <= w_mmio_write_data[6:0];
       r_cop_nz <= r_cop_n != 28'd0;
    end
+`ifndef SYNTHESIS
+   // sim only: a CACHE_CTRL write's go must have been high in a cycle before
+   // the cycle of the store's ready (r_mmio_write_dv_d2), see the margin note
+   // at r_cc_go (delayed-go mutants: tools/vsim sddmamut, cc_go_late1/2)
+   logic r_cc_armed = 1'b0, r_cc_seen = 1'b0;
+   always_ff @(posedge i_Clk) begin
+      if (r_mmio_write_dv_d2) begin
+         if (r_cc_armed)
+            assert (r_cc_seen)
+               else $fatal(1, "CACHE_CTRL go not high before the store's ready: pending-walk flag late (SD DMA review 1 MAJOR 1)");
+         r_cc_armed <= 1'b0;
+         r_cc_seen  <= 1'b0;
+      end
+      if (w_cc_dec && !r_cc_dec) r_cc_armed <= 1'b1;
+      if (r_cc_go && r_cc_armed)  r_cc_seen  <= 1'b1;
+   end
+`endif
    wire        w_cache_rng_go  = r_cc_go && (r_cc_d[5:4] != 2'b00) &&
                                  !r_cc_d[1] && !r_cc_d[2] && r_cop_nz;
    wire        w_cache_rng_inv = r_cc_d[5];

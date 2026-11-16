@@ -109,6 +109,12 @@ MUTS = [
     ('whole_level', "the whole-cache go is a level again (every whole op walks twice)", TOP, ['range_inv', 'range_combo'],
      "   wire        w_cache_flush_go = r_cc_go && r_cc_d[1];",
      "   wire        w_cache_flush_go = w_cc_dec && w_mmio_write_data[1];"),
+    ('cc_go_late1', "the registered CACHE_CTRL go one cycle later (passes functionally; only the margin assertion in KlaussCPU.sv kills it)", TOP, ['range_inv'],
+     "   always_ff @(posedge i_Clk) begin\n      r_cc_go  <= w_cc_dec && !r_cc_dec;\n      r_cc_d   <= w_mmio_write_data[6:0];",
+     "   logic r_cc_g1 = 1'b0; logic [6:0] r_cc_d1 = '0;\n   always_ff @(posedge i_Clk) begin\n      r_cc_g1  <= w_cc_dec && !r_cc_dec;\n      r_cc_go  <= r_cc_g1;\n      r_cc_d1  <= w_mmio_write_data[6:0];\n      r_cc_d   <= r_cc_d1;"),
+    ('cc_go_late2', "the registered CACHE_CTRL go two cycles later (stale load after RANGE_INV / INVALIDATE; review 1 MAJOR 1 reopened)", TOP, ['range_inv'],
+     "   always_ff @(posedge i_Clk) begin\n      r_cc_go  <= w_cc_dec && !r_cc_dec;\n      r_cc_d   <= w_mmio_write_data[6:0];",
+     "   logic r_cc_g1 = 1'b0, r_cc_g2 = 1'b0; logic [6:0] r_cc_d1 = '0, r_cc_d2 = '0;\n   always_ff @(posedge i_Clk) begin\n      r_cc_g1  <= w_cc_dec && !r_cc_dec;\n      r_cc_g2  <= r_cc_g1;\n      r_cc_go  <= r_cc_g2;\n      r_cc_d1  <= w_mmio_write_data[6:0];\n      r_cc_d2  <= r_cc_d1;\n      r_cc_d   <= r_cc_d2;"),
     # (not here: w_dma_seterr masked by w_dm_abort, review 1 nit — it
     # matters only when DMA_EN = 0 lands in the single M_CHK cycle of a
     # block that would leave DDR; fixed by inspection)

@@ -2412,11 +2412,28 @@ all passing:
 - `tb_sd_dma` seeds 1–25 (644–659 checks each), `tb_sd_native`,
   `tb_sd_spi_compat`; `socsd`, `socsddma` (all 402 tests), `socsdvga`
   (MIGLAT 36 / 44, 0 underflows, as before), `socsdabort`; `sddmamut.py` 40
-  of 40.
+  of 40 (42 of 42 with the delta-review mutants).
 - Cycles vs `tmg`: `socdiff --cycles` 30 seeds identical (PIPE_RUN 61,698
   both); `socbench` data96k / code96k / chase112k identical (382,024 /
   142,666 / 199,846).  Only programs with a whole FLUSH / INVALIDATE change
   (above).
+
+### §7 delta review (branch `sddma2`, after review 1)
+
+- MINOR (latent): the registered CACHE_CTRL go (`r_cc_go` / `r_cc_d`,
+  KlaussCPU.sv) sets the pending-walk flag that holds loads (`r_h_conf`:
+  `r_rng_pend && inv`, `r_mnt_pending && r_mnt_mode`) exactly one cycle before
+  the core completes the store (DV to core completion = 3 cycles, measured;
+  a 1-cycle later go still passes, 2 returns stale data).  A shorter MMIO
+  write ack would silently reopen MAJOR 1.  Now a sim-only assertion
+  (`ifndef SYNTHESIS`, `$fatal`) fires when a CACHE_CTRL write's ready
+  (`r_mmio_write_dv_d2`) arrives without `r_cc_go` having been high in an
+  earlier cycle, so it also flags the lost margin at +1; the comment at
+  `r_cc_go` states the margin.  `sddmamut.py`: `cc_go_late1` (only the
+  assertion kills it) and `cc_go_late2`, 42 of 42.
+- NIT: the whole-cache decode needs `byte_en[0]`, as MMIO_MAP says.
+- NIT: the RANGE_IINV registered-mask mutant is killed only by `iinv_wrap101`
+  / `iinv_wrap_end`.
 
 ### §7 deferred
 
