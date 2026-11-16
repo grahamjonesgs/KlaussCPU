@@ -40,10 +40,13 @@ Then, released together on 2026-11-16 as `sddma_release_3ae5ed6.bit`
   deflate / cxx-hello unchanged vs the L2 release (37.6 / 88.6 s
   user+sys).
 
-Next: the runtime session's emulator re-ranks the next RTL candidates on the
-current baseline (L2 + call-graph-ordered clang: I-fetch 37–51 % of
-cycles, D-cache stalls 30–38 %, L2 I-side hit rate 37–44 %) before any
-further hardware item is picked.
+Next: **waiting on Graham.** On 2026-11-16 (relayed by the runtime
+session) Graham ended the clang-speed work after one last software item,
+a PGO / ThinLTO build of the native clang; there is no emulator re-rank
+and no further hardware item is queued. Graham decides the next RTL work.
+For reference, the current baseline (L2 + call-graph-ordered clang):
+I-fetch 37–51 % of cycles, D-cache stalls 30–38 %, L2 I-side hit rate
+37–44 %.
 
 ## Estimates (runtime session, 2026-11-11)
 
