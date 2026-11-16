@@ -2,8 +2,10 @@
 # Run the SD controller unit testbenches under xsim (Vivado 2025.2):
 #   tb_sd_native      native SD mode against sd_card_model
 #   tb_sd_spi_compat  SPI mode against the old sd_spi (sd_spi_ref)
+#   tb_sd_dma         the SD DMA engine against sd_card_model and a DDR port
+#                     model (SDDMA_SEED=<n>: its random latencies)
 # Work dir: $SDSIM_WORK (default ~/.cache/sdsim).  No waveforms are dumped.
-# Usage: tools/sdsim/run_sd_tb.sh [native|compat|all]
+# Usage: tools/sdsim/run_sd_tb.sh [native|compat|dma|all]
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 S=$ROOT/KlaussCPU.srcs
@@ -17,7 +19,7 @@ run() {   # $1 = top, rest = sources
     rm -rf "$d"; mkdir -p "$d"; cd "$d"
     xvlog -sv "$@" > xvlog.log 2>&1 || { tail -20 xvlog.log; return 1; }
     xelab -debug off "$top" > xelab.log 2>&1 || { grep -i error xelab.log | head; return 1; }
-    xsim "$top" -R > xsim.log 2>&1 || true
+    xsim "$top" -R $XSIM_ARGS > xsim.log 2>&1 || true
     grep -E "^TB_|FAIL|compared|card:" xsim.log | head -40
     grep -qE "^TB_[A-Z]+ PASS" xsim.log
 }
@@ -29,5 +31,10 @@ fi
 if [ "$which" = compat ] || [ "$which" = all ]; then
     run tb_sd_spi_compat $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv \
         $S/sim_1/new/sd_spi_ref.sv $S/sim_1/new/tb_sd_spi_compat.sv || rc=1
+fi
+if [ "$which" = dma ] || [ "$which" = all ]; then
+    XSIM_ARGS="-testplusarg SEED=${SDDMA_SEED:-1} ${SDDMA_PLUS:-}" \
+    run tb_sd_dma $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv \
+        $S/sim_1/new/sd_card_model.sv $S/sim_1/new/tb_sd_dma.sv || rc=1
 fi
 exit $rc

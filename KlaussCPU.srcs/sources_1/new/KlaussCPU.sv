@@ -430,7 +430,39 @@ module KlaussCPU #(
                                 && (w_mmio_addr[27:16] == 12'h005)
                                 && (w_mmio_addr[15:0]  == 16'h0000)
                                 && w_mmio_write_data[2];
-   wire        w_cache_mnt_busy;
+   wire        w_cache_mnt_busy;      // the D-cache: a walk pending or running
+   wire        w_ic_rk_busy;          // core 1: a RANGE_IINV sweep running
+
+   // D-cache / I-cache range operations (SD DMA spec v1.2, CPU_FEATURES[27]).
+   // CACHE_OP_ADDR (0xF005_0030, a physical address, [4:0] read 0) and
+   // CACHE_OP_LEN (0x0038, [31:0]): RW, reset by CPU_RESETN only.  The range
+   // is ceil(LEN / 32) lines from ADDR & ~31; LEN = 0 is a no-op.  On the
+   // first cycle of a CACHE_CTRL write (byte 0 enabled) with [4] RANGE_CLEAN
+   // or [5] RANGE_INV and neither [1] FLUSH nor [2] INVALIDATE (the
+   // whole-cache op wins), the D-cache gets the op with its lines (copied
+   // there).  [6] RANGE_IINV is decoded by core 1 itself from its completing
+   // store, like ICACHE_INV [3], with the lines below (r_cop_*: settled long
+   // before — the store to CACHE_CTRL completes after the ones to ADDR / LEN).
+   logic [31:5] r_cop_addr = '0;
+   logic [31:0] r_cop_len  = '0;
+   logic [27:0] r_cop_n    = '0;      // ceil(LEN / 32), registered
+   always_ff @(posedge i_Clk) begin
+      if (w_reset_H) begin
+         r_cop_addr <= '0;
+         r_cop_len  <= '0;
+      end else if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h005) begin
+         if (w_mmio_addr[15:0] == 16'h0030) r_cop_addr <= w_mmio_write_data[31:5];
+         if (w_mmio_addr[15:0] == 16'h0038) r_cop_len  <= w_mmio_write_data[31:0];
+      end
+      r_cop_n <= 28'(({1'b0, r_cop_len} + 33'd31) >> 5);
+   end
+   wire        w_cc_dec = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h005) &&
+                          (w_mmio_addr[15:0] == 16'h0000) && w_mmio_byte_en[0];
+   logic       r_cc_dec = 1'b0;
+   always_ff @(posedge i_Clk) r_cc_dec <= w_cc_dec;
+   wire        w_cache_rng_go  = w_cc_dec && !r_cc_dec && (w_mmio_write_data[5:4] != 2'b00) &&
+                                 !w_mmio_write_data[1] && !w_mmio_write_data[2] && (r_cop_n != 28'd0);
+   wire        w_cache_rng_inv = w_mmio_write_data[5];
 
    // L2_CTRL (0xF005_0028, HW_PERF_PLAN.md §6): [0] EN, [1] WBINV; a write
    // (first cycle of the store's DV, byte 0 enabled) goes to the L2, which
@@ -746,7 +778,7 @@ module KlaussCPU #(
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
                    .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N), .TLB_WALK(CORE1_TLB_WALK),
-                   .IC_LINES(CORE1_IC_LINES), .IC_LB(CORE1_IC_LB)) pipeline_core_i (
+                   .IC_LINES(CORE1_IC_LINES), .IC_LB(CORE1_IC_LB), .RIINV_EN(1'b1)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -816,7 +848,11 @@ module KlaussCPU #(
       .dbg_sp     (pip_dbg_sp),
       .dbg_flags  (pip_dbg_flags),
       .dbg_i      (w_dbg_i),
-      .dbg_o      (w_dbg_o)
+      .dbg_o      (w_dbg_o),
+      // RANGE_IINV (CACHE_CTRL[6]): the range's lines, and its sweep (MNT_BUSY)
+      .cop_line   (r_cop_addr),
+      .cop_n      (r_cop_n),
+      .rk_busy    (w_ic_rk_busy)
    );
 
    (* KEEP_HIERARCHY = "yes" *)
@@ -869,6 +905,12 @@ module KlaussCPU #(
       assign io_SD_DAT[gi] = w_sd_dat_oe[gi] ? w_sd_dat_o[gi] : 1'bz;
    end
    wire       w_sd_irq;
+   // the SD DMA engine's DDR port (master E on mem_read_write's arbiter)
+   wire         w_sd_dma_req, w_sd_dma_done, w_sd_dma_write_DV, w_sd_dma_read_DV;
+   wire [31:0]  w_sd_dma_addr;
+   wire [127:0] w_sd_dma_write_data, w_sd_dma_read_data;
+   wire [15:0]  w_sd_dma_wdf_mask;
+   wire         w_sd_dma_ready, w_sd_dma_grant;
    // LOAD_COMPLETE, registered: resets the SD controller iff SD_MODE = 1
    // (sd_spi), and INT2_EN.
    logic r_load_pulse = 1'b0;
@@ -896,7 +938,17 @@ module KlaussCPU #(
        .i_sd_cmd(io_SD_CMD),
        .o_sd_dat(w_sd_dat_o),
        .o_sd_dat_oe(w_sd_dat_oe),
-       .i_sd_dat(io_SD_DAT)
+       .i_sd_dat(io_SD_DAT),
+       .o_dma_req(w_sd_dma_req),
+       .o_dma_done(w_sd_dma_done),
+       .o_dma_write_DV(w_sd_dma_write_DV),
+       .o_dma_read_DV(w_sd_dma_read_DV),
+       .o_dma_addr(w_sd_dma_addr),
+       .o_dma_write_data(w_sd_dma_write_data),
+       .o_dma_wdf_mask(w_sd_dma_wdf_mask),
+       .i_dma_read_data(w_sd_dma_read_data),
+       .i_dma_ready(w_sd_dma_ready),
+       .i_dma_grant(w_sd_dma_grant)
    );
    assign w_sd_read_data = sd_bus.read_data;
 
@@ -1275,10 +1327,12 @@ module KlaussCPU #(
                // 0x0000 CACHE_CTRL is self-clearing — reads as 0
                16'h0000: r_mmio_read_data_comb = 64'h0;
                16'h0008: r_mmio_read_data_comb = w_cache_info;
-               16'h0010: r_mmio_read_data_comb = {63'b0, w_cache_mnt_busy}; // CACHE_STATUS
+               16'h0010: r_mmio_read_data_comb = {63'b0, w_cache_mnt_busy | w_ic_rk_busy}; // CACHE_STATUS
                16'h0018: r_mmio_read_data_comb = LP_ICACHE_INFO;            // ICACHE_INFO
                16'h0020: r_mmio_read_data_comb = w_l2_info;                 // L2_INFO (0 without the L2)
                16'h0028: r_mmio_read_data_comb = {55'b0, w_l2_busy, 7'b0, w_l2_en};   // L2_CTRL
+               16'h0030: r_mmio_read_data_comb = {32'b0, r_cop_addr, 5'b0};         // CACHE_OP_ADDR
+               16'h0038: r_mmio_read_data_comb = {32'b0, r_cop_len};                // CACHE_OP_LEN
                16'h0040: r_mmio_read_data_comb = w_cnt_read_hits;
                16'h0048: r_mmio_read_data_comb = w_cnt_read_misses;
                16'h0050: r_mmio_read_data_comb = w_cnt_write_hits;
@@ -1327,7 +1381,8 @@ module KlaussCPU #(
                                                   CORE1_EXC_EN && CORE1_MPU_EN, CORE1_EXC_EN}
                                                  | 64'h0100_0000   // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
                                                  | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0}
-                                                 | {37'b0, CORE1_L2_EN, 26'b0};   // [26] the L2 (HW_PERF_PLAN.md §6)
+                                                 | {37'b0, CORE1_L2_EN, 26'b0}    // [26] the L2 (HW_PERF_PLAN.md §6)
+                                                 | 64'h0800_0000;                 // [27] the cache range ops (SD DMA spec v1.2)
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;
@@ -1492,6 +1547,21 @@ module KlaussCPU #(
        .i_flush_go(w_cache_flush_go),
        .i_inval_go(w_cache_inval_go),
        .o_mnt_busy(w_cache_mnt_busy),
+       .i_rng_go(w_cache_rng_go),
+       .i_rng_inv(w_cache_rng_inv),
+       .i_rng_l0(r_cop_addr),
+       .i_rng_n(r_cop_n),
+       // DDR master E — the SD DMA engine (sd_native, device 0x000).
+       .i_sd_req(w_sd_dma_req),
+       .i_sd_done(w_sd_dma_done),
+       .i_sd_write_DV(w_sd_dma_write_DV),
+       .i_sd_read_DV(w_sd_dma_read_DV),
+       .i_sd_addr(w_sd_dma_addr),
+       .i_sd_write_data(w_sd_dma_write_data),
+       .i_sd_wdf_mask(w_sd_dma_wdf_mask),
+       .o_sd_read_data(w_sd_dma_read_data),
+       .o_sd_ready(w_sd_dma_ready),
+       .o_sd_grant(w_sd_dma_grant),
        .i_h_addr(w_h_addr),
        .i_h_pg0(w_h_pg0),
        .i_h_pg1(w_h_pg1),

@@ -1275,7 +1275,10 @@ take-back of write-buffer lines (both below).
   buffer); and a write to the set it waits in is held off until the walk
   has copied it, so each way of a set is copied at most once.  During a
   walk nothing allocates, hits are served, and writes that miss are posted
-  to DDR, so no data is lost or reordered.  It ends when the buffer entries
+  to DDR, so no data is lost or reordered.  A write to the set being walked
+  waits until the walk has copied that set (the l2b delta review: a single
+  write's worst wait ~48–96 cycles under adversarial traffic, 162–186 at 8
+  ways; an SD DMA stream during WBINVs under VGA load: §7).  It ends when the buffer entries
   present when the last set was done have drained (writes posted after
   that are later writes: traffic that keeps the buffer busy cannot hold
   BUSY up).  A write of 0 / 3 to a disabled L2 only drains the buffer, so
@@ -1974,6 +1977,328 @@ randprog 61,698 (30 seeds; 64 B span 24,645); `socbench`: data96k
   already exists for `ex_b_zero`), the L2's `e_c` read mux, and the hit
   pipe's BRAM → `wb_hext` data path.
 
+## 7. SD DMA engine and cache range operations (2026-11-16, branch `sddma`)
+
+Branch `sddma` from `l2b` (`c0bf7b2`).  SD DMA spec v1.2, agreed with the
+runtime session (the kernel's `sd_native.c` / `cacheflush.c` at f2afeb7
+and klausscc's `--sd-dma` / `--dcache-range-ops` model are written to it).
+Phase 1 here: RTL, simulation and regression; no Vivado build (one waits for
+the core / D-cache timing work on `tmg`, and this branch is rebased onto it
+first).  The controller's behaviour is SD_NATIVE_PLAN.md §8; the registers
+are in MMIO_MAP.md ("Native SD mode", "Cache controller").
+
+### §7 design
+
+- **The engine** (`sd_native.sv`, `DMA_EN` parameter, default 1).  A data
+  command written with `SDM_CFG[16]` starts a DMA phase.  Up-front checks,
+  decided in the command's accept cycle so a refused command never leaves:
+  the block size's bit 2 (not a multiple of 8), and for a known count
+  `[ADDR, ADDR + size × count)` inside 128 MiB — a two-stage pipeline from
+  the registers (product, then add-and-compare: every register write lands
+  at least two edges before the next MMIO access; a simulation assertion
+  recomputes it at every DMA data command).  The engine then works a block
+  at a time (`M_IDLE` → `M_CHK`, the per-block range check → per 16-byte
+  transaction `M_GATH` (pop 1–2 words from the FIFO head) or `M_PUSH` (push
+  them), `M_XFER` → `M_WAIT`).  A transaction is an aligned 16 bytes: a pair
+  of words when the address is 16-byte aligned and two words remain, else
+  one word with the other half masked.
+  - Reads move a block once it is committed in the FIFO (its CRC passed),
+    so a bad block never reaches DDR, and the FIFO's flow control stops the
+    card's clock if DDR is slow.  A counted read's last block sets
+    `r_dd_pend` instead of DATA_DONE; the engine sets DATA_DONE when that
+    block's last write has been accepted.
+  - Writes fetch a block whenever the FIFO has room for one: at most 4 KiB
+    ahead of the card, never past size × count.
+- **The bus adapter** (`r_a_*`): req → grant → DV → ready → (writes: two
+  settle cycles) → done, one transaction per tenure as core 2.  It has no
+  reset: once started a transaction always completes, so a reset or a FIFO
+  reset in the middle of one never drops a DV or a grant; the engine just
+  stops owning it (`r_x_own`) and a read's data is not pushed.
+  `DMA_BUSY = adapter busy || (phase && !(write phase && card side done))`:
+  0 means nothing in flight and nothing to come (m1), on every path; the
+  write phase's term makes DMA_BUSY drop in the very cycle DATA_DONE rises.
+- **Ends** (SD_NATIVE_PLAN §8.4): DMA_EN = 0 and clearing SD_MODE finish the
+  block in progress (block-granular `SDM_DMA_ADDR`; the card side goes on as
+  PIO); a FIFO reset or the native reset stop after the transaction in
+  flight; CMD12 and card errors on a read move the good blocks still in the
+  FIFO first.  While DMA_BUSY the FIFO port is the engine's (`SDM_DATA` reads
+  0 / stores set FIFO_ERR, FIFO_THRESH 0) and data commands are ignored.
+- **Master E** (`mem_read_write.sv`): a fifth requester on the arbiter's
+  muxes, narrow (16 B, `mig_wide` = 0), a DMA master to the L2 (`i_dma`),
+  priority VGA > SD > blitter > core 2, granted only from the no-grant state
+  with no cache miss in flight and `o_mnt_busy` = 0 (the blitter's gate),
+  released by its done, with the orphaned-grant guard.  With no SD request
+  the arbiter's choices are those of `c0bf7b2`.
+- **Range walk** (`mem_read_write.sv`, the MAINT sub-FSM).  `RANGE_CLEAN` /
+  `RANGE_INV` come from the SoC as a one-cycle pulse with the op's first line
+  and ceil(LEN / 32) lines (`KlaussCPU.sv` keeps `CACHE_OP_ADDR` / `LEN` and
+  the count, registered).  One range op waits in `r_rng_*` with its copied
+  range; one that finds that slot taken, a whole-cache walk pending, or that
+  covers more than 2,048 lines becomes a whole-cache walk (FLUSH, or
+  INVALIDATE if either op invalidates: a superset).  The walk visits
+  min(n, 1024) sets from the first line's index; at visit j a way is in the
+  range iff its tag is T_j (= (L0 + j)[26:10]) or, while j < n − 1024, T_j + 1
+  (`r_rw_tag` / `r_rw_tag1` / `r_rw_two`, two 17-bit compares).  `MS_READ`,
+  `MS_RCHK`: with nothing dirty among the selected ways they are dropped
+  (RANGE_INV) and the walk moves on — 2 cycles a set; otherwise the whole
+  walk's `MS_W0` … `MS_CLR`, qualified by the selection (`w_ms_sel*`, 1 for a
+  whole walk, so its behaviour is unchanged).  **RANGE_INV writes a dirty
+  line back before it drops it** (the spec; see the disagreements).
+  `o_mnt_busy` also covers the pending range op.
+- **RANGE_IINV** (`pipeline_core.sv`, `RIINV_EN`, core 1 only).  The core
+  decodes its own completing store to `CACHE_CTRL` with `[6]` (and neither
+  `[1]`, `[2]` nor `[3]`, LEN ≠ 0), exactly where it decodes ICACHE_INV, and
+  does everything ICACHE_INV does — squash and refetch the younger
+  instructions, empty the window, the NLB, the BTIC (and the ID snapshot),
+  drop a pending install — except that its valid-bit sweep is limited to the
+  range: the 2,048 valid bits are 32 LUTRAM banks of 64, and at each bank
+  address the sweep clears only the banks whose line there is in the range
+  (a registered 32-bit mask from two thermometer compares, wrapping), from
+  the range's first address for min(n, 64) steps.  A store's snoop clear
+  during a range sweep takes the write port and the sweep waits a cycle
+  (a whole sweep needs no such care).  As in a whole sweep, every lookup
+  misses and installs wait while it runs, so fetch is coherent with the op
+  at once.  Emptying the whole BTIC / NLB rather than only the range's
+  entries is a superset (16 + 2 entries, refilled in a few branches), and
+  keeps the BTIC kill compares — a timing path — untouched.  `rk_busy`
+  feeds `MNT_BUSY`.  A range op that meets a sweep already running, or that
+  covers the I-cache, sweeps everything; with 16 B lines (core 2's
+  geometry, `RIINV_EN` = 0 there anyway) it is a whole ICACHE_INV.
+- **(m3)**  *A `CACHE_CTRL` write takes effect only after every earlier
+  store is in the D-cache:* the core has one in-order port; an MMIO store
+  issues only once the posted store (`st_post`) has had its ready and the
+  store queue (`sq_v`) is empty; the D-cache acknowledges a store when it
+  latches it (WAIT) and finishes it in CHECK or its miss states; a walk, of
+  either kind, starts only from WAIT.  *A data command after a range op
+  cannot reach DDR before the walk's write-backs:* the op sets its pending
+  flag in its MMIO write's first cycle, the `SDM_CMD` write is a later
+  access, master E is not granted while `o_mnt_busy` (pending, queued or
+  running), and the walk ends only after its last write-back's ready (the
+  L2 has accepted it).  **No software wait is needed** between the
+  `CACHE_CTRL` write and `SDM_CMD`, in either direction; tests `rd_m3_*` /
+  `wr_m3_*` below, and the mutations `m3_gate` / `m3_pending` that break the
+  gate are killed by them.
+
+### §7 verification
+
+- **`tb_sd_dma`** (`tools/sdsim/run_sd_tb.sh dma`, xsim; `SDDMA_SEED`): the
+  engine in `sd_spi` against `sd_card_model` and a DDR-port model with
+  random grant and ready latencies that checks the master-E contract (DV
+  only with the grant, address held, req until done, nothing outside DDR).
+  ~625 checks a seed, seeds 1–17 pass: registers; counted reads / writes in
+  both lanes, CMD17 / 24, 8- and 64-byte blocks; DATA_DONE only with the data
+  in DDR; the refusals (size, range end past DDR, exactly at its end, above
+  4 GiB, the registers written back to back before `SDM_CMD`); open-ended
+  reads and writes into DDR's end (per-block DMA_ERR, the card side going on
+  as PIO); the 4 KiB read-ahead (fetched − sent ≤ 512 words, measured);
+  CRC errors (the bad block never in DDR, BLKDONE = good blocks); a bad CRC
+  token; the registers during a DMA (DMA_ADDR, `SDM_DATA` both ways,
+  FIFO_THRESH with blocks waiting, data commands ignored, CMD13 sent);
+  every abort (DMA_EN = 0 on reads and writes, FIFO reset at random points,
+  CMD12 on open-ended and counted reads and an open-ended write, SD_MODE =
+  0 on both, the native reset with a DDR read in flight); interrupts; 24
+  random transfers (sizes 8–512, counts, lanes, latencies).  **(m1)** is
+  checked on every one of these paths: once an MMIO read shows DMA_BUSY = 0
+  the port must be idle, stay idle, and DDR must already hold the data; a
+  monitor also checks every cycle that DMA_BUSY = 0 implies an idle port.
+- **`socsddma`** (`tools/vsim/sddma.py`, tb_soc with `sd_card_sync`, a
+  synchronous card model for Verilator; the memory-consistency checker sees
+  the DMA's transactions): (m3) both directions, the data command written at
+  once after the clean (`nowait`), behind another walk (`queued`), after a
+  store that misses (`last_store`), and after the poll (`wait`) — a 32 KiB
+  dirty range with the DMA buffer at its end, the sequence run twice so its
+  code is in the I-cache (else the fetches wait for the walk and the race
+  never happens: the first version of these tests could not see the gate
+  removed); range ops with partial ADDR / LEN, the lines straddling the
+  ends cleaned and their neighbours untouched (D-cache probes), the range's
+  precision within a set (the other way's dirty lines stay), RANGE_INV
+  writing back, LEN = 0, the queue (a queued op keeps its copied range; a
+  second op becomes a whole walk), a range of 1,536 lines (the second tag),
+  the combinations with FLUSH / INVALIDATE / ICACHE_INV; RANGE_IINV with
+  code rewritten by DMA — stale without it, fresh with it or ICACHE_INV,
+  stale after a RANGE_IINV of another range (only the range is dropped), a
+  store's snoop during a range sweep, ICACHE_INV after a range sweep — with
+  tb_soc's BTIC coverage / currency checks gating every run; the DMA_ERR
+  and DATA_DONE interrupts through the INT2 cascade.
+- **`socsdvga`**: an open-ended SD DMA at 50 MHz (a read stream: DMA writes
+  into DDR; or a write stream) alongside the VGA scanout, `_vga_prog`'s CPU
+  miss / write-back traffic, L2 WBINVs every 1,500 or 150 iterations, and
+  (`--blit`) the blitter, against the same run without the DMA, at MIGLAT
+  36 and 44 (below); the DMA's data checked at the end.
+- **Mutations** (`tools/vsim/sddmamut.py`, the unit bench or the named SoC
+  tests per mutant): **34 of 34 killed** — DATA_DONE before the data is in
+  DDR; DMA_BUSY without the transaction in flight; each refusal and the
+  per-block check; the fetch's room and count limits; a FIFO reset that
+  leaves the engine waiting; aborts ignored; `SDM_DATA` / FIFO_THRESH /
+  `SDM_DMA_ADDR` / data commands not gated; the lane mask; CMD12 dropping
+  the received blocks; the adapter reset by the native reset; the DMA_ERR
+  interrupt; the m3 gate and the pending op in MNT_BUSY; the walk's second
+  tag, its precision, its last set, RANGE_INV without the write-back (the
+  emulator's reading), the copied range, the queue, the 64 KiB conversion,
+  FLUSH | range bits; the hit pipe during a pending RANGE_INV; RANGE_IINV's mask (none, off by a bank), its snoop
+  stall, its decode.  (Not listed: clearing `vl_any` at a range sweep's end
+  — equivalent in practice, every fetch during a sweep reinstalls.)
+
+### §7 results
+
+**Walk timings** (tb_soc, cycles at 100 MHz; the emulator's models in
+brackets):
+
+| Op | Cycles | Emulator |
+|---|---|---|
+| RANGE_CLEAN / RANGE_INV, n lines | 1 + 2 × min(n, 1024) + 6 per set with a dirty range line (+3 for a second) | 8 + 2n + 10 per dirty line |
+| … 32 lines clean / dirty | 65 / 257 | 72 / 392 |
+| … 1,024 lines clean / dirty | 2,049 / 8,193 | 2,056 / 12,296 |
+| … 1,536 lines, all dirty | 9,726 | 18,440 |
+| RANGE_IINV, n lines | min(n, 64) (+1 per store snoop during it; 0 with the I-cache empty) | 8 + 2n |
+| … 1 / 32 / 64 / 128 (4 KiB) / 2,048 lines | 1 / 32 / 64 / 64 / 64 | 10 / 72 / 136 / 264 / 4,104 |
+| FLUSH / INVALIDATE (whole) | 4,097 + ~3 per dirty line, **run twice** (below) | 2,048 + 10 per dirty line |
+
+RANGE_IINV: one line a cycle up to 64 lines, then n / 64 lines a cycle (a
+4 KiB page: 2 lines a cycle; 64 KiB: 32).
+
+**A finding in the existing design (not changed here, to keep `c0bf7b2`'s
+timing):** every whole-cache FLUSH / INVALIDATE walks the cache twice.  The
+SoC's decode of `CACHE_CTRL[2:1]` is a level for the store's whole MMIO
+strobe (~4 cycles); the walk starts a cycle after the first, its start clears
+`r_mnt_pending`, and the strobe still high re-arms it, so a second walk
+(4,097 cycles, nothing dirty left) follows every time.  A whole-cache op
+therefore keeps MNT_BUSY (and the core's cached accesses) for ~8,200 cycles
++ ~3 per dirty line.  The range ops' go is the strobe's first cycle (as
+L2_CTRL's), so they walk once.  Fixing it (an edge on the whole-cache go)
+is a one-line change; it changes the timing of every program that uses
+FLUSH / INVALIDATE.
+
+**VGA under an SD DMA stream during L2 WBINVs** (the l2b delta review's
+question; `socsdvga`, 120+ display lines, underflows = starved lines):
+
+| MIGLAT | WBINV every | Blitter | SD DMA | Underflows | Worst line fetch (of 3,200) | VGA's worst grant wait | SD: worst DV → ready | SD: worst req → ready |
+|---|---|---|---|---|---|---|---|---|
+| 36 | 1,500 | — | off | 0 | 2,766 | 82 | — | — |
+| 36 | 1,500 | — | read | 0 | 2,785 | 96 | 29 | 2,877 |
+| 44 | 1,500 | — | off | 0 | 3,013 | 90 | — | — |
+| 44 | 1,500 | — | read | 0 | 3,021 | 92 | 35 | 3,139 |
+| 36 | 150 | — | off | 0 | 2,388 | 68 | — | — |
+| 36 | 150 | — | read | 0 | 2,392 | 84 | 16 | 2,457 |
+| 44 | 150 | — | off | 0 | 2,628 | 76 | — | — |
+| 44 | 150 | — | read | 0 | 2,630 | 92 | 17 | 2,749 |
+| 36 | 150 | FILLs | off | 0 | 2,439 | 134 | — | — |
+| 36 | 150 | FILLs | read | 0 | 2,407 | 129 | 13 | 2,551 |
+| 36 | 150 | FILLs | write | 0 | 2,430 | 113 | 86 | 2,555 |
+| 44 | 150 | FILLs | off | 0 | 2,644 | 142 | — | — |
+| 44 | 150 | FILLs | read | 0 | 2,644 | 152 | 12 | 2,800 |
+| 44 | 150 | FILLs | write | 0 | 2,625 | 125 | 92 | 2,787 |
+
+No line starved with the DMA; the worst line fetch moves by at most 0.7 %.
+The SD DMA's writes into the walked set did not show as long waits (worst
+DV → ready 35 cycles for the read stream; a write stream's reads, 92); VGA's
+worst grant wait rises by at most 14 cycles (none with the blitter).  Its worst wait for the bus
+(~2,500–3,100 cycles) is the arbiter's rule for every DMA master — no
+grant while a CPU miss is in flight, VGA first — under this miss-heavy loop;
+the 4 KiB FIFO absorbs it (the card's clock stops between blocks).
+
+**Regression** (against `c0bf7b2`): `l2_regress.sh` core (the 5
+configurations — default, DEBUG_EN, MPU, 16-entry TLB, no walker — diff /
+diff_irq / excdiff / mpudiff / tlbdiff / tlbpage / dcbzdiff / dmtest, btfuzz
+300 seeds), soc36, soc8, socvar (L2 off, 8 ways, jittered and slow MIG), eq
+(`L2_EN` = 0 against `c0bf7b2` under the same tb_soc) and the tb_l2 sweep
+(120 of 120): all pass.  l2mut's inputs (`l2_cache.sv`, `tb_l2.sv`,
+`mig_model.sv`, `l2mut.py`) are byte-identical to `c0bf7b2` (36 of 36
+killed there); its first 7 mutants were re-run here (all killed) and the
+run was then stopped.  `tools/sdsim/run_sd_tb.sh`: tb_sd_native
+337 checks, tb_sd_spi_compat, tb_sd_dma seeds 1–17.  **DMA_EN = 0 is
+cycle-identical to `c0bf7b2`**: `socdiff --cycles` (identical retire traces
+*and* PIPE_RUN cycles, per program) over 30 randprog seeds with the L2 and
+20 without, the regression's socdiff / eq totals, and `_vga_prog` with WBINVs
+every 300 iterations, with and without the blitter (cycles, display lines,
+worst fetch and MIG bursts identical).  The CPU_FEATURES expectations
+(socmmio-style checks, soccrypto, socwalk, socsd) are updated to `[27]`;
+soccrypto's full-configuration value was stale on `c0bf7b2` (`0x01FF200D`)
+and is now derived.
+
+**Utilisation** (synthesis only, `44580c7` vs `13be986` = `c0bf7b2`'s RTL,
+`build_fast -stop_after_synth`): LUTs as logic 35,321 (+813), LUTs as memory
+3,932 (+0), registers 24,535 (+780), BRAM 124 (+0), DSP 20 (+1: the
+up-front range check's size × count).
+
+**A second finding, fixed for the range ops only: loads could pass a
+pending invalidate.**  The documented rule is that the CPU's next cached
+access waits for a walk.  A walk starts only when the D-cache is idle, so
+one requested while the cache finishes an earlier store's miss is pending
+for up to that miss; meanwhile the load-hit pipe (HW_PERF_PLAN §1a stage 3,
+its own read port) still answered loads — from lines the walk was about to
+invalidate.  `inv_hit_whole` (a store that misses, then INVALIDATE, then a
+load of a line the invalidate should drop, with a DMA's new data in DDR):
+the load returns the stale line on `c0bf7b2` and here; `inv_hit_wait`
+(MNT_BUSY polled first): the new data.  For RANGE_INV the hit pipe is now
+held off while the op is pending (`r_h_conf` += `r_rng_pend && r_rng_inv`;
+`inv_hit_range`, mutation `hit_pend`), so a load after a RANGE_INV always
+sees memory.  The whole-cache INVALIDATE is left as it was (the same one
+term, `r_mnt_pending && r_mnt_mode`, would fix it, and change those programs'
+timing): software must poll MNT_BUSY after INVALIDATE before reading the
+data (the kernel does, after every op).
+
+**(m3): the answer for the runtime session.**  The `MNT_BUSY` poll between a
+range op and `SDM_CMD` is **not needed**: the engine cannot touch DDR while
+a walk is pending or running, and the walk's end means its write-backs are
+in the L2 (`wr_m3_nowait` / `_queued` / `_last_store`, `rd_m3_nowait` /
+`_queued` pass without it; `m3_gate` and `m3_pending` are killed by them).
+After RANGE_INV the CPU's loads now wait for the walk too.  The waits that
+remain useful: before writing `CACHE_OP_ADDR` / `LEN` (with interrupts off,
+so a handler's op cannot interleave its registers — the queue holds one
+range op, a second becomes a whole-cache walk, correct but slower), and
+after a whole-cache INVALIDATE before reading (above).
+
+**Disagreements with the spec / the emulator** (decided as stated; for the
+runtime session to confirm):
+
+1. **RANGE_INV alone.**  Spec v1.2: "write back, then invalidate".  The
+   kernel's header (`KL_CACHE_RANGE_INV`: "alone: drop them, no
+   writeback") and the emulator's coherence checker ("range invalidate (no
+   clean) dropped line …: its data is lost") read it as a drop without
+   write-back.  The RTL follows the spec.  For correct software (a buffer
+   cleaned before the device writes it and left alone during the DMA) both
+   readings give the same memory; they differ only for a dirty line, which
+   the hardware writes back where the emulator would report lost data.
+   The mutation `rinv_nowb` (the other reading) is killed by `range_inv`.
+2. **CACHE_OP_ADDR width**: 32 bits in the RTL (MMIO_MAP's width; the
+   D-cache tags a 32-bit PA); 64 bits in the emulator.  An address written
+   above 4 GiB reads back differently (and means nothing either way).
+3. **The range-op queue**: the emulator queues any number of ops, each with
+   its range; the RTL holds one and turns a second into a whole-cache walk.
+4. **Abort granularity.**  The emulator stores each read block whole as it
+   arrives (so after DMA_EN = 0 every received block is in DDR, and DMA_BUSY
+   reads 1 for 200 more cycles); the RTL moves blocks as fast as DDR takes
+   them, finishes the block in progress on DMA_EN = 0 / SD_MODE = 0 and
+   leaves any further committed block in the FIFO for PIO (`SDM_DMA_ADDR`
+   says how far it got).  A FIFO reset stops the RTL after its 16-byte
+   transaction (not block-granular).
+5. **PIO after an abort**: the emulator gives the FIFO back to `SDM_DATA` as
+   soon as the phase is no longer a DMA phase; the RTL when DMA_BUSY drops.
+   Likewise a data command written while DMA_BUSY (DATA_BUSY clear: after a
+   CMD12 / abort, the engine finishing) is ignored by the RTL (it would race
+   the engine for the FIFO); the emulator accepts it.
+6. **A DMA read uses the FIFO**: words left in it before the command would
+   be moved to DDR ahead of the card's data; the emulator's card bypasses
+   the FIFO.  Drivers reset the FIFO before a data command (the kernel does).
+7. **RANGE_IINV** drops the whole BTIC, NLB and fetch window (and refetches),
+   not only the range's entries: a superset, invisible except in cycles.
+8. **Walk timings** differ from the emulator's models (the table above),
+   and every whole-cache walk runs twice (the first finding).
+
+### §7 deferred
+
+- The Vivado build (phase 2, after `tmg` lands and this branch is rebased
+  onto it): timing of the arbiter's fifth leg (its muxes feed the L2's
+  request port), the range walk's tag compares in MAINT, the core's
+  sweep-mask register into the valid-bit bank write enables.
+- The double whole-cache walk and the hit pipe during a pending whole
+  INVALIDATE (findings above): one-line fixes each, left for a decision
+  because they change existing programs' timing.
+- A range walk at one set a cycle (a second read port or a read-ahead of
+  the next set); a BTIC kill by range instead of emptying it.
+- Board test: the kernel's driver with `klausscpu_sd.dma=1`.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -1982,6 +2307,7 @@ randprog 61,698 (30 seeds; 64 B span 24,645); `socbench`: data96k
 | `[23]` | STATUS.MAL64 (§4) |
 | `[24]` | `ETH_RX_SLOTS` (§3) |
 | `[26]` | the unified L2 (§6) |
+| `[27]` | the cache range operations: RANGE_CLEAN / RANGE_INV / RANGE_IINV (§7; the SD DMA engine itself is `SDM_CAPS[10]`) |
 
 ## Implementation notes (§1 and §4, 2026-11-11)
 
@@ -2121,3 +2447,10 @@ Decisions taken while implementing the frozen text above:
   D-cache paths (placement: the L2's area equals `c9cadea`'s), alt-place
   `ExtraPostPlacementOpt` +0.028 / +0.038,
   `~/.cache/kbuild/l2b_13be986_epp.bit`.  Not yet run on the board.
+- 2026-11-16: §7 SD DMA engine (SD DMA spec v1.2: `SDM_DMA_ADDR`,
+  DMA_EN / DMA_BUSY / DMA_ERR, master E) and the cache range operations
+  (RANGE_CLEAN / RANGE_INV / RANGE_IINV, `CACHE_OP_ADDR` / `LEN`,
+  `CPU_FEATURES[27]`): branch `sddma`, RTL and simulation only (tb_sd_dma,
+  socsddma, socsdvga, 34 of 34 mutations, the L2 regression; cycle-identical
+  to `c0bf7b2` without DMA); synthesis +813 LUTs.  Not yet built (waits for
+  `tmg`).

@@ -12,7 +12,7 @@ expected final-state fields).  Build products go to $VSIM_WORK (default
 /tmp/vsim).  Verilator 5.020 cannot take a default value on a module input,
 so the core is copied and `dbg_i = '0` is stripped from the copy only.
 """
-import argparse, hashlib, os, re, subprocess, sys, shutil
+import argparse, fnmatch, hashlib, os, re, subprocess, sys, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
@@ -132,13 +132,15 @@ SOC_FILES = ['klauss_pkg.sv', 'membus_if.sv', 'mmio_if.sv', 'pipeline_core.sv', 
 # ddr2_control / l2_cache (older revisions' tb_soc has a behavioural
 # ddr2_control instead: then neither ddr2_control.sv nor the MIG model)
 SIM_MIG = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'mig_model.sv')
+SIM_SDC = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'sd_card_sync.sv')
 # a run whose tb_soc consistency checker saw a wrong read answer
 CONS_FATAL = 'FATAL consistency'
 
 
 def _l2bit():
-    """CPU_FEATURES[26] (the L2) of the tb_soc build"""
-    return (1 << 26) if l2_cfg()[0] else 0
+    """CPU_FEATURES[26] (the L2) of the tb_soc build, and [27] (the cache
+    range ops, SD DMA spec v1.2: every build of this revision)"""
+    return ((1 << 26) if l2_cfg()[0] else 0) | (1 << 27)
 
 
 def l2_cfg():
@@ -340,6 +342,12 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
         mig = git_show(rev, SIM_MIG) if rev and not tb_wt else open(SIM_MIG).read()
         open(os.path.join(src, 'mig_model.sv'), 'w').write(mig)
         allsrc += mig
+    # the SD card model (tb_soc instantiates it since the SD DMA work)
+    sdc = None
+    if 'sd_card_sync' in tb:
+        sdc = git_show(rev, SIM_SDC) if rev and not tb_wt else open(SIM_SDC).read()
+        open(os.path.join(src, 'sd_card_sync.sv'), 'w').write(sdc)
+        allsrc += sdc
     # report the cycle count at HALTED (for real-cache A/B timing)
     tb = tb.replace('$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);',
                     '$display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes, t=%0d", icount, uart_n, runcyc);')
@@ -402,11 +410,14 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
         defs = ['+define+L2_PROBE'] if l2 else ['+define+DDRPATH=g_ddr.ddr2_control']
         if l2 and 'r_wk_wb' in allsrc:
             defs.append('+define+L2_PROBE_WK')        # (review 2: the walk's drain terms)
+    if 'r_grant_sd' in allsrc:
+        defs.append('+define+SD_DMA_PROBE')           # (master E: tb_soc counts its transactions)
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \
           kn + [os.path.join(src, n) for n in SOC_FILES if n in present] + \
           ([] if beh_ddr else [os.path.join(src, 'mig_model.sv')]) + \
+          ([os.path.join(src, 'sd_card_sync.sv')] if sdc else []) + \
           [os.path.join(src, 'tb_soc.sv'), os.path.join(src, 'unisim_stubs.v')]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -1002,7 +1013,7 @@ def cmd_socmmio(a):
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
     l2, l2w = l2_cfg()
-    if f'r2=00000000{0x07F0200D if l2 else 0x03F0200D:08x}' not in last:
+    if f'r2=00000000{0x0FF0200D if l2 else 0x0BF0200D:08x}' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -1057,7 +1068,7 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF200D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x03FF200D | _l2bit()}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
             want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x03F0200D | _l2bit()}
@@ -1084,7 +1095,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080501, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -1120,6 +1131,99 @@ def _socsd_progs():
     progs.append(('cascade', a, {'r10': 512, 'r2': 2, 'r3': ('bit2', 0), 'r5': ('bit2', 1), 'r6': 2,
                                  'r8': 0, 'r9': ('bit2', 0)}))
     return progs
+
+
+def _soc_final(log):
+    """tb_soc's HALTED report: final registers, the card's counters, the
+    D-cache probes, the maintenance walks / RANGE_IINV sweeps"""
+    m = re.search(r'TB_SOC: REGS(.*)', log)
+    regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', m.group(1))} if m else None
+    sdc = dict((k, int(v)) for k, v in re.findall(r'(\w+)=(\d+)', (re.search(r'TB_SOC: SDC (.*)', log) or [''])[0]))
+    dcp = {int(k): (int(v), int(d)) for k, v, d in re.findall(r'DCP(\d) [0-9a-f]+ valid=(\d) dirty=(\d)', log)}
+    walks = re.findall(r'TB_SOC: WALK (\w+) sets=(\d+) dirty_wb=(\d+) cycles=(\d+)', log)
+    sweeps = re.findall(r'TB_SOC: RKSWEEP lines=(\d+) cycles=(\d+)', log)
+    return regs, sdc, dcp, walks, sweeps
+
+
+def cmd_socsddma(a):
+    """SD DMA spec v1.2 through the SoC (tools/vsim/sddma.py): DMA reads and
+    writes through mem_read_write's arbiter and the L2 against tb_soc's card,
+    the (m3) ordering without the MNT_BUSY poll, the range operations'
+    coherence (partial lines, straddling lines, LEN = 0, the queue, the
+    combinations), and the walk timings.  Every run is also under tb_soc's
+    memory-consistency checker (DMA transactions included)."""
+    import sddma
+    exe = build_soc(None)
+    fails = 0
+    for name, asm, exp, plus, chk in sddma.tests():
+        if a.only and not any(fnmatch.fnmatch(name, g) for g in a.only):
+            continue
+        r = run_soc(exe, asm, 'sddma_' + name, plus=plus + a.plus, timeout=7200)
+        regs, sdc, dcp, walks, sweeps = _soc_final(r['log'])
+        bad = []
+        if regs is None:
+            bad.append('no HALTED')
+        else:
+            for k, v in exp.items():
+                if regs.get(k) != v:
+                    bad.append(f'{k}={regs.get(k) if regs.get(k) is None else hex(regs[k])} want {v:#x}')
+        for k, v in chk.items():
+            if k == 'dcp':
+                for i, want in v.items():
+                    if dcp.get(i) != want:
+                        bad.append(f'DCP{i} (valid, dirty)={dcp.get(i)} want {want}')
+            elif k == 'walks':
+                got = [w[0] for w in walks]
+                if got != v:
+                    bad.append(f'walks {got} want {v}')
+            elif sdc.get(k) != v:
+                bad.append(f'card {k}={sdc.get(k)} want {v}')
+        fails += bool(bad)
+        tim = ' '.join(f'{w[0]}({w[1]} sets, {w[2]} wb)={w[3]}c' for w in walks[:6])
+        print(f'{"pass" if not bad else "FAIL"} {name} {" ".join(bad)}  '
+              f'[dma wr={sdc.get("sd_dma_wr")} rd={sdc.get("sd_dma_rd")} card rd={sdc.get("rd_blocks")} '
+              f'wr={sdc.get("wr_blocks")}] {tim} '
+              + ' '.join(f'iinv({x[0]} lines)={x[1]}c' for x in sweeps))
+        if not bad and not a.keep:
+            shutil.rmtree(os.path.join(WORK, 'socruns', 'sddma_' + name), ignore_errors=True)
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
+def cmd_socsdvga(a):
+    """SD DMA alongside VGA scanout, CPU miss traffic, L2 WBINV walks and
+    (--blit) the blitter (sddma.t_vga), against the same run without the SD
+    DMA: starved display lines, the worst line fetch, and the DMA's data
+    (r12 = mismatches, r9 = blocks).  The L2 review's case: an SD read
+    stream (DMA writes into DDR) during WBINV under VGA load, at each
+    --miglat."""
+    import sddma
+    exe = build_soc(None)
+    fails = 0
+    for lat in a.miglat:
+        for sd in (False, True):
+            for wr in ((False, True) if sd and a.write else (False,)):
+                prog = sddma.t_vga(a.lines, a.wbinv_every, sd=sd, blit=a.blit, sd_write=wr)
+                tag = f'sdvga_{lat}_{int(sd)}{int(wr)}{int(a.blit)}_{a.wbinv_every}'
+                r = run_soc(exe, prog, tag, timeout=14400, plus=['+VGA_V0=478', f'+MIGLAT={lat}'] + a.plus)
+                regs, sdc, _, walks, _ = _soc_final(r['log'])
+                m = re.search(r'VGA lines=(\d+) max_fetch=(\d+) underflows=(\d+)', r['log'])
+                vr = re.search(r'VGA reads=(\d+) read_cycles=(\d+) grant_cyc=(\d+)', r['log'])
+                ok = bool(m) and int(m.group(1)) >= 20 and regs is not None and \
+                    (not sd or (regs.get('r12') == 0 and regs.get('r9', 0) > 0 and sdc.get('host_err') == 0 and
+                                (not wr or sdc.get('wr_bad') == 0)))
+                fails += not ok
+                n = max(1, int(vr.group(1))) if vr else 1
+                print(f'{"pass" if ok else "FAIL"} MIGLAT={lat} sd={"write" if wr else "read" if sd else "off"}'
+                      f'{" blit" if a.blit else ""}: lines={m and m.group(1)} max_fetch={m and m.group(2)} '
+                      f'underflows={m and m.group(3)} vga_gnt_wait/read={int(vr.group(3)) / n if vr else 0:.1f} '
+                      f'sd blocks={regs and regs.get("r9")} mismatches={regs and regs.get("r12")} '
+                      f'dma wr={sdc.get("sd_dma_wr")} rd={sdc.get("sd_dma_rd")} '
+                      + ' '.join(re.findall(r'SDLAT (.*)', r['log'])))
+                if ok and not a.keep:
+                    shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
+    print(f'{fails} failing')
+    return 1 if fails else 0
 
 
 def cmd_socsd(a):
@@ -2171,6 +2275,8 @@ def cmd_socdiff(a):
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
         t = [int(re.search(r'\bt=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
+        if a.cycles:
+            same = same and t[0] == t[1] and t[0] > 0      # (cycle-identical, not only the same retires)
         tb += t[0]; tn += t[1]
         for k, r in (('base', rb), ('new', rn)):
             m = re.search(r'BTPROBE btic_chk=\d+ btic_hits=(\d+)', r['log'])
@@ -2281,6 +2387,13 @@ def main():
     sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
     sz.add_argument('--seed0', type=int, default=1)
     sub.add_parser('socsd')
+    sdv = sub.add_parser('socsdvga'); sdv.add_argument('--lines', type=int, default=120)
+    sdv.add_argument('--wbinv-every', type=int, default=1500)
+    sdv.add_argument('--miglat', type=int, nargs='+', default=[36, 44])
+    sdv.add_argument('--blit', action='store_true'); sdv.add_argument('--write', action='store_true')
+    sdv.add_argument('--plus', action='append', default=[]); sdv.add_argument('--keep', action='store_true')
+    sdd = sub.add_parser('socsddma'); sdd.add_argument('only', nargs='*')
+    sdd.add_argument('--plus', action='append', default=[]); sdd.add_argument('--keep', action='store_true')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
     bp = sub.add_parser('socbench'); bp.add_argument('--plus', action='append', default=[])
@@ -2307,6 +2420,7 @@ def main():
     tc.add_argument('--seed0', type=int, default=1); tc.add_argument('--rev')
     tc.add_argument('--plus', nargs='*', default=[])
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
+    sd.add_argument('--cycles', action='store_true', help='also require identical PIPE_RUN cycles per program')
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
     sd.add_argument('--base-env', action='append', help='KEY=VAL for the base build (with --base wt)')
@@ -2369,6 +2483,10 @@ def main():
         sys.exit(cmd_socdcbz(a))
     elif a.cmd == 'socwalk':
         sys.exit(cmd_socwalk(a))
+    elif a.cmd == 'socsdvga':
+        sys.exit(cmd_socsdvga(a))
+    elif a.cmd == 'socsddma':
+        sys.exit(cmd_socsddma(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
     elif a.cmd == 'socx':

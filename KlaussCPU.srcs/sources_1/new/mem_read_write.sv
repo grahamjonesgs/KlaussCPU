@@ -139,6 +139,26 @@ module mem_read_write #(
     output            o_vga_yield,      // a cache miss is waiting for DDR: VGA should end its tenure
 
     // -------------------------------------------------------------------------
+    // DDR master E — the SD DMA engine (sd_native, SD DMA spec v1.2).  The
+    // B / C contract: req level, grant, one 128 b transaction (DV until
+    // ready, wdf_mask 1 = byte not written), done releases; it releases after
+    // every transaction.  Priority: VGA > SD > blitter > core 2, gated like the
+    // blitter (no cache miss in flight, no maintenance walk pending or
+    // running: a data command written after a CACHE_CTRL op cannot reach DDR
+    // before the walk's writebacks have).  A DMA master to the L2 (i_dma).
+    // -------------------------------------------------------------------------
+    input             i_sd_req,
+    input             i_sd_done,
+    input             i_sd_write_DV,
+    input             i_sd_read_DV,
+    input      [31:0] i_sd_addr,
+    input      [127:0] i_sd_write_data,
+    input      [15:0] i_sd_wdf_mask,
+    output     [127:0] o_sd_read_data,
+    output            o_sd_ready,
+    output            o_sd_grant,
+
+    // -------------------------------------------------------------------------
     // Cache-maintenance control (MMIO 0xF005). Full-cache operations that walk
     // every set/way. Pulses (1 cycle) trigger; o_mnt_busy is high while a walk
     // runs. The CPU's next cached access transparently stalls until the walk
@@ -153,6 +173,15 @@ module mem_read_write #(
     input             i_flush_go,
     input             i_inval_go,
     output            o_mnt_busy,
+    // D-cache range operations (CACHE_CTRL[5:4] RANGE_CLEAN / RANGE_INV over
+    // CACHE_OP_ADDR / CACHE_OP_LEN, SD DMA spec v1.2): a one-cycle pulse with
+    // the op's lines, copied when the op is accepted.  i_rng_n = ceil(LEN/32)
+    // (>= 1: LEN = 0 is a no-op the SoC drops).  RANGE_INV writes a dirty
+    // line back before it drops it.  Queued like FLUSH (see the capture).
+    input             i_rng_go,
+    input             i_rng_inv,
+    input      [26:0] i_rng_l0,         // first line: PA[31:5]
+    input      [27:0] i_rng_n,
 
     // 1a stage 3 (STAGE3_DCACHE_PLAN.md): the load-hit pipe.  i_h_addr is the
     // core's AGU result; its shadow tag/data arrays are read EVERY cycle at
@@ -252,28 +281,34 @@ module mem_read_write #(
     logic          r_grant_blit = 1'b0;     // blitter owns DDR (master B)
     logic          r_grant_c2   = 1'b0;     // AMP core 2 owns DDR (master C)
     logic          r_grant_vga  = 1'b0;     // VGA scanout owns DDR (master D, read-only)
+    logic          r_grant_sd   = 1'b0;     // the SD DMA engine owns DDR (master E)
     // Mutually exclusive by construction (one grant block below); the cache
     // (master A) owns the controller whenever all are low.
 
     wire         mig_write_DV   = r_grant_vga  ? 1'b0
+                                : r_grant_sd   ? i_sd_write_DV
                                 : r_grant_blit ? i_dma_write_DV
                                 : r_grant_c2   ? i_c2_write_DV   : o_ddr_mem_write_DV;
     wire         mig_read_DV    = r_grant_vga  ? i_vga_read_DV
+                                : r_grant_sd   ? i_sd_read_DV
                                 : r_grant_blit ? i_dma_read_DV
                                 : r_grant_c2   ? i_c2_read_DV    : o_ddr_mem_read_DV;
     wire [ 31:0] mig_addr       = r_grant_vga  ? i_vga_addr
+                                : r_grant_sd   ? i_sd_addr
                                 : r_grant_blit ? i_dma_addr
                                 : r_grant_c2   ? i_c2_addr       : o_ddr_mem_addr;
-    wire [255:0] mig_write_data = r_grant_blit ? {128'b0, i_dma_write_data}
+    wire [255:0] mig_write_data = r_grant_sd   ? {128'b0, i_sd_write_data}
+                                : r_grant_blit ? {128'b0, i_dma_write_data}
                                 : r_grant_c2   ? {128'b0, i_c2_write_data}
                                                : o_ddr_mem_write_data;
-    wire [ 15:0] mig_wdf_mask   = r_grant_blit ? i_dma_wdf_mask
+    wire [ 15:0] mig_wdf_mask   = r_grant_sd   ? i_sd_wdf_mask
+                                : r_grant_blit ? i_dma_wdf_mask
                                 : r_grant_c2   ? i_c2_wdf_mask   : w_app_wdf_mask;
     // Cache and VGA fill a full 32 B line (two pipelined BL8 bursts); the
     // blitter and core 2 do single 128 b bursts. `mig_wide` tells ddr2_control
     // which.  VGA always asks for dword 0 (mig_dw_off, at the ddr2_control
     // instance: in-order bursts, no CWF).
-    wire         mig_wide       = ~(r_grant_blit | r_grant_c2);
+    wire         mig_wide       = ~(r_grant_blit | r_grant_c2 | r_grant_sd);
 
     assign o_dma_read_data = i_ddr_mem_read_data[127:0]; // blitter uses low 128 b; latches on o_dma_ready
     assign o_dma_grant     = r_grant_blit;
@@ -281,6 +316,8 @@ module mem_read_write #(
     assign o_c2_grant      = r_grant_c2;
     assign o_vga_read_data = i_ddr_mem_read_data;
     assign o_vga_grant     = r_grant_vga;
+    assign o_sd_read_data  = i_ddr_mem_read_data[127:0];
+    assign o_sd_grant      = r_grant_sd;
 
     // -------------------------------------------------------------------------
     // Cache-maintenance request capture. A flush/invalidate pulse sets a sticky
@@ -300,21 +337,56 @@ module mem_read_write #(
     logic r_mnt_active    = 1'b0;   // set by the main FSM while a walk runs
     logic r_mnt_active_d  = 1'b0;   // for the consume edge below
     logic r_mnt_walk_mode = 1'b0;   // mode of the RUNNING walk (owned by the FSM)
+    logic r_mnt_rng       = 1'b0;   // the RUNNING walk is a range walk (owned by the FSM)
 
-    assign o_mnt_busy = r_mnt_active | r_mnt_pending;
+    // Range operations (SD DMA spec v1.2).  One range op can wait here with
+    // its own lines (r_rng_*, copied when it is accepted), behind a running
+    // walk of either kind.  Anything that would need a second queue entry is
+    // turned into a whole-cache walk, a superset that is always correct
+    // (RANGE_INV writes back, so dropping more lines loses nothing):
+    //   - a range op of more than 2 x 1024 lines (64 KiB, the cache) — the
+    //     whole walk is no slower;
+    //   - a range op while a whole-cache walk is pending (it merges in: an
+    //     INVALIDATE if either invalidates), or while another range op is
+    //     pending (both become one whole-cache walk);
+    //   - a whole-cache request while a range op is pending (it absorbs it).
+    // A whole-cache request keeps its existing capture exactly (a level for
+    // the store's whole strobe; cleared when its walk starts).
+    localparam int RNG_MAX = 2 * CACHE_SIZE;
+    logic        r_rng_pend = 1'b0;
+    logic        r_rng_inv  = 1'b0;
+    logic [26:0] r_rng_l0;
+    logic [11:0] r_rng_n;           // 1 .. RNG_MAX
+    wire         w_rng_start;       // the FSM starts the pending range walk on this edge
+    wire         w_rng_pq  = r_rng_pend && !w_rng_start;   // ...still pending after it
+    wire         w_rng_cvt = i_rng_go && (i_rng_n > 28'(RNG_MAX) || w_rng_pq || r_mnt_pending);
+    wire         w_wgo     = i_flush_go || i_inval_go || w_rng_cvt;
+    wire         w_wgo_inv = i_inval_go || (w_rng_cvt && i_rng_inv) || (w_wgo && w_rng_pq && r_rng_inv);
+
+    assign o_mnt_busy = r_mnt_active | r_mnt_pending | r_rng_pend;
 
     always_ff @(posedge i_Clk) begin
         r_mnt_active_d <= r_mnt_active;
-        if (i_flush_go || i_inval_go) begin
+        if (w_wgo) begin
             r_mnt_pending <= 1'b1;
             // INVALIDATE wins over FLUSH; a still-pending INVALIDATE is never
             // downgraded by a later FLUSH pulse (the walk does the superset).
-            r_mnt_mode    <= i_inval_go | (r_mnt_pending & r_mnt_mode);
-        end else if (r_mnt_active && !r_mnt_active_d) begin
+            r_mnt_mode    <= w_wgo_inv | (r_mnt_pending & r_mnt_mode);
+        end else if (r_mnt_active && !r_mnt_active_d && !r_mnt_rng) begin
             // The walk that just started (WAIT -> MAINT edge) owns this
             // request; clear ONLY here so a pulse arriving mid-walk re-arms
             // pending and schedules a fresh walk after the current one.
+            // (Not at a range walk's start: a whole request then is new.)
             r_mnt_pending <= 1'b0;
+        end
+        // the range slot
+        if (w_rng_start) r_rng_pend <= 1'b0;
+        if (w_wgo && w_rng_pq) r_rng_pend <= 1'b0;          // absorbed by the whole walk
+        if (i_rng_go && !w_rng_cvt) begin
+            r_rng_pend <= 1'b1;
+            r_rng_inv  <= i_rng_inv;
+            r_rng_l0   <= i_rng_l0;
+            r_rng_n    <= i_rng_n[11:0];
         end
     end
 
@@ -327,17 +399,19 @@ module mem_read_write #(
     // ddr2_control's ready belongs to whichever master is currently granted.
     // Gate it so each master only acts on its own DDR completions — none can
     // mistake another's ready for its own.
-    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga;
+    wire w_cache_ddr_ready = i_ddr_mem_ready & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga & ~r_grant_sd;
     wire w_blit_ddr_ready  = i_ddr_mem_ready &  r_grant_blit;
     wire w_c2_ddr_ready    = i_ddr_mem_ready &  r_grant_c2;
     wire w_vga_ddr_ready   = i_ddr_mem_ready &  r_grant_vga;
+    wire w_sd_ddr_ready    = i_ddr_mem_ready &  r_grant_sd;
     // CWF early pulse is cache-only.  VGA's wide reads DO emit it (they are
     // the cache's read shape), so the VGA term here is load-bearing.
-    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga;
+    wire w_cache_dw_ready  = w_ddr_dw_ready  & ~r_grant_blit & ~r_grant_c2 & ~r_grant_vga & ~r_grant_sd;
 
     assign o_dma_ready = w_blit_ddr_ready;
     assign o_c2_ready  = w_c2_ddr_ready;
     assign o_vga_ready = w_vga_ddr_ready;
+    assign o_sd_ready  = w_sd_ddr_ready;
 
     // -------------------------------------------------------------------------
     // Address decode — combinational from cpu.addr (32-bit byte address).
@@ -529,7 +603,29 @@ module mem_read_write #(
     localparam MS_W1_GAP  = 4'd6;
     localparam MS_CLR     = 4'd7;   // clear dirty (both modes) / valid (INVALIDATE)
     localparam MS_DONE    = 4'd8;
+    localparam MS_RCHK    = 4'd9;   // range walk: which ways hold a line of the range
     logic [3:0] r_mnt_sub = MS_READ;
+
+    // Range walk (r_mnt_rng).  It visits min(n, 1024) sets from the first
+    // line's index, two cycles a set (MS_READ, MS_RCHK) when nothing there
+    // needs writing back.  At visit j (the line L0 + j) a way holds a line
+    // of the range iff its tag is T_j = (L0 + j)[26:10], or (n > 1024 and
+    // j < n - 1024: the line L0 + j + 1024 at the same index) T_j + 1.
+    // The selected ways (r_rw_s0 / r_rw_s1) are written back if dirty
+    // (the whole walk's MS_W0 / MS_W1, qualified) and, for RANGE_INV,
+    // dropped; the other ways are not touched.
+    logic [TAG_BITS-1:0] r_rw_tag, r_rw_tag1;   // T_j, T_j + 1
+    logic [10:0]         r_rw_left;             // sets still to visit (this one included)
+    logic [10:0]         r_rw_two;              // visits left that hold a second range line
+    logic                r_rw_inv;              // RANGE_INV (else RANGE_CLEAN)
+    logic                r_rw_s0 = 1'b0, r_rw_s1 = 1'b0;
+    wire w_rw_sel0 = r_tag_way0[TAG_BITS] && (r_tag_way0[TAG_BITS-1:0] == r_rw_tag ||
+                                              (r_rw_two != 11'd0 && r_tag_way0[TAG_BITS-1:0] == r_rw_tag1));
+    wire w_rw_sel1 = r_tag_way1[TAG_BITS] && (r_tag_way1[TAG_BITS-1:0] == r_rw_tag ||
+                                              (r_rw_two != 11'd0 && r_tag_way1[TAG_BITS-1:0] == r_rw_tag1));
+    // a whole walk selects every way (r_mnt_rng = 0)
+    wire w_ms_sel0 = !r_mnt_rng || r_rw_s0;
+    wire w_ms_sel1 = !r_mnt_rng || r_rw_s1;
 
     // Unified cache-array READ index. The CPU (WAIT) and the maintenance walk
     // (MAINT/MS_READ) read the tag/dirty/data/lru arrays through THIS single
@@ -592,7 +688,7 @@ module mem_read_write #(
     wire dirty0_wen = (w_write_hit_now &&                       r_hit_way0) ||
                       (state == WRITE_FETCH  && w_wf_fill         && r_evict_way == 1'b0) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b0) ||
-                      (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
+                      (state == MAINT && r_mnt_sub == MS_CLR && w_ms_sel0);  // flush/inval: clear dirty
     // WRITE_FETCH installs as DIRTY (write-back on miss): avoids DDR write-through
     // after a miss, which would race against MIG's internal write pipeline and
     // could clobber bytes committed by a prior buffered write to the same line.
@@ -603,7 +699,7 @@ module mem_read_write #(
     wire dirty1_wen = (w_write_hit_now &&                       r_hit_way1) ||
                       (state == WRITE_FETCH  && w_wf_fill         && r_evict_way == 1'b1) ||
                       (state == READ_WAIT    && w_cache_ddr_ready && r_evict_way == 1'b1) ||
-                      (state == MAINT && r_mnt_sub == MS_CLR);  // flush/inval: clear dirty
+                      (state == MAINT && r_mnt_sub == MS_CLR && w_ms_sel1);  // flush/inval: clear dirty
     wire dirty1_din = w_write_hit_now || (state == WRITE_FETCH && w_wf_fill);
 
     always_ff @(posedge i_Clk) begin
@@ -704,7 +800,12 @@ module mem_read_write #(
         r_h_tag1 <= w_h_a1[31:5+INDEX_BITS];
         r_h_c1   <= i_h_c1;
         r_h_off  <= i_h_addr[4:3];
-        r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);
+        // (and while a RANGE_INV waits to start — the cache still busy with
+        // an earlier miss: a load must not hit a line it is about to drop,
+        // so RANGE_INV is synchronous for loads as for the port.  A pending
+        // whole-cache INVALIDATE is not covered: unchanged from c0bf7b2.)
+        r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx) ||
+                    (r_rng_pend && r_rng_inv);
     end
     // (both candidates compared in parallel; the carry selects the result)
     wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_c1 ? (r_h_tq0[TAG_BITS-1:0] == r_h_tag1)
@@ -783,7 +884,20 @@ module mem_read_write #(
                     // its (un-served) request until the walk completes.
                     r_mnt_active    <= 1'b1;
                     r_mnt_walk_mode <= r_mnt_mode;   // freeze the mode for this walk
+                    r_mnt_rng       <= 1'b0;
                     r_cache_index   <= {INDEX_BITS{1'b0}};
+                    r_mnt_sub       <= MS_READ;
+                    state           <= MAINT;
+                end else if (r_rng_pend) begin
+                    // a range walk (w_rng_start): from the op's copied lines
+                    r_mnt_active    <= 1'b1;
+                    r_mnt_rng       <= 1'b1;
+                    r_rw_inv        <= r_rng_inv;
+                    r_cache_index   <= r_rng_l0[INDEX_BITS-1:0];
+                    r_rw_tag        <= r_rng_l0[26:INDEX_BITS];
+                    r_rw_tag1       <= r_rng_l0[26:INDEX_BITS] + 1'b1;
+                    r_rw_left       <= (r_rng_n > 12'(CACHE_SIZE)) ? 11'(CACHE_SIZE) : r_rng_n[10:0];
+                    r_rw_two        <= (r_rng_n > 12'(CACHE_SIZE)) ? 11'(r_rng_n - 12'(CACHE_SIZE)) : 11'd0;
                     r_mnt_sub       <= MS_READ;
                     state           <= MAINT;
                 end else if (w_dv_new) begin
@@ -1089,7 +1203,40 @@ module mem_read_write #(
                         r_dirty_way1 <= cache_dirty_way1[w_rd_index];
                         r_data_way0  <= cache_val_data_way0[w_rd_index];
                         r_data_way1  <= cache_val_data_way1[w_rd_index];
-                        r_mnt_sub    <= MS_W0;
+                        r_mnt_sub    <= r_mnt_rng ? MS_RCHK : MS_W0;
+                    end
+
+                    MS_RCHK: begin
+                        // range walk: select the ways holding range lines;
+                        // with nothing dirty among them, drop them now
+                        // (RANGE_INV) and go to the next set — else the
+                        // whole walk's writeback steps, then MS_CLR
+                        r_rw_s0 <= w_rw_sel0;
+                        r_rw_s1 <= w_rw_sel1;
+                        if ((w_rw_sel0 && r_dirty_way0) || (w_rw_sel1 && r_dirty_way1)) begin
+                            r_mnt_sub <= MS_W0;
+                        end else begin
+                            if (r_rw_inv && w_rw_sel0) begin
+                                cache_val_addr_way0[r_cache_index] <= {(TAG_BITS+1){1'b0}};
+                                h_tag_way0[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                            end
+                            if (r_rw_inv && w_rw_sel1) begin
+                                cache_val_addr_way1[r_cache_index] <= {(TAG_BITS+1){1'b0}};
+                                h_tag_way1[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                            end
+                            if (r_rw_left == 11'd1) begin
+                                r_mnt_sub <= MS_DONE;
+                            end else begin
+                                r_cache_index <= r_cache_index + 1'b1;
+                                if (r_cache_index == INDEX_BITS'(CACHE_SIZE - 1)) begin
+                                    r_rw_tag  <= r_rw_tag + 1'b1;
+                                    r_rw_tag1 <= r_rw_tag1 + 1'b1;
+                                end
+                                r_rw_left <= r_rw_left - 11'd1;
+                                if (r_rw_two != 11'd0) r_rw_two <= r_rw_two - 11'd1;
+                                r_mnt_sub <= MS_READ;
+                            end
+                        end
                     end
 
                     MS_W0: begin
@@ -1100,7 +1247,7 @@ module mem_read_write #(
                         // to HALF its address — the LVGL flush=blitter code
                         // corruption (0xA600A600 at PC 0xD69A4 = fb line
                         // 0x1AD340 mis-flushed to 0xD69A0).
-                        if (r_tag_way0[TAG_BITS] && r_dirty_way0) begin
+                        if (r_tag_way0[TAG_BITS] && r_dirty_way0 && w_ms_sel0) begin
                             o_ddr_mem_addr       <= {r_tag_way0[TAG_BITS-1:0], r_cache_index, 5'b00000};
                             o_ddr_mem_write_data <= r_data_way0;
                             r_app_wdf_mask       <= 16'h0000;   // write all 16 bytes
@@ -1125,7 +1272,7 @@ module mem_read_write #(
                     end
 
                     MS_W1: begin
-                        if (r_tag_way1[TAG_BITS] && r_dirty_way1) begin
+                        if (r_tag_way1[TAG_BITS] && r_dirty_way1 && w_ms_sel1) begin
                             o_ddr_mem_addr       <= {r_tag_way1[TAG_BITS-1:0], r_cache_index, 5'b00000};
                             o_ddr_mem_write_data <= r_data_way1;
                             r_app_wdf_mask       <= 16'h0000;
@@ -1153,13 +1300,30 @@ module mem_read_write #(
                         // Dirty bits for both ways are cleared via the dirty0/1_wen
                         // wires (which include the MS_CLR term). For INVALIDATE,
                         // also clear the valid bit on both ways.
-                        if (r_mnt_walk_mode) begin   // INVALIDATE
-                            cache_val_addr_way0[r_cache_index] <= {(TAG_BITS+1){1'b0}};
-                            cache_val_addr_way1[r_cache_index] <= {(TAG_BITS+1){1'b0}};
-                            h_tag_way0[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
-                            h_tag_way1[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                        if (r_mnt_rng ? r_rw_inv : r_mnt_walk_mode) begin   // INVALIDATE / RANGE_INV
+                            if (w_ms_sel0) begin
+                                cache_val_addr_way0[r_cache_index] <= {(TAG_BITS+1){1'b0}};
+                                h_tag_way0[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                            end
+                            if (w_ms_sel1) begin
+                                cache_val_addr_way1[r_cache_index] <= {(TAG_BITS+1){1'b0}};
+                                h_tag_way1[r_cache_index]          <= {(TAG_BITS+1){1'b0}};
+                            end
                         end
-                        if (r_cache_index == CACHE_SIZE - 1) begin
+                        if (r_mnt_rng) begin
+                            if (r_rw_left == 11'd1) begin
+                                r_mnt_sub <= MS_DONE;
+                            end else begin
+                                r_cache_index <= r_cache_index + 1'b1;
+                                if (r_cache_index == INDEX_BITS'(CACHE_SIZE - 1)) begin
+                                    r_rw_tag  <= r_rw_tag + 1'b1;
+                                    r_rw_tag1 <= r_rw_tag1 + 1'b1;
+                                end
+                                r_rw_left <= r_rw_left - 11'd1;
+                                if (r_rw_two != 11'd0) r_rw_two <= r_rw_two - 11'd1;
+                                r_mnt_sub <= MS_READ;
+                            end
+                        end else if (r_cache_index == CACHE_SIZE - 1) begin
                             r_mnt_sub <= MS_DONE;
                         end else begin
                             r_cache_index <= r_cache_index + 1'b1;
@@ -1214,6 +1378,9 @@ module mem_read_write #(
     // M10a: the shadow-writeback states are part of the miss path — the
     // blitter arbiter must stay locked out until the victim line is safely in
     // DDR (see the EVICT_SHADOW comment in the FSM).
+    // the FSM takes the pending range op on this edge (WAIT, no whole walk first)
+    assign w_rng_start = (state == WAIT) && !r_mnt_pending && r_rng_pend;
+
     wire is_miss_path = (state == WRITE_FETCH)      ||
                         (state == READ_WAIT)        ||
                         (state == EVICT_SHADOW_GAP) ||
@@ -1261,8 +1428,9 @@ module mem_read_write #(
     logic [3:0] r_grant_orphan_cnt = 4'd0;
     wire w_grant_orphaned = (r_grant_blit && !i_dma_req && !i_dma_done) ||
                             (r_grant_c2   && !i_c2_req  && !i_c2_done)  ||
-                            (r_grant_vga  && !i_vga_req && !i_vga_done);
-    wire w_no_grant = !r_grant_blit && !r_grant_c2 && !r_grant_vga;
+                            (r_grant_vga  && !i_vga_req && !i_vga_done) ||
+                            (r_grant_sd   && !i_sd_req  && !i_sd_done);
+    wire w_no_grant = !r_grant_blit && !r_grant_c2 && !r_grant_vga && !r_grant_sd;
     wire w_vga_gate = !is_miss_path && (state != MAINT || r_mnt_sub == MS_READ);
     assign o_vga_yield = is_miss_path;
 
@@ -1275,12 +1443,16 @@ module mem_read_write #(
             if (i_vga_req && w_vga_gate)
                 r_grant_vga  <= 1'b1;
             else if (!is_miss_path && !o_mnt_busy) begin
-                if (i_dma_req)     r_grant_blit <= 1'b1;
+                if (i_sd_req)      r_grant_sd   <= 1'b1;
+                else if (i_dma_req) r_grant_blit <= 1'b1;
                 else if (i_c2_req) r_grant_c2   <= 1'b1;
             end
         end else if (r_grant_vga) begin
             if (i_vga_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
                 r_grant_vga <= 1'b0;
+        end else if (r_grant_sd) begin
+            if (i_sd_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+                r_grant_sd <= 1'b0;
         end else if (r_grant_blit) begin
             if (i_dma_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
                 r_grant_blit <= 1'b0;
@@ -1371,7 +1543,7 @@ module mem_read_write #(
         .o_mem_dw_ready   (w_ddr_dw_ready),
         .o_calib_done     (o_calib_done),
         .o_ui_clk         (w_ui_clk),
-        .i_dma            (r_grant_blit | r_grant_c2 | r_grant_vga),
+        .i_dma            (r_grant_blit | r_grant_c2 | r_grant_vga | r_grant_sd),
         .i_ifetch         (r_is_ifetch),
         .i_rt_req         (i_vga_req),
         // the speculative lookup: this cache's request in its CHECK cycle

@@ -65,6 +65,9 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    klauss_pkg::flags_t dbg_flags;
    klauss_pkg::dbg_in_t  dbg_i = '0;
    klauss_pkg::dbg_out_t dbg_o;
+   logic [26:0]  cop_line = '0;      // RANGE_IINV inputs (RIINV_EN = 0 here)
+   logic [27:0]  cop_n    = '0;
+   logic         rk_busy;
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (.*, .lcd_ready(1'b1), .ce(1'b1));
 
