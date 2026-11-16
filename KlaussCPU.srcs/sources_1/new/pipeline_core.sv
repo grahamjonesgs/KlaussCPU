@@ -2178,10 +2178,46 @@ module pipeline_core
    wire ex_is_mm  = (ex_d.uop == U_BOOL) &&
                     (cmp_op_e'(ex_d.sub) == CMP_MIN || cmp_op_e'(ex_d.sub) == CMP_MAX ||
                      cmp_op_e'(ex_d.sub) == CMP_MINU || cmp_op_e'(ex_d.sub) == CMP_MAXU);
-   wire ex_mmpick = (cmp_op_e'(ex_d.sub) == CMP_MIN)  ? ($signed(opa) < $signed(opb))
-                  : (cmp_op_e'(ex_d.sub) == CMP_MAX)  ? ($signed(opa) > $signed(opb))
-                  : (cmp_op_e'(ex_d.sub) == CMP_MINU) ? (opa < opb)
-                  :                                     (opa > opb);      // MAXU
+   // (§8 timing) every compare — the BOOL / FBR conditions and MIN/MAX's
+   // pick — from two chains, equal and unsigned-less (signed: the sign bits
+   // decide when they differ), and the condition's three outcomes registered
+   // at dispatch (ex_cv = the result when opa == opb / opa < opb / opa >
+   // opb; ex_cs = signed: f_cmpv), so a condition is one LUT after the
+   // chains instead of a case mux on ex_d.sub (b1: ex_a -> the compare
+   // chains -> the case -> exo_result[0] -> mem_result[0] was -0.462).
+   // MIN = LT, MAX = GT.  Asserted against the old forms.
+   logic [2:0] ex_cv;
+   logic       ex_cs;
+   wire ex_ceq  = opa == opb;
+   wire ex_cltu = opa < opb;
+   wire ex_clt  = (ex_cs && (opa[63] ^ opb[63])) ? opa[63] : ex_cltu;
+   wire ex_cres = ex_ceq ? ex_cv[2] : ex_clt ? ex_cv[1] : ex_cv[0];
+   function automatic logic [3:0] f_cmpv(dec_t d);     // {cv[2:0], cs}
+      case (cmp_op_e'(d.sub))
+         CMP_EQ:   return 4'b100_1;
+         CMP_NE:   return 4'b011_1;
+         CMP_LT:   return 4'b010_1;
+         CMP_LE:   return 4'b110_1;
+         CMP_GT:   return 4'b001_1;
+         CMP_GE:   return 4'b101_1;
+         CMP_ULT:  return 4'b010_0;
+         CMP_ULE:  return 4'b110_0;
+         CMP_UGT:  return 4'b001_0;
+         CMP_UGE:  return 4'b101_0;
+         CMP_MIN:  return 4'b010_1;
+         CMP_MAX:  return 4'b001_1;
+         CMP_MINU: return 4'b010_0;
+         CMP_MAXU: return 4'b001_0;
+         default:  return 4'b000_0;
+      endcase
+   endfunction
+   wire ex_mmpick = ex_cres;
+`ifndef SYNTHESIS
+   wire ex_mmpick_ref = (cmp_op_e'(ex_d.sub) == CMP_MIN)  ? ($signed(opa) < $signed(opb))
+                      : (cmp_op_e'(ex_d.sub) == CMP_MAX)  ? ($signed(opa) > $signed(opb))
+                      : (cmp_op_e'(ex_d.sub) == CMP_MINU) ? (opa < opb)
+                      :                                     (opa > opb);      // MAXU
+`endif
    // (tmg timing) the ALU result's two hot legs, selected last: the
    // adder's sum (U_ALU other than AND / OR / XOR) and a compare's bit
    // (U_BOOL / U_FBR EQ ... UGE), decided at dispatch (ex_res_add /
@@ -2192,21 +2228,32 @@ module pipeline_core
    wire        ex_cin = ex_alu_cf && flags_eff.carry;
    wire [64:0] ex_sum = ex_alu_sub ? ({1'b0, opa} - {1'b0, opb} - {64'b0, ex_cin})
                                    : ({1'b0, opa} + {1'b0, opb} + {64'b0, ex_cin});
-   logic       ex_cmpbit;
+   wire        ex_cmpbit = ex_cres;
+`ifndef SYNTHESIS
+   logic       ex_cmpbit_ref;
    always_comb
       case (cmp_op_e'(ex_d.sub))
-         CMP_EQ:  ex_cmpbit = (opa == opb);
-         CMP_NE:  ex_cmpbit = (opa != opb);
-         CMP_LT:  ex_cmpbit = ($signed(opa) <  $signed(opb));
-         CMP_LE:  ex_cmpbit = ($signed(opa) <= $signed(opb));
-         CMP_GT:  ex_cmpbit = ($signed(opa) >  $signed(opb));
-         CMP_GE:  ex_cmpbit = ($signed(opa) >= $signed(opb));
-         CMP_ULT: ex_cmpbit = (opa <  opb);
-         CMP_ULE: ex_cmpbit = (opa <= opb);
-         CMP_UGT: ex_cmpbit = (opa >  opb);
-         CMP_UGE: ex_cmpbit = (opa >= opb);
-         default: ex_cmpbit = 1'b0;
+         CMP_EQ:  ex_cmpbit_ref = (opa == opb);
+         CMP_NE:  ex_cmpbit_ref = (opa != opb);
+         CMP_LT:  ex_cmpbit_ref = ($signed(opa) <  $signed(opb));
+         CMP_LE:  ex_cmpbit_ref = ($signed(opa) <= $signed(opb));
+         CMP_GT:  ex_cmpbit_ref = ($signed(opa) >  $signed(opb));
+         CMP_GE:  ex_cmpbit_ref = ($signed(opa) >= $signed(opb));
+         CMP_ULT: ex_cmpbit_ref = (opa <  opb);
+         CMP_ULE: ex_cmpbit_ref = (opa <= opb);
+         CMP_UGT: ex_cmpbit_ref = (opa >  opb);
+         CMP_UGE: ex_cmpbit_ref = (opa >= opb);
+         default: ex_cmpbit_ref = 1'b0;
       endcase
+   always_ff @(posedge clk) if (!rst && ex_valid) begin
+      assert ({ex_cv, ex_cs} == f_cmpv(ex_d))
+         else $fatal(1, "ex_cv / ex_cs != f_cmpv(ex_d) (pc %h)", ex_pc);
+      if (ex_res_cmp) assert (ex_cmpbit == ex_cmpbit_ref)
+         else $fatal(1, "ex_cmpbit != the case form (pc %h)", ex_pc);
+      if (ex_is_mm) assert (ex_mmpick == ex_mmpick_ref)
+         else $fatal(1, "ex_mmpick != the old form (pc %h)", ex_pc);
+   end
+`endif
    function automatic logic f_res_add(dec_t d);
       return d.uop == U_ALU && d.sub != 4'd4 && d.sub != 4'd5 && d.sub != 4'd6;
    endfunction
@@ -2226,8 +2273,11 @@ module pipeline_core
                                ex_alu_cf  == (ex_d.sub == 4'd2 || ex_d.sub == 4'd3))))
          else $fatal(1, "ex_res_add / ex_res_cmp / ALU controls != ex_d (pc %h)", ex_pc);
    // the selected-last legs are the case's result
+   // (§8: a compare's leg in exo_result is 0 — mem_result takes ex_cmpbit
+   // through ex_res_cmp — so the compare chains do not also reach
+   // mem_result through the uop mux)
    always_ff @(posedge clk) if (!rst && ex_valid && (ex_res_add || ex_res_cmp))
-      assert (exo_result == (ex_res_add ? ex_sum[63:0] : {63'b0, ex_cmpbit}))
+      assert (exo_result == (ex_res_add ? ex_sum[63:0] : 64'b0))
          else $fatal(1, "exo_result's fast leg (pc %h)", ex_pc);
 `endif
    always_comb begin : ex_logic
@@ -2271,7 +2321,12 @@ module pipeline_core
             sa = opa; sb = opb;
             case (cmp_op_e'(ex_d.sub))
                CMP_EQ, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE,
-               CMP_ULT, CMP_ULE, CMP_UGT, CMP_UGE: exo_result = {63'b0, ex_cmpbit};
+               CMP_ULT, CMP_ULE, CMP_UGT, CMP_UGE:
+                  // (§8 timing: mem_result takes the bit through ex_res_cmp;
+                  // only the 2b-lite equality FBR, off here, reads it below)
+                  exo_result = (EN_FBR_EQ_EX && !EN_BP && ex_d.uop == U_FBR &&
+                                (cmp_op_e'(ex_d.sub) == CMP_EQ || cmp_op_e'(ex_d.sub) == CMP_NE))
+                               ? {63'b0, ex_cmpbit} : 64'b0;
                // MIN/MAX/MINU/MAXU (timing): the 64-bit select moved to MEM
                // (mem_result_eff, M12 Stage D style).  EX hands on opa (as
                // the result), opb (in the store-data register, unused by ALU
@@ -4884,6 +4939,7 @@ module pipeline_core
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
                   ex_res_add <= f_res_add(dec);  ex_res_cmp <= f_res_cmp(dec);   // (tmg)
+                  {ex_cv, ex_cs} <= f_cmpv(dec);                                  // (§8)
                   ex_alu_sub <= (dec.sub == 4'd1 || dec.sub == 4'd3 || dec.sub == 4'd7);
                   ex_alu_cf  <= (dec.sub == 4'd2 || dec.sub == 4'd3);
                   ex_eiser   <= id_eiser;
