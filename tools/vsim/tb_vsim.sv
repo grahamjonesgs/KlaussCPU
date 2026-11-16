@@ -536,6 +536,38 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          ba_tag[0] = dut.id_pc[31:2];  ba_last[0] = dut.id_last_dw;  ba_v[0] = 1'b1;
       end
    end
+   // (HW_PERF_PLAN §8 item 3b; §5 review-of-review-3 deferred minor 1) No
+   // BTIC capture of a line a store has snooped while that store is still
+   // outstanding (snooped, not yet written: the window may hold the old
+   // bytes).  The core's own rule covers only the snoop's edge (bt_cap and
+   // the pending capture's kill); an arm after it is unreachable today
+   // (EN_ST1 stores are squashed at the snoop, a non-speculative one is
+   // chained behind a load).  sn_v / sn_idx: the snooping store, from its
+   // snoop (snoop_q) until a write to its line index completes on the port.
+   // btic_snarm > 0 ends the run with a FATAL line; sn_n counts the stores
+   // tracked.
+   localparam int SN_IW = $clog2(IC_LINES);
+   logic             sn_v = 1'b0, sn_pr = 1'b0;
+   logic [SN_IW-1:0] sn_idx = '0;
+   longint           btic_snarm = 0, sn_n = 0;
+   function automatic logic sn_m(input logic [SN_IW-1:0] i, input logic [SN_IW-1:0] x, input logic pr);
+      return (IC_LB == 32) ? (i == x) : (i[SN_IW-1:1] == x[SN_IW-1:1] && (pr || i[0] == x[0]));
+   endfunction
+   always @(posedge clk) if (!rst) begin
+      // (the snoop's own edge included: the core blocks that capture itself)
+      if (dut.bt_cap && ((sn_v && (sn_m(dut.r_bt_wbase[SN_IW+BT_LW-1:BT_LW], sn_idx, sn_pr) ||
+                                   sn_m(dut.r_bt_wblidx, sn_idx, sn_pr))) ||
+                         (dut.snoop_q && (sn_m(dut.r_bt_wbase[SN_IW+BT_LW-1:BT_LW], dut.snoop_idx_q, dut.snoop_pr_q) ||
+                                          sn_m(dut.r_bt_wblidx, dut.snoop_idx_q, dut.snoop_pr_q))))) begin
+         btic_snarm++;
+         $display("TB: BTIC capture at t=%0d of a line whose snooping store is outstanding", cyc);
+      end
+      if (dut.snoop_q) begin
+         sn_v <= 1'b1;  sn_idx <= dut.snoop_idx_q;  sn_pr <= dut.snoop_pr_q;  sn_n++;
+      end else if (sn_v && dut.m_write_DV && dut.w_mrdy &&
+                   m_addr[SN_IW+BT_LW+2:BT_LW+3] == sn_idx)
+         sn_v <= 1'b0;
+   end
    always @(posedge clk) if (!rst) begin
       if (dut.li_now) ic_inst++;
       if (dut.lp_ev && dut.lp_wrh) ic_drop++;
@@ -668,10 +700,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);
 `endif
 `ifdef HAS_ICLB
-      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d btic_pau=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc, btic_pau);
+      $fdisplay(f, "ic_inst=%0d ic_drop=%0d ic_vdefer=%0d ic_sweeps=%0d ic_lines=%0d itlb_ref=%0d btic_unc=%0d btic_pau=%0d sn_n=%0d", ic_inst, ic_drop, ic_vdefer, ic_sweeps, n_line, n_itlb, btic_unc, btic_pau, sn_n);
       $fdisplay(f, "btic_chk=%0d btic_hits=%0d btic_stale=%0d btic_noarm=%0d", btic_chk, btic_hits, btic_stale, btic_noarm);
       if (btic_unc != 0) $display("TB: FATAL BTIC coverage: btic_unc=%0d (a valid BTIC entry's line not in the tag shadow)", btic_unc);
       if (btic_stale != 0) $display("TB: FATAL BTIC currency: btic_stale=%0d (a BTIC hit's window not at the branch's target)", btic_stale);
+`ifdef HAS_ICLB
+      if (btic_snarm != 0) $display("TB: FATAL BTIC capture of a snooped line before its store landed: btic_snarm=%0d", btic_snarm);
+`endif
       if (btic_noarm != 0) $display("TB: FATAL BTIC check: btic_noarm=%0d (an entry written without its arm)", btic_noarm);
 `ifdef HAS_PERF_ITLB
       $fdisplay(f, "itlb_disc=%0d", itlb_disc);
