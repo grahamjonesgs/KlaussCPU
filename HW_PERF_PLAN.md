@@ -2047,7 +2047,7 @@ are in MMIO_MAP.md ("Native SD mode", "Cache controller").
   (`--blit`) the blitter, against the same run without the DMA, at MIGLAT
   36 and 44 (below); the DMA's data checked at the end.
 - **Mutations** (`tools/vsim/sddmamut.py`, the unit bench or the named SoC
-  tests per mutant): **33 of 33 killed** — DATA_DONE before the data is in
+  tests per mutant): **34 of 34 killed** — DATA_DONE before the data is in
   DDR; DMA_BUSY without the transaction in flight; each refusal and the
   per-block check; the fetch's room and count limits; a FIFO reset that
   leaves the engine waiting; aborts ignored; `SDM_DATA` / FIFO_THRESH /
@@ -2056,7 +2056,7 @@ are in MMIO_MAP.md ("Native SD mode", "Cache controller").
   interrupt; the m3 gate and the pending op in MNT_BUSY; the walk's second
   tag, its precision, its last set, RANGE_INV without the write-back (the
   emulator's reading), the copied range, the queue, the 64 KiB conversion,
-  FLUSH | range bits; RANGE_IINV's mask (none, off by a bank), its snoop
+  FLUSH | range bits; the hit pipe during a pending RANGE_INV; RANGE_IINV's mask (none, off by a bank), its snoop
   stall, its decode.  (Not listed: clearing `vl_any` at a range sweep's end
   — equivalent in practice, every fetch during a sweep reinstalls.)
 
@@ -2117,6 +2117,27 @@ worst grant wait rises by at most 14 cycles (none with the blitter).  Its worst 
 (~2,500–3,100 cycles) is the arbiter's rule for every DMA master — no
 grant while a CPU miss is in flight, VGA first — under this miss-heavy loop;
 the 4 KiB FIFO absorbs it (the card's clock stops between blocks).
+
+**Regression** (against `c0bf7b2`): `l2_regress.sh` core (the 5
+configurations — default, DEBUG_EN, MPU, 16-entry TLB, no walker — diff /
+diff_irq / excdiff / mpudiff / tlbdiff / tlbpage / dcbzdiff / dmtest, btfuzz
+300 seeds), soc36, soc8, socvar (L2 off, 8 ways, jittered and slow MIG), eq
+(`L2_EN` = 0 against `c0bf7b2` under the same tb_soc), the tb_l2 sweep
+(120 of 120) and l2mut: all pass.  `tools/sdsim/run_sd_tb.sh`: tb_sd_native
+337 checks, tb_sd_spi_compat, tb_sd_dma seeds 1–17.  **DMA_EN = 0 is
+cycle-identical to `c0bf7b2`**: `socdiff --cycles` (identical retire traces
+*and* PIPE_RUN cycles, per program) over 30 randprog seeds with the L2 and
+20 without, the regression's socdiff / eq totals, and `_vga_prog` with WBINVs
+every 300 iterations, with and without the blitter (cycles, display lines,
+worst fetch and MIG bursts identical).  The CPU_FEATURES expectations
+(socmmio-style checks, soccrypto, socwalk, socsd) are updated to `[27]`;
+soccrypto's full-configuration value was stale on `c0bf7b2` (`0x01FF200D`)
+and is now derived.
+
+**Utilisation** (synthesis only, `44580c7` vs `13be986` = `c0bf7b2`'s RTL,
+`build_fast -stop_after_synth`): LUTs as logic 35,321 (+813), LUTs as memory
+3,932 (+0), registers 24,535 (+780), BRAM 124 (+0), DSP 20 (+1: the
+up-front range check's size × count).
 
 **A second finding, fixed for the range ops only: loads could pass a
 pending invalidate.**  The documented rule is that the CPU's next cached
@@ -2344,3 +2365,10 @@ Decisions taken while implementing the frozen text above:
   D-cache paths (placement: the L2's area equals `c9cadea`'s), alt-place
   `ExtraPostPlacementOpt` +0.028 / +0.038,
   `~/.cache/kbuild/l2b_13be986_epp.bit`.  Not yet run on the board.
+- 2026-11-16: §7 SD DMA engine (SD DMA spec v1.2: `SDM_DMA_ADDR`,
+  DMA_EN / DMA_BUSY / DMA_ERR, master E) and the cache range operations
+  (RANGE_CLEAN / RANGE_INV / RANGE_IINV, `CACHE_OP_ADDR` / `LEN`,
+  `CPU_FEATURES[27]`): branch `sddma`, RTL and simulation only (tb_sd_dma,
+  socsddma, socsdvga, 34 of 34 mutations, the L2 regression; cycle-identical
+  to `c0bf7b2` without DMA); synthesis +813 LUTs.  Not yet built (waits for
+  `tmg`).
