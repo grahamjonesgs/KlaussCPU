@@ -6694,8 +6694,9 @@ def tx_pair():
                 ld32(0x7FFFFFFD, X_TLB_LD, 0x7FFFFFFD)   # 1st: TLB, 2nd: kseg (fine)
                 ld32(0xC002FFFD, X_TLB_LD, 0xC0030000)  # 1st kmap mapped, 2nd unmapped
                 ld32(0x87FFFFFD, X_ACC_LD, 0x88000000)  # kseg 1st, 2nd the hole
-                # (not tested: a supervisor MEMGET32 at 0xFFFFFFFD, whose 2nd dword wraps to VA 0, takes no
-                # TLB fault on db67f3f or master; MMU_PLAN §11.9)
+                # (a supervisor MEMGET32 at 0xFFFFFFFD, whose 2nd dword wraps to VA 0, takes no fault
+                # HERE because _te_on maps page 0 (the code) — not a bug; tx_wrap makes page 0
+                # execute-only and gets the fault, EADDR 0: HW_PERF_PLAN §8 item 3a)
         a, e, p = _te_prog(body, user, None, logs=logs, setup=_tx_kmsetup, plus=plus)
         _tx_preload(a)
         out.append((a, e, p))
@@ -6904,4 +6905,36 @@ def mmio_frame_irq():
                                            irq=True)
                 exp['m00180000'] = 'nonzero'
                 out.append((a, exp, plus))
+    return out
+
+
+@test
+def tx_wrap():
+    """MMU_PLAN §11.9 (HW_PERF_PLAN §8 item 3a): TE = 1 supervisor, page 0
+    execute-only: a MEMGET32 at 0xFFFF_FFFD / a LEAVERET at R15 =
+    0xFFFF_FFF8 (1st doubleword MMIO, 2nd wraps to VA 0) take page 0's
+    permission fault (EADDR = VA 0, the lowest faulting byte); a plain load
+    from page 0 is the control"""
+    if NOEXC:
+        return []
+    out = []
+    for plus, dist in [(pl, d) for pl in ([], ['+HIT=70', '+LAT=1']) for d in (0, 1, 3)]:
+        logs = []
+        def body(a):
+            _tlb_set(a, 0, 0x0000, 0x000, TLB_V | TLB_X, g=1)
+            a.setr(9, 0x8); a.ld(64, 7, 9)
+            logs.append((X_ACC_LD, 0x8))
+            a.setr(9, 0xFFFFFFFD)
+            for _ in range(dist):
+                a.nop()
+            a.ld(32, 7, 9)
+            logs.append((X_ACC_LD, 0x0))
+            a.setr(15, 0xFFFFFFF8)
+            for _ in range(dist):
+                a.nop()
+            a.leaveret()
+            logs.append((X_ACC_LD, 0x0))
+            _tlb_set(a, 0, 0x0000, 0x000, TLB_RWX, g=1)
+        a, e, p = _te_prog(body, False, None, logs=logs, plus=plus)
+        out.append((a, e, p))
     return out
