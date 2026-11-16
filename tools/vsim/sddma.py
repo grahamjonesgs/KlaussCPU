@@ -512,6 +512,38 @@ def t_irq():
     return a, {'r4': 0x42, 'r7': ST_DMA_ERR, 'r9': 2, 'r12': 0}, [], {'host_err': 0}
 
 
+def t_inv_hit(whole=False, wait=False):
+    """a load right after a RANGE_INV (or a whole INVALIDATE) without the
+    MNT_BUSY poll, while the D-cache is still busy with an earlier store's
+    miss (so the walk is pending, not running): does the load see the
+    invalidated (stale) line?  B is cached with an old copy; a DMA put the
+    card's data in DDR; then a store that misses, the invalidate, and a load
+    of B at once (twice: warm code, the first pass with CACHE_CTRL = 0).
+    r7 = the load's value, r6 = the card's.  Characterisation (see run)."""
+    a = SdAsm().prologue(div=0)
+    B, K, X = 0x00424000, 1300, 0x00500000
+    a.fill(B, K, 1, xor=JUNK)                     # the old copy, cached
+    a.cache_op(RCLEAN, B, 512)
+    a.dma(17, K, B, 512, 1, 0); a.wait_done(); a.mov(4, 3)
+    a.wr(14, OP_ADDR, B); a.wr(14, OP_LEN, 512)
+    a.setr(3, 0); a.setr(9, 2); a.setr(10, B); a.setr(11, X); a.setr(13, 0)
+    a.label('ih')
+    a.st(64, 9, 11, 0)                            # a store that misses (a new line each pass)
+    a.st(64, 3, 14, CACHE_CTRL)
+    if wait:
+        a.mnt_wait()
+    a.ld(64, 7, 10, 0)                            # B's first dword, at once
+    a.setr(1, 0x1000); a.alu('add', 11, 11, 1)
+    a.setr(3, INVAL if whole else RINV); a.dec(9); a.fbr('ne', 9, 0, 'ih', imm=True)
+    a.setr64(6, P(K, 0))
+    a.stop()
+    a.halt()
+    # RANGE_INV: the load waits for the walk (the hit pipe is held off while
+    # it is pending); whole INVALIDATE: the stale line (c0bf7b2's behaviour,
+    # unchanged: poll MNT_BUSY before reading)
+    return a, {'r4': 0, 'r7': JUNK ^ P(K, 0) if whole and not wait else P(K, 0)}, [], {'host_err': 0}
+
+
 def t_iinv_time(ln, addr=0x10000):
     """RANGE_IINV's sweep for ln bytes from addr with the I-cache warm
     (RKSWEEP lines= cycles=): a timing figure; every LEN 32 .. 64 KiB"""
@@ -624,6 +656,9 @@ def tests():
         ('iinv_then_icinv', *t_iinv_snoop(then_icinv=True)),
         ('range_two', *t_range_two()),
         ('irq', *t_irq()),
+        ('inv_hit_range', *t_inv_hit()),
+        ('inv_hit_whole', *t_inv_hit(whole=True)),
+        ('inv_hit_wait', *t_inv_hit(wait=True)),
     ] + [
         (f'iinv_time_{ln}', *t_iinv_time(ln)) for ln in (32, 1024, 2048, 4096, 8192, 0xFFE0, 0x10000)
     ]

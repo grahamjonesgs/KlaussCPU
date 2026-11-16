@@ -97,6 +97,9 @@ MUTS = [
     ('whole_wins', 'range bits with FLUSH / INVALIDATE also queue a range op', TOP, ['range_combo'],
      "(w_mmio_write_data[5:4] != 2'b00) &&\n                                 !w_mmio_write_data[1] && !w_mmio_write_data[2] &&",
      "(w_mmio_write_data[5:4] != 2'b00) &&"),
+    ('hit_pend', 'a load hits a line a pending RANGE_INV is about to drop (the hit pipe not held off)', MR, ['inv_hit_range'],
+     "r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx) ||\n                    (r_rng_pend && r_rng_inv);",
+     "r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);"),
     # ---------------- RANGE_IINV (tb_soc) ----------------
     ('iinv_nomask', 'the range sweep clears nothing', PC, ['iinv', 'iinv_wide'],
      "         wire we = swst ? (!r_sw_rng || r_sw_mask[b])", "         wire we = swst ? (!r_sw_rng)"),

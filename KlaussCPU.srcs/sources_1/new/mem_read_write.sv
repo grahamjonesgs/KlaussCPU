@@ -732,7 +732,12 @@ module mem_read_write #(
         r_h_tag1 <= w_h_a1[31:5+INDEX_BITS];
         r_h_c1   <= i_h_c1;
         r_h_off  <= i_h_addr[4:3];
-        r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);
+        // (and while a RANGE_INV waits to start — the cache still busy with
+        // an earlier miss: a load must not hit a line it is about to drop,
+        // so RANGE_INV is synchronous for loads as for the port.  A pending
+        // whole-cache INVALIDATE is not covered: unchanged from c0bf7b2.)
+        r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx) ||
+                    (r_rng_pend && r_rng_inv);
     end
     // (both candidates compared in parallel; the carry selects the result)
     wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_c1 ? (r_h_tq0[TAG_BITS-1:0] == r_h_tag1)
