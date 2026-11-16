@@ -2981,8 +2981,13 @@ module pipeline_core
    // bit 3; the core decodes its own completing store. Invalidates every
    // fetch-side code copy and refetches everything younger — for code written
    // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
-   wire        icinv_f    = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
-                            mem_be[0] && mem_wdata[3];
+   // (sddma2 timing: a CACHE_CTRL store is MMIO, so of mem_done_now's terms
+   // only the port's can complete it — the posted / queued / fast-load
+   // terms all need iaddr[31:28] != F; = the plain form, asserted)
+   wire        cc_st      = mem_is_write && mem_iaddr == 32'hF005_0000 && mem_be[0];
+   wire        cc_done    = (mem_xc == 2'd1 && w_mrdy && !mem_need2) || (mem_xc == 2'd3 && w_mrdy) ||
+                            (mem_xc == 2'd1 && st_post_ok);
+   wire        icinv_f    = cc_st && cc_done && mem_wdata[3];
    // RANGE_IINV (CACHE_CTRL[6], RIINV_EN; honoured with FLUSH /
    // INVALIDATE, as ICACHE_INV is — SD DMA review 1; ignored with LEN = 0;
    // with ICACHE_INV the fence covers it).  Everything ICACHE_INV does but the valid bits: of those only the
@@ -2994,8 +2999,7 @@ module pipeline_core
       r_cop_nz   <= cop_n != 28'd0;
       r_cop_full <= cop_n >= 28'(IC_LINES);
    end
-   wire        icinv_r    = RIINV_EN && mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
-                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && r_cop_nz;
+   wire        icinv_r    = RIINV_EN && cc_st && cc_done && mem_wdata[6] && !mem_wdata[3] && r_cop_nz;
    wire        icinv      = icinv_f || icinv_r;
 
    // ------------- HW_PERF_PLAN §5: line valid bits (IC_LB = 32) -------------
@@ -3217,42 +3221,53 @@ module pipeline_core
    // interlock, no sched-model change needed.
    wire mem_is_sh     = mem_valid && (mem_d.uop == U_SHIFT);
    wire ex_is_sh_hand = ex_valid && (ex_d.uop == U_SHIFT) && !ex_busy && !mem_busy;
-   logic [63:0] r_shl1, r_shr1, r_sar1, r_rol1, r_ror1, r_oh1, r_btr1, r_sha_op;
-   logic [2:0]  r_shhi, r_bthi;
+   // (sddma2 timing: stage 1 also picks the kind — every kind becomes one
+   // byte rotate of one register, r_src, by r_rk bytes, then a byte keep /
+   // fill: SHL / ROL rotate left by hi, SHR / SAR / ROR by -hi; SHL keeps
+   // bytes >= hi, SHR / SAR bytes < 8 - hi, SAR fills the rest with the
+   // sign.  BTS / BTR / BTC / BTSTRR are done in stage 1 (r_rk = 0, keep
+   // all).  Was a 9-way case on r_shsub after five byte barrels: r_shhi ->
+   // w_sh2 -> the forwards / wb_zero, sddma_b2's tier-1 worst, -0.280.)
+   logic [63:0] r_src;
+   logic [2:0]  r_rk;
+   logic [7:0]  r_keepb, r_fillb;
    logic [3:0]  r_shsub;
    always_ff @(posedge clk) if (ce) begin
-      if (ex_is_sh_hand) begin
-         r_shl1  <= ex_a << ex_shcnt[2:0];
-         r_shr1  <= ex_a >> ex_shcnt[2:0];
-         r_sar1  <= $signed(ex_a) >>> ex_shcnt[2:0];
-         r_rol1  <= (ex_a << ex_shcnt[2:0]) | (ex_a >> (7'd64 - {4'b0, ex_shcnt[2:0]}));
-         r_ror1  <= (ex_a >> ex_shcnt[2:0]) | (ex_a << (7'd64 - {4'b0, ex_shcnt[2:0]}));
-         r_oh1   <= 64'b1 << ex_shcnt[2:0];
-         r_btr1  <= (ex_a >> ex_b[2:0]) | (ex_a << (7'd64 - {4'b0, ex_b[2:0]}));
-         r_shhi  <= ex_shcnt[5:3];
-         r_bthi  <= ex_b[5:3];
+      if (ex_is_sh_hand) begin : sh_st1
+         logic [2:0]  lo, hi;
+         logic [63:0] oh;
+         lo = ex_shcnt[2:0];  hi = ex_shcnt[5:3];
+         oh = 64'b1 << ex_shcnt;
          r_shsub <= ex_d.sub;
-         r_sha_op<= ex_a;
+         r_rk    <= 3'd0;  r_keepb <= 8'hFF;  r_fillb <= 8'h00;
+         case (ex_d.sub)
+            4'd0: begin r_src <= ex_a << lo;                                    r_rk <= hi;
+                        for (int j = 0; j < 8; j++) r_keepb[j] <= 3'(j) >= hi; end
+            4'd1: begin r_src <= ex_a >> lo;                                    r_rk <= -hi;
+                        for (int j = 0; j < 8; j++) r_keepb[j] <= 4'(j) + 4'(hi) <= 4'd7; end
+            4'd2: begin r_src <= $signed(ex_a) >>> lo;                          r_rk <= -hi;
+                        for (int j = 0; j < 8; j++) begin
+                           r_keepb[j] <= 4'(j) + 4'(hi) <= 4'd7;
+                           r_fillb[j] <= !(4'(j) + 4'(hi) <= 4'd7) && ex_a[63];
+                        end end
+            4'd3: begin r_src <= (ex_a << lo) | (ex_a >> (7'd64 - {4'b0, lo})); r_rk <= hi;  end
+            4'd4: begin r_src <= (ex_a >> lo) | (ex_a << (7'd64 - {4'b0, lo})); r_rk <= -hi; end
+            4'd8:  r_src <= ex_a |  oh;
+            4'd9:  r_src <= ex_a & ~oh;
+            4'd10: r_src <= ex_a ^  oh;
+            default: r_src <= {63'b0, ex_a[ex_b[5:0]]};   // BTSTRR
+         endcase
       end
    end
+   function automatic logic [63:0] f_rot8(logic [63:0] v, logic [2:0] k);   // byte j <- byte j - k
+      return (v << {k, 3'b000}) | (v >> (7'd64 - {1'b0, k, 3'b000}));
+   endfunction
    logic [63:0] w_sh2;
    always_comb begin : sh_stage2
-      logic [6:0]  hi8, bhi8;
-      logic [63:0] btr_full;
-      hi8  = {1'b0, r_shhi, 3'b000};
-      bhi8 = {1'b0, r_bthi, 3'b000};
-      btr_full = (r_btr1 >> bhi8) | (r_btr1 << (7'd64 - bhi8));
-      case (r_shsub)
-         4'd0:  w_sh2 = r_shl1 << hi8;
-         4'd1:  w_sh2 = r_shr1 >> hi8;
-         4'd2:  w_sh2 = $signed(r_sar1) >>> hi8;
-         4'd3:  w_sh2 = (r_rol1 << hi8) | (r_rol1 >> (7'd64 - hi8));
-         4'd4:  w_sh2 = (r_ror1 >> hi8) | (r_ror1 << (7'd64 - hi8));
-         4'd8:  w_sh2 = r_sha_op |  (r_oh1 << hi8);
-         4'd9:  w_sh2 = r_sha_op & ~(r_oh1 << hi8);
-         4'd10: w_sh2 = r_sha_op ^  (r_oh1 << hi8);
-         default: w_sh2 = {63'b0, btr_full[0]};   // BTSTRR
-      endcase
+      logic [63:0] rot;
+      rot = f_rot8(r_src, r_rk);
+      for (int j = 0; j < 8; j++)
+         w_sh2[8*j +: 8] = (rot[8*j +: 8] & {8{r_keepb[j]}}) | {8{r_fillb[j]}};
    end
    // v3 D3: a W op's result is its low 32 bits sign-extended — applied here,
    // on the registered MEM value both forwarding and WB read (only the
@@ -3482,28 +3497,10 @@ module pipeline_core
    // = f_wz(id_w, w_sh2), asserted.)  sh_rz[j]: byte j of w_sh2 is zero.
    logic [7:0] sh_rz;
    always_comb begin : sh_zero
-      logic [7:0] zl, zr, zs, zol, zor, za, zan, zx;
-      logic [2:0] k;
-      zl  = f_bz(r_shl1);  zr  = f_bz(r_shr1);  zs = f_bz(r_sar1);
-      zol = f_bz(r_rol1);  zor = f_bz(r_ror1);  za = f_bz(r_sha_op);
-      for (int i = 0; i < 8; i++) begin
-         zan[i] = (r_sha_op[8*i +: 8] & ~r_oh1[7:0]) == 8'd0;   // byte i with the bit cleared
-         zx[i]  = (r_sha_op[8*i +: 8] ^  r_oh1[7:0]) == 8'd0;   //  ... flipped
-      end
-      k = r_shhi;
-      for (int j = 0; j < 8; j++) begin
-         case (r_shsub)
-            4'd0:  sh_rz[j] = (j >= k) ? zl[3'(j - k)] : 1'b1;              // SHL
-            4'd1:  sh_rz[j] = (j + k <= 7) ? zr[3'(j + k)] : 1'b1;          // SHR
-            4'd2:  sh_rz[j] = (j + k <= 7) ? zs[3'(j + k)] : !r_sar1[63];   // SAR
-            4'd3:  sh_rz[j] = zol[3'(j - k)];                               // ROL
-            4'd4:  sh_rz[j] = zor[3'(j + k)];                               // ROR
-            4'd8:  sh_rz[j] = (3'(j) == k) ? 1'b0 : za[j];                 // BTS
-            4'd9:  sh_rz[j] = (3'(j) == k) ? zan[j] : za[j];               // BTR
-            4'd10: sh_rz[j] = (3'(j) == k) ? zx[j] : za[j];                // BTC
-            default: sh_rz[j] = (j != 0) || !r_btr1[{r_bthi, 3'b000}];     // BTSTRR
-         endcase
-      end
+      logic [7:0] zs;
+      zs = f_bz(r_src);
+      for (int j = 0; j < 8; j++)
+         sh_rz[j] = r_keepb[j] ? zs[3'(3'(j) - r_rk)] : !r_fillb[j];
    end
    wire bz_sh = id_w ? &sh_rz[3:0] : &sh_rz;
    (* keep = "true" *) wire bz_mem = mem_is_sh ? bz_sh : f_wz(id_w, mem_res_nsh);
@@ -4611,7 +4608,8 @@ module pipeline_core
             // Z producers are never port reads (IRET's flags come from
             // iret_fval with wb_zval 0), so the reduce sees mem_result_eff
             // only and stays off the m_rdata path.
-            wb_zero    <= (mem_result_eff == 64'b0);
+            // (sddma2 timing: a shift's from stage 2's byte-zero flags)
+            wb_zero    <= mem_is_sh ? &sh_rz : (mem_res_nsh == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
@@ -5632,10 +5630,35 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
          else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
+   // CACHE_CTRL's completion = mem_done_now for that store (sddma2 timing)
+   always_ff @(posedge clk) if (!rst && !$isunknown({cc_st, cc_done, mem_done_now}))
+      assert (!cc_st || cc_done == mem_done_now)
+         else $fatal(1, "cc_done form: %b vs mem_done_now %b", cc_done, mem_done_now);
+   // the shifter's rotate / keep / fill form equals the plain shift of the
+   // captured operands (sddma2 timing)
+   logic [63:0] sr_a; logic [5:0] sr_n, sr_b; logic [3:0] sr_sub;
+   always_ff @(posedge clk) if (ce && ex_is_sh_hand) begin
+      sr_a <= ex_a; sr_n <= ex_shcnt; sr_b <= ex_b[5:0]; sr_sub <= ex_d.sub;
+   end
+   always_ff @(posedge clk) if (!rst && mem_is_sh && !$isunknown({sr_a, sr_n, sr_b, sr_sub})) begin : sh_ref
+      logic [63:0] ref_v;
+      case (sr_sub)
+         4'd0: ref_v = sr_a << sr_n;
+         4'd1: ref_v = sr_a >> sr_n;
+         4'd2: ref_v = $signed(sr_a) >>> sr_n;
+         4'd3: ref_v = (sr_a << sr_n) | (sr_a >> (7'd64 - {1'b0, sr_n}));
+         4'd4: ref_v = (sr_a >> sr_n) | (sr_a << (7'd64 - {1'b0, sr_n}));
+         4'd8: ref_v = sr_a |  (64'b1 << sr_n);
+         4'd9: ref_v = sr_a & ~(64'b1 << sr_n);
+         4'd10: ref_v = sr_a ^ (64'b1 << sr_n);
+         default: ref_v = {63'b0, sr_a[sr_b]};
+      endcase
+      assert (w_sh2 == ref_v) else $fatal(1, "shifter form: sub=%0d n=%0d a=%h got %h want %h", sr_sub, sr_n, sr_a, w_sh2, ref_v);
+   end
    // bz_mem's byte-flag form of the shifter's zero test equals the real one
    always_ff @(posedge clk) if (!rst && !$isunknown({bz_mem, mem_result_eff, id_w}))
       assert (bz_mem == f_wz(id_w, mem_result_eff))
-         else $fatal(1, "bz_mem form: sub=%0d hi=%0d w=%b v=%h", r_shsub, r_shhi, id_w, mem_result_eff);
+         else $fatal(1, "bz_mem form: sub=%0d rk=%0d w=%b v=%h", r_shsub, r_rk, id_w, mem_result_eff);
    // CE_TIED: the instance really ties ce high (§5, IC_LB = 32)
    always_ff @(posedge clk) if (!rst && CE_TIED)
       assert (ce === 1'b1) else $fatal(1, "pipeline_core: CE_TIED = 1 but ce = %b", ce);
