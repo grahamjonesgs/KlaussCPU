@@ -349,8 +349,12 @@ module l2_cache #(
     logic        wb_h    = 1'b0;        // head (oldest)
     wire  [1:0]  wb_n    = {1'b0, wb_v[0]} + {1'b0, wb_v[1]};
     wire         wb_full = (wb_v == 2'b11);
-    // full for a posted write: also while the walk holds the next free slot
-    // (r_wk_wb), unless both are free
+    // full for the front end: also while the walk holds the next free slot
+    // (r_wk_wb), unless both are free.  Only a posted write sees the
+    // difference (r_wk_wb implies a walk, when nothing allocates, so the
+    // victim-copy paths are dead); it is used for all of the front end's
+    // slot decisions all the same: a separate signal for the posted write
+    // alone cost ~330 LUTs of unshared write-buffer update logic (review 2)
     wire         wb_full_p = wb_full || (r_wk_wb && wb_v != 2'b00);
     wire         wb_tail = wb_v[wb_h] ? !wb_h : wb_h;
     // the entry the engine drains: the oldest (FIFO — a later entry of the
@@ -526,7 +530,7 @@ module l2_cache #(
     wire       w_rd_needslot = w_rd_newline && (r_vd != 2'b00);
     // (the walk waits on a full buffer: its drain goes before a demand read)
     wire       w_wk_need;
-    wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full) &&
+    wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full_p) &&
                           !(w_wk_need && wb_rdy[wb_dh]);
     // writes
     wire       w_wr_cache_hit = q_lk && !q_dma && r_many;               // line present: write in place
@@ -538,8 +542,8 @@ module l2_cache #(
     // line, or a full buffer in the way of an allocation's victim copy or of
     // a posted write (wb_full_p: the walk's reserved slot counts as taken)
     wire       w_fe_req  = (f_st == F_DEC) &&
-                           (q_wr ? (w_wr_cache_alloc && r_vd != 2'b00 && wb_full) || (w_wr_post && wb_full_p)
-                                 : !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full)));
+                           (q_wr ? wb_full_p && ((w_wr_cache_alloc && r_vd != 2'b00) || w_wr_post)
+                                 : !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full_p)));
     // the walk waits on the write buffer (review 2, m-A): a dirty way to
     // copy and the buffer full, or (its end) the entries present when its
     // last set was done.  The walk is a request in hand (the L2_CTRL write):
@@ -597,7 +601,7 @@ module l2_cache #(
                                                     r_tv[r_mway] | (q_sec ? 2'b10 : 2'b01),
                                                     r_td[r_mway] | (q_sec ? 2'b10 : 2'b01)), r_mway);
                         db_we = WAYS'(1) << r_mway;
-                    end else if (w_wr_cache_alloc && !(r_vd != 2'b00 && wb_full)) begin
+                    end else if (w_wr_cache_alloc && !(r_vd != 2'b00 && wb_full_p)) begin
                         tb_we = 1'b1;
                         tb_din = f_plru_tw(f_setway(r_tw, r_vic, q_tag, q_sec ? 2'b10 : 2'b01,
                                                     q_sec ? 2'b10 : 2'b01), r_vic);
@@ -768,7 +772,7 @@ module l2_cache #(
                         end else begin
                             f_st <= F_WRSP;
                         end
-                    end else if (w_rd_needslot && wb_full) begin
+                    end else if (w_rd_needslot && wb_full_p) begin
                         ev_wbfull <= 1'b1;
                     end
                 end else if (!eng_bwr) begin
@@ -780,7 +784,7 @@ module l2_cache #(
                         if (r_vd == 2'b00) begin
                             ev_w_miss <= 1'b1;
                             f_st <= F_IDLE;
-                        end else if (!wb_full) begin
+                        end else if (!wb_full_p) begin
                             ev_w_miss <= 1'b1;
                             c_way <= r_vic; c_sec <= r_vd; c_e <= wb_tail;
                             r_msel <= r_vic;
@@ -1012,6 +1016,10 @@ module l2_cache #(
         if (|r_db_we && (f_st == F_VC0 || f_st == F_VC1 || f_st == F_VC2) &&
             r_db_addr[SETW:1] == c_set && r_db_we[c_way])
             $fatal(1, "l2_cache: fill write overtook the victim copy (set %0d way %0d)", e_set, e_way);
+    // the walk's reserved slot: only during a walk (no allocation then)
+    always_ff @(posedge clk)
+        if (r_wk_wb && (w_alloc || !r_walking))
+            $fatal(1, "l2_cache: r_wk_wb outside a walk");
     // a stream-buffer answer never waits on the write buffer (review 2: the
     // stream buffer holds a line no write has touched since its fill, so no
     // entry of that line exists)
