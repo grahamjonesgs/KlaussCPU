@@ -261,6 +261,19 @@ module tb_soc;
    always @(posedge dut.i_Clk) if (dut.mem_read_write.r_grant_sd && dut.mem_read_write.i_ddr_mem_ready) begin
       if (dut.mem_read_write.mig_write_DV) sd_dma_wr++; else sd_dma_rd++;
    end
+   // the worst SD DMA transaction (cycles from its req to its ready; and DV
+   // to ready) and the worst wait of VGA's req for its grant
+   int sd_lat_max = 0, sd_dv_max = 0, vga_gw_max = 0, sd_lat = 0, sd_dv = 0, vga_gw = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.w_sd_dma_req) sd_lat++; else sd_lat = 0;
+      if (dut.w_sd_dma_write_DV || dut.w_sd_dma_read_DV) sd_dv++; else sd_dv = 0;
+      if (dut.w_sd_dma_ready) begin
+         if (sd_lat > sd_lat_max) sd_lat_max = sd_lat;
+         if (sd_dv > sd_dv_max) sd_dv_max = sd_dv;
+      end
+      if (dut.vga_ctrl_i.scanout.o_dma_req && !dut.vga_ctrl_i.scanout.i_dma_grant) vga_gw++;
+      else begin if (vga_gw > vga_gw_max) vga_gw_max = vga_gw; vga_gw = 0; end
+   end
    // cache maintenance timing (SD DMA spec v1.2 walk timing): one line per
    // D-cache walk ("WALK range|whole lines= dirty_wb= cycles=", from the
    // WAIT -> MAINT edge to MNT_BUSY's drop, queue wait excluded) and per
@@ -394,6 +407,9 @@ module tb_soc;
          $display("TB_SOC: SDC cmds=%0d rd_blocks=%0d wr_blocks=%0d wr_bad=%0d host_err=%0d rd_bad_sent=%0d sd_dma_wr=%0d sd_dma_rd=%0d",
                   sdcard.n_cmds, sdcard.blocks_read, sdcard.blocks_written, sdcard.wr_bad, sdcard.host_err,
                   sdcard.rd_bad_sent, sd_dma_wr, sd_dma_rd);
+`ifdef SD_DMA_PROBE
+         $display("TB_SOC: SDLAT req_to_ready_max=%0d dv_to_ready_max=%0d vga_grant_wait_max=%0d", sd_lat_max, sd_dv_max, vga_gw_max);
+`endif
          $display("TB_SOC: VGA reads=%0d read_cycles=%0d grant_cyc=%0d", vga_rd_n, vga_rd_cyc, vga_gnt_cyc);
 `ifdef L2_PROBE
          $display("TB_SOC: L2 rt drains bad=%0d need=%0d", rt_bad, rt_need);

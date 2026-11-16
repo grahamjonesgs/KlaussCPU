@@ -291,7 +291,7 @@ def t_range_queue(phase):
         return a, {}, plus, {'dcp': {0: (0, 0), 1: (0, 0), 2: (1, 1), 3: (1, 1)},
                              'walks': ['range', 'range']}
     a.touch(R, 1024, store=True, val=8)
-    a.touch(Cx, 2, store=True, val=3)
+    a.touch(Cx, 2, store=True, val=3); a.touch(X, 2, store=True, val=4)
     # (twice: the first pass, CACHE_CTRL = 0, brings the code into the
     # I-cache — an I-fill during the walk would wait for it)
     a.setr(7, 0); a.setr(13, 2)
@@ -301,8 +301,8 @@ def t_range_queue(phase):
     a.mnt_wait()
     a.setr(7, RCLEAN); a.dec(13); a.fbr('ne', 13, 0, 'rq2', imm=True)
     a.halt()
-    plus = [f'+DCP0={A:x}', f'+DCP2={B:x}', f'+DCP3={Cx:x}', f'+DCP4={R:x}']
-    return a, {}, plus, {'dcp': {0: (0, 0), 2: (1, 0), 3: (1, 0), 4: (1, 0)},
+    plus = [f'+DCP0={A:x}', f'+DCP2={B:x}', f'+DCP3={Cx:x}', f'+DCP4={R:x}', f'+DCP5={X:x}']
+    return a, {}, plus, {'dcp': {0: (0, 0), 2: (1, 0), 3: (1, 0), 4: (1, 0), 5: (1, 0)},
                          'walks': ['range', 'range', 'range', 'whole']}
 
 
@@ -384,6 +384,102 @@ def t_iinv(variant, ln=512):
         [], {'host_err': 0}
 
 
+def t_range_two():
+    """a range of 1536 lines (48 KiB): every set visited once, the first 512
+    of them holding two lines of the range (tags T and T + 1, the
+    r_rw_two / r_rw_tag1 path).  48 KiB dirty with the CPU's data over an
+    older copy in DDR, RANGE_CLEAN of all of it, then a DMA write of the
+    last 8 KiB (lines L0 + 1024 + ..., the second tag in their sets): the
+    card must get the CPU's data (wr_bad = 0)."""
+    a = SdAsm().prologue(div=0)
+    A, B0, N = 0x00340000, 1000, 96
+    a.fill(A, B0, N, xor=JUNK)
+    a.cache_op(FLUSH)                             # DDR: the old data
+    a.fill(A, B0, N)                              # dirty (the first 512 sets hold two lines each)
+    a.cache_op(RCLEAN, A, N * 512, wait=False)
+    a.dma(25, B0 + 80, A + 80 * 512, 512, 16, 1)
+    a.wait_done(); a.mov(4, 3)
+    a.stop()
+    a.halt()
+    return a, {'r4': 0}, [], {'wr_bad': 0, 'host_err': 0, 'wr_blocks': 16}
+
+
+def t_iinv_snoop(then_icinv=False):
+    """a store's I-cache snoop during a RANGE_IINV sweep: G (r5 = 3; RET) at
+    Y is cached and run; a RANGE_IINV of 64 lines elsewhere (a 64-cycle
+    sweep); the very next instructions patch G to r5 = 4 (CPU stores: the
+    snoop clears Y's line, outside the range — it must land, the sweep
+    waits a cycle for it); G must then return 4.  then_icinv: instead, X
+    is rewritten by DMA (as t_iinv) after the range sweep, and an ICACHE_INV
+    must still drop it (the range sweep left other lines valid, so the
+    whole-cache sweep must not be skipped)."""
+    a = SdAsm().prologue(div=0)
+    X, Y, S, K = 0x8000, 0xA000, 0x9000, 51
+    for i, d in enumerate(_code_dwords(Y, 3)):
+        a.dword(Y + 8 * i, d)
+    for i, d in enumerate(_code_dwords(X, 1)):
+        a.dword(X + 8 * i, d)
+    a.call(Y); a.call(Y); a.mov(6, 5)              # G cached
+    a.call(X); a.call(X)
+    if not then_icinv:
+        a.setr(10, Y); g = _code_dwords(Y, 4)
+        a.setr64(7, g[0]); a.setr64(8, g[1])
+        a.wr(14, OP_ADDR, 0x20000); a.wr(14, OP_LEN, 64 * 32); a.setr(1, RIINV)
+        a.st(64, 1, 14, CACHE_CTRL)                # the sweep starts as this store completes ...
+        a.st(64, 7, 10, 0); a.st(64, 8, 10, 8)     # ... and these snoop Y during it
+        a.mnt_wait()
+        a.call(Y); a.mov(7, 5)
+        a.halt()
+        return a, {'r6': 3, 'r7': 4}, [], {}
+    a.setr(10, S)
+    for i, d in enumerate(_code_dwords(X, 2)):
+        a.setr64(1, d); a.st(64, 1, 10, 8 * i)
+    a.cache_op(RCLEAN, S, 512)
+    a.dma(24, K, S, 512, 1, 1); a.wait_done(); a.mov(4, 3)
+    a.cache_op(RCLEAN, X, 512)
+    a.dma(17, K, X, 512, 1, 0); a.wait_done(); a.alu('or', 4, 4, 3)
+    a.cache_op(RINV, X, 512)
+    a.cache_op(RIINV, 0x20000, 64 * 32)            # a range sweep elsewhere
+    a.wr(14, CACHE_CTRL, ICINV)                   # then the whole I-cache
+    a.call(X); a.mov(7, 5)
+    a.halt()
+    return a, {'r4': 0, 'r7': 2}, [], {'host_err': 0}
+
+
+def t_irq():
+    """the SD interrupt through the SoC's source-2 cascade: SDM_IRQ_EN =
+    DMA_ERR | DATA_DONE, INT2_EN = SD; a refused DMA (a range leaving DDR)
+    raises INT2_PENDING[1] / INT_PENDING[2] (r5, r6) with SDM_STATUS[27]
+    (r7); W1C drops it (r8); a DMA read's DATA_DONE raises it again (r9),
+    only once its data is in DDR (r12 = mismatches read right then, after
+    a RANGE_INV)."""
+    a = SdAsm().prologue(div=0)
+    A, B0 = 0x00380000, 1200
+    a.setr(13, IRQ)
+    a.wr(13, 0x50, 2)                             # INT2_EN = SD
+    a.wr(15, SDM_IRQEN, ST_DMA_ERR | ST_DATA_DONE)
+    a.wr(15, SDM_DMA, 0x07FFFE00); a.wr(15, SDM_BLK, (2 << 16) | 512); a.wr(15, SDM_CFG, 1 | (1 << 16))
+    a.cmd(18, B0, RT_R1, data=1)
+    a.nop(); a.nop(); a.nop(); a.nop()
+    # (r4 = INT2_PENDING | (INT_PENDING & 4) << 4 | INT2_PENDING after the
+    # W1C << 8: the check helpers use r1, r2, r5, r6, r8 .. r12)
+    a.ld(64, 4, 13, 0x58); a.ld(64, 6, 13, 0x08); a.setr(1, 4); a.alu('and', 6, 6, 1)
+    a.shift_n('shl', 6, 6, 4); a.alu('or', 4, 4, 6)
+    a.ld(64, 7, 15, SDM_STATUS); a.setr(1, ST_DMA_ERR); a.alu('and', 7, 7, 1)
+    a.wr(15, SDM_STATUS, 0xFFFFFFFF)
+    a.nop(); a.nop(); a.nop()
+    a.ld(64, 8, 13, 0x58); a.shift_n('shl', 8, 8, 8); a.alu('or', 4, 4, 8)
+    a.cache_op(RCLEAN, A, 1024)
+    a.dma(18, B0, A, 512, 2, 0)
+    a.poll(13, 0x58, 2, True)                     # the interrupt line
+    a.cache_op(RINV, A, 1024)
+    a.check(A, B0, 2)
+    a.ld(64, 9, 13, 0x58)
+    a.stop()
+    a.halt()
+    return a, {'r4': 0x42, 'r7': ST_DMA_ERR, 'r9': 2, 'r12': 0}, [], {'host_err': 0}
+
+
 def t_iinv_time(ln, addr=0x10000):
     """RANGE_IINV's sweep for ln bytes from addr with the I-cache warm
     (RKSWEEP lines= cycles=): a timing figure; every LEN 32 .. 64 KiB"""
@@ -392,6 +488,84 @@ def t_iinv_time(ln, addr=0x10000):
     a.cache_op(RIINV, addr, ln)
     a.halt()
     return a, {}, [], {}
+
+
+def t_vga(lines=120, wbinv_every=1500, sd=True, blit=False, sd_write=False, span=0x80000):
+    """DMA alongside VGA, the blitter and L2 walks (and the L2 review's
+    question: an SD-DMA stream of writes into DDR during WBINV walks under
+    VGA load).  run.py's _vga_prog traffic (640 x 480 scanout at 4 MiB, a
+    strided CPU walk with dirty victims on both levels, an L2 WBINV every
+    wbinv_every iterations, optionally the blitter FILLing back to back),
+    plus an open-ended SD DMA at 50 MHz started first: a read stream into
+    6 MiB (DMA writes into DDR) or, sd_write, a write stream from 6 MiB.
+    At the end: CMD12, DMA_BUSY = 0, RANGE_INV of the buffer and the CPU
+    checks every block the card delivered (r12 = mismatches; the card's
+    wr_bad for a write stream).  r1 = VGA_STATUS."""
+    a = SdAsm()
+    a.setr(15, SD); a.setr(14, CC); a.setr(12, 0)
+    SB = 0x00600000
+    if sd:
+        a.setr(1, (1 << 18) | (1 << 17) | 0); a.st(64, 1, 15, 0); a.wr(15, SDM_CFG, 1)
+        if sd_write:
+            a.fill(SB, 2000, 1024)                 # (512 KiB: more than the stream sends)
+            a.cache_op(RCLEAN, SB, 1024 * 512)
+        a.dma(25 if sd_write else 18, 2000, SB, 512, 0, 1 if sd_write else 0)
+    a.setr(15, 0xF0110000)
+    a.setr(1, 0x400000); a.st(64, 1, 15, 0x08)
+    a.setr(1, 1280); a.st(64, 1, 15, 0x10)
+    a.setr(1, 480); a.st(64, 1, 15, 0x38)
+    a.setr(1, 0); a.st(64, 1, 15, 0x28)
+    a.setr(1, 4); a.st(64, 1, 15, 0x18)
+    a.setr(1, 1); a.st(64, 1, 15, 0x00)
+    a.setr(10, 0x100000); a.setr(9, (lines * 3200) // 40); a.setr(8, 0); a.setr(7, wbinv_every)
+    if blit:
+        a.setr(13, 0xF00E0000)
+        for off, v in ((0x10, 0x500000), (0x18, 1280), (0x30, 640), (0x38, 64), (0x40, 0x1234)):
+            a.setr(1, v); a.st(64, 1, 13, off)
+    a.label('top')
+    a.alu('add', 11, 10, 8)
+    a.ld(64, 2, 11, 0); a.addi_s(2, 2, 1); a.st(64, 2, 11, 0)
+    a.ld(64, 3, 11, 0x1000); a.st(64, 3, 11, 0x1008)
+    if blit:
+        a.ld(64, 4, 13, 0x08); a.setr(6, 1); a.alu('and', 4, 4, 6)
+        a.fbr('ne', 4, 0, 'noblit', imm=True)
+        a.setr(4, 2); a.st(64, 4, 13, 0x08)
+        a.setr(4, 1); a.st(64, 4, 13, 0x00)
+        a.label('noblit')
+    a.setr(6, 37 * 64); a.alu('add', 8, 8, 6)
+    a.setr(6, span - 1); a.alu('and', 8, 8, 6)
+    a.dec(7)
+    a.fbr('ne', 7, 0, 'nowrap', imm=True)
+    a.setr(7, wbinv_every)
+    a.setr(1, 3); a.st(64, 1, 14, 0x28)
+    a.label('wpoll')
+    a.ld(64, 1, 14, 0x28); a.setr(6, 0x100); a.alu('and', 1, 1, 6)
+    a.fbr('ne', 1, 0, 'wpoll', imm=True)
+    a.label('nowrap')
+    a.dec(9)
+    a.fbr('ne', 9, 0, 'top', imm=True)
+    a.ld(64, 13, 15, 0x18)                              # VGA_STATUS
+    if sd:
+        a.setr(15, SD)
+        a.stop()
+        a.poll(15, SDM_STATUS, ST_DMA_BUSY, False)
+        if not sd_write:
+            a.ld(64, 9, 15, SDM_BLKDONE)
+            a.cache_op(RINV, SB, 0x40000)
+            # check BLKDONE blocks (r9), card blocks 2000 ..
+            a.setr(10, SB); a.setr(11, 2000); a.setr(6, 64)
+            a.fbr('eq', 9, 0, 'vdone', imm=True)
+            a.label('vb'); a.setr(8, 0)
+            a.label('vk')
+            a.shift_n('shl', 1, 11, 32); a.alui('xor', 2, 8, 0xA5A50000, sgn=False); a.alu('or', 1, 1, 2)
+            a.ld(64, 2, 10, 0); a.fbr('eq', 1, 2, 'vok'); a.inc(12)
+            a.label('vok'); a.addi_s(10, 10, 8); a.inc(8); a.fbr('ne', 8, 6, 'vk')
+            a.inc(11); a.dec(9); a.fbr('ne', 9, 0, 'vb', imm=True)
+            a.label('vdone')
+        a.ld(64, 9, 15, SDM_BLKDONE)
+    a.mov(1, 13)
+    a.halt()
+    return a
 
 
 def tests():
@@ -411,6 +585,10 @@ def tests():
         ('iinv_wide', *t_iinv('iinv', ln=0x3000)),
         ('iinv_other', *t_iinv('other')),
         ('iinv_icinv', *t_iinv('icinv')),
+        ('iinv_snoop', *t_iinv_snoop()),
+        ('iinv_then_icinv', *t_iinv_snoop(then_icinv=True)),
+        ('range_two', *t_range_two()),
+        ('irq', *t_irq()),
     ] + [
         (f'iinv_time_{ln}', *t_iinv_time(ln)) for ln in (32, 1024, 2048, 4096, 8192, 0xFFE0, 0x10000)
     ]

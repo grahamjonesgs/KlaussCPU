@@ -1188,6 +1188,42 @@ def cmd_socsddma(a):
     return 1 if fails else 0
 
 
+def cmd_socsdvga(a):
+    """SD DMA alongside VGA scanout, CPU miss traffic, L2 WBINV walks and
+    (--blit) the blitter (sddma.t_vga), against the same run without the SD
+    DMA: starved display lines, the worst line fetch, and the DMA's data
+    (r12 = mismatches, r9 = blocks).  The L2 review's case: an SD read
+    stream (DMA writes into DDR) during WBINV under VGA load, at each
+    --miglat."""
+    import sddma
+    exe = build_soc(None)
+    fails = 0
+    for lat in a.miglat:
+        for sd in (False, True):
+            for wr in ((False, True) if sd and a.write else (False,)):
+                prog = sddma.t_vga(a.lines, a.wbinv_every, sd=sd, blit=a.blit, sd_write=wr)
+                tag = f'sdvga_{lat}_{int(sd)}{int(wr)}{int(a.blit)}_{a.wbinv_every}'
+                r = run_soc(exe, prog, tag, timeout=14400, plus=['+VGA_V0=478', f'+MIGLAT={lat}'] + a.plus)
+                regs, sdc, _, walks, _ = _soc_final(r['log'])
+                m = re.search(r'VGA lines=(\d+) max_fetch=(\d+) underflows=(\d+)', r['log'])
+                vr = re.search(r'VGA reads=(\d+) read_cycles=(\d+) grant_cyc=(\d+)', r['log'])
+                ok = bool(m) and int(m.group(1)) >= 20 and regs is not None and \
+                    (not sd or (regs.get('r12') == 0 and regs.get('r9', 0) > 0 and sdc.get('host_err') == 0 and
+                                (not wr or sdc.get('wr_bad') == 0)))
+                fails += not ok
+                n = max(1, int(vr.group(1))) if vr else 1
+                print(f'{"pass" if ok else "FAIL"} MIGLAT={lat} sd={"write" if wr else "read" if sd else "off"}'
+                      f'{" blit" if a.blit else ""}: lines={m and m.group(1)} max_fetch={m and m.group(2)} '
+                      f'underflows={m and m.group(3)} vga_gnt_wait/read={int(vr.group(3)) / n if vr else 0:.1f} '
+                      f'sd blocks={regs and regs.get("r9")} mismatches={regs and regs.get("r12")} '
+                      f'dma wr={sdc.get("sd_dma_wr")} rd={sdc.get("sd_dma_rd")} '
+                      + ' '.join(re.findall(r'SDLAT (.*)', r['log'])))
+                if ok and not a.keep:
+                    shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def cmd_socsd(a):
     exe = build_soc(None)
     fails = 0
@@ -2237,6 +2273,8 @@ def cmd_socdiff(a):
         okb = 'HALTED' in rb['log']
         same = okb and open(rb['trace']).read() == open(rn['trace']).read()
         t = [int(re.search(r'\bt=(\d+)', r['log']).group(1)) if 't=' in r['log'] else 0 for r in (rb, rn)]
+        if a.cycles:
+            same = same and t[0] == t[1] and t[0] > 0      # (cycle-identical, not only the same retires)
         tb += t[0]; tn += t[1]
         for k, r in (('base', rb), ('new', rn)):
             m = re.search(r'BTPROBE btic_chk=\d+ btic_hits=(\d+)', r['log'])
@@ -2347,6 +2385,11 @@ def main():
     sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
     sz.add_argument('--seed0', type=int, default=1)
     sub.add_parser('socsd')
+    sdv = sub.add_parser('socsdvga'); sdv.add_argument('--lines', type=int, default=120)
+    sdv.add_argument('--wbinv-every', type=int, default=1500)
+    sdv.add_argument('--miglat', type=int, nargs='+', default=[36, 44])
+    sdv.add_argument('--blit', action='store_true'); sdv.add_argument('--write', action='store_true')
+    sdv.add_argument('--plus', action='append', default=[]); sdv.add_argument('--keep', action='store_true')
     sdd = sub.add_parser('socsddma'); sdd.add_argument('only', nargs='*')
     sdd.add_argument('--plus', action='append', default=[]); sdd.add_argument('--keep', action='store_true')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
@@ -2375,6 +2418,7 @@ def main():
     tc.add_argument('--seed0', type=int, default=1); tc.add_argument('--rev')
     tc.add_argument('--plus', nargs='*', default=[])
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
+    sd.add_argument('--cycles', action='store_true', help='also require identical PIPE_RUN cycles per program')
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
     sd.add_argument('-v', '--verbose', action='store_true')
     sd.add_argument('--base-env', action='append', help='KEY=VAL for the base build (with --base wt)')
@@ -2437,6 +2481,8 @@ def main():
         sys.exit(cmd_socdcbz(a))
     elif a.cmd == 'socwalk':
         sys.exit(cmd_socwalk(a))
+    elif a.cmd == 'socsdvga':
+        sys.exit(cmd_socsdvga(a))
     elif a.cmd == 'socsddma':
         sys.exit(cmd_socsddma(a))
     elif a.cmd == 'socsd':
