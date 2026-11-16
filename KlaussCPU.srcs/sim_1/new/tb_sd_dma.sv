@@ -607,9 +607,9 @@ module tb_sd_dma;
             // (slow DDR: a whole block waits in the FIFO, as for PIO's
             // FIFO_THRESH; it still reads 0, and does not interrupt)
             lmax = 400; mw(SDM_IRQ_EN, 64'h10);
-            t0 = ncyc; do mr(SDM_FIFO, d); while (d < 64 && ncyc - t0 < 400000);
+            t0 = ncyc; while (dut.native_i.w_level < 128 && ncyc - t0 < 400000) @(negedge clk);
             status(st);
-            check_true({w, ": a whole block in the FIFO"}, d >= 64);
+            check_true({w, ": whole blocks in the FIFO"}, dut.native_i.w_level >= 64);
             check({w, ": FIFO_THRESH 0 with a block in the FIFO"}, st[B_THRESH], 0);
             check({w, ": no FIFO_THRESH interrupt"}, irq, 0);
             mw(SDM_IRQ_EN, 0); lmax = 12;
