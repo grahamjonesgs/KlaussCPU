@@ -738,8 +738,18 @@ stops the phase, CMD13 does not).
 | DMA_ERR (open-ended) | ends before the block (not set if an abort lands in the same cycle: the DMA ends without it) | goes on as PIO |
 
 A counted read whose card side completed while the DMA still owed blocks
+keeps DATA_BUSY up (`r_dd_pend`) until the last block is in DDR, also across
+a CMD12 sent meanwhile (no data phase runs then: an ordinary R1b, §4.8); it
 sets DATA_DONE at once if the DMA is aborted (DMA_EN = 0, FIFO reset);
 clearing SD_MODE sets no DONE bit (§4.8).
+
+A data command whose response fails (CMD_TIMEOUT / CRC / END / IDX) runs no
+data phase (§4.2).  Its DMA phase began when the command was accepted: a
+read's moves nothing; a write's may already have fetched blocks into the
+FIFO (DDR read, never written) and ends after the block in progress, when
+DMA_BUSY drops.  The driver resets the FIFO before a retry.  (The emulator
+starts no DMA phase at all here; the visible difference is the FIFO's
+contents and a short DMA_BUSY.)
 
 **(m1)** On every path, DMA_BUSY = 0 means every write the engine issued
 has been accepted at the coherent point (the L2 / DDR) and no further access

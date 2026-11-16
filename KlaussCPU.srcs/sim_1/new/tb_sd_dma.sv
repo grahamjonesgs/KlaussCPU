@@ -807,6 +807,49 @@ module tb_sd_dma;
             mw(SD_CTRL, (64'h1 << 18) | (64'h1 << 17) | 64'd1);
         end
 
+        // ============================================== a CMD12 after a counted read's card side is done
+        // (r_dd_pend): DATA_BUSY stays up until the DMA has moved the data
+        // (CMD12 with no data phase running is an ordinary R1b), then DATA_DONE
+        begin
+            automatic longint a = 64'h0088_0000;
+            automatic string w = "counted read done, CMD12 while the DMA moves";
+            lmax = 400;
+            dma_cmd(18, 9900, 0, a, 512, 3);
+            t0 = ncyc; while (!dut.native_i.r_dd_pend && ncyc - t0 < 2_000_000) @(negedge clk);
+            check({w, ": card side done, DMA owing (dd_pend)"}, dut.native_i.r_dd_pend, 1);
+            stop_cmd(st);
+            check({w, ": CMD12 done"}, st[B_CMD_DONE], 1);
+            check({w, ": DATA_BUSY still up after the CMD12"}, st[B_DATA_BUSY] && !st[B_DATA_DONE], 1);
+            wait_bit({w, " DATA_DONE"}, B_DATA_DONE, 1, st);
+            check_ddr_read({w, " at DATA_DONE"}, a, 9900, 3, 512);
+            m1_check(w);
+            lmax = 12;
+            wait_card_idle();
+        end
+        // ============================================== a response error on a DMA data command
+        // read: no data phase, nothing moves; write: the phase started at the
+        // command (the fetch runs ahead of the response) ends after the block
+        // in progress — DDR read only, never written; DMA_BUSY drops
+        for (int wr = 0; wr < 2; wr++) begin
+            automatic longint a = 64'h0089_0000;
+            automatic string w = wr ? "write: response CRC error" : "read: response CRC error";
+            if (wr) ddr_fill(a, 4 * 512, 95);
+            nw0 = n_wr; nr0 = n_rd;
+            card.inj_rsp_crc = wr ? 25 : 18;
+            dma_cmd(wr ? 25 : 18, 9950, wr, a, 512, 4);
+            wait_cmd(st);
+            check({w, ": CMD_CRC_ERR"}, st[17], 1);
+            m1_check(w);
+            status(st);
+            check({w, ": no DATA_DONE, not DATA_BUSY"}, st & 64'h0202, 0);
+            check({w, ": nothing written to DDR"}, n_wr - nw0, 0);
+            if (!wr) check({w, ": nothing read from DDR"}, n_rd - nr0, 0);
+            else check_true({w, ": at most the FIFO's 8 blocks fetched"}, n_rd - nr0 <= 8 * 32);
+            stop_cmd(st);
+            fifo_reset();
+            wait_card_idle();
+        end
+
         // ============================================== interrupts
         begin
             // DMA_ERR

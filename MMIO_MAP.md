@@ -221,6 +221,13 @@ and invalidate it (`RANGE_INV`, or INVALIDATE) after a read.
   issued has been accepted at the L2 / DDR and nothing more will be issued.
 - **Interrupt**: `SDM_IRQ_EN[27]` enables `DMA_ERR`; `DATA_DONE` of a DMA
   read comes when the data is in DDR.
+- A counted read whose card side is done but whose blocks are still being
+  moved keeps `DATA_BUSY` up until they are in DDR; a CMD12 sent then (no
+  data phase is running: an ordinary R1b) does not change that.
+- A data command whose response fails runs no data phase.  A read moves
+  nothing; a write may already have fetched blocks into the FIFO (the fetch
+  runs ahead of the response; DDR is only read) and stops after the block
+  in progress, `DMA_BUSY` then dropping.  Reset the FIFO before retrying.
 - **Ordering**: a data command written after a `CACHE_CTRL` op cannot start
   its DMA before that op's walk has finished (its write-backs are then in
   the L2): no `MNT_BUSY` poll is needed between them (Cache controller).
@@ -475,11 +482,13 @@ and last lines.
   with `[3]` ICACHE_INV the whole I-cache is dropped (covering `[6]`) and a
   D-cache range op runs too.
 - `CACHE_OP_ADDR` / `CACHE_OP_LEN` are copied when the op is accepted, so
-  they may be rewritten at once.  Ops queue like FLUSH: one range op can wait
-  behind a running walk with its own range; a range op that finds one already
-  waiting, or a whole-cache walk waiting, or that covers more than 64 KiB, is
-  turned into a whole-cache walk (FLUSH, or INVALIDATE if either op
-  invalidates) — a superset, never less.
+  they may be rewritten at once.  Ops queue like FLUSH: **one** range op may
+  be queued behind a running walk, with its own copied range.  A range op is
+  turned into a whole-cache walk only when another range op is already
+  waiting, when it covers more than 2,048 lines (64 KiB), or when a
+  whole-cache walk is pending; a whole-cache op written while a range op
+  waits absorbs that op.  The converted walk is an INVALIDATE if either op
+  invalidates, else a FLUSH — a superset, never less.
 - **Ordering.**  A `CACHE_CTRL` write takes effect only after every earlier
   store, posted or queued, is in the data cache (the core has one in-order
   port, and a walk starts only with the cache idle).  A DMA master (the SD
