@@ -735,7 +735,7 @@ stops the phase, CMD13 does not).
 | clearing SD_MODE | finishes the block in progress, then stops | abandoned (§4.8) |
 | `SDM_FIFO[31]` | stops after the 16-byte DDR transaction in flight; a read's data from DDR is dropped | goes on as PIO, with an empty FIFO |
 | CPU_RESETN, the native-mode load reset | as `SDM_FIFO[31]` | reset |
-| DMA_ERR (open-ended) | ends before the block | goes on as PIO |
+| DMA_ERR (open-ended) | ends before the block (not set if an abort lands in the same cycle: the DMA ends without it) | goes on as PIO |
 
 A counted read whose card side completed while the DMA still owed blocks
 sets DATA_DONE at once if the DMA is aborted (DMA_EN = 0, FIFO reset);

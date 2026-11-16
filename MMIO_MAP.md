@@ -455,7 +455,11 @@ can be set in the same write. `mmio.h`: `icache_invalidate()`.
 v1.2).**  For DMA coherence on buffers, without the whole-cache walk.  The
 range is ceil(`CACHE_OP_LEN` / 32) lines from `CACHE_OP_ADDR` & ~31
 (physical addresses; the D-cache is physically tagged and the I-cache's
-index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.
+index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.  **The count is
+taken from LEN alone**, so for an `CACHE_OP_ADDR` that is not 32-byte
+aligned the lines do **not** cover `[ADDR, ADDR + LEN)`: write
+`LEN + (ADDR & 31)` (as the kernel does) to cover a buffer's partial first
+and last lines.
 
 - `[4]` **RANGE_CLEAN**: write back the range's dirty lines, keep them valid.
 - `[5]` **RANGE_INV**: write back the range's dirty lines, then invalidate
@@ -466,8 +470,10 @@ index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.
   the fetch window, a pending install) and refetches after the store, as for
   ICACHE_INV. Instruction fetch is coherent with it at once (during its
   sweep every I-cache lookup misses).
-- With `[1]` FLUSH or `[2]` INVALIDATE the whole-cache op runs and the range
-  bits are ignored; with `[3]` ICACHE_INV both happen.
+- With `[1]` FLUSH or `[2]` INVALIDATE the whole-cache op runs and `[5:4]`
+  are ignored; `[6]` RANGE_IINV is still done (as `[3]` ICACHE_INV is);
+  with `[3]` ICACHE_INV the whole I-cache is dropped (covering `[6]`) and a
+  D-cache range op runs too.
 - `CACHE_OP_ADDR` / `CACHE_OP_LEN` are copied when the op is accepted, so
   they may be rewritten at once.  Ops queue like FLUSH: one range op can wait
   behind a running walk with its own range; a range op that finds one already
@@ -481,14 +487,15 @@ index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.
   pending or running, so a data command written right after a range op
   cannot read or write DDR before the walk's write-backs are in the L2.
   `MNT_BUSY` need not be polled for that; it still says when the walk is
-  over.  The CPU's own loads and stores wait for a range walk, pending or
-  running (a load after RANGE_INV sees memory).
+  over.  The CPU's own loads and stores wait for a walk, pending or
+  running: a load after RANGE_INV or INVALIDATE sees memory, with no poll.
 - **Timing** (simulation, 100 MHz): a range walk visits min(n, 1024) sets
   (n lines), 2 cycles a set, +6 for a set with a dirty line of the range
   (+3 more for a second one), +1; a RANGE_IINV sweep takes min(n, 64)
   cycles (one line a cycle up to 64 lines, then n / 64 lines a cycle: a
   4 KiB page in 64 cycles), and none when the I-cache holds nothing.  A
-  whole-cache walk takes 4,097 cycles + ~3 per dirty line.
+  whole-cache walk takes 4,097 cycles + ~3 per dirty line (one walk per
+  op; bitstreams before the SD DMA work walked twice, ~8,200 cycles).
 
 **Flush / invalidate (full-cache).** `CACHE_CTRL[1]` (FLUSH) and `[2]`
 (INVALIDATE) trigger an FSM in `mem_read_write.sv` that walks every set/way
@@ -510,12 +517,13 @@ guaranteed complete before the next *cached* access lands, which is what the
 DMA-coherency sequences need; but code that must not start the next MMIO
 action (e.g. kicking the blitter) before the walk ends should poll
 `CACHE_STATUS[0]` (MNT_BUSY) — it covers both the pending and active phases.
-**One exception (found 2026-11-16, unchanged from earlier bitstreams):** a
-walk starts only when the cache is idle, so one requested while it is still
-finishing an earlier store's miss waits; during that wait the load-hit pipe
-can still answer a load from a line an INVALIDATE is about to drop.  Poll
-MNT_BUSY after INVALIDATE before reading data that a DMA wrote.  (RANGE_INV
-holds the hit pipe off while it waits: a load after it always sees memory.)
+A walk starts only when the cache is idle, so one requested while it is
+still finishing an earlier store's miss waits; the load-hit pipe is held off
+during that wait for an invalidating walk (INVALIDATE, RANGE_INV, or a
+range op turned into a whole walk), so a load issued right after the
+`CACHE_CTRL` write never sees a line the walk is about to drop.  **On
+bitstreams before the SD DMA work (`CPU_FEATURES[27]` = 0) it could:** poll
+MNT_BUSY after INVALIDATE there before reading data a DMA wrote.
 
 These exist for **DMA / blitter coherency**: the CPU accesses memory through
 this write-back cache, while the [2D DMA blitter](#2d-dma-blitter--base-0xf00e_0000)
