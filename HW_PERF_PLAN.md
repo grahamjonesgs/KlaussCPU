@@ -2407,7 +2407,7 @@ all passing:
 - `fwdfuzz` vs `tmg`: 12 seeds × 12 latency / hit configs (144 runs) and 8
   tb_soc runs: 0 differing.
 - `l2_regress.sh` mut, soc36, soc8, socvar, eq (BASE = `d7f3994`, the
-  L2-off equivalence): 0 failing; L2MUT.  (The tb_l2 sweep not rerun:
+  L2-off equivalence): 0 failing; `l2mut` 36 of 36 killed.  (The tb_l2 sweep not rerun:
   `l2_cache.sv` is unchanged.)
 - `tb_sd_dma` seeds 1–25 (644–659 checks each), `tb_sd_native`,
   `tb_sd_spi_compat`; `socsd`, `socsddma` (all 402 tests), `socsdvga`
