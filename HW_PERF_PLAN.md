@@ -40,6 +40,10 @@ Then, released together on 2026-11-16 as `sddma_release_3ae5ed6.bit`
   deflate / cxx-hello unchanged vs the L2 release (37.6 / 88.6 s
   user+sys).
 
+Then (2026-11-17, Graham: "the known correctness issues, then stop"):
+§8, branch `fixes` — built (`fixes_433a323.bit`, tier 1), not on the
+board.
+
 Next: **waiting on Graham.** On 2026-11-16 (relayed by the runtime
 session) Graham ended the clang-speed work after one last software item,
 a PGO / ThinLTO build of the native clang; there is no emulator re-rank
@@ -2484,6 +2488,265 @@ all passing:
   the next set); a BTIC kill by range instead of emptying it.
 - Board test: the kernel's driver with `klausscpu_sd.dma=1`.
 
+## 8. Correctness fixes (2026-11-17, branch `fixes`)
+
+The known, deferred correctness items, from `origin/master` `587ad8d` (the
+released SD DMA build: RTL `3ae5ed6` + a sim-only assertion).  No
+performance work, no features.  Two RTL fixes (items 1 and 3d), the rest
+tools / tests; one timing restructure for the build (§8 build).
+
+| # | Item | Status |
+|---|---|---|
+| 1 | LEAVERET whose frame is popped from MMIO deadlocks | **fixed** (pipeline_core) |
+| 2 | `mpudiff` harness stale | **fixed** (run.py; no RTL bug) |
+| 3a | supervisor MEMGET32 at 0xFFFF_FFFD, TE = 1, no fault | **not a bug** (harness); test added |
+| 3b | BTIC latent snoop-then-arm | still unreachable; **testbench check** added, no RTL change |
+| 3c | xsim `hello` / implicit reads in `f_sf_ln` / `f_sf_dw` | **already done** on master (§5 deferred §11.9 fix) |
+| 3d | L2 review 1 minor 5, the arbiter's orphaned-grant window | **correctness hazard: fixed** (mem_read_write, l2_cache, ddr2_control) |
+
+### §8 item 1: a two-read op in MMIO deadlocked
+
+**Root cause.**  LEAVERET reads [R15] and [R15 + 8]; a MEMGET32 whose
+bytes span two doublewords reads both.  When the second doubleword is not
+in the first's line answer (`m_next_valid` = 0, always so for MMIO) the
+MEM engine issues a second read (`mem_xc` 1 → 2 → 3) by changing `m_addr`
+under a DV it keeps high, and clears `rdy_armed`.  The D-cache takes an
+address change under a held DV as a new request (its served-DV guard).
+The SoC's MMIO side does not: its ready is the request strobe delayed
+(`r_mmio_read_dv_d2`, then the splitter's register), so it stays high for
+as long as DV does, the core never sees it low, `rdy_armed` never re-arms
+and the second read never completes (`tb_soc` DEADLOCK sm=16, i.e.
+PIPE_RUN).  The Ethernet bridge would wait in `S_COOL` for DV low
+instead — the same hang.  So every supervisor LEAVERET with its frame in
+MMIO and every supervisor MEMGET32 spanning two MMIO doublewords hung
+(user mode faults on MMIO first).  RET / IRET read one doubleword and were
+fine; the `tmg` RET compare (an MMIO return address always counts as a
+RAS miss) is unrelated and correct.  tb_vsim never showed it: its MMIO
+model answered any request, whether or not DV had dropped.
+
+**Fix** (`pipeline_core.sv`, the MEM port engine): after an MMIO first
+read (`m_addr[31:28]` = F; since `433a323` the registered `m_io`) DV
+drops for the settle cycle
+(`mem_xc` = 2) and rises again with the second address.  A one-cycle gap
+gives the MMIO ready a one-cycle low (it is the strobe delayed), so
+`rdy_armed` re-arms, and takes the bridge out of `S_COOL`.  A DRAM first
+read keeps DV up, so every DRAM access is cycle-identical.
+
+**Tests.**  tb_vsim's MMIO model now follows the SoC's protocol: once the
+core has seen an MMIO ready, a DV still up at an MMIO address in the next
+cycle holds ready high and is never answered (`mmio_hold=` in the `.out`
+file; `run.py test` fails any test with `mmio_hold` ≠ 0, so every directed
+test checks the protocol), and an MMIO scratch RAM at `0xF0FD_0000`
+reads back.  `tests.py` `mmio_frame` (10 variants: RET, LEAVERET — jumped
+to, or called and RAS-predicted — and a spanning MEMGET32, LAT 1 / 3) and
+`mmio_frame_irq` (10: the same in a 40-iteration loop under a timer IRQ,
+whose frame lands in the MMIO scratch while SP points there): on `587ad8d`
+the 4 LEAVERET and 2 MEMGET32 variants of `mmio_frame` and the 6 of
+`mmio_frame_irq` time out (16 failing); after, 20 of 20 pass.
+`run.py socframe` (tb_soc): RET / LEAVERET with the frame in INT_VEC0 / 1,
+jumped to or called, a spanning MEMGET32 on INT_VEC and one on the
+Ethernet bridge (ETH_RX_SLOTS): on `587ad8d` all four two-read programs
+DEADLOCK (sm=16); after, 6 of 6 pass.
+
+**Mutations** (`mmio_frame*`): the DV drop removed — 12 failing; the DV
+re-raise in the settle cycle removed — 12 failing; the drop made
+unconditional (every second read, DRAM too) — functionally correct, but
+`diff --plus +TRACECYC` (40 seeds × LAT 1 / 3 / 7) shows 39 differing
+traces, 169,092 → 169,200 cycles: the MMIO condition is what keeps DRAM
+cycle-identical.
+
+(Observation, not changed: the MMIO decodes take the byte address, so the
+first read of a spanning MEMGET32 at a non-aligned MMIO address matches no
+register and reads 0; the emulator instead returns the MMIO register's low
+bytes and does not read the second doubleword.  No software does this.)
+
+### §8 item 2: `mpudiff`
+
+**What was stale.**  `mpudiff` built whatever the environment asked for.
+The A7 build has no MPU (`CORE1_MPU_EN` = 0, so `VSIM_MPU_EN` unset
+elaborates MPU_EN = 0); there its MPU register writes are ILLEGAL, the
+handler took them for MPU faults, turned the (absent) MPU off and retried
+them forever: 20 of 20 seeds time out — the "fails on `l2b`" (the
+regression script itself sets `VSIM_MPU_EN=1` and passed).  With the MPU
+built, it passed — but vacuously against an MPU that never denies: with
+the data-side check forced off (`ex_mchk` = 0) or the fetch-side denies
+forced off (`f_deny1/2` = 0) it still reported 0 differing.
+
+**Fix** (`run.py`, no RTL change): `mpudiff` always elaborates MPU_EN = 1;
+the handler counts the MPU faults it retries in TP (data faults [15:0],
+fetch faults [31:16]; the closing user HALT leaves the count in r13) and
+halts with r13 = 0xBAD00 | cause on any exception other than SYSCALL /
+ACCESS_*; the command fails a seed on such a halt, and fails overall when
+no data or no fetch MPU fault was taken.
+
+**What it covers** (precisely): randprog programs in user mode, TE = 0,
+under 16 random regions (R / W / X, GUARD) over code, the data window and
+the user stack, with SYSCALLs injected; on an ACCESS fault the handler
+turns the MPU off and retries, on a SYSCALL turns it on again; r1–r12,
+r15 and the data window must equal the plain program's.  So it checks that
+every MPU fault is precise and restartable (the faulting instruction has
+no effect, nothing after it ran) and that faults occur on both sides.  It
+does not check that each fault is *right* (a spurious deny is retried and
+passes) — the `mpu_*` directed tests do that, one per §10.2 rule.  The
+MPU is ignored while TE = 1 and is not built on the A7.
+
+**Result**: 20 seeds: 0 differing, 15 data / 380 fetch faults; `--irq
+--lats 1 5`: 0 differing, 30 / 846.  Mutants `ex_mchk` = 0 (0 data faults)
+and `f_deny` = 0 (0 fetch faults): both now fail (both passed before).
+
+### §8 item 3a: supervisor MEMGET32 at 0xFFFF_FFFD with TE = 1
+
+Not a bug.  The note's program (`tx_pair`) runs under `_te_on`, which maps
+page 0 (the code and handlers) with a global identity entry, so the
+wrapped second doubleword (VA 0) is mapped and no fault is right.  The
+RTL translates it: `ex_xpg` (VA[15:3] = 0x1FFF) takes the second-page
+cycle with `ex_ea_q` = {VA[31:16] + 1, 0} = 0 (16-bit wrap) — the
+emulator's `map_data` also translates `(ea & !7) + 8` wrapping, so both
+fault on page 0 when it is not mapped.  New test `tx_wrap` (6 variants,
+also under TLB_N = 16, no walker, DEBUG_EN): page 0 made execute-only, a
+supervisor MEMGET32 at 0xFFFF_FFFD and a LEAVERET at R15 = 0xFFFF_FFF8
+take ACCESS_LD with EADDR = 0 (the lowest faulting byte), a plain load
+from page 0 the same: pass on `587ad8d` and here.  `tx_pair`'s comment
+corrected.
+
+### §8 item 3b: BTIC snoop-then-arm (review of review 3, deferred minor 1)
+
+Still unreachable, so no RTL change (a speculative hardening would cost a
+term in `bt_cap` and could not be shown to change anything).  Instead the
+deferred "testbench assertion": tb_vsim tracks each snooping store from its
+snoop (`snoop_q`) until a write to its line index completes on the port,
+and any BTIC capture (`bt_cap`) of a window or branch line it snooped —
+from the snoop's own edge on — counts in `btic_snarm` and ends the run
+with `FATAL BTIC ...`, which `run.py` gates on every tb_vsim run (test,
+diff, btfuzz, fwdfuzz…).  It never fires in the regression (421 snooping
+stores in the `smc*` / `bt*` tests and 40 btfuzz seeds; all of `test`,
+`btfuzz` 300).  Liveness: with its clear disabled (the store never lands)
+it fires in 104 of 168 runs of `btic_pend_snoop`, `ic32_smc_btic`,
+`smc_ahead`.  Even with both of the core's snoop rules removed (the
+`bt_cap` block and the pending capture's kill) no capture falls inside a
+store's window in those tests: the stale captures that then occur (the
+core's "BTIC base != target" assertion, 16 of 96) come after the store
+has landed, from the SMC refetch — the review-3 rules' own failure, which
+`btic_pend_snoop` already catches.
+
+### §8 item 3c: xsim and `f_sf_ln` / `f_sf_dw`
+
+Already done on master: the functions take `ex_ta`, `ex_tb` and the
+carries as arguments since `icache` (§5 deferred §11.9 fix, netlist
+identical; the xsim SoC `hello` run halts with the exact UART text there).
+Nothing to change; MMU_PLAN §11.9's note already says Done.
+
+### §8 item 3d: the arbiter's orphaned grant (L2 review 1 minor 5)
+
+**A correctness hazard.**  CPU_RESETN resets the DMA masters (blitter,
+VGA, SD, core 2) but not the memory system (`mem_read_write`, the L2,
+`ddr2_control`: power-on only).  A master reset mid-tenure drops its req
+with no done; the arbiter released that grant after 15 quiet cycles,
+assuming anything it left in flight would be done by then.  But a read
+the L2 (or `ddr2_control`) has accepted answers when DDR does — about 40
+cycles for an L2 miss, more behind a write-buffer drain or refresh — and
+after the release the answer's ready is routed to the D-cache
+(`w_cache_ddr_ready`).  A D-cache miss that arose during the tenure waits
+with its DV up for the grant, so it takes that ready as its own answer and
+installs the dead master's data as its line — in a D-cache the reset does
+not clear, under the program that runs after the reset.  Reproduced
+(below): line 0x0015_7480 installed with the framebuffer's 0x0040_0780.
+
+**Fix** (`mem_read_write.sv`; `l2_cache.sv` and `ddr2_control.sv` export
+`o_fe_idle`): an orphaned grant is released only when the count has
+reached 15 **and** the controller's front end is idle — the L2 in
+`F_IDLE` (a read's ready leaves with the move back to it; writes are
+acknowledged at acceptance), `ddr2_control` in `IDLE`; the count
+saturates.  Only the orphan path changes: cycle-identical otherwise.
+
+**Test.**  tb_soc `+RSTORPH=<k>`: at the k-th moment a DMA master holds
+the grant with its read accepted below (the L2's front end busy with a DMA
+read; `ddr2_control` in a read state) while the D-cache waits with a
+request, CPU_RESETN goes low for 40 board cycles; the run ends 4,000
+cycles later with the consistency checker's count.  The framebuffer is
+preloaded with a pattern (in the MIG model and the checker's reference),
+so an answer meant for the scanout differs from any other line.
+`run.py socorphan` (the VGA scanout under CPU miss traffic, without and
+with the blitter's FILLs; k = 1, 2, 3, 5, 8, 13): on `587ad8d` 5 of 12
+fail with the L2, 11 of 12 without (`VSIM_L2=0`); after, 0 of 12 in both.
+Added to `l2_regress.sh` (`soc36`, `socvar` without the L2), with
+`socframe`.
+
+**Mutations**: the idle term dropped (the old 15-cycle release) — 5 / 11
+of 12 failing (L2 / no L2); the L2's `o_fe_idle` tied to 1 — 5 of 12.
+
+### §8 other deferred items
+
+Nothing else in the deferred lists is a correctness bug: §5 review of
+review 3 minor 2 (16 B lines only, not the release geometry, not
+constructible); L2 review 1 minor 6 (a shadow writeback waits for the
+fill of its own set: performance); §6 write-buffer take-back, hit-under-
+fill (performance); §7 delta review's CACHE_CTRL go margin (latent, has a
+sim assertion).
+
+### §8 regression
+
+On the final RTL (`433a323`: the fixes plus the two timing restructures;
+the whole set was also run on `2b00a91` and on `62e654a`, with the same
+results), BASE = `origin/master` `587ad8d` where an
+A/B, all passing:
+
+- core (`l2_regress.sh core`): `test` in the five configurations
+  (default, DEBUG_EN, MPU_EN, TLB_N = 16, no walker; 2,226 runs in the
+  default one, every one also gated on `mmio_hold` = 0 and the new BTIC
+  check); `diff` 40 seeds × LAT 1 / 3 / 7 with `+TRACECYC`: 0 differing,
+  169,092 = 169,092 cycles; `diff --irq` 40 seeds: 107,709 = 107,709;
+  `excdiff`; `mpudiff` (the new harness: 15 data / 380 fetch MPU faults);
+  `tlbdiff`; `tlbpage`; `dcbzdiff` 200 seeds; `dmtest`; `btfuzz` 300 seeds.
+- `fwdfuzz` vs `587ad8d`: 12 seeds × 12 latency / hit configurations and 8
+  tb_soc runs (152): 0 differing.
+- `l2_regress.sh` soc36, soc8, socvar (L2 off, 8 ways, jittered, slow MIG),
+  with the new `socframe` / `socorphan`: 0 failing; socdiff traces and
+  PIPE_RUN cycles identical in every configuration (61,698 / 24,645 at
+  MIGLAT 36; 42,251 / 21,338 at 8; L2 off 69,249 / 25,610; jittered 52,150
+  / 22,944; slow 78,533 / 27,530).  `eq` (VSIM_L2 = 0 against `d7f3994`
+  under this tb_soc): identical traces and cycles (69,249 / 25,610).
+- `socdiff --cycles` 30 seeds: identical per program (61,698);
+  `socbench --base 587ad8d`: data96k 382,024, code96k 142,666, chase112k
+  199,846, each +0.00 %.
+- `socsddma` (402 tests), `socsdabort --rounds 4` (16 runs), `sddmamut.py`
+  42 of 42 killed; `l2mut` 36 of 36 killed (on `2b00a91`: nothing under
+  the L2 changed after it).  (The tb_l2 sweep was not rerun:
+  `l2_cache.sv` gained only the `o_fe_idle` output; `l2mut` rebuilds
+  tb_l2 with it.)
+
+**Cycles**: identical to `587ad8d` everywhere measured.  The two fixes
+act only on an MMIO two-read op (none in any A/B program) and on an
+orphaned DMA grant (a reset mid-tenure); the timing restructures are
+logically equivalent (asserted).  The item 1 mutants rerun on `433a323`:
+the same results.
+
+### §8 build
+
+Standard flow (`build_fast -resynth` in a `git archive` copy, under the
+lock); three builds, the last met tier 1:
+
+| Build | Commit | Change | Tier 1 WNS / WHS | Final | LUTs | FFs | BRAM |
+|---|---|---|---|---|---|---|---|
+| `fixes_b1` | `2b00a91` | the two fixes | −0.462 / +0.022 | tier 2 −0.260, not met | 42,281 | 27,500 | 126 |
+| `fixes_b2` | `62e654a` | + the compare restructure | −0.168 / +0.024 | tier 2 −0.163, not met | 41,350 | 27,507 | 126 |
+| **`fixes_b3`** | **`433a323`** | **+ `m_io`** | **+0.082 / +0.017** | **tier 1, met** | **41,096** | **27,160** | **126** |
+
+(`sddma_b3`, the release: 41,089 LUTs, 27,475 FFs, 126 BRAM.)
+
+| Family (failing) | Build | Fix | `fixes_b3` |
+|---|---|---|---|
+| `ex_a` → the compare's carry chains → the condition case on `ex_d.sub` → `exo_result[0]` → `mem_result[0]` (19 levels) | b1 −0.462 | every compare from two chains (equal, unsigned-less; signed from the sign bits) and the condition's outcomes registered at dispatch (`ex_cv` = the result for =, <, >; `ex_cs` signed; `f_cmpv`), one LUT after the chains; a compare's `exo_result` leg 0 (`mem_result` takes it through `ex_res_cmp`: the chains no longer reach `mem_result` through the uop mux too); MIN/MAX's pick the same formula.  Asserted against the old forms (`ex_cmpbit_ref`, `ex_mmpick_ref`).  b1's synthesis was also +1,054 LUTs over `sddma_b3`'s; with this change b3's is +2 | not in the worst 10 (`ex_a` → `mem_result[5]`, another leg, +0.308) |
+| `pip_m_addr` → the MMIO decode → `w_pip_ready` → `icinv` → `pc` / the RAS write enable; → `ifb_dw` CE (b1 −0.139) | b2 −0.168 | the core registers `m_io` (= `m_addr[31:28]` = F) with `m_addr` at its 12 assignment sites (asserted); KlaussCPU's ready select, the RET compare's MMIO term and §8's DV drop use it — one LUT less in front of `w_pip_ready` | not in the worst 10 |
+
+`fixes_b3`'s worst paths: the blitter's `r_irq_en` → the IRQ take → the
+fetch engine's `pos` / `pf_look` / `r_bt_pend` (+0.082 … +0.177),
+`mem_xsp` → the multiplier's CE (+0.296), `ex_a` → `mem_result[5]`
+(+0.308).  Hold +0.017.  Bitstream `~/.cache/kbuild/fixes_433a323.bit`,
+md5 `b27e98eed27f8160dcc620e2be61d418` (build dir
+`~/.cache/kbuild/fixes_b3`).  Not run on the board (this task does not
+program it).  The head of `fixes` after it changes documents only.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -2639,3 +2902,11 @@ Decisions taken while implementing the frozen text above:
   socsddma, socsdvga, 34 of 34 mutations, the L2 regression; cycle-identical
   to `c0bf7b2` without DMA); synthesis +813 LUTs.  Not yet built (waits for
   `tmg`).
+- 2026-11-17: §8 correctness fixes on branch `fixes` (from `587ad8d`): a
+  LEAVERET / spanning MEMGET32 in MMIO no longer deadlocks (DV drops
+  between the two reads); an orphaned DMA grant waits for the DDR front
+  end to be idle (CPU_RESETN mid-DMA corrupted a D-cache line);
+  `mpudiff` fixed; `tx_wrap`, the BTIC snoop check, `socframe`,
+  `socorphan`; two timing restructures (compare, `m_io`).  Standard flow
+  tier 1 WNS +0.082 / WHS +0.017, `~/.cache/kbuild/fixes_433a323.bit`.
+  Cycle-identical to `587ad8d`.  Not yet run on the board.
