@@ -135,8 +135,9 @@ CONS_FATAL = 'FATAL consistency'
 
 
 def _l2bit():
-    """CPU_FEATURES[26] (the L2) of the tb_soc build"""
-    return (1 << 26) if l2_cfg()[0] else 0
+    """CPU_FEATURES[26] (the L2) of the tb_soc build, and [27] (the cache
+    range ops, SD DMA spec v1.2: every build of this revision)"""
+    return ((1 << 26) if l2_cfg()[0] else 0) | (1 << 27)
 
 
 def l2_cfg():
@@ -1000,7 +1001,7 @@ def cmd_socmmio(a):
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
     l2, l2w = l2_cfg()
-    if f'r2=00000000{0x07F0200D if l2 else 0x03F0200D:08x}' not in last:
+    if f'r2=00000000{0x0FF0200D if l2 else 0x0BF0200D:08x}' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -1055,7 +1056,7 @@ def cmd_soccrypto(a):
         regs = dict(re.findall(r'(r\d+)=([0-9a-f]{16})', last))
         got = {k: int(regs.get(k, '0'), 16) for k in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6')}
         if full:
-            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x01FF200D}
+            want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x03FF200D | _l2bit()}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
             want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x03F0200D | _l2bit()}
@@ -1082,7 +1083,7 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080101, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080501, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset

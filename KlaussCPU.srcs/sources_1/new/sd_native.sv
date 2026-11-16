@@ -29,9 +29,24 @@
 //              and end bits check good; a bad or aborted block is rolled
 //              back.  Little-endian: byte 0 of the block in [7:0] of the
 //              first word.
+//
+//   DMA        (SD DMA spec v1.2, SD_NATIVE_PLAN.md §8; DMA_EN = 1) a data
+//              command written with SDM_CFG[16] moves its blocks between
+//              the FIFO and DDR at SDM_DMA_ADDR, through o_dma_* (master E
+//              on mem_read_write's arbiter: 16 B transactions, one per bus
+//              tenure, to the L2 as a DMA master).  A read moves each block
+//              once it is committed (its CRC passed); a write fetches a
+//              block whenever the FIFO has room for one.  The bus adapter
+//              (r_a_*) has no reset: a transaction it has started always
+//              completes (a read's data is then dropped if the engine was
+//              reset or the FIFO emptied meanwhile), so DMA_BUSY = 0 (engine
+//              idle and adapter idle) means every write it issued has been
+//              accepted and nothing more will be issued (m1).
 //////////////////////////////////////////////////////////////////////////////////
 
-module sd_native (
+module sd_native #(
+    parameter bit DMA_EN = 1'b1          // the SD DMA engine (SDM_CAPS[10])
+) (
     input  logic        i_Clk,
     input  logic        i_rst,           // synchronous, active high
     input  logic        i_sd_mode,       // SD_CTRL[18]
@@ -53,7 +68,23 @@ module sd_native (
     output logic [3:0]  o_dat_oe,
     input  logic        i_cmd,
     input  logic [3:0]  i_dat,
-    input  logic        i_cd
+    input  logic        i_cd,
+
+    // DDR master (DMA): the blitter / core-2 contract of mem_read_write —
+    // req (level) until the grant, one 16 B transaction (DV until ready),
+    // then done (one cycle, with req dropped).  Data: [127:64] = the dword
+    // at the 16 B-aligned address, [63:0] = the one 8 bytes above it; mask
+    // 1 = byte not written.
+    output logic        o_dma_req,
+    output logic        o_dma_done,
+    output logic        o_dma_write_DV,
+    output logic        o_dma_read_DV,
+    output logic [31:0] o_dma_addr,
+    output logic [127:0] o_dma_write_data,
+    output logic [15:0] o_dma_wdf_mask,
+    input  logic [127:0] i_dma_read_data,
+    input  logic        i_dma_ready,
+    input  logic        i_dma_grant
 );
 
     // -----------------------------------------------------------------------
@@ -65,7 +96,10 @@ module sd_native (
                            O_FIFO    = 8'h48, O_DMA    = 8'h50, O_BLKDONE = 8'h58,
                            O_DATA    = 8'h80, O_CAPS   = 8'hF8;
 
-    localparam logic [63:0] CAPS = 64'h0000_0000_0008_0101;   // v1, 4-bit, no HS, 8 blocks
+    // v1, 4-bit, no HS, 8 blocks; [10] DMA
+    localparam logic [63:0] CAPS = 64'h0000_0000_0008_0101 | (DMA_EN ? 64'h400 : 64'h0);
+    // DDR: a DMA may touch only [0, 128 MiB) (SD DMA spec v1.2: DMA_ERR past it)
+    localparam int DDR_LG = 27;
 
     localparam int NCR_MAX   = 66;   // response start bit within N_CR (64) clocks, plus slack
     localparam int TOK_WIN   = 8;    // write CRC token start bit within 8 clocks of the end bit
@@ -117,10 +151,15 @@ module sd_native (
     logic [15:0] r_blkcnt;           // 0 = open-ended
     logic        r_cmd_done, r_data_done;
     logic [10:0] r_err;
-    logic [26:0] r_irq_en;           // only [4], [9:8], [26:16] are kept
+    logic [27:0] r_irq_en;           // only [4], [9:8], [27:16] are kept
     logic [31:0] r_tmo_data, r_tmo_busy;
     logic        r_cfg_w4, r_cfg_clkon;
     logic [15:0] r_blkdone;
+    // DMA registers: SDM_DMA_ADDR (always the first byte not yet
+    // transferred), SDM_CFG[16] DMA_EN, SDM_STATUS[27] DMA_ERR (sticky)
+    logic [63:3] r_dma_addr;
+    logic        r_cfg_dma;
+    logic        r_dma_err;
 
     // -----------------------------------------------------------------------
     // MMIO inputs, registered first: the raw address comes through the
@@ -160,9 +199,11 @@ module sd_native (
     wire w_wr1    = w_new_wr && w_win;                 // first cycle: side effects
 
     wire w_cmd_wr  = w_wr1 && (w_off == O_CMD);
-    wire w_push    = w_wr1 && (w_off == O_DATA);
+    wire w_push_rq = w_wr1 && (w_off == O_DATA);      // a CPU push (dropped + FIFO_ERR during DMA)
     wire w_fifo_rs = w_wr1 && (w_off == O_FIFO) && r_in_wdata[31];
     wire w_w1c     = w_wr1 && (w_off == O_STATUS);
+    // DMA_EN = 0 written (any SDM_CFG write with [16] clear): aborts a DMA
+    wire w_cfg_dma_off = DMA_EN && w_wr1 && (w_off == O_CFG) && !r_in_wdata[16];
 
     // -----------------------------------------------------------------------
     // Clock generator
@@ -220,7 +261,7 @@ module sd_native (
     logic [9:0]  r_mrp;             // memory fetch pointer
     logic [63:0] r_head;
     logic        r_head_v, r_fetch;
-    logic [25:0] r_push_words;      // words pushed since the FIFO reset (write FIFO_THRESH)
+    logic [25:0] r_push_words;      // words the CPU pushed since the FIFO reset (write FIFO_THRESH)
     logic [25:0] r_d_target;        // block count × latched block size, in words
     logic        r_d_tgt_stale;     // r_d_target is one cycle behind the latch
     logic        r_rd_room;         // room for one more whole read block (registered)
@@ -244,12 +285,41 @@ module sd_native (
                    || (r_d_state == D_RD_CRC)  || (r_d_state == D_RD_HOLD);
     wire w_d_write  = w_d_active && !w_d_read;
 
+    // ---------------- DMA engine state (declared here: the command decode
+    // and the FIFO ports use it) ----------------
+    // r_dm_ph: a DMA data phase, from its data command until the engine has
+    // finished with it; r_dm_on: it may still start blocks (cleared by an
+    // abort, DMA_ERR and the end of the card side); r_dm_wr: an SD write
+    // (DDR -> FIFO); r_dm_nblk: blocks moved to DDR (read) / fetched (write).
+    // r_dd_pend: a counted DMA read whose every block is in the FIFO —
+    // DATA_DONE (and the end of DATA_BUSY) wait for the last one to reach DDR.
+    typedef enum logic [2:0] {M_IDLE, M_CHK, M_GATH, M_XFER, M_WAIT, M_PUSH} mstate_t;
+    mstate_t     r_m_st;
+    logic        r_dm_ph, r_dm_on, r_dm_wr;
+    logic [15:0] r_dm_nblk;
+    logic        r_dd_pend;
+    logic        w_a_busy;          // the bus adapter has a transaction (below)
+    logic        w_dm_wend;         // a write DMA ends this cycle (the card side is done)
+    // DMA_BUSY: the engine owns the FIFO and DDR; 0 = every DMA write has
+    // been accepted at the L2 / DDR and none will be issued (m1).  A write
+    // DMA's phase ends in the very cycle its card side does (DATA_DONE).
+    wire       w_dma_busy = w_a_busy || (r_dm_ph && !w_dm_wend);
+    wire       w_dbusy    = w_d_active || r_dd_pend;          // SDM_STATUS[1] DATA_BUSY
+
     // a command accepted this cycle (§4.8: ignored while CMD_BUSY, while
-    // SD_MODE = 0, and — with the data flag — while DATA_BUSY)
-    wire       w_cmd_acc  = w_cmd_wr && i_sd_mode && !w_c_active && !(r_in_wdata[11] && w_d_active);
+    // SD_MODE = 0, and — with the data flag — while DATA_BUSY or DMA_BUSY;
+    // a data command with DMA_EN that the engine refuses is not sent either)
+    wire       w_cmd_ok   = w_cmd_wr && i_sd_mode && !w_c_active && !(r_in_wdata[11] && (w_dbusy || w_dma_busy));
+    // the up-front DMA checks (spec v1.2): a block size that is not a
+    // multiple of 8, or a counted transfer whose range leaves DDR
+    logic      r_rng_ok;            // [SDM_DMA_ADDR, + size x count) inside DDR (pipelined, below)
+    wire       w_dma_refuse = DMA_EN && w_cmd_ok && r_in_wdata[11] && r_cfg_dma &&
+                              (r_blksz[2] || (r_blkcnt != 16'd0 && !r_rng_ok));
+    wire       w_cmd_acc  = w_cmd_ok && !w_dma_refuse;
     wire [2:0] w_rtype_in = (r_in_wdata[10:8] > 3'd4) ? 3'd0 : r_in_wdata[10:8];
     wire       w_acc_data = w_cmd_acc && r_in_wdata[11];
     wire       w_acc_stop = w_cmd_acc && r_in_wdata[13];
+    wire       w_acc_dma  = DMA_EN && w_acc_data && r_cfg_dma;
 
     // the last unit of a FIFO word: a full word, or the block's last unit
     // (which ends a half word when size mod 8 = 4)
@@ -267,13 +337,18 @@ module sd_native (
     // write: a whole block in the FIFO and the head word ready
     wire w_blk_ready = (w_level >= r_d_blkw) && r_head_v;
 
-    // FIFO side effects
+    // FIFO side effects.  During a DMA (DMA_BUSY) the FIFO port is the
+    // engine's: a CPU load of SDM_DATA reads 0 and pops nothing, a CPU store
+    // is dropped with FIFO_ERR (spec v1.2).
+    logic      w_dma_pop, w_dma_push;   // the DMA engine's pop / push (below)
+    logic [63:0] w_dma_pword;
     wire w_eng_we  = r_samp && (r_d_state == D_RD_DATA) && w_rx_wordb;
     wire w_eng_pop = ev_fall && (((r_d_state == D_WR_WAIT) && w_blk_ready)
                               || ((r_d_state == D_WR_DATA) && (r_d_units != 15'd1) && w_tx_wordb));
-    wire w_cpu_pop = w_new_rd && w_win && (w_off == O_DATA) && r_head_v;
-    wire w_pop     = w_cpu_pop || w_eng_pop;
+    wire w_cpu_pop = w_new_rd && w_win && (w_off == O_DATA) && r_head_v && !w_dma_busy;
+    wire w_pop     = w_cpu_pop || w_eng_pop || w_dma_pop;
     wire w_fetch   = (r_mrp != r_wc) && !r_fetch && (!r_head_v || w_pop);
+    wire w_push    = w_push_rq && !w_dma_busy;
     wire w_push_ok = w_push && !w_full && !w_eng_we;
 
     // Flow control: park CLK between blocks.  The read decision is also
@@ -292,23 +367,25 @@ module sd_native (
     wire w_thresh_wr = (r_dir == DIR_WRITE) && w_d_write
                        && ((11'd512 - {1'b0, w_level}) >= {1'b0, r_d_blkw})
                        && !r_d_tgt_stale && ((r_d_cnt == 16'd0) || (r_push_words < r_d_target));
-    wire w_thresh    = w_thresh_rd || w_thresh_wr;
-    wire w_err_any   = |r_err;
-    wire [31:0] w_status = {w_err_any, 4'b0, r_err, 6'b0, r_data_done, r_cmd_done,
-                            3'b0, w_thresh, ~r_cd_sync[1], r_dat_in[0], w_d_active, w_c_active};
+    // (FIFO_THRESH reads 0 during a DMA: the engine, not the driver, moves
+    // the data)
+    wire w_thresh    = (w_thresh_rd || w_thresh_wr) && !w_dma_busy;
+    wire w_err_any   = (|r_err) || r_dma_err;
+    wire [31:0] w_status = {w_err_any, 3'b0, r_dma_err, r_err, 6'b0, r_data_done, r_cmd_done,
+                            2'b0, w_dma_busy, w_thresh, ~r_cd_sync[1], r_dat_in[0], w_dbusy, w_c_active};
     // CARD_PRESENT = NOT the CD pin: the Nexys A7 slot's card-detect switch
     // pulls SD_CD low with a card inserted (measured on the board, 2026-11-10;
     // SD_STATUS[1] keeps reporting the raw pin for compatibility).
-    localparam logic [31:0] IRQ_MASK = 32'h07FF_0310;
+    localparam logic [31:0] IRQ_MASK = DMA_EN ? 32'h0FFF_0310 : 32'h07FF_0310;
 
     // -----------------------------------------------------------------------
     // FIFO memory (simple dual port, synchronous read)
     // -----------------------------------------------------------------------
-    wire        w_mem_we    = (w_eng_we && !w_full) || w_push_ok;
+    wire        w_mem_we    = (w_eng_we && !w_full) || w_push_ok || w_dma_push;
     // a half last word: its 4 bytes in [31:0], [63:32] = 0
     wire [63:0] w_rx_word   = w_rx_half ? {32'h0, w_rx_next[7:0], w_rx_next[15:8], w_rx_next[23:16], w_rx_next[31:24]}
                                         : f_bswap(w_rx_next);
-    wire [63:0] w_mem_wdata = w_eng_we ? w_rx_word : r_in_wdata;
+    wire [63:0] w_mem_wdata = w_eng_we ? w_rx_word : w_dma_push ? w_dma_pword : r_in_wdata;
     always_ff @(posedge i_Clk) begin
         if (w_mem_we) r_mem[r_wp[8:0]] <= w_mem_wdata;
         if (w_fetch)  r_mem_q <= r_mem[r_mrp[8:0]];
@@ -348,7 +425,9 @@ module sd_native (
             r_dir       <= DIR_NONE;
             r_cmd_done  <= 1'b0;  r_data_done <= 1'b0;
             r_err       <= 11'h0;
-            r_irq_en    <= 27'h0;
+            r_irq_en    <= 28'h0;
+            r_dma_addr  <= '0;    r_cfg_dma <= 1'b0;  r_dma_err <= 1'b0;
+            r_dd_pend   <= 1'b0;
             r_tmo_data  <= 32'd2_500_000;
             r_tmo_busy  <= 32'd12_500_000;
             r_cfg_w4    <= 1'b0;  r_cfg_clkon <= 1'b0;
@@ -385,15 +464,21 @@ module sd_native (
             // ---------------- plain register writes ----------------
             if (w_wr && w_off == O_ARG)   r_arg <= r_in_wdata[31:0];
             if (w_wr && w_off == O_BLK)   begin r_blksz <= r_in_wdata[11:2]; r_blkcnt <= r_in_wdata[31:16]; end
-            if (w_wr && w_off == O_IRQEN) r_irq_en <= r_in_wdata[26:0] & IRQ_MASK[26:0];
+            if (w_wr && w_off == O_IRQEN) r_irq_en <= r_in_wdata[27:0] & IRQ_MASK[27:0];
             if (w_wr && w_off == O_TMO)   begin r_tmo_data <= r_in_wdata[31:0]; r_tmo_busy <= r_in_wdata[63:32]; end
-            if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= r_in_wdata[0]; r_cfg_clkon <= r_in_wdata[2]; end
+            if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= r_in_wdata[0]; r_cfg_clkon <= r_in_wdata[2];
+                                                r_cfg_dma <= DMA_EN && r_in_wdata[16]; end
+            // SDM_DMA_ADDR: ignored while DMA_BUSY (it is the live address
+            // then); the engine advances it past every word it moves
+            if (DMA_EN && w_wr && w_off == O_DMA && !w_dma_busy) r_dma_addr <= r_in_wdata[63:3];
+            if (w_dma_adv) r_dma_addr[27:3] <= r_dma_addr[27:3] + {23'h0, w_dma_adv_n};
 
             // ---------------- sticky status: W1C first, engine sets below win ----------------
             if (w_w1c) begin
                 if (r_in_wdata[8]) r_cmd_done  <= 1'b0;
                 if (r_in_wdata[9]) r_data_done <= 1'b0;
                 r_err <= r_err & ~r_in_wdata[26:16];
+                if (r_in_wdata[27]) r_dma_err <= 1'b0;
             end
 
             // ---------------- trailing clocks ----------------
@@ -415,6 +500,11 @@ module sd_native (
             if (w_pop) r_rp <= r_rp + 10'd1;
 
             // ---------------- FIFO: CPU push ----------------
+            if (w_push_rq && !w_push) r_err[E_FIFO] <= 1'b1;   // a store to SDM_DATA during a DMA
+            if (w_dma_push) begin
+                r_wp <= r_wp + 10'd1;                       // (pushed words count only the CPU's)
+                r_wc <= r_wc + 10'd1;
+            end
             if (w_push) begin
                 if (w_push_ok) begin
                     r_wp <= r_wp + 10'd1;
@@ -635,7 +725,10 @@ module sd_native (
                                     r_wc      <= r_wp;              // the block becomes visible
                                     r_blkdone <= r_blkdone + 16'd1;
                                     if (w_rd_last_blk) begin
-                                        r_data_done <= 1'b1;
+                                        // (a DMA read: DATA_DONE once the last
+                                        // block is in DDR — the engine's)
+                                        if (r_dm_on && !r_dm_wr) r_dd_pend   <= 1'b1;
+                                        else                     r_data_done <= 1'b1;
                                         r_trail     <= 4'd8;
                                         r_d_state   <= D_IDLE;
                                     end else begin
@@ -806,6 +899,20 @@ module sd_native (
                 end
             end
 
+            // ---------------- DMA status ----------------
+            // DMA_ERR: a data command refused up front, or an open-ended
+            // block that would leave DDR (the engine)
+            if (w_dma_refuse || w_dma_seterr) r_dma_err <= 1'b1;
+            // a counted DMA read's DATA_DONE (and the end of its DATA_BUSY):
+            // the engine moved its last block to DDR; or the DMA was aborted
+            // (DMA_EN = 0) or the FIFO emptied first — then at once, as the
+            // card side is complete (the blocks still in the FIFO are PIO's);
+            // clearing SD_MODE sets no DONE bit (§4.8)
+            if (r_dd_pend && (w_dma_ddone || w_fifo_rs || w_cfg_dma_off || !i_sd_mode)) begin
+                r_dd_pend <= 1'b0;
+                if (i_sd_mode) r_data_done <= 1'b1;
+            end
+
             // ---------------- FIFO reset (highest priority on the pointers) ----------------
             if (w_fifo_rs) begin
                 r_wp <= 10'd0; r_wc <= 10'd0; r_rp <= 10'd0; r_mrp <= 10'd0;
@@ -814,9 +921,266 @@ module sd_native (
                 r_dir    <= DIR_NONE;
             end
 
-            o_irq <= |(w_status & {5'h0, r_irq_en} & IRQ_MASK);
+            o_irq <= |(w_status & {4'h0, r_irq_en} & IRQ_MASK);
         end
     end
+
+    // =======================================================================
+    // DMA engine (SD DMA spec v1.2; SD_NATIVE_PLAN.md §8)
+    // =======================================================================
+    // The up-front check of a counted DMA: [SDM_DMA_ADDR, + size x count)
+    // inside DDR, pipelined from the registers (two edges).  Every register
+    // write reaches them at least two edges before the next MMIO access's
+    // first cycle (an access holds its strobe until its ready, and the core
+    // issues the next one only after it), so the SDM_CMD that uses it sees
+    // it settled (checked in simulation below).  In 4-byte units: the size
+    // field (0 acts as 8) times the count, at most 512 x 65535 < 2^25.
+    logic [25:0] r_rng_prod;
+    always_ff @(posedge i_Clk) begin
+        r_rng_prod <= 26'(w_sz4 * r_blkcnt);
+        r_rng_ok   <= (r_dma_addr[63:DDR_LG] == '0) &&
+                      ({2'b0, r_dma_addr[DDR_LG-1:3], 1'b0} + {1'b0, r_rng_prod} <= 27'(1 << (DDR_LG - 2)));
+    end
+    // the per-block check (an open-ended DMA; a counted one passes it): the
+    // block at SDM_DMA_ADDR inside DDR (words; the address is stable in
+    // M_CHK — nothing moves there)
+    wire w_blk_ok = (r_dma_addr[63:DDR_LG] == '0) &&
+                    ({1'b0, r_dma_addr[DDR_LG-1:3]} + {15'b0, r_d_blkw} <= 25'(1 << (DDR_LG - 3)));
+
+    // ---------------- the bus adapter (no reset: see the header) ----------------
+    typedef enum logic [1:0] {A_IDLE, A_REQ, A_DRV, A_GAP} astate_t;
+    astate_t      r_a_st  = A_IDLE;
+    logic         r_a_wr  = 1'b0;      // the transaction is a DDR write (an SD read's data)
+    logic [1:0]   r_a_gap = 2'd0;
+    logic         r_a_cpl = 1'b0;      // it completed on the last edge (a read's data in r_a_rdata)
+    logic [127:0] r_a_rdata;
+    initial begin
+        o_dma_req = 1'b0; o_dma_done = 1'b0; o_dma_write_DV = 1'b0; o_dma_read_DV = 1'b0;
+        o_dma_addr = 32'h0; o_dma_write_data = '0; o_dma_wdf_mask = 16'h0;
+    end
+    assign w_a_busy = (r_a_st != A_IDLE);
+
+    // ---------------- the engine ----------------
+    logic [9:0]   r_bk_left;           // words of the block still to move
+    logic [1:0]   r_x_n;               // words in this transaction (1 or 2)
+    logic         r_x_lane;            // its first word's lane: SDM_DMA_ADDR[3]
+    logic [1:0]   r_x_k;               // words gathered (to DDR) / pushed (from DDR)
+    logic [127:0] r_x_wd;              // [127:64] the dword at the 16 B address, [63:0] the next
+    logic [15:0]  r_x_mask;
+    logic         r_x_own;             // the adapter's transaction is ours (not an abandoned one)
+
+    // abort: DMA_EN = 0 written, or SD_MODE cleared — no new block (the
+    // block in progress is finished); kill: the FIFO emptied — at once
+    // (the adapter's transaction completes; a read's data is dropped).  The
+    // native reset (CPU_RESETN, the native-mode program-load reset) kills too.
+    wire w_dm_abort = w_cfg_dma_off || !i_sd_mode;
+    wire w_dm_kill  = w_fifo_rs;
+    // a block may start: words for it in the FIFO (to DDR) / room for it
+    // (from DDR: so at most the FIFO's 4 KiB ahead of the card), blocks
+    // left (never past size x count), the adapter free
+    wire w_cnt_left = (r_d_cnt == 16'd0) || (r_dm_nblk != r_d_cnt);
+    wire w_bk_can   = r_dm_on && !w_a_busy && w_cnt_left &&
+                      (r_dm_wr ? ((11'd512 - {1'b0, w_used}) >= {1'b0, r_d_blkw})
+                               : (w_level >= r_d_blkw));
+    // the phase is over (in M_IDLE, the adapter idle):
+    //   to DDR   — every block of a counted read moved; or aborted / DMA_ERR;
+    //              or the card side ended (CMD12, an error, SD_MODE) and no
+    //              whole block is left in the FIFO (those still there are
+    //              moved first: "the good blocks already received are
+    //              finished"; a counted read's last block holds r_dd_pend);
+    //   from DDR — aborted / DMA_ERR, or the card side ended (DATA_DONE or not).
+    wire w_m_idle   = r_dm_ph && (r_m_st == M_IDLE) && !w_a_busy;
+    wire w_dm_rend  = w_m_idle && !r_dm_wr &&
+                      ((r_d_cnt != 16'd0 && r_dm_nblk == r_d_cnt) || !r_dm_on ||
+                       (!w_d_active && !r_dd_pend && w_level < r_d_blkw));
+    assign w_dm_wend = w_m_idle && r_dm_wr && (!r_dm_on || !w_d_active);
+    // the strobes into the register / FIFO block above
+    wire  w_dma_ddone  = w_dm_rend;                                  // (DATA_DONE if r_dd_pend)
+    wire  w_dma_seterr = (r_m_st == M_CHK) && r_dm_on && !w_blk_ok && !w_dm_kill;
+    assign w_dma_pop   = (r_m_st == M_GATH) && r_head_v && !w_dm_kill;
+    assign w_dma_push  = (r_m_st == M_PUSH) && !w_dm_kill;
+    assign w_dma_pword = (r_x_lane ^ r_x_k[0]) ? r_a_rdata[63:0] : r_a_rdata[127:64];
+    // SDM_DMA_ADDR advances past a transaction's words when they are in DDR
+    // (its write accepted) or in the FIFO (the last one pushed)
+    wire  w_x_last_push = (r_m_st == M_PUSH) && (2'(r_x_k + 2'd1) == r_x_n);
+    wire  w_dma_adv     = !w_dm_kill && (((r_m_st == M_WAIT) && r_a_cpl && r_x_own && !r_dm_wr) || w_x_last_push);
+    wire  [1:0] w_dma_adv_n = r_x_n;
+    wire  w_x_go        = (r_m_st == M_XFER) && !w_a_busy && !w_dm_kill && !i_rst;
+
+    // the next transaction of the block: its lane and size from the address
+    // the current one leaves (a 16 B-aligned pair, else a single word)
+    task automatic t_next(input logic lane, input logic [9:0] left);
+        r_x_lane <= lane;
+        r_x_n    <= (!lane && left >= 10'd2) ? 2'd2 : 2'd1;
+        r_x_mask <= (!lane && left >= 10'd2) ? 16'h0000 : lane ? 16'hFF00 : 16'h00FF;
+        r_x_k    <= 2'd0;
+    endtask
+
+    always_ff @(posedge i_Clk) begin
+        if (i_rst || !DMA_EN) begin
+            r_m_st    <= M_IDLE;
+            r_dm_ph   <= 1'b0;  r_dm_on <= 1'b0;  r_dm_wr <= 1'b0;
+            r_dm_nblk <= 16'h0;
+            r_bk_left <= 10'd0;
+            r_x_n     <= 2'd1;  r_x_lane <= 1'b0;  r_x_k <= 2'd0;  r_x_mask <= 16'h0;
+            r_x_own   <= 1'b0;
+        end else begin
+            if (w_dm_abort) r_dm_on <= 1'b0;
+            case (r_m_st)
+                M_IDLE: begin
+                    if (w_dm_rend || w_dm_wend) begin
+                        r_dm_ph <= 1'b0;
+                        r_dm_on <= 1'b0;
+                    end else if (w_bk_can && !w_dm_abort) begin
+                        r_m_st <= M_CHK;
+                    end
+                end
+                M_CHK: begin
+                    if (!r_dm_on || w_dm_abort) begin
+                        r_m_st <= M_IDLE;
+                    end else if (!w_blk_ok) begin
+                        // DMA_ERR (w_dma_seterr): the DMA ends here, nothing of
+                        // the block moved; the card side goes on through the FIFO
+                        r_dm_on <= 1'b0;
+                        r_m_st  <= M_IDLE;
+                    end else begin
+                        r_bk_left <= r_d_blkw;
+                        t_next(r_dma_addr[3], r_d_blkw);
+                        r_m_st    <= r_dm_wr ? M_XFER : M_GATH;
+                    end
+                end
+                M_GATH: begin           // to DDR: pop the transaction's words
+                    if (w_dma_pop) begin
+                        if (r_x_lane ^ r_x_k[0]) r_x_wd[63:0]   <= r_head;
+                        else                     r_x_wd[127:64] <= r_head;
+                        r_x_k <= r_x_k + 2'd1;
+                        if (2'(r_x_k + 2'd1) == r_x_n) r_m_st <= M_XFER;
+                    end
+                end
+                M_XFER: begin           // hand it to the adapter
+                    if (w_x_go) begin
+                        r_x_own <= 1'b1;
+                        r_m_st  <= M_WAIT;
+                    end
+                end
+                M_WAIT: begin
+                    if (r_a_cpl && r_x_own) begin
+                        r_x_own <= 1'b0;
+                        if (r_dm_wr) begin
+                            r_x_k  <= 2'd0;
+                            r_m_st <= M_PUSH;
+                        end else begin
+                            // the write is accepted: its words are in DDR
+                            r_bk_left <= r_bk_left - {8'h0, r_x_n};
+                            if (r_bk_left == {8'h0, r_x_n}) begin
+                                r_dm_nblk <= r_dm_nblk + 16'd1;
+                                r_m_st    <= M_IDLE;
+                            end else begin
+                                t_next(r_x_lane ^ r_x_n[0], r_bk_left - {8'h0, r_x_n});
+                                r_m_st <= M_GATH;
+                            end
+                        end
+                    end
+                end
+                M_PUSH: begin           // from DDR: push the words into the FIFO
+                    r_x_k <= r_x_k + 2'd1;
+                    if (w_x_last_push) begin
+                        r_bk_left <= r_bk_left - {8'h0, r_x_n};
+                        if (r_bk_left == {8'h0, r_x_n}) begin
+                            r_dm_nblk <= r_dm_nblk + 16'd1;
+                            r_m_st    <= M_IDLE;
+                        end else begin
+                            t_next(r_x_lane ^ r_x_n[0], r_bk_left - {8'h0, r_x_n});
+                            r_m_st <= M_XFER;
+                        end
+                    end
+                end
+                default: r_m_st <= M_IDLE;
+            endcase
+            // a data command with DMA_EN starts a phase (only with the engine
+            // and the adapter idle: w_cmd_ok)
+            if (w_acc_dma) begin
+                r_dm_ph   <= 1'b1;
+                r_dm_on   <= 1'b1;
+                r_dm_wr   <= r_in_wdata[12];
+                r_dm_nblk <= 16'h0;
+                r_m_st    <= M_IDLE;
+            end
+            if (w_dm_kill) begin
+                r_dm_ph <= 1'b0;
+                r_dm_on <= 1'b0;
+                r_x_own <= 1'b0;
+                r_m_st  <= M_IDLE;
+            end
+        end
+    end
+
+    // the adapter: one transaction per bus tenure (as core 2), req held
+    // until the done pulse; a write is accepted (posted at the L2) on its
+    // ready, then the blitter's two-cycle settle before the release
+    always_ff @(posedge i_Clk) begin
+        o_dma_done <= 1'b0;
+        r_a_cpl    <= 1'b0;
+        case (r_a_st)
+            A_IDLE: if (w_x_go) begin
+                r_a_wr           <= !r_dm_wr;
+                o_dma_addr       <= {r_dma_addr[31:4], 4'b0000};
+                o_dma_write_data <= r_x_wd;
+                o_dma_wdf_mask   <= r_x_mask;
+                o_dma_req        <= 1'b1;
+                r_a_st           <= A_REQ;
+            end
+            A_REQ: if (i_dma_grant) begin
+                if (r_a_wr) o_dma_write_DV <= 1'b1;
+                else        o_dma_read_DV  <= 1'b1;
+                r_a_st <= A_DRV;
+            end
+            A_DRV: if (i_dma_ready) begin
+                r_a_cpl <= 1'b1;
+                if (r_a_wr) begin
+                    o_dma_write_DV <= 1'b0;
+                    r_a_gap        <= 2'd2;
+                    r_a_st         <= A_GAP;
+                end else begin
+                    r_a_rdata     <= i_dma_read_data;
+                    o_dma_read_DV <= 1'b0;
+                    o_dma_done    <= 1'b1;
+                    o_dma_req     <= 1'b0;
+                    r_a_st        <= A_IDLE;
+                end
+            end
+            A_GAP: begin
+                if (r_a_gap == 2'd0) begin
+                    o_dma_done <= 1'b1;
+                    o_dma_req  <= 1'b0;
+                    r_a_st     <= A_IDLE;
+                end else r_a_gap <= r_a_gap - 2'd1;
+            end
+            default: r_a_st <= A_IDLE;
+        endcase
+    end
+
+`ifndef SYNTHESIS
+    // the up-front range check had settled when a DMA data command used it
+    always_ff @(posedge i_Clk)
+        if (!i_rst && DMA_EN && w_cmd_ok && r_in_wdata[11] && r_cfg_dma && r_blkcnt != 16'd0 &&
+            r_rng_ok != ((r_dma_addr[63:DDR_LG] == '0) &&
+                         (28'({r_dma_addr[DDR_LG-1:3], 3'b000}) + 28'(w_sz4 * r_blkcnt) * 28'd4 <= 28'(1 << DDR_LG))))
+            $fatal(1, "sd_native: SD DMA range check not settled at the data command");
+    // the engine's FIFO ports
+    always_ff @(posedge i_Clk) begin
+        if (!i_rst && w_dma_push && (w_full || w_eng_we || w_push_ok))
+            $fatal(1, "sd_native: DMA push into a full FIFO or beside another write");
+        if (!i_rst && w_dma_pop && (w_cpu_pop || w_eng_pop))
+            $fatal(1, "sd_native: DMA pop beside another pop");
+        // (m1) DMA_BUSY = 0: nothing in flight on the DDR port
+        if (!w_dma_busy && (o_dma_req || o_dma_write_DV || o_dma_read_DV))
+            $fatal(1, "sd_native: DMA_BUSY = 0 with a DDR transaction in flight");
+        // a transaction never leaves DDR
+        if ((o_dma_write_DV || o_dma_read_DV) && o_dma_addr[31:DDR_LG] != '0)
+            $fatal(1, "sd_native: DMA address %08x outside DDR", o_dma_addr);
+    end
+`endif
 
     // -----------------------------------------------------------------------
     // Read mux: combinational from the registered address (valid in the
@@ -830,14 +1194,15 @@ module sd_native (
             O_RESP1:   o_rdata = r_resp1;
             O_BLK:     o_rdata = {32'h0, r_blkcnt, 4'h0, r_blksz, 2'b00};
             O_STATUS:  o_rdata = {32'h0, w_status};
-            O_IRQEN:   o_rdata = {37'h0, r_irq_en};
+            O_IRQEN:   o_rdata = {36'h0, r_irq_en};
             O_TMO:     o_rdata = {r_tmo_busy, r_tmo_data};
-            O_CFG:     o_rdata = {61'h0, r_cfg_clkon, 1'b0, r_cfg_w4};
+            O_CFG:     o_rdata = {47'h0, r_cfg_dma, 13'h0, r_cfg_clkon, 1'b0, r_cfg_w4};
+            O_DMA:     o_rdata = DMA_EN ? {r_dma_addr, 3'b000} : 64'h0;
             O_FIFO:    o_rdata = {54'h0, w_level};
             O_BLKDONE: o_rdata = {48'h0, r_blkdone};
-            O_DATA:    o_rdata = r_head_v ? r_head : 64'h0;
+            O_DATA:    o_rdata = (r_head_v && !w_dma_busy) ? r_head : 64'h0;
             O_CAPS:    o_rdata = CAPS;
-            default:   o_rdata = 64'h0;           // SDM_CMD, SDM_DMA_ADDR, reserved
+            default:   o_rdata = 64'h0;           // SDM_CMD, reserved
         endcase
     end
 

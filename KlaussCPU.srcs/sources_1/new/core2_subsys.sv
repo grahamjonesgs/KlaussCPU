@@ -188,7 +188,10 @@ module core2_subsys
       .park_op    (c2_park_op),
       .dbg_r      (c2_dbg_r),
       .dbg_sp     (c2_dbg_sp),
-      .dbg_flags  (c2_dbg_flags)
+      .dbg_flags  (c2_dbg_flags),
+      .cop_line   (27'h0),          // (RIINV_EN = 0: no RANGE_IINV on core 2)
+      .cop_n      (28'h0),
+      .rk_busy    ()
    );
 
    // Start sequencing (CE grid): RUN 0→1 releases reset, waits 2 core cycles,

@@ -80,7 +80,14 @@ module pipeline_core
    // and lp_v would hold the fill engine for good.  An instance with a
    // real clock enable (core 2) passes 0 and IC_LB = 16 (elaboration
    // check below; a simulation assertion checks ce stays 1 when it is 1).
-   parameter bit CE_TIED  = 1'b1
+   parameter bit CE_TIED  = 1'b1,
+   // SD DMA spec v1.2: CACHE_CTRL[6] RANGE_IINV — the core decodes its own
+   // completing store as for ICACHE_INV [3], and drops the lines of the
+   // range (cop_line / cop_n, the SoC's CACHE_OP_ADDR / LEN) from the
+   // I-cache with a sweep of only those lines; every other fetch-side copy
+   // (window, NLB, BTIC, a pending install) goes as for ICACHE_INV.  With
+   // 16 B lines it is a whole ICACHE_INV.  0: bit 6 is ignored (core 2).
+   parameter bit RIINV_EN = 1'b0
 )
 (
    input  logic         clk,
@@ -188,7 +195,12 @@ module pipeline_core
    // debugger (DEBUG_EN): halt/resume/step, breakpoints, watchpoints, and
    // register / memory access while debug-halted
    input  dbg_in_t      dbg_i = '0,
-   output dbg_out_t     dbg_o
+   output dbg_out_t     dbg_o,
+   // RANGE_IINV (RIINV_EN): the range's first line PA[31:5] and line count
+   // (0 = LEN 0: a no-op), and its sweep running (CACHE_STATUS.MNT_BUSY)
+   input  logic [26:0]  cop_line,
+   input  logic [27:0]  cop_n,
+   output logic         rk_busy
 );
 
    // ------------------------------------------------------- build switches
@@ -2880,8 +2892,16 @@ module pipeline_core
    // bit 3; the core decodes its own completing store. Invalidates every
    // fetch-side code copy and refetches everything younger — for code written
    // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
-   wire        icinv      = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
+   wire        icinv_f    = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
                             mem_be[0] && mem_wdata[3];
+   // RANGE_IINV (CACHE_CTRL[6], RIINV_EN; ignored with FLUSH / INVALIDATE —
+   // the whole-cache op wins — or LEN = 0; with ICACHE_INV the fence covers
+   // it).  Everything ICACHE_INV does but the valid bits: of those only the
+   // range's (g_vl's range sweep; 16 B lines: all of them).
+   wire        icinv_r    = RIINV_EN && mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
+                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && !mem_wdata[2] && !mem_wdata[1] &&
+                            cop_n != 28'd0;
+   wire        icinv      = icinv_f || icinv_r;
 
    // ------------- HW_PERF_PLAN §5: line valid bits (IC_LB = 32) -------------
    // VB_N LUTRAM banks of VB_D x 1, the bank = the line index's high bits.
@@ -2918,15 +2938,50 @@ module pipeline_core
       wire               vdrop = snoop_q && snoop_idx_q == vidx;
       wire               vset  = vreq && !vdrop && !lpi;   // a set, now or deferred
       wire [IC_IDXW-1:0] wl    = snoop_q ? snoop_idx_q : vidx;
-      wire [VB_AW-1:0]   wa    = ic_sw ? ic_swa : wl[VB_AW-1:0];
-      wire               wd    = !ic_sw && !snoop_q && !lpi;
-      wire               swgo  = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv;
+      // RANGE_IINV (SD DMA spec v1.2): a range sweep (r_sw_rng) clears at
+      // each bank address only the banks whose line there is in the range
+      // (r_sw_mask, registered for the address it is used at), from the
+      // range's first address for min(n, VB_D) steps: n lines in
+      // min(n, VB_D) cycles.  A store's snoop clear outside the range must
+      // still land, so it takes the write port and the sweep waits a cycle
+      // (a whole sweep needs neither).  Lookups miss and sets wait for the
+      // whole of it, as in a whole sweep.  A range op that meets a sweep
+      // already running, or covers the whole cache, sweeps the whole cache.
+      logic              r_sw_rng = 1'b0, r_sw_rk = 1'b0;
+      logic [VB_N-1:0]   r_sw_mask = '0;
+      logic [VB_AW:0]    r_sw_left = '0;
+      logic [IC_IDXW-1:0] r_rk_s = '0, r_rk_e = '0;
+      logic              r_rk_wrap = 1'b0;
+      wire               swst  = ic_sw && !(r_sw_rng && snoop_q);   // a sweep step this cycle
+      wire [VB_AW-1:0]   wa    = swst ? ic_swa : wl[VB_AW-1:0];
+      wire               wd    = !swst && !snoop_q && !lpi;
+      wire               swgo_x = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv_f;
+      wire               swgo  = swgo_x || icinv;
+      // the range: first / last line index, wrapping past the last line
+      wire               rk_full = cop_n >= 28'(IC_LINES);
+      wire [IC_IDXW-1:0] rk_s  = cop_line[IC_IDXW-1:0];
+      wire [IC_IDXW-1:0] rk_e  = rk_s + IC_IDXW'(cop_n - 28'd1);
+      wire               rk_wr = (29'(rk_s) + 29'(cop_n) - 29'd1) >= 29'(IC_LINES);
+      wire               rk_go = icinv_r && !swgo_x && !rk_full && !ic_sw;   // a range sweep starts
+      // banks whose line at address a is in [s, e] (or, wrapping, [s, end] + [0, e])
+      function automatic logic [VB_N-1:0] f_rkm(input logic [VB_AW-1:0] a, input logic [IC_IDXW-1:0] s,
+                                                input logic [IC_IDXW-1:0] e, input logic wrap);
+         int blo, bhi;
+         blo = int'(s >> VB_AW) + ((a < s[VB_AW-1:0]) ? 1 : 0);
+         bhi = int'(e >> VB_AW) - ((a > e[VB_AW-1:0]) ? 1 : 0);
+         for (int b = 0; b < VB_N; b++) f_rkm[b] = wrap ? (b >= blo || b <= bhi) : (b >= blo && b <= bhi);
+      endfunction
+      wire [VB_AW-1:0]   sw_na = rk_go ? rk_s[VB_AW-1:0] : swst ? ic_swa + 1'b1 : ic_swa;
+      always_ff @(posedge clk) if (ce)
+         r_sw_mask <= rk_go ? f_rkm(sw_na, rk_s, rk_e, rk_wr) : f_rkm(sw_na, r_rk_s, r_rk_e, r_rk_wrap);
+      assign rk_busy = ic_sw && r_sw_rk;
       logic [VB_N-1:0]   bl, bs;
       logic              vl_any = 1'b0;
       for (genvar b = 0; b < VB_N; b++) begin : g_b
          (* ram_style = "distributed" *) logic m [0:VB_D-1];
          initial for (int i = 0; i < VB_D; i++) m[i] = 1'b0;
-         wire we = ic_sw || ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
+         wire we = swst ? (!r_sw_rng || r_sw_mask[b])
+                        : ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
          // (no rst: a valid set on a reset edge — an install of a fill
          // completing then — sets vl_any, and the reset / start sweep
          // clears it)
@@ -2939,24 +2994,32 @@ module pipeline_core
       always_ff @(posedge clk)
          if (rst) begin
             ic_sw <= vl_any || (vset && !snoop_q);  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+            r_sw_rng <= 1'b0;  r_sw_rk <= 1'b0;
             if (ce && !ic_sw && vset && !snoop_q) vl_any <= 1'b1;
          end else if (ce) begin
-            if (ic_sw) begin
+            if (swst) begin
                ic_swa <= ic_swa + 1'b1;
-               if (ic_swa == VB_AW'(VB_D - 1)) begin
+               r_sw_left <= r_sw_left - 1'b1;
+               if (r_sw_rng ? (r_sw_left == (VB_AW+1)'(1)) : (ic_swa == VB_AW'(VB_D - 1))) begin
                   ic_sw  <= 1'b0;
-                  vl_any <= 1'b0;
+                  // (a range sweep leaves the other lines valid)
+                  if (!r_sw_rng) vl_any <= 1'b0;
                end
-            end else if (vset && !snoop_q)
+            end else if (!ic_sw && vset && !snoop_q)
                vl_any <= 1'b1;                    // a valid bit is set this edge
             vs_pend <= vset && (ic_sw || snoop_q);
             vs_idx  <= vidx;
             if (swgo) begin
                ic_sw <= vl_any || (vset && !snoop_q && !ic_sw);
-               ic_swa <= '0;  vs_pend <= 1'b0;
+               ic_swa <= rk_go ? rk_s[VB_AW-1:0] : '0;  vs_pend <= 1'b0;
+               r_sw_rng  <= rk_go;
+               r_sw_rk   <= icinv_r || (ic_sw && r_sw_rk);
+               r_sw_left <= (cop_n < 28'(VB_D)) ? (VB_AW+1)'(cop_n) : (VB_AW+1)'(VB_D);
+               r_rk_s <= rk_s;  r_rk_e <= rk_e;  r_rk_wrap <= rk_wr;
             end
          end
    end else begin : g_novl
+      assign rk_busy = 1'b0;
       assign vl_rd_look = 1'b0;  assign vl_rd_sn = 1'b0;
       assign ic_sw = 1'b0;  assign ic_swa = '0;  assign vs_pend = 1'b0;  assign vs_idx = '0;
    end endgenerate
@@ -4909,7 +4972,10 @@ module pipeline_core
          if (icinv) begin
             ic_lv <= '0;  lp_v <= 1'b0;  // (§5: a fill's line from before the fence is not installed)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
-            if_look <= 1'b0;  snoop_q <= 1'b0;
+            if_look <= 1'b0;
+            // (a RANGE_IINV keeps a snoop clear armed on this edge: lines
+            // outside its range stay valid — g_vl lets the clear land)
+            if (icinv_f) snoop_q <= 1'b0;
             ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
          end
          if (sq_any) begin
