@@ -259,7 +259,7 @@ module tb_soc;
    // and the buffer full, or its end with entries left.  A DMA / VGA read
    // miss needs no slot.
    function automatic bit rt_need_now();
-      bit hit, many, lk, dmaq, alloc, vdirty, full, wbm, post;
+      bit hit, many, lk, dmaq, alloc, vdirty, full, wbm, post, wk_wb;
       hit   = `L2C.r_hit; many = `L2C.r_many; lk = `L2C.q_lk; dmaq = `L2C.q_dma;
       alloc = `L2C.r_en && !`L2C.r_walking;
       vdirty = `L2C.r_td[`L2C.r_vic] != 2'b00;
@@ -267,13 +267,19 @@ module tb_soc;
       wbm   = (`L2C.wb_v[0] && `L2C.wb_line[0] == `L2C.q_addr[26:6]) ||
               (`L2C.wb_v[1] && `L2C.wb_line[1] == `L2C.q_addr[26:6]);
       post  = !(lk && !dmaq && many) && !(alloc && lk && !dmaq && !many) && !(lk && dmaq && hit);
-      if (`L2C.r_wk_wb && full) return 1;
+      wk_wb = 0;
+`ifdef L2_PROBE_WK
+      // (review 2's walk terms; run.py defines L2_PROBE_WK for an RTL that
+      // has them — an older L2 under this tb_soc has no r_wk_wb)
+      wk_wb = `L2C.r_wk_wb;
       if (`L2C.r_walk_end && `L2C.r_wk_snap && `L2C.r_wk_fl != 2'b00) return 1;
+`endif
+      if (wk_wb && full) return 1;
       if (`L2C.f_st != 4'd2) return 0;
       if (!`L2C.q_wr)
          return !(lk && hit) && (wbm || (alloc && lk && !dmaq && !many && vdirty && full));
       return (alloc && lk && !dmaq && !many && vdirty && full) ||
-             (post && (full || (`L2C.r_wk_wb && `L2C.wb_v != 2'b00)));
+             (post && (full || (wk_wb && `L2C.wb_v != 2'b00)));
    endfunction
    bit rt_pend = 0, rt_pneed = 0;
    always @(posedge dut.i_Clk) begin

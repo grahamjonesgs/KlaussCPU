@@ -398,6 +398,8 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
     else:
         # (L2_PROBE: tb_soc's count of drains in VGA's / DMA's window, review 1 M2)
         defs = ['+define+L2_PROBE'] if l2 else ['+define+DDRPATH=g_ddr.ddr2_control']
+        if l2 and 'r_wk_wb' in allsrc:
+            defs.append('+define+L2_PROBE_WK')        # (review 2: the walk's drain terms)
     cmd = ['verilator', '--binary', '--timing', '-j', '8', '-Wno-fatal', '-Wno-lint', '-Wno-style',
            '-Wno-MULTIDRIVEN', '-Wno-BLKANDNBLK', '-Wno-UNOPTFLAT', '--assert', '--top-module', 'tb_soc',
            '-I' + src, '-Mdir', os.path.join(d, 'obj')] + defs + \

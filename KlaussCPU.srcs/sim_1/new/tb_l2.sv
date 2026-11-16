@@ -465,8 +465,11 @@ module tb_l2;
             check_ddr_drained("wbinv");
             late_m.delete();
             begin
+               // a line dirty before the walk that the traffic above never
+               // touches (it may run past BUSY's drop and allocate L(0, 0):
+               // review 2's 8-way sweep caught that)
                int m0 = evc[D_MISS];
-               xact(0, 0, 1, L(0, 0), 0, 0, 0, 1, 0);
+               xact(0, 0, 1, L(3, 7 * 13) + 32, 0, 0, 0, 1, 0);
                if (evc[D_MISS] != m0 + 1) fail("read after WBINV hit");
             end
             if (!en) fail("EN dropped by WBINV");
@@ -707,7 +710,7 @@ module tb_l2;
                t0 = int'($time / 10);
                tenure = 1;
                while (busy && nr < 4 * SETS) begin
-                  xact(1, 1, 0, L(5 + g, nr % SETS) + 16 * (nr % 4), 0, rnd256(), 16'(nr * 31), 0, 0);
+                  xact(1, 1, 0, L(5 + g, far_set(nr)) + 16 * (nr % 4), 0, rnd256(), 16'(nr * 31), 0, 0);
                   nr++;
                   repeat (gaps[g]) @(negedge clk);
                   if (nr % 8 == 0) begin dma = 0; @(negedge clk); dma = 1; end
@@ -732,7 +735,7 @@ module tb_l2;
                for (int s = 0; s < SETS; s++) xact(1, 0, 1, L(s % 3, s), 0, rnd256(), 0, 0, 0);
                ctrl(2'b11);
                while (busy && nr < 4 * SETS) begin
-                  xact(1, 0, 1, L(5 + g, nr % SETS) + 32 * (nr % 2), 0, rnd256(), 0, 0, 0);
+                  xact(1, 0, 1, L(5 + g, far_set(nr)) + 32 * (nr % 2), 0, rnd256(), 0, 0, 0);
                   nr++;
                   repeat (gaps[g]) @(negedge clk);
                end
@@ -755,6 +758,9 @@ module tb_l2;
             for (int s = 0; s < SETS; s++) xact(1, 0, 1, L(s % 3, s) + 32 * (s % 2), 0, rnd256(), 0, 0, 0);
             for (int s = 0; s < SETS; s += 8) xact(0, 0, 1, L(4, s), 0, 0, 0, 1, 0);   // clean lines: VGA hits
             @(negedge clk); rt_req = 1;
+            // (DDR beats spread out: a stream fill's tail then often ends
+            // while the next read waits, the case the priority decides)
+            dut.mig_7series_0.jit = 40;
             ctrl(2'b11);
             while (busy && nr < 8 * SETS) begin
                int k = $urandom_range(3, 0);
@@ -763,6 +769,7 @@ module tb_l2;
                else             xact(0, 1, 1, L(6 + nr % 2, nr % SETS), 0, 0, 0, 0, 0);   // sector 0: stream fills
                nr++;
             end
+            dut.mig_7series_0.jit = 0;
             if (busy) fail($sformatf("rtwalk: BUSY after %0d requests with VGA on the bus (walk at set %0d)",
                                      nr, dut.r_walk_set));
             $display("TB_L2 rtwalk: walk done after %0d requests, %0d drains before a waiting read", nr, wk_prio);
@@ -778,7 +785,7 @@ module tb_l2;
             // copied at most once a way, so BUSY must drop within
             // 2 x SETS x WAYS requests and the walk write at most
             // SETS x WAYS lines
-            int nr = 0, n0;
+            int nr = 0, n0, t0;
             for (int k = 0; k < `L2_WAYS; k++) for (int s = 0; s < SETS; s++) begin
                xact(1, 0, 1, L(k, s), 0, rnd256(), 0, 0, 0);
                xact(1, 0, 1, L(k, s) + 32, 0, rnd256(), 0, 0, 0);
@@ -786,6 +793,7 @@ module tb_l2;
             repeat (200) @(negedge clk);
             n0 = evc[WR_BEAT];
             ctrl(2'b11);
+            t0 = int'($time / 10);
             tenure = 1;
             while (busy && nr < 2 * SETS * `L2_WAYS) begin
                int s = int'(dut.r_walk_set);
@@ -795,8 +803,8 @@ module tb_l2;
             end
             tenure = 0; dma = 0;
             if (busy) fail($sformatf("wkset: BUSY after %0d requests (walk at set %0d)", nr, dut.r_walk_set));
-            $display("TB_L2 wkset: walk done after %0d requests, %0d write beats (whole cache %0d)", nr,
-                     evc[WR_BEAT] - n0, SETS * `L2_WAYS * 8);
+            $display("TB_L2 wkset: walk done after %0d requests, %0d cycles, %0d write beats (whole cache %0d)", nr,
+                     int'($time / 10) - t0, evc[WR_BEAT] - n0, SETS * `L2_WAYS * 8);
             wait_idle(); ctrl(2'b11); wait_idle(); check_ddr("wkset");
          end
          // ---------------------------------------------------------------
@@ -868,6 +876,11 @@ module tb_l2;
       $finish;
    end
 
+   // dmapost / cpupost: a set away from the one the walk is in (a write to
+   // that set waits for the walk's copy, which would hide the slot race)
+   function automatic int far_set(input int nr);
+      return (int'(dut.r_walk_set) + SETS / 2 + nr % 64) % SETS;
+   endfunction
    function automatic bit d_of(input int r);
       return r % 2;
    endfunction
