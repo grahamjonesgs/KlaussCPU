@@ -368,8 +368,9 @@ non-inclusive (it never invalidates the L1s), with tree pseudo-LRU and a
   request stream — the CPU's, the blitter's, VGA's — can hold BUSY up: the
   walk spends one step on each set, and each dirty line costs it at most
   the DDR transaction in progress, one write-buffer drain and one request
-  (HW_PERF_PLAN.md §6 review 2 gives the bound; a WBINV of a fully dirty
-  L2 under back-to-back traffic takes a few hundred µs).
+  (HW_PERF_PLAN.md §6 review 2 gives the bound; in simulation a WBINV of a
+  fully dirty L2 under back-to-back DMA writes into the set being walked
+  took ~0.45 ms, little more than its 2,048 line drains alone).
 - **A write while BUSY = 1 is ignored** (dropped, not queued). Poll BUSY = 0
   before writing, and again after a write of 0 or 3.
 - BUSY = 0 means DDR holds every write acknowledged before the walk's end

@@ -1234,21 +1234,29 @@ take-back of write-buffer lines (both below).
 - **VGA scanout (real time).**  Its reads now pass the L2 lookup and could
   wait behind drains.  While VGA requests the bus (`i_rt_req` = its req) or
   any DMA master holds the grant, a drain starts only for the request in
-  F_DEC that waits on the buffer (`w_fe_need`: a read miss of a buffered
+  F_DEC that waits on the buffer (`w_fe_req`: a read miss of a buffered
   line, or a full buffer in the way of an allocation's victim copy or of a
-  posted write), and a demand miss fetches only its own sector (2 bursts,
-  as `ddr2_control`).  So in VGA's window the L2 starts DDR traffic only
-  for a request in hand — its sector, the drain it is blocked on, or (VGA's
-  own) the stream fill below — never a background drain or a whole-line
-  fetch (review 1 M2; before, any front-end state but idle let a drain
-  start, including the F_LOOK every VGA read passes).
+  posted write) or for the WBINV walk waiting on it (`w_wk_need`: a dirty
+  way to copy and the buffer full, or its final drain; review 2), and a
+  demand miss fetches only its own sector (2 bursts, as `ddr2_control`).
+  So in VGA's window the L2 starts DDR traffic only for a request in hand —
+  its sector, the drain it is blocked on, (VGA's own) the stream fill
+  below, or the drain the walk is blocked on — never a background drain or
+  a whole-line fetch (review 1 M2; before, any front-end state but idle
+  let a drain start, including the F_LOOK every VGA read passes).  **The
+  walk counts as a request in hand** (the `L2_CTRL` write, review 2): left
+  out, a VGA or DMA tenure held BUSY up for as long as it lasted.
 - **VGA stream buffer** (review 1).  A VGA read (a wide DMA read) of sector
   0 of a line the L2 does not hold fetches the whole 64 B line (4 bursts,
   row hits); sector 1 is kept in a 256-bit register for the scanout's next
   read (its addresses ascend), which it answers at hit latency with no DDR
   round trip.  Any write accepted to that line (any master) drops it, also
   while sector 1 is still on its way; a line the L2 holds (a sector there
-  may be dirty) never fills it.  It halves the scanout's DDR round trips:
+  may be dirty) never fills it.  Only while the L2 is enabled (review 2: a
+  disabled L2 is a plain path to DDR; the buffer stays coherent meanwhile,
+  as writes still drop it).  A stream hit counts as a DMA hit and its fill
+  as a DMA miss, so a scanout of a framebuffer outside the L2 shows DMA
+  hits = DMA misses.  It halves the scanout's DDR round trips:
   the margin numbers below.
 - **`L2_CTRL`** (MMIO_MAP): write 1 = enable (instant: a disabled L2 holds no
   line); 3 = write back and invalidate, stay enabled; 0 = write back,
@@ -1260,7 +1268,12 @@ take-back of write-buffer lines (both below).
   full; a copied way's dirty bits are cleared in the tag RAM at the copy,
   so a set walked again after a yield copies only ways dirtied meanwhile
   (review 1 M1).  The walk and the requests take turns: after a request
-  accepted during the walk, the next set goes first (review 1).  During a
+  accepted during the walk, the next set goes first (review 1).  A walk
+  that finds the buffer full is a waiter like a request (review 2): its
+  drain may start in VGA's / DMA's window and goes before a demand read;
+  the slot it frees is the walk's (a posted write then waits for an empty
+  buffer); and a write to the set it waits in is held off until the walk
+  has copied it, so each way of a set is copied at most once.  During a
   walk nothing allocates, hits are served, and writes that miss are posted
   to DDR, so no data is lost or reordered.  It ends when the buffer entries
   present when the last set was done have drained (writes posted after
@@ -1700,6 +1713,188 @@ Bitstream `~/.cache/kbuild/l2_c9cadea.bit` (md5 `c4b1bd598877774ed65bf1a0aa36027
 build dir `~/.cache/kbuild/l2_b3` (`l2_b2` deleted).  Not run on the
 board.
 
+### §6 review 2 (2026-11-16)
+
+A delta review of `c9cadea` (review 1's RTL, the bitstream about to be
+flashed) found no critical or major findings, three minors and three
+nits; the coordinator added one item from the board (the DMA counters with
+the L2 disabled).  The SD DMA engine's posted write streams come next, so
+m-A mattered.  Fixed in `0af3aa0` (RTL, benches, tools, MMIO_MAP); `32c318c`
+changes only benches and tools; `13be986` restructures one signal for
+area and timing (identical behaviour: every simulation below is
+cycle-identical between the two).
+
+**Findings and fixes.**
+
+| # | Finding | Fix |
+|---|---|---|
+| m-A | A posted-write stream held BUSY up.  The walk's turn helped only if a buffer slot was free when it reached F_WK2; a posted write (a write that misses during the walk) waiting in F_DEC took each freed slot, so the walk found the buffer full again and yielded again.  While a DMA master holds the grant only `w_fe_need` drains start, and the walk was not a waiter, so a DMA tenure of posted writes held BUSY at any rate (the reviewer's `dmapost`: the walk at set 1 after 20,000 requests, also 10 or 40 idle cycles apart); back-to-back D-cache writes that miss did too (`cpupost`).  A regression from M2 (at `fba47c0` a drain could start while the walk waited) | The walk is a **request in hand** while it waits on the buffer (`w_wk_need`: a dirty way to copy and the buffer full — `r_wk_wb`, set in F_WK2 — or its end with entries left from before its last set): its drain starts in VGA's / DMA's window, and before a demand read.  The slot that drain frees is the walk's: while `r_wk_wb` a posted write needs an empty buffer (`wb_full_p`).  A write to the set the walk waits in is not accepted until the walk has copied it: without this `wkset` (a DMA master writing into the walk's set, re-dirtying a way already copied) kept the walk at set 0, the lowest dirty way going into the reserved slot every time.  Bound below |
+| m-B | The drain probe was looser than the RTL: `rt_pneed` (tb_l2) and tb_soc's `L2_PROBE` took any F_DEC non-hit with a full buffer as a need, so a mutant draining for VGA read misses whenever the buffer is full passed the `rt_bad` gate | Both probes spell the need out from the design's rule (the request's kind, its line, the victim's dirty bits, the walk's state), not from `w_fe_need`; `rtdrain` fills the buffer and sends VGA and DMA read misses and VGA stream fills with their stream hits (no drain may start); mutation `rt_need_full` |
+| m-C | Removing the same-edge term of the stream buffer's capture (`!(w_wr_acc && i_mem_addr[26:6] == e_line)`) survived `vgastream` and the random seeds | `strmedge`: a stream fill, then a DMA write timed at every offset 0–15 cycles after the read's ready (2 land on the capture edge at `MIGLAT=36`), then the sector-1 read; mutation `strm_edge` |
+| nit | `run.py` passed an L2-on gated tb_soc run with no `L2 rt drains` line | such a run fails (`SOC_L2P`) |
+| nit | `w_imm` compared `[31:5]`, not the folded `[26:5]`: aliases lost the 3-cycle speculative hit | compares `[26:5]` (5 comparator bits fewer) |
+| nit | `w_fe_need` does not exclude `w_strm_hit` | an assertion: never a stream-buffer hit while the request in F_DEC waits on the buffer (`w_fe_req`) — the stream buffer holds a line no write has touched since its fill, so no entry of it exists |
+| board | With the L2 disabled (`L2_CTRL` = 0) the DMA counters showed hits = half of VGA's reads and misses = 0: the stream buffer still served the scanout in bypass and counted its hits, while the misses were gated by `q_lk` | **Not intended**: the stream buffer now works only while the L2 is enabled (`q_lk` in `w_strm_hit` / `w_strm_new`), so bypass is the plain DDR path of an A/B run and counts no lookup at all.  MMIO_MAP says a stream hit counts as a DMA hit and its fill as a DMA miss (a scanout over a framebuffer outside the L2 shows hits = misses, as the board does).  `toggle` checks VGA reads in bypass (no stream hit); mutation `strm_bypass` |
+
+**The walk's bound.**  Let `T_x` be the longest DDR transaction (a 4-burst
+read or a 64 B drain, MIG stalls — refresh, turnarounds — included) and
+`T_q` the longest time a request accepted during the walk holds the front
+end (a read: a drain of its line and its read; a posted write: the
+transaction in progress and two drains; ≤ 3 `T_x`).  The walk spends one
+step (4 cycles) on each set, preceded by at most one request (the turns).
+Each way of a set is copied at most once — its dirty bits clear at the
+copy, and writes to the set it waits in are held off — so there are at
+most `SETS × WAYS` copies.  A copy that finds the buffer full waits for at
+most the transaction in progress and its own drain (which goes before any
+read; no posted write takes the slot it frees), then the one request
+accepted meanwhile.  The end waits for at most one request and two drains.
+So under any request stream, from the write that starts the walk:
+
+    BUSY ≤ SETS × (T_q + 4) + SETS × WAYS × (2 T_x + T_q + 7) + T_q + 2 T_x
+
+— a few ms at 4 ways with refresh-length `T_x`.  In simulation a WBINV of
+a fully dirty L2 (2,048 lines) with back-to-back DMA writes into the set
+being walked took 42,701 cycles at `MIGLAT=36` and 47,309 at `MIGLAT=60
++MIGREF=200 +MIGRDY=10` (~0.45 ms); with a dirty line in every set and a
+DMA posted-write stream (`dmapost`), 15,863.  MMIO_MAP's "no request
+stream can hold BUSY up" is now true.
+
+**VGA.**  The walk's drains now also run in VGA's window (one each time
+the walk finds the buffer full, before a demand read).  `socvga`'s heavy
+load (a 512 KiB stride walk, WBINV every 1,500 steps): starved lines
+(worst fetch of 3,200 cycles) and the scanout's read latency, `c9cadea`
+against review 2 (`0af3aa0` = `13be986`, cycle for cycle):
+
+| Load, MIG | `c9cadea` | review 2 | VGA read latency |
+|---|---|---|---|
+| heavy, `MIGLAT=36` | 0 (2,769) | 0 (2,786) | 27.3 / 27.6 |
+| heavy + blit, 36 | 0 (2,784) | 0 (2,794) | 26.8 / 27.1 |
+| heavy, 44 | 0 (2,986) | 0 (3,013) | 31.0 / 31.3 |
+| heavy + blit, 44 | 0 (3,009) | 0 (2,996) | 30.5 / 31.1 |
+| heavy, 52 | 2 (3,201) | **0** (3,192) | 34.7 / 34.9 |
+| heavy + blit, 52 | 17 (3,198) | 16 (3,202) | 34.6 / 34.8 |
+
+No setting starves more; the worst fetch moves by −13 … +27 cycles (in
+this load the WBINV walks now drain while VGA fetches: a VGA read can meet
+one of the walk's drains, where before the walk waited for VGA to leave
+the bus).  The drain probe counted 0 drains in VGA's / DMA's window
+without a waiter in every run.
+
+**Tests added** (`tb_l2`; the first four fail on `c9cadea`):
+`dmapost` (a dirty line in every set, WBINV, a DMA tenure of posted 16 B
+writes to lines half the cache away from the walk's set, the grant
+dropped one cycle every 8, 0 / 10 / 40 idle cycles between them: BUSY
+within `4 × SETS` requests — 1,025 / 1,024 / 217; `c9cadea` still at set 1
+after 2,048, also with the gaps), `cpupost` (the same with the D-cache's
+32 B writes, 0 / 10 apart: 823 / 551; `c9cadea` at set 2), `rtwalk` (VGA's
+request up for the whole walk, reads back to back — hits, DMA misses,
+sector-0 stream fills, DDR beats spread out —, nothing needing a slot:
+BUSY within `8 × SETS` requests with VGA still on the bus, 1,074;
+`c9cadea` stopped at set 2; a read never starts before the walk's drain,
+`wk_prio_bad`, and the case is met 120–160 times a run), `wkset` (every
+set fully dirty, a DMA master writing into the set being walked: BUSY
+within `2 × SETS × WAYS` requests, 514; without the held-off writes the
+walk stayed at set 0), `strmedge` (m-C).  `rtdrain` and `toggle` extended
+(above).  The posted writes of `dmapost` / `cpupost` go to sets away from
+the walk's: to the walk's own set they are held off until its copy, which
+hid the slot race (mutation `wk_reserve` survived a first version that
+wrote to the set the walk was in).  `wbinv`'s final check reads a line its
+traffic never touches (the 8-way sweep caught the traffic's last request,
+accepted after BUSY dropped, allocating the line it read).
+
+**Mutations** (`l2mut.py`, now 36; every directed test and 4 random seeds
+under two MIG timings).  `spec_noaddr`, `strm_any`, `acc_wrcoll`,
+`rt_need_wbm` follow the RTL's new text.  The new ones:
+
+| Mutation | What it breaks | First failing run |
+|---|---|---|
+| `wk_need_copy` | the walk waiting on a full buffer is not a waiter (m-A) | `wbinv`: 3 demand reads started before the drain the walk waited on |
+| `wk_need_end` | the walk's final drain is not a waiter (m-A) | `rtwalk`: BUSY after 4,096 requests with VGA on the bus |
+| `wk_reserve` | a posted write takes the slot the walk waits for (m-A) | `cpupost`: BUSY after 2,048 requests (walk at set 2) |
+| `wk_rd_first` | a demand read starts before the drain the walk waits on | `rtwalk`: reads started before the walk's drain (`wk_prio_bad`) |
+| `wk_set_wr` | a write to the set the walk waits in is accepted | `wkset`: BUSY after 4,096 requests (walk at set 0) |
+| `rt_need_full` | a DMA / VGA read miss counts as waiting on a full buffer (m-B) | `random` seed 2: the stream-hit assertion; with the assertion taken out, `rtdrain`'s probe (`rt_bad` = 1) |
+| `strm_edge` | a write accepted on the edge sector 1 is captured does not drop the stream buffer (m-C) | `strmedge`: the stream-hit assertion (the stale buffer answered a read of a buffered line) |
+| `strm_bypass` | the stream buffer serves VGA while the L2 is disabled | `toggle`: VGA reads in bypass used the stream buffer |
+
+**36 of 36 killed** on `13be986` (the unmutated bench: 0 of 44 runs
+fail).  `rt_need_full` can start a drain only on a stream-buffer hit (a
+demand miss starts before any drain), so `rtdrain` now also sends stream
+fills and their stream hits with the buffer full; the old, looser probe
+counted that drain as needed.
+
+**Regression** (`tools/vsim/l2_regress.sh`, on `13be986`'s RTL):
+- `tb_l2` sweep (`l2mut.py --sweep`): every directed test (now 18) and 12
+  random seeds × 3,000 transactions at 2, 4 and 8 ways under four MIG
+  timings: all 360 runs pass.
+- SoC tests at `MIGLAT=36` (incl. `socsd`, `soceth`, `socvga`), at
+  `+MIGLAT=8`, with the L2 off, with 8 ways, at `+MIGLAT=8 +MIGJIT=20
+  +MIGRDY=30` and at `+MIGLAT=60 +MIGREF=500` (`socdiff` against
+  `d7f3994`, 30 seeds and 20 with a 64 B span, `socmmio`, `socwalk`,
+  `socx`, `socdcbz`, `socl2`): all pass, every run gated (BTIC probe,
+  consistency checker, the exact drain probe — 0 bad drains).
+- `L2_EN` = 0 equivalence (`VSIM_L2=0` against `d7f3994` under the same
+  tb_soc): identical traces and PIPE_RUN cycles (69,249 = 69,249; 64 B
+  span 25,610 = 25,610).
+- Core regression (`pipeline_core` unchanged): `test` in 5 configurations,
+  `diff` with `+TRACECYC` (169,092 = 169,092), `--irq` (107,709 =),
+  `excdiff`, `mpudiff`, `tlbdiff`, `tlbpage`, `dcbzdiff` 200 seeds,
+  `dmtest`, `btfuzz` 300 seeds × 7: all pass.
+
+**Cycles** against `c9cadea` (tb_soc, `MIGLAT=36`): **identical** —
+randprog 61,698 (30 seeds; 64 B span 24,645), and `socbench --base
+c9cadea`: data96k 382,024, code96k 142,666, chase112k 199,846, each
++0.00 %.  The changes act only during walks, with the L2 disabled, and on
+alias speculation (the programs use none).
+
+**Build** (standard `build_fast -resynth`; `l2b_c9ref` rebuilt `c9cadea`
+the same day as a reference — the flow is deterministic, it reproduced
+`l2_b3` exactly):
+
+| Build | Commit | Tier 1 WNS / WHS | Tier 2 | Alt-place (`ExtraPostPlacementOpt`) | LUTs | `mem_read_write` / `l2_cache` own (in context) | FFs |
+|---|---|---|---|---|---|---|---|
+| `l2b_c9ref` | `c9cadea` | +0.040 / +0.010 | — | — | 40,779 | 12,898 / 4,430 | 26,791 |
+| `l2b_b1` | `0af3aa0` | −0.076 / +0.021 | +0.006 / +0.021 | +0.032 / +0.010 | 41,366 | 13,276 / 4,795 | 26,870 |
+| **`l2b_b2`** | **`13be986`** | −0.187 / +0.027 | −0.001 (not met) | **+0.028 / +0.038** (ExtraTimingOpt +0.008 / +0.024) | 41,018 (alt: 40,990) | 12,754 / 4,433 | 26,861 |
+
+- **`l2b_b1`** (`0af3aa0`) missed tier 1 by 0.076 on the D-cache hit →
+  the core's load extension (`r_h_tq0` → `wb_hext`, 10 levels, 74 %
+  routing; +0.218 at `c9cadea`).  In context the L2's own logic had grown
+  by 365 LUTs, much more than the new terms: synthesised with each change
+  left out, the slot reservation and the held-off writes each cost ~330
+  (`mem_read_write` 10,715 → 10,382 / 10,381; `c9cadea` 10,349).  The
+  posted write's own `wb_full_p` kept the write-buffer entry updates from
+  sharing their logic with the victim-copy paths that used `wb_full`.
+- **`13be986`** uses `wb_full_p` for all of the front end's slot
+  decisions: the two differ only while `r_wk_wb`, during a walk, when the
+  victim-copy paths are dead (nothing allocates; asserted).
+  `mem_read_write` synthesises to 10,171 LUTs (below `c9cadea`), and
+  placed, `l2_cache`'s own logic is 4,433 LUTs against `c9cadea`'s 4,430.
+- **`l2b_b2`** nonetheless missed tier 1 by 0.187, and tier 2 ended at
+  −0.001.  Every failing path is outside the L2 and unchanged since
+  `c9cadea`: the D-cache's line-fill BRAM → hit-copy BRAM write data
+  (`cache_val_data_way1` → `h_data_way1` `DIADI`, 3 levels, −0.187), the
+  hit pipe → `wb_hext` (−0.144), the TLB → `r_h_tag` / `r_h_tag1`
+  (−0.105 / −0.098), `wb_hok` → the TLB's `q_b` (−0.102),
+  `id_op` → `ex_d` (−0.042).  With the L2's area equal to `c9cadea`'s,
+  this is placement variance on the core's and the D-cache's own
+  near-zero-margin paths (they move ±0.2 ns between two placements of an
+  L2 of the same size), not something the L2's RTL can close.
+- The alt-place cross-check from `l2b_b2`'s opt checkpoint met with
+  margin: **+0.028 / +0.038** (worst: the core's `ex_lb_a` →
+  `mem_result`, 15 levels; then `bus_splitter.r_is_mmio` → `pc` CE, and
+  the hit pipe → `wb_hext` +0.067).  Nothing of the L2 within +0.19.
+- A core-side timing item (the hit pipe → `wb_hext`, the TLB → `r_h_tag`,
+  the D-cache's BRAM → BRAM fill copy) would make tier 1 robust for the
+  next features; it is outside this review.
+- Bitstreams: **`~/.cache/kbuild/l2b_13be986_epp.bit`** (md5
+  `995f412ee3187f6dfd1dd588f91b0484`, alt-place, the review's final RTL);
+  `l2b_0af3aa0.bit` (standard flow, tier 2 +0.006; md5
+  `ffa0f11add8a8a28ea53cda3864c9308`) and `l2b_0af3aa0_epp.bit` (+0.032 /
+  +0.010; md5 `69754f0ef93d45256f5c70fc822df96a`) are the same behaviour
+  with the larger L2.  Build dirs `~/.cache/kbuild/l2b_b1`, `l2b_b2`,
+  `l2b_c9ref`.  Not run on the board.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -1839,3 +2034,11 @@ Decisions taken while implementing the frozen text above:
   build starve less than the build without it): branch `l2`, `c9cadea`,
   standard flow tier 1 WNS +0.040 / WHS +0.010,
   `~/.cache/kbuild/l2_c9cadea.bit`.  Not yet run on the board.
+- 2026-11-16: §6 review 2 (posted-write streams held BUSY up: the walk
+  waiting on the buffer is a request in hand, its slot reserved, writes to
+  its set held — BUSY now bounded under any request stream; exact drain
+  probes; the stream buffer's capture edge tested; no stream buffer in
+  bypass): branch `l2b`, `13be986`; standard flow tier 1 −0.187 on core /
+  D-cache paths (placement: the L2's area equals `c9cadea`'s), alt-place
+  `ExtraPostPlacementOpt` +0.028 / +0.038,
+  `~/.cache/kbuild/l2b_13be986_epp.bit`.  Not yet run on the board.

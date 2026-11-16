@@ -684,12 +684,16 @@ module tb_l2;
             xact(1, 1, 0, L(2, 25), 0, rnd256(), 16'h0F00, 0, 0);
             repeat (5) @(negedge clk);                           // (posted after its ready)
             if (dut.wb_v != 2'b11) fail("rtdrain: buffer not full (test vacuous)");
+            h = strm_hits;
             for (int i = 0; i < 6; i++) begin
-               xact(0, 1, 1, L(3 + i, 26), 0, 0, 0, 0, 0);              // VGA misses
+               xact(0, 1, 1, L(3 + i, 26), 0, 0, 0, 0, 0);              // VGA misses (stream fills)
+               while (dut.e_st != 2'd0) @(negedge clk);
+               xact(0, 1, 1, L(3 + i, 26) + 32, 0, 0, 0, 0, 0);         // ... stream hits
                xact(0, 1, 0, L(3 + i, 27) + 16, 0, 0, 0, 0, 0);         // DMA misses
                xact(0, 1, 1, L(i % 2, 20 + i % 2), 0, 0, 0, 0, 0);      // VGA hits
             end
-            if (dut.wb_v != 2'b11) fail("rtdrain: a full buffer drained for VGA / DMA read misses");
+            if (strm_hits == h) fail("rtdrain: no stream hit with the buffer full (test vacuous)");
+            if (dut.wb_v != 2'b11) fail("rtdrain: a full buffer drained for VGA / DMA reads");
             @(negedge clk); rt_req = 0;
             ctrl(2'b11); wait_idle(); check_ddr("rtdrain");
          end
