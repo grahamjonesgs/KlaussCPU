@@ -274,7 +274,7 @@ def t_range_inv():
     # from DDR, refetched clean)
     return a, {'r4': 0, 'r13': 0, 'r7': 0, 'r8': 0x1122334455667788, 'r9': 0}, \
         [f'+DCP0={C:x}', f'+DCP1={D:x}'], {'host_err': 0, 'dcp': {0: (1, 0), 1: (1, 1)},
-                                           'walks': ['whole', 'whole', 'range', 'range', 'range']}
+                                           'walks': ['whole', 'range', 'range', 'range']}
 
 
 def t_range_queue(phase):
@@ -357,8 +357,8 @@ def t_range_combo():
     a.halt()
     plus = [f'+DCP0={A:x}', f'+DCP1={B:x}', f'+DCP2={Cx:x}', f'+DCP3={D:x}', f'+DCP4={D + 0x1000:x}']
     return a, {}, plus, {'dcp': {0: (1, 0), 1: (1, 0), 2: (0, 0), 3: (0, 0), 4: (1, 1)},
-                         # (a whole op's go is a level: its walk runs twice — not a range op's)
-                         'walks': ['whole', 'whole', 'whole', 'whole', 'whole', 'range']}
+                         # (one walk per op: before review 1 a whole op walked twice)
+                         'walks': ['whole', 'whole', 'whole', 'range']}
 
 
 def _code_dwords(base, val):
@@ -538,10 +538,129 @@ def t_inv_hit(whole=False, wait=False):
     a.setr64(6, P(K, 0))
     a.stop()
     a.halt()
-    # RANGE_INV: the load waits for the walk (the hit pipe is held off while
-    # it is pending); whole INVALIDATE: the stale line (c0bf7b2's behaviour,
-    # unchanged: poll MNT_BUSY before reading)
-    return a, {'r4': 0, 'r7': JUNK ^ P(K, 0) if whole and not wait else P(K, 0)}, [], {'host_err': 0}
+    # the load waits for the walk (the hit pipe is held off while an
+    # invalidating walk is pending: RANGE_INV and, since review 1, INVALIDATE)
+    return a, {'r4': 0, 'r7': P(K, 0)}, [], {'host_err': 0}
+
+
+def t_conv_hit(ln):
+    """(review 1, MAJOR 1) t_inv_hit with a RANGE_INV turned into a whole
+    INVALIDATE (LEN > 64 KiB): the load right after it must wait too"""
+    a = SdAsm().prologue(div=0)
+    B, K, X = 0x00424000, 1300, 0x00500000
+    a.fill(B, K, 1, xor=JUNK)
+    a.cache_op(RCLEAN, B, 512)
+    a.dma(17, K, B, 512, 1, 0); a.wait_done(); a.mov(4, 3)
+    a.wr(14, OP_ADDR, B); a.wr(14, OP_LEN, ln)
+    a.setr(3, 0); a.setr(9, 2); a.setr(10, B); a.setr(11, X); a.setr(13, 0)
+    a.label('ih')
+    a.st(64, 9, 11, 0)
+    a.st(64, 3, 14, CACHE_CTRL)
+    a.ld(64, 7, 10, 0)
+    a.setr(1, 0x1000); a.alu('add', 11, 11, 1)
+    a.setr(3, RINV); a.dec(9); a.fbr('ne', 9, 0, 'ih', imm=True)
+    a.setr64(6, P(K, 0))
+    a.stop()
+    a.halt()
+    return a, {'r4': 0, 'r7': P(K, 0)}, [], {'host_err': 0}
+
+
+def t_lost(d, first=FLUSH, second=RINV, ln=32):
+    """(review 1, MAJOR 2) a store that misses keeps the D-cache busy; d NOPs
+    later `first` (pending behind the miss), then `second` — a range op
+    converted into a whole walk (one is pending), or a whole op.  At some d
+    the second go lands in the very cycle the first's walk starts: it must
+    still get a walk of its own.  B (cached, clean) must end invalid when
+    either op invalidates; tb_soc's op accounting checks nothing is lost.
+    (The sequence runs twice, the first time with CACHE_CTRL = 0: warm code.)"""
+    a = SdAsm()
+    a.setr(15, SD); a.setr(14, CC); a.setr(12, 0)
+    B, X = 0x00424000, 0x00500000
+    a.setr(10, B); a.ld(64, 1, 10, 0)
+    a.wr(14, OP_ADDR, B); a.wr(14, OP_LEN, ln)
+    a.setr(3, first); a.setr(5, second); a.setr(11, X); a.setr(9, 0x77)
+    a.setr(13, 2); a.setr(7, 0); a.setr(8, 0); a.setr(6, ln)
+    a.label('lp')
+    a.st(64, 9, 11, 0)
+    for _ in range(d):
+        a.nop()
+    a.st(64, 7, 14, CACHE_CTRL)
+    a.st(64, 6, 14, OP_LEN)
+    a.st(64, 8, 14, CACHE_CTRL)
+    a.mnt_wait()
+    a.setr(1, 0x1000); a.alu('add', 11, 11, 1)
+    a.mov(7, 3); a.mov(8, 5)
+    a.dec(13); a.fbr('ne', 13, 0, 'lp', imm=True)
+    a.halt()
+    inv = bool((first | second) & (INVAL | RINV))
+    return a, {}, [f'+DCP0={B:x}'], {'dcp': {0: (0, 0) if inv else (1, 0)}}
+
+
+def t_b2b():
+    """(review 1) RANGE_CLEAN then RANGE_INV of one dirty line, CACHE_CTRL
+    stores back to back: both walk; the line ends invalid"""
+    a = SdAsm()
+    a.setr(15, SD); a.setr(14, CC); a.setr(12, 0)
+    B = 0x00424000
+    a.setr(10, B); a.setr(1, 5); a.st(64, 1, 10, 0)
+    a.wr(14, OP_ADDR, B); a.wr(14, OP_LEN, 32)
+    a.setr(3, RCLEAN); a.setr(5, RINV)
+    a.st(64, 3, 14, CACHE_CTRL); a.st(64, 5, 14, CACHE_CTRL)
+    a.mnt_wait()
+    a.halt()
+    return a, {}, [f'+DCP0={B:x}'], {'dcp': {0: (0, 0)}, 'walks': ['range', 'range']}
+
+
+def t_iinv_wrap(rs, ln, X=0x10000, ctrl=RIINV):
+    """(review 1) RANGE_IINV over a range that wraps the I-cache's 64 KiB
+    index (more than 64 lines: the bank mask), X (index 0) rewritten by DMA;
+    ctrl may add FLUSH / INVALIDATE (RANGE_IINV is honoured with them)"""
+    a = SdAsm().prologue(div=0)
+    S, K = 0x9000, 50
+    for i, d in enumerate(_code_dwords(X, 1)):
+        a.dword(X + 8 * i, d)
+    a.setr(6, 0); a.setr(13, 0)
+    a.label('run'); a.setr(9, 4)
+    a.label('lp'); a.call(X); a.alu('add', 6, 6, 5); a.dec(9); a.fbr('ne', 9, 0, 'lp', imm=True)
+    a.fbr('ne', 13, 0, 'after1', imm=True)
+    a.setr(10, S)
+    for i, d in enumerate(_code_dwords(X, 2)):
+        a.setr64(1, d); a.st(64, 1, 10, 8 * i)
+    a.cache_op(RCLEAN, S, 512)
+    a.dma(24, K, S, 512, 1, 1); a.wait_done(); a.mov(4, 3)
+    a.cache_op(RCLEAN, X, 512)
+    a.dma(17, K, X, 512, 1, 0); a.wait_done(); a.alu('or', 4, 4, 3)
+    a.cache_op(RINV, X, 512)
+    a.cache_op(ctrl, rs, ln)
+    a.setr(13, 1); a.jmp('run')
+    a.label('after1')
+    a.mov(7, 5)
+    a.halt()
+    return a, {'r4': 0, 'r6': 12, 'r7': 2}, [], {'host_err': 0}
+
+
+def t_two_wrap(A, N, a_kept=True):
+    """(review 1) a RANGE_CLEAN of N blocks from A, the range's second tag
+    in its sets (A = set 960: 1,536 lines wrap the index), lines just
+    outside it dirty and kept dirty; a DMA write of all of it"""
+    a = SdAsm().prologue(div=0)
+    B0 = 1000
+    a.fill(A, B0, N, xor=JUNK)
+    a.cache_op(FLUSH)
+    a.fill(A, B0, N)
+    E = A + N * 512
+    a.setr(10, A - 32); a.setr(1, 1); a.st(64, 1, 10, 0)
+    a.setr(10, E); a.st(64, 1, 10, 0)
+    a.cache_op(RCLEAN, A, N * 512, wait=False)
+    a.dma(25, B0, A, 512, N, 1)
+    a.wait_done(); a.mov(4, 3)
+    a.stop()
+    a.halt()
+    return a, {'r4': 0}, [f'+DCP0={A-32:x}', f'+DCP1={E:x}', f'+DCP2={A:x}', f'+DCP3={E-32:x}'], \
+        {'wr_bad': 0, 'host_err': 0, 'wr_blocks': N,
+         # (N = 128: 64 KiB fills both ways of every set, and the store at E,
+         # A's set, evicts A — written back, so the DMA still reads it)
+         'dcp': {0: (1, 1), 1: (1, 1), 2: (1, 0) if a_kept else (0, 0), 3: (1, 0)}}
 
 
 def t_iinv_time(ln, addr=0x10000):
@@ -659,6 +778,19 @@ def tests():
         ('inv_hit_range', *t_inv_hit()),
         ('inv_hit_whole', *t_inv_hit(whole=True)),
         ('inv_hit_wait', *t_inv_hit(wait=True)),
+        ('conv_hit_big', *t_conv_hit(0x10020)),
+        ('conv_hit_ok', *t_conv_hit(512)),
+        ('b2b', *t_b2b()),
+        ('iinv_wrap80', *t_iinv_wrap(0xF800, 0x800 + 512)),
+        ('iinv_wrap101', *t_iinv_wrap(0x10000 - 0x20 * 100, 0x20 * 101)),
+        ('iinv_wrap_end', *t_iinv_wrap(0x10000 - 0x20 * 3, 0x20 * 4)),
+        ('iinv_flush', *t_iinv_wrap(0x10000, 64, ctrl=FLUSH | RIINV)),
+        ('iinv_inval', *t_iinv_wrap(0x10000, 64, ctrl=INVAL | RIINV)),
+        ('two_wrap', *t_two_wrap(0x0034F800, 96)),
+        ('two_wrap_full', *t_two_wrap(0x0035F820, 128, a_kept=False)),
     ] + [
         (f'iinv_time_{ln}', *t_iinv_time(ln)) for ln in (32, 1024, 2048, 4096, 8192, 0xFFE0, 0x10000)
+    ] + [
+        (f'lost_{nm}_{d}', *t_lost(d, f, g)) for nm, f, g in (('fr', FLUSH, RINV), ('fi', FLUSH, INVAL), ('if', INVAL, FLUSH))
+        for d in range(0, 120)
     ]

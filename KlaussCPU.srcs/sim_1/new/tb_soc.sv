@@ -295,6 +295,34 @@ module tb_soc;
          $display("TB_SOC: RKSWEEP lines=%0d cycles=%0d", rk_n, runcyc_all - rk_t0);
       rk_q = dut.w_ic_rk_busy;
    end
+   // maintenance-op accounting (SD DMA review 1): every whole-cache go
+   // (FLUSH / INVALIDATE, or a range op turned into one) must be followed by
+   // a whole walk that STARTS after it (a walk starting in the go's own
+   // cycle froze its mode before it) and, for an invalidating go, by an
+   // INVALIDATE walk; every range go that takes the slot, by a range walk
+   // starting after it.  An op still owed at HALTED, with MNT_BUSY = 0,
+   // is lost (FATAL, gated like the consistency checker).
+   bit mo_any = 0, mo_inv = 0, mo_rng = 0;
+   int mo_lost = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.mem_read_write.w_whole_start) begin
+         mo_any = 0;
+         if (dut.mem_read_write.r_mnt_mode) mo_inv = 0;
+      end
+      if (dut.mem_read_write.w_rng_start) mo_rng = 0;
+      if (dut.mem_read_write.w_wgo) begin
+         // (a pending range op absorbed here is owed by the whole walk now:
+         // w_wgo_inv includes its invalidate)
+         if (dut.mem_read_write.w_rng_pq) mo_rng = 0;
+         mo_any = 1;
+         if (dut.mem_read_write.w_wgo_inv) mo_inv = 1;
+      end
+      if (dut.mem_read_write.i_rng_go && !dut.mem_read_write.w_rng_cvt) mo_rng = 1;
+   end
+   task automatic mo_check();
+      if (!dut.w_cache_mnt_busy && (mo_any || mo_inv || mo_rng))
+         $display("TB_SOC: FATAL consistency: a maintenance op was lost (whole %0d, invalidate %0d, range %0d)", mo_any, mo_inv, mo_rng);
+   endtask
    // +DCP<k>=<hex PA> (k = 0..7): the D-cache's state of that line at HALTED
    task automatic dcp_dump();
       for (int k = 0; k < 8; k++) begin
@@ -310,6 +338,7 @@ module tb_soc;
    endtask
 `else
    task automatic dcp_dump(); endtask
+   task automatic mo_check(); endtask
 `endif
 
    // ---------------- L2 drains in VGA's / DMA's window (review 1 M2) --------
@@ -414,6 +443,7 @@ module tb_soc;
 `ifdef L2_PROBE
          $display("TB_SOC: L2 rt drains bad=%0d need=%0d", rt_bad, rt_need);
 `endif
+         mo_check();
          dcp_dump();
          // the final registers (runs without a retire trace)
          begin

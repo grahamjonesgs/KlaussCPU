@@ -2983,12 +2983,12 @@ module pipeline_core
    // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
    wire        icinv_f    = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
                             mem_be[0] && mem_wdata[3];
-   // RANGE_IINV (CACHE_CTRL[6], RIINV_EN; ignored with FLUSH / INVALIDATE —
-   // the whole-cache op wins — or LEN = 0; with ICACHE_INV the fence covers
-   // it).  Everything ICACHE_INV does but the valid bits: of those only the
+   // RANGE_IINV (CACHE_CTRL[6], RIINV_EN; honoured with FLUSH /
+   // INVALIDATE, as ICACHE_INV is — SD DMA review 1; ignored with LEN = 0;
+   // with ICACHE_INV the fence covers it).  Everything ICACHE_INV does but the valid bits: of those only the
    // range's (g_vl's range sweep; 16 B lines: all of them).
    wire        icinv_r    = RIINV_EN && mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
-                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && !mem_wdata[2] && !mem_wdata[1] &&
+                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] &&
                             cop_n != 28'd0;
    wire        icinv      = icinv_f || icinv_r;
 

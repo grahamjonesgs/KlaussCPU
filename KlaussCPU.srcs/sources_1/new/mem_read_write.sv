@@ -335,7 +335,6 @@ module mem_read_write #(
     logic r_mnt_pending   = 1'b0;
     logic r_mnt_mode      = 1'b0;
     logic r_mnt_active    = 1'b0;   // set by the main FSM while a walk runs
-    logic r_mnt_active_d  = 1'b0;   // for the consume edge below
     logic r_mnt_walk_mode = 1'b0;   // mode of the RUNNING walk (owned by the FSM)
     logic r_mnt_rng       = 1'b0;   // the RUNNING walk is a range walk (owned by the FSM)
 
@@ -350,8 +349,13 @@ module mem_read_write #(
     //     INVALIDATE if either invalidates), or while another range op is
     //     pending (both become one whole-cache walk);
     //   - a whole-cache request while a range op is pending (it absorbs it).
-    // A whole-cache request keeps its existing capture exactly (a level for
-    // the store's whole strobe; cleared when its walk starts).
+    // Every go is a one-cycle pulse (the CACHE_CTRL write's first cycle; a
+    // level for the store's whole strobe re-armed the request after its walk
+    // had started, so every whole-cache op walked twice — review 1).
+    // r_mnt_pending clears on the FSM's own start condition, in the start
+    // cycle, unless a go arrives in that same cycle: the walk starting then
+    // froze the mode before it, so that go needs a walk of its own (review 1
+    // MAJOR 2: it was cleared a cycle later, and the op lost).
     localparam int RNG_MAX = 2 * CACHE_SIZE;
     logic        r_rng_pend = 1'b0;
     logic        r_rng_inv  = 1'b0;
@@ -365,18 +369,17 @@ module mem_read_write #(
 
     assign o_mnt_busy = r_mnt_active | r_mnt_pending | r_rng_pend;
 
+    wire         w_whole_start;     // the FSM starts the pending whole walk on this edge
     always_ff @(posedge i_Clk) begin
-        r_mnt_active_d <= r_mnt_active;
         if (w_wgo) begin
             r_mnt_pending <= 1'b1;
             // INVALIDATE wins over FLUSH; a still-pending INVALIDATE is never
             // downgraded by a later FLUSH pulse (the walk does the superset).
+            // (A go in the start cycle merges with the starting walk's mode
+            // into the next walk: a superset.)
             r_mnt_mode    <= w_wgo_inv | (r_mnt_pending & r_mnt_mode);
-        end else if (r_mnt_active && !r_mnt_active_d && !r_mnt_rng) begin
-            // The walk that just started (WAIT -> MAINT edge) owns this
-            // request; clear ONLY here so a pulse arriving mid-walk re-arms
-            // pending and schedules a fresh walk after the current one.
-            // (Not at a range walk's start: a whole request then is new.)
+        end else if (w_whole_start) begin
+            // the walk starting on this edge owns the request
             r_mnt_pending <= 1'b0;
         end
         // the range slot
@@ -800,12 +803,13 @@ module mem_read_write #(
         r_h_tag1 <= w_h_a1[31:5+INDEX_BITS];
         r_h_c1   <= i_h_c1;
         r_h_off  <= i_h_addr[4:3];
-        // (and while a RANGE_INV waits to start — the cache still busy with
-        // an earlier miss: a load must not hit a line it is about to drop,
-        // so RANGE_INV is synchronous for loads as for the port.  A pending
-        // whole-cache INVALIDATE is not covered: unchanged from c0bf7b2.)
+        // (and while an invalidating walk waits to start — RANGE_INV, or a
+        // whole INVALIDATE, a range op converted into one included — the
+        // cache still busy with an earlier miss: a load must not hit a line
+        // it is about to drop, so the invalidates are synchronous for loads
+        // as for the port; review 1 MAJOR 1)
         r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx) ||
-                    (r_rng_pend && r_rng_inv);
+                    (r_rng_pend && r_rng_inv) || (r_mnt_pending && r_mnt_mode);
     end
     // (both candidates compared in parallel; the carry selects the result)
     wire w_h_hit0 = r_h_tq0[TAG_BITS] && (r_h_c1 ? (r_h_tq0[TAG_BITS-1:0] == r_h_tag1)
@@ -1380,6 +1384,7 @@ module mem_read_write #(
     // DDR (see the EVICT_SHADOW comment in the FSM).
     // the FSM takes the pending range op on this edge (WAIT, no whole walk first)
     assign w_rng_start = (state == WAIT) && !r_mnt_pending && r_rng_pend;
+    assign w_whole_start = (state == WAIT) && r_mnt_pending;
 
     wire is_miss_path = (state == WRITE_FETCH)      ||
                         (state == READ_WAIT)        ||

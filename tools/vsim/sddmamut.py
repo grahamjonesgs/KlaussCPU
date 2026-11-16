@@ -98,8 +98,23 @@ MUTS = [
      "(w_mmio_write_data[5:4] != 2'b00) &&\n                                 !w_mmio_write_data[1] && !w_mmio_write_data[2] &&",
      "(w_mmio_write_data[5:4] != 2'b00) &&"),
     ('hit_pend', 'a load hits a line a pending RANGE_INV is about to drop (the hit pipe not held off)', MR, ['inv_hit_range'],
-     "r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx) ||\n                    (r_rng_pend && r_rng_inv);",
-     "r_h_conf <= (state == MAINT) || (state != WAIT && r_cache_index == w_h_idx);"),
+     "                    (r_rng_pend && r_rng_inv) || (r_mnt_pending && r_mnt_mode);",
+     "                    (r_mnt_pending && r_mnt_mode);"),
+    ('hit_pend_whole', 'review 1 MAJOR 1: a load hits a line a pending whole INVALIDATE (or a converted RANGE_INV) is about to drop', MR, ['conv_hit_big', 'inv_hit_whole'],
+     "                    (r_rng_pend && r_rng_inv) || (r_mnt_pending && r_mnt_mode);",
+     "                    (r_rng_pend && r_rng_inv);"),
+    ('lost_start', "review 1 MAJOR 2: a go in the cycle a pending whole walk starts is cleared with it", MR, ['lost_*_3[0-9]', 'lost_*_2[0-9]'],
+     "        end else if (w_whole_start) begin\n            // the walk starting on this edge owns the request\n            r_mnt_pending <= 1'b0;\n        end",
+     "        end\n        if (w_whole_start) r_mnt_pending <= 1'b0;"),
+    ('whole_level', "the whole-cache go is a level again (every whole op walks twice)", TOP, ['range_inv', 'range_combo'],
+     "   wire        w_cache_flush_go = w_cc_wr1 && w_mmio_write_data[1];",
+     "   wire        w_cache_flush_go = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h005) && (w_mmio_addr[15:0] == 16'h0000) && w_mmio_write_data[1];"),
+    # (not here: w_dma_seterr masked by w_dm_abort, review 1 nit — it
+    # matters only when DMA_EN = 0 lands in the single M_CHK cycle of a
+    # block that would leave DDR; fixed by inspection)
+    ('iinv_with_whole', "RANGE_IINV is ignored with FLUSH / INVALIDATE (review 1 nit: it is honoured)", PC, ['iinv_flush', 'iinv_inval'],
+     "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] &&",
+     "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && !mem_wdata[2] && !mem_wdata[1] &&"),
     # ---------------- RANGE_IINV (tb_soc) ----------------
     ('iinv_nomask', 'the range sweep clears nothing', PC, ['iinv', 'iinv_wide'],
      "         wire we = swst ? (!r_sw_rng || r_sw_mask[b])", "         wire we = swst ? (!r_sw_rng)"),

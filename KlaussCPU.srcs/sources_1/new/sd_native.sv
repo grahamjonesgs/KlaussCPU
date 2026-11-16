@@ -1004,7 +1004,7 @@ module sd_native #(
     assign w_dm_wend = w_m_idle && r_dm_wr && (!r_dm_on || !w_d_active);
     // the strobes into the register / FIFO block above
     assign w_dma_ddone  = w_dm_rend;                                  // (DATA_DONE if r_dd_pend)
-    assign w_dma_seterr = (r_m_st == M_CHK) && r_dm_on && !w_blk_ok && !w_dm_kill;
+    assign w_dma_seterr = (r_m_st == M_CHK) && r_dm_on && !w_blk_ok && !w_dm_kill && !w_dm_abort;
     assign w_dma_pop   = (r_m_st == M_GATH) && r_head_v && !w_dm_kill;
     assign w_dma_push  = (r_m_st == M_PUSH) && !w_dm_kill;
     assign w_dma_pword = (r_x_lane ^ r_x_k[0]) ? r_a_rdata[63:0] : r_a_rdata[127:64];
