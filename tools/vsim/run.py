@@ -88,6 +88,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_RDATA_DRAM')
     if 'input  logic [63:0]  h_dword' in core:
         defs.append('+define+HAS_DCH')
+    if 'm_rdata_next_dram' in core:
+        defs.append('+define+HAS_TMG')
     if 'ras_miss' in core:
         defs.append('+define+HAS_RAS')
     if 'st_post_ok' in core:

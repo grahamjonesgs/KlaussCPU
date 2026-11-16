@@ -109,6 +109,9 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 `ifdef HAS_DCH
       .h_addr(h_addr), .h_ok(h_ok), .h_dword(h_dword),   // +HIT=<pct> models hits (default: none)
 `endif
+`ifdef HAS_TMG
+      .h_dw0(h_dword), .h_dw1(h_dword), .h_sel0(1'b1), .m_rdata_next_dram(m_rdata_next),
+`endif
       .m_rdata_next, .m_next_valid, .m_ready,
 `ifdef HAS_ICLB
       .m_line, .m_line_v,

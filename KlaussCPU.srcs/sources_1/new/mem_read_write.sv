@@ -168,6 +168,10 @@ module mem_read_write #(
     input             i_h_c1,
     output            o_h_ok,
     output     [63:0] o_h_dword,
+    // (tmg timing) each way's dword at the offset, and the way select
+    output     [63:0] o_h_dw0,
+    output     [63:0] o_h_dw1,
+    output            o_h_sel0,
 
     // HW_PERF_PLAN.md §5: the whole 32 B line of every CPU read this cache
     // answers, for the core's 32 B I-cache lines (one cycle, o_cpu_line_v):
@@ -611,6 +615,70 @@ module mem_read_write #(
     end
 
     // -------------------------------------------------------------------------
+    // Data array writes (tmg timing): byte write enables, from registers.
+    // A write hit used to read-modify-write the whole line in CHECK — the
+    // hit way's line (r_data_wayN, the BRAM's unregistered output) merged
+    // with the store's dword and written back to both arrays: BRAM -> merge
+    // -> BRAM, the build's worst path (cache_val_data -> h_data DIADI).  It
+    // now writes only the store's bytes, from r_write_data (registered in
+    // WAIT), with the hit decided on the write enables; the other bytes of
+    // the line keep their contents, which is exactly the old merge (the
+    // FSM writes nothing between the WAIT read and CHECK).  A DCBZ hit
+    // writes all 32 bytes with zeros.  The installs (WRITE_FETCH's merged
+    // fetch line, READ_WAIT's line) write every byte of the victim way.
+    // Every array write is still at r_cache_index, on the same edges, so
+    // the hit pipe's conflict flag (r_h_conf) is unchanged.  (Both ways
+    // hitting — never, the tags of a set are distinct — would now leave
+    // each way its own other bytes, where the merge copied way 0's.)
+    // -------------------------------------------------------------------------
+    logic [255:0] w_wf_line;   // WRITE_FETCH's install: the fetched line, the store merged in
+    always_comb begin
+        logic [63:0] old_dw, new_dw;
+        // fetched 256 b line: dw0[255:192] dw1[191:128] dw2[127:64] dw3[63:0]
+        case (r_dw_offset)
+            2'b00:   old_dw = i_ddr_mem_read_data[255:192];
+            2'b01:   old_dw = i_ddr_mem_read_data[191:128];
+            2'b10:   old_dw = i_ddr_mem_read_data[127:64];
+            default: old_dw = i_ddr_mem_read_data[63:0];
+        endcase
+        for (int b = 0; b < 8; b++)
+            new_dw[8*b +: 8] = r_byte_en[b] ? r_write_data[8*b +: 8] : old_dw[8*b +: 8];
+        w_wf_line = i_ddr_mem_read_data;
+        case (r_dw_offset)
+            2'b00:   w_wf_line[255:192] = new_dw;
+            2'b01:   w_wf_line[191:128] = new_dw;
+            2'b10:   w_wf_line[127:64]  = new_dw;
+            default: w_wf_line[63:0]    = new_dw;
+        endcase
+        if (r_zero_line) w_wf_line = '0;   // DCBZ miss: a zero line, no fetch
+    end
+    // the install edges (one write per array, the victim way)
+    wire         w_dfill   = (state == WRITE_FETCH && w_wf_fill) ||
+                             (state == READ_WAIT   && w_cache_ddr_ready);
+    // a write hit's bytes: dword r_dw_offset (dw k at bytes 31-8k .. 24-8k)
+    wire [31:0]  w_hit_be  = r_zero_line ? 32'hFFFF_FFFF
+                                         : (32'(r_byte_en) << {~r_dw_offset, 3'b000});
+    wire [255:0] w_dwdata  = (state == CHECK)       ? (r_zero_line ? 256'b0 : {4{r_write_data}})
+                           : (state == WRITE_FETCH) ? w_wf_line
+                           :                          i_ddr_mem_read_data;
+    wire [31:0]  w_dwe0    = (w_write_hit_now && r_hit_way0) ? w_hit_be
+                                                             : {32{w_dfill && r_evict_way == 1'b0}};
+    wire [31:0]  w_dwe1    = (w_write_hit_now && r_hit_way1) ? w_hit_be
+                                                             : {32{w_dfill && r_evict_way == 1'b1}};
+    always_ff @(posedge i_Clk)
+        for (int b = 0; b < 32; b++)
+            if (w_dwe0[b]) cache_val_data_way0[r_cache_index][8*b +: 8] <= w_dwdata[8*b +: 8];
+    always_ff @(posedge i_Clk)
+        for (int b = 0; b < 32; b++)
+            if (w_dwe0[b]) h_data_way0[r_cache_index][8*b +: 8] <= w_dwdata[8*b +: 8];
+    always_ff @(posedge i_Clk)
+        for (int b = 0; b < 32; b++)
+            if (w_dwe1[b]) cache_val_data_way1[r_cache_index][8*b +: 8] <= w_dwdata[8*b +: 8];
+    always_ff @(posedge i_Clk)
+        for (int b = 0; b < 32; b++)
+            if (w_dwe1[b]) h_data_way1[r_cache_index][8*b +: 8] <= w_dwdata[8*b +: 8];
+
+    // -------------------------------------------------------------------------
     // 1a stage 3 load-hit pipe.  H1 (this edge): read both shadow ways at
     // i_h_addr.  H2 (next cycle, comb): compare, select, qualify.  Every array
     // write is at r_cache_index in a non-WAIT state, so a read in the same
@@ -662,18 +730,23 @@ module mem_read_write #(
     always_ff @(posedge i_Clk) if (hc_on && r_h_conf && (w_h_hit0 || w_h_hit1) && state != MAINT) hc_conf++;
     final if (hc_on) $display("HCOV cache conflict_hits=%0d", hc_conf);
 `endif
-    wire [255:0] w_h_line = w_h_hit0 ? r_h_dq0 : r_h_dq1;
-    assign o_h_dword = (r_h_off == 2'b00) ? w_h_line[255:192]
-                     : (r_h_off == 2'b01) ? w_h_line[191:128]
-                     : (r_h_off == 2'b10) ? w_h_line[127:64]
-                     :                      w_h_line[63:0];
+    // (tmg timing) each way's dword first, then the way: the core extracts
+    // a load's value from both ways' dwords in parallel with the tag
+    // compare, and w_h_hit0 picks at its register (o_h_dw0 / o_h_dw1 /
+    // o_h_sel0); o_h_dword = o_h_sel0 ? o_h_dw0 : o_h_dw1, as before
+    function automatic logic [63:0] f_hdw(logic [255:0] l, logic [1:0] off);
+        return (off == 2'b00) ? l[255:192] : (off == 2'b01) ? l[191:128]
+             : (off == 2'b10) ? l[127:64]  :                  l[63:0];
+    endfunction
+    assign o_h_dw0   = f_hdw(r_h_dq0, r_h_off);
+    assign o_h_dw1   = f_hdw(r_h_dq1, r_h_off);
+    assign o_h_sel0  = w_h_hit0;
+    assign o_h_dword = w_h_hit0 ? o_h_dw0 : o_h_dw1;
 
     // -------------------------------------------------------------------------
     // Main FSM
     // -------------------------------------------------------------------------
     always_ff @(posedge i_Clk) begin : fsm
-
-        logic [255:0] merged; // procedural variable for cache line merge
 
         // Served-DV guard clear — runs in every state (see the declaration
         // comment). The case arms' set-assignments below override when a ready
@@ -758,51 +831,11 @@ module mem_read_write #(
                 if (r_is_write) begin
 
                     if (r_cache_hit) begin
-                        // Write hit — byte-merge into the hit way's line and
-                        // write the BRAM now.  Dirty bit set via the
+                        // Write hit — the hit way's data arrays take the
+                        // store's bytes (or, DCBZ, the whole line of zeros)
+                        // through their byte write enables (w_dwe0 / w_dwe1,
+                        // below the FSM).  Dirty bit set via the
                         // combinatorial dirty0/1_wen wires (w_write_hit_now).
-                        begin : write_hit_merge
-                            logic [255:0] hitline;
-                            logic [63:0]  old_dw;
-                            logic [63:0]  new_dw;
-                            hitline = r_hit_way0 ? r_data_way0 : r_data_way1;
-                            // Extract old doubleword at r_dw_offset
-                            // (00=dw0 [255:192], 01=dw1 [191:128], 10=dw2 [127:64], 11=dw3 [63:0])
-                            case (r_dw_offset)
-                                2'b00:   old_dw = hitline[255:192];
-                                2'b01:   old_dw = hitline[191:128];
-                                2'b10:   old_dw = hitline[127:64];
-                                default: old_dw = hitline[63:0];
-                            endcase
-                            // Apply byte enables: r_byte_en[0]=LSByte bits[7:0], r_byte_en[7]=MSByte bits[63:56]
-                            new_dw[63:56] = r_byte_en[7] ? r_write_data[63:56] : old_dw[63:56];
-                            new_dw[55:48] = r_byte_en[6] ? r_write_data[55:48] : old_dw[55:48];
-                            new_dw[47:40] = r_byte_en[5] ? r_write_data[47:40] : old_dw[47:40];
-                            new_dw[39:32] = r_byte_en[4] ? r_write_data[39:32] : old_dw[39:32];
-                            new_dw[31:24] = r_byte_en[3] ? r_write_data[31:24] : old_dw[31:24];
-                            new_dw[23:16] = r_byte_en[2] ? r_write_data[23:16] : old_dw[23:16];
-                            new_dw[15:8]  = r_byte_en[1] ? r_write_data[15:8]  : old_dw[15:8];
-                            new_dw[7:0]   = r_byte_en[0] ? r_write_data[7:0]   : old_dw[7:0];
-                            // Merge the new doubleword back into its slot; other dwords unchanged.
-                            merged = hitline;
-                            case (r_dw_offset)
-                                2'b00:   merged[255:192] = new_dw;
-                                2'b01:   merged[191:128] = new_dw;
-                                2'b10:   merged[127:64]  = new_dw;
-                                default: merged[63:0]    = new_dw;
-                            endcase
-                            if (r_zero_line) merged = '0;   // DCBZ hit: the whole line
-                        end
-
-                        // Separate write-enable per way — one write per array per cycle, BRAM-friendly.
-                        if (r_hit_way0) begin
-                            cache_val_data_way0[r_cache_index] <= merged;
-                            h_data_way0[r_cache_index]         <= merged;
-                        end
-                        if (r_hit_way1) begin
-                            cache_val_data_way1[r_cache_index] <= merged;
-                            h_data_way1[r_cache_index]         <= merged;
-                        end
                         cache_lru[r_cache_index] <= r_hit_way0 ? 1'b1 : 1'b0;
 
                         // Already acked at the WAIT latch (write-ack-at-latch).
@@ -889,46 +922,17 @@ module mem_read_write #(
                 if (w_wf_fill) begin
                     o_ddr_mem_read_DV <= 0;
 
-                    begin : write_fetch_merge
-                        logic [63:0] old_dw;
-                        logic [63:0] new_dw;
-                        // fetched 256 b line: dw0[255:192] dw1[191:128] dw2[127:64] dw3[63:0]
-                        case (r_dw_offset)
-                            2'b00:   old_dw = i_ddr_mem_read_data[255:192];
-                            2'b01:   old_dw = i_ddr_mem_read_data[191:128];
-                            2'b10:   old_dw = i_ddr_mem_read_data[127:64];
-                            default: old_dw = i_ddr_mem_read_data[63:0];
-                        endcase
-                        new_dw[63:56] = r_byte_en[7] ? r_write_data[63:56] : old_dw[63:56];
-                        new_dw[55:48] = r_byte_en[6] ? r_write_data[55:48] : old_dw[55:48];
-                        new_dw[47:40] = r_byte_en[5] ? r_write_data[47:40] : old_dw[47:40];
-                        new_dw[39:32] = r_byte_en[4] ? r_write_data[39:32] : old_dw[39:32];
-                        new_dw[31:24] = r_byte_en[3] ? r_write_data[31:24] : old_dw[31:24];
-                        new_dw[23:16] = r_byte_en[2] ? r_write_data[23:16] : old_dw[23:16];
-                        new_dw[15:8]  = r_byte_en[1] ? r_write_data[15:8]  : old_dw[15:8];
-                        new_dw[7:0]   = r_byte_en[0] ? r_write_data[7:0]   : old_dw[7:0];
-                        merged = i_ddr_mem_read_data;
-                        case (r_dw_offset)
-                            2'b00:   merged[255:192] = new_dw;
-                            2'b01:   merged[191:128] = new_dw;
-                            2'b10:   merged[127:64]  = new_dw;
-                            default: merged[63:0]    = new_dw;
-                        endcase
-                        if (r_zero_line) merged = '0;   // DCBZ miss: a zero line, no fetch
-                    end
+                    // (the merged line goes into the data arrays through
+                    // w_dwdata / w_dwe0 / w_dwe1, below the FSM)
 
                     // Install merged line in cache as DIRTY (write-back policy on miss).
                     // Dirty bit set via dirty0/1_din combinatorial wires above.
                     if (r_evict_way == 1'b0) begin
-                        cache_val_data_way0[r_cache_index] <= merged;
                         cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
-                        h_data_way0[r_cache_index]         <= merged;
                         h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     if (r_evict_way == 1'b1) begin
-                        cache_val_data_way1[r_cache_index] <= merged;
                         cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
-                        h_data_way1[r_cache_index]         <= merged;
                         h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;
@@ -993,16 +997,14 @@ module mem_read_write #(
                     o_cpu_line_v      <= 1'b1;
 
                     // Dirty bit cleared via dirty0/1_wen combinatorial wires above.
+                    // (the line goes into the data arrays through w_dwe0 /
+                    // w_dwe1, below the FSM)
                     if (r_evict_way == 1'b0) begin
-                        cache_val_data_way0[r_cache_index] <= i_ddr_mem_read_data;
                         cache_val_addr_way0[r_cache_index] <= {1'b1, r_cache_tag};
-                        h_data_way0[r_cache_index]         <= i_ddr_mem_read_data;
                         h_tag_way0[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     if (r_evict_way == 1'b1) begin
-                        cache_val_data_way1[r_cache_index] <= i_ddr_mem_read_data;
                         cache_val_addr_way1[r_cache_index] <= {1'b1, r_cache_tag};
-                        h_data_way1[r_cache_index]         <= i_ddr_mem_read_data;
                         h_tag_way1[r_cache_index]          <= {1'b1, r_cache_tag};
                     end
                     cache_lru[r_cache_index] <= (r_evict_way == 1'b0) ? 1'b1 : 1'b0;

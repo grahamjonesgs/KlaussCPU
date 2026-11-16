@@ -713,6 +713,8 @@ module KlaussCPU #(
    wire         w_h_c1;
    wire         w_h_ok;
    wire [63:0]  w_h_dword;
+   wire [63:0]  w_h_dw0, w_h_dw1;   // (tmg timing) each way's dword, the way select
+   wire         w_h_sel0;
    wire         pip_perf_id_empty;
    wire         pip_perf_br, pip_perf_br_taken, pip_perf_fbr_taken;
    wire [1:0]   pip_perf_ic;
@@ -759,12 +761,16 @@ module KlaussCPU #(
       .m_if       (pip_m_if),
       .m_rdata    (w_mem_read_data),
       .m_rdata_dram (dram_mem.read_data),
+      .m_rdata_next_dram (dram_mem.read_data_next),
       .h_addr     (w_h_addr),
       .h_pg0      (w_h_pg0),
       .h_pg1      (w_h_pg1),
       .h_c1       (w_h_c1),
       .h_ok       (w_h_ok),
       .h_dword    (w_h_dword),
+      .h_dw0      (w_h_dw0),
+      .h_dw1      (w_h_dw1),
+      .h_sel0     (w_h_sel0),
       .m_rdata_next (w_mem_read_data_next),
       .m_next_valid (w_mem_next_valid),
       .m_ready    (w_pip_ready),
@@ -1492,6 +1498,9 @@ module KlaussCPU #(
        .i_h_c1(w_h_c1),
        .o_h_ok(w_h_ok),
        .o_h_dword(w_h_dword),
+       .o_h_dw0(w_h_dw0),
+       .o_h_dw1(w_h_dw1),
+       .o_h_sel0(w_h_sel0),
        .o_cpu_line(w_cpu_line),
        .o_cpu_line_v(w_cpu_line_v),
        .i_l2_ctrl_wr(w_l2_ctrl_wr),

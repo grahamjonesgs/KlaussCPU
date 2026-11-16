@@ -148,9 +148,13 @@ module core2_subsys
       .m_zl       (),            // (DCBZ_EN = 0: always 0)
       .m_rdata    (m2_rdata),
       .m_rdata_dram (m2_rdata),
+      .m_rdata_next_dram (m2_rdata_next),
       .h_addr     (),            // no hit pipe on core 2: the slow path
       .h_ok       (1'b0),
       .h_dword    (64'b0),
+      .h_dw0      (64'b0),
+      .h_dw1      (64'b0),
+      .h_sel0     (1'b0),
       .m_rdata_next (m2_rdata_next),
       .m_next_valid (m2_next_valid),
       .m_line     ('0),             // (16 B I-cache lines: unused)

@@ -113,6 +113,10 @@ module pipeline_core
    // the bus_splitter response select) — a fast load is always DRAM, so its
    // value skips the address decode / select (timing); = m_rdata elsewhere
    input  logic [63:0]  m_rdata_dram,
+   // (tmg timing) the DRAM side's next dword (= m_rdata_next for a DRAM
+   // read): a RET / LEAVERET's return address compare skips the splitter's
+   // response select (see ret_ne)
+   input  logic [63:0]  m_rdata_next_dram,
    // 1a stage 3 load-hit pipe (mem_read_write): the EX op's load address goes
    // out every cycle; the cache answers the cycle after with the doubleword
    // and whether it is a clean hit (STAGE3_DCACHE_PLAN.md)
@@ -123,6 +127,11 @@ module pipeline_core
    output logic         h_c1,
    input  logic         h_ok,
    input  logic [63:0]  h_dword,
+   // (tmg timing) each way's dword at h_addr's offset and the way select
+   // (h_dword = h_sel0 ? h_dw0 : h_dw1): the load-bypass value wb_hext is
+   // extracted from both in parallel with the cache's tag compare
+   input  logic [63:0]  h_dw0, h_dw1,
+   input  logic         h_sel0,
    input  logic         m_next_valid,
    input  logic         m_ready,
    // HW_PERF_PLAN.md §5 (IC_LB = 32): the cache's whole 32 B line for each
@@ -1470,8 +1479,38 @@ module pipeline_core
    // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
    logic id_fx, id_fxc, id_mfsr, id_fx2, id_fxg, id_fxm, id_fxl;
    logic [63:0] id_srv;           // mmu_sr's read port, at id_op[15:12]
+   // (tmg timing) the ID op's legality and privilege, decoded from w_op at
+   // the IF->ID latch (f_decode_raw(id_op).legal and f_priv of its raw
+   // decode — both already computed there, for id_ser / w_xser): the ILLEGAL
+   // / PRIVILEGED override of every ex_d field no longer waits on the
+   // legality cone of id_op (id_op -> ex_d.uop / the field clears)
+   logic id_legal, id_privop;
+   // = f_decode(op, um, ...) with d.legal = lg and f_priv(d, op) = pv
+   function automatic dec_t f_decode_q(logic [31:0] op, logic lg, logic pv, logic um, logic fx,
+                                       logic fxc, logic fx2, logic fxg, logic fxm, logic fxl);
+      dec_t d;
+      d = f_decode_raw(op);
+      d.legal = lg;
+      if (!lg) begin
+         d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
+         d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0; d.zl = 1'b0;
+         d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
+      end else if (EN_EXC && um && pv) begin
+         d = f_mkx(d, X_PRIV);
+      end
+      if (EN_EXC && fx) begin
+         d = f_mkx(d, fxc ? X_MISAL_FE : (EN_TLB && fxm) ? X_TLB_FE : X_ACC_FE);
+         d.fx2 = fx2 && !fxc;  d.fxg = fxg && !fxc;  d.fxl = EN_TLB && fxl && !fxc;
+      end
+      return d;
+   endfunction
    dec_t dec;
-   assign dec = f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl);
+   assign dec = f_decode_q(id_op, id_legal, id_privop, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && id_valid)
+      assert (dec == f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl))
+         else $fatal(1, "f_decode_q != f_decode (id_op %h)", id_op);
+`endif
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
@@ -2689,9 +2728,20 @@ module pipeline_core
    wire ret_ne_fb    = mem_fwb[31:0]   != mem_pred_tgt;
    wire ret_ne_fc    = mem_fwc[31:0]   != mem_pred_tgt;
    wire ret_ne_h     = mem_fq ? (mem_fsel ? ret_ne_fa : mem_fselc ? ret_ne_fc : ret_ne_fb) : ret_ne_hr;
+   // (tmg timing: the port's return address is compared from the DRAM
+   // side's data, m_rdata_dram / m_rdata_next_dram — the cache's registers,
+   // without the splitter's response select (bus_splitter r_is_mmio ->
+   // read data -> compare -> ras_miss -> pc was a near-critical family).
+   // A return address popped from MMIO (the port address m_addr in
+   // 0xF...: the splitter's select, registered, when the data is used)
+   // always counts as mispredicted: the redirect goes to ret_actual, the
+   // real value, so it is correct, a squash only when the prediction was
+   // right — no program keeps its stack in MMIO.)
+   wire ret_port_io  = m_addr[31:28] == 4'hF;
    wire ret_ne       = mem_ret_h ? ret_ne_h
-                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata[31:0] != mem_pred_tgt)
-                     : (m_rdata_next[31:0] != mem_pred_tgt);
+                     : ret_port_io ? 1'b1
+                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata_dram[31:0] != mem_pred_tgt)
+                     : (m_rdata_next_dram[31:0] != mem_pred_tgt);
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && ret_ne;
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
@@ -3158,13 +3208,22 @@ module pipeline_core
          default: return dw;
       endcase
    endfunction
+   // (tmg timing) the MEM -> WB edge's load-bypass value, wb_hext: f_ldext
+   // of each way's hit dword and of the captured / forwarded dword, in
+   // parallel (the selects are at the register, see MEM -> WB)
+   wire [63:0] wb_hext_0 = f_ldext(h_dw0,   mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
+   wire [63:0] wb_hext_1 = f_ldext(h_dw1,   mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
+   wire [63:0] wb_hext_m = f_ldext(mem_hdw, mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
    // (stage 3: a hit-pipe hit's doubleword, else the port response)
-   logic [63:0] wb_ldval;
+   logic [63:0] wb_ldval, wb_ldval_p;
    // (EN_MUL2: a MUL in WB taking its product from the DSP joins here, the
    // first select of the load-forward path, as a full-dword "load" — no
    // extra mux level at the end of the forward cone)
-   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2
-                        : (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
+   // (tmg timing: a hit's value is wb_hext — f_ldext of wb_hdw with the
+   // same fields, registered on the same edge — so the hit select, wb_h &&
+   // wb_hok, is the LAST mux of the forward value instead of the first
+   // ahead of the extraction: = the old f_ldext(wb_hit ? wb_hdw : port))
+   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2 : m_rdata_dram;
    always_comb begin
       logic [7:0]  b8;
       logic [15:0] h16;
@@ -3172,14 +3231,25 @@ module pipeline_core
       b8  = wb_lddw[(wb_ld_ea * 8) +: 8];
       h16 = wb_lddw[(wb_ld_ea[2:1] * 16) +: 16];
       w32 = wb_ld_ea[2] ? wb_lddw[63:32] : wb_lddw[31:0];
-      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval = wb_lddw;
+      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval_p = wb_lddw;
       else case (wb_ld_msz)
-         2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
-         2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
-         2'd2:    wb_ldval = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-         default: wb_ldval = wb_lddw;
+         2'd0:    wb_ldval_p = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
+         2'd1:    wb_ldval_p = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
+         2'd2:    wb_ldval_p = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
+         default: wb_ldval_p = wb_lddw;
       endcase
+      wb_ldval = (EN_DC_H && wb_h && wb_hok && !(EN_MUL2 && wb_mdir)) ? wb_hext : wb_ldval_p;
    end
+`ifndef SYNTHESIS
+   // the hit's value is wb_hdw's extraction (the old form)
+   always_ff @(posedge clk) if (!rst && EN_DC_H && wb_valid && wb_h && wb_hok && !(EN_MUL2 && wb_mdir))
+      assert (wb_hext == f_ldext(wb_hdw, wb_ld_ea, wb_ld_msz, wb_ld_sgn, wb_ld_full))
+         else $fatal(1, "wb_hext %h != the hit's extraction (pc %h)", wb_hext, wb_pc);
+   // the per-way dwords select to h_dword
+   always_ff @(posedge clk) if (!rst && EN_DC_H && mem_valid && mem_h1)
+      assert (h_dword == (h_sel0 ? h_dw0 : h_dw1))
+         else $fatal(1, "h_dword %h != h_sel0 %b ? %h : %h", h_dword, h_sel0, h_dw0, h_dw1);
+`endif
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
    wire [63:0] wb_fwd_v = ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
@@ -4380,8 +4450,11 @@ module pipeline_core
             wb_mul     <= mem_mul;
             // EN_LDBYP: the hit-pipe / forwarded answer, extracted (a missed
             // load's value comes from the port; its consumer captures that)
-            wb_hext    <= f_ldext(mem_h1 ? h_dword : mem_hdw, mem_eaddr[2:0], mem_d.msz, mem_d.sgn,
-                                  mem_d.uop != U_LOAD);
+            // (tmg timing: extracted from each way's dword and from the
+            // captured / forwarded dword in parallel; the tag compare's way
+            // select and mem_h1 pick at the register — = f_ldext(mem_h1 ?
+            // h_dword : mem_hdw, ...))
+            wb_hext    <= !mem_h1 ? wb_hext_m : h_sel0 ? wb_hext_0 : wb_hext_1;
             wb_mulf    <= mem_mul && mem_mulf;
             wb_mdir    <= mem_mul && mem_mage == 2'd0;
             wb_mhi     <= mem_d.mdhigh;  wb_muns <= mem_d.mduns;  wb_mw32 <= mem_d.w32;
@@ -4753,6 +4826,7 @@ module pipeline_core
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
                      id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
+                     id_legal   <= w_dec.legal;  id_privop <= f_priv(w_dec, w_op);   // (tmg)
                      id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
@@ -5400,8 +5474,10 @@ module pipeline_core
       assert (ex_b_zero == (ex_b == 64'd0))
          else $fatal(1, "ex_b_zero stale: ex_b=%h", ex_b);
    // ras_miss's compare-then-select form equals ret_actual != mem_pred_tgt
-   always_ff @(posedge clk) if (!rst && mem_valid && mem_pred)
-      assert (ret_ne == (ret_actual != mem_pred_tgt))
+   // where it is used (the return address has arrived: !mem_busy), except
+   // that a return address from MMIO always counts as mispredicted (tmg)
+   always_ff @(posedge clk) if (!rst && mem_valid && mem_pred && !mem_busy)
+      assert (ret_ne == ((!mem_ret_h && ret_port_io) || (ret_actual != mem_pred_tgt)))
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst && !$isunknown({mem_xsq, mem_xs2, mem_xs2_x, mem_xs_tm, mem_xs_tm_x, mem_xs_tlb, mem_xs_tlb_x}))
