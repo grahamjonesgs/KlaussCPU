@@ -756,6 +756,27 @@ has been accepted at the coherent point (the L2 / DDR) and no further access
 will be issued; `SDM_DMA_ADDR` is then final.  The bus adapter has no reset:
 a transaction it has started always completes (DMA_BUSY stays up for it).
 
+**Stop latency** (`run.py socsdabort`, sddma2: 40 aborts per case at
+random points in a 512 B block, under VGA scanout, the blitter FILLing back
+to back, a miss-heavy CPU loop and an L2 WBINV every 150 of its iterations;
+MIGLAT 36 / 44).  Cycles from the `SDM_CFG` / `SDM_FIFO` write to
+DMA_BUSY = 0, max:
+
+| | DMA_EN = 0, CPU loop running | DMA_EN = 0, tight poll | FIFO reset, CPU loop | FIFO reset, tight poll |
+|---|---|---|---|---|
+| read, MIGLAT 36 | 12,684 | 5,156 | 2,445 | 1,042 |
+| read, MIGLAT 44 | 15,593 | 5,592 | 2,687 | 1,302 |
+| write, MIGLAT 36 | 11,820 | 6,865 | 2,347 | 1,086 |
+| write, MIGLAT 44 | 19,105 | 7,657 | 2,691 | 1,249 |
+
+Each 16-byte transaction's wait for the bus (request to grant), over all
+16 runs (247,826 transactions): 8 % under 16 cycles, 38 % 16–63, 46 %
+64–255, 0.06 % 256–1,023, 2.9 % 1,024–2,047, 4.9 % 2,048–4,095 (a VGA
+line burst or a WBINV walk ahead of it), none longer; max 2,791.  DMA_EN = 0 finishes the block in progress: at most 32 transactions,
+bounded by 32 × the worst wait (about 90,000 cycles, 0.9 ms, only if every
+one met a full VGA burst or WBINV walk; the measured worst was 0.19 ms).  A
+FIFO reset waits for one transaction: at most about 2,800 cycles.
+
 ### 8.5 Behaviour the spec left open (decided here)
 
 - DMA pushes into the FIFO do not count as "pushed" for the write-side

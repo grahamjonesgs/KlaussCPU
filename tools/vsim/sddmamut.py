@@ -113,8 +113,8 @@ MUTS = [
     # matters only when DMA_EN = 0 lands in the single M_CHK cycle of a
     # block that would leave DDR; fixed by inspection)
     ('iinv_with_whole', "RANGE_IINV is ignored with FLUSH / INVALIDATE (review 1 nit: it is honoured)", PC, ['iinv_flush', 'iinv_inval'],
-     "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] &&",
-     "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && !mem_wdata[2] && !mem_wdata[1] &&"),
+     "cc_st && cc_done && mem_wdata[6] && !mem_wdata[3] && r_cop_nz;",
+     "cc_st && cc_done && mem_wdata[6] && !mem_wdata[3] && r_cop_nz && !mem_wdata[2] && !mem_wdata[1];"),
     # ---------------- the tmg review's forward mutants (fwdfuzz) ----------------
     ('fwd_tb_md', "t_tb_d takes a MEM shift's result for any mode, not only [rs1+rs2] (tmg review)", PC, 'fwd',
      "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;",
