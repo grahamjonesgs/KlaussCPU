@@ -27,10 +27,20 @@ by the runtime session). Their outcome so far:
 | 4 | 64 KiB I-cache (built before the L2) | released 2026-11-15 (§5) |
 | 5 | return-address stack 4 → 8 entries | **dropped** 2026-11-16 by Graham: ~0.3 % (< 0.5 % with the L2 and the call-graph-ordered clang), below run-to-run noise, on a timing-sensitive path. `RAS_DEPTH` stays 4 and is not bundled into another build |
 
-Next: core / D-cache timing margin (branch `tmg`), then the SD DMA
-engine with the D-cache / I-cache range operations (SD DMA spec v1.2,
-branch `sddma`; SD_NATIVE_PLAN §4.4 deferred it). After SD DMA, the
-runtime session's emulator re-ranks the next RTL candidates on the
+Then, released together on 2026-11-16 as `sddma_release_3ae5ed6.bit`
+(master merge of `sddma2`; QSPI written, rollback entry in
+~/.cache/kbuild/rollback/README.txt):
+
+- the L2 review 2 follow-up (`l2b`, §6);
+- core / D-cache timing margin (`tmg`, §6 timing);
+- the SD DMA engine with the D-cache / I-cache range operations (SD DMA
+  spec v1.2, §7 with review 1 and the delta review; SD_NATIVE_PLAN
+  §4.4 / §8). Board: board-check 16/16, SD DMA round trips and ~33,000
+  DMA requests clean, 32 MiB read DMA 3.23 s vs PIO 4.24 s; clang
+  deflate / cxx-hello unchanged vs the L2 release (37.6 / 88.6 s
+  user+sys).
+
+Next: the runtime session's emulator re-ranks the next RTL candidates on the
 current baseline (L2 + call-graph-ordered clang: I-fetch 37–51 % of
 cycles, D-cache stalls 30–38 %, L2 I-side hit rate 37–44 %) before any
 further hardware item is picked.
