@@ -29,7 +29,11 @@ module tb_sd_spi_compat;
         .i_Clk(clk), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus_n), .o_irq(irq_n),
         .i_sd_cd(cd), .o_sd_reset_n(reset_n_n), .o_sd_sck(sck_n),
         .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .i_sd_cmd(cmd_o),
-        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat({dat_o[3:1], miso})
+        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat({dat_o[3:1], miso}),
+        // the SD DMA port: idle here (no DMA_EN data command; tb_sd_dma tests it)
+        .o_dma_req(), .o_dma_done(), .o_dma_write_DV(), .o_dma_read_DV(), .o_dma_addr(),
+        .o_dma_write_data(), .o_dma_wdf_mask(), .i_dma_read_data(128'h0), .i_dma_ready(1'b0),
+        .i_dma_grant(1'b0)
     );
     sd_spi_ref ref_i (
         .i_Clk(clk), .i_Rst_L(rst_l), .mmio(bus_r),

@@ -3,6 +3,8 @@
 Status: **phases 0–2 done (2026-11-10)**: release candidate `5648f75` on
 klaussCPU branch `mmu-sd`, board-validated (results §6.1; implementation notes
 §4.9). Register map v1 frozen. Phase 3 (high speed) not started.
+Phase 4 (DMA, SD DMA spec v1.2, §8): RTL and simulation on branch `sddma`
+(2026-11-16), not yet built.
 (Graham's go-ahead, relayed by the runtime session.)
 Plan written 2026-11-10. Requested by Graham through the
 klausscpu-runtime session; that session reviews the software interface (§5)
@@ -331,7 +333,7 @@ Results:
     DMA support, and touches nothing timing-critical.
   - Reserved for DMA: `SDM_DMA_ADDR` (0x150) and `SDM_CFG[16]` = DMA enable,
     which read 0 and are ignored on this design. Phase 4 adds them if the CPU
-    share turns out to matter.
+    share turns out to matter. (Done: §8, with the range operations.)
 - **Double buffering.** It comes free with the 8-block FIFO and the clock
   stopping: the card fills block n+1 while the CPU drains block n.
 
@@ -415,15 +417,15 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
 | 0x110 | `SDM_RESP0` | R | response [63:0] (48-bit: [31:0] = status/OCR/RCA) |
 | 0x118 | `SDM_RESP1` | R | R2 response [127:64] |
 | 0x120 | `SDM_BLK` | RW | `[11:0]` block size (multiple of 4, 4–2048; `[1:0]` read 0; a block takes ceil(size/8) words, §4.3), `[31:16]` block count (0 = open-ended) |
-| 0x128 | `SDM_STATUS` | R/W1C | **live** (read-only): `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0 level, `[3]` CARD_PRESENT (1 = card in; the Nexys A7 SD_CD pin is active low, so this is its inverse, while SPI's `SD_STATUS[1]` stays the raw pin), `[4]` FIFO_THRESH (§4.5). **sticky** (write-1-to-clear): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT (no read start bit), `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR (token ≠ 010), `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT (R1b or write busy), `[26]` FIFO_ERR (push to a full FIFO). `[31]` ERR_ANY (live) = OR of `[26:16]` |
-| 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same bit positions as `SDM_STATUS` (`[4]`, `[9:8]`, `[26:16]`); others ignored |
+| 0x128 | `SDM_STATUS` | R/W1C | **live** (read-only): `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0 level, `[3]` CARD_PRESENT (1 = card in; the Nexys A7 SD_CD pin is active low, so this is its inverse, while SPI's `SD_STATUS[1]` stays the raw pin), `[4]` FIFO_THRESH (§4.5). **sticky** (write-1-to-clear): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT (no read start bit), `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR (token ≠ 010), `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT (R1b or write busy), `[26]` FIFO_ERR (push to a full FIFO), `[27]` DMA_ERR (§8). live `[5]` DMA_BUSY (§8). `[31]` ERR_ANY (live) = OR of `[27:16]` |
+| 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same bit positions as `SDM_STATUS` (`[4]`, `[9:8]`, `[27:16]`); others ignored |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` data timeout (read start bit), `[63:32]` busy timeout (R1b / write busy), both in CLK cycles. Reset 2 500 000 / 12 500 000 (100 ms / 500 ms at 25 MHz); software rescales for other clocks |
-| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit, `[2]` CLK_ON (free-running clock). Reserved until phase 3, reading 0: `[1]` high-speed edge, `[7:4]` HS sample phase. `[16]` DMA enable, reserved for phase 4. Reset 0 |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit, `[2]` CLK_ON (free-running clock). Reserved until phase 3, reading 0: `[1]` high-speed edge, `[7:4]` HS sample phase. `[16]` DMA_EN (§8). Reset 0 |
 | 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in words; writing `[31]` resets the FIFO |
-| 0x150 | `SDM_DMA_ADDR` | — | reserved for phase 4 (reads 0) |
+| 0x150 | `SDM_DMA_ADDR` | RW | §8: 64-bit PA, `[2:0]` read 0, the first byte not yet transferred; writes ignored while DMA_BUSY |
 | 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command (§4.3); reset by an `SDM_CMD` with the data flag |
 | 0x180 | `SDM_DATA` | RW | FIFO port: load pops, store pushes (64-bit) |
-| 0x1F8 | `SDM_CAPS` | R | `[7:0]` version (1), `[8]` 4-bit, `[9]` high speed (0 until phase 3), `[23:16]` FIFO size in 512-byte blocks (8) |
+| 0x1F8 | `SDM_CAPS` | R | `[7:0]` version (1), `[8]` 4-bit, `[9]` high speed (0 until phase 3), `[10]` DMA (§8), `[23:16]` FIFO size in 512-byte blocks (8) |
 | 0x200–0x3F8 | `SD_BUF` | RW | scratch RAM, as today |
 
 Registers elsewhere:
@@ -588,7 +590,7 @@ this (the register map is unchanged):
    calibration, CMD6 switch.
 4. **Optional DMA:** a fifth DDR master, and address-range cache
    flush/invalidate (also useful to Linux as a whole). Only if the CPU share
-   in phases 2 and 3 matters.
+   in phases 2 and 3 matters. Done in simulation: §8.
 
 ### 6.1 Results (2026-11-10)
 
@@ -667,3 +669,125 @@ Timing risk is **low** for phases 1–2:
 
 Phase 3's risk is I/O timing (§4.6), not fabric timing. Phase 4 touches the
 cache arbiter and is the only phase with real core-timing risk.
+
+## 8. SD DMA (phase 4, SD DMA spec v1.2)
+
+Agreed with the runtime session (spec v1.2, frozen; the kernel driver
+`linux/arch/klausscpu/kernel/sd_native.c` and the emulator's `--sd-dma` model
+are written against it).  RTL on branch `sddma`: `sd_native.sv` (the engine
+and its bus adapter), `sd_spi.sv` (the port), `mem_read_write.sv` (master E
+on the DDR arbiter; the D-cache range walk), `pipeline_core.sv` (RANGE_IINV),
+`KlaussCPU.sv` (`CACHE_OP_ADDR` / `CACHE_OP_LEN`, `CPU_FEATURES[27]`).  The
+design, its verification and the results are in HW_PERF_PLAN.md §7; this
+section is the controller's behaviour.
+
+### 8.1 Registers
+
+`SDM_DMA_ADDR` (0x150, RW, 64 bits, `[2:0]` read 0), `SDM_CFG[16]` DMA_EN,
+`SDM_STATUS[5]` DMA_BUSY (live) and `[27]` DMA_ERR (sticky, W1C; in ERR_ANY
+and `SDM_IRQ_EN[27]`), `SDM_CAPS[10]` = 1.  Reset: `SDM_DMA_ADDR` 0, DMA_EN 0
+(CPU_RESETN and the native-mode program-load reset of §4.1).
+
+### 8.2 A DMA data command
+
+DMA_EN is sampled when a data command (`SDM_CMD[11]`) is accepted:
+
+- **Refused up front** — DMA_ERR is set, and the command is ignored
+  entirely otherwise (not sent to the card; no CMD_DONE; DIR, `SDM_BLKDONE`
+  and the latched size unchanged): a block size that is not a multiple of
+  8; or a known count whose `[ADDR, ADDR + size × count)` is not inside DDR
+  (`[0, 128 MiB)`; `ADDR[63:27]` must be 0).  A command that would be
+  ignored anyway (CMD_BUSY, DATA_BUSY or DMA_BUSY) sets nothing.
+- **Read** (card → DDR): the data engine fills the FIFO as for PIO; each
+  block, once its CRC and end bit checked good (so it is visible in the
+  FIFO), is moved to DDR.  An open-ended count is checked per block: a block
+  that would leave DDR sets DMA_ERR and the DMA ends (nothing of the block
+  moves; it stays in the FIFO, and the card side goes on as PIO).
+  `SDM_BLKDONE` counts good blocks received.  For a known count, DATA_DONE
+  and the end of DATA_BUSY come when the last block's last write has been
+  accepted (in the L2 / DDR).
+- **Write** (DDR → card): a block is fetched into the FIFO whenever there is
+  room for it and blocks are left (never past size × count; an open-ended
+  count at most the FIFO's 4 KiB ahead of the card).  `SDM_DMA_ADDR`
+  advances as words are fetched.  DMA_BUSY drops with DATA_DONE.
+- **The FIFO is the engine's**: a DMA read moves whatever is at the FIFO's
+  head, so the FIFO must be empty (reset) when the command is written — the
+  kernel resets it before every data command.
+
+### 8.3 While DMA_BUSY
+
+`SDM_DATA` loads read 0 and pop nothing; stores are dropped and set
+FIFO_ERR; FIFO_THRESH reads 0 (and does not interrupt); writes to
+`SDM_DMA_ADDR` are ignored (it reads the live address); a data command is
+ignored entirely (as while DATA_BUSY).  Non-data commands go out (CMD12
+stops the phase, CMD13 does not).
+
+### 8.4 Ends and aborts
+
+| Event | The DMA | The card side |
+|---|---|---|
+| a counted read's last block in DDR | ends; DATA_DONE | done |
+| a counted write's last block programmed | ends with DATA_DONE | done |
+| CMD12 (`[13]`), a read | the good blocks still in the FIFO are moved, then it ends | stops at once (§4.8: DATA_DONE for an open-ended phase) |
+| CMD12, a write | stops fetching after the block in progress | stops at once |
+| a card error (CRC, timeout, token, busy) | as CMD12 | stops, error bit |
+| DMA_EN = 0 (any `SDM_CFG` write with `[16]` = 0) | finishes the block in progress, then stops | goes on as PIO through the FIFO |
+| clearing SD_MODE | finishes the block in progress, then stops | abandoned (§4.8) |
+| `SDM_FIFO[31]` | stops after the 16-byte DDR transaction in flight; a read's data from DDR is dropped | goes on as PIO, with an empty FIFO |
+| CPU_RESETN, the native-mode load reset | as `SDM_FIFO[31]` | reset |
+| DMA_ERR (open-ended) | ends before the block (not set if an abort lands in the same cycle: the DMA ends without it) | goes on as PIO |
+
+A counted read whose card side completed while the DMA still owed blocks
+keeps DATA_BUSY up (`r_dd_pend`) until the last block is in DDR, also across
+a CMD12 sent meanwhile (no data phase runs then: an ordinary R1b, §4.8); it
+sets DATA_DONE at once if the DMA is aborted (DMA_EN = 0, FIFO reset);
+clearing SD_MODE sets no DONE bit (§4.8).
+
+A data command whose response fails (CMD_TIMEOUT / CRC / END / IDX) runs no
+data phase (§4.2).  Its DMA phase began when the command was accepted: a
+read's moves nothing; a write's may already have fetched blocks into the
+FIFO (DDR read, never written) and ends after the block in progress, when
+DMA_BUSY drops.  The driver resets the FIFO before a retry.  (The emulator
+starts no DMA phase at all here; the visible difference is the FIFO's
+contents and a short DMA_BUSY.)
+
+**(m1)** On every path, DMA_BUSY = 0 means every write the engine issued
+has been accepted at the coherent point (the L2 / DDR) and no further access
+will be issued; `SDM_DMA_ADDR` is then final.  The bus adapter has no reset:
+a transaction it has started always completes (DMA_BUSY stays up for it).
+
+**Stop latency** (`run.py socsdabort`, sddma2: 40 aborts per case at
+random points in a 512 B block, under VGA scanout, the blitter FILLing back
+to back, a miss-heavy CPU loop and an L2 WBINV every 150 of its iterations;
+MIGLAT 36 / 44).  Cycles from the `SDM_CFG` / `SDM_FIFO` write to
+DMA_BUSY = 0, max:
+
+| | DMA_EN = 0, CPU loop running | DMA_EN = 0, tight poll | FIFO reset, CPU loop | FIFO reset, tight poll |
+|---|---|---|---|---|
+| read, MIGLAT 36 | 12,684 | 5,156 | 2,445 | 1,042 |
+| read, MIGLAT 44 | 15,593 | 5,592 | 2,687 | 1,302 |
+| write, MIGLAT 36 | 11,820 | 6,865 | 2,347 | 1,086 |
+| write, MIGLAT 44 | 19,105 | 7,657 | 2,691 | 1,249 |
+
+Each 16-byte transaction's wait for the bus (request to grant), over all
+16 runs (247,826 transactions): 8 % under 16 cycles, 38 % 16–63, 46 %
+64–255, 0.06 % 256–1,023, 2.9 % 1,024–2,047, 4.9 % 2,048–4,095 (a VGA
+line burst or a WBINV walk ahead of it), none longer; max 2,791.  DMA_EN = 0 finishes the block in progress: at most 32 transactions,
+bounded by 32 × the worst wait (about 90,000 cycles, 0.9 ms, only if every
+one met a full VGA burst or WBINV walk; the measured worst was 0.19 ms).  A
+FIFO reset waits for one transaction: at most about 2,800 cycles.
+
+### 8.5 Behaviour the spec left open (decided here)
+
+- DMA pushes into the FIFO do not count as "pushed" for the write-side
+  FIFO_THRESH (as the emulator).
+- `SDM_DMA_ADDR` is 64 bits (as the emulator); a transfer only ever touches
+  `[0, 128 MiB)`.
+- DMA_BUSY, not only "a DMA data phase", gates `SDM_DATA` / FIFO_THRESH and
+  data commands: after an abort the engine still finishes its block, and PIO
+  resumes when DMA_BUSY drops (the emulator resumes PIO at once and holds
+  DMA_BUSY up for a modelled drain).
+- The engine moves 16-byte transactions, one per bus tenure, priority VGA >
+  SD > blitter > core 2, held off (like the blitter) while a data-cache miss
+  is in flight or a maintenance walk is pending or running.
+

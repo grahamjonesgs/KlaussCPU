@@ -159,15 +159,15 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 | 0x110 | `SDM_RESP0` | R | 48-bit response: `[31:0]` argument field, `[37:32]` index echo, `[63:38]` 0. R2: response bits `[63:0]` (CRC7 and end bit in `[7:0]`) |
 | 0x118 | `SDM_RESP1` | R | R2: response bits `[127:64]`; 0 after a 48-bit response |
 | 0x120 | `SDM_BLK` | RW | `[11:0]` block size in bytes (multiple of 4, 4–2048; `[1:0]` read 0; 0 acts as 8), `[31:16]` block count (0 = open-ended). Reset `0x0001_0200`. Latched by each data command. A block takes ceil(size/8) FIFO words; when size mod 8 = 4 its last word holds the final 4 bytes in `[31:0]` (`[63:32]` = 0 on reads, ignored on writes) |
-| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR; `[31]` ERR_ANY (live OR of `[26:16]`). `[5]` DMA_BUSY and `[27]` DMA_ERR are reserved for the future SD DMA (SD DMA spec v1.2; read 0). |
-| 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[26:16]`) |
+| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR, `[27]` DMA_ERR (a DMA refused up front, or an open-ended DMA's block that would leave DDR); `[31]` ERR_ANY (live OR of `[27:16]`). Live `[5]` DMA_BUSY: the DMA engine owns the FIFO and DDR — 0 means every DMA write has been accepted at the L2 / DDR and none will be issued. |
+| 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[27:16]`) |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` read start-bit timeout, `[63:32]` busy timeout, in CLK cycles. Reset 2 500 000 / 12 500 000 (100 / 500 ms at 25 MHz) |
-| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply). Reserved (read 0): `[1]` the high-speed edge and `[7:4]` the HS sample phase (SD_NATIVE_PLAN phase 3), `[16]` DMA_EN for the future SD DMA (SD DMA spec v1.2) |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply), `[16]` DMA_EN (sampled by each data command; writing `SDM_CFG` with `[16]` = 0 aborts a DMA). Reserved (read 0): `[1]` the high-speed edge and `[7:4]` the HS sample phase (SD_NATIVE_PLAN phase 3) |
 | 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in 64-bit words; write `[31]` = 1 to empty the FIFO (also sets the direction latch to NONE) |
-| 0x150 | `SDM_DMA_ADDR` | — | reserved (reads 0) |
+| 0x150 | `SDM_DMA_ADDR` | RW | 64-bit physical address, `[2:0]` read 0: always the first byte not yet transferred (it advances as the DMA moves words). Writes are ignored while DMA_BUSY |
 | 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command |
 | 0x180 | `SDM_DATA` | RW | FIFO port: a 64-bit load pops a word (0 if empty), a 64-bit store pushes one (dropped + FIFO_ERR if full). Byte 0 of the block in `[7:0]` |
-| 0x1F8 | `SDM_CAPS` | R | `0x0008_0101`: version 1, 4-bit, no high speed, 8 × 512-byte FIFO. `[10]` is reserved for the future SD DMA (SD DMA spec v1.2: DMA present; reads 0) |
+| 0x1F8 | `SDM_CAPS` | R | `0x0008_0501`: version 1, 4-bit, no high speed, `[10]` the DMA engine, 8 × 512-byte FIFO (`0x0008_0101` on bitstreams without the DMA) |
 
 - **Interrupt**: `|(SDM_STATUS & SDM_IRQ_EN)`, a level, cascaded on
   interrupt source 2 through `INT2_EN[1]` (Timers / interrupts below).
@@ -185,6 +185,52 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 - **Pins**: CMD and DAT[3:0] are bidirectional with pull-ups. In SPI mode
   CMD (MOSI), DAT3 (CS_n), DAT1 and DAT2 are always driven and DAT0 is an
   input, as before.
+
+#### SD DMA (`SDM_CAPS[10]`, SD DMA spec v1.2)
+
+A data command written with `SDM_CFG[16]` DMA_EN = 1 moves its blocks
+between the card and DDR at `SDM_DMA_ADDR` instead of through the CPU
+(details and every corner case: [SD_NATIVE_PLAN.md](SD_NATIVE_PLAN.md) §8).
+The engine is a DMA master on the DDR arbiter, through the L2 (16-byte
+transactions; it never allocates in the L2). It is **not coherent with the
+data cache**: clean the buffer (`RANGE_CLEAN`, or FLUSH) before the command,
+and invalidate it (`RANGE_INV`, or INVALIDATE) after a read.
+
+- **Refused up front** (`DMA_ERR`, no command goes to the card, nothing
+  changes but `DMA_ERR`): a block size that is not a multiple of 8, or a
+  known block count whose range `[ADDR, ADDR + size × count)` is not inside
+  DDR (`[0, 128 MiB)`). An open-ended count is checked block by block: a
+  block that would leave DDR sets `DMA_ERR` and ends the DMA (nothing of it
+  moves); the card side then goes on through the FIFO, as PIO.
+- **Reads**: a block reaches DDR only after its CRC passed (a bad block
+  never does). `SDM_BLKDONE` = good blocks received. `DATA_DONE` (and the
+  end of `DATA_BUSY`) come when the last block is in DDR.
+- **Writes**: blocks are fetched into the FIFO while it has room for one —
+  at most 4 KiB ahead of the card, never past size × count. `DMA_BUSY`
+  drops with `DATA_DONE`.
+- **During a DMA** (`DMA_BUSY`): `SDM_DATA` loads return 0 and pop
+  nothing, stores are dropped and set FIFO_ERR, FIFO_THRESH reads 0, writes
+  to `SDM_DMA_ADDR` are ignored, and a data command is ignored entirely
+  (as while `DATA_BUSY`). Other commands (CMD12, CMD13) go out.
+- **Ends and aborts**: `DMA_EN` = 0 or clearing `SD_MODE`: the block in
+  progress is finished, then the DMA stops (the card side goes on as PIO;
+  `SDM_DMA_ADDR` is block-granular). `SDM_FIFO[31]`: the DMA stops after
+  its 16-byte transaction in flight (a read's data from DDR is dropped).
+  CMD12, or a card error: the good blocks already in the FIFO are moved
+  to DDR first. On every path `DMA_BUSY` = 0 means every write the DMA
+  issued has been accepted at the L2 / DDR and nothing more will be issued.
+- **Interrupt**: `SDM_IRQ_EN[27]` enables `DMA_ERR`; `DATA_DONE` of a DMA
+  read comes when the data is in DDR.
+- A counted read whose card side is done but whose blocks are still being
+  moved keeps `DATA_BUSY` up until they are in DDR; a CMD12 sent then (no
+  data phase is running: an ordinary R1b) does not change that.
+- A data command whose response fails runs no data phase.  A read moves
+  nothing; a write may already have fetched blocks into the FIFO (the fetch
+  runs ahead of the response; DDR is only read) and stops after the block
+  in progress, `DMA_BUSY` then dropping.  Reset the FIFO before retrying.
+- **Ordering**: a data command written after a `CACHE_CTRL` op cannot start
+  its DMA before that op's walk has finished (its write-backs are then in
+  the L2): no `MNT_BUSY` poll is needed between them (Cache controller).
 
 ### QSPI flash — base `0xF012_0000`
 
@@ -317,14 +363,14 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 
 | Offset  | Reg                  | RW | Width | Description |
 |---------|----------------------|----|-------|-------------|
-| 0x0000  | `CACHE_CTRL`         | W  | 4     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). `[3]` ICACHE_INV — fence.i: the core drops its whole I-cache, prefetch buffer and fetch window and refetches everything after the store (see below). `[6:4]` reserved for the D-cache range operations of the future SD DMA (SD DMA spec v1.2: `[4]` RANGE_CLEAN, `[5]` RANGE_INV, `[6]` RANGE_IINV, over `CACHE_OP_ADDR` / `CACHE_OP_LEN`; write 0). Reads as 0. |
+| 0x0000  | `CACHE_CTRL`         | W  | 4     | `[0]` write-1-clear-counters (self-clearing). `[1]` FLUSH — write back every dirty line, keep it valid (self-clearing). `[2]` INVALIDATE — flush dirty lines, then drop (clear valid on) every line (self-clearing). `[3]` ICACHE_INV — fence.i: the core drops its whole I-cache, prefetch buffer and fetch window and refetches everything after the store (see below). `[4]` RANGE_CLEAN, `[5]` RANGE_INV, `[6]` RANGE_IINV — the range operations over `CACHE_OP_ADDR` / `CACHE_OP_LEN` (see below; `CPU_FEATURES[27]`). Reads as 0. |
 | 0x0008  | `CACHE_INFO`         | R  | 64    | Read-only geometry. `[7:0]` = ways, `[23:8]` = sets, `[31:24]` = line bytes, `[63:32]` = total bytes. For the current build returns `64'h0001_0000_2004_0002` (2 ways, 1024 sets, 32 B/line, 64 KB total). |
-| 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a flush/invalidate walk is in progress. |
+| 0x0010  | `CACHE_STATUS`       | R  | 1     | `[0]` MNT_BUSY — a data-cache walk (flush / invalidate / range) is pending or running, or a RANGE_IINV sweep is running. |
 | 0x0018  | `ICACHE_INFO`        | R  | 64    | Read-only geometry of core 1's fetch I-cache, in `CACHE_INFO`'s format (`[7:0]` ways, `[23:8]` sets, `[31:24]` line bytes, `[63:32]` total bytes). Current build: `64'h0001_0000_2008_0001` (direct-mapped, 2048 sets, 32 B/line, 64 KiB; HW_PERF_PLAN.md §5). The 16 KiB bitstreams (HW_PERF_PLAN.md §2) read `64'h0000_4000_1004_0001` (1024 sets, 16 B/line). Reads 0 on older bitstreams (8 KiB I-cache, 512 sets, 16 B lines). Build parameters `CORE1_IC_LINES`, `CORE1_IC_LB`. Software that walks code by I-cache line must take the line size from `[31:24]`. |
 | 0x0020  | `L2_INFO`            | R  | 64    | Read-only geometry of the unified L2 (HW_PERF_PLAN.md §6), in `CACHE_INFO`'s format. Current build: `64'h0002_0000_4002_0004` (4 ways, 512 sets, 64 B lines, 128 KiB); an 8-way build reads `64'h0002_0000_4001_0008`. Each 64 B line is two 32 B sectors with their own valid and dirty bits. Reads 0 on bitstreams without an L2 (`CPU_FEATURES[26]` = 0). |
 | 0x0028  | `L2_CTRL`            | RW | 9     | The L2's control (see "L2 cache" below). Write `[0]` EN, `[1]` WBINV: **1** = enable; **3** = write back every dirty line and invalidate the whole L2, stay enabled; **0** (or 2) = write back and invalidate, then bypass (disabled). Read: `[0]` EN (the value last written, 1 after reset / program load), `[8]` BUSY (a write-back walk is running). **A write while BUSY = 1 is ignored.** Reads 0 without an L2. |
-| 0x0030  | —                    | —  | 32    | Reserved: `CACHE_OP_ADDR`, the start address of a D-cache range operation (`CACHE_CTRL[6:4]`, SD DMA spec v1.2). Reads 0. |
-| 0x0038  | —                    | —  | 32    | Reserved: `CACHE_OP_LEN`, its length in bytes (the same). Reads 0. |
+| 0x0030  | `CACHE_OP_ADDR`      | RW | 32    | The range operations' start: a **physical** address, `[4:0]` read 0. Reset 0 (`CPU_RESETN`). Reads 0 on bitstreams without the range ops (`CPU_FEATURES[27]` = 0). |
+| 0x0038  | `CACHE_OP_LEN`       | RW | 32    | Their length in bytes; 0 = no-op. Reset 0. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line (including DCBZ hits). |
@@ -336,11 +382,11 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 **L2 cache (`L2_INFO` / `L2_CTRL`, HW_PERF_PLAN.md §6, `CPU_FEATURES[26]`).**
 A unified, physically indexed and tagged 128 KiB L2 sits between the data
 cache (which also serves the I-cache's fills) and DDR, **below the DDR
-arbiter**: every DDR master — the data cache, the blitter, core 2 and VGA
-scanout — reaches DDR only through it, so the L2 and DDR always behave as one
-memory. Nothing about cache coherence changes for software: flush /
-invalidate the *data cache* (`CACHE_CTRL` bits 1 / 2) around DMA exactly as
-before; there is no L2 flush to add. (DMA reads take valid L2 data, DMA
+arbiter**: every DDR master — the data cache, the blitter, core 2, VGA
+scanout and the SD DMA engine — reaches DDR only through it, so the L2 and
+DDR always behave as one memory. Nothing about cache coherence changes for
+software: flush / invalidate the *data cache* (`CACHE_CTRL` bits 1 / 2, or
+the range ops) around DMA exactly as before; there is no L2 flush to add. (DMA reads take valid L2 data, DMA
 writes update a valid L2 copy, and DMA never allocates in the L2.) Physical
 addresses alias as in DDR itself: `PA[31:27]` are ignored (the memory
 controller ignores its rank bit `PA[27]` and never sees `PA[31:28]`), and the
@@ -360,9 +406,18 @@ non-inclusive (it never invalidates the L1s), with tree pseudo-LRU and a
 - **Write 1: enable.** Immediate (a disabled L2 holds no line).
 - **During a walk** the core and every other master keep running: hits are
   served as usual, nothing is allocated, and a write that misses goes to DDR
-  through the write buffer; no data is lost or reordered. The walk and the
-  waiting requests take turns (a request, then a set), so continuous
-  traffic cannot hold BUSY up.
+  through the write buffer; no data is lost or reordered.  A write to the
+  set being walked waits until the walk has copied that set. The walk and the
+  waiting requests take turns (a request, then a step of the walk), and a
+  walk that waits for a free write-buffer slot is served like a waiting
+  request: the next drain is its own (also while VGA or a DMA master holds
+  the bus), and no posted write takes the slot that drain frees. So no
+  request stream — the CPU's, the blitter's, VGA's — can hold BUSY up: the
+  walk spends one step on each set, and each dirty line costs it at most
+  the DDR transaction in progress, one write-buffer drain and one request
+  (HW_PERF_PLAN.md §6 review 2 gives the bound; in simulation a WBINV of a
+  fully dirty L2 under back-to-back DMA writes into the set being walked
+  took ~0.45 ms, little more than its 2,048 line drains alone).
 - **A write while BUSY = 1 is ignored** (dropped, not queued). Poll BUSY = 0
   before writing, and again after a write of 0 or 3.
 - BUSY = 0 means DDR holds every write acknowledged before the walk's end
@@ -403,6 +458,54 @@ to new code. For DMA-written code, also make the data cache consistent first
 (FLUSH before the DMA reads, INVALIDATE after it writes). The data-cache bits
 can be set in the same write. `mmio.h`: `icache_invalidate()`.
 
+**Range operations (`CACHE_CTRL[6:4]`, `CPU_FEATURES[27]`, SD DMA spec
+v1.2).**  For DMA coherence on buffers, without the whole-cache walk.  The
+range is ceil(`CACHE_OP_LEN` / 32) lines from `CACHE_OP_ADDR` & ~31
+(physical addresses; the D-cache is physically tagged and the I-cache's
+index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.  **The count is
+taken from LEN alone**, so for an `CACHE_OP_ADDR` that is not 32-byte
+aligned the lines do **not** cover `[ADDR, ADDR + LEN)`: write
+`LEN + (ADDR & 31)` (as the kernel does) to cover a buffer's partial first
+and last lines.
+
+- `[4]` **RANGE_CLEAN**: write back the range's dirty lines, keep them valid.
+- `[5]` **RANGE_INV**: write back the range's dirty lines, then invalidate
+  the range's lines (a dirty line is never dropped unwritten). With `[4]`:
+  the same.
+- `[6]` **RANGE_IINV**: drop the range's lines from the I-cache; the core
+  also drops every other fetch-side copy (the next-line buffer, the BTIC,
+  the fetch window, a pending install) and refetches after the store, as for
+  ICACHE_INV. Instruction fetch is coherent with it at once (during its
+  sweep every I-cache lookup misses).
+- With `[1]` FLUSH or `[2]` INVALIDATE the whole-cache op runs and `[5:4]`
+  are ignored; `[6]` RANGE_IINV is still done (as `[3]` ICACHE_INV is);
+  with `[3]` ICACHE_INV the whole I-cache is dropped (covering `[6]`) and a
+  D-cache range op runs too.
+- `CACHE_OP_ADDR` / `CACHE_OP_LEN` are copied when the op is accepted, so
+  they may be rewritten at once.  Ops queue like FLUSH: **one** range op may
+  be queued behind a running walk, with its own copied range.  A range op is
+  turned into a whole-cache walk only when another range op is already
+  waiting, when it covers more than 2,048 lines (64 KiB), or when a
+  whole-cache walk is pending; a whole-cache op written while a range op
+  waits absorbs that op.  The converted walk is an INVALIDATE if either op
+  invalidates, else a FLUSH — a superset, never less.
+- **Ordering.**  A `CACHE_CTRL` write takes effect only after every earlier
+  store, posted or queued, is in the data cache (the core has one in-order
+  port, and a walk starts only with the cache idle).  A DMA master (the SD
+  DMA engine, the blitter, core 2) is not granted the bus while a walk is
+  pending or running, so a data command written right after a range op
+  cannot read or write DDR before the walk's write-backs are in the L2.
+  `MNT_BUSY` need not be polled for that; it still says when the walk is
+  over.  The CPU's own loads and stores wait for a walk, pending or
+  running: a load after RANGE_INV or INVALIDATE sees memory, with no poll.
+- **Timing** (simulation, 100 MHz): a range walk visits min(n, 1024) sets
+  (n lines), 2 cycles a set, +6 for a set with a dirty line of the range
+  (+3 more for a second one), +1; a RANGE_IINV sweep takes min(n, 64)
+  cycles (one line a cycle up to 64 lines, then n / 64 lines a cycle: a
+  4 KiB page in 64 cycles), and none when the I-cache holds nothing.  A
+  whole-cache walk takes 4,097 cycles + ~3 per dirty line (one walk per
+  op; bitstreams before the SD DMA work walked twice, ~8,200 cycles).
+
 **Flush / invalidate (full-cache).** `CACHE_CTRL[1]` (FLUSH) and `[2]`
 (INVALIDATE) trigger an FSM in `mem_read_write.sv` that walks every set/way
 (1024 × 2). FLUSH writes back each dirty line to DDR and marks it clean,
@@ -423,6 +526,13 @@ guaranteed complete before the next *cached* access lands, which is what the
 DMA-coherency sequences need; but code that must not start the next MMIO
 action (e.g. kicking the blitter) before the walk ends should poll
 `CACHE_STATUS[0]` (MNT_BUSY) — it covers both the pending and active phases.
+A walk starts only when the cache is idle, so one requested while it is
+still finishing an earlier store's miss waits; the load-hit pipe is held off
+during that wait for an invalidating walk (INVALIDATE, RANGE_INV, or a
+range op turned into a whole walk), so a load issued right after the
+`CACHE_CTRL` write never sees a line the walk is about to drop.  **On
+bitstreams before the SD DMA work (`CPU_FEATURES[27]` = 0) it could:** poll
+MNT_BUSY after INVALIDATE there before reading data a DMA wrote.
 
 These exist for **DMA / blitter coherency**: the CPU accesses memory through
 this write-back cache, while the [2D DMA blitter](#2d-dma-blitter--base-0xf00e_0000)
@@ -548,9 +658,14 @@ run, read.
 | 0x0140 | `PERF_L2_WB_MISS`       | R  | 48    | Data-cache writebacks that missed: the sector is allocated without a fetch (or, during a walk, written to DDR). |
 | 0x0148 | `PERF_L2_DDR_RD`        | R  | 48    | DDR read beats (8 B each; a 64 B line is 8), all masters. |
 | 0x0150 | `PERF_L2_DDR_WR`        | R  | 48    | DDR write beats (8 B each), all masters. |
-| 0x0158 | `PERF_L2_WBUF_FULL`     | R  | 48    | Cycles a request (or the walk) waited because the L2's write buffer was full. |
-| 0x0160 | `PERF_L2_DMA_HIT`       | R  | 48    | Blitter / core 2 / VGA accesses served by the L2 (a read of a valid sector, a write merged into one). |
-| 0x0168 | `PERF_L2_DMA_MISS`      | R  | 48    | Blitter / core 2 / VGA accesses that went to DDR. |
+| 0x0158 | `PERF_L2_WBUF_FULL`     | R  | 48    | Cycles a request (or the walk) waited because the L2's write buffer was full (during a walk that waits for a slot, a posted write also waits while the buffer is not empty). |
+| 0x0160 | `PERF_L2_DMA_HIT`       | R  | 48    | Blitter / core 2 / VGA / SD DMA accesses served by the L2 (a read of a valid sector, a write merged into one). **Includes VGA's stream-buffer hits:** a scanout read of sector 0 of a line the L2 does not hold fetches the whole 64 B line (one `PERF_L2_DMA_MISS`) and the scanout's read of sector 1 is answered from a register (one `PERF_L2_DMA_HIT`), so a scanout over a framebuffer that is not in the L2 shows DMA hits = DMA misses. |
+| 0x0168 | `PERF_L2_DMA_MISS`      | R  | 48    | Blitter / core 2 / VGA / SD DMA accesses that went to DDR. |
+
+With the L2 disabled (`L2_CTRL[0]` = 0, bypass) no access is looked up:
+the I / D / writeback / DMA hit and miss counters stay 0 (only the DDR
+beat and write-buffer counters move), and VGA's stream buffer is off too
+(every scanout read goes to DDR, as before the L2).
 
 **Mix invariant.** Each retired instruction is classified into exactly one of
 the seven Tier-2 buckets (ALU, LOAD, STORE, BRANCH, JUMP, CALL, INDIRECT) or
@@ -938,7 +1053,7 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[24]` | `ETH_RX_SLOTS` (`0xF007_0000`): up to 8 LiteEth RX slots, see the Ethernet section |
 | `[25]` | the hardware TLB walker (SRs `TLB_PTB` / `TLB_WALK` / `TLB_WCNT`, MMU_PLAN.md §11.8) |
 | `[26]` | the unified L2 (`L2_INFO` / `L2_CTRL` at `0xF005_0020` / `0x0028`, counters `0xF00D_0118` …, HW_PERF_PLAN.md §6) |
-| `[27]` | reserved: the D-cache range operations (`CACHE_CTRL[6:4]`, `CACHE_OP_ADDR` / `CACHE_OP_LEN` at `0xF005_0030` / `0x0038`; SD DMA spec v1.2); reads 0 |
+| `[27]` | the cache range operations (`CACHE_CTRL[6:4]`, `CACHE_OP_ADDR` / `CACHE_OP_LEN` at `0xF005_0030` / `0x0038`; SD DMA spec v1.2). The SD DMA engine itself is `SDM_CAPS[10]` |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
@@ -947,7 +1062,8 @@ too: `0x0030_100D` lean, `0x003F_100D` full; with DCBZ, MAL64 and `ETH_RX_SLOTS`
 `perf-hw`, `[24:22]`) `0x01F0_100D` lean, `0x01FF_100D` full; with the 32-entry
 TLB (branch `tlb32`, `[15:8]` = 32) `0x01F0_200D` lean, `0x01FF_200D` full; with the
 hardware TLB walker (branch `tlbwalk`, `[25]`) `0x03F0_200D` lean, `0x03FF_200D` full; with the L2
-(branch `l2`, `[26]`) **`0x07F0_200D`** lean, `0x07FF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+(branch `l2`, `[26]`) `0x07F0_200D` lean, `0x07FF_200D` full; with the range
+ops (branch `sddma`, `[27]`) **`0x0FF0_200D`** lean, `0x0FFF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =

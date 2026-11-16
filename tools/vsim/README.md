@@ -101,9 +101,10 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   mutations, the SoC tests at `MIGLAT` 36 and 8, L2 off / 8 ways / other
   timings, the `L2_EN` = 0 equivalence, the core regression).
 - tb_soc with the L2 also counts drains started in VGA's / DMA's window
-  with no request waiting on the buffer (`L2 rt drains bad=`: a gated run
-  fails on any); a gated run whose consistency checker checked nothing
-  fails.  `socvga --blit` adds a back-to-back blitter FILL.
+  with no request (nor the WBINV walk) waiting on the buffer (`L2 rt
+  drains bad=`, the need spelled out as in tb_l2; a gated run fails on any,
+  and an L2-on gated run without that line fails too); a gated run whose
+  consistency checker checked nothing fails.  `socvga --blit` adds a back-to-back blitter FILL.
 
 ## Sim-copy patches (Verilator 5.020 limits)
 

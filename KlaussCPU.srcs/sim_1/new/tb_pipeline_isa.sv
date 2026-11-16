@@ -33,9 +33,12 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    logic         m_read_DV, m_write_DV;
    logic [63:0]  m_wdata, m_rdata, m_rdata_next;
    wire  [63:0]  m_rdata_dram = m_rdata;   // (no bus_splitter here)
+   wire  [63:0]  m_rdata_next_dram = m_rdata_next;
    wire  [31:0]  h_addr;                   // no load-hit pipe here: the slow path
    wire          h_ok    = 1'b0;
    wire  [63:0]  h_dword = 64'b0;
+   wire  [63:0]  h_dw0 = 64'b0, h_dw1 = 64'b0;
+   wire          h_sel0 = 1'b0;
    logic [7:0]   m_be;
    logic         m_next_valid, m_ready;
    logic [7:0]   lcd_byte;  logic lcd_dc, lcd_dv, lcd_rst_n, lcd_rst_wr, bus_idle;
@@ -62,6 +65,9 @@ module tb_pipeline_isa #(parameter bit DEBUG_EN = 1'b0);
    klauss_pkg::flags_t dbg_flags;
    klauss_pkg::dbg_in_t  dbg_i = '0;
    klauss_pkg::dbg_out_t dbg_o;
+   logic [26:0]  cop_line = '0;      // RANGE_IINV inputs (RIINV_EN = 0 here)
+   logic [27:0]  cop_n    = '0;
+   logic         rk_busy;
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN)) dut (.*, .lcd_ready(1'b1), .ce(1'b1));
 

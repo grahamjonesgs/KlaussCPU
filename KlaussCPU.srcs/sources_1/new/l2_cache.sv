@@ -297,6 +297,14 @@ module l2_cache #(
     // busy cannot hold BUSY up
     logic       r_wk_snap = 1'b0;
     logic [1:0] r_wk_fl   = 2'b00;
+    // the walk waits on the write buffer (review 2, m-A): F_WK2 found a
+    // dirty way and the buffer full.  Until the walk copies it, the slot
+    // the next drain frees is the walk's: a posted write then needs an
+    // empty buffer (wb_full_p), so it cannot take the walk's slot on every
+    // turn; and the walk counts as a request in hand (w_wk_need): its
+    // drain starts in VGA's / a DMA master's window too, before a demand
+    // read
+    logic       r_wk_wb   = 1'b0;
     logic [SETW-1:0] r_walk_set = '0;
     assign o_en   = r_en_tgt;
     assign o_busy = r_walking;
@@ -341,6 +349,13 @@ module l2_cache #(
     logic        wb_h    = 1'b0;        // head (oldest)
     wire  [1:0]  wb_n    = {1'b0, wb_v[0]} + {1'b0, wb_v[1]};
     wire         wb_full = (wb_v == 2'b11);
+    // full for the front end: also while the walk holds the next free slot
+    // (r_wk_wb), unless both are free.  Only a posted write sees the
+    // difference (r_wk_wb implies a walk, when nothing allocates, so the
+    // victim-copy paths are dead); it is used for all of the front end's
+    // slot decisions all the same: a separate signal for the posted write
+    // alone cost ~330 LUTs of unshared write-buffer update logic (review 2)
+    wire         wb_full_p = wb_full || (r_wk_wb && wb_v != 2'b00);
     wire         wb_tail = wb_v[wb_h] ? !wb_h : wb_h;
     // the entry the engine drains: the oldest (FIFO — a later entry of the
     // same line holds newer bytes)
@@ -431,13 +446,18 @@ module l2_cache #(
     wire  w_wk_on   = r_walking && !r_walk_end;
     wire  w_wk_go   = w_wk_on && !e_filling && !(|r_db_we);
     // accept: a new request (not one already served), not to the set a fill
-    // is writing, not on the walk's turn
+    // is writing, not on the walk's turn, not a write to the set the walk
+    // waits in (review 2: it could dirty a way the walk copied already, so
+    // the walk would copy it again into its slot — a master writing that
+    // set held the walk there; held off, each way of a set is copied at
+    // most once, which bounds the walk)
     wire w_acc_ok = calib_done && w_dv && !r_served && !(r_wk_turn && w_wk_on) &&
                     !(e_filling && i_mem_addr[6 +: SETW] == e_set) &&
-                    !(|r_db_we && i_mem_addr[6 +: SETW] == r_db_addr[SETW:1]);
+                    !(|r_db_we && i_mem_addr[6 +: SETW] == r_db_addr[SETW:1]) &&
+                    !(r_wk_wb && i_mem_write_DV && i_mem_addr[6 +: SETW] == r_walk_set);
     assign w_wr_acc = (f_st == F_IDLE) && w_acc_ok && i_mem_write_DV;
     // the tags read on the last edge are this request's
-    wire w_imm = ra_ok && (ra_addr[31:5] == i_mem_addr[31:5]);
+    wire w_imm = ra_ok && (ra_addr[26:5] == i_mem_addr[26:5]);   // (the folded DDR address: aliases too)
 
     // port A address
     always_comb begin
@@ -500,11 +520,18 @@ module l2_cache #(
     // only the requested sector
     wire       w_rd_both = w_rd_newline && !i_rt_req;
     // VGA (wide DMA) reads: the stream buffer answers, or a sector-0 miss
-    // of an absent line fetches both sectors into it
-    wire       w_strm_hit = q_dma && q_wide && s_v && s_sec == q_addr[26:5];
-    wire       w_strm_new = q_dma && q_wide && !q_sec && !r_many;
+    // of an absent line fetches both sectors into it.  Only while the L2 is
+    // enabled (q_lk; review 2): a disabled L2 is a plain path to DDR, as
+    // L2_CTRL = 0 promises for A/B runs, and its DMA hit / miss counters
+    // stay 0 (a stream hit counts as a DMA hit, its fill as a DMA miss).  The
+    // buffer stays coherent while disabled (any write to its line drops it)
+    wire       w_strm_hit = q_lk && q_dma && q_wide && s_v && s_sec == q_addr[26:5];
+    wire       w_strm_new = q_lk && q_dma && q_wide && !q_sec && !r_many;
     wire       w_rd_needslot = w_rd_newline && (r_vd != 2'b00);
-    wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full);
+    // (the walk waits on a full buffer: its drain goes before a demand read)
+    wire       w_wk_need;
+    wire       w_rd_can = (e_st == E_IDLE) && !f_wbm(q_line) && !(w_rd_needslot && wb_full_p) &&
+                          !(w_wk_need && wb_rdy[wb_dh]);
     // writes
     wire       w_wr_cache_hit = q_lk && !q_dma && r_many;               // line present: write in place
     wire       w_wr_cache_alloc = w_alloc && q_lk && !q_dma && !r_many; // allocate the sector
@@ -513,10 +540,18 @@ module l2_cache #(
 
     // the front end waits on the write buffer: a read miss of a buffered
     // line, or a full buffer in the way of an allocation's victim copy or of
-    // a posted write
-    wire       w_fe_need = (f_st == F_DEC) &&
-                           (q_wr ? wb_full && ((w_wr_cache_alloc && r_vd != 2'b00) || w_wr_post)
-                                 : !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full)));
+    // a posted write (wb_full_p: the walk's reserved slot counts as taken)
+    wire       w_fe_req  = (f_st == F_DEC) &&
+                           (q_wr ? wb_full_p && ((w_wr_cache_alloc && r_vd != 2'b00) || w_wr_post)
+                                 : !w_rd_hit && (f_wbm(q_line) || (w_rd_needslot && wb_full_p)));
+    // the walk waits on the write buffer (review 2, m-A): a dirty way to
+    // copy and the buffer full, or (its end) the entries present when its
+    // last set was done.  The walk is a request in hand (the L2_CTRL write):
+    // without this a DMA master's posted writes (a write may drain in its
+    // window only for the request that waits on it) took every freed slot
+    // and held BUSY up for as long as they came
+    assign     w_wk_need = (r_wk_wb && wb_full) || (r_walk_end && r_wk_snap && r_wk_fl != 2'b00);
+    wire       w_fe_need = w_fe_req || w_wk_need;
 
     // the first burst: the one holding the requested dword (a 32 B request
     // carries a line-aligned address and the dword in q_dwoff)
@@ -566,7 +601,7 @@ module l2_cache #(
                                                     r_tv[r_mway] | (q_sec ? 2'b10 : 2'b01),
                                                     r_td[r_mway] | (q_sec ? 2'b10 : 2'b01)), r_mway);
                         db_we = WAYS'(1) << r_mway;
-                    end else if (w_wr_cache_alloc && !(r_vd != 2'b00 && wb_full)) begin
+                    end else if (w_wr_cache_alloc && !(r_vd != 2'b00 && wb_full_p)) begin
                         tb_we = 1'b1;
                         tb_din = f_plru_tw(f_setway(r_tw, r_vic, q_tag, q_sec ? 2'b10 : 2'b01,
                                                     q_sec ? 2'b10 : 2'b01), r_vic);
@@ -576,7 +611,7 @@ module l2_cache #(
                         tb_din = f_setway(r_tw, r_mway, q_tag, r_tv[r_mway],
                                           r_td[r_mway] | (q_sec ? 2'b10 : 2'b01));
                         db_we = WAYS'(1) << r_mway;
-                    end else if (w_wr_post && !wb_full) begin
+                    end else if (w_wr_post && !wb_full_p) begin
                         wbd_we = 1'b1;
                     end
                 end
@@ -632,6 +667,7 @@ module l2_cache #(
                 r_walking  <= 1'b1;
                 r_walk_end <= !r_en;
                 r_wk_snap  <= 1'b0;
+                r_wk_wb    <= 1'b0;
                 r_walk_set <= '0;
                 r_dis_pend <= !i_ctrl_wdata[0];
             end else r_en <= 1'b1;   // 1: enable (instant)
@@ -736,7 +772,7 @@ module l2_cache #(
                         end else begin
                             f_st <= F_WRSP;
                         end
-                    end else if (w_rd_needslot && wb_full) begin
+                    end else if (w_rd_needslot && wb_full_p) begin
                         ev_wbfull <= 1'b1;
                     end
                 end else if (!eng_bwr) begin
@@ -748,7 +784,7 @@ module l2_cache #(
                         if (r_vd == 2'b00) begin
                             ev_w_miss <= 1'b1;
                             f_st <= F_IDLE;
-                        end else if (!wb_full) begin
+                        end else if (!wb_full_p) begin
                             ev_w_miss <= 1'b1;
                             c_way <= r_vic; c_sec <= r_vd; c_e <= wb_tail;
                             r_msel <= r_vic;
@@ -762,7 +798,7 @@ module l2_cache #(
                     end else if (w_wr_dma_hit) begin
                         ev_dma_hit <= 1'b1;
                         f_st <= F_IDLE;
-                    end else if (!wb_full) begin
+                    end else if (!wb_full_p) begin
                         // post to DDR through the write buffer
                         if (q_lk) begin
                             if (q_dma) ev_dma_miss <= 1'b1;
@@ -797,6 +833,7 @@ module l2_cache #(
                 f_st <= F_WK2;
             end
             F_WK2: begin
+                r_wk_wb <= r_wk_any && wb_full;
                 if (r_wk_any) begin
                     if (!wb_full) begin
                         c_way <= r_wk_way; c_sec <= r_td[r_wk_way]; c_e <= wb_tail;
@@ -811,10 +848,12 @@ module l2_cache #(
                         f_st  <= F_VC0;
                     end else begin
                         ev_wbfull <= 1'b1;
-                        // yield to a request while the buffer drains; the
-                        // set is walked again from its tags, where the ways
-                        // copied already are clean (a way a request dirtied
-                        // meanwhile is copied again: a later entry)
+                        // yield to a request while the buffer drains (the
+                        // drain is the walk's: w_wk_need; the slot it frees
+                        // too: wb_full_p); the set is walked again from its
+                        // tags, where the ways copied already are clean (a
+                        // way a request dirtied meanwhile is copied again: a
+                        // later entry)
                         if (w_acc_ok) f_st <= F_IDLE;
                     end
                 end else begin
@@ -838,6 +877,7 @@ module l2_cache #(
             r_walk_end <= 1'b0;
             r_wk_turn  <= 1'b0;
             r_wk_snap  <= 1'b0;
+            r_wk_wb    <= 1'b0;
             r_en       <= !r_dis_pend || i_ctrl_en;
             r_dis_pend <= 1'b0;
         end
@@ -856,6 +896,8 @@ module l2_cache #(
             E_IDLE: begin
                 if (f_st == F_DEC && !q_wr && !w_rd_hit && !w_strm_hit && w_rd_can) begin
                     // start the read: the first burst holds the requested dword
+                    // (w_rd_can: not while the walk waits on a full buffer
+                    // whose oldest entry may drain — that drain goes first)
                     e_st    <= E_RD;
                     e_line  <= q_line;
                     e_c     <= w_cburst;
@@ -877,8 +919,8 @@ module l2_cache #(
                              (!(i_dma || i_rt_req) || w_fe_need)) begin
                     // (no drain starts during a DMA tenure, nor while VGA
                     // wants the bus — its reads would wait them out —
-                    // unless the request in F_DEC waits on the buffer:
-                    // w_fe_need)
+                    // unless the request in F_DEC or the walk waits on
+                    // the buffer: w_fe_need)
                     e_st  <= E_WR;
                     e_bm  <= wb_hb;
                     e_p   <= f_first(wb_hb);
@@ -964,7 +1006,7 @@ module l2_cache #(
         if (ui_rst) begin
             f_st <= F_IDLE; e_st <= E_IDLE;
             app_en <= 1'b0; app_wdf_wren <= 1'b0; app_wdf_end <= 1'b0;
-            wb_v <= '0; wb_rdy <= '0; e_rsp <= 1'b0; r_wk_fl <= '0; s_v <= 1'b0;
+            wb_v <= '0; wb_rdy <= '0; e_rsp <= 1'b0; r_wk_fl <= '0; s_v <= 1'b0; r_wk_wb <= 1'b0;
         end
     end
 
@@ -974,6 +1016,16 @@ module l2_cache #(
         if (|r_db_we && (f_st == F_VC0 || f_st == F_VC1 || f_st == F_VC2) &&
             r_db_addr[SETW:1] == c_set && r_db_we[c_way])
             $fatal(1, "l2_cache: fill write overtook the victim copy (set %0d way %0d)", e_set, e_way);
+    // the walk's reserved slot: only during a walk (no allocation then)
+    always_ff @(posedge clk)
+        if (r_wk_wb && (w_alloc || !r_walking))
+            $fatal(1, "l2_cache: r_wk_wb outside a walk");
+    // a stream-buffer answer never waits on the write buffer (review 2: the
+    // stream buffer holds a line no write has touched since its fill, so no
+    // entry of that line exists)
+    always_ff @(posedge clk)
+        if (w_fe_req && w_strm_hit)
+            $fatal(1, "l2_cache: a stream-buffer hit waits on the write buffer (%08x)", q_addr);
     // the D-cache always writes whole sectors
     always_ff @(posedge clk)
         if (f_st == F_IDLE && w_acc_ok && i_mem_write_DV && i_mem_wide && i_app_wdf_mask != 16'h0)

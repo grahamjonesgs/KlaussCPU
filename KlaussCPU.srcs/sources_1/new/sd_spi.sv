@@ -59,7 +59,19 @@ module sd_spi (
     input             i_sd_cmd,
     output     [3:0]  o_sd_dat,        // DAT[3:0] (SPI: DAT3 = CS_n, DAT1/2 high)
     output     [3:0]  o_sd_dat_oe,
-    input      [3:0]  i_sd_dat         // (SPI: DAT0 = MISO)
+    input      [3:0]  i_sd_dat,        // (SPI: DAT0 = MISO)
+
+    // ----- SD DMA: DDR master E on mem_read_write's arbiter (sd_native) -----
+    output            o_dma_req,
+    output            o_dma_done,
+    output            o_dma_write_DV,
+    output            o_dma_read_DV,
+    output     [31:0] o_dma_addr,
+    output    [127:0] o_dma_write_data,
+    output     [15:0] o_dma_wdf_mask,
+    input     [127:0] i_dma_read_data,
+    input             i_dma_ready,
+    input             i_dma_grant
 );
 
     // -----------------------------------------------------------------------
@@ -254,7 +266,17 @@ module sd_spi (
         .o_dat_oe  (w_nat_dat_oe),
         .i_cmd     (i_sd_cmd),
         .i_dat     (i_sd_dat),
-        .i_cd      (i_sd_cd)
+        .i_cd      (i_sd_cd),
+        .o_dma_req        (o_dma_req),
+        .o_dma_done       (o_dma_done),
+        .o_dma_write_DV   (o_dma_write_DV),
+        .o_dma_read_DV    (o_dma_read_DV),
+        .o_dma_addr       (o_dma_addr),
+        .o_dma_write_data (o_dma_write_data),
+        .o_dma_wdf_mask   (o_dma_wdf_mask),
+        .i_dma_read_data  (i_dma_read_data),
+        .i_dma_ready      (i_dma_ready),
+        .i_dma_grant      (i_dma_grant)
     );
 
     // Slot powered (pwr_en = 1): SPI mode keeps every pin's old direction and

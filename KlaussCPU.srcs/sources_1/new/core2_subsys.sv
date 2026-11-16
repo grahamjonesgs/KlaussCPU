@@ -148,9 +148,13 @@ module core2_subsys
       .m_zl       (),            // (DCBZ_EN = 0: always 0)
       .m_rdata    (m2_rdata),
       .m_rdata_dram (m2_rdata),
+      .m_rdata_next_dram (m2_rdata_next),
       .h_addr     (),            // no hit pipe on core 2: the slow path
       .h_ok       (1'b0),
       .h_dword    (64'b0),
+      .h_dw0      (64'b0),
+      .h_dw1      (64'b0),
+      .h_sel0     (1'b0),
       .m_rdata_next (m2_rdata_next),
       .m_next_valid (m2_next_valid),
       .m_line     ('0),             // (16 B I-cache lines: unused)
@@ -188,7 +192,10 @@ module core2_subsys
       .park_op    (c2_park_op),
       .dbg_r      (c2_dbg_r),
       .dbg_sp     (c2_dbg_sp),
-      .dbg_flags  (c2_dbg_flags)
+      .dbg_flags  (c2_dbg_flags),
+      .cop_line   (27'h0),          // (RIINV_EN = 0: no RANGE_IINV on core 2)
+      .cop_n      (28'h0),
+      .rk_busy    ()
    );
 
    // Start sequencing (CE grid): RUN 0→1 releases reset, waits 2 core cycles,

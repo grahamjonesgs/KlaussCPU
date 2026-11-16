@@ -25,8 +25,9 @@
 // (FATAL line otherwise).  Indexed by the DDR address: PA[31:27] alias
 // PA[26:0] (the MIG ignores its rank bit PA[27]; PA[31:28] never reach it).
 // With the L2 (+define+L2_PROBE): drains that start while VGA wants the bus
-// or a DMA master holds it, with no request waiting on the write buffer
-// (review 1 M2), are counted ("L2 rt drains bad=").
+// or a DMA master holds it, with no request (nor the WBINV walk) waiting on
+// the write buffer (review 1 M2, review 2), are counted ("L2 rt drains
+// bad="; the need spelled out as in tb_l2, not taken from the RTL).
 //===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -130,6 +131,10 @@ module tb_soc;
       .ddr2_ck_p(), .ddr2_ck_n(), .ddr2_cke(), .ddr2_cs_n(),
       .ddr2_dm(ddr2_dm), .ddr2_odt()
    );
+
+   // the SD card on the native bus (sd_card_sync: the SD DMA tests; idle
+   // unless a program powers the slot and talks to it)
+   sd_card_sync sdcard (.clk(dut.i_Clk), .sck(o_SD_SCK), .pwr(!o_SD_RESET), .cmd(io_SD_CMD), .dat(io_SD_DAT));
 
    // silicon powers up with this at 0 (bitstream init); xsim needs the deposit
    initial dut.r_start_wait_counter = 32'h0;
@@ -247,24 +252,163 @@ module tb_soc;
       end
    end
 
+   // ---------------- SD DMA transactions (master E) ----------------
+   longint runcyc_all = 0;
+   always @(posedge dut.i_Clk) runcyc_all++;
+   // (SD_DMA_PROBE: run.py defines it for an RTL with master E)
+   int sd_dma_wr = 0, sd_dma_rd = 0;
+`ifdef SD_DMA_PROBE
+   always @(posedge dut.i_Clk) if (dut.mem_read_write.r_grant_sd && dut.mem_read_write.i_ddr_mem_ready) begin
+      if (dut.mem_read_write.mig_write_DV) sd_dma_wr++; else sd_dma_rd++;
+   end
+   // the worst SD DMA transaction (cycles from its req to its ready; and DV
+   // to ready) and the worst wait of VGA's req for its grant
+   int sd_lat_max = 0, sd_dv_max = 0, vga_gw_max = 0, sd_lat = 0, sd_dv = 0, vga_gw = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.w_sd_dma_req) sd_lat++; else sd_lat = 0;
+      if (dut.w_sd_dma_write_DV || dut.w_sd_dma_read_DV) sd_dv++; else sd_dv = 0;
+      if (dut.w_sd_dma_ready) begin
+         if (sd_lat > sd_lat_max) sd_lat_max = sd_lat;
+         if (sd_dv > sd_dv_max) sd_dv_max = sd_dv;
+      end
+      if (dut.vga_ctrl_i.scanout.o_dma_req && !dut.vga_ctrl_i.scanout.i_dma_grant) vga_gw++;
+      else begin if (vga_gw > vga_gw_max) vga_gw_max = vga_gw; vga_gw = 0; end
+   end
+   // SD DMA abort latency (runtime-96's stop budget): cycles from an
+   // SDM_CFG write with DMA_EN = 0 (or a FIFO reset) during DMA_BUSY to
+   // DMA_BUSY = 0, max per kind; and each 16 B transaction's wait for the
+   // bus (req -> grant), as a histogram
+   longint ab_t0 = -1; int ab_kind = 0; int ab_max[2] = '{0, 0}; int ab_n[2] = '{0, 0};
+   int bw = 0, bw_max = 0;
+   int bw_h[7] = '{0, 0, 0, 0, 0, 0, 0};        // < 16, < 64, < 256, < 1024, < 2048, < 4096, more
+   always @(posedge dut.i_Clk) begin
+      if (ab_t0 < 0 && dut.sd_spi_i.native_i.w_dma_busy &&
+          (dut.sd_spi_i.native_i.w_cfg_dma_off || dut.sd_spi_i.native_i.w_fifo_rs)) begin
+         ab_t0 = runcyc_all; ab_kind = dut.sd_spi_i.native_i.w_fifo_rs ? 1 : 0;
+      end else if (ab_t0 >= 0 && !dut.sd_spi_i.native_i.w_dma_busy) begin
+         if (int'(runcyc_all - ab_t0) > ab_max[ab_kind]) ab_max[ab_kind] = int'(runcyc_all - ab_t0);
+         ab_n[ab_kind]++;
+         ab_t0 = -1;
+      end
+      if (dut.w_sd_dma_req && !dut.w_sd_dma_grant) bw++;
+      else if (dut.w_sd_dma_req && dut.w_sd_dma_grant && bw >= 0) begin
+         bw_h[bw < 16 ? 0 : bw < 64 ? 1 : bw < 256 ? 2 : bw < 1024 ? 3 : bw < 2048 ? 4 : bw < 4096 ? 5 : 6]++;
+         if (bw > bw_max) bw_max = bw;
+         bw = -1;
+      end
+      if (!dut.w_sd_dma_req) bw = 0;
+   end
+   // cache maintenance timing (SD DMA spec v1.2 walk timing): one line per
+   // D-cache walk ("WALK range|whole lines= dirty_wb= cycles=", from the
+   // WAIT -> MAINT edge to MNT_BUSY's drop, queue wait excluded) and per
+   // RANGE_IINV sweep ("RKSWEEP lines= cycles=", MNT_BUSY's share)
+   longint wk_t0 = 0, rk_t0 = 0;
+   int wk_wb = 0, wk_n = 0, rk_n = 0;
+   bit wk_q = 0, rk_q = 0, wk_rng = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.mem_read_write.r_mnt_active && !wk_q) begin
+         wk_t0 = runcyc_all; wk_wb = 0; wk_rng = dut.mem_read_write.r_mnt_rng;
+         wk_n = dut.mem_read_write.r_mnt_rng ? int'(dut.mem_read_write.r_rw_left) : 2048;
+      end
+      if (dut.mem_read_write.state == 16'd16384 && dut.mem_read_write.w_cache_ddr_ready) wk_wb++;
+      if (!dut.mem_read_write.r_mnt_active && wk_q)
+         $display("TB_SOC: WALK %s sets=%0d dirty_wb=%0d cycles=%0d", wk_rng ? "range" : "whole", wk_n, wk_wb, runcyc_all - wk_t0);
+      wk_q = dut.mem_read_write.r_mnt_active;
+      if (dut.w_ic_rk_busy && !rk_q) begin rk_t0 = runcyc_all; rk_n = int'(dut.r_cop_n); end
+      if (!dut.w_ic_rk_busy && rk_q)
+         $display("TB_SOC: RKSWEEP lines=%0d cycles=%0d", rk_n, runcyc_all - rk_t0);
+      rk_q = dut.w_ic_rk_busy;
+   end
+   // maintenance-op accounting (SD DMA review 1): every whole-cache go
+   // (FLUSH / INVALIDATE, or a range op turned into one) must be followed by
+   // a whole walk that STARTS after it (a walk starting in the go's own
+   // cycle froze its mode before it) and, for an invalidating go, by an
+   // INVALIDATE walk; every range go that takes the slot, by a range walk
+   // starting after it.  An op still owed at HALTED, with MNT_BUSY = 0,
+   // is lost (FATAL, gated like the consistency checker).
+   bit mo_any = 0, mo_inv = 0, mo_rng = 0;
+   int mo_lost = 0;
+   always @(posedge dut.i_Clk) begin
+      if (dut.mem_read_write.w_whole_start) begin
+         mo_any = 0;
+         if (dut.mem_read_write.r_mnt_mode) mo_inv = 0;
+      end
+      if (dut.mem_read_write.w_rng_start) mo_rng = 0;
+      if (dut.mem_read_write.w_wgo) begin
+         // (a pending range op absorbed here is owed by the whole walk now:
+         // w_wgo_inv includes its invalidate)
+         if (dut.mem_read_write.w_rng_pq) mo_rng = 0;
+         mo_any = 1;
+         if (dut.mem_read_write.w_wgo_inv) mo_inv = 1;
+      end
+      if (dut.mem_read_write.i_rng_go && !dut.mem_read_write.w_rng_cvt) mo_rng = 1;
+   end
+   task automatic mo_check();
+      if (!dut.w_cache_mnt_busy && (mo_any || mo_inv || mo_rng))
+         $display("TB_SOC: FATAL consistency: a maintenance op was lost (whole %0d, invalidate %0d, range %0d)", mo_any, mo_inv, mo_rng);
+   endtask
+   // +DCP<k>=<hex PA> (k = 0..7): the D-cache's state of that line at HALTED
+   task automatic dcp_dump();
+      for (int k = 0; k < 8; k++) begin
+         logic [31:0] pa;
+         if ($value$plusargs($sformatf("DCP%0d=%%h", k), pa)) begin
+            automatic int ix = pa[14:5];
+            automatic logic h0 = dut.mem_read_write.cache_val_addr_way0[ix] == {1'b1, pa[31:15]};
+            automatic logic h1 = dut.mem_read_write.cache_val_addr_way1[ix] == {1'b1, pa[31:15]};
+            automatic logic d  = h0 ? dut.mem_read_write.cache_dirty_way0[ix] : h1 ? dut.mem_read_write.cache_dirty_way1[ix] : 1'b0;
+            $display("TB_SOC: DCP%0d %08x valid=%0d dirty=%0d", k, pa, h0 || h1, d);
+         end
+      end
+   endtask
+`else
+   task automatic dcp_dump(); endtask
+   task automatic mo_check(); endtask
+`endif
+
    // ---------------- L2 drains in VGA's / DMA's window (review 1 M2) --------
    int rt_bad = 0, rt_need = 0;
 `ifdef L2_PROBE
+`define L2C dut.mem_read_write.g_l2.l2_cache
+   // the need (tb_l2's rt_need_now): the request in F_DEC — a read miss of
+   // a buffered line, a cache read / write allocating over a dirty victim
+   // with the buffer full, a posted write with the buffer full (or not
+   // empty while the walk holds the next slot) — or the walk: a dirty way
+   // and the buffer full, or its end with entries left.  A DMA / VGA read
+   // miss needs no slot.
+   function automatic bit rt_need_now();
+      bit hit, many, lk, dmaq, alloc, vdirty, full, wbm, post, wk_wb;
+      hit   = `L2C.r_hit; many = `L2C.r_many; lk = `L2C.q_lk; dmaq = `L2C.q_dma;
+      alloc = `L2C.r_en && !`L2C.r_walking;
+      vdirty = `L2C.r_td[`L2C.r_vic] != 2'b00;
+      full  = `L2C.wb_v == 2'b11;
+      wbm   = (`L2C.wb_v[0] && `L2C.wb_line[0] == `L2C.q_addr[26:6]) ||
+              (`L2C.wb_v[1] && `L2C.wb_line[1] == `L2C.q_addr[26:6]);
+      post  = !(lk && !dmaq && many) && !(alloc && lk && !dmaq && !many) && !(lk && dmaq && hit);
+      wk_wb = 0;
+`ifdef L2_PROBE_WK
+      // (review 2's walk terms; run.py defines L2_PROBE_WK for an RTL that
+      // has them — an older L2 under this tb_soc has no r_wk_wb)
+      wk_wb = `L2C.r_wk_wb;
+      if (`L2C.r_walk_end && `L2C.r_wk_snap && `L2C.r_wk_fl != 2'b00) return 1;
+`endif
+      if (wk_wb && full) return 1;
+      if (`L2C.f_st != 4'd2) return 0;
+      if (!`L2C.q_wr)
+         return !(lk && hit) && (wbm || (alloc && lk && !dmaq && !many && vdirty && full));
+      return (alloc && lk && !dmaq && !many && vdirty && full) ||
+             (post && (full || (wk_wb && `L2C.wb_v != 2'b00)));
+   endfunction
    bit rt_pend = 0, rt_pneed = 0;
    always @(posedge dut.i_Clk) begin
       // a drain started on the last edge (E_IDLE -> E_WR): judged by that
-      // cycle's state — a request in F_DEC waiting on the buffer (full, or
-      // its line in it) or not
-      if (rt_pend && dut.mem_read_write.g_l2.l2_cache.e_st == 2'd2) begin
+      // cycle's state
+      if (rt_pend && `L2C.e_st == 2'd2) begin
          if (rt_pneed) rt_need++; else rt_bad++;
       end
-      rt_pend  = dut.mem_read_write.g_l2.l2_cache.e_st == 2'd0 &&
-                 (dut.mem_read_write.g_l2.l2_cache.i_rt_req || dut.mem_read_write.g_l2.l2_cache.i_dma);
-      rt_pneed = dut.mem_read_write.g_l2.l2_cache.f_st == 4'd2 &&
-                 !(!dut.mem_read_write.g_l2.l2_cache.q_wr && dut.mem_read_write.g_l2.l2_cache.w_rd_hit) &&
-                 (dut.mem_read_write.g_l2.l2_cache.wb_full ||
-                  dut.mem_read_write.g_l2.l2_cache.f_wbm(dut.mem_read_write.g_l2.l2_cache.q_line));
+      rt_pend  = `L2C.e_st == 2'd0 && (`L2C.i_rt_req || `L2C.i_dma);
+      rt_pneed = rt_need_now();
    end
+`undef L2C
 `endif
 
    // ---------------- VGA scanout probe (HW_PERF_PLAN.md §6) ----------------
@@ -313,10 +457,26 @@ module tb_soc;
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_ref,
                   dut.mem_read_write.`DDRPATH.mig_7series_0.n_wtr);
          $display("TB_SOC: VGA lines=%0d max_fetch=%0d underflows=%0d", vga_lines, vga_age_max, vga_under);
+         $display("TB_SOC: SDC cmds=%0d rd_blocks=%0d wr_blocks=%0d wr_bad=%0d host_err=%0d rd_bad_sent=%0d sd_dma_wr=%0d sd_dma_rd=%0d",
+                  sdcard.n_cmds, sdcard.blocks_read, sdcard.blocks_written, sdcard.wr_bad, sdcard.host_err,
+                  sdcard.rd_bad_sent, sd_dma_wr, sd_dma_rd);
+`ifdef SD_DMA_PROBE
+         $display("TB_SOC: SDLAT req_to_ready_max=%0d dv_to_ready_max=%0d vga_grant_wait_max=%0d", sd_lat_max, sd_dv_max, vga_gw_max);
+         $display("TB_SOC: SDABORT en_n=%0d en_max=%0d fifo_n=%0d fifo_max=%0d busw_max=%0d busw_hist=%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                  ab_n[0], ab_max[0], ab_n[1], ab_max[1], bw_max, bw_h[0], bw_h[1], bw_h[2], bw_h[3], bw_h[4], bw_h[5], bw_h[6]);
+`endif
          $display("TB_SOC: VGA reads=%0d read_cycles=%0d grant_cyc=%0d", vga_rd_n, vga_rd_cyc, vga_gnt_cyc);
 `ifdef L2_PROBE
          $display("TB_SOC: L2 rt drains bad=%0d need=%0d", rt_bad, rt_need);
 `endif
+         mo_check();
+         dcp_dump();
+         // the final registers (runs without a retire trace)
+         begin
+            string rs = "TB_SOC: REGS";
+            for (int i = 0; i < 16; i++) rs = {rs, $sformatf(" r%0d=%016x", i, dut.pipeline_core_i.rf[i])};
+            $display("%s", rs);
+         end
          $display("TB_SOC: HALTED after %0d retired instructions, %0d UART bytes", icount, uart_n);
          $fclose(uart_f); $fclose(trace_f);
          $finish;

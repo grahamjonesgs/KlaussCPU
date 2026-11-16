@@ -80,7 +80,14 @@ module pipeline_core
    // and lp_v would hold the fill engine for good.  An instance with a
    // real clock enable (core 2) passes 0 and IC_LB = 16 (elaboration
    // check below; a simulation assertion checks ce stays 1 when it is 1).
-   parameter bit CE_TIED  = 1'b1
+   parameter bit CE_TIED  = 1'b1,
+   // SD DMA spec v1.2: CACHE_CTRL[6] RANGE_IINV — the core decodes its own
+   // completing store as for ICACHE_INV [3], and drops the lines of the
+   // range (cop_line / cop_n, the SoC's CACHE_OP_ADDR / LEN) from the
+   // I-cache with a sweep of only those lines; every other fetch-side copy
+   // (window, NLB, BTIC, a pending install) goes as for ICACHE_INV.  With
+   // 16 B lines it is a whole ICACHE_INV.  0: bit 6 is ignored (core 2).
+   parameter bit RIINV_EN = 1'b0
 )
 (
    input  logic         clk,
@@ -113,6 +120,10 @@ module pipeline_core
    // the bus_splitter response select) — a fast load is always DRAM, so its
    // value skips the address decode / select (timing); = m_rdata elsewhere
    input  logic [63:0]  m_rdata_dram,
+   // (tmg timing) the DRAM side's next dword (= m_rdata_next for a DRAM
+   // read): a RET / LEAVERET's return address compare skips the splitter's
+   // response select (see ret_ne)
+   input  logic [63:0]  m_rdata_next_dram,
    // 1a stage 3 load-hit pipe (mem_read_write): the EX op's load address goes
    // out every cycle; the cache answers the cycle after with the doubleword
    // and whether it is a clean hit (STAGE3_DCACHE_PLAN.md)
@@ -123,6 +134,11 @@ module pipeline_core
    output logic         h_c1,
    input  logic         h_ok,
    input  logic [63:0]  h_dword,
+   // (tmg timing) each way's dword at h_addr's offset and the way select
+   // (h_dword = h_sel0 ? h_dw0 : h_dw1): the load-bypass value wb_hext is
+   // extracted from both in parallel with the cache's tag compare
+   input  logic [63:0]  h_dw0, h_dw1,
+   input  logic         h_sel0,
    input  logic         m_next_valid,
    input  logic         m_ready,
    // HW_PERF_PLAN.md §5 (IC_LB = 32): the cache's whole 32 B line for each
@@ -188,7 +204,12 @@ module pipeline_core
    // debugger (DEBUG_EN): halt/resume/step, breakpoints, watchpoints, and
    // register / memory access while debug-halted
    input  dbg_in_t      dbg_i = '0,
-   output dbg_out_t     dbg_o
+   output dbg_out_t     dbg_o,
+   // RANGE_IINV (RIINV_EN): the range's first line PA[31:5] and line count
+   // (0 = LEN 0: a no-op), and its sweep running (CACHE_STATUS.MNT_BUSY)
+   input  logic [26:0]  cop_line,
+   input  logic [27:0]  cop_n,
+   output logic         rk_busy
 );
 
    // ------------------------------------------------------- build switches
@@ -607,7 +628,10 @@ module pipeline_core
    logic [28:0] r_base_p1;         // ifb_base + 1
    logic [28:0] r_base_p2;         // ifb_base + 2
    logic [27:0] r_want_line;       // ifb_base[28:1] + 1
-   wire        in0   = ifb_val[0] && pos[0];
+   // (tmg timing) = ifb_val[0] && pos[0], registered (asserted; see pos_track)
+   (* max_fanout = 48 *) logic r_in0;
+   logic [1:0]  ifb_val_n;
+   wire        in0   = r_in0;
    wire        in1   = ifb_val[1] && pos[1];
    wire [127:0] w_win = in0 ? {ifb_dw[1], ifb_dw[0]} : {64'h0, ifb_dw[1]};
    wire [31:0] w_op   = pc[2] ? w_win[63:32]  : w_win[31:0];
@@ -1470,8 +1494,38 @@ module pipeline_core
    // id_mfsr = it is an MFSR (its SR value, id_srv, loads ex_var1/2)
    logic id_fx, id_fxc, id_mfsr, id_fx2, id_fxg, id_fxm, id_fxl;
    logic [63:0] id_srv;           // mmu_sr's read port, at id_op[15:12]
+   // (tmg timing) the ID op's legality and privilege, decoded from w_op at
+   // the IF->ID latch (f_decode_raw(id_op).legal and f_priv of its raw
+   // decode — both already computed there, for id_ser / w_xser): the ILLEGAL
+   // / PRIVILEGED override of every ex_d field no longer waits on the
+   // legality cone of id_op (id_op -> ex_d.uop / the field clears)
+   logic id_legal, id_privop;
+   // = f_decode(op, um, ...) with d.legal = lg and f_priv(d, op) = pv
+   function automatic dec_t f_decode_q(logic [31:0] op, logic lg, logic pv, logic um, logic fx,
+                                       logic fxc, logic fx2, logic fxg, logic fxm, logic fxl);
+      dec_t d;
+      d = f_decode_raw(op);
+      d.legal = lg;
+      if (!lg) begin
+         d.uop = U_ILL; d.serialize = 1'b1; d.mtsr = 1'b0; d.tlbi = 1'b0;
+         d.wreg = 1'b0; d.fmask = '0; d.is_mem = 1'b0; d.sp_wr = 1'b0; d.zl = 1'b0;
+         d.use_rs1 = 1'b0; d.use_rs2 = 1'b0; d.use_rdd = 1'b0; d.fread = 1'b0; d.sp_rd = 1'b0;
+      end else if (EN_EXC && um && pv) begin
+         d = f_mkx(d, X_PRIV);
+      end
+      if (EN_EXC && fx) begin
+         d = f_mkx(d, fxc ? X_MISAL_FE : (EN_TLB && fxm) ? X_TLB_FE : X_ACC_FE);
+         d.fx2 = fx2 && !fxc;  d.fxg = fxg && !fxc;  d.fxl = EN_TLB && fxl && !fxc;
+      end
+      return d;
+   endfunction
    dec_t dec;
-   assign dec = f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl);
+   assign dec = f_decode_q(id_op, id_legal, id_privop, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && id_valid)
+      assert (dec == f_decode(id_op, umode, id_fx, id_fxc, id_fx2, id_fxg, id_fxm, id_fxl))
+         else $fatal(1, "f_decode_q != f_decode (id_op %h)", id_op);
+`endif
    // M12 hazard predecode: the operand-use flags the interlock needs are
    // decoded from w_op at the IF->ID latch and registered, so raw_stall (and
    // through it the pc/dispatch hold) starts from registers instead of the
@@ -2128,9 +2182,56 @@ module pipeline_core
                   : (cmp_op_e'(ex_d.sub) == CMP_MAX)  ? ($signed(opa) > $signed(opb))
                   : (cmp_op_e'(ex_d.sub) == CMP_MINU) ? (opa < opb)
                   :                                     (opa > opb);      // MAXU
+   // (tmg timing) the ALU result's two hot legs, selected last: the
+   // adder's sum (U_ALU other than AND / OR / XOR) and a compare's bit
+   // (U_BOOL / U_FBR EQ ... UGE), decided at dispatch (ex_res_add /
+   // ex_res_cmp, with the adder's subtract / carry-in controls), so the
+   // 64-bit carry chain no longer feeds the uop case mux (ex_d.uop ->
+   // adder control -> carry chain -> five mux levels -> mem_result)
+   logic ex_res_add, ex_res_cmp, ex_alu_sub, ex_alu_cf;
+   wire        ex_cin = ex_alu_cf && flags_eff.carry;
+   wire [64:0] ex_sum = ex_alu_sub ? ({1'b0, opa} - {1'b0, opb} - {64'b0, ex_cin})
+                                   : ({1'b0, opa} + {1'b0, opb} + {64'b0, ex_cin});
+   logic       ex_cmpbit;
+   always_comb
+      case (cmp_op_e'(ex_d.sub))
+         CMP_EQ:  ex_cmpbit = (opa == opb);
+         CMP_NE:  ex_cmpbit = (opa != opb);
+         CMP_LT:  ex_cmpbit = ($signed(opa) <  $signed(opb));
+         CMP_LE:  ex_cmpbit = ($signed(opa) <= $signed(opb));
+         CMP_GT:  ex_cmpbit = ($signed(opa) >  $signed(opb));
+         CMP_GE:  ex_cmpbit = ($signed(opa) >= $signed(opb));
+         CMP_ULT: ex_cmpbit = (opa <  opb);
+         CMP_ULE: ex_cmpbit = (opa <= opb);
+         CMP_UGT: ex_cmpbit = (opa >  opb);
+         CMP_UGE: ex_cmpbit = (opa >= opb);
+         default: ex_cmpbit = 1'b0;
+      endcase
+   function automatic logic f_res_add(dec_t d);
+      return d.uop == U_ALU && d.sub != 4'd4 && d.sub != 4'd5 && d.sub != 4'd6;
+   endfunction
+   function automatic logic f_res_cmp(dec_t d);
+      return (d.uop == U_BOOL || d.uop == U_FBR) &&
+             (cmp_op_e'(d.sub) == CMP_EQ || cmp_op_e'(d.sub) == CMP_NE || cmp_op_e'(d.sub) == CMP_LT ||
+              cmp_op_e'(d.sub) == CMP_LE || cmp_op_e'(d.sub) == CMP_GT || cmp_op_e'(d.sub) == CMP_GE ||
+              cmp_op_e'(d.sub) == CMP_ULT || cmp_op_e'(d.sub) == CMP_ULE || cmp_op_e'(d.sub) == CMP_UGT ||
+              cmp_op_e'(d.sub) == CMP_UGE) &&
+             !(EN_FBR_EQ_EX && !EN_BP && d.uop == U_FBR &&
+               (cmp_op_e'(d.sub) == CMP_EQ || cmp_op_e'(d.sub) == CMP_NE));
+   endfunction
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && ex_valid)
+      assert (ex_res_add == f_res_add(ex_d) && ex_res_cmp == f_res_cmp(ex_d) &&
+              (!ex_res_add || (ex_alu_sub == (ex_d.sub == 4'd1 || ex_d.sub == 4'd3 || ex_d.sub == 4'd7) &&
+                               ex_alu_cf  == (ex_d.sub == 4'd2 || ex_d.sub == 4'd3))))
+         else $fatal(1, "ex_res_add / ex_res_cmp / ALU controls != ex_d (pc %h)", ex_pc);
+   // the selected-last legs are the case's result
+   always_ff @(posedge clk) if (!rst && ex_valid && (ex_res_add || ex_res_cmp))
+      assert (exo_result == (ex_res_add ? ex_sum[63:0] : {63'b0, ex_cmpbit}))
+         else $fatal(1, "exo_result's fast leg (pc %h)", ex_pc);
+`endif
    always_comb begin : ex_logic
       logic [64:0]        sum;
-      logic               is_sub, cin;
       logic signed [63:0] sa, sb;
       logic [63:0]        val, q_raw;
       logic               q_neg;
@@ -2149,19 +2250,16 @@ module pipeline_core
       endcase
       case (ex_d.uop)
          U_ALU: begin
-            is_sub = (ex_d.sub == 4'd1) || (ex_d.sub == 4'd3) || (ex_d.sub == 4'd7);
-            cin    = (ex_d.sub == 4'd2 || ex_d.sub == 4'd3) ? flags_eff.carry : 1'b0;
             case (ex_d.sub)
                4'd4: exo_result = opa & opb;
                4'd5: exo_result = opa | opb;
                4'd6: exo_result = opa ^ opb;
                default: begin
-                  if (is_sub) sum = {1'b0, opa} - {1'b0, opb} - {64'b0, cin};
-                  else        sum = {1'b0, opa} + {1'b0, opb} + {64'b0, cin};
+                  sum = ex_sum;   // (= the is_sub / cin form, asserted at dispatch)
                   exo_result        = sum[63:0];
                   exo_fval.carry    = sum[64];
                   exo_fval.sign     = sum[63];
-                  exo_fval.overflow = is_sub ? ((opa[63] != opb[63]) && (sum[63] != opa[63]))
+                  exo_fval.overflow = ex_alu_sub ? ((opa[63] != opb[63]) && (sum[63] != opa[63]))
                                              : ((opa[63] == opb[63]) && (sum[63] != opa[63]));
                end
             endcase
@@ -2172,16 +2270,8 @@ module pipeline_core
             if (ex_d.uop == U_FBR) exo_eaddr = ex_pc + ex_var2;
             sa = opa; sb = opb;
             case (cmp_op_e'(ex_d.sub))
-               CMP_EQ:   exo_result = (opa == opb) ? 64'b1 : 64'b0;
-               CMP_NE:   exo_result = (opa != opb) ? 64'b1 : 64'b0;
-               CMP_LT:   exo_result = (sa < sb)   ? 64'b1 : 64'b0;
-               CMP_LE:   exo_result = (sa <= sb)  ? 64'b1 : 64'b0;
-               CMP_GT:   exo_result = (sa > sb)   ? 64'b1 : 64'b0;
-               CMP_GE:   exo_result = (sa >= sb)  ? 64'b1 : 64'b0;
-               CMP_ULT:  exo_result = (opa < opb)  ? 64'b1 : 64'b0;
-               CMP_ULE:  exo_result = (opa <= opb) ? 64'b1 : 64'b0;
-               CMP_UGT:  exo_result = (opa > opb)  ? 64'b1 : 64'b0;
-               CMP_UGE:  exo_result = (opa >= opb) ? 64'b1 : 64'b0;
+               CMP_EQ, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE,
+               CMP_ULT, CMP_ULE, CMP_UGT, CMP_UGE: exo_result = {63'b0, ex_cmpbit};
                // MIN/MAX/MINU/MAXU (timing): the 64-bit select moved to MEM
                // (mem_result_eff, M12 Stage D style).  EX hands on opa (as
                // the result), opb (in the store-data register, unused by ALU
@@ -2689,9 +2779,20 @@ module pipeline_core
    wire ret_ne_fb    = mem_fwb[31:0]   != mem_pred_tgt;
    wire ret_ne_fc    = mem_fwc[31:0]   != mem_pred_tgt;
    wire ret_ne_h     = mem_fq ? (mem_fsel ? ret_ne_fa : mem_fselc ? ret_ne_fc : ret_ne_fb) : ret_ne_hr;
+   // (tmg timing: the port's return address is compared from the DRAM
+   // side's data, m_rdata_dram / m_rdata_next_dram — the cache's registers,
+   // without the splitter's response select (bus_splitter r_is_mmio ->
+   // read data -> compare -> ras_miss -> pc was a near-critical family).
+   // A return address popped from MMIO (the port address m_addr in
+   // 0xF...: the splitter's select, registered, when the data is used)
+   // always counts as mispredicted: the redirect goes to ret_actual, the
+   // real value, so it is correct, a squash only when the prediction was
+   // right — no program keeps its stack in MMIO.)
+   wire ret_port_io  = m_addr[31:28] == 4'hF;
    wire ret_ne       = mem_ret_h ? ret_ne_h
-                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata[31:0] != mem_pred_tgt)
-                     : (m_rdata_next[31:0] != mem_pred_tgt);
+                     : ret_port_io ? 1'b1
+                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata_dram[31:0] != mem_pred_tgt)
+                     : (m_rdata_next_dram[31:0] != mem_pred_tgt);
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && ret_ne;
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
                         ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
@@ -2880,8 +2981,26 @@ module pipeline_core
    // bit 3; the core decodes its own completing store. Invalidates every
    // fetch-side code copy and refetches everything younger — for code written
    // by non-snooping writers (DMA, core 2) and as an explicit loader fence.
-   wire        icinv      = mem_done_now && mem_is_write && mem_iaddr == 32'hF005_0000 &&
-                            mem_be[0] && mem_wdata[3];
+   // (sddma2 timing: a CACHE_CTRL store is MMIO, so of mem_done_now's terms
+   // only the port's can complete it — the posted / queued / fast-load
+   // terms all need iaddr[31:28] != F; = the plain form, asserted)
+   wire        cc_st      = mem_is_write && mem_iaddr == 32'hF005_0000 && mem_be[0];
+   wire        cc_done    = (mem_xc == 2'd1 && w_mrdy && !mem_need2) || (mem_xc == 2'd3 && w_mrdy) ||
+                            (mem_xc == 2'd1 && st_post_ok);
+   wire        icinv_f    = cc_st && cc_done && mem_wdata[3];
+   // RANGE_IINV (CACHE_CTRL[6], RIINV_EN; honoured with FLUSH /
+   // INVALIDATE, as ICACHE_INV is — SD DMA review 1; ignored with LEN = 0;
+   // with ICACHE_INV the fence covers it).  Everything ICACHE_INV does but the valid bits: of those only the
+   // range's (g_vl's range sweep; 16 B lines: all of them).
+   // (timing: LEN != 0 and the range's "whole cache" test registered — the
+   // SoC's CACHE_OP_LEN is written long before the CACHE_CTRL store)
+   logic       r_cop_nz = 1'b0, r_cop_full = 1'b0;
+   always_ff @(posedge clk) begin
+      r_cop_nz   <= cop_n != 28'd0;
+      r_cop_full <= cop_n >= 28'(IC_LINES);
+   end
+   wire        icinv_r    = RIINV_EN && cc_st && cc_done && mem_wdata[6] && !mem_wdata[3] && r_cop_nz;
+   wire        icinv      = icinv_f || icinv_r;
 
    // ------------- HW_PERF_PLAN §5: line valid bits (IC_LB = 32) -------------
    // VB_N LUTRAM banks of VB_D x 1, the bank = the line index's high bits.
@@ -2918,15 +3037,53 @@ module pipeline_core
       wire               vdrop = snoop_q && snoop_idx_q == vidx;
       wire               vset  = vreq && !vdrop && !lpi;   // a set, now or deferred
       wire [IC_IDXW-1:0] wl    = snoop_q ? snoop_idx_q : vidx;
-      wire [VB_AW-1:0]   wa    = ic_sw ? ic_swa : wl[VB_AW-1:0];
-      wire               wd    = !ic_sw && !snoop_q && !lpi;
-      wire               swgo  = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv;
+      // RANGE_IINV (SD DMA spec v1.2): a range sweep (r_sw_rng) clears at
+      // each bank address only the banks whose line there is in the range
+      // (r_sw_mask, registered for the address it is used at), from the
+      // range's first address for min(n, VB_D) steps: n lines in
+      // min(n, VB_D) cycles.  A store's snoop clear outside the range must
+      // still land, so it takes the write port and the sweep waits a cycle
+      // (a whole sweep needs neither).  Lookups miss and sets wait for the
+      // whole of it, as in a whole sweep.  A range op that meets a sweep
+      // already running, or covers the whole cache, sweeps the whole cache.
+      logic              r_sw_rng = 1'b0, r_sw_rk = 1'b0;
+      logic [VB_N-1:0]   r_sw_mask = '0;
+      logic [VB_AW:0]    r_sw_left = '0;
+      logic [IC_IDXW-1:0] r_rk_s = '0, r_rk_e = '0;
+      logic              r_rk_wrap = 1'b0;
+      wire               swst  = ic_sw && !(r_sw_rng && snoop_q);   // a sweep step this cycle
+      wire [VB_AW-1:0]   wa    = swst ? ic_swa : wl[VB_AW-1:0];
+      wire               wd    = !swst && !snoop_q && !lpi;
+      wire               swgo_x = start || (DEBUG_EN && dbg_halted && dbg_i.resume) || icinv_f;
+      wire               swgo  = swgo_x || icinv;
+      // the range: first / last line index, wrapping past the last line
+      wire               rk_full = r_cop_full;
+      wire [IC_IDXW-1:0] rk_s  = cop_line[IC_IDXW-1:0];
+      wire [IC_IDXW-1:0] rk_e  = rk_s + IC_IDXW'(cop_n - 28'd1);
+      wire               rk_wr = (29'(rk_s) + 29'(cop_n) - 29'd1) >= 29'(IC_LINES);
+      wire               rk_go = icinv_r && !swgo_x && !rk_full && !ic_sw;   // a range sweep starts
+      // banks whose line at address a is in [s, e] (or, wrapping, [s, end] + [0, e])
+      function automatic logic [VB_N-1:0] f_rkm(input logic [VB_AW-1:0] a, input logic [IC_IDXW-1:0] s,
+                                                input logic [IC_IDXW-1:0] e, input logic wrap);
+         int blo, bhi;
+         blo = int'(s >> VB_AW) + ((a < s[VB_AW-1:0]) ? 1 : 0);
+         bhi = int'(e >> VB_AW) - ((a > e[VB_AW-1:0]) ? 1 : 0);
+         for (int b = 0; b < VB_N; b++) f_rkm[b] = wrap ? (b >= blo || b <= bhi) : (b >= blo && b <= bhi);
+      endfunction
+      // (timing: both candidate masks from registers / the SoC's registered
+      // range; rk_go — the late store-completion decode — only selects)
+      wire [VB_N-1:0]    m_go  = f_rkm(rk_s[VB_AW-1:0], rk_s, rk_e, rk_wr);
+      wire [VB_N-1:0]    m_run = f_rkm(swst ? ic_swa + 1'b1 : ic_swa, r_rk_s, r_rk_e, r_rk_wrap);
+      always_ff @(posedge clk) if (ce)
+         r_sw_mask <= rk_go ? m_go : m_run;
+      assign rk_busy = ic_sw && r_sw_rk;
       logic [VB_N-1:0]   bl, bs;
       logic              vl_any = 1'b0;
       for (genvar b = 0; b < VB_N; b++) begin : g_b
          (* ram_style = "distributed" *) logic m [0:VB_D-1];
          initial for (int i = 0; i < VB_D; i++) m[i] = 1'b0;
-         wire we = ic_sw || ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
+         wire we = swst ? (!r_sw_rng || r_sw_mask[b])
+                        : ((snoop_q || (vreq && !vdrop)) && (wl >> VB_AW) == b);
          // (no rst: a valid set on a reset edge — an install of a fill
          // completing then — sets vl_any, and the reset / start sweep
          // clears it)
@@ -2939,24 +3096,32 @@ module pipeline_core
       always_ff @(posedge clk)
          if (rst) begin
             ic_sw <= vl_any || (vset && !snoop_q);  ic_swa <= '0;  vs_pend <= 1'b0;  vs_idx <= '0;
+            r_sw_rng <= 1'b0;  r_sw_rk <= 1'b0;
             if (ce && !ic_sw && vset && !snoop_q) vl_any <= 1'b1;
          end else if (ce) begin
-            if (ic_sw) begin
+            if (swst) begin
                ic_swa <= ic_swa + 1'b1;
-               if (ic_swa == VB_AW'(VB_D - 1)) begin
+               r_sw_left <= r_sw_left - 1'b1;
+               if (r_sw_rng ? (r_sw_left == (VB_AW+1)'(1)) : (ic_swa == VB_AW'(VB_D - 1))) begin
                   ic_sw  <= 1'b0;
-                  vl_any <= 1'b0;
+                  // (a range sweep leaves the other lines valid)
+                  if (!r_sw_rng) vl_any <= 1'b0;
                end
-            end else if (vset && !snoop_q)
+            end else if (!ic_sw && vset && !snoop_q)
                vl_any <= 1'b1;                    // a valid bit is set this edge
             vs_pend <= vset && (ic_sw || snoop_q);
             vs_idx  <= vidx;
             if (swgo) begin
                ic_sw <= vl_any || (vset && !snoop_q && !ic_sw);
-               ic_swa <= '0;  vs_pend <= 1'b0;
+               ic_swa <= rk_go ? rk_s[VB_AW-1:0] : '0;  vs_pend <= 1'b0;
+               r_sw_rng  <= rk_go;
+               r_sw_rk   <= icinv_r || (ic_sw && r_sw_rk);
+               r_sw_left <= (cop_n < 28'(VB_D)) ? (VB_AW+1)'(cop_n) : (VB_AW+1)'(VB_D);
+               r_rk_s <= rk_s;  r_rk_e <= rk_e;  r_rk_wrap <= rk_wr;
             end
          end
    end else begin : g_novl
+      assign rk_busy = 1'b0;
       assign vl_rd_look = 1'b0;  assign vl_rd_sn = 1'b0;
       assign ic_sw = 1'b0;  assign ic_swa = '0;  assign vs_pend = 1'b0;  assign vs_idx = '0;
    end endgenerate
@@ -3056,42 +3221,53 @@ module pipeline_core
    // interlock, no sched-model change needed.
    wire mem_is_sh     = mem_valid && (mem_d.uop == U_SHIFT);
    wire ex_is_sh_hand = ex_valid && (ex_d.uop == U_SHIFT) && !ex_busy && !mem_busy;
-   logic [63:0] r_shl1, r_shr1, r_sar1, r_rol1, r_ror1, r_oh1, r_btr1, r_sha_op;
-   logic [2:0]  r_shhi, r_bthi;
+   // (sddma2 timing: stage 1 also picks the kind — every kind becomes one
+   // byte rotate of one register, r_src, by r_rk bytes, then a byte keep /
+   // fill: SHL / ROL rotate left by hi, SHR / SAR / ROR by -hi; SHL keeps
+   // bytes >= hi, SHR / SAR bytes < 8 - hi, SAR fills the rest with the
+   // sign.  BTS / BTR / BTC / BTSTRR are done in stage 1 (r_rk = 0, keep
+   // all).  Was a 9-way case on r_shsub after five byte barrels: r_shhi ->
+   // w_sh2 -> the forwards / wb_zero, sddma_b2's tier-1 worst, -0.280.)
+   logic [63:0] r_src;
+   logic [2:0]  r_rk;
+   logic [7:0]  r_keepb, r_fillb;
    logic [3:0]  r_shsub;
    always_ff @(posedge clk) if (ce) begin
-      if (ex_is_sh_hand) begin
-         r_shl1  <= ex_a << ex_shcnt[2:0];
-         r_shr1  <= ex_a >> ex_shcnt[2:0];
-         r_sar1  <= $signed(ex_a) >>> ex_shcnt[2:0];
-         r_rol1  <= (ex_a << ex_shcnt[2:0]) | (ex_a >> (7'd64 - {4'b0, ex_shcnt[2:0]}));
-         r_ror1  <= (ex_a >> ex_shcnt[2:0]) | (ex_a << (7'd64 - {4'b0, ex_shcnt[2:0]}));
-         r_oh1   <= 64'b1 << ex_shcnt[2:0];
-         r_btr1  <= (ex_a >> ex_b[2:0]) | (ex_a << (7'd64 - {4'b0, ex_b[2:0]}));
-         r_shhi  <= ex_shcnt[5:3];
-         r_bthi  <= ex_b[5:3];
+      if (ex_is_sh_hand) begin : sh_st1
+         logic [2:0]  lo, hi;
+         logic [63:0] oh;
+         lo = ex_shcnt[2:0];  hi = ex_shcnt[5:3];
+         oh = 64'b1 << ex_shcnt;
          r_shsub <= ex_d.sub;
-         r_sha_op<= ex_a;
+         r_rk    <= 3'd0;  r_keepb <= 8'hFF;  r_fillb <= 8'h00;
+         case (ex_d.sub)
+            4'd0: begin r_src <= ex_a << lo;                                    r_rk <= hi;
+                        for (int j = 0; j < 8; j++) r_keepb[j] <= 3'(j) >= hi; end
+            4'd1: begin r_src <= ex_a >> lo;                                    r_rk <= -hi;
+                        for (int j = 0; j < 8; j++) r_keepb[j] <= 4'(j) + 4'(hi) <= 4'd7; end
+            4'd2: begin r_src <= $signed(ex_a) >>> lo;                          r_rk <= -hi;
+                        for (int j = 0; j < 8; j++) begin
+                           r_keepb[j] <= 4'(j) + 4'(hi) <= 4'd7;
+                           r_fillb[j] <= !(4'(j) + 4'(hi) <= 4'd7) && ex_a[63];
+                        end end
+            4'd3: begin r_src <= (ex_a << lo) | (ex_a >> (7'd64 - {4'b0, lo})); r_rk <= hi;  end
+            4'd4: begin r_src <= (ex_a >> lo) | (ex_a << (7'd64 - {4'b0, lo})); r_rk <= -hi; end
+            4'd8:  r_src <= ex_a |  oh;
+            4'd9:  r_src <= ex_a & ~oh;
+            4'd10: r_src <= ex_a ^  oh;
+            default: r_src <= {63'b0, ex_a[ex_b[5:0]]};   // BTSTRR
+         endcase
       end
    end
+   function automatic logic [63:0] f_rot8(logic [63:0] v, logic [2:0] k);   // byte j <- byte j - k
+      return (v << {k, 3'b000}) | (v >> (7'd64 - {1'b0, k, 3'b000}));
+   endfunction
    logic [63:0] w_sh2;
    always_comb begin : sh_stage2
-      logic [6:0]  hi8, bhi8;
-      logic [63:0] btr_full;
-      hi8  = {1'b0, r_shhi, 3'b000};
-      bhi8 = {1'b0, r_bthi, 3'b000};
-      btr_full = (r_btr1 >> bhi8) | (r_btr1 << (7'd64 - bhi8));
-      case (r_shsub)
-         4'd0:  w_sh2 = r_shl1 << hi8;
-         4'd1:  w_sh2 = r_shr1 >> hi8;
-         4'd2:  w_sh2 = $signed(r_sar1) >>> hi8;
-         4'd3:  w_sh2 = (r_rol1 << hi8) | (r_rol1 >> (7'd64 - hi8));
-         4'd4:  w_sh2 = (r_ror1 >> hi8) | (r_ror1 << (7'd64 - hi8));
-         4'd8:  w_sh2 = r_sha_op |  (r_oh1 << hi8);
-         4'd9:  w_sh2 = r_sha_op & ~(r_oh1 << hi8);
-         4'd10: w_sh2 = r_sha_op ^  (r_oh1 << hi8);
-         default: w_sh2 = {63'b0, btr_full[0]};   // BTSTRR
-      endcase
+      logic [63:0] rot;
+      rot = f_rot8(r_src, r_rk);
+      for (int j = 0; j < 8; j++)
+         w_sh2[8*j +: 8] = (rot[8*j +: 8] & {8{r_keepb[j]}}) | {8{r_fillb[j]}};
    end
    // v3 D3: a W op's result is its low 32 bits sign-extended — applied here,
    // on the registered MEM value both forwarding and WB read (only the
@@ -3158,13 +3334,22 @@ module pipeline_core
          default: return dw;
       endcase
    endfunction
+   // (tmg timing) the MEM -> WB edge's load-bypass value, wb_hext: f_ldext
+   // of each way's hit dword and of the captured / forwarded dword, in
+   // parallel (the selects are at the register, see MEM -> WB)
+   wire [63:0] wb_hext_0 = f_ldext(h_dw0,   mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
+   wire [63:0] wb_hext_1 = f_ldext(h_dw1,   mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
+   wire [63:0] wb_hext_m = f_ldext(mem_hdw, mem_eaddr[2:0], mem_d.msz, mem_d.sgn, mem_d.uop != U_LOAD);
    // (stage 3: a hit-pipe hit's doubleword, else the port response)
-   logic [63:0] wb_ldval;
+   logic [63:0] wb_ldval, wb_ldval_p;
    // (EN_MUL2: a MUL in WB taking its product from the DSP joins here, the
    // first select of the load-forward path, as a full-dword "load" — no
    // extra mux level at the end of the forward cone)
-   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2
-                        : (EN_DC_H && wb_h && wb_hok) ? wb_hdw : m_rdata_dram;
+   // (tmg timing: a hit's value is wb_hext — f_ldext of wb_hdw with the
+   // same fields, registered on the same edge — so the hit select, wb_h &&
+   // wb_hok, is the LAST mux of the forward value instead of the first
+   // ahead of the extraction: = the old f_ldext(wb_hit ? wb_hdw : port))
+   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2 : m_rdata_dram;
    always_comb begin
       logic [7:0]  b8;
       logic [15:0] h16;
@@ -3172,14 +3357,25 @@ module pipeline_core
       b8  = wb_lddw[(wb_ld_ea * 8) +: 8];
       h16 = wb_lddw[(wb_ld_ea[2:1] * 16) +: 16];
       w32 = wb_ld_ea[2] ? wb_lddw[63:32] : wb_lddw[31:0];
-      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval = wb_lddw;
+      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval_p = wb_lddw;
       else case (wb_ld_msz)
-         2'd0:    wb_ldval = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
-         2'd1:    wb_ldval = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
-         2'd2:    wb_ldval = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-         default: wb_ldval = wb_lddw;
+         2'd0:    wb_ldval_p = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
+         2'd1:    wb_ldval_p = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
+         2'd2:    wb_ldval_p = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
+         default: wb_ldval_p = wb_lddw;
       endcase
+      wb_ldval = (EN_DC_H && wb_h && wb_hok && !(EN_MUL2 && wb_mdir)) ? wb_hext : wb_ldval_p;
    end
+`ifndef SYNTHESIS
+   // the hit's value is wb_hdw's extraction (the old form)
+   always_ff @(posedge clk) if (!rst && EN_DC_H && wb_valid && wb_h && wb_hok && !(EN_MUL2 && wb_mdir))
+      assert (wb_hext == f_ldext(wb_hdw, wb_ld_ea, wb_ld_msz, wb_ld_sgn, wb_ld_full))
+         else $fatal(1, "wb_hext %h != the hit's extraction (pc %h)", wb_hext, wb_pc);
+   // the per-way dwords select to h_dword
+   always_ff @(posedge clk) if (!rst && EN_DC_H && mem_valid && mem_h1)
+      assert (h_dword == (h_sel0 ? h_dw0 : h_dw1))
+         else $fatal(1, "h_dword %h != h_sel0 %b ? %h : %h", h_dword, h_sel0, h_dw0, h_dw1);
+`endif
 
    // the WB forwarding source: a fast load's response value (1a stage 2)
    wire [63:0] wb_fwd_v = ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) ? wb_ldval : wb_value;
@@ -3207,18 +3403,74 @@ module pipeline_core
    function automatic logic f_xpg(logic lr, logic l32, logic [15:0] v);
       return (lr || (l32 && v[2:0] > 3'd4)) && v[15:3] == 13'h1FFF;
    endfunction
-   wire [31:0] t_ta_d = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
+   // (tmg timing) a shift in MEM forwards its stage-2 result w_sh2 as the
+   // LAST select of every ID -> EX operand (fs_a / fs_b / fs_c: the MEM
+   // forward is taken and the MEM op is a shift — registers only); the
+   // other candidates take mem_res_nsh, mem_result_eff's non-shift leg.
+   // Each operand = its old form with mem_result_eff (asserted).  (r_shhi
+   // -> the barrel's 2nd stage -> mem_result_eff -> the forward muxes ->
+   // ex_ta / the TLB keys / ex_a / the multiplier was tmg_b1's worst.)
+   wire fs_a = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rs1;
+   wire fs_b = mem_is_sh && mem_fwd_ok && mem_d.rd == dec.rs2;
+   wire fs_c = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rd;
+   wire [31:0] t_ta_n = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
                               : (wb_valid && wb_sp_we)   ? wb_sp_new : sp)
                       : (t_mem && t_md == 2'b10) ? 32'd0
-                      : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
+                      : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh[31:0]
                       : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v[31:0]
                       : rf[id_rs1][31:0];
-   wire [31:0] t_tb_d = t_m8 ? 32'hFFFF_FFF8
+   wire [31:0] t_tb_n = t_m8 ? 32'hFFFF_FFF8
                       : (!t_mem || t_md == 2'b00) ? 32'd0
                       : (t_md != 2'b11) ? id_var1
-                      : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
+                      : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh[31:0]
                       : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v[31:0]
                       : rf[dec.rs2][31:0];
+   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0] : t_ta_n;
+   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;
+   // the ID -> EX operand latches' D values (the forward muxes)
+   wire [63:0] ex_a_d = fs_a ? f_wsh(id_w, w_sh2)
+                      : f_wsh(id_w, (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh
+                                  : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
+                                  : rf[id_rs1]);
+   wire [63:0] ex_c_d = fs_c ? w_sh2
+                      : (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_res_nsh
+                      : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
+                      : rf[id_rd];
+   wire [63:0] ex_b_d = (fs_b && !id_b_one && !id_b_imm) ? f_wsh(id_w, w_sh2)
+                      : f_wsh(id_w,
+                          id_b_one ? 64'd1
+                        : id_b_imm
+                          ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                        : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh
+                        : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
+                        : rf[dec.rs2]);
+   wire        ex_txpg_d = fs_a ? f_xpg(t_lr, t_l32, w_sh2[15:0])
+                         : (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_res_nsh[15:0])
+                         : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                         : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({mem_result_eff, ex_a_d, ex_b_d, ex_c_d}))
+      assert (t_ta_d == (t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new : (wb_valid && wb_sp_we) ? wb_sp_new : sp)
+                         : (t_mem && t_md == 2'b10) ? 32'd0
+                         : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff[31:0]
+                         : (b_wb && wb_rd == id_rs1) ? wb_fwd_v[31:0] : rf[id_rs1][31:0]) &&
+              t_tb_d == (t_m8 ? 32'hFFFF_FFF8 : (!t_mem || t_md == 2'b00) ? 32'd0
+                         : (t_md != 2'b11) ? id_var1
+                         : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff[31:0]
+                         : (b_wb && wb_rd == dec.rs2) ? wb_fwd_v[31:0] : rf[dec.rs2][31:0]) &&
+              ex_a_d == f_wsh(id_w, (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
+                                  : (b_wb && wb_rd == id_rs1) ? wb_fwd_v : rf[id_rs1]) &&
+              ex_c_d == ((mem_fwd_ok && mem_d.rd == id_rd) ? mem_result_eff
+                         : (b_wb && wb_rd == id_rd) ? wb_fwd_v : rf[id_rd]) &&
+              ex_b_d == f_wsh(id_w, id_b_one ? 64'd1
+                                  : id_b_imm ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
+                                  : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
+                                  : (b_wb && wb_rd == dec.rs2) ? wb_fwd_v : rf[dec.rs2]) &&
+              ex_txpg_d == ((mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_result_eff[15:0])
+                            : (b_wb && wb_rd == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                            : f_xpg(t_lr, t_l32, rf[id_rs1][15:0])))
+         else $fatal(1, "shift-last forward form (pc %h)", id_pc);
+`endif
    // (timing) f_wz(id_w, wb_fwd_v) for ex_b_zero, from the sources' byte-
    // zero flags in parallel instead of after the MUL / load-extract selects:
    // a MUL's product halves (registers), a load's dword by its size / offset
@@ -3245,28 +3497,10 @@ module pipeline_core
    // = f_wz(id_w, w_sh2), asserted.)  sh_rz[j]: byte j of w_sh2 is zero.
    logic [7:0] sh_rz;
    always_comb begin : sh_zero
-      logic [7:0] zl, zr, zs, zol, zor, za, zan, zx;
-      logic [2:0] k;
-      zl  = f_bz(r_shl1);  zr  = f_bz(r_shr1);  zs = f_bz(r_sar1);
-      zol = f_bz(r_rol1);  zor = f_bz(r_ror1);  za = f_bz(r_sha_op);
-      for (int i = 0; i < 8; i++) begin
-         zan[i] = (r_sha_op[8*i +: 8] & ~r_oh1[7:0]) == 8'd0;   // byte i with the bit cleared
-         zx[i]  = (r_sha_op[8*i +: 8] ^  r_oh1[7:0]) == 8'd0;   //  ... flipped
-      end
-      k = r_shhi;
-      for (int j = 0; j < 8; j++) begin
-         case (r_shsub)
-            4'd0:  sh_rz[j] = (j >= k) ? zl[3'(j - k)] : 1'b1;              // SHL
-            4'd1:  sh_rz[j] = (j + k <= 7) ? zr[3'(j + k)] : 1'b1;          // SHR
-            4'd2:  sh_rz[j] = (j + k <= 7) ? zs[3'(j + k)] : !r_sar1[63];   // SAR
-            4'd3:  sh_rz[j] = zol[3'(j - k)];                               // ROL
-            4'd4:  sh_rz[j] = zor[3'(j + k)];                               // ROR
-            4'd8:  sh_rz[j] = (3'(j) == k) ? 1'b0 : za[j];                 // BTS
-            4'd9:  sh_rz[j] = (3'(j) == k) ? zan[j] : za[j];               // BTR
-            4'd10: sh_rz[j] = (3'(j) == k) ? zx[j] : za[j];                // BTC
-            default: sh_rz[j] = (j != 0) || !r_btr1[{r_bthi, 3'b000}];     // BTSTRR
-         endcase
-      end
+      logic [7:0] zs;
+      zs = f_bz(r_src);
+      for (int j = 0; j < 8; j++)
+         sh_rz[j] = r_keepb[j] ? zs[3'(3'(j) - r_rk)] : !r_fillb[j];
    end
    wire bz_sh = id_w ? &sh_rz[3:0] : &sh_rz;
    (* keep = "true" *) wire bz_mem = mem_is_sh ? bz_sh : f_wz(id_w, mem_res_nsh);
@@ -3370,6 +3604,7 @@ module pipeline_core
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0; if_drop <= 1'b0;
+         r_in0 <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
@@ -3387,6 +3622,7 @@ module pipeline_core
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          ic_lv <= '0;  lp_v <= 1'b0;  // (§5)
       end else if (ce) begin
+         ifb_val_n = ifb_val;   // (tmg: blocking next value; ifb_val / r_in0 load it in pos_track)
          // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.
@@ -3413,7 +3649,7 @@ module pipeline_core
             pc <= (DEBUG_EN && !start) ? park_pc : start_pc;
             running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-            ifb_val <= 2'b00; if_look <= 1'b0;
+            ifb_val_n = 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
             ut_v <= '0;  it_ref <= 1'b0;      // (stage 3: the micro-ITLB)
@@ -4054,11 +4290,11 @@ module pipeline_core
                end else if (if_rebase) begin
                   ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
-                  ifb_dw[0] <= 64'b0;  ifb_val[0] <= 1'b1;
-                  ifb_val[1] <= 1'b0;
+                  ifb_dw[0] <= 64'b0;  ifb_val_n[0] = 1'b1;
+                  ifb_val_n[1] = 1'b0;
                   ifb_ft[0] <= if_fflt;  ifb_fm[0] <= if_fmiss;
                end else begin
-                  ifb_dw[1] <= 64'b0;  ifb_val[1] <= 1'b1;
+                  ifb_dw[1] <= 64'b0;  ifb_val_n[1] = 1'b1;
                   ifb_ft[1] <= if_fflt;  ifb_fm[1] <= if_fmiss;
                end
                if_xc   <= 1'b0;
@@ -4072,11 +4308,11 @@ module pipeline_core
                   ev_fill   = 1'b1;
                   ev_nx     = !IC32 && if_req_dw[0] && m_next_valid;   // (review 3)
                   ifb_base  <= if_req_dw;
-                  ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
-                  ifb_dw[1] <= m_rdata_next;  ifb_val[1] <= m_next_valid;
+                  ifb_dw[0] <= m_rdata;       ifb_val_n[0] = 1'b1;
+                  ifb_dw[1] <= m_rdata_next;  ifb_val_n[1] = m_next_valid;
                   ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                end else begin
-                  ifb_dw[1] <= m_rdata;       ifb_val[1] <= 1'b1;
+                  ifb_dw[1] <= m_rdata;       ifb_val_n[1] = 1'b1;
                   ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                end
                m_read_DV <= 1'b0;
@@ -4124,11 +4360,11 @@ module pipeline_core
                   // because it captures old base + old data together).
                   if (!in0) begin
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
-                     ifb_dw[0] <= ifr_rdata;       ifb_val[0] <= 1'b1;
-                     ifb_dw[1] <= ifr_rdata_next;  ifb_val[1] <= ifr_next_valid;
+                     ifb_dw[0] <= ifr_rdata;       ifb_val_n[0] = 1'b1;
+                     ifb_dw[1] <= ifr_rdata_next;  ifb_val_n[1] = ifr_next_valid;
                      ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
-                     ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_dw[1] <= ifr_rdata;       ifb_val_n[1] = 1'b1;
                      ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                   if_look <= 1'b0;
@@ -4186,11 +4422,11 @@ module pipeline_core
                if (nlb_dw_ok) begin
                   if (!in0) begin
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
-                     ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
-                     ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+                     ifb_dw[0] <= nlb_rdata;       ifb_val_n[0] = 1'b1;
+                     ifb_dw[1] <= nlb_rdata_next;  ifb_val_n[1] = nlb_next_valid;
                      ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
-                     ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_dw[1] <= nlb_rdata;       ifb_val_n[1] = 1'b1;
                      ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                end else if (w_slide) begin
@@ -4199,8 +4435,8 @@ module pipeline_core
                   // in the window's own line). Slide instead of if_look: 1 cycle,
                   // no BRAM, no port.
                   ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
-                  ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
-                  ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+                  ifb_dw[0] <= ifb_dw[1];       ifb_val_n[0] = 1'b1;
+                  ifb_dw[1] <= slide_data;      ifb_val_n[1] = 1'b1;
                   ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
                end else begin
                   if_look   <= 1'b1;              // begin lookup (no port access)
@@ -4210,8 +4446,8 @@ module pipeline_core
                // window forward NOW, so the coming sequential line cross finds
                // its dword already in the window and fetch never stalls.
                ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
-               ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
-               ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+               ifb_dw[0] <= ifb_dw[1];       ifb_val_n[0] = 1'b1;
+               ifb_dw[1] <= slide_data;      ifb_val_n[1] = 1'b1;
                ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
             end
          end
@@ -4324,7 +4560,7 @@ module pipeline_core
                ifb_base   <= id_bt_base;
                ifb_dw[0]  <= id_bt_d0;
                ifb_dw[1]  <= id_bt_d1;
-               ifb_val    <= {id_bt_v1, 1'b1};
+               ifb_val_n    = {id_bt_v1, 1'b1};
                ifb_ft     <= 2'b00;  ifb_fm <= 2'b00;
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
@@ -4372,7 +4608,8 @@ module pipeline_core
             // Z producers are never port reads (IRET's flags come from
             // iret_fval with wb_zval 0), so the reduce sees mem_result_eff
             // only and stays off the m_rdata path.
-            wb_zero    <= (mem_result_eff == 64'b0);
+            // (sddma2 timing: a shift's from stage 2's byte-zero flags)
+            wb_zero    <= mem_is_sh ? &sh_rz : (mem_res_nsh == 64'b0);
             wb_fval    <= (mem_valid && mem_d.uop == U_IRET) ? iret_fval : mem_fval;
             wb_zval    <= mem_zval && !(mem_valid && mem_d.uop == U_IRET);
             // EN_MUL2: the MUL's product: from WB itself (age 0), the DSP now
@@ -4380,8 +4617,11 @@ module pipeline_core
             wb_mul     <= mem_mul;
             // EN_LDBYP: the hit-pipe / forwarded answer, extracted (a missed
             // load's value comes from the port; its consumer captures that)
-            wb_hext    <= f_ldext(mem_h1 ? h_dword : mem_hdw, mem_eaddr[2:0], mem_d.msz, mem_d.sgn,
-                                  mem_d.uop != U_LOAD);
+            // (tmg timing: extracted from each way's dword and from the
+            // captured / forwarded dword in parallel; the tag compare's way
+            // select and mem_h1 pick at the register — = f_ldext(mem_h1 ?
+            // h_dword : mem_hdw, ...))
+            wb_hext    <= !mem_h1 ? wb_hext_m : h_sel0 ? wb_hext_0 : wb_hext_1;
             wb_mulf    <= mem_mul && mem_mulf;
             wb_mdir    <= mem_mul && mem_mage == 2'd0;
             wb_mhi     <= mem_d.mdhigh;  wb_muns <= mem_d.mduns;  wb_mw32 <= mem_d.w32;
@@ -4531,7 +4771,9 @@ module pipeline_core
                   ras_ptr      <= ras_ptr + 1'b1;
                   if (ras_cnt != (RAS_PW+1)'(RAS_DEPTH)) ras_cnt <= ras_cnt + 1'b1;
                end
-               mem_result <= (ex_d.uop == U_STORE || ex_d.uop == U_PUSH ||
+               // (tmg timing: the sum / compare legs last, see ex_res_add)
+               mem_result <= ex_res_add ? ex_sum[63:0] : ex_res_cmp ? {63'b0, ex_cmpbit}
+                           : (ex_d.uop == U_STORE || ex_d.uop == U_PUSH ||
                               ex_d.uop == U_CALL) ? exo_raw : exo_result;
                mem_fval   <= exo_fval; mem_fmask <= ex_valid ? exo_fmask : '0;
                mem_zval   <= (ex_d.uop != U_BTSTN);   // Z from (value==0) at WB
@@ -4581,10 +4823,7 @@ module pipeline_core
                // flags -> taken cone.
                // M6 register-sourced forwarding at the operand-register
                // inputs: youngest writer wins (MEM over WB over rf).
-               ex_a       <= f_wsh(id_w,
-                             (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_result_eff
-                           : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
-                           : rf[id_rs1]);
+               ex_a       <= ex_a_d;   // (tmg: the shift forward last)
                // EN_SPFWD: the youngest older SP writer's value (one in EX
                // holds this op back via sp_busy)
                ex_lb_a    <= id_use_rs1 && lb1;
@@ -4592,26 +4831,16 @@ module pipeline_core
                // (§11.9) ex_xpg from rs1 as it will be in EX: each forwarding
                // candidate tested in parallel, the same select picks (timing:
                // the ex_b_zero pattern; ex_busy reads the register)
-               ex_txpg    <= (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_result_eff[15:0])
-                           : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
-                           : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
+               ex_txpg    <= ex_txpg_d;
                ex_lb_b    <= id_use_rs2 && lb2;
                ex_w       <= id_w;
                ex_sp      <= (mem_valid && mem_sp_we) ? mem_sp_new
                            : (wb_valid && wb_sp_we)   ? wb_sp_new : sp;
-               ex_c       <= (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_result_eff
-                           : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
-                           : rf[id_rd];
+               ex_c       <= ex_c_d;
                // The b-operand fully resolves HERE (reg / extended imm32 /
                // constant 1 for INC-DEC / forwarded result) so EX's adder
                // and comparators read pure registers.
-               ex_b       <= f_wsh(id_w,
-                             id_b_one ? 64'd1
-                           : id_b_imm
-                             ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
-                           : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_result_eff
-                           : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
-                           : rf[dec.rs2]);
+               ex_b       <= ex_b_d;
                // (timing) "ex_b == 0" for DIV's divide-by-zero, registered:
                // each candidate reduced in parallel, the same select picks
                ex_b_zero  <= id_b_one ? 1'b0
@@ -4642,6 +4871,9 @@ module pipeline_core
                   ex_bp_cnd  <= id_bp_cnd;
                   ex_last_dw <= id_last_dw;
                   ex_d       <= dec;
+                  ex_res_add <= f_res_add(dec);  ex_res_cmp <= f_res_cmp(dec);   // (tmg)
+                  ex_alu_sub <= (dec.sub == 4'd1 || dec.sub == 4'd3 || dec.sub == 4'd7);
+                  ex_alu_cf  <= (dec.sub == 4'd2 || dec.sub == 4'd3);
                   ex_eiser   <= id_eiser;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   mul_cnt    <= 2'd0;
@@ -4753,6 +4985,7 @@ module pipeline_core
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
                      id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
+                     id_legal   <= w_dec.legal;  id_privop <= f_priv(w_dec, w_op);   // (tmg)
                      id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
@@ -4837,8 +5070,8 @@ module pipeline_core
          // span overlaps the stored dword; refetch from the oldest squashed.
          // Safe because side effects only exist from MEM onward.
          if (smc_st) begin
-            if (ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl))          ifb_val[0] <= 1'b0;
-            if (ifb_val[1] && f_dweq(ifb_base + 29'd1, smc_dw, mzl))  ifb_val[1] <= 1'b0;
+            if (ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl))          ifb_val_n[0] = 1'b0;
+            if (ifb_val[1] && f_dweq(ifb_base + 29'd1, smc_dw, mzl))  ifb_val_n[1] = 1'b0;
             // M9: the NLB is a code copy too — same store-match rule (line-granular)
             if ((nlb_vhi || nlb_vlo) && f_lneq(nlb_line, smc_dw[28:1], mzl)) begin
                nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
@@ -4903,14 +5136,17 @@ module pipeline_core
             m_vav <= 1'b0;  sq_vav <= 1'b0;   // (STLF: their VAs may now map elsewhere)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;
-            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
+            ifb_val_n = 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
             if (if_xc) if_drop <= 1'b1;
          end
          if (icinv) begin
             ic_lv <= '0;  lp_v <= 1'b0;  // (§5: a fill's line from before the fence is not installed)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
-            if_look <= 1'b0;  snoop_q <= 1'b0;
-            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
+            if_look <= 1'b0;
+            // (a RANGE_IINV keeps a snoop clear armed on this edge: lines
+            // outside its range stay valid — g_vl lets the clear land)
+            if (icinv_f) snoop_q <= 1'b0;
+            ifb_val_n = 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
          end
          if (sq_any) begin
             ev_ovr = 1'b1;
@@ -4931,7 +5167,7 @@ module pipeline_core
                div_ph <= MD_IDLE;   // the squashed DIV may have started
             end
             id_valid   <= 1'b0;
-            ifb_val    <= 2'b00;
+            ifb_val_n    = 2'b00;
             ev_pcz     = 1'b1;
             pc         <= sq_ex ? ex_pc : id_pc;
             // Every in-flight serializer is younger than the store, so it is
@@ -4948,7 +5184,7 @@ module pipeline_core
             ev_ovr   = 1'b1;
             if (DEBUG_EN) id_bp <= 1'b0;
             id_valid <= 1'b0;
-            ifb_val  <= 2'b00;
+            ifb_val_n  = 2'b00;
             ev_pcz   = 1'b1;
             pc       <= pc;
          end
@@ -4969,7 +5205,7 @@ module pipeline_core
             dly_on     <= 1'b0;
             div_ph     <= MD_IDLE;
             id_valid   <= 1'b0;
-            ifb_val    <= 2'b00;
+            ifb_val_n    = 2'b00;
             // one cycle after the issue an I-cache lookup / prefetch started
             // before the snoop (clearing the line on this edge) may still be
             // in flight: drop them and the NLB, as ICACHE_INV does
@@ -5137,6 +5373,12 @@ module pipeline_core
             // pc after the dispatch (the base below still follows the load)
             if (ev_btic && !ev_ovr) p = 3'b001;
             pos <= p;
+            // (tmg timing) the window's slot-0 select, in0 = ifb_val[0] &&
+            // pos[0], as a register of its own: it selected w_op and the
+            // fetch engine's every slot decision through one LUT with
+            // fanout ~300 (the IF -> ID / fetch family's first level)
+            ifb_val <= ifb_val_n;
+            r_in0   <= ifb_val_n[0] && p[0];
             // HW proposal 3: a redirect aborts any background prefetch (it was
             // for the old sequential path), so the BRAM read port reads the
             // new miss_dw on the very next cycle — the free first-cycle read
@@ -5388,10 +5630,35 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
          else $fatal(1, "mul_r2 stale: %h vs %h", mul_r2, mul_w[63:0]);
+   // CACHE_CTRL's completion = mem_done_now for that store (sddma2 timing)
+   always_ff @(posedge clk) if (!rst && !$isunknown({cc_st, cc_done, mem_done_now}))
+      assert (!cc_st || cc_done == mem_done_now)
+         else $fatal(1, "cc_done form: %b vs mem_done_now %b", cc_done, mem_done_now);
+   // the shifter's rotate / keep / fill form equals the plain shift of the
+   // captured operands (sddma2 timing)
+   logic [63:0] sr_a; logic [5:0] sr_n, sr_b; logic [3:0] sr_sub;
+   always_ff @(posedge clk) if (ce && ex_is_sh_hand) begin
+      sr_a <= ex_a; sr_n <= ex_shcnt; sr_b <= ex_b[5:0]; sr_sub <= ex_d.sub;
+   end
+   always_ff @(posedge clk) if (!rst && mem_is_sh && !$isunknown({sr_a, sr_n, sr_b, sr_sub})) begin : sh_ref
+      logic [63:0] ref_v;
+      case (sr_sub)
+         4'd0: ref_v = sr_a << sr_n;
+         4'd1: ref_v = sr_a >> sr_n;
+         4'd2: ref_v = $signed(sr_a) >>> sr_n;
+         4'd3: ref_v = (sr_a << sr_n) | (sr_a >> (7'd64 - {1'b0, sr_n}));
+         4'd4: ref_v = (sr_a >> sr_n) | (sr_a << (7'd64 - {1'b0, sr_n}));
+         4'd8: ref_v = sr_a |  (64'b1 << sr_n);
+         4'd9: ref_v = sr_a & ~(64'b1 << sr_n);
+         4'd10: ref_v = sr_a ^ (64'b1 << sr_n);
+         default: ref_v = {63'b0, sr_a[sr_b]};
+      endcase
+      assert (w_sh2 == ref_v) else $fatal(1, "shifter form: sub=%0d n=%0d a=%h got %h want %h", sr_sub, sr_n, sr_a, w_sh2, ref_v);
+   end
    // bz_mem's byte-flag form of the shifter's zero test equals the real one
    always_ff @(posedge clk) if (!rst && !$isunknown({bz_mem, mem_result_eff, id_w}))
       assert (bz_mem == f_wz(id_w, mem_result_eff))
-         else $fatal(1, "bz_mem form: sub=%0d hi=%0d w=%b v=%h", r_shsub, r_shhi, id_w, mem_result_eff);
+         else $fatal(1, "bz_mem form: sub=%0d rk=%0d w=%b v=%h", r_shsub, r_rk, id_w, mem_result_eff);
    // CE_TIED: the instance really ties ce high (§5, IC_LB = 32)
    always_ff @(posedge clk) if (!rst && CE_TIED)
       assert (ce === 1'b1) else $fatal(1, "pipeline_core: CE_TIED = 1 but ce = %b", ce);
@@ -5400,8 +5667,10 @@ module pipeline_core
       assert (ex_b_zero == (ex_b == 64'd0))
          else $fatal(1, "ex_b_zero stale: ex_b=%h", ex_b);
    // ras_miss's compare-then-select form equals ret_actual != mem_pred_tgt
-   always_ff @(posedge clk) if (!rst && mem_valid && mem_pred)
-      assert (ret_ne == (ret_actual != mem_pred_tgt))
+   // where it is used (the return address has arrived: !mem_busy), except
+   // that a return address from MMIO always counts as mispredicted (tmg)
+   always_ff @(posedge clk) if (!rst && mem_valid && mem_pred && !mem_busy)
+      assert (ret_ne == ((!mem_ret_h && ret_port_io) || (ret_actual != mem_pred_tgt)))
          else $fatal(1, "ret_ne form: pc=%h", mem_pc);
    // (stage 3 timing) ex_mok is the registered form of the check-cycle state
    always_ff @(posedge clk) if (!rst && !$isunknown({mem_xsq, mem_xs2, mem_xs2_x, mem_xs_tm, mem_xs_tm_x, mem_xs_tlb, mem_xs_tlb_x}))
@@ -5420,6 +5689,8 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
       assert (ex_txpg == ex_xpg)
          else $fatal(1, "ex_txpg stale: pc=%h a=%h", ex_pc, ex_a);
+   always_ff @(posedge clk) if (!rst)
+      assert (r_in0 == (ifb_val[0] && pos[0])) else $fatal(1, "r_in0 != ifb_val[0] && pos[0]");
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);

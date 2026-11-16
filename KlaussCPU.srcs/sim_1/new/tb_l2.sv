@@ -15,9 +15,12 @@
 // After a write-back-and-invalidate the MIG's memory must equal it too.
 // PA[31:27] alias PA[26:0] (the MIG's rank bit and the dropped high bits).
 // Every ready must answer a request (a DV tail must not be taken as a new
-// one).  VGA / DMA rule (review 1, M2): while the VGA request or a DMA
-// master is on the bus, a write-buffer drain may start only for a request
-// that waits on the buffer (rt_bad must stay 0).
+// one).  VGA / DMA rule (review 1, M2; review 2): while the VGA request or
+// a DMA master is on the bus, a write-buffer drain may start only for a
+// request that waits on the buffer, or for the WBINV walk waiting on it
+// (rt_bad must stay 0; the terms are spelled out here, not taken from the
+// RTL's w_fe_need).  While the walk waits on a full buffer no demand read
+// starts before its drain (wk_prio_bad must stay 0).
 //
 // +TEST=<name> runs a directed test (see the case below); +TEST=random
 // (default) runs +N transactions from +SEED with random control writes.
@@ -97,10 +100,35 @@ module tb_l2;
    always @(posedge clk)
       if (dut.f_st == 4'd10 && dut.r_wk_any && dut.wb_full && dut.w_acc_ok) yields++;
    // drains started while VGA / a DMA master is on the bus: rt_need when
-   // the request in F_DEC waited on the buffer (full, or its line in it),
-   // rt_bad otherwise (judged on the edge the drain starts)
-   int rt_bad = 0, rt_need = 0;
-   bit rt_pend = 0, rt_pneed = 0;
+   // a request or the walk waited on the buffer, rt_bad otherwise (judged
+   // on the edge the drain starts).  The need, from the design's rule:
+   //   - the request in F_DEC: a read miss of a buffered line; a cache read
+   //     miss that allocates a new line over a dirty victim, buffer full; a
+   //     cache write that allocates over a dirty victim, buffer full; a
+   //     posted write (the line not in the L2), buffer full or (the walk
+   //     holding the next slot) not empty
+   //   - the walk: a dirty way to copy and the buffer full; or its end with
+   //     entries left from before its last set
+   // (DMA and VGA read misses need no slot: a full buffer alone is no need)
+   function automatic bit rt_need_now();
+      bit hit, many, lk, dmaq, alloc, vdirty, full, wbm, post;
+      hit   = dut.r_hit; many = dut.r_many; lk = dut.q_lk; dmaq = dut.q_dma;
+      alloc = dut.r_en && !dut.r_walking;
+      vdirty = dut.r_td[dut.r_vic] != 2'b00;
+      full  = dut.wb_v == 2'b11;
+      wbm   = (dut.wb_v[0] && dut.wb_line[0] == dut.q_addr[26:6]) ||
+              (dut.wb_v[1] && dut.wb_line[1] == dut.q_addr[26:6]);
+      post  = !(lk && !dmaq && many) && !(alloc && lk && !dmaq && !many) && !(lk && dmaq && hit);
+      if (dut.r_wk_wb && full) return 1;
+      if (dut.r_walk_end && dut.r_wk_snap && dut.r_wk_fl != 2'b00) return 1;
+      if (dut.f_st != 4'd2) return 0;
+      if (!dut.q_wr)
+         return !(lk && hit) && (wbm || (alloc && lk && !dmaq && !many && vdirty && full));
+      return (alloc && lk && !dmaq && !many && vdirty && full) ||
+             (post && (full || (dut.r_wk_wb && dut.wb_v != 2'b00)));
+   endfunction
+   int rt_bad = 0, rt_need = 0, wk_prio_bad = 0, wk_prio = 0;
+   bit rt_pend = 0, rt_pneed = 0, wk_rd = 0;
    always @(posedge clk) begin
       if (rt_pend && dut.e_st == 2'd2) begin
          if (rt_pneed) rt_need++;
@@ -109,15 +137,27 @@ module tb_l2;
             if (rt_bad <= 3) $display("TB_L2 rt drain at t=%0t f_st=%0d", $time, dut.f_st);
          end
       end
+      // the walk waits on a full buffer whose oldest entry may drain, a
+      // read waits in F_DEC, the engine is idle: the drain must start first
+      if (wk_rd) begin
+         if (dut.e_st == 2'd1) begin
+            wk_prio_bad++;
+            if (wk_prio_bad <= 3) $display("TB_L2 read before the walk's drain at t=%0t", $time);
+         end else if (dut.e_st == 2'd2) wk_prio++;
+      end
+      wk_rd    = dut.e_st == 2'd0 && dut.f_st == 4'd2 && !dut.q_wr && !(dut.q_lk && dut.r_hit) &&
+                 dut.r_wk_wb && dut.wb_v == 2'b11 && dut.wb_rdy[dut.wb_h];
       rt_pend  = dut.e_st == 2'd0 && (rt_req || dma);
-      rt_pneed = dut.f_st == 4'd2 && !(!dut.q_wr && dut.w_rd_hit) && (dut.wb_full || dut.f_wbm(dut.q_line));
+      rt_pneed = rt_need_now();
    end
    // the VGA stream buffer: reads it answered; writes accepted to the line
-   // of a stream read still in flight
-   int strm_hits = 0, strm_snoops = 0;
+   // of a stream read still in flight; ... on the edge sector 1 is captured
+   int strm_hits = 0, strm_snoops = 0, strm_edge = 0;
    always @(posedge clk) begin
       if (dut.f_st == 4'd2 && !dut.q_wr && !dut.w_rd_hit && dut.w_strm_hit) strm_hits++;
       if (dut.w_wr_acc && dut.e_st == 2'd1 && dut.e_strm && addr[26:6] == dut.e_line) strm_snoops++;
+      if (dut.w_wr_acc && dut.e_st == 2'd1 && dut.e_strm && !dut.e_rsp && dut.rb_sec_done &&
+          addr[26:6] == dut.e_line) strm_edge++;
    end
    // every ready answers a request
    int n_req = 0, n_rdy = 0;
@@ -425,8 +465,11 @@ module tb_l2;
             check_ddr_drained("wbinv");
             late_m.delete();
             begin
+               // a line dirty before the walk that the traffic above never
+               // touches (it may run past BUSY's drop and allocate L(0, 0):
+               // review 2's 8-way sweep caught that)
                int m0 = evc[D_MISS];
-               xact(0, 0, 1, L(0, 0), 0, 0, 0, 1, 0);
+               xact(0, 0, 1, L(3, 7 * 13) + 32, 0, 0, 0, 1, 0);
                if (evc[D_MISS] != m0 + 1) fail("read after WBINV hit");
             end
             if (!en) fail("EN dropped by WBINV");
@@ -445,14 +488,29 @@ module tb_l2;
             if (en || dut.r_en) fail("write of 1 during the 0-walk was not ignored");
             check_ddr("toggle disable");
             begin
-               int h0 = evc[D_HIT] + evc[D_MISS] + evc[W_HIT] + evc[W_MISS];
+               int h0 = evc[D_HIT] + evc[D_MISS] + evc[W_HIT] + evc[W_MISS] + evc[DMA_HIT] + evc[DMA_MISS];
+               int b0, s0;
                for (int s = 0; s < 16; s++) begin
                   xact(1, 0, 1, L(s % 3, s), 0, rnd256(), 0, 0, 0);
                   xact(0, 0, 1, L(s % 3, s), 2'(s), 0, 0, 1, 0);
                   xact(1, 1, 0, L(s % 3, s) + 16, 0, rnd256(), 16'h1234, 0, 0);
                   xact(0, 1, 0, L(s % 3, s) + 16, 0, 0, 0, 0, 0);
                end
-               if (evc[D_HIT] + evc[D_MISS] + evc[W_HIT] + evc[W_MISS] != h0) fail("bypass counted lookups");
+               // review 2: VGA's sector 0 then sector 1 in bypass — no stream
+               // buffer (a disabled L2 is a plain path to DDR: two 32 B reads)
+               repeat (100) @(negedge clk);
+               b0 = evc[RD_BEAT]; s0 = strm_hits;
+               for (int s = 0; s < 4; s++) begin
+                  xact(0, 1, 1, L(6, 50 + s), 0, 0, 0, 0, 0);
+                  while (dut.e_st != 2'd0) @(negedge clk);
+                  xact(0, 1, 1, L(6, 50 + s) + 32, 0, 0, 0, 0, 0);
+               end
+               repeat (20) @(negedge clk);
+               if (evc[RD_BEAT] - b0 != 4 * 8 || strm_hits != s0)
+                  fail($sformatf("bypass: VGA reads used the stream buffer (%0d read beats want 32, %0d stream hits)",
+                                 evc[RD_BEAT] - b0, strm_hits - s0));
+               if (evc[D_HIT] + evc[D_MISS] + evc[W_HIT] + evc[W_MISS] + evc[DMA_HIT] + evc[DMA_MISS] != h0)
+                  fail("bypass counted lookups");
             end
             repeat (100) @(negedge clk);
             check_ddr("toggle bypass");
@@ -619,8 +677,162 @@ module tb_l2;
             h = rt_need;
             xact(0, 1, 1, L(2, 22), 0, 0, 0, 0, 0);              // its line: waits for the drain
             if (rt_need != h + 1) fail($sformatf("rtdrain: %0d needed drains want 1", rt_need - h));
+            // review 2 (m-B): a full buffer (two posted writes); VGA and DMA
+            // read misses need no slot, so they must not drain it
+            repeat (60) @(negedge clk);
+            xact(1, 1, 0, L(2, 24) + 16, 0, rnd256(), 16'h00F0, 0, 0);
+            xact(1, 1, 0, L(2, 25), 0, rnd256(), 16'h0F00, 0, 0);
+            repeat (5) @(negedge clk);                           // (posted after its ready)
+            if (dut.wb_v != 2'b11) fail("rtdrain: buffer not full (test vacuous)");
+            h = strm_hits;
+            for (int i = 0; i < 6; i++) begin
+               xact(0, 1, 1, L(3 + i, 26), 0, 0, 0, 0, 0);              // VGA misses (stream fills)
+               while (dut.e_st != 2'd0) @(negedge clk);
+               xact(0, 1, 1, L(3 + i, 26) + 32, 0, 0, 0, 0, 0);         // ... stream hits
+               xact(0, 1, 0, L(3 + i, 27) + 16, 0, 0, 0, 0, 0);         // DMA misses
+               xact(0, 1, 1, L(i % 2, 20 + i % 2), 0, 0, 0, 0, 0);      // VGA hits
+            end
+            if (strm_hits == h) fail("rtdrain: no stream hit with the buffer full (test vacuous)");
+            if (dut.wb_v != 2'b11) fail("rtdrain: a full buffer drained for VGA / DMA reads");
             @(negedge clk); rt_req = 0;
             ctrl(2'b11); wait_idle(); check_ddr("rtdrain");
+         end
+         // ---------------------------------------------------------------
+         "dmapost": begin
+            // review 2 (m-A): a DMA master's posted writes (lines the L2 does
+            // not hold) during a WBINV walk with a dirty line in every set,
+            // the grant held over chunks of 8 and dropped one cycle between
+            // them (a blitter), with 0, 10 and 40 idle cycles between the
+            // writes.  On c9cadea each posted write took the slot a drain
+            // freed and the walk stayed at set 1; now BUSY must drop within
+            // 4 x SETS requests
+            int gaps[3] = '{0, 10, 40};
+            foreach (gaps[g]) begin
+               int nr = 0, t0 = 0;
+               for (int s = 0; s < SETS; s++) xact(1, 0, 1, L(s % 3, s), 0, rnd256(), 0, 0, 0);
+               ctrl(2'b11);
+               t0 = int'($time / 10);
+               tenure = 1;
+               while (busy && nr < 4 * SETS) begin
+                  xact(1, 1, 0, L(5 + g, far_set(nr)) + 16 * (nr % 4), 0, rnd256(), 16'(nr * 31), 0, 0);
+                  nr++;
+                  repeat (gaps[g]) @(negedge clk);
+                  if (nr % 8 == 0) begin dma = 0; @(negedge clk); dma = 1; end
+               end
+               tenure = 0; dma = 0;
+               if (busy) fail($sformatf("dmapost gap %0d: BUSY after %0d requests (walk at set %0d of %0d)",
+                                        gaps[g], nr, dut.r_walk_set, SETS));
+               $display("TB_L2 dmapost gap %0d: walk done after %0d requests, %0d cycles", gaps[g], nr,
+                        int'($time / 10) - t0);
+               wait_idle(); ctrl(2'b11); wait_idle(); check_ddr($sformatf("dmapost gap %0d", gaps[g]));
+            end
+         end
+         // ---------------------------------------------------------------
+         "cpupost": begin
+            // review 2 (m-A): the D-cache's 32 B writes to lines the L2 does
+            // not hold (posted: nothing allocates during the walk), back to
+            // back or 10 cycles apart, during a WBINV walk with a dirty line
+            // in every set: BUSY must drop within 4 x SETS requests
+            int gaps[2] = '{0, 10};
+            foreach (gaps[g]) begin
+               int nr = 0;
+               for (int s = 0; s < SETS; s++) xact(1, 0, 1, L(s % 3, s), 0, rnd256(), 0, 0, 0);
+               ctrl(2'b11);
+               while (busy && nr < 4 * SETS) begin
+                  xact(1, 0, 1, L(5 + g, far_set(nr)) + 32 * (nr % 2), 0, rnd256(), 0, 0, 0);
+                  nr++;
+                  repeat (gaps[g]) @(negedge clk);
+               end
+               if (busy) fail($sformatf("cpupost gap %0d: BUSY after %0d requests (walk at set %0d of %0d)",
+                                        gaps[g], nr, dut.r_walk_set, SETS));
+               $display("TB_L2 cpupost gap %0d: walk done after %0d requests", gaps[g], nr);
+               wait_idle(); ctrl(2'b11); wait_idle(); check_ddr($sformatf("cpupost gap %0d", gaps[g]));
+            end
+         end
+         // ---------------------------------------------------------------
+         "rtwalk": begin
+            // review 2 (m-A): VGA requests the bus for the whole walk (its
+            // request never drops) with reads back to back — hits, misses,
+            // sector-0 stream fills — and no request needs a buffer slot:
+            // only the walk waits on the buffer, so only its own drains can
+            // move it.  BUSY must drop within 8 x SETS requests with VGA
+            // still on the bus (on c9cadea the walk stopped at its first
+            // full buffer); a read must not start before the walk's drain
+            int nr = 0;
+            for (int s = 0; s < SETS; s++) xact(1, 0, 1, L(s % 3, s) + 32 * (s % 2), 0, rnd256(), 0, 0, 0);
+            for (int s = 0; s < SETS; s += 8) xact(0, 0, 1, L(4, s), 0, 0, 0, 1, 0);   // clean lines: VGA hits
+            @(negedge clk); rt_req = 1;
+            // (DDR beats spread out: a stream fill's tail then often ends
+            // while the next read waits, the case the priority decides)
+            dut.mig_7series_0.jit = 40;
+            ctrl(2'b11);
+            while (busy && nr < 8 * SETS) begin
+               int k = $urandom_range(3, 0);
+               if (k == 0)      xact(0, 1, 1, L(4, 8 * $urandom_range(SETS / 8 - 1, 0)), 0, 0, 0, 0, 0);
+               else if (k == 1) xact(0, 1, 0, L(8, $urandom_range(SETS - 1, 0)) + 16 * $urandom_range(3, 0), 0, 0, 0, 0, 0);
+               else             xact(0, 1, 1, L(6 + nr % 2, nr % SETS), 0, 0, 0, 0, 0);   // sector 0: stream fills
+               nr++;
+            end
+            dut.mig_7series_0.jit = 0;
+            if (busy) fail($sformatf("rtwalk: BUSY after %0d requests with VGA on the bus (walk at set %0d)",
+                                     nr, dut.r_walk_set));
+            $display("TB_L2 rtwalk: walk done after %0d requests, %0d drains before a waiting read", nr, wk_prio);
+            if (wk_prio == 0) fail("rtwalk: no read waited for the walk's drain (priority untested)");
+            @(negedge clk); rt_req = 0;
+            wait_idle(); check_ddr("rtwalk");
+         end
+         // ---------------------------------------------------------------
+         "wkset": begin
+            // review 2 (m-A): a DMA master writing into the very set the walk
+            // waits on (every way dirty), re-dirtying a way the walk already
+            // copied — chasing the walk from set to set.  Each set must be
+            // copied at most once a way, so BUSY must drop within
+            // 2 x SETS x WAYS requests and the walk write at most
+            // SETS x WAYS lines
+            int nr = 0, n0, t0;
+            for (int k = 0; k < `L2_WAYS; k++) for (int s = 0; s < SETS; s++) begin
+               xact(1, 0, 1, L(k, s), 0, rnd256(), 0, 0, 0);
+               xact(1, 0, 1, L(k, s) + 32, 0, rnd256(), 0, 0, 0);
+            end
+            repeat (200) @(negedge clk);
+            n0 = evc[WR_BEAT];
+            ctrl(2'b11);
+            t0 = int'($time / 10);
+            tenure = 1;
+            while (busy && nr < 2 * SETS * `L2_WAYS) begin
+               int s = int'(dut.r_walk_set);
+               xact(1, 1, 0, L(nr % 2, s) + 16 * (nr % 4), 0, rnd256(), 16'(nr * 13), 0, 0);
+               nr++;
+               if (nr % 8 == 0) begin dma = 0; @(negedge clk); dma = 1; end
+            end
+            tenure = 0; dma = 0;
+            if (busy) fail($sformatf("wkset: BUSY after %0d requests (walk at set %0d)", nr, dut.r_walk_set));
+            $display("TB_L2 wkset: walk done after %0d requests, %0d cycles, %0d write beats (whole cache %0d)", nr,
+                     int'($time / 10) - t0, evc[WR_BEAT] - n0, SETS * `L2_WAYS * 8);
+            wait_idle(); ctrl(2'b11); wait_idle(); check_ddr("wkset");
+         end
+         // ---------------------------------------------------------------
+         "strmedge": begin
+            // review 2 (m-C): a write accepted on the very edge the stream
+            // buffer captures sector 1 (the fill's last beat) must leave it
+            // empty.  The write is timed at every offset from the read's
+            // ready over the fill's tail, so one of them lands on that edge
+            int same = 0;
+            // (DMA writes: posted, so the line stays out of the L2 and the
+            // sector-1 read below can only be answered by the stream buffer
+            // or DDR)
+            for (int r = 0; r < 32; r++) begin
+               logic [31:0] b = L(7 + r % 3, 100 + r);
+               xact(0, 1, 1, b, 0, 0, 0, 0, 0);                  // sector 0: the stream fill
+               repeat (r % 16) @(negedge clk);
+               xact(1, 1, 0, b + 32 + 16 * (r % 2), 0, rnd256(), 16'(r * 4099), 0, 0);
+               while (dut.e_st != 2'd0) @(negedge clk);
+               xact(0, 1, 1, b + 32, 0, 0, 0, 0, 0);             // sector 1: must see the write
+            end
+            same = strm_edge;
+            if (same == 0) fail("strmedge: no write accepted on the capture edge (test vacuous)");
+            $display("TB_L2 strmedge: %0d writes on the capture edge", same);
+            ctrl(2'b11); wait_idle(); check_ddr("strmedge");
          end
          // ---------------------------------------------------------------
          default: begin
@@ -659,6 +871,7 @@ module tb_l2;
       repeat (20) @(negedge clk);
       if (n_rdy != n_req) fail($sformatf("%0d readies for %0d requests", n_rdy, n_req));
       if (rt_bad != 0) fail($sformatf("%0d drains started while VGA / DMA held the bus with no request waiting on the buffer", rt_bad));
+      if (wk_prio_bad != 0) fail($sformatf("%0d demand reads started before the drain the walk waited on", wk_prio_bad));
       $display("TB_L2 ev i_hit=%0d i_miss=%0d d_hit=%0d d_miss=%0d w_hit=%0d w_miss=%0d rd_beat=%0d wr_beat=%0d wbfull=%0d dma_hit=%0d dma_miss=%0d wbm_wait=%0d spec_used=%0d dw_seen=%0d rt_need=%0d rt_bad=%0d",
                evc[0], evc[1], evc[2], evc[3], evc[4], evc[5], evc[6], evc[7], evc[8], evc[9], evc[10],
                wbm_wait, spec_used, dw_seen, rt_need, rt_bad);
@@ -667,6 +880,11 @@ module tb_l2;
       $finish;
    end
 
+   // dmapost / cpupost: a set away from the one the walk is in (a write to
+   // that set waits for the walk's copy, which would hide the slot race)
+   function automatic int far_set(input int nr);
+      return (int'(dut.r_walk_set) + SETS / 2 + nr % 64) % SETS;
+   endfunction
    function automatic bit d_of(input int r);
       return r % 2;
    endfunction

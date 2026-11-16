@@ -281,7 +281,16 @@ module qspi_ctrl #(
     always_comb begin
         w_eng_buf_we    = w_byte_done && (r_kind == K_READ)
                           && (r_byte >= {7'b0, r_hdr});
-        w_eng_buf_idx   = w_eng_buf_we ? w_cur_data_idx[7:0] : w_data_idx_next[7:0];
+        // (tmg timing) the index's select does not wait on the SCK tick:
+        // a read command past its header always points at the byte being
+        // received (written on its last tick, w_eng_buf_we), anything else
+        // at the next tx byte.  Where w_eng_buf_we is 0 the index only
+        // feeds w_eng_buf_rbyte -> w_nb, which reads the buffer byte only
+        // for K_WRITE (= w_data_idx_next as before); so the writes and r_tx
+        // are unchanged.  (r_div_cnt -> w_tick -> the index -> the buffer
+        // read -> w_nb -> r_tx was the controller's near-critical path.)
+        w_eng_buf_idx   = (r_kind == K_READ && r_byte >= {7'b0, r_hdr}) ? w_cur_data_idx[7:0]
+                                                                         : w_data_idx_next[7:0];
         w_eng_buf_wdata = w_rx_full;
     end
     wire [7:0] w_eng_buf_rbyte = r_buf[w_eng_buf_idx[7:3]][w_eng_buf_idx[2:0]*8 +: 8];

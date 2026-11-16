@@ -34,7 +34,11 @@ module tb_sd_native;
         .i_Clk(clk), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus), .o_irq(irq),
         .i_sd_cd(cd), .o_sd_reset_n(reset_n), .o_sd_sck(sck),
         .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .i_sd_cmd(sd_cmd),
-        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat(sd_dat)
+        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat(sd_dat),
+        // the SD DMA port: idle here (no DMA_EN data command; tb_sd_dma tests it)
+        .o_dma_req(), .o_dma_done(), .o_dma_write_DV(), .o_dma_read_DV(), .o_dma_addr(),
+        .o_dma_write_data(), .o_dma_wdf_mask(), .i_dma_read_data(128'h0), .i_dma_ready(1'b0),
+        .i_dma_grant(1'b0)
     );
     sd_card_model card (.clk(sck), .pwr(!reset_n), .cmd(sd_cmd), .dat(sd_dat));
 
@@ -252,7 +256,7 @@ module tb_sd_native;
 
         // =========================================================== reset values
         mr(SD_CTRL, d);      check("SD_CTRL reset", d, 64'h0001_00F9);
-        mr(SDM_CAPS, d);     check("SDM_CAPS", d, 64'h0008_0101);
+        mr(SDM_CAPS, d);     check("SDM_CAPS ([10]: the SD DMA engine)", d, 64'h0008_0501);
         mr(SDM_TIMEOUT, d);  check("SDM_TIMEOUT reset", d, {32'd12_500_000, 32'd2_500_000});
         mr(SDM_CFG, d);      check("SDM_CFG reset", d, 0);
         mr(SDM_BLK, d);      check("SDM_BLK reset", d, 64'h0001_0200);
@@ -270,14 +274,14 @@ module tb_sd_native;
         mw(SDM_ARG, 64'hFFFF_FFFF_1234_5678);    mr(SDM_ARG, d);  check("SDM_ARG", d, 64'h1234_5678);
         mw(SDM_BLK, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_BLK, d);  check("SDM_BLK [1:0]/[15:12] read 0", d, 64'hFFFF_0FFC);
         mw(SDM_BLK, 64'h0001_0003);              mr(SDM_BLK, d);  check("SDM_BLK size 3 reads 0", d, 64'h0001_0000);
-        mw(SDM_IRQ_EN, 64'hFFFF_FFFF_FFFF_FFFF); mr(SDM_IRQ_EN, d); check("SDM_IRQ_EN mask", d, 64'h07FF_0310);
+        mw(SDM_IRQ_EN, 64'hFFFF_FFFF_FFFF_FFFF); mr(SDM_IRQ_EN, d); check("SDM_IRQ_EN mask ([27] DMA_ERR)", d, 64'h0FFF_0310);
         mw(SDM_IRQ_EN, 0);
-        mw(SDM_CFG, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_CFG, d);  check("SDM_CFG reserved bits read 0", d, 64'h5);
+        mw(SDM_CFG, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_CFG, d);  check("SDM_CFG reserved bits read 0 ([16] DMA_EN)", d, 64'h1_0005);
         mw(SDM_CFG, 0);
         mw(SDM_TIMEOUT, 64'h0000_1111_0000_2222); mr(SDM_TIMEOUT, d); check("SDM_TIMEOUT", d, 64'h0000_1111_0000_2222);
         mw(SDM_TIMEOUT, {32'd12_500_000, 32'd2_500_000});
-        mw(SDM_DMA, 64'hFFFF_FFFF);              mr(SDM_DMA, d);  check("SDM_DMA_ADDR reads 0", d, 0);
-        mw(SDM_CAPS, 0);                          mr(SDM_CAPS, d); check("SDM_CAPS read-only", d, 64'h0008_0101);
+        mw(SDM_DMA, 64'hFFFF_FFFF);              mr(SDM_DMA, d);  check("SDM_DMA_ADDR ([2:0] read 0)", d, 64'hFFFF_FFF8);
+        mw(SDM_CAPS, 0);                          mr(SDM_CAPS, d); check("SDM_CAPS read-only", d, 64'h0008_0501);
         mr(SDM_CMD, d);                           check("SDM_CMD reads 0", d, 0);
         mw(SDM_STATUS, 64'hFFFF_FFFF);            status(st);      check("SDM_STATUS W1C on clean", st, 64'h08);
 
