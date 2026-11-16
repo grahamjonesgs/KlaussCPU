@@ -329,6 +329,71 @@ def t_range_combo():
                          'walks': ['whole', 'whole', 'whole', 'whole', 'whole', 'range']}
 
 
+def _code_dwords(base, val):
+    """F: r5 = val; RET — as dwords at base (zero-padded)"""
+    f = Asm(base=base)
+    f.setr(5, val); f.ret()
+    w = f.assemble() + [0]
+    return [(w[i] | (w[i + 1] << 32)) for i in range(0, len(w) - 1, 2)]
+
+
+def t_iinv(variant, ln=512):
+    """RANGE_IINV (CACHE_CTRL[6]): F (r5 = 1; RET) at X runs from a loop's
+    CALL (I-cache line, NLB, BTIC entry for the CALL's target window); F'
+    (r5 = 2) goes to the card by DMA from a staging buffer, comes back by DMA
+    over X; RANGE_INV X in the D-cache (I-fills come through it); then:
+      none   — no I-cache op: the loop still runs F (r6 = 4 + 2: the
+               control, the test sees stale code);
+      iinv   — RANGE_IINV [X, +ln): F' (r6 = 4 + 4);
+      other  — RANGE_IINV of another range: the I-cache line of X stays
+               (r6 = 6: only the range's lines are dropped);
+      icinv  — ICACHE_INV: F'.
+    The same CALL site runs before and after (the BTIC entry); tb_soc's BTIC
+    checks (btic_unc / btic_stale) gate every run; RKSWEEP gives the sweep."""
+    a = SdAsm().prologue(div=0)
+    X, S, K = 0x8000, 0x9000, 50
+    for i, d in enumerate(_code_dwords(X, 1)):
+        a.dword(X + 8 * i, d)
+    a.setr(6, 0); a.setr(13, 0)
+    a.label('run'); a.setr(9, 4)
+    a.label('lp'); a.call(X); a.alu('add', 6, 6, 5); a.dec(9); a.fbr('ne', 9, 0, 'lp', imm=True)
+    a.fbr('ne', 13, 0, 'after1', imm=True)
+    # F' to the card through a staging buffer, then back over X
+    a.setr(10, S)
+    for i, d in enumerate(_code_dwords(X, 2)):
+        a.setr64(1, d); a.st(64, 1, 10, 8 * i)
+    a.cache_op(RCLEAN, S, 512)
+    a.dma(24, K, S, 512, 1, 1); a.wait_done(); a.mov(4, 3)
+    # (clean before the device writes X: the boot copy left X dirty in the
+    # D-cache, and RANGE_INV would write that line back over the DMA's data)
+    a.cache_op(RCLEAN, X, 512)
+    a.dma(17, K, X, 512, 1, 0); a.wait_done(); a.alu('or', 4, 4, 3)
+    a.cache_op(RINV, X, 512)
+    if variant == 'iinv':
+        a.cache_op(RIINV, X, ln)
+    elif variant == 'other':
+        a.cache_op(RIINV, X + 0x1000, ln)
+    elif variant == 'icinv':
+        a.wr(14, CACHE_CTRL, ICINV)
+    a.setr(13, 1); a.jmp('run')
+    a.label('after1')
+    a.mov(7, 5)
+    a.halt()
+    new = variant in ('iinv', 'icinv')
+    return a, {'r4': 0, 'r6': 12 if new else 8, 'r7': 2 if new else 1}, \
+        [], {'host_err': 0}
+
+
+def t_iinv_time(ln, addr=0x10000):
+    """RANGE_IINV's sweep for ln bytes from addr with the I-cache warm
+    (RKSWEEP lines= cycles=): a timing figure; every LEN 32 .. 64 KiB"""
+    a = SdAsm().prologue(div=0)
+    a.setr(10, 0)
+    a.cache_op(RIINV, addr, ln)
+    a.halt()
+    return a, {}, [], {}
+
+
 def tests():
     return [
         ('rd_m3_nowait', *t_read_coherent(False)),
@@ -341,4 +406,11 @@ def tests():
         ('range_queue_copy', *t_range_queue(1)),
         ('range_queue_full', *t_range_queue(2)),
         ('range_combo', *t_range_combo()),
+        ('iinv_none', *t_iinv('none')),
+        ('iinv', *t_iinv('iinv')),
+        ('iinv_wide', *t_iinv('iinv', ln=0x3000)),
+        ('iinv_other', *t_iinv('other')),
+        ('iinv_icinv', *t_iinv('icinv')),
+    ] + [
+        (f'iinv_time_{ln}', *t_iinv_time(ln)) for ln in (32, 1024, 2048, 4096, 8192, 0xFFE0, 0x10000)
     ]
