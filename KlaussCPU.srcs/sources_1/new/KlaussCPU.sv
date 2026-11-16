@@ -741,8 +741,10 @@ module KlaussCPU #(
    // and 0 otherwise as before.  Takes r_pipe_owns -> address mux ->
    // splitter decode off the ready -> stall -> forward / pc cones (timing).
    wire        w_split_ready_q;
-   wire        w_pip_ready = w_pipe_owns &&
-                             ((pip_m_addr[31:28] == 4'hF) ? w_split_ready_q : dram_mem.ready);
+   // (§8 timing: the core's registered m_io = pip_m_addr[31:28] == F; b2's
+   // worst, pip_m_addr -> the decode -> w_pip_ready -> icinv -> pc)
+   wire        pip_m_io;
+   wire        w_pip_ready = w_pipe_owns && (pip_m_io ? w_split_ready_q : dram_mem.ready);
 
    // Pipeline core — the execution engine (owns rf / flags / SP / PC /
    // int_mask; single retire at WB; see pipeline_core.sv + PIPELINE_IMPL.md).
@@ -817,6 +819,7 @@ module KlaussCPU #(
       .start      (r_pip_start),
       .start_pc   (r_pip_start_pc),
       .m_addr     (pip_m_addr),
+      .m_io       (pip_m_io),
       .m_read_DV  (pip_m_read_DV),
       .m_write_DV (pip_m_write_DV),
       .m_wdata    (pip_m_wdata),

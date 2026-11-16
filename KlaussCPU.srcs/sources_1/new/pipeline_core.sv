@@ -104,6 +104,9 @@ module pipeline_core
    input  logic [31:0]  start_pc,
    // shared memory port (membus_if master shape)
    output logic [31:0]  m_addr,
+   // (§8 timing) m_addr[31:28] == 4'hF, registered with m_addr: the SoC's
+   // ready select (KlaussCPU w_pip_ready) takes one register, not a decode
+   output logic         m_io,
    output logic         m_read_DV,
    output logic         m_write_DV,
    output logic [63:0]  m_wdata,
@@ -1872,6 +1875,13 @@ module pipeline_core
    // (ready-edge arming, see the MEM / IF port engines; declared here for
    // the 1a hazard terms)
    logic rdy_armed;
+   function automatic logic f_io(logic [31:0] a);   // (m_io's next value)
+      return a[31:28] == 4'hF;
+   endfunction
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst) assert (m_io == (m_addr[31:28] == 4'hF))
+      else $fatal(1, "m_io != m_addr[31:28] == F (m_addr %h)", m_addr);
+`endif
    wire  w_mrdy = m_ready && rdy_armed;
    logic [31:0] wb_pc, wb_op;
    logic [3:0]  wb_rd;
@@ -2843,7 +2853,7 @@ module pipeline_core
    // always counts as mispredicted: the redirect goes to ret_actual, the
    // real value, so it is correct, a squash only when the prediction was
    // right — no program keeps its stack in MMIO.)
-   wire ret_port_io  = m_addr[31:28] == 4'hF;
+   wire ret_port_io  = m_io;
    wire ret_ne       = mem_ret_h ? ret_ne_h
                      : ret_port_io ? 1'b1
                      : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata_dram[31:0] != mem_pred_tgt)
@@ -3662,7 +3672,7 @@ module pipeline_core
          r_in0 <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
-         m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
+         m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_io <= 1'b0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
          irq_active <= 1'b0; irq_xc <= 1'b0; irq_ack <= 1'b0;
          rdy_armed <= 1'b0; ex_fwd_f <= 1'b0; snoop_q <= 1'b0; ri_v <= 1'b0; ri_m <= 1'b0;
          dbg_active <= 1'b0; dbg_cause_q <= '0; dbg_cause <= '0;
@@ -3818,7 +3828,7 @@ module pipeline_core
                            end
                         end
                      end else begin
-                        m_addr     <= {5'b0, wk_a, 3'b000};
+                        m_addr     <= {5'b0, wk_a, 3'b000}; m_io <= f_io({5'b0, wk_a, 3'b000});
                         m_be       <= 8'hFF;  m_zl <= 1'b0;
                         m_read_DV  <= 1'b1;
                         m_vav      <= 1'b0;
@@ -3850,7 +3860,7 @@ module pipeline_core
                      // an exception's frame PC is its EPC
                      // (stage 3: with TE = 1 the push is not translated: PA =
                      // SP - 8 - 0x8000_0000, SP - 8 in kseg — checked above)
-                     m_addr     <= (EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va;
+                     m_addr     <= (EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va; m_io <= f_io((EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va);
                      m_wdata    <= {19'b0, EN_EXC && umode, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
@@ -4096,7 +4106,7 @@ module pipeline_core
             // EN_SQ: the queued store follows on the same edge (the cache
             // needs a DV-low cycle between two requests to one address)
             if (sq_v && sq_addr != m_addr) begin
-               m_addr     <= sq_addr;
+               m_addr     <= sq_addr; m_io <= f_io(sq_addr);
                m_wdata    <= sq_wdata;
                m_be       <= sq_be;  m_zl <= sq_zl;
                m_write_DV <= 1'b1;
@@ -4108,7 +4118,7 @@ module pipeline_core
          end
          // ...or on an idle port (the same-address case, a cycle later)
          if (EN_SQ && sq_v && !st_post && !if_xc && !ld_out && mem_xc == 2'd0) begin
-            m_addr     <= sq_addr;
+            m_addr     <= sq_addr; m_io <= f_io(sq_addr);
             m_wdata    <= sq_wdata;
             m_be       <= sq_be;  m_zl <= sq_zl;
             m_write_DV <= 1'b1;
@@ -4130,14 +4140,14 @@ module pipeline_core
          // wb_hmiss, so it is the oldest request.
          if (wb_hmiss && !if_xc && !st_post && !sq_v && mem_xc == 2'd0 && !irq_xc &&
              !(DEBUG_EN && dbg_mx)) begin
-            m_addr    <= wb_iaddr;
+            m_addr    <= wb_iaddr; m_io <= f_io(wb_iaddr);
             m_be      <= wb_be;  m_zl <= 1'b0;
             m_read_DV <= 1'b1;
             rdy_armed <= !m_ready;
             ld_out    <= 1'b1;
          end
          if (h_miss_now) begin
-            m_addr    <= mem_iaddr;
+            m_addr    <= mem_iaddr; m_io <= f_io(mem_iaddr);
             m_be      <= mem_be;  m_zl <= 1'b0;
             m_read_DV <= 1'b1;
             rdy_armed <= !m_ready;
@@ -4166,7 +4176,7 @@ module pipeline_core
                   // port now only if that one drains this edge to another
                   // address; else it waits in sq_*)
                   if (!sq_enq_now || (w_mrdy && mem_iaddr != m_addr)) begin
-                     m_addr     <= mem_iaddr;
+                     m_addr     <= mem_iaddr; m_io <= f_io(mem_iaddr);
                      m_wdata    <= mem_wdata;
                      m_be       <= mem_be;  m_zl <= EN_DCBZ && mem_d.zl;
                      m_read_DV  <= mem_port_rd;
@@ -4259,7 +4269,7 @@ module pipeline_core
                      mem_dw0   <= m_rdata;
                      // (stage 3: the 2nd dword's PA — next to the 1st, or
                      // the start of the next page's frame)
-                     m_addr    <= mem_xpg ? {mem_pa2hi, 16'h0000} : {mem_iaddr[31:3], 3'b000} + 32'd8;
+                     m_addr    <= mem_xpg ? {mem_pa2hi, 16'h0000} : {mem_iaddr[31:3], 3'b000} + 32'd8; m_io <= f_io(mem_xpg ? {mem_pa2hi, 16'h0000} : {mem_iaddr[31:3], 3'b000} + 32'd8);
                      rdy_armed <= 1'b0;        // new request (DV held, addr changed)
                      mem_xc    <= 2'd2;        // settle cycle (f_memget32 shape)
                      // (HW_PERF_PLAN §8: after an MMIO 1st read, DV drops for
@@ -4270,7 +4280,7 @@ module pipeline_core
                      // Ethernet bridge waits for DV low — so a LEAVERET /
                      // spanning MEMGET32 in MMIO deadlocked.  DRAM 1st reads
                      // keep DV up: cycle-identical.)
-                     if (m_addr[31:28] == 4'hF) m_read_DV <= 1'b0;
+                     if (m_io) m_read_DV <= 1'b0;
                   end else begin
                      m_read_DV <= 1'b0;  m_write_DV <= 1'b0;
                      mem_xc    <= 2'd0;
@@ -4305,7 +4315,7 @@ module pipeline_core
          if (DEBUG_EN && dbg_halted) begin
             if (!dbg_mx) begin
                if (dbg_i.mem_req && !if_xc && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out) begin
-                  m_addr     <= dbg_i.mem_addr;
+                  m_addr     <= dbg_i.mem_addr; m_io <= f_io(dbg_i.mem_addr);
                   m_wdata    <= dbg_i.mem_wdata;
                   m_be       <= dbg_i.mem_be;  m_zl <= 1'b0;
                   m_read_DV  <= !dbg_i.mem_we;
@@ -4465,6 +4475,7 @@ module pipeline_core
                   // fault tag, nothing on the port)
                   m_addr    <= (EN_TLB && te) ? {r_look_pa, miss_dw[12:0], 3'b000}
                                               : {miss_dw, 3'b000};   // miss: issue the shared-port fill
+                  m_io      <= f_io((EN_TLB && te) ? {r_look_pa, miss_dw[12:0], 3'b000} : {miss_dw, 3'b000});
                   // MMU stage 1: in user mode a 0xF... dword is a FAKE fill —
                   // no DV on the port; it completes next cycle with zeros and
                   // no I-cache install, and the ID fetch check makes the op
@@ -4779,7 +4790,7 @@ module pipeline_core
                // early load issue (see EN_EARLY_LD): the MEM engine then
                // starts in its wait-ready state
                if (w_early_ld && !ex_misal && !ex_uf_early) begin
-                  m_addr     <= exo_iaddr;
+                  m_addr     <= exo_iaddr; m_io <= f_io(exo_iaddr);
                   m_be       <= exo_be;  m_zl <= 1'b0;
                   m_read_DV  <= 1'b1;
                   rdy_armed  <= !m_ready;
