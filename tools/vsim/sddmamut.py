@@ -115,6 +115,13 @@ MUTS = [
     ('iinv_with_whole', "RANGE_IINV is ignored with FLUSH / INVALIDATE (review 1 nit: it is honoured)", PC, ['iinv_flush', 'iinv_inval'],
      "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] &&",
      "                            mem_be[0] && mem_wdata[6] && !mem_wdata[3] && !mem_wdata[2] && !mem_wdata[1] &&"),
+    # ---------------- the tmg review's forward mutants (fwdfuzz) ----------------
+    ('fwd_tb_md', "t_tb_d takes a MEM shift's result for any mode, not only [rs1+rs2] (tmg review)", PC, 'fwd',
+     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;",
+     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem)    ? w_sh2[31:0] : t_tb_n;"),
+    ('fwd_ta_md', "t_ta_d takes a MEM shift's result for an [imm] access (tmg review)", PC, 'fwd',
+     "   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0] : t_ta_n;",
+     "   wire [31:0] t_ta_d = (fs_a && !t_sp) ? w_sh2[31:0] : t_ta_n;"),
     # ---------------- RANGE_IINV (tb_soc) ----------------
     ('iinv_nomask', 'the range sweep clears nothing', PC, ['iinv', 'iinv_wide'],
      "         wire we = swst ? (!r_sw_rng || r_sw_mask[b])", "         wire we = swst ? (!r_sw_rng)"),
@@ -161,6 +168,14 @@ def run_mut(m, keep=False):
                 killed = True
                 break
         first = next((l for l in out.splitlines() if 'FAIL' in l or 'atal' in l or 'ERROR' in l or 'FATAL' in l), '?')
+    elif suite == 'fwd':
+        env.update(VSIM_WORK=os.path.join(d, 'vw'), VSIM_GIT=ROOT)
+        base = subprocess.check_output(['git', '-C', ROOT, 'rev-parse', 'HEAD'], text=True).strip()
+        r = subprocess.run([sys.executable, os.path.join(d, 'tools/vsim/run.py'), 'fwdfuzz', '--base', base,
+                            '--seeds', '6'], env=env, capture_output=True, text=True, timeout=7200)
+        out = r.stdout + r.stderr
+        killed = r.returncode != 0
+        first = next((l for l in out.splitlines() if l.startswith('DIFF') or 'failed' in l), '?')
     else:
         env.update(VSIM_WORK=os.path.join(d, 'vw'))
         r = subprocess.run([sys.executable, os.path.join(d, 'tools/vsim/run.py'), 'socsddma'] + suite, env=env,

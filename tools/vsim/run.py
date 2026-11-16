@@ -23,7 +23,8 @@ sys.path.insert(0, HERE)
 
 def git_show(rev, path):
     rel = os.path.relpath(path, ROOT)
-    return subprocess.check_output(['git', '-C', ROOT, 'show', f'{rev}:{rel}'], text=True,
+    # (VSIM_GIT: the repository, when this tree is a copy — a mutant's)
+    return subprocess.check_output(['git', '-C', os.environ.get('VSIM_GIT', ROOT), 'show', f'{rev}:{rel}'], text=True,
                                    stderr=subprocess.DEVNULL)
 
 
@@ -604,6 +605,51 @@ def cmd_diff(a):
     print(f'{fails} differing; total cycles base={tot["base"]} new={tot["new"]} '
           f'({100.0 * (tot["new"] - tot["base"]) / max(1, tot["base"]):+.2f}%); '
           f'BTIC hits base={hits["base"]} new={hits["new"]}')
+    return 1 if fails else 0
+
+
+def cmd_fwdfuzz(a):
+    """tmg review: tools/vsim/fwdfuzz.py's producer -> memory-op programs on a
+    base revision and the working tree, identical retire traces required,
+    at +LAT 1 / 2 / 3 / 5 x +HIT 0 / 70 / 95 (tb_vsim); --soc also through
+    tb_soc (the real cache and hit pipe)."""
+    import fwdfuzz
+    base = build(a.base)
+    new = build(None)
+    fails = n = 0
+    for s in range(a.seed0, a.seed0 + a.seeds):
+        asm = fwdfuzz.gen(s)
+        for lat in (1, 2, 3, 5):
+            for hit in (0, 70, 95):
+                plus = [f'+LAT={lat}', f'+HIT={hit}'] + a.plus
+                sb, tb = run(base, asm, f'fb{s}_{lat}_{hit}', plus, trace=True, gate=False)
+                sn, tn = run(new, asm, f'fn{s}_{lat}_{hit}', plus, trace=True)
+                same = sb.get('end') == 'park' and sb.get('kind') == '0' and open(tb).read() == open(tn).read() \
+                    and 'fatal' not in (sb['log'] + sn['log']).lower()
+                n += 1
+                if not same:
+                    fails += 1
+                    print(f'DIFF seed={s} lat={lat} hit={hit} end {sb.get("end")}/{sn.get("end")} '
+                          f'kind {sb.get("kind")}/{sn.get("kind")} '
+                          + ' '.join(l for l in sn['log'].splitlines() if 'atal' in l)[:200])
+                for f in (tb, tn):
+                    if f and os.path.exists(f):
+                        os.remove(f)
+    if a.soc:
+        sbase = build_soc(a.base)
+        snew = build_soc(None)
+        for s in range(a.seed0, a.seed0 + a.soc):
+            asm = fwdfuzz.gen(s)
+            rb = run_soc(sbase, asm, f'ffs_b{s}', trace=True, gate=False)
+            rn = run_soc(snew, asm, f'ffs_n{s}', trace=True)
+            same = 'HALTED' in rb['log'] and open(rb['trace']).read() == open(rn['trace']).read()
+            n += 1
+            if not same:
+                fails += 1
+                print(f'DIFF soc seed={s} ' + ' '.join(l for l in rn['log'].splitlines() if 'atal' in l or 'DEADLOCK' in l)[:200])
+            for r in (rb, rn):
+                shutil.rmtree(os.path.dirname(r['trace']), ignore_errors=True)
+    print(f'{fails} differing of {n} runs')
     return 1 if fails else 0
 
 
@@ -2386,6 +2432,10 @@ def main():
     dz.add_argument('--seed0', type=int, default=1); dz.add_argument('-v', '--verbose', action='store_true')
     sz = sub.add_parser('socdcbz'); sz.add_argument('--seeds', type=int, default=6)
     sz.add_argument('--seed0', type=int, default=1)
+    ff = sub.add_parser('fwdfuzz'); ff.add_argument('--base', required=True)
+    ff.add_argument('--seeds', type=int, default=20); ff.add_argument('--seed0', type=int, default=1)
+    ff.add_argument('--soc', type=int, default=0, help='also this many seeds through tb_soc')
+    ff.add_argument('--plus', action='append', default=[])
     sub.add_parser('socsd')
     sdv = sub.add_parser('socsdvga'); sdv.add_argument('--lines', type=int, default=120)
     sdv.add_argument('--wbinv-every', type=int, default=1500)
@@ -2483,6 +2533,8 @@ def main():
         sys.exit(cmd_socdcbz(a))
     elif a.cmd == 'socwalk':
         sys.exit(cmd_socwalk(a))
+    elif a.cmd == 'fwdfuzz':
+        sys.exit(cmd_fwdfuzz(a))
     elif a.cmd == 'socsdvga':
         sys.exit(cmd_socsdvga(a))
     elif a.cmd == 'socsddma':
