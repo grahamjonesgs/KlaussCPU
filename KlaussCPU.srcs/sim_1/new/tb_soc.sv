@@ -440,6 +440,59 @@ module tb_soc;
       if (dut.vga_ctrl_i.scanout.o_dma_req && !dut.vga_ctrl_i.scanout.i_dma_grant) vga_gnt_cyc++;
    end
 
+   // ---------------- a CPU_RESETN press mid-DMA-tenure (HW_PERF_PLAN §8 3d)
+   // +RSTORPH=<k>: at the k-th start of a cycle run in which a DMA master
+   // holds the DDR grant with its read DV up (its read accepted below, or
+   // about to be) while the D-cache waits with a request of its own, pull
+   // CPU_RESETN low for 40 board cycles: the DMA masters reset (their req
+   // drops with no done: the arbiter's orphaned grant), the memory system
+   // does not.  4,000 cycles later the run ends with the consistency
+   // checker's count (an answer to the dead master's read delivered to the
+   // D-cache is a wrong read answer).
+   int rst_k = 0, rst_seen = 0;
+   bit rst_go = 0, rst_c_q = 0;
+   always @(posedge dut.i_Clk) if (rst_k != 0 && !rst_go) begin
+      // (the read accepted below: the L2's front end busy with a DMA read,
+      // or ddr2_control in a read state)
+      automatic bit acc =
+`ifdef L2_PROBE
+         dut.mem_read_write.`DDRPATH.f_st != 0 && dut.mem_read_write.`DDRPATH.q_dma && !dut.mem_read_write.`DDRPATH.q_wr;
+`else
+         dut.mem_read_write.`DDRPATH.state inside {4'd4, 4'd5, 4'd7};
+`endif
+      automatic bit c = (dut.mem_read_write.r_grant_vga || dut.mem_read_write.r_grant_blit ||
+                         dut.mem_read_write.r_grant_sd || dut.mem_read_write.r_grant_c2) &&
+                        dut.mem_read_write.mig_read_DV && dut.mem_read_write.o_ddr_mem_read_DV && acc;
+      if (c && !rst_c_q) begin
+         rst_seen++;
+         if (rst_seen == rst_k) rst_go = 1;
+      end
+      rst_c_q = c;
+   end
+   initial begin
+      if ($value$plusargs("RSTORPH=%d", rst_k)) begin
+         // the framebuffer the scanout reads (4 MiB, 600 KiB) holds a
+         // pattern, in DDR and in the checker's reference: an answer to a
+         // scanout read then differs from any other line's
+         wait (dut.st.SM == PIPE_RUN);
+         for (int i = 0; i < 640 * 480 * 2 / 8; i++) begin
+            automatic logic [31:0] a = 32'h0040_0000 + 32'(8 * i);
+            // (the model's 16 B burst: beat 0 = the dword at +8)
+            dut.mem_read_write.`DDRPATH.mig_7series_0.mem_lo[(a >> 3) ^ 1] = {~a, a};
+            ref_m[a] = {~a, a};
+         end
+         wait (rst_go);
+         $display("TB_SOC: RSTORPH reset at grant vga=%0d blit=%0d sd=%0d c2=%0d", dut.mem_read_write.r_grant_vga,
+                  dut.mem_read_write.r_grant_blit, dut.mem_read_write.r_grant_sd, dut.mem_read_write.r_grant_c2);
+         cpu_resetn = 1'b0;
+         repeat (40) @(posedge clk100);
+         cpu_resetn = 1'b1;
+         repeat (4000) @(posedge dut.i_Clk);
+         $display("TB_SOC: RSTORPH done consistency checks=%0d errors=%0d", cc_n, cc_err);
+         $finish;
+      end
+   end
+
    // ---------------- end / progress ----------------
    longint last_i = -1;
    int     idle_n = 0;

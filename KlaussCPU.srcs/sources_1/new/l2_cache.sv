@@ -104,7 +104,11 @@ module l2_cache #(
     output            o_en,             // L2_CTRL[0]
     output            o_busy,           // L2_CTRL[8]
     // perf events (one-cycle strobes): see the assigns at the end
-    output logic [10:0] o_ev
+    output logic [10:0] o_ev,
+    // the front end holds no accepted request (no answer outstanding: a
+    // read's ready leaves with the move back to F_IDLE; writes are acked
+    // at acceptance) — the arbiter's orphaned-grant release (HW_PERF_PLAN §8)
+    output            o_fe_idle
 );
 
     // ---------------------------------------------------------------------
@@ -431,6 +435,7 @@ module l2_cache #(
         F_WK0, F_WK1, F_WK2
     } fst_t;
     fst_t f_st = F_IDLE;
+    assign o_fe_idle = f_st == F_IDLE;
     fst_t f_ret;                         // after a victim / walk copy
     logic [WAYW-1:0] c_way;              // copy: the way
     logic [1:0]      c_sec;              // copy: its dirty sectors

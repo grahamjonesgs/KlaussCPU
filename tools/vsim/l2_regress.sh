@@ -59,6 +59,8 @@ sec_soc36() {
    t socsd_m36 X=1 -- $R socsd
    t soceth_m36 X=1 -- $R soceth
    t socvga_m36 X=1 -- $R socvga
+   t socframe_m36 X=1 -- $R socframe          # HW_PERF_PLAN §8 item 1
+   t socorphan_m36 X=1 -- $R socorphan        # §8 item 3d
 }
 sec_soc8() {
    soc_set m8 VSIM_SOC_PLUS=+MIGLAT=8
@@ -67,6 +69,7 @@ sec_soc8() {
 sec_socvar() {
    soc_set nol2 VSIM_L2=0
    t socl2_nol2 VSIM_L2=0 -- $R socl2
+   t socorphan_nol2 VSIM_L2=0 -- $R socorphan
    soc_set w8 VSIM_L2_WAYS=8
    t socl2_w8 VSIM_L2_WAYS=8 -- $R socl2
    soc_set jit "VSIM_SOC_PLUS=+MIGLAT=8 +MIGJIT=20 +MIGRDY=30"

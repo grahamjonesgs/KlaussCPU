@@ -1430,7 +1430,15 @@ module mem_read_write #(
     // MS_Wx_WAIT on the gated w_cache_ddr_ready) exactly like a cache miss
     // parks behind a blitter chunk.  Without this a full-cache flush (up to
     // ~1.2 ms with every line dirty) would underflow ~38 display lines.
+    // (HW_PERF_PLAN §8 item 3d: the quiet cycles were not enough — a read
+    // the dead master left below answers when DDR does, ~40+ cycles with
+    // the L2's miss path, and that ready went to the D-cache, which takes a
+    // request held up by the grant, as its own line: an orphaned grant is
+    // released only once the controller's front end is idle as well
+    // (w_ddr_fe_idle: no accepted request unanswered).  The count saturates.)
+    wire        w_ddr_fe_idle;
     logic [3:0] r_grant_orphan_cnt = 4'd0;
+    wire w_orph_rel = r_grant_orphan_cnt == 4'd15 && w_ddr_fe_idle;
     wire w_grant_orphaned = (r_grant_blit && !i_dma_req && !i_dma_done) ||
                             (r_grant_c2   && !i_c2_req  && !i_c2_done)  ||
                             (r_grant_vga  && !i_vga_req && !i_vga_done) ||
@@ -1440,7 +1448,8 @@ module mem_read_write #(
     assign o_vga_yield = is_miss_path;
 
     always_ff @(posedge i_Clk) begin
-        r_grant_orphan_cnt <= w_grant_orphaned ? r_grant_orphan_cnt + 4'd1 : 4'd0;
+        r_grant_orphan_cnt <= !w_grant_orphaned ? 4'd0
+                            : (r_grant_orphan_cnt == 4'd15) ? 4'd15 : r_grant_orphan_cnt + 4'd1;
         if (w_no_grant) begin
             // o_mnt_busy (not just r_mnt_active): a REQUESTED flush/invalidate
             // must win over a new blit/core-2 tenure even before its walk has
@@ -1453,16 +1462,16 @@ module mem_read_write #(
                 else if (i_c2_req) r_grant_c2   <= 1'b1;
             end
         end else if (r_grant_vga) begin
-            if (i_vga_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+            if (i_vga_done || (w_grant_orphaned && w_orph_rel))
                 r_grant_vga <= 1'b0;
         end else if (r_grant_sd) begin
-            if (i_sd_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+            if (i_sd_done || (w_grant_orphaned && w_orph_rel))
                 r_grant_sd <= 1'b0;
         end else if (r_grant_blit) begin
-            if (i_dma_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+            if (i_dma_done || (w_grant_orphaned && w_orph_rel))
                 r_grant_blit <= 1'b0;
         end else begin
-            if (i_c2_done || (w_grant_orphaned && r_grant_orphan_cnt == 4'd15))
+            if (i_c2_done || (w_grant_orphaned && w_orph_rel))
                 r_grant_c2 <= 1'b0;
         end
     end
@@ -1559,7 +1568,8 @@ module mem_read_write #(
         .i_ctrl_en        (i_l2_ctrl_en),
         .o_en             (o_l2_en),
         .o_busy           (o_l2_busy),
-        .o_ev             (o_l2_ev)
+        .o_ev             (o_l2_ev),
+        .o_fe_idle        (w_ddr_fe_idle)
     );
     // L2_INFO, CACHE_INFO's format: 128 KiB, 64 B lines, sets, ways
     assign o_l2_info = {32'(128 * 1024), 8'd64, 16'(128 * 1024 / 64 / L2_WAYS), 8'(L2_WAYS)};
@@ -1595,7 +1605,8 @@ module mem_read_write #(
         .o_mem_dw_next_ok (w_ddr_dw_next_ok),
         .o_mem_dw_ready   (w_ddr_dw_ready),
         .o_calib_done     (o_calib_done),
-        .o_ui_clk         (w_ui_clk)
+        .o_ui_clk         (w_ui_clk),
+        .o_fe_idle        (w_ddr_fe_idle)
     );
     assign o_l2_en   = 1'b0;
     assign o_l2_busy = 1'b0;

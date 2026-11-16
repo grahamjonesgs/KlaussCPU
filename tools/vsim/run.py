@@ -2110,6 +2110,34 @@ def cmd_socvga(a):
     return 0 if ok else 1
 
 
+def cmd_socorphan(a):
+    """HW_PERF_PLAN §8 item 3d: CPU_RESETN pressed while a DMA master (VGA
+    scanout; with --blit the blitter's FILL too) holds the DDR grant with a
+    read below and the D-cache waits (tb_soc +RSTORPH=<k>, the k-th such
+    moment): the masters reset, the memory system does not.  The arbiter
+    must not hand the bus to the D-cache before the dead master's read has
+    been answered, or that answer reaches the D-cache (a wrong read answer:
+    tb_soc's consistency checker)."""
+    exe = build_soc(a.rev, tb_wt=bool(a.rev))      # (an older RTL under this tb_soc)
+    fails = 0
+    for blit in (False, True):
+        prog = _vga_prog(40, 1500, span=0x80000, blit=blit)
+        for k in a.k:
+            tag = f'orph_{int(blit)}_{k}'
+            r = run_soc(exe, prog, tag, timeout=3600, gate=False,
+                        plus=['+VGA_V0=478', f'+RSTORPH={k}'] + a.plus)
+            m = re.search(r'RSTORPH done consistency checks=(\d+) errors=(\d+)', r['log'])
+            g = re.search(r'RSTORPH reset at grant (\S+ \S+ \S+ \S+)', r['log'])
+            ok = bool(m and g) and int(m.group(2)) == 0
+            fails += not ok
+            print(f'{"pass" if ok else "FAIL"} socorphan blit={int(blit)} k={k} {g and g.group(1)} '
+                  f'checks={m and m.group(1)} errors={m and m.group(2)} ' +
+                  ' '.join(l for l in r['log'].splitlines() if 'FATAL' in l)[:300])
+            shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 M64 = (1 << 64) - 1
 
 
@@ -2587,6 +2615,9 @@ def main():
     vg.add_argument('--blit', action='store_true', help='the blitter FILLs back to back too (review 1)')
     sx = sub.add_parser('socx'); sx.add_argument('--seeds', type=int, default=4)
     sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
+    sor = sub.add_parser('socorphan'); sor.add_argument('--rev')
+    sor.add_argument('--k', type=int, nargs='+', default=[1, 2, 3, 5, 8, 13])
+    sor.add_argument('--plus', action='append', default=[])
     sfr = sub.add_parser('socframe'); sfr.add_argument('--rev', help="another revision's RTL (its own tb_soc)")
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
@@ -2675,6 +2706,8 @@ def main():
         sys.exit(cmd_socsddma(a))
     elif a.cmd == 'socsd':
         sys.exit(cmd_socsd(a))
+    elif a.cmd == 'socorphan':
+        sys.exit(cmd_socorphan(a))
     elif a.cmd == 'socframe':
         sys.exit(cmd_socframe(a))
     elif a.cmd == 'socx':
