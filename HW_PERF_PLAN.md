@@ -1132,7 +1132,8 @@ RAMB36 + 18 RAMB18 as in `823b5ea`.  Then the standard `build_fast
   first.  A probe over 4,100 non-speculative snooping stores saw 0 such
   arms.  Planned hardening for the next RTL build: a 1-bit "snoop
   outstanding until `smc_st`" that blocks `bt_cap`, or a testbench
-  assertion.
+  assertion.  **§8 item 3b: the testbench assertion** (tb_vsim
+  `btic_snarm`, gated on every run); still unreachable, no RTL change.
 - **Deferred minor 2 (16 B lines only).**  The 16 B NLB kill has no
   `pf_ik` equivalent, so a same-edge prefetch capture may stay valid.  Not
   constructible (0 in 354 `btfuzz` runs).
@@ -1558,7 +1559,9 @@ RAM32M + 64 RAM16X1D; BRAM tiles 91 → 124.
   orphaned-grant window of `mem_read_write`'s arbiter (a DMA master reset
   mid-tenure holds the grant for 15 quiet cycles first), and a D-cache
   shadow writeback that waits for the L2 fill of its own set before it is
-  accepted.
+  accepted.  **Minor 5 was a correctness hazard, fixed in §8 item 3d**
+  (the dead master's read answered after the release, into the D-cache);
+  minor 6 is performance only and stays deferred.
 - **Write combining.**  Each posted write takes a write-buffer entry of its
   own (a blitter FILL of 16 B writes to lines the L2 does not hold drains
   one burst per write); merging into the tail entry of the same line would
@@ -1591,7 +1594,8 @@ The commit after it changes only `tb_l2` (two test fixes, found by the
 
 The review's minors 5 and 6 (the orphaned-grant window; shadow writebacks
 waiting for the fill) are pre-existing or performance only: deferred
-(list above).
+(list above).  (Minor 5 turned out to be a correctness hazard: fixed in
+§8 item 3d.)
 
 **The DRAM model** (`mig_model.sv`; the board's MIG is `mig_c.prj`:
 MT47H64M16HR-25E at tCK = 5 ns — DDR2-400, CL 3, WL 2, BL8 — with
@@ -2429,6 +2433,9 @@ the alt build's in `alt_eto/`).  Not run on the board.
 frame is popped from MMIO deadlocks (tb_vsim DEADLOCK sm=16; also on `l2b`);
 `mpudiff`'s harness is stale (it fails on `l2b`; the MPU is off on the A7) —
 in this branch's core regression against `tmg` it reports 0 differing.
+**Both resolved in §8** (items 1 and 2: the deadlock was tb_soc's, a second
+MMIO read under a held DV; `mpudiff` without `VSIM_MPU_EN=1` looped on
+ILLEGAL MPU writes).
 
 **Regression** (on the final RTL `3ae5ed6`, against `tmg` where an A/B),
 all passing:

@@ -1856,6 +1856,11 @@ the new assertions are X-safe in 4-state simulators, and `tx_kmap`,
   TE = 1, where page 0 is unmapped. User mode faults on the 1st doubleword's
   segment, as it should. Not covered by `tx_pair`; decide the architectural
   answer (wrap faults, or the access is undefined) before changing anything.
+  **Resolved** (HW_PERF_PLAN §8 item 3a): not a bug — `tx_pair` runs under
+  `_te_on`, which maps page 0, so no fault is right.  The wrap is
+  translated (VA 0, `ex_ea_q`'s 16-bit page + 1), as the emulator's
+  `map_data` does; with page 0 execute-only, `tx_wrap` gets ACCESS_LD with
+  EADDR = 0 for the MEMGET32 and for a LEAVERET at R15 = 0xFFFF_FFF8.
 
 ---
 

@@ -62,6 +62,27 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   usable A/B for core changes. `run.run_soc(exe, image_or_mem_path, name)`
   also boots any `netboot.mem`-format image (e.g. the real netboot).
 
+## MMIO in tb_vsim; frames popped from MMIO (HW_PERF_PLAN.md §8)
+
+- tb_vsim's MMIO side follows the SoC's protocol: one answer per DV pulse.
+  Once the core has seen an MMIO ready, a DV it keeps up at an MMIO address
+  in the next cycle (the same address or not) holds ready high and is never
+  answered — the SoC's MMIO ready is the strobe delayed, the Ethernet bridge
+  waits for DV low — so such a core deadlocks here as on the board.  The
+  `.out` file's `mmio_hold=` counts those cycles; `run.py test` fails a test
+  with `mmio_hold` ≠ 0.  `+MMIOPULSE`: the old model (a new request on any
+  cycle).
+- `0xF0FD_0000..0xF0FD_00FF`: an MMIO scratch RAM (32 dwords, byte enables)
+  that reads back what was written — `tests.py`'s `mmio_frame` /
+  `mmio_frame_irq` pop RET / LEAVERET frames from it and run a spanning
+  MEMGET32 there.
+- **`socframe`** (`--rev`): the same through tb_soc (INT_VEC0 / 1 as the
+  frame; a spanning MEMGET32 on INT_VEC and on the Ethernet bridge).
+- **`socorphan`** (`--rev`, `--k`): CPU_RESETN pressed while a DMA master
+  holds the DDR grant with a read accepted below and the D-cache waiting
+  (tb_soc `+RSTORPH=<k>`; the framebuffer holds a pattern); the consistency
+  checker must see no wrong answer (§8 item 3d).
+
 ## The L2 (HW_PERF_PLAN.md §6)
 
 - **tb_soc's DDR** is the behavioural MIG (`sim_1/new/mig_model.sv`) behind

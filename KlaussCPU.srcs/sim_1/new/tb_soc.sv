@@ -461,7 +461,10 @@ module tb_soc;
          dut.mem_read_write.`DDRPATH.state inside {4'd4, 4'd5, 4'd7};
 `endif
       automatic bit c = (dut.mem_read_write.r_grant_vga || dut.mem_read_write.r_grant_blit ||
-                         dut.mem_read_write.r_grant_sd || dut.mem_read_write.r_grant_c2) &&
+`ifdef SD_DMA_PROBE
+                         dut.mem_read_write.r_grant_sd ||
+`endif
+                         dut.mem_read_write.r_grant_c2) &&
                         dut.mem_read_write.mig_read_DV && dut.mem_read_write.o_ddr_mem_read_DV && acc;
       if (c && !rst_c_q) begin
          rst_seen++;
@@ -483,7 +486,13 @@ module tb_soc;
          end
          wait (rst_go);
          $display("TB_SOC: RSTORPH reset at grant vga=%0d blit=%0d sd=%0d c2=%0d", dut.mem_read_write.r_grant_vga,
-                  dut.mem_read_write.r_grant_blit, dut.mem_read_write.r_grant_sd, dut.mem_read_write.r_grant_c2);
+                  dut.mem_read_write.r_grant_blit,
+`ifdef SD_DMA_PROBE
+                  dut.mem_read_write.r_grant_sd,
+`else
+                  1'b0,
+`endif
+                  dut.mem_read_write.r_grant_c2);
          cpu_resetn = 1'b0;
          repeat (40) @(posedge clk100);
          cpu_resetn = 1'b1;
