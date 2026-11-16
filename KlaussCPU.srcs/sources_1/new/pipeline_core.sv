@@ -616,7 +616,10 @@ module pipeline_core
    logic [28:0] r_base_p1;         // ifb_base + 1
    logic [28:0] r_base_p2;         // ifb_base + 2
    logic [27:0] r_want_line;       // ifb_base[28:1] + 1
-   wire        in0   = ifb_val[0] && pos[0];
+   // (tmg timing) = ifb_val[0] && pos[0], registered (asserted; see pos_track)
+   (* max_fanout = 48 *) logic r_in0;
+   logic [1:0]  ifb_val_n;
+   wire        in0   = r_in0;
    wire        in1   = ifb_val[1] && pos[1];
    wire [127:0] w_win = in0 ? {ifb_dw[1], ifb_dw[0]} : {64'h0, ifb_dw[1]};
    wire [31:0] w_op   = pc[2] ? w_win[63:32]  : w_win[31:0];
@@ -3532,6 +3535,7 @@ module pipeline_core
          parked <= 1'b0; park_kind <= '0; park_pc <= '0; park_op <= '0;
          ret_valid <= 1'b0; ret_wr <= 1'b0; lcd_rst_n <= 1'b0;
          mem_xc <= '0; if_xc <= 1'b0; if_look <= 1'b0; ifb_val <= 2'b00; if_fake <= 1'b0; if_drop <= 1'b0;
+         r_in0 <= 1'b0;
          nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
          pos <= 3'b000; r_base_p1 <= 29'd1; r_base_p2 <= 29'd2; r_want_line <= 28'd1;
          m_read_DV <= 1'b0; m_write_DV <= 1'b0; m_addr <= '0; m_be <= 8'hFF; m_zl <= 1'b0; sq_zl <= 1'b0;
@@ -3549,6 +3553,7 @@ module pipeline_core
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          ic_lv <= '0;  lp_v <= 1'b0;  // (§5)
       end else if (ce) begin
+         ifb_val_n = ifb_val;   // (tmg: blocking next value; ifb_val / r_in0 load it in pos_track)
          // M12 pos-tracker event flags: cleared here, BLOCKING-set by the
          // real write sites below, folded by the pos_track composer at the
          // end of this block. Same-process sampling — no mirrors, no drift.
@@ -3575,7 +3580,7 @@ module pipeline_core
             pc <= (DEBUG_EN && !start) ? park_pc : start_pc;
             running <= 1'b1; fetch_halt <= 1'b0; parked <= 1'b0;
             id_valid <= 1'b0; ex_valid <= 1'b0; mem_valid <= 1'b0; wb_valid <= 1'b0;
-            ifb_val <= 2'b00; if_look <= 1'b0;
+            ifb_val_n = 2'b00; if_look <= 1'b0;
             nlb_vhi <= 1'b0; nlb_vlo <= 1'b0; pf_look <= 1'b0; nlb1_vhi <= 1'b0; nlb1_vlo <= 1'b0;
             bt_v <= '0;  r_bt_pend <= 1'b0;   // 2a: the BTIC is a code copy too
             ut_v <= '0;  it_ref <= 1'b0;      // (stage 3: the micro-ITLB)
@@ -4216,11 +4221,11 @@ module pipeline_core
                end else if (if_rebase) begin
                   ev_fill   = 1'b1;
                   ifb_base  <= if_req_dw;
-                  ifb_dw[0] <= 64'b0;  ifb_val[0] <= 1'b1;
-                  ifb_val[1] <= 1'b0;
+                  ifb_dw[0] <= 64'b0;  ifb_val_n[0] = 1'b1;
+                  ifb_val_n[1] = 1'b0;
                   ifb_ft[0] <= if_fflt;  ifb_fm[0] <= if_fmiss;
                end else begin
-                  ifb_dw[1] <= 64'b0;  ifb_val[1] <= 1'b1;
+                  ifb_dw[1] <= 64'b0;  ifb_val_n[1] = 1'b1;
                   ifb_ft[1] <= if_fflt;  ifb_fm[1] <= if_fmiss;
                end
                if_xc   <= 1'b0;
@@ -4234,11 +4239,11 @@ module pipeline_core
                   ev_fill   = 1'b1;
                   ev_nx     = !IC32 && if_req_dw[0] && m_next_valid;   // (review 3)
                   ifb_base  <= if_req_dw;
-                  ifb_dw[0] <= m_rdata;       ifb_val[0] <= 1'b1;
-                  ifb_dw[1] <= m_rdata_next;  ifb_val[1] <= m_next_valid;
+                  ifb_dw[0] <= m_rdata;       ifb_val_n[0] = 1'b1;
+                  ifb_dw[1] <= m_rdata_next;  ifb_val_n[1] = m_next_valid;
                   ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                end else begin
-                  ifb_dw[1] <= m_rdata;       ifb_val[1] <= 1'b1;
+                  ifb_dw[1] <= m_rdata;       ifb_val_n[1] = 1'b1;
                   ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                end
                m_read_DV <= 1'b0;
@@ -4286,11 +4291,11 @@ module pipeline_core
                   // because it captures old base + old data together).
                   if (!in0) begin
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
-                     ifb_dw[0] <= ifr_rdata;       ifb_val[0] <= 1'b1;
-                     ifb_dw[1] <= ifr_rdata_next;  ifb_val[1] <= ifr_next_valid;
+                     ifb_dw[0] <= ifr_rdata;       ifb_val_n[0] = 1'b1;
+                     ifb_dw[1] <= ifr_rdata_next;  ifb_val_n[1] = ifr_next_valid;
                      ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
-                     ifb_dw[1] <= ifr_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_dw[1] <= ifr_rdata;       ifb_val_n[1] = 1'b1;
                      ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                   if_look <= 1'b0;
@@ -4348,11 +4353,11 @@ module pipeline_core
                if (nlb_dw_ok) begin
                   if (!in0) begin
                      ifb_base  <= miss_dw;  ev_rebase = 1'b1;
-                     ifb_dw[0] <= nlb_rdata;       ifb_val[0] <= 1'b1;
-                     ifb_dw[1] <= nlb_rdata_next;  ifb_val[1] <= nlb_next_valid;
+                     ifb_dw[0] <= nlb_rdata;       ifb_val_n[0] = 1'b1;
+                     ifb_dw[1] <= nlb_rdata_next;  ifb_val_n[1] = nlb_next_valid;
                      ifb_ft    <= 2'b00;  ifb_fm <= 2'b00;
                   end else begin
-                     ifb_dw[1] <= nlb_rdata;       ifb_val[1] <= 1'b1;
+                     ifb_dw[1] <= nlb_rdata;       ifb_val_n[1] = 1'b1;
                      ifb_ft[1] <= 1'b0;   ifb_fm[1] <= 1'b0;
                   end
                end else if (w_slide) begin
@@ -4361,8 +4366,8 @@ module pipeline_core
                   // in the window's own line). Slide instead of if_look: 1 cycle,
                   // no BRAM, no port.
                   ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
-                  ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
-                  ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+                  ifb_dw[0] <= ifb_dw[1];       ifb_val_n[0] = 1'b1;
+                  ifb_dw[1] <= slide_data;      ifb_val_n[1] = 1'b1;
                   ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
                end else begin
                   if_look   <= 1'b1;              // begin lookup (no port access)
@@ -4372,8 +4377,8 @@ module pipeline_core
                // window forward NOW, so the coming sequential line cross finds
                // its dword already in the window and fetch never stalls.
                ifb_base  <= ifb_base + 29'd1;  ev_slide = 1'b1;
-               ifb_dw[0] <= ifb_dw[1];       ifb_val[0] <= 1'b1;
-               ifb_dw[1] <= slide_data;      ifb_val[1] <= 1'b1;
+               ifb_dw[0] <= ifb_dw[1];       ifb_val_n[0] = 1'b1;
+               ifb_dw[1] <= slide_data;      ifb_val_n[1] = 1'b1;
                ifb_ft    <= {1'b0, ifb_ft[1]};  ifb_fm <= {1'b0, ifb_fm[1]};
             end
          end
@@ -4486,7 +4491,7 @@ module pipeline_core
                ifb_base   <= id_bt_base;
                ifb_dw[0]  <= id_bt_d0;
                ifb_dw[1]  <= id_bt_d1;
-               ifb_val    <= {id_bt_v1, 1'b1};
+               ifb_val_n    = {id_bt_v1, 1'b1};
                ifb_ft     <= 2'b00;  ifb_fm <= 2'b00;
                if_look    <= 1'b0;
             end else if (EN_BTIC) begin
@@ -4995,8 +5000,8 @@ module pipeline_core
          // span overlaps the stored dword; refetch from the oldest squashed.
          // Safe because side effects only exist from MEM onward.
          if (smc_st) begin
-            if (ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl))          ifb_val[0] <= 1'b0;
-            if (ifb_val[1] && f_dweq(ifb_base + 29'd1, smc_dw, mzl))  ifb_val[1] <= 1'b0;
+            if (ifb_val[0] && f_dweq(ifb_base, smc_dw, mzl))          ifb_val_n[0] = 1'b0;
+            if (ifb_val[1] && f_dweq(ifb_base + 29'd1, smc_dw, mzl))  ifb_val_n[1] = 1'b0;
             // M9: the NLB is a code copy too — same store-match rule (line-granular)
             if ((nlb_vhi || nlb_vlo) && f_lneq(nlb_line, smc_dw[28:1], mzl)) begin
                nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;
@@ -5061,14 +5066,14 @@ module pipeline_core
             m_vav <= 1'b0;  sq_vav <= 1'b0;   // (STLF: their VAs may now map elsewhere)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;
-            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
+            ifb_val_n = 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
             if (if_xc) if_drop <= 1'b1;
          end
          if (icinv) begin
             ic_lv <= '0;  lp_v <= 1'b0;  // (§5: a fill's line from before the fence is not installed)
             nlb_vhi <= 1'b0;  nlb_vlo <= 1'b0;  pf_look <= 1'b0;  nlb1_vhi <= 1'b0;  nlb1_vlo <= 1'b0;
             if_look <= 1'b0;  snoop_q <= 1'b0;
-            ifb_val <= 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
+            ifb_val_n = 2'b00; ev_pcz = 1'b1; ev_ovr = 1'b1;
          end
          if (sq_any) begin
             ev_ovr = 1'b1;
@@ -5089,7 +5094,7 @@ module pipeline_core
                div_ph <= MD_IDLE;   // the squashed DIV may have started
             end
             id_valid   <= 1'b0;
-            ifb_val    <= 2'b00;
+            ifb_val_n    = 2'b00;
             ev_pcz     = 1'b1;
             pc         <= sq_ex ? ex_pc : id_pc;
             // Every in-flight serializer is younger than the store, so it is
@@ -5106,7 +5111,7 @@ module pipeline_core
             ev_ovr   = 1'b1;
             if (DEBUG_EN) id_bp <= 1'b0;
             id_valid <= 1'b0;
-            ifb_val  <= 2'b00;
+            ifb_val_n  = 2'b00;
             ev_pcz   = 1'b1;
             pc       <= pc;
          end
@@ -5127,7 +5132,7 @@ module pipeline_core
             dly_on     <= 1'b0;
             div_ph     <= MD_IDLE;
             id_valid   <= 1'b0;
-            ifb_val    <= 2'b00;
+            ifb_val_n    = 2'b00;
             // one cycle after the issue an I-cache lookup / prefetch started
             // before the snoop (clearing the line on this edge) may still be
             // in flight: drop them and the NLB, as ICACHE_INV does
@@ -5295,6 +5300,12 @@ module pipeline_core
             // pc after the dispatch (the base below still follows the load)
             if (ev_btic && !ev_ovr) p = 3'b001;
             pos <= p;
+            // (tmg timing) the window's slot-0 select, in0 = ifb_val[0] &&
+            // pos[0], as a register of its own: it selected w_op and the
+            // fetch engine's every slot decision through one LUT with
+            // fanout ~300 (the IF -> ID / fetch family's first level)
+            ifb_val <= ifb_val_n;
+            r_in0   <= ifb_val_n[0] && p[0];
             // HW proposal 3: a redirect aborts any background prefetch (it was
             // for the old sequential path), so the BRAM read port reads the
             // new miss_dw on the very next cycle — the free first-cycle read
@@ -5580,6 +5591,8 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && ex_valid && ex_d.is_mem)
       assert (ex_txpg == ex_xpg)
          else $fatal(1, "ex_txpg stale: pc=%h a=%h", ex_pc, ex_a);
+   always_ff @(posedge clk) if (!rst)
+      assert (r_in0 == (ifb_val[0] && pos[0])) else $fatal(1, "r_in0 != ifb_val[0] && pos[0]");
    always_ff @(posedge clk) if (!rst && running) begin
       if (ifb_val[0] && pos[0]) assert (pc_dw == ifb_base)
          else $fatal(1, "pos0 unsound: pc=%h base=%h", pc, ifb_base);
