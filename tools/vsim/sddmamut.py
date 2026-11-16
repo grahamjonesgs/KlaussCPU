@@ -41,9 +41,9 @@ MUTS = [
      "(r_dm_wr ? ((11'd512 - {1'b0, w_used}) >= {1'b0, r_d_blkw})", "(r_dm_wr ? 1'b1"),
     ('fetch_count', 'a counted write fetches past size x count', SN, 'unit',
      "wire w_cnt_left = (r_d_cnt == 16'd0) || (r_dm_nblk != r_d_cnt);", "wire w_cnt_left = 1'b1;"),
-    ('kill_keep', 'a FIFO reset does not drop the read in flight (it is pushed after)', SN, 'unit',
-     "            if (w_dm_kill) begin\n                r_dm_ph <= 1'b0;\n                r_dm_on <= 1'b0;\n                r_x_own <= 1'b0;",
-     "            if (w_dm_kill) begin\n                r_dm_ph <= 1'b0;\n                r_dm_on <= 1'b0;"),
+    ('kill_keep', 'a FIFO reset leaves the engine waiting for its transaction (its read is pushed after)', SN, 'unit',
+     "                r_x_own <= 1'b0;\n                r_m_st  <= M_IDLE;\n            end\n        end\n    end",
+     "            end\n        end\n    end"),
     ('abort_ignored', 'DMA_EN = 0 / SD_MODE = 0 does not stop the engine', SN, 'unit',
      "            if (w_dm_abort) r_dm_on <= 1'b0;", ""),
     ('pio_pop', 'an SDM_DATA load during a DMA pops the FIFO', SN, 'unit',
@@ -70,13 +70,13 @@ MUTS = [
     ('m3_gate', 'the SD DMA is granted during a maintenance walk (m3)', MR, ['wr_m3_*', 'rd_m3_*'],
      "            if (i_vga_req && w_vga_gate)\n                r_grant_vga  <= 1'b1;",
      "            if (i_vga_req && w_vga_gate)\n                r_grant_vga  <= 1'b1;\n            else if (i_sd_req && !is_miss_path)\n                r_grant_sd   <= 1'b1;"),
-    ('m3_pending', 'a pending range op is not MNT_BUSY (nor holds the DMA off)', MR, ['wr_m3_*', 'rd_m3_*', 'range_*'],
+    ('m3_pending', 'a pending range op is not MNT_BUSY (nor holds the DMA off)', MR, ['wr_m3_queued', 'rd_m3_queued', 'range_queue_*'],
      "assign o_mnt_busy = r_mnt_active | r_mnt_pending | r_rng_pend;",
      "assign o_mnt_busy = r_mnt_active | r_mnt_pending;"),
     ('rw_two', "the range walk misses a set's second range line (T + 1)", MR, ['range_two'],
-     "(r_rw_two != 11'd0 && r_tag_way0[TAG_BITS-1:0] == r_rw_tag1));",
-     "1'b0);"),
-    ('rw_any', 'the range walk takes every valid way (not only the range)', MR, ['range_inv', 'range_partial', 'range_queue_copy'],
+     "(r_rw_two != 11'd0 && r_tag_way0[TAG_BITS-1:0] == r_rw_tag1));\n    wire w_rw_sel1 = r_tag_way1[TAG_BITS] && (r_tag_way1[TAG_BITS-1:0] == r_rw_tag ||\n                                              (r_rw_two != 11'd0 && r_tag_way1[TAG_BITS-1:0] == r_rw_tag1));",
+     "1'b0);\n    wire w_rw_sel1 = r_tag_way1[TAG_BITS] && (r_tag_way1[TAG_BITS-1:0] == r_rw_tag ||\n                                              1'b0);"),
+    ('rw_any', 'the range walk takes every valid way of a set it visits (not only the range)', MR, ['range_prec'],
      "    wire w_rw_sel0 = r_tag_way0[TAG_BITS] && (r_tag_way0[TAG_BITS-1:0] == r_rw_tag ||",
      "    wire w_rw_sel0 = r_tag_way0[TAG_BITS] && (1'b1 ||"),
     ('rinv_nowb', 'RANGE_INV drops a dirty line without writing it back (the emulator / kernel reading)', MR, ['range_inv'],
@@ -106,8 +106,10 @@ MUTS = [
     ('iinv_snoop', "a store's snoop clear during a range sweep is lost", PC, ['iinv_snoop'],
      "      wire               swst  = ic_sw && !(r_sw_rng && snoop_q);   // a sweep step this cycle",
      "      wire               swst  = ic_sw;"),
-    ('iinv_vlany', "a range sweep's end marks the I-cache empty (a later ICACHE_INV is skipped)", PC, ['iinv_then_icinv'],
-     "                  if (!r_sw_rng) vl_any <= 1'b0;", "                  vl_any <= 1'b0;"),
+    # (not here: a range sweep's end clearing vl_any.  Every fetch during a
+    # sweep misses and refills, and the deferred install sets vl_any again
+    # as it ends, so a later ICACHE_INV is never skipped in practice — an
+    # equivalent mutant; the RTL keeps vl_any anyway)
     ('iinv_ignored', 'RANGE_IINV is not decoded', PC, ['iinv'],
      "   wire        icinv      = icinv_f || icinv_r;", "   wire        icinv      = icinv_f;"),
 ]
@@ -140,14 +142,14 @@ def run_mut(m, keep=False):
             if r.returncode != 0 or 'TB_SDDMA PASS' not in r.stdout:
                 killed = True
                 break
-        first = next((l for l in out.splitlines() if 'FAIL' in l or 'Fatal' in l or 'ERROR' in l), '?')
+        first = next((l for l in out.splitlines() if 'FAIL' in l or 'atal' in l or 'ERROR' in l or 'FATAL' in l), '?')
     else:
         env.update(VSIM_WORK=os.path.join(d, 'vw'))
         r = subprocess.run([sys.executable, os.path.join(d, 'tools/vsim/run.py'), 'socsddma'] + suite, env=env,
                            capture_output=True, text=True, timeout=7200)
         out = r.stdout + r.stderr
         killed = r.returncode != 0
-        first = next((l for l in out.splitlines() if l.startswith('FAIL') or 'failed' in l), '?')
+        first = next((l for l in out.splitlines() if l.startswith('FAIL') or 'failed' in l or 'atal' in l), '?')
     if not keep:
         shutil.rmtree(d, ignore_errors=True)
     return name, 'killed' if killed else 'SURVIVED', first[:220]

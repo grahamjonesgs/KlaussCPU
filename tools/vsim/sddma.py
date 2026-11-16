@@ -143,63 +143,74 @@ class SdAsm(Asm):
 JUNK = 0x5A5A_5A5A_0000_0000
 
 
-def t_read_coherent(order_wait):
-    """SD read by DMA into a buffer the CPU has dirty in the D-cache: CLEAN
-    the range (the dirty lines must reach DDR before the DMA writes it, or
-    they would land over the card's data), then the data command — at once
-    (order_wait False: the (m3) claim, no MNT_BUSY poll) or after the poll;
-    after DATA_DONE a RANGE_INV and the CPU reads the card's data.  The
-    cleaned range is 32 KiB, all dirty (a ~8200-cycle walk), with the 4 KiB
-    buffer at its END: the walk reaches the buffer's lines ~7000 cycles in,
-    long after the card's first block (~2200 cycles at 50 MHz), so a DMA
-    not held off by the walk would write lines it has not yet written back.
-    r12 = mismatches, r4 = error bits."""
+def t_m3(write, variant='nowait'):
+    """(m3) ordering, both halves.  A 32 KiB range, all dirty (the CPU's
+    data over an older copy in DDR for an SD write; the CPU's stale copy for
+    an SD read), CLEANed with the 4 KiB DMA buffer at its END: the walk
+    (~8200 cycles) reaches the buffer's lines last, so a DMA not held off
+    by it reads stale DDR (write) or has its data written over (read).  The
+    data command follows the CACHE_CTRL write at once (variant 'nowait': no
+    MNT_BUSY poll — the claim), after the poll ('wait'), with the clean
+    queued behind another long walk ('queued': it is pending, not running,
+    when the command lands), or ('last_store') with the buffer's last dword
+    stored by the instruction right before the CACHE_CTRL write, that
+    store a D-cache miss whose line arrives after the write (half 1: the
+    walk starts only after the store is in the D-cache).
+    The sequence from the CACHE_CTRL write to SDM_CMD runs twice, the first
+    time with CACHE_CTRL = 0 and a CMD13: its code must be in the I-cache,
+    or its fetches wait for the walk and the race never happens.  r12 =
+    mismatches (read), the card's wr_bad (write), r4 = error bits."""
     a = SdAsm().prologue(div=0)
     A0, B0, N = 0x00200000, 100, 8
     A = A0 + 0x8000 - N * 512
-    a.fill(A0, B0, 64, xor=JUNK)                  # the CPU's stale copy, dirty
-    a.cache_op(RCLEAN, A0, 0x8000, wait=order_wait)
-    a.dma(18, B0, A, 512, N, 0)
-    a.wait_done()
-    a.mov(4, 3)
-    a.cache_op(RINV, A, N * 512)
-    a.check(A, B0, N)
-    a.stop()
-    a.halt()
-    return a, {'r12': 0, 'r4': 0}, ['+SDC_NAC=2'], {'host_err': 0}
-
-
-def t_write_coherent(order_wait, last_store=True):
-    """SD write by DMA from a buffer the CPU just wrote (dirty in the
-    D-cache, DDR holding an older copy after a FLUSH): RANGE_CLEAN, then the
-    data command at once (no MNT_BUSY poll: m3) — the engine fetches its
-    first block right away, so it must wait for the walk; the card checks
-    every dword (wr_bad).  last_store: the last dword is stored by the
-    instruction right before the CACHE_CTRL write (m3's first half: the
-    clean covers a store still on its way to the D-cache)."""
-    a = SdAsm().prologue(div=0)
-    A, B0, N = 0x00210000, 300, 16
-    a.fill(A, B0, N, xor=JUNK)
-    a.cache_op(FLUSH)                             # DDR: the old data
-    if last_store:
-        a.fill(A, B0, N - 1)
-        a.fill(A + (N - 1) * 512, B0 + N - 1, 1, words=63)
-        a.setr64(7, P(B0 + N - 1, 63)); a.setr(13, A + N * 512 - 8)
-        a.wr(14, OP_ADDR, A); a.wr(14, OP_LEN, N * 512)
-        a.setr(13, A + N * 512 - 8); a.setr(1, RCLEAN)
-        a.st(64, 7, 13, 0)                        # the last dword ...
-        a.st(64, 1, 14, CACHE_CTRL)               # ... and the clean, back to back
-        if order_wait:
-            a.mnt_wait()
+    BB = B0 + 64 - N
+    OTHER = 0x00300000
+    if write:
+        a.fill(A0, B0, 64, xor=JUNK)
+        a.cache_op(FLUSH)                         # DDR: the old copy
+        a.fill(A0, B0, 64)                        # the CPU's data, dirty
     else:
-        a.fill(A, B0, N)
-        a.cache_op(RCLEAN, A, N * 512, wait=order_wait)
-    a.dma(25, B0, A, 512, N, 1)
-    a.wait_done()
-    a.mov(4, 3)
+        a.fill(A0, B0, 64, xor=JUNK)              # the CPU's stale copy, dirty
+    if variant == 'queued':
+        a.touch(OTHER, 1024, store=True, val=9)
+    # (last_store: pass 1 stores junk there, then that line is written back
+    # and dropped, so pass 2's store of the data is a miss)
+    a.setr64(7, JUNK if variant == 'last_store' else P(BB + N - 1, 63)); a.setr(11, A0 + 0x8000 - 8)
+    cmd_d = (int(write) << 12) | (1 << 11) | (RT_R1 << 8) | (25 if write else 18)
+    a.setr(3, 0); a.setr(13, (RT_R1 << 8) | 13)  # pass 1: CACHE_CTRL = 0, CMD13
+    a.setr(9, 2)
+    a.label('m3p')
+    if variant == 'queued':
+        a.wr(14, OP_ADDR, OTHER); a.wr(14, OP_LEN, 0x8000); a.st(64, 3, 14, CACHE_CTRL)
+    a.wr(14, OP_ADDR, A0); a.wr(14, OP_LEN, 0x8000)
+    if variant == 'last_store':
+        a.st(64, 7, 11, 0)                        # the store (a miss) ...
+    a.st(64, 3, 14, CACHE_CTRL)                   # ... and the clean, back to back
+    if variant == 'wait':
+        a.mnt_wait()
+    a.wr(15, SDM_FIFO, 0x80000000); a.wr(15, SDM_STATUS, 0xFFFFFFFF)
+    a.wr(15, SDM_DMA, A); a.wr(15, SDM_BLK, (N << 16) | 512); a.wr(15, SDM_CFG, 1 | (1 << 16))
+    a.wr(15, SDM_ARG, BB)
+    a.st(64, 13, 15, SDM_CMD)
+    a.poll(15, SDM_STATUS, 1, False)              # CMD_BUSY = 0
+    if variant == 'last_store':
+        a.fbr('ne', 9, 2, 'm3n', imm=True)
+        a.cache_op(RINV, A0 + 0x8000 - 32, 32)
+        a.setr64(7, P(BB + N - 1, 63))
+        a.label('m3n')
+    a.setr(3, RCLEAN); a.setr(13, cmd_d)
+    a.dec(9); a.fbr('ne', 9, 0, 'm3p', imm=True)
+    a.wait_done(); a.mov(4, 3)
+    if not write:
+        a.cache_op(RINV, A, N * 512)
+        a.check(A, BB, N)
     a.stop()
     a.halt()
-    return a, {'r4': 0}, [], {'wr_bad': 0, 'host_err': 0, 'wr_blocks': N}
+    exp = {'r4': 0} if write else {'r4': 0, 'r12': 0}
+    chk = {'host_err': 0}
+    if write:
+        chk.update(wr_bad=0, wr_blocks=N)
+    return a, exp, ['+SDC_NAC=2'], chk
 
 
 def t_range_partial():
@@ -281,10 +292,15 @@ def t_range_queue(phase):
     R, A, B, Cx, X = 0x00300000, 0x00244000, 0x00254100, 0x00264200, 0x00274400
     a.touch(R, 1024, store=True, val=7)           # 32 KiB dirty: one way of every set
     a.touch(A, 4, store=True, val=1); a.touch(B, 4, store=True, val=2)
-    a.cache_op(RCLEAN, R, 0x8000, wait=False)     # a long walk ...
-    a.cache_op(RINV, A, 128, wait=False)          # ... this one queued behind it
+    # (twice, the first time with CACHE_CTRL = 0: the code must be in the
+    # I-cache, or its fetches wait for the walk)
+    a.setr(3, 0); a.setr(7, 0); a.setr(9, 2)
+    a.label('rq1')
+    a.wr(14, OP_ADDR, R); a.wr(14, OP_LEN, 0x8000); a.st(64, 3, 14, CACHE_CTRL)   # a long walk ...
+    a.wr(14, OP_ADDR, A); a.wr(14, OP_LEN, 128); a.st(64, 7, 14, CACHE_CTRL)      # ... this one queued
     a.wr(14, OP_ADDR, B); a.wr(14, OP_LEN, 128)   # (must not retarget it)
     a.mnt_wait()
+    a.setr(3, RCLEAN); a.setr(7, RINV); a.dec(9); a.fbr('ne', 9, 0, 'rq1', imm=True)
     if phase == 1:
         a.halt()
         plus = [f'+DCP0={A:x}', f'+DCP1={A + 96:x}', f'+DCP2={B:x}', f'+DCP3={B + 96:x}']
@@ -304,6 +320,22 @@ def t_range_queue(phase):
     plus = [f'+DCP0={A:x}', f'+DCP2={B:x}', f'+DCP3={Cx:x}', f'+DCP4={R:x}', f'+DCP5={X:x}']
     return a, {}, plus, {'dcp': {0: (0, 0), 2: (1, 0), 3: (1, 0), 4: (1, 0), 5: (1, 0)},
                          'walks': ['range', 'range', 'range', 'whole']}
+
+
+def t_range_prec():
+    """the range walk's precision within a set: lines of the range share
+    their sets with dirty lines of another tag (A2 = A + 32 KiB, the other
+    way); RANGE_CLEAN then RANGE_INV of A's 8 lines must leave every A2 line
+    valid and dirty (sets >= 512, away from the program's lines)."""
+    a = SdAsm().prologue(div=0)
+    A = 0x00414000
+    A2 = A + 0x8000
+    a.touch(A, 8, store=True, val=1); a.touch(A2, 8, store=True, val=2)
+    a.cache_op(RCLEAN, A, 256)
+    a.cache_op(RINV, A, 256)
+    a.halt()
+    plus = [f'+DCP0={A:x}', f'+DCP1={A + 224:x}', f'+DCP2={A2:x}', f'+DCP3={A2 + 224:x}']
+    return a, {}, plus, {'dcp': {0: (0, 0), 1: (0, 0), 2: (1, 1), 3: (1, 1)}}
 
 
 def t_range_combo():
@@ -397,11 +429,11 @@ def t_range_two():
     a.cache_op(FLUSH)                             # DDR: the old data
     a.fill(A, B0, N)                              # dirty (the first 512 sets hold two lines each)
     a.cache_op(RCLEAN, A, N * 512, wait=False)
-    a.dma(25, B0 + 80, A + 80 * 512, 512, 16, 1)
+    a.dma(25, B0, A, 512, N, 1)
     a.wait_done(); a.mov(4, 3)
     a.stop()
     a.halt()
-    return a, {'r4': 0}, [], {'wr_bad': 0, 'host_err': 0, 'wr_blocks': 16}
+    return a, {'r4': 0}, [], {'wr_bad': 0, 'host_err': 0, 'wr_blocks': N}
 
 
 def t_iinv_snoop(then_icinv=False):
@@ -570,11 +602,14 @@ def t_vga(lines=120, wbinv_every=1500, sd=True, blit=False, sd_write=False, span
 
 def tests():
     return [
-        ('rd_m3_nowait', *t_read_coherent(False)),
-        ('rd_wait', *t_read_coherent(True)),
-        ('wr_m3_nowait', *t_write_coherent(False, last_store=False)),
-        ('wr_m3_last_store', *t_write_coherent(False, last_store=True)),
-        ('wr_wait', *t_write_coherent(True, last_store=False)),
+        ('rd_m3_nowait', *t_m3(False)),
+        ('rd_m3_queued', *t_m3(False, 'queued')),
+        ('rd_m3_wait', *t_m3(False, 'wait')),
+        ('wr_m3_nowait', *t_m3(True)),
+        ('wr_m3_queued', *t_m3(True, 'queued')),
+        ('wr_m3_last_store', *t_m3(True, 'last_store')),
+        ('wr_m3_wait', *t_m3(True, 'wait')),
+        ('range_prec', *t_range_prec()),
         ('range_partial', *t_range_partial()),
         ('range_inv', *t_range_inv()),
         ('range_queue_copy', *t_range_queue(1)),

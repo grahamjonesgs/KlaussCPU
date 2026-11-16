@@ -604,6 +604,15 @@ module tb_sd_dma;
             mw(SDM_DATA, 64'h1234);
             status(st); check({w, ": SDM_DATA store sets FIFO_ERR"}, st[B_FIFO_ERR], 1);
             check({w, ": FIFO_THRESH reads 0"}, st[B_THRESH], 0);
+            // (slow DDR: a whole block waits in the FIFO, as for PIO's
+            // FIFO_THRESH; it still reads 0, and does not interrupt)
+            lmax = 400; mw(SDM_IRQ_EN, 64'h10);
+            t0 = ncyc; do mr(SDM_FIFO, d); while (d < 64 && ncyc - t0 < 400000);
+            status(st);
+            check_true({w, ": a whole block in the FIFO"}, d >= 64);
+            check({w, ": FIFO_THRESH 0 with a block in the FIFO"}, st[B_THRESH], 0);
+            check({w, ": no FIFO_THRESH interrupt"}, irq, 0);
+            mw(SDM_IRQ_EN, 0); lmax = 12;
             // a data command while DMA_BUSY is ignored (no command, no change)
             n0 = card.n_cmds;
             mw(SDM_CMD, {50'h0, 3'b001, 3'(RT_R1), 2'b00, 6'd17});
@@ -692,11 +701,21 @@ module tb_sd_dma;
         begin
             automatic longint a = 64'h0083_0000;
             automatic string w = "open-ended read: CMD12";
+            // (slow DDR: received blocks wait in the FIFO when CMD12 comes)
+            lmax = 300;
             dma_cmd(18, 9300, 0, a, 512, 0);
-            t0 = ncyc; while (dut.native_i.r_blkdone < 3 && ncyc - t0 < 1_000_000) @(negedge clk);
+            t0 = ncyc; while (dut.native_i.r_blkdone < 4 && ncyc - t0 < 2_000_000) @(negedge clk);
             stop_cmd(st);
             check({w, " DATA_DONE"}, st[B_DATA_DONE], 1);
+            check({w, ": blocks still to move at the stop"}, st[B_DMA_BUSY] && dut.native_i.w_level >= 64, 1);
+            // a data command now (DMA_BUSY, not DATA_BUSY) is ignored
+            check({w, ": DATA_BUSY 0"}, st[B_DATA_BUSY], 0);
+            n0 = card.n_cmds;
+            mw(SDM_CMD, {50'h0, 3'b001, 3'(RT_R1), 2'b00, 6'd17});
+            repeat (100) @(negedge clk);
+            check({w, ": data command during DMA_BUSY ignored"}, card.n_cmds - n0, 0);
             m1_check(w);
+            lmax = 12;
             mr(SDM_BLKDONE, n0);
             check_ddr_read(w, a, 9300, n0, 512);
             mr(SDM_DMA, d); check({w, ": DMA_ADDR = BLKDONE x 512"}, d, a + n0 * 512);
