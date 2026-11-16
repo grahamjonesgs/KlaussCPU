@@ -14,6 +14,27 @@ the old behaviour.
 Order agreed with the runtime session: 1 → 3 → 2, with 4 wherever
 convenient.
 
+## Queue after the clang perf round (2026-11-14 → 2026-11-16)
+
+Graham approved the clang-on-board candidates in ranking order (relayed
+by the runtime session). Their outcome so far:
+
+| # | Item | Outcome |
+|---|---|---|
+| 1 | TLB refill walker | released 2026-11-14 (MMU_PLAN §11.8) |
+| 2 | the TLB's +1 EX cycle | released 2026-11-14 (MMU_PLAN §11.9) |
+| 3 | 128 KiB L2 | released 2026-11-16 as `c9cadea` (§6); review 2 follow-up on `l2b` |
+| 4 | 64 KiB I-cache (built before the L2) | released 2026-11-15 (§5) |
+| 5 | return-address stack 4 → 8 entries | **dropped** 2026-11-16 by Graham: ~0.3 % (< 0.5 % with the L2 and the call-graph-ordered clang), below run-to-run noise, on a timing-sensitive path. `RAS_DEPTH` stays 4 and is not bundled into another build |
+
+Next: core / D-cache timing margin (branch `tmg`), then the SD DMA
+engine with the D-cache / I-cache range operations (SD DMA spec v1.2,
+branch `sddma`; SD_NATIVE_PLAN §4.4 deferred it). After SD DMA, the
+runtime session's emulator re-ranks the next RTL candidates on the
+current baseline (L2 + call-graph-ordered clang: I-fetch 37–51 % of
+cycles, D-cache stalls 30–38 %, L2 I-side hit rate 37–44 %) before any
+further hardware item is picked.
+
 ## Estimates (runtime session, 2026-11-11)
 
 Board counters come from the current kernel. Miss counts come from the
