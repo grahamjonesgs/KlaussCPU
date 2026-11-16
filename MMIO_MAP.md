@@ -481,7 +481,8 @@ index is the physical one); `CACHE_OP_LEN` = 0 is a no-op.
   pending or running, so a data command written right after a range op
   cannot read or write DDR before the walk's write-backs are in the L2.
   `MNT_BUSY` need not be polled for that; it still says when the walk is
-  over.
+  over.  The CPU's own loads and stores wait for a range walk, pending or
+  running (a load after RANGE_INV sees memory).
 - **Timing** (simulation, 100 MHz): a range walk visits min(n, 1024) sets
   (n lines), 2 cycles a set, +6 for a set with a dirty line of the range
   (+3 more for a second one), +1; a RANGE_IINV sweep takes min(n, 64)
@@ -509,6 +510,12 @@ guaranteed complete before the next *cached* access lands, which is what the
 DMA-coherency sequences need; but code that must not start the next MMIO
 action (e.g. kicking the blitter) before the walk ends should poll
 `CACHE_STATUS[0]` (MNT_BUSY) — it covers both the pending and active phases.
+**One exception (found 2026-11-16, unchanged from earlier bitstreams):** a
+walk starts only when the cache is idle, so one requested while it is still
+finishing an earlier store's miss waits; during that wait the load-hit pipe
+can still answer a load from a line an INVALIDATE is about to drop.  Poll
+MNT_BUSY after INVALIDATE before reading data that a DMA wrote.  (RANGE_INV
+holds the hit pipe off while it waits: a load after it always sees memory.)
 
 These exist for **DMA / blitter coherency**: the CPU accesses memory through
 this write-back cache, while the [2D DMA blitter](#2d-dma-blitter--base-0xf00e_0000)

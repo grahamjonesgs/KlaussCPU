@@ -2118,6 +2118,84 @@ worst grant wait rises by at most 14 cycles (none with the blitter).  Its worst 
 grant while a CPU miss is in flight, VGA first — under this miss-heavy loop;
 the 4 KiB FIFO absorbs it (the card's clock stops between blocks).
 
+**A second finding, fixed for the range ops only: loads could pass a
+pending invalidate.**  The documented rule is that the CPU's next cached
+access waits for a walk.  A walk starts only when the D-cache is idle, so
+one requested while the cache finishes an earlier store's miss is pending
+for up to that miss; meanwhile the load-hit pipe (HW_PERF_PLAN §1a stage 3,
+its own read port) still answered loads — from lines the walk was about to
+invalidate.  `inv_hit_whole` (a store that misses, then INVALIDATE, then a
+load of a line the invalidate should drop, with a DMA's new data in DDR):
+the load returns the stale line on `c0bf7b2` and here; `inv_hit_wait`
+(MNT_BUSY polled first): the new data.  For RANGE_INV the hit pipe is now
+held off while the op is pending (`r_h_conf` += `r_rng_pend && r_rng_inv`;
+`inv_hit_range`, mutation `hit_pend`), so a load after a RANGE_INV always
+sees memory.  The whole-cache INVALIDATE is left as it was (the same one
+term, `r_mnt_pending && r_mnt_mode`, would fix it, and change those programs'
+timing): software must poll MNT_BUSY after INVALIDATE before reading the
+data (the kernel does, after every op).
+
+**(m3): the answer for the runtime session.**  The `MNT_BUSY` poll between a
+range op and `SDM_CMD` is **not needed**: the engine cannot touch DDR while
+a walk is pending or running, and the walk's end means its write-backs are
+in the L2 (`wr_m3_nowait` / `_queued` / `_last_store`, `rd_m3_nowait` /
+`_queued` pass without it; `m3_gate` and `m3_pending` are killed by them).
+After RANGE_INV the CPU's loads now wait for the walk too.  The waits that
+remain useful: before writing `CACHE_OP_ADDR` / `LEN` (with interrupts off,
+so a handler's op cannot interleave its registers — the queue holds one
+range op, a second becomes a whole-cache walk, correct but slower), and
+after a whole-cache INVALIDATE before reading (above).
+
+**Disagreements with the spec / the emulator** (decided as stated; for the
+runtime session to confirm):
+
+1. **RANGE_INV alone.**  Spec v1.2: "write back, then invalidate".  The
+   kernel's header (`KL_CACHE_RANGE_INV`: "alone: drop them, no
+   writeback") and the emulator's coherence checker ("range invalidate (no
+   clean) dropped line …: its data is lost") read it as a drop without
+   write-back.  The RTL follows the spec.  For correct software (a buffer
+   cleaned before the device writes it and left alone during the DMA) both
+   readings give the same memory; they differ only for a dirty line, which
+   the hardware writes back where the emulator would report lost data.
+   The mutation `rinv_nowb` (the other reading) is killed by `range_inv`.
+2. **CACHE_OP_ADDR width**: 32 bits in the RTL (MMIO_MAP's width; the
+   D-cache tags a 32-bit PA); 64 bits in the emulator.  An address written
+   above 4 GiB reads back differently (and means nothing either way).
+3. **The range-op queue**: the emulator queues any number of ops, each with
+   its range; the RTL holds one and turns a second into a whole-cache walk.
+4. **Abort granularity.**  The emulator stores each read block whole as it
+   arrives (so after DMA_EN = 0 every received block is in DDR, and DMA_BUSY
+   reads 1 for 200 more cycles); the RTL moves blocks as fast as DDR takes
+   them, finishes the block in progress on DMA_EN = 0 / SD_MODE = 0 and
+   leaves any further committed block in the FIFO for PIO (`SDM_DMA_ADDR`
+   says how far it got).  A FIFO reset stops the RTL after its 16-byte
+   transaction (not block-granular).
+5. **PIO after an abort**: the emulator gives the FIFO back to `SDM_DATA` as
+   soon as the phase is no longer a DMA phase; the RTL when DMA_BUSY drops.
+   Likewise a data command written while DMA_BUSY (DATA_BUSY clear: after a
+   CMD12 / abort, the engine finishing) is ignored by the RTL (it would race
+   the engine for the FIFO); the emulator accepts it.
+6. **A DMA read uses the FIFO**: words left in it before the command would
+   be moved to DDR ahead of the card's data; the emulator's card bypasses
+   the FIFO.  Drivers reset the FIFO before a data command (the kernel does).
+7. **RANGE_IINV** drops the whole BTIC, NLB and fetch window (and refetches),
+   not only the range's entries: a superset, invisible except in cycles.
+8. **Walk timings** differ from the emulator's models (the table above),
+   and every whole-cache walk runs twice (the first finding).
+
+### §7 deferred
+
+- The Vivado build (phase 2, after `tmg` lands and this branch is rebased
+  onto it): timing of the arbiter's fifth leg (its muxes feed the L2's
+  request port), the range walk's tag compares in MAINT, the core's
+  sweep-mask register into the valid-bit bank write enables.
+- The double whole-cache walk and the hit pipe during a pending whole
+  INVALIDATE (findings above): one-line fixes each, left for a decision
+  because they change existing programs' timing.
+- A range walk at one set a cycle (a second read port or a read-ahead of
+  the next set); a BTIC kill by range instead of emptying it.
+- Board test: the kernel's driver with `klausscpu_sd.dma=1`.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
