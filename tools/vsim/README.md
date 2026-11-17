@@ -78,10 +78,12 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   MEMGET32 there.
 - **`socframe`** (`--rev`): the same through tb_soc (INT_VEC0 / 1 as the
   frame; a spanning MEMGET32 on INT_VEC and on the Ethernet bridge).
-- **`socorphan`** (`--rev`, `--k`): CPU_RESETN pressed while a DMA master
-  holds the DDR grant with a read accepted below and the D-cache waiting
-  (tb_soc `+RSTORPH=<k>`; the framebuffer holds a pattern); the consistency
-  checker must see no wrong answer (§8 item 3d).
+- **`socorphan`** (`--rev`, `--k`, `--modes`, `-v`): CPU_RESETN pressed
+  while a DMA master holds the DDR grant — with a read accepted below and
+  the D-cache waiting (tb_soc `+RSTORPH=<k>`), or at any moment of a tenure
+  (`+RSTORPH_ANY`); the framebuffer holds a pattern.  No wrong answer, no
+  grant held at the end, no D-cache request waiting > 2,000 cycles; with
+  the L2 also in runtime bypass (§8 item 3d and its review).
 
 ## The L2 (HW_PERF_PLAN.md §6)
 

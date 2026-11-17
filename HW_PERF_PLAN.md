@@ -41,8 +41,8 @@ Then, released together on 2026-11-16 as `sddma_release_3ae5ed6.bit`
   user+sys).
 
 Then (2026-11-17, Graham: "the known correctness issues, then stop"):
-§8, branch `fixes` — built (`fixes_433a323.bit`, tier 1), not on the
-board.
+§8, branch `fixes` — reviewed, built (`fixes_1d6a04b.bit`, tier 1), not
+on the board.
 
 Next: **waiting on Graham.** On 2026-11-16 (relayed by the runtime
 session) Graham ended the clang-speed work after one last software item,
@@ -2675,6 +2675,14 @@ Added to `l2_regress.sh` (`soc36`, `socvar` without the L2), with
 **Mutations**: the idle term dropped (the old 15-cycle release) — 5 / 11
 of 12 failing (L2 / no L2); the L2's `o_fe_idle` tied to 1 — 5 of 12.
 
+(The review below found that `ddr2_control`'s first `o_fe_idle`, IDLE
+only, never released an orphaned grant at rest with L2_EN = 0 — fixed in
+`1d6a04b`, with `socorphan`'s grant / progress checks.  Known, not fixed:
+a VGA scanout reset mid-read that requests again within ~40 cycles is not
+orphaned — its req never drops for 15 quiet cycles — so the dead read's
+answer can reach the new request: a moment of wrong pixels; the CPU is
+not affected.)
+
 ### §8 other deferred items
 
 Nothing else in the deferred lists is a correctness bug: §5 review of
@@ -2743,9 +2751,70 @@ lock); three builds, the last met tier 1:
 fetch engine's `pos` / `pf_look` / `r_bt_pend` (+0.082 … +0.177),
 `mem_xsp` → the multiplier's CE (+0.296), `ex_a` → `mem_result[5]`
 (+0.308).  Hold +0.017.  Bitstream `~/.cache/kbuild/fixes_433a323.bit`,
-md5 `b27e98eed27f8160dcc620e2be61d418` (build dir
-`~/.cache/kbuild/fixes_b3`).  Not run on the board (this task does not
+md5 `b27e98eed27f8160dcc620e2be61d418` (superseded after the review by
+`fixes_1d6a04b.bit`, §8 review).  Not run on the board (this task does not
 program it).  The head of `fixes` after it changes documents only.
+
+### §8 review (2026-11-17)
+
+An adversarial review of `fixes` (`433a323` / `9677257`; tests in
+`~/.cache/kbuild/review-tests/fixes-rv/`) found it fit for the board with
+the L2 on (the release configuration), one MAJOR in `2b00a91`, a test gap
+and a nit.  The compare restructure was checked independently (a
+standalone check of `f_cmpv` and the chains against an ISA reference, 32 M
+cases; a core-level compare fuzzer, 96 runs identical to master; 5 of 5
+compare mutants killed).
+
+- **MAJOR — `ddr2_control`'s `o_fe_idle` (L2_EN = 0 only).**  It was
+  `state == IDLE`, but the controller rests in WAIT: IDLE lasts only until
+  the answered request's DV drops.  So with the L2 built out the front end
+  never looked idle at rest, the saturated orphan count never released,
+  and after a CPU_RESETN during a DMA tenure with nothing below (the
+  blitter between transactions, or a read answered within the 15 quiet
+  cycles) the grant was held for ever: every later D-cache miss and VGA
+  request hung.  `587ad8d` released after 15 cycles.  **Fix**
+  (`1d6a04b`): `o_fe_idle = state == IDLE || (state == WAIT && no DV)`.
+  Checked: neither state holds an accepted request — an answer's ready
+  leaves on the edge into IDLE, and WAIT moves to READ / WRITE on the DV
+  it accepts (the DV term only guards that edge; an orphan's master has
+  had its DV down for 15 cycles).  The L2 build was not affected: its
+  front end rests in `F_IDLE`, and that holds in runtime bypass too
+  (L2_CTRL[0] = 0): a bypassed read goes `F_DEC` → `F_WRSP`, which waits
+  for the DDR engine's answer (`e_rsp`) before `F_IDLE` — the L2 has no
+  `ddr2_control` below it.
+- **MINOR — the test gap.**  `socorphan` passed on "no wrong answer" only.
+  Now (tb_soc) a press also reports the grants held at the end and the
+  D-cache's progress after it; `run.py socorphan` fails on any grant held
+  or a D-cache request waiting more than 2,000 cycles, and runs every
+  variant: `read` (a read accepted below, as before) and `any`
+  (`+RSTORPH_ANY`: any moment of a tenure, nothing need be pending) ×
+  scanout alone / with the blitter × k = 1, 2, 3, 5, 8, 13, with the L2,
+  with the L2 in runtime bypass (`_vga_prog(bypass=True)`: L2_CTRL = 0,
+  its periodic walks write 2) and without it (`VSIM_L2=0`).  Results:
+
+  | RTL | L2 on (incl. bypass) | L2 off |
+  |---|---|---|
+  | `587ad8d` (master) | — | 17 of 24 fail: wrong answers (the hazard of item 3d) |
+  | `433a323` | 0 of 48 | **7 of 24 fail**: 6 `any` with the blitter (grant held), 1 `read` (the VGA's read answered within 15 cycles: grant held, the D-cache waits 4,000 cycles) |
+  | `1d6a04b` | 0 of 48 | 0 of 24 |
+
+- **NIT** (documented above, not fixed): a VGA scanout reset that
+  re-requests within ~40 cycles is not orphaned; a moment of wrong pixels.
+
+**Regression after the review** (on `1d6a04b`, against `587ad8d`): `test`
+(all directed tests), `diff` 40 seeds × LAT 1 / 3 / 7 with `+TRACECYC`
+(169,092 = 169,092 cycles), `socframe`, `socorphan` (48 of 48 with the L2
+incl. bypass, 24 of 24 without), `l2_regress.sh` soc36 / soc8 / socvar
+(socdiff cycles identical in every configuration, as before), `socsddma`,
+`sddmamut.py` 42 of 42: all pass.
+
+**Build** `fixes_b4` (`1d6a04b`, standard flow): tier 1 WNS +0.082 / WHS
++0.017, met — the same as `fixes_b3` (41,096 LUTs, 27,160 FFs, 126 BRAM):
+`ddr2_control` is not in the L2-on build, so the netlist is `433a323`'s.
+Bitstream `~/.cache/kbuild/fixes_1d6a04b.bit`, md5
+`b9965e959e113818370a8333d09c572f` (build dir `~/.cache/kbuild/fixes_b4`;
+`fixes_433a323.bit` is kept, its build dir is not).  This supersedes
+`fixes_433a323.bit`.  Not run on the board.
 
 ## CPU_FEATURES additions
 
@@ -2910,3 +2979,7 @@ Decisions taken while implementing the frozen text above:
   `socorphan`; two timing restructures (compare, `m_io`).  Standard flow
   tier 1 WNS +0.082 / WHS +0.017, `~/.cache/kbuild/fixes_433a323.bit`.
   Cycle-identical to `587ad8d`.  Not yet run on the board.
+- 2026-11-17: §8 review: `ddr2_control`'s idle includes WAIT (an orphaned
+  grant was never released with L2_EN = 0); `socorphan` checks grants and
+  progress, `+RSTORPH_ANY`, L2 bypass.  `1d6a04b`, tier 1 +0.082 /
+  +0.017 (netlist as `433a323`), `~/.cache/kbuild/fixes_1d6a04b.bit`.
