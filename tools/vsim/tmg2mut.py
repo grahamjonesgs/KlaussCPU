@@ -122,13 +122,15 @@ MUTS = [
     ('hmmio_na', "the same, without its assertion", PC, [['socmmio', '--base', BASE], ['test', 'mmio_*']],
      ": (ex_tpg[15:12] == 4'hF);   // = exo_iaddr[31:28] == F", ": (ex_tpg[15:12] == 4'hE);   // = exo_iaddr[31:28] == F",
      "         assert ((EN_MPU || !ex_mph) && ex_hmmio == (exo_iaddr[31:28] == 4'hF))", "         assert (1'b1)"),
-    # ---------------- round 3 ----------------
-    ('fkey', "the fetch-CAM key copies not loaded by a micro-ITLB miss", PC, TLB,
-     "for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end", ""),
-    ('fkey_na', "the same, without the copies' assertions", PC, TLB + [['permfuzz', '--seeds', '6', '--fetch', '--remap']],
-     "for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end", "",
-     "assert (f_vpnc[q] == f_vpn && f_asidc[q] == f_asid) else", "assert (1'b1) else",
-     "assert (fm == f_match(f_vpn, f_asid)) else", "assert (1'b1) else"),
+    # ---------------- round 4: the c15 select after the registers ----------------
+    ('pa2_c15', "mem_pa2hi's carry candidates swapped", PC, TLB,
+     "wire  [15:0] mem_pa2hi = mem_pa2c ? mem_pa2hi1 : mem_pa2hi0;", "wire  [15:0] mem_pa2hi = mem_pa2c ? mem_pa2hi0 : mem_pa2hi1;"),
+    ('t1_c15_na', "t1_pahi's carry candidates swapped (no assertion)", PC, TLB + [['test', 'tx_*', 'mpu_*']],
+     "wire  [15:0] t1_pahi = t1_c15 ? t1_pahi1 : t1_pahi0;", "wire  [15:0] t1_pahi = t1_c15 ? t1_pahi0 : t1_pahi1;",
+     "      assert (t1_pahi == t1_pahi_ref && mem_pa2hi == mem_pa2hi_ref)", "      assert (1'b1)"),
+    ('pa2_c15_na', "mem_pa2hi's carry candidates swapped (no assertion)", PC, TLB,
+     "wire  [15:0] mem_pa2hi = mem_pa2c ? mem_pa2hi1 : mem_pa2hi0;", "wire  [15:0] mem_pa2hi = mem_pa2c ? mem_pa2hi0 : mem_pa2hi1;",
+     "      assert (t1_pahi == t1_pahi_ref && mem_pa2hi == mem_pa2hi_ref)", "      assert (1'b1)"),
 ]
 
 def stage(name):
