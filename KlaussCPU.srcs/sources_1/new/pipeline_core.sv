@@ -1643,15 +1643,21 @@ module pipeline_core
    // the legality / serialize decode -> id_ser / id_privop, 10 levels,
    // the sddma_b3 worst.  Kept, so synthesis does not share one decode
    // behind a mux of the words.  = the w_op decode, asserted below.
-   function automatic logic [2:0] f_idpd(logic [31:0] op);   // {serialize, priv, legal}
-      dec_t d;
-      d = f_decode_raw(op);
-      return {f_decode(op, 1'b0, 1'b0, 1'b0).serialize, f_priv(d, op), d.legal};
-   endfunction
-   (* keep = "true" *) wire [2:0] w_pd0 = f_idpd(ifb_dw[0][31:0]);
-   (* keep = "true" *) wire [2:0] w_pd1 = f_idpd(ifb_dw[0][63:32]);
-   (* keep = "true" *) wire [2:0] w_pd2 = f_idpd(ifb_dw[1][31:0]);
-   (* keep = "true" *) wire [2:0] w_pd3 = f_idpd(ifb_dw[1][63:32]);
+   // (Written as module-level dec_t nets, as w_dec / w_decf are: Vivado
+   // 2025.2 synthesised a function wrapping f_decode_raw / f_decode into
+   // a constant 0 — every op illegal — while Verilator simulated it right.)
+   wire [31:0] w_pdop [0:3];
+   assign w_pdop[0] = ifb_dw[0][31:0];   assign w_pdop[1] = ifb_dw[0][63:32];
+   assign w_pdop[2] = ifb_dw[1][31:0];   assign w_pdop[3] = ifb_dw[1][63:32];
+   dec_t w_pdr [0:3];                    // {serialize, priv, legal} of each candidate
+   dec_t w_pdf [0:3];
+   (* keep = "true" *) logic [2:0] w_pdk [0:3];
+   for (genvar k = 0; k < 4; k++) begin : g_pd
+      assign w_pdr[k] = f_decode_raw(w_pdop[k]);
+      assign w_pdf[k] = f_decode(w_pdop[k], 1'b0, 1'b0, 1'b0);
+      assign w_pdk[k] = {w_pdf[k].serialize, f_priv(w_pdr[k], w_pdop[k]), w_pdr[k].legal};
+   end
+   wire [2:0] w_pd0 = w_pdk[0], w_pd1 = w_pdk[1], w_pd2 = w_pdk[2], w_pd3 = w_pdk[3];
    wire [2:0] w_pd = pc[2] ? (in0 ? w_pd1 : w_pd3) : (in0 ? w_pd0 : w_pd2);
    wire w_pd_ser = w_pd[2], w_pd_priv = w_pd[1], w_pd_legal = w_pd[0];
 `ifndef SYNTHESIS
