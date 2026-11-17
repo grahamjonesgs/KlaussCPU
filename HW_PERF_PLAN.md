@@ -3518,6 +3518,12 @@ passing:
     btfuzz 300;
   - permfuzz 240 + 120 + 10 tb_soc, plus the self-check.
 - `fwdfuzz` 40 seeds: 0 of 480 differing.
+- `EXC_EN = 0` (core 2's MMU-less configuration, `VSIM_EXC_EN=0`): `test`
+  2012 tests, 680 failing (the exception tests), the pass/fail list
+  identical to `e298fc6`'s; `diff --seeds 20 --lats 1 3` 0 differing,
+  47,776 = 47,776 cycles.  The hit-pipe MMIO check (`ex_hmmio`, with
+  `ex_tpg`) now sits outside `g_tlb`, so it covers core 2 (it was not
+  compiled there); `ifndef SYNTHESIS` only, the netlist is unchanged.
 - `tecost` 60 seeds: identical to `e298fc6` (supervisor TE = 0 / 1:
   88,713 / 89,194; user 92,135 / 92,770).
 - `l2_regress.sh` `soc36` (with `socframe`, `socorphan` 48, `socreset` 47,

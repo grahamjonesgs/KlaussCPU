@@ -5924,10 +5924,6 @@ module pipeline_core
          assert ((32'(ex_ta + ex_tb) >> 3) == (exo_iaddr >> 3) && ex_tlo3[2:0] == exo_eaddr[2:0])
             else $fatal(1, "ex_ta + ex_tb %h + %h != hit-pipe EA %h (pc %h)", ex_ta, ex_tb,
                         exo_iaddr, ex_pc);
-      // (§10) ... and the hit-pipe loads' MMIO test from ex_tpg
-      always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld && !$isunknown(exo_iaddr))
-         assert ((EN_MPU || !ex_mph) && ex_hmmio == (exo_iaddr[31:28] == 4'hF))
-            else $fatal(1, "ex_hmmio != (exo_iaddr[31:28] == F) (pc %h)", ex_pc);
       // ... and f_pgeq is the page compare
       // (4-state sims: ex_ta / ex_tb / ex_tc / mem_eaddr are unreset, skip while X)
       always_ff @(posedge clk) if (ce && !rst && !$isunknown({ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]}))
@@ -5967,6 +5963,17 @@ module pipeline_core
       if (mem_valid && mem_is_write && mem_xc != 2'd0) sc_st2++;
    end
    final if (hc_on) $display("HCOV store2 %0d of %0d cycles", sc_st2, sc_cyc);
+`ifndef SYNTHESIS
+   // (§10) the hit-pipe loads' MMIO test from ex_tpg, and ex_tpg itself: in
+   // every configuration (EN_TLB = 0 too: core 2's ex_hmmio drives h_base
+   // and mem_fastq there), so outside g_tlb
+   always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld && !$isunknown(exo_iaddr)) begin
+      assert ((EN_MPU || !ex_mph) && ex_hmmio == (exo_iaddr[31:28] == 4'hF))
+         else $fatal(1, "ex_hmmio != (exo_iaddr[31:28] == F) (pc %h)", ex_pc);
+      if (!ex_mph) assert (ex_tpg == exo_eaddr[31:16])
+         else $fatal(1, "ex_tpg %h != EA page %h (pc %h)", ex_tpg, exo_eaddr[31:16], ex_pc);
+   end
+`endif
 
    // M12 pos-tracker self-checks. Position flags are ONE-DIRECTIONAL by
    // design (a set flag must be TRUE; a clear flag may be conservative —
