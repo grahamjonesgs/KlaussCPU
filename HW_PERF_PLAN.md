@@ -3538,7 +3538,7 @@ passing:
 - mutations: `tmg2mut.py` 31 of 31 killed (the plain ones by the new
   assertions, the `_na` variants by behaviour, `lcy` by its time-0 self-
   check); `fablemut.py` 17 of 17; `sddmamut.py` 42 of 42 (two patterns
-  updated to the new `t_ta_d` / `t_tb_d` text); `l2mut.py`: running at the time of this commit (see the next commit).
+  updated to the new `t_ta_d` / `t_tb_d` text); `l2mut.py` 36 of 36.
 
 ### §10 utilisation
 
