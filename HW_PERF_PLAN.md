@@ -57,10 +57,17 @@ checks clean, aliasjit PASS; clang deflate / cxx-hello 30.24 / 77.82 s
 user+sys, unchanged.
 
 Then (queued by Graham, 2026-11-17): **a timing-hardening pass** — done
-on branch `tmg2` (§10), not merged: the recurring families restructured
-and a TLB pblock; tier 1 minimum over two placements +0.066 → +0.089, the
+on branch `tmg2` (§10): the recurring families restructured and a TLB
+pblock; tier 1 minimum over two placements +0.066 → +0.089, the
 +0.20 / +0.15 target not reached (a wall of 7-10-level paths; pipelining
-is Graham's decision).  The original queue entry: Thin
+is Graham's decision). Graham chose to adopt it and end the pass: Opus
+review (no blocker / major; its MINOR, the hit-pipe MMIO check outside
+`g_tlb`, done in 264f5f4, sim only), released 2026-11-17 as
+`tmg2_release_fe83ff4.bit` (master fast-forwarded to `tmg2`; QSPI
+written, rollback entry in ~/.cache/kbuild/rollback/README.txt).  Board:
+all_tests 31/31, dcbz, hwprop, board-check 16/16 (SRAM and flash boot),
+SD DMA checks clean, aliasjit PASS; clang deflate / cxx-hello 29.74 /
+77.20 s user, unchanged.  The original queue entry: Thin
 slack is a development cost, not a reliability one (sign-off already
 covers worst-case PVT and jitter): placement noise of about ±0.1 ns and
 BRAM at 126 / 135 tiles keep pushing untouched paths to the edge, and
@@ -3614,7 +3621,11 @@ pipeline-advance cone → `ex_a`, the MMIO strobes, the VGA scanout.
 Beyond those, the margin needs pipelining (see the wall), which is
 Graham's decision.
 
-**Not done:** the board.  Not run on it (this task does not program it).
+**Board (2026-11-17):** `tmg2_fe83ff4.bit` in SRAM: all_tests 31/31,
+dcbz_test 0 fails, hwprop ALL PASS; runtime: board-check --boot 16/16, SD
+DMA md5 1 B .. 32 MiB (DMA / PIO / O_DIRECT), dmaexec PASS, aliasjit PASS,
+clang -O2 deflate 29.74 s / cxx-hello 77.20 s user (fable 29.74 / 77.31).
+Written to QSPI as `tmg2_release_fe83ff4.bit`; flash boot board-check 16/16.
 
 ## CPU_FEATURES additions
 
@@ -3806,5 +3817,9 @@ Decisions taken while implementing the frozen text above:
   cycle-neutral restructures with assertions and `tmg2mut.py` mutations,
   a TLB pblock (`constrs_1/new/floorplan.xdc`).  `fe83ff4`: standard tier 1
   +0.124 / +0.024, ExtraTimingOpt +0.089 / +0.008 (fable: +0.109 / +0.066),
-  `~/.cache/kbuild/tmg2_fe83ff4.bit`.  Cycle-identical to `e298fc6`.  Not
-  merged; not run on the board.
+  `~/.cache/kbuild/tmg2_fe83ff4.bit`.  Cycle-identical to `e298fc6`.
+- 2026-11-17: §10 released (Graham: adopt and end the pass): Opus review
+  no blocker / major, its MINOR done in 264f5f4 (sim only); board SRAM and
+  runtime checks clean, clang unchanged; QSPI = `tmg2_release_fe83ff4.bit`
+  (md5 56f288e6…), flash boot board-check 16/16; master fast-forwarded to
+  `tmg2`.  No hardware item queued; Graham decides the next RTL work.
