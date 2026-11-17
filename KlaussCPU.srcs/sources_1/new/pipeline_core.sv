@@ -1607,13 +1607,17 @@ module pipeline_core
    // in particular one an older MMIO store enables (INT_MASK, INT_VECn,
    // INT2_EN, a device's IRQ enable), which writes its register only while
    // that store is in MEM, after an EI 0-1 instructions behind it has been
-   // latched.  In EX, decided on the edge the EI leaves EX: the younger op
-   // in ID is squashed, nothing dispatches and fetch halts (as behind a
+   // latched.  Decided on the edge the EI leaves EX: the younger op in ID
+   // is squashed, nothing dispatches and fetch halts (as behind a
    // serializer: nothing younger than the EI is in flight), and mem_eiser
    // carries it to wb_rfch, which refetches EI+4, so the next boundary
-   // takes the interrupt there (CPU_ARCHITECTURE §13.1).  In ID: it simply
-   // becomes a serializer (id_ser / id_eiser; performance only — the EX
-   // decision covers it).
+   // takes the interrupt there (CPU_ARCHITECTURE §13.1).  (No conversion
+   // in ID: it would only save the refetch of the op behind the EI — the
+   // EX decision covers it — and it put a late enable on id_ser's D, the
+   // id_ser family's worst path: −0.007 in build fable_b2.)  The squashes
+   // later in the block are older and win: one that kills the EI clears /
+   // sets fetch_halt itself, and an SMC squash of the ID op alone on the
+   // conversion edge keeps fetch halted (ev_eicv).
    // Why that is always in time: the enabling store holds MEM until its
    // MMIO ack, >= 3 cycles after its DV (the strobe delayed 2 + the
    // splitter's register); its register is written at the DV's first edge
@@ -3639,8 +3643,6 @@ module pipeline_core
    always_ff @(posedge clk) irq_ok_q <= !rst && irq_ok;
    wire ex_eicv = EN_DIEI && ex_valid && ex_isei && !ex_eiser && irq_ok_q && !irq_active &&
                   !(DEBUG_EN && (dbg_active || dbg_stepping));
-   wire id_eicv = EN_DIEI && id_valid && id_isei && !id_eiser && irq_ok_q && !irq_active &&
-                  !(DEBUG_EN && (dbg_active || dbg_stepping));
    logic       ev_bp;   // a breakpoint was taken in ID this edge (debug)
    logic [1:0] ev_adv;
    logic [28:0] r_ifq_p1;
@@ -5147,18 +5149,6 @@ module pipeline_core
                   if (DEBUG_EN) dbg_active <= 1'b0;
                end
             end
-         end
-
-         // §9 item 4: an EI waiting in ID becomes a serializer (it then
-         // dispatches with fetch halted behind it: nothing to squash).  An
-         // EI held in EX is converted as it leaves EX (the dispatch branch
-         // above), which is never before the enabling store's MMIO ack.
-         // (The squashes below are older and win; one that kills the EI
-         // clears / sets fetch_halt itself, and an SMC squash of the ID op
-         // alone keeps it halted, ev_eicv.)
-         if (id_eicv && (mem_busy || ex_busy || raw_stall)) begin
-            id_ser     <= 1'b1;
-            id_eiser   <= 1'b1;
          end
 
          // ---------------- ISA v3 B: taken fused branch (MEM redirect) ------

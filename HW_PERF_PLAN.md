@@ -2820,6 +2820,224 @@ Bitstream `~/.cache/kbuild/fixes_1d6a04b.bit`, md5
 `fixes_433a323.bit` is kept, its build dir is not).  This supersedes
 `fixes_433a323.bit`.  Not run on the board.
 
+## 9. Fable review fixes (2026-11-17, branch `fable`)
+
+The confirmed findings of the Fable review of `origin/master` `d612472`
+(the §8 release; reports in `~/.cache/fable-review/{memsys,exc,mmu}`,
+independent repros in `~/.cache/kbuild/review-tests/fable-{memsys,exc}`),
+all approved by Graham.  Four RTL fixes, one sim-only RTL clean-up, the
+review's MMU fuzzer adopted, and new regression targets for each.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | memsys-1: `CPU_RESETN` leaves the boot FSM's memory request and the never-reset D-cache out of step (dword 0 lost; a stuck DV hangs the boot copy for good) | **fixed** (KlaussCPU, mem_read_write) |
+| 2 | memsys-2: a UART break / command byte in a one-cycle ack cycle hangs the boot copy (and the crash dump); the break cycle skips the PIPE_RUN arm | **fixed** (KlaussCPU) |
+| 3 | memsys-3: a UART `S` load does not stop the SD DMA or the blitter | **fixed** (KlaussCPU, blitter_dma) |
+| 4 | exc-1: precise `EI` misses an interrupt that an MMIO store 0-1 instructions ahead makes pending | **fixed** (pipeline_core) |
+| 5 | the review's `permfuzz.py` | **adopted** (`run.py permfuzz`) |
+| 6 | Verilator drops the UART loader's blocking nibble writes (every tb_soc `S` load failed) | **fixed in the RTL** (a local variable; synthesis unchanged) |
+| 7 | stale `mem_read_write.sv` header; `CACHE_OP_ADDR` / `LEN` ignore byte enables | header fixed; MMIO_MAP now says narrow stores leave them undefined |
+
+### §9 item 1: `CPU_RESETN` against the boot FSM and the never-reset D-cache
+
+- **Finding** (memsys-1).  The SoC FSM's `w_reset_H` branch re-armed the
+  boot copy but kept `st.mem_write_DV` / `st.mem_read_DV`, and
+  `mem_read_write` has no reset.  (a) A press shorter than a D-cache miss
+  (1-30 cycles) during a read miss of the pipeline: the copy's phase 4
+  took the dead read's ready (READ_WAIT's early restart) as boot dword
+  0's ack — the write was lost, DDR kept the old dword 0.  (b) A short
+  press, a 4-100-cycle release and a long press (or two 1-cycle glitches
+  4 cycles apart while a boot write miss is in the shadow): the DV at
+  address 0 survived the reset, the D-cache served it during the reset,
+  and after it the same address under a DV that never dropped was not a
+  new request to the served-DV guard — the copy hung for good, and no
+  later press recovered it (only a UART `S` or a reconfiguration).
+- **Fix.**  (b) the reset branch clears both DVs (and the new `r_s_rst`).
+  (a) `mem_read_write` exports `o_cpu_idle` (`state == WAIT`: nothing of
+  the port's latched and unanswered; a ready set on the edge into WAIT is
+  visible in its first cycle only, and phase 4 comes 4 cycles after phase
+  0), and boot phase 0 waits for it as well as for calibration.  Other FSM
+  requests: the crash dump's DDR reads start only from a park with
+  `pip_bus_idle` (no ready outstanding for the pipeline: its write misses
+  are acked at the latch, its reads answered before it drains); the
+  loader's first write comes ≥ 8 UART characters (2,640 cycles) after the
+  `S`, and §9 item 3 stops the DMA masters a dead read could wait behind.
+  A press during a crash-dump read is a test case (below).
+- **Tests** (`run.py socreset`, 47 cases): presses of 1, 2, 3, 5, 10, 20,
+  30 cycles during the 5th read miss (the program corrupts DDR dword 0,
+  reboots and must boot with the ROM's dword 0), 40 / 200 controls,
+  3-cycle press + 2…100-cycle release + 200-cycle press, 3+15+1, 1+8+1,
+  release bounce at boot dword 40 (h 2-8), a 40-cycle press with a glitch
+  2-5 cycles after phase 1, two glitches with a boot write miss in the
+  shadow (h 2-40), a press of 1 / 3 cycles 0-5 cycles into the crash
+  dump's first DDR read.  Every boot ack must follow a D-cache write latch
+  of `st.mem_addr`; every run must reach PIPE_RUN.  **d612472: 18 of 47
+  fail** (lone_1…30: BAD-ACK, dword 0 = 0x5A5A5A5A; b_3_4…100_200,
+  b_3_15_1, b_1_8_1, p2_dw40_o2/o3, wf_h4: hang at phase 4 / dword 0 /
+  served_addr 0).  **9ad86b7: 0 of 47.**
+- **Mutations** (`fablemut.py`): `rst_dv` (the reset keeps the DVs) and
+  `boot_idle` (phase 0 does not wait for `o_cpu_idle`): both killed.
+
+### §9 item 2: a UART break / command byte in an ack cycle
+
+- **Finding** (memsys-2).  The `w_uart_break` and break-command branches
+  sat above `case (st.SM)` in the else-if chain, so in such a cycle no
+  state arm ran: a boot-copy write's one-cycle `w_mem_ready` was lost and
+  the copy waited for ever (4 of 48 break offsets); the same for the crash
+  dump's DDR reads (STACK_FETCH), and — new in this work — a break in the
+  cycle after the dump's message DV left `r_msg_send_DV` up a second cycle
+  and the dump stalled in DONE_WAIT.  In PIPE_RUN the arm's retire trace /
+  instruction count, LCD byte and MMIO side effects of that cycle were
+  skipped.
+- **Fix.**  The normal body runs every non-reset cycle; after the case and
+  the MMIO handler, a break sets `r_break_received` and a command byte
+  after a break is decoded: the `S` command's assignments come last and
+  win over the arm's and the handler's (plus `r_pip_start <= 0`, and an
+  `S` during a HALT / crash-dump TX break ends that break).  LOADING_BYTE
+  takes only data bytes (`w_uart_rx_DV && !r_break_received`), as the RX
+  FIFO already did, so a command byte is never loaded as data.  The
+  break-branch copies of the timer's IRQ-ack consume are gone (the
+  PIPE_RUN arm now always runs).
+- **Tests** (`run.py socbreak`, 93 cases): a 400-cycle break swept over 48
+  offsets from boot dword 40 (the copy must finish and the program run);
+  40 offsets around the crash dump's first DDR read (two passes: the first
+  finds the read's cycle; the dump must progress); 4 / 9 breaks + 'A'
+  during a 180,000-instruction loop (the FSM's `r_instr_count` must equal
+  the pipeline's retires); a break + 'A' after 5 / 30 / 60 characters of a
+  .kbt stream (the load must succeed).  Coverage: 4 pulses land on a boot
+  ack, 1 on an HCF read ack.  **d612472: 8 of 93 fail** (boot_o32 / 36 /
+  40 / 44 and hcf_o20 / o24: hang; run_nb4 / run_nb9: retire count
+  179,999 / 179,995 vs 180,003).  **9ad86b7: 0 of 93.**
+- **Mutations**: `brk_preempt` (the arms skipped in a break / command
+  cycle again) and `brk_data` (LOADING_BYTE takes the command byte):
+  killed.
+
+### §9 item 3: a UART `S` load stops the SD DMA and the blitter
+
+- **Finding** (memsys-3).  `sd_native` was reset only by CPU_RESETN and at
+  LOAD_COMPLETE (`r_load_pulse && SD_MODE`), the blitter only by
+  CPU_RESETN: after break + `S` a running SD DMA (or blit) kept writing
+  DDR under the image being loaded (11,395 SD DMA writes during one load
+  in the repro).
+- **Fix.**  The `S` command pulses `r_s_rst` (registered): the SD
+  controller's load reset (`i_load_rst = r_load_pulse || r_s_rst`, iff
+  SD_MODE = 1, as at LOAD_COMPLETE — which then finds SD_MODE = 0) and a
+  new `blitter_dma.i_soft_rst`, which resets the blitter's engine (BUSY,
+  DONE, the DDR request) and not its registers (`BLIT_CHUNK` survives a
+  program load, as documented).  The blitter's reset drops its request
+  mid-tenure: the arbiter's orphaned-grant guard (§8 item 3d) releases
+  the grant.  The SD engine's DDR adapter is not reset (by design: one
+  transaction per tenure, it finishes it and releases with its done), so
+  SD leaves no orphan.
+- **Tests** (`run.py socsload`): a 512-block SD DMA read into 0x400
+  (inside the new image) / back-to-back 640 × 480 FILLs, then break + `S`
+  + a 0x800-byte .kbt; and the `S` placed 2 / 5 / 9 cycles after three
+  later grant rises of each master (a run without the `S` gives them; the
+  sim is deterministic up to it): no SD / blitter grant after a 200-cycle
+  grace, none held at the end, the loaded image intact, the program run;
+  a blitter grant held at the `S` must be released by the orphaned-grant
+  guard (3 SD and 4 blitter runs found the grant held).  **d612472: 8 of 8
+  fail** (79,765 SD / 412,909 blitter grant cycles during the 0x800 load).
+  **9ad86b7: 0 of 8**, also with the L2 off (`ddr2_control`'s `o_fe_idle`).
+- **Mutations**: `s_sd`, `s_blit` (the `S` pulse not wired): killed.
+
+### §9 item 4: precise EI behind an enabling MMIO store
+
+- **Finding** (exc-1).  `w_eiser = w_is_ei && irq_ok` was sampled only at
+  the EI's IF → ID latch.  INT_MASK, INT_VECn, INT2_EN and the devices'
+  enables are written while the store is in MEM, so an EI 0 or 1
+  instructions behind the enabling store latched as an ordinary op and the
+  interrupt came late (EI+16 / +20 with 4 instructions to the DI), or not
+  before a DI within 3 instructions at all; a `{INT_MASK = 0; nop;
+  INT_MASK = 1; EI; DI}` loop never took it.  CPU_ARCHITECTURE §13.1 and
+  MMU_PLAN §3.3 require the take at EI+4, and klausscc does that.
+- **Fix** (the confirming agent's (a′)).  `irq_ok_q` (registered); an EI
+  latched as an ordinary op (`id_isei` / `ex_isei`: a plain EI, not
+  serialized for another reason) is converted on the edge it leaves EX
+  (the dispatch branch, after the EX redirect): `mem_eiser <= ex_eiser ||
+  ex_eicv`, the ID op is dropped, nothing dispatches, fetch halts;
+  `wb_rfch` then refetches EI+4 and the next boundary takes the
+  interrupt.  `pc` is not touched there (the refetch rewrites it, and
+  fetch is halted in between: no new cone on `pc`).  An SMC squash of the
+  ID op alone on that edge keeps fetch halted (`ev_eicv`); an older squash
+  that kills the EI sets `fetch_halt` itself.
+  Two variants were built and dropped: converting an EI held in EX while
+  MEM is busy (redundant: the mutation `ei_hold` survived — the EI leaves
+  EX through the dispatch branch anyway) and converting an EI waiting in
+  ID into a serializer (performance only, mutation `ei_id` survived, and
+  its late enable on `id_ser`'s D was a failing path in `fable_b2`,
+  −0.007).  The refetch of the op behind the EI happens at `wb_rfch` in
+  every variant, so the cycles are the same.
+  Not done (as instructed): `wb_rfch` at MEM → WB for a non-serialized EI —
+  it squashes nothing, so EI+4..+12 would have executed twice.
+  **Why it is always in time**: the enabling store holds MEM until its
+  MMIO ack, which is the DV's strobe delayed 2 plus the splitter's
+  register: ≥ 3 cycles after the DV.  The register is written on the DV's
+  first edge (D → D+1); every source reaches `irq_ok` by D+2 (INT2_EN
+  goes through `r_eth_irq`, the others by D+1), `irq_ok_q` by D+3 — the
+  ack's cycle.  The EI, younger, can leave EX at the earliest on that
+  cycle's edge, so it sees `irq_ok_q`.  No interrupt pending: nothing
+  changes.
+- **Tests.**  `run.py socei` (tb_soc): `[enabling store] nop*k EI nop*j
+  DI` warm, k = 0, 1, 2, j = 0, 4, for INT_MASK, INT_VEC0 (8 alignments
+  each), INT_VEC1 (blitter DONE), INT_VEC2 (SD CMD_DONE with
+  `SDM_IRQEN`, INT2_EN = SD), INT_VEC3 (vsync), INT2_EN 1 → 3, VGA_CTRL
+  VSYNC_IRQ_EN (4 alignments each): every cell `1@+4`; the loop takes
+  131-156 interrupts (one per timer period, as the k = 2 control's 146).
+  The blitter's IRQ_EN is written only with START, which clears DONE, so
+  that store never makes an interrupt pending itself; the timer is the
+  source of `mask` / `vec0`.  **d612472: 102 of 221 fail** (cells with
+  k = 0, 1; the four k ≤ 1 loops take 1 interrupt in 2,000 passes).
+  **9ad86b7: 0 of 221.**
+  `tests.py ei_enable_store` (core TB, k 0-2 × 4 alignments × LAT 1 / 3):
+  **d612472 12 of 24 fail, 9ad86b7 0.**  tb_vsim now writes INT_MASK on
+  the store's DV as the SoC does (it used to apply it after the store
+  completed, which hid the window).
+- **Mutations**: `ei_none` (no conversion), `ei_disp` (the ID op not
+  squashed / fetch not halted: the DI behind it ran twice, `kind 2`),
+  `ei_rfch` (not carried to `wb_rfch`: fetch halted for ever),
+  `ei_regok` (`irq_ok_q` stuck at 0): killed.  The `ev_eicv`
+  term of the SMC squash is defensive (an SMC squash of the op behind the
+  EI on the conversion edge); no test reaches it.
+
+### §9 item 5: `permfuzz`
+
+The MMU review's fuzzer, adopted as `tools/vsim/permfuzz.py` (`run.py
+permfuzz`, its own options), importing this directory's run.py / kasm /
+tests instead of the review snapshot.  `PF_NOFLUSH` is kept, and
+`--selfcheck` runs it: with the remap's flush removed from the test
+program at least a third of 12 seeds must differ (7 of 12).  In
+`l2_regress.sh core`: 40 seeds `--fetch --remap` (240 runs), 20 seeds
+`--walk --irq` (120), 10 tb_soc seeds `--soc --walk --fetch`, the
+self-check: 0 failing.
+
+### §9 item 6: the UART loader in Verilator
+
+The loader wrote `o_ram_write_value`'s nibbles with blocking assignments
+and cleared it with an NBA in the 'X' branch; Verilator (BLKANDNBLK
+waived) dropped the blocking writes, so every tb_soc `S` load failed its
+checksum (HCF 5).  The nibble now goes into a local copy (`v`), which the
+word and the checksum use, and `o_ram_write_value <= v`: the same logic
+(the word and checksum saw the new nibble before too), NBA-only.
+`run.py` patches older revisions' loader in the sim copy (so `--rev
+d612472` tests the real bugs).  Mutation `ld_mixed` (the register written
+blocking again): killed.
+
+### §9 item 7
+
+`mem_read_write.sv`'s header described 128-bit lines and `addr[3]`: now
+32 B lines, `addr[4:3]`.  `CACHE_OP_ADDR` / `CACHE_OP_LEN` ignore byte
+enables (left as is: no software writes them narrow); MMIO_MAP's rows and
+its access-width rules now say a narrower store leaves them undefined.
+
+### §9 regression
+
+REGRESSION_PLACEHOLDER
+
+### §9 build
+
+BUILD_PLACEHOLDER
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |

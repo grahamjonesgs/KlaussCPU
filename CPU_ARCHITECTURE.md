@@ -456,9 +456,9 @@ behind the store that unmasks or enables the source (`INT_MASK`,
 (Implementation: an `EI` latched with an interrupt pending serializes,
 commits at WB and refetches at EI+4; the next boundary takes the
 interrupt.  One latched with nothing pending is converted to that form
-while it is still in ID or EX if an interrupt becomes pending — the
-enabling MMIO store writes its register only in MEM and holds MEM until
-its ack, so the `EI` is still in EX then; HW_PERF_PLAN §9 item 4.)
+as it leaves EX if an interrupt is pending by then — the enabling MMIO
+store writes its register only in MEM and holds MEM until its ack, so the
+`EI` cannot have left EX before; HW_PERF_PLAN §9 item 4.)
 
 A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`
 and interrupts are not disabled by `DI`.

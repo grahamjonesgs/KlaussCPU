@@ -47,10 +47,6 @@ MUTS = [
      "mem_eiser  <= ex_eiser || ex_eicv;", "mem_eiser  <= ex_eiser;"),
     ('ei_regok', 'the conversion takes the combinational irq_ok\'s previous value from a stale register', PC,
      EI_SUITE, "always_ff @(posedge clk) irq_ok_q <= !rst && irq_ok;", "always_ff @(posedge clk) irq_ok_q <= 1'b0;"),
-    # (ID conversion: id_eicv only saves the refetch of the op behind the
-    # EI — the EX conversion covers it; expected to survive, see §9)
-    ('ei_id', 'no conversion in ID (performance only: the EX conversion covers it)', PC, EI_SUITE,
-     "wire id_eicv = EN_DIEI && id_valid", "wire id_eicv = 1'b0 && id_valid"),
     # ---------------- item 6: the loader ----------------
     ('ld_mixed', "the loader's nibbles as blocking writes next to the 'X' branch's NBA again (item 6)", TOP,
      [['socbreak', 'load_split5']],
@@ -110,7 +106,7 @@ def main():
             res.append((name, st))
     k = sum(st == 'killed' for _, st in res)
     print(f'{k} of {len(res)} mutations killed')
-    return 0 if all(st == 'killed' or n == 'ei_id' for n, st in res) else 1
+    return 0 if k == len(res) else 1
 
 
 if __name__ == '__main__':
