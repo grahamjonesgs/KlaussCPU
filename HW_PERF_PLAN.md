@@ -3032,11 +3032,65 @@ its access-width rules now say a narrower store leaves them undefined.
 
 ### §9 regression
 
-REGRESSION_PLACEHOLDER
+On the final RTL (`e2523dd`; the groups also ran on `9ad86b7`, which
+differs only by the ID-stage conversion, with the same results), BASE =
+`origin/master` `d612472`, all passing:
+
+- core (`l2_regress.sh core`): `test` in the five configurations
+  (default, DEBUG_EN, MPU_EN, TLB_N = 16, no walker; with the new
+  `ei_enable_store`); `diff` 40 seeds × LAT 1 / 3 / 7 with `+TRACECYC`:
+  0 differing, 169,092 = 169,092 cycles; `diff --irq` 40 seeds: 107,709 =
+  107,709; `excdiff`, `mpudiff` (15 data / 380 fetch MPU faults),
+  `tlbdiff`, `tlbpage`, `dcbzdiff` 200 seeds, `dmtest`, `btfuzz` 300 seeds;
+  `permfuzz` 40 seeds `--fetch --remap` (240 runs, 23,376 exception
+  entries), 20 seeds `--walk --irq` (120), 10 tb_soc seeds, the self-check
+  (7 of 12 differ).
+- `fwdfuzz --base d612472` 12 seeds + 8 tb_soc: 0 of 152 differing.
+- `l2_regress.sh` soc36 (with `socframe`, `socorphan` 48 of 48 and the §9
+  targets: `socreset` 47, `socbreak` 93, `socsload` 8, `socei` 221), soc8,
+  socvar (L2 off incl. `socorphan` 24 of 24, `socreset`, `socsload`;
+  8 ways; jittered; slow MIG): 0 failing; socdiff traces and PIPE_RUN
+  cycles identical in every configuration (61,698 / 24,645 at MIGLAT 36;
+  42,251 / 21,338 at 8; 8 ways 61,698 / 24,645; jittered 52,150 / 22,944;
+  slow 78,533 / 27,530; L2 off as before).
+- `socsddma`, `socsdabort --rounds 4`, `sddmamut.py` 42 of 42 killed,
+  `l2mut` 36 of 36 killed; `fablemut.py` 11 of 11 killed
+  (on `e2523dd`).
+
+**Cycles**: identical to `d612472` everywhere measured.  Items 1-3 act
+only on CPU_RESETN, UART break / command cycles and the `S` command; item
+4 only when an interrupt is pending while a plain EI is in EX (none of
+the A/B programs, and `diff --irq`'s totals are unchanged); tb_vsim's
+INT_MASK timing change moved no A/B total either.
 
 ### §9 build
 
-BUILD_PLACEHOLDER
+Standard flow (`build_fast -resynth` in a `git archive` copy, under the
+lock), three builds:
+
+| Build | Commit | Change | Tier 1 WNS / WHS | LUTs | FFs |
+|---|---|---|---|---|---|
+| `fable_b1` | `27249e2` | items 1-4, 6 (EX conversion also while MEM busy, ID conversion) | −0.276 / +0.022 (tier 2 −0.242, not met) | 41,425 | 27,519 |
+| `fable_b2` | `9ad86b7` | − the MEM-busy conversion | −0.042 / +0.033 | 41,089 | 27,441 |
+| **`fable_b3`** | **`e2523dd`** | **− the ID conversion** | **+0.011 / +0.024, met** | **41,230** | **27,550** |
+
+(`fixes_b4`, the release: 41,096 LUTs, 27,160 FFs.)  b1's worst: an L2
+path (`e_c` → `o_mem_read_data`, 14 levels, unchanged logic, 62 % route)
+and `mem_d.uop` → … → the `ex_valid` term → `pc` CE (the new priority
+level of the conversion in the dispatch chain sits there).  b2's: three
+`ex_a` → EA / TLB / result paths (unchanged logic) and `r_in0` → `id_ser`
+(−0.007: the ID conversion's late enable on `id_ser`'s D — removed in b3).
+b3's worst: `ex_a` → the next-page EA → `mem_pa2hi` / `t1_pahi` (+0.011,
++0.056; MMU §11.9's page-crossing path, 15 levels), the TLB's `q_a`
+(+0.049), the multiplier's CE (+0.058) — none in §9's logic.
+
+**Tier 1 meets (+0.011 / +0.024) but not the +0.03 margin target**, and
+that was the third build, so the work stopped there (no alt-place).  The
+candidate for an RTL restructure is the next-page EA → `mem_pa2hi` /
+`t1_pahi` family (registering the page-crossing PA one cycle earlier, as
+§11.9 did for `ex_xpg_q`).  Bitstream `~/.cache/kbuild/fable_e2523dd.bit`,
+md5 `9223823d22124b372878c66e3356a5ea` (build dir
+`~/.cache/kbuild/fable_b3`).  Not run on the board.
 
 ## CPU_FEATURES additions
 
@@ -3205,3 +3259,13 @@ Decisions taken while implementing the frozen text above:
   grant was never released with L2_EN = 0); `socorphan` checks grants and
   progress, `+RSTORPH_ANY`, L2 bypass.  `1d6a04b`, tier 1 +0.082 /
   +0.017 (netlist as `433a323`), `~/.cache/kbuild/fixes_1d6a04b.bit`.
+- 2026-11-17: §9 Fable review fixes on branch `fable` (from `d612472`):
+  CPU_RESETN clears the FSM's DVs and the boot copy waits for an idle
+  D-cache; UART break / command no longer pre-empt the state arms; the
+  `S` command resets the SD controller and the blitter's engine; precise
+  EI behind an enabling MMIO store; the loader's nibbles in a local
+  variable; `permfuzz` adopted; `socreset` / `socbreak` / `socsload` /
+  `socei` / `fablemut.py`.  Cycle-identical to `d612472`.  `e2523dd`,
+  standard flow tier 1 +0.011 / +0.024 (met, below the +0.03 target after
+  three builds), `~/.cache/kbuild/fable_e2523dd.bit`.  Not yet run on the
+  board.
