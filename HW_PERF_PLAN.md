@@ -3144,7 +3144,7 @@ Not run on the board.
 
 Review of `e2523dd` and 56e59df's timing change (the reviewer's tests:
 `~/.cache/kbuild/review-tests/fable-rv`): the §9 fixes approved by
-Graham, with two MINOR findings, both gaps in them.  Fixed in `2216433`.
+Graham, with two MINOR findings, both gaps in them.  Fixed in `2216433`; timing in `5d61392`.
 
 - **MINOR 1: precise EI was late behind SD's own IRQ enable store,
   `SDM_IRQEN` (0xF000_0130).**  Item 4's "every source reaches `irq_ok`
@@ -3219,14 +3219,40 @@ Graham, with two MINOR findings, both gaps in them.  Fixed in `2216433`.
   `socorphan` 24; `socsddma` 402 runs, `socsdabort --rounds 4`,
   `sddmamut.py` 42 of 42 killed: all passing.  `sei_sd.py`: 80 of 80
   `1@+4`.
-- **Build** (standard flow, `fable_b5`): tier 1 **+0.024** / +0.006, met, but
-  **below the +0.03 target**; 40,903 LUTs, 27,522 FFs.  Worst path:
-  `r_pipe_owns` → `w_pip_ready` → the core's MEM logic → `m_addr` CE
-  (8 levels; unchanged logic — `w_pip_ready` takes the splitter's
-  registered ready, so the new ack term only feeds that register's D),
-  then `pc` → `ifb_dw` (+0.045), the multiplier (+0.077), `m_addr` →
-  `qspi_ctrl` (+0.107).  Bitstream left in the build dir (md5
-  `7f306efbf4b3f3e2832de25f0c3ca00d`), not released; waits for a decision.
+- **Build 5** (standard flow, `fable_b5`, `2216433`): tier 1 +0.024 /
+  +0.006, met but below the +0.03 target; 40,903 LUTs, 27,522 FFs.
+  Worst: `r_pipe_owns` → `w_pip_ready` → the core's MEM logic → `m_addr`
+  CE (8 levels; logic unchanged — `w_pip_ready` takes the splitter's
+  registered ready, the new ack term only feeds that register's D), then
+  `pc` → `ifb_dw` (+0.045), the multiplier (+0.077).  Not released.
+- **Timing fix** (`5d61392`, a design change, no alt-place):
+  `r_pipe_owns` has ~110 loads (the port's address / data muxes) and
+  its route alone was 1.2 ns of that path.  `w_pip_ready` now takes its
+  ownership term from a kept replica, `r_pipe_owns_rdy` (same D, `st.SM
+  == PIPE_RUN`), with that one load.  A sim assertion checks
+  `w_pip_ready` against the old form (`w_pipe_owns && (m_io ? split ready
+  : DRAM ready)`) every cycle.  (Gating the splitter's ready register
+  with the next-cycle ownership would remove the MMIO leg's term only:
+  the DRAM leg is the cache's combinational-return ready, COMB_DRAM_RET,
+  so the gate would stay in the LUT.)  `pc` → `ifb_dw` was left alone.
+- **Regression** on `5d61392` vs `d612472`: core `test` 0 failing,
+  `diff +TRACECYC` 169,092 = 169,092, `--irq` 107,709 = 107,709;
+  `l2_regress.sh` soc36 0 failing (socdiff 61,698 / 24,645 cycles,
+  `socorphan` 48, `socreset` 47, `socbreak` 93, `socsload` 18 with the
+  `blits` coverage 4, `socei` 245); `socsddma` 402 runs; `fablemut.py`
+  17 of 17 killed.
+- **Build 6**:
+
+| Build | Commit | Change | Tier 1 WNS / WHS | LUTs | FFs |
+|---|---|---|---|---|---|
+| `fable_b5` | `2216433` | the two MINOR fixes | +0.024 / +0.006 (below target) | 40,903 | 27,522 |
+| **`fable_b6`** | **`5d61392`** | **+ the ready's ownership replica** | **+0.109 / +0.023, met** | **40,968** | **27,452** |
+
+b6's worst paths: `it_vpn` → `ut_pa` (the micro-ITLB, +0.109 / +0.112),
+the TLB's `q_b` → `t1_pahi` (+0.142); `r_pipe_owns` is no longer among
+them.  **Bitstream `~/.cache/kbuild/fable_5d61392.bit`, md5
+`bb30bdadd0b13fbec710706ec3dcf949`** (build dir
+`~/.cache/kbuild/fable_b6`).  Not run on the board.
 
 ## CPU_FEATURES additions
 
@@ -3407,3 +3433,10 @@ Decisions taken while implementing the frozen text above:
   for the translation by carry select (§9 timing): `56e59df`, tier 1
   +0.122 / +0.019, `~/.cache/kbuild/fable_56e59df.bit`.  Not yet run on
   the board.
+- 2026-11-17: §9 review (two MINORs): `SDM_IRQEN`'s MMIO write ack
+  stretched 2 cycles (precise EI behind SD's own IRQ enable); the `S`
+  reset clears the blitter's start pulse; `socei` `sdirqen`, `socsload`
+  `blits_*`, four mutations.  Timing: the pipeline ready's ownership term
+  from a replica of `r_pipe_owns`.  `5d61392`, tier 1 +0.109 / +0.023,
+  `~/.cache/kbuild/fable_5d61392.bit`.  Cycle-identical to `d612472`.
+  Not yet run on the board.
