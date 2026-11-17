@@ -56,15 +56,25 @@ module bus_splitter #(
     // request in the MMIO region.  The top rebuilds the pipeline's ready
     // from it, dram.ready and the core's own registered address, off the
     // ownership mux on cpu.addr (timing; KlaussCPU.sv w_pip_ready).
-    output            o_ready_q
+    output            o_ready_q,
+    // (HW_PERF_PLAN §10 timing) the region of cpu.addr, decoded by the
+    // master before its address mux: = cpu.addr[31:28] == F, and that with
+    // [27:16] in 006-008 (asserted).  The SoC's ownership select then sits
+    // after the decode instead of in front of it (r_pipe_owns -> the address
+    // mux -> is_mmio -> is_eth -> the MMIO / DRAM strobes -> the devices).
+    input             i_is_mmio,
+    input             i_is_eth
 );
 
-    wire is_mmio = (cpu.addr[31:28] == 4'hF);
-    wire is_eth  = is_mmio && (
-                       (cpu.addr[27:16] == 12'h006) ||
-                       (cpu.addr[27:16] == 12'h007) ||
-                       (cpu.addr[27:16] == 12'h008)
-                   );
+    wire is_mmio = i_is_mmio;
+    wire is_eth  = i_is_eth;
+`ifndef SYNTHESIS
+    always_ff @(posedge i_clk) if (!$isunknown(cpu.addr))
+        assert (is_mmio == (cpu.addr[31:28] == 4'hF) &&
+                is_eth  == ((cpu.addr[31:28] == 4'hF) && (cpu.addr[27:16] == 12'h006 ||
+                            cpu.addr[27:16] == 12'h007 || cpu.addr[27:16] == 12'h008)))
+            else $fatal(1, "bus_splitter: the predecoded region != the decode of cpu.addr %h", cpu.addr);
+`endif
     wire is_periph = is_mmio && !is_eth;
 
     // Strobes only fire on the selected destination.

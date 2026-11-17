@@ -543,6 +543,16 @@ module pipeline_core
    logic [23:0] tlb_ptb;         // TLB_PTB[26:3] (mmu_tlb)
    // the frame push address of an entry (the kernel SP after any swap)
    wire [31:0]  push_va = ((EN_EXC && umode) ? sp_alt : sp) - 32'd8;
+   // (HW_PERF_PLAN §10 timing) push_va[31:27] == 5'b10000 (the frame in
+   // kseg, the TE = 1 DOUBLE_FAULT test) without the subtractor: SP - 8
+   // borrows from bit 27 iff SP[26:3] == 0, so the test is on SP[31:27]
+   // (10000, or 10001 with the borrow) — per candidate SP, umode last.  The
+   // 32-bit subtract (8 CARRY4) sat in front of the entry's decision ->
+   // irq_xc -> the m_addr / port enables (sddma_b3, umode -> m_addr CE).
+   function automatic logic f_pkseg(logic [31:0] v);
+      return (v[26:3] == 24'd0) ? (v[31:27] == 5'b10001) : (v[31:27] == 5'b10000);
+   endfunction
+   wire         push_kseg = (EN_EXC && umode) ? f_pkseg(sp_alt) : f_pkseg(sp);
    logic [31:0] exc_addr_q, exc_epc_q;
    logic [31:0] pc;
    logic        running;        // fetch enabled
@@ -895,8 +905,11 @@ module pipeline_core
    logic [4:0]      tlb_f_idx;        // the fetch port's matching entry (mmu_tlb)
    logic [4:0]      tlb_w_idx;        // the entry a TLBWI / walk writes (mmu_tlb, at its discard)
    logic        it_ref;
-   logic [15:0] it_vpn;
-   logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
+   // (HW_PERF_PLAN §10 timing: replicated — the fetch-port CAM's key, ~40
+   // loads across the 32 entries: it_vpn -> the CAM -> the PFN mux -> ut_pa,
+   // fable_b6's worst)
+   (* max_fanout = 12 *) logic [15:0] it_vpn;
+   (* max_fanout = 12 *) logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
    wire  [15:0] look_vpn = pf_sel ? pf_line[27:12] : miss_dw[28:13];
    logic [15:0] r_look_vpn = '0, r_look_pa = '0;
    logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
@@ -1011,10 +1024,26 @@ module pipeline_core
                         (!(EN_TLB && te) || (r_look_hit && r_look_vpn == pf_line[27:12] &&
                                              r_look_um == fe_um && r_look_ok));
    // M9: NLB serve triple for the demand window (mirrors ifr_* / m_* shapes)
-   wire        nlb0_dw_ok     = (nlb_line == miss_dw[28:1]) &&
-                                (miss_dw[0] ? nlb_vlo : nlb_vhi);
-   wire        nlb1_dw_ok     = EN_NLB2 && EN_NLB2SRV && (nlb1_line == miss_dw[28:1]) &&
-                                (miss_dw[0] ? nlb1_vlo : nlb1_vhi);
+   // (HW_PERF_PLAN §10 timing) compare, then select: miss_dw is in0 ?
+   // r_base_p1 : pc_dw (registers), so each NLB entry is compared with both
+   // candidates in parallel and in0 picks the result — the miss_dw mux
+   // (and its route) was in front of the 28-bit compares: pc / r_base_p1 ->
+   // miss_dw -> the compare -> nlb0_dw_ok -> the serve select (fanout ~180)
+   // -> ifb_dw, fable_b5's second worst.  Kept: synthesis would share one
+   // compare behind the mux.  = the miss_dw form (asserted below).
+   (* keep = "true" *) wire nlb0_ok_b1 = (nlb_line == r_base_p1[28:1]) && (r_base_p1[0] ? nlb_vlo : nlb_vhi);
+   (* keep = "true" *) wire nlb0_ok_pc = (nlb_line == pc_dw[28:1])     && (pc_dw[0]     ? nlb_vlo : nlb_vhi);
+   (* keep = "true" *) wire nlb1_ok_b1 = (nlb1_line == r_base_p1[28:1]) && (r_base_p1[0] ? nlb1_vlo : nlb1_vhi);
+   (* keep = "true" *) wire nlb1_ok_pc = (nlb1_line == pc_dw[28:1])     && (pc_dw[0]     ? nlb1_vlo : nlb1_vhi);
+   wire        nlb0_dw_ok     = in0 ? nlb0_ok_b1 : nlb0_ok_pc;
+   wire        nlb1_dw_ok     = EN_NLB2 && EN_NLB2SRV && (in0 ? nlb1_ok_b1 : nlb1_ok_pc);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({in0, r_base_p1, pc_dw, nlb_line, nlb1_line}))
+      assert (nlb0_dw_ok == ((nlb_line == miss_dw[28:1]) && (miss_dw[0] ? nlb_vlo : nlb_vhi)) &&
+              nlb1_dw_ok == (EN_NLB2 && EN_NLB2SRV && (nlb1_line == miss_dw[28:1]) &&
+                             (miss_dw[0] ? nlb1_vlo : nlb1_vhi)))
+         else $fatal(1, "nlb*_dw_ok != the miss_dw form (pc %h)", pc);
+`endif
    wire        nlb_dw_ok      = nlb0_dw_ok || nlb1_dw_ok;
    wire [127:0] nlb_srv_data  = nlb0_dw_ok ? nlb_data : nlb1_data;
    wire        nlb_srv_vlo    = nlb0_dw_ok ? nlb_vlo  : nlb1_vlo;
@@ -1554,8 +1583,24 @@ module pipeline_core
    // and the window's LEN bits, registered into id_fx / id_fx2 / id_fxg.
    wire        w_cross = (w_op[31:30] == 2'b10 && pc[4:2] == 3'd7) ||
                          (w_op[31:30] == 2'b11 && pc[4:3] == 2'b11);
+   // (HW_PERF_PLAN §10 timing) the last word's region tests read
+   // w_last_pc[31:27] only, = pc[31:27] or pc[31:27] + 1 when the +4 / +8
+   // carries past bit 26: both candidates' tests are from pc's registers
+   // (one LUT each), the carry an AND of pc[26:2] / pc[26:3], and the LEN
+   // bits pick last — the 32-bit pc + 4 / pc + 8 adders (8 CARRY4) are no
+   // longer in front of w_fx -> id_ser / id_fx*.  Asserted against
+   // w_last_pc below.
+   wire [4:0]  w_lt0 = pc[31:27];
+   wire [4:0]  w_lt1 = pc[31:27] + 5'd1;
+   wire        w_lcy = (w_op[31:30] == 2'b11 && &pc[26:3]) || (w_op[31:30] == 2'b10 && &pc[26:2]);
+   function automatic logic f_s1t(logic [4:0] t);           // [31:28] == F
+      return t[4:1] == 4'hF;
+   endfunction
+   function automatic logic f_tst(logic um, logic [4:0] t);  // the §11.2 segment rule on [31:27]
+      return um ? t[4] : (t[4:3] == 2'b10 && t != 5'b10000);
+   endfunction
    wire        w_s1a = fe_um && pc[31:28] == 4'hF;
-   wire        w_s1b = fe_um && w_last_pc[31:28] == 4'hF;
+   wire        w_s1b = fe_um && (w_lcy ? f_s1t(w_lt1) : f_s1t(w_lt0));
    // (stage 3, TE = 1: the MPU is off; the segment rule of §11.2 — user at
    // 0x8000_0000+, supervisor in the 0x88-0xBF hole — from pc (ts*), then
    // the window slot's fault tag (tf*, tm* = a TLB miss).  An instruction
@@ -1563,8 +1608,14 @@ module pipeline_core
    // that page's start = the next granule's start, as for the MPU.)
    wire        w_te  = EN_TLB && te;
    wire        w_tsa = w_te && (fe_um ? pc[31] : (pc[31:30] == 2'b10 && pc[31:27] != 5'b10000));
-   wire        w_tsb = w_te && (fe_um ? w_last_pc[31]
-                                      : (w_last_pc[31:30] == 2'b10 && w_last_pc[31:27] != 5'b10000));
+   wire        w_tsb = w_te && (w_lcy ? f_tst(fe_um, w_lt1) : f_tst(fe_um, w_lt0));
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({w_op[31:30], pc, fe_um, w_te}))
+      assert (w_s1b == (fe_um && w_last_pc[31:28] == 4'hF) &&
+              w_tsb == (w_te && (fe_um ? w_last_pc[31]
+                                       : (w_last_pc[31:30] == 2'b10 && w_last_pc[31:27] != 5'b10000))))
+         else $fatal(1, "w_s1b / w_tsb != the w_last_pc form (pc %h)", pc);
+`endif
    wire        w_tf1 = w_te && (in0 ? ifb_ft[0] : ifb_ft[1]);
    wire        w_tm1 = w_te && (in0 ? ifb_fm[0] : ifb_fm[1]);
    // (LEN = 00, an illegal op, occupies one word: it spans nothing)
@@ -1584,7 +1635,31 @@ module pipeline_core
    // fault gates the predictor bits at their uses (id_fx), and the
    // overrides' serialize is ORed in as a parallel term, w_xser.  A
    // privileged op is never a branch or return.)
-   wire w_xser = EN_EXC && (w_fx || (fe_um && f_priv(w_dec, w_op)));
+   // (HW_PERF_PLAN §10 timing) the latch's serialize / privilege /
+   // legality bits are decoded from each of the window's four candidate
+   // words in parallel (the slot-0 / slot-1 dwords' halves, registers), and
+   // in0 / pc[2] pick one result last — the window mux (in0, then pc[2])
+   // and w_op's fanout (~66) were in front of the decode: ifb_dw -> w_op ->
+   // the legality / serialize decode -> id_ser / id_privop, 10 levels,
+   // the sddma_b3 worst.  Kept, so synthesis does not share one decode
+   // behind a mux of the words.  = the w_op decode, asserted below.
+   function automatic logic [2:0] f_idpd(logic [31:0] op);   // {serialize, priv, legal}
+      dec_t d;
+      d = f_decode_raw(op);
+      return {f_decode(op, 1'b0, 1'b0, 1'b0).serialize, f_priv(d, op), d.legal};
+   endfunction
+   (* keep = "true" *) wire [2:0] w_pd0 = f_idpd(ifb_dw[0][31:0]);
+   (* keep = "true" *) wire [2:0] w_pd1 = f_idpd(ifb_dw[0][63:32]);
+   (* keep = "true" *) wire [2:0] w_pd2 = f_idpd(ifb_dw[1][31:0]);
+   (* keep = "true" *) wire [2:0] w_pd3 = f_idpd(ifb_dw[1][63:32]);
+   wire [2:0] w_pd = pc[2] ? (in0 ? w_pd1 : w_pd3) : (in0 ? w_pd0 : w_pd2);
+   wire w_pd_ser = w_pd[2], w_pd_priv = w_pd[1], w_pd_legal = w_pd[0];
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({w_op, w_pd}))
+      assert (w_pd_ser == w_decf.serialize && w_pd_priv == f_priv(w_dec, w_op) && w_pd_legal == w_dec.legal)
+         else $fatal(1, "the candidate predecode != the w_op decode (pc %h op %h)", pc, w_op);
+`endif
+   wire w_xser = EN_EXC && (w_fx || (fe_um && w_pd_priv));
    logic id_ser;
    // Precise EI (RISC-V-like): an EI latched while an interrupt is pending
    // (irq_ok — never during a debugger single-step) serializes: fetch halts
@@ -1764,7 +1839,9 @@ module pipeline_core
    logic               r_bt_pend;            // a missed entry waits for its serve
    logic [5:0]         r_bt_widx;
    logic [29:0]        r_bt_wtag;
-   logic [28:0]        r_bt_wbase;
+   // (HW_PERF_PLAN §10 timing: replicated — ~70 loads across the BTIC
+   // arrays; a 0-level path with a 9.3 ns route in fable_b4)
+   (* max_fanout = 16 *) logic [28:0] r_bt_wbase;
    logic [IC_IDXW-1:0] r_bt_wblidx;
    logic               ev_btic;          // blocking event: IFB loaded from the BTIC
    logic               ev_btarm;         // blocking event: a BTIC capture armed (review 3)
@@ -1901,6 +1978,15 @@ module pipeline_core
    // (EN_MUL2) MUL (no MEM forward), mem_mulq = MUL, mem_mulf / wb_mulf = a
    // flag-setting MUL
    logic        mem_lkq, mem_mulq, mem_mulf, wb_mulf;
+   // (HW_PERF_PLAN §10 timing) the MEM op's port classes, registered at
+   // EX -> MEM like mem_lkq: mem_prdq = a port-read uop (LOAD, POP, RET,
+   // IRET, LEAVE, LEAVERET, LR), mem_pwrq = STORE / PUSH / ENTER, and
+   // CALL / SC / RET / LEAVERET / FBR.  mem_port_rd / _wr, the hit-RET
+   // hold, the LEAVERET lookahead and the FBR resolution read them instead
+   // of decoding mem_d.uop (mem_d.uop -> mem_busy -> the MEM / EX
+   // enables -> ex_d resets / ex_pred_tgt CE).  Asserted equal.
+   logic        mem_prdq, mem_pwrq, mem_callq, mem_scq, mem_retq, mem_lvrq, mem_fbrq;
+   logic        mem_l32q, mem_fldq, mem_shq;   // LOAD32; LOAD / POP / LEAVE; SHIFT
    // EN_LDBYP: mem_fastq = the MEM op is a fast load (registered at EX ->
    // MEM); id_ldc = the ID op may consume through the bypass; ex_lb_a/b =
    // the EX op reads rs1 / rs2 from the bypass; ex_w = its W-compare shift;
@@ -2765,7 +2851,9 @@ module pipeline_core
    // not postable
    logic        st_spec;
    logic [31:0] st_spec_nx;
-   logic [28:0] if_req_dw;
+   // (HW_PERF_PLAN §10 timing: replicated — it addresses the I-cache tag
+   // LUTRAM's write port, spread over the array: 0 levels, ~9 ns of route)
+   (* max_fanout = 32 *) logic [28:0] if_req_dw;
    logic        if_rebase;
    // MMU stage 1: the fill in flight is a fake one (user fetch from 0xF...)
    logic        if_fake;
@@ -2788,10 +2876,10 @@ module pipeline_core
    // already low); the arm sets once ready has been observed low; completions
    // require ready AND armed. One flag suffices — one transaction in flight.
 
-   wire mem_is_ld32  = mem_valid && (mem_d.uop == U_LOAD32);
+   wire mem_is_ld32  = mem_valid && mem_l32q;   // (§10: registered class)
    // 1a: a load that may leave MEM once issued (see EN_LD_WB)
    wire mem_fastld   = EN_LD_WB && mem_valid && !mem_misal && !mem_xsq && mem_iaddr[31:28] != 4'hF &&
-                       (mem_d.uop == U_LOAD || mem_d.uop == U_POP || mem_d.uop == U_LEAVE);
+                       mem_fldq;
    // ISA v3 B: taken fused branch in MEM (compare bit registered in EX)
    // fbr_tk = the fused branch in MEM is taken; fbr_taken = it REDIRECTS
    // (squashing EX/ID), i.e. it disagrees with the ID prediction (2b).
@@ -2811,13 +2899,13 @@ module pipeline_core
    // only issues out of a lookup — so not while if_look: then the WB path).
    // The load then reaches WB with its request already out (ld_out).
    // (!ld_out && !wb_hmiss imply WB is not waiting, so it does leave MEM.)
-   wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok && mem_d.uop != U_RET && !mem_xsq &&
+   wire h_miss_now   = EN_DC_H && mem_valid && mem_h && mem_h1 && !h_ok && !mem_retq && !mem_xsq &&
                        !wb_hmiss && !if_xc && !if_look && !st_post && !sq_v && !ld_out && mem_xc == 2'd0 &&
                        !irq_xc && !(DEBUG_EN && dbg_mx);
    // (1a: a non-port op may now wait in MEM behind a fast load in WB —
    // act only on the edge it leaves MEM)
-   wire fbr_tk       = EN_FBR && mem_valid && mem_d.uop == U_FBR && mem_result[0] && !wb_wait;
-   wire fbr_taken    = EN_FBR && mem_valid && mem_d.uop == U_FBR && (mem_result[0] != (EN_BP && mem_ptk))
+   wire fbr_tk       = EN_FBR && mem_valid && mem_fbrq && mem_result[0] && !wb_wait;
+   wire fbr_taken    = EN_FBR && mem_valid && mem_fbrq && (mem_result[0] != (EN_BP && mem_ptk))
                        && !wb_wait;
    wire [31:0] fbr_tgt = mem_result[0] ? mem_eaddr : mem_pc_next;
    // EX redirect: a taken JMP/CALL/RESET, except a JMP/CALL already taken
@@ -2830,7 +2918,7 @@ module pipeline_core
    // it) and the mispredict, valid on its completion edge (!mem_busy).
    // (EN_HRET: a RET answered by the hit pipe / a forwarded store has its
    // return address in the captured doubleword)
-   wire        mem_ret_h  = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && !mem_h1 && mem_hok;
+   wire        mem_ret_h  = EN_HRET && mem_valid && mem_retq && mem_h && !mem_h1 && mem_hok;
    wire [31:0] ret_actual = mem_ret_h ? mem_hdw[31:0]
                           : (mem_d.uop != U_LEAVERET) ? m_rdata[31:0]
                           : (mem_xc == 2'd3) ? m_rdata[31:0] : m_rdata_next[31:0];
@@ -2839,24 +2927,20 @@ module pipeline_core
    // a miss — the cycle after its first, with nothing captured)
    // (MMU: an access-faulted op — mem_xsq, registered in EX — makes no
    // port access, and the WB / redirect side ignores it: §7.1)
-   wire mem_port_rd  = mem_valid && !mem_xsq && !(EN_DC_H && mem_h && !(mem_d.uop == U_RET && !mem_h1 && !mem_hok)) &&
-                                    (mem_d.uop == U_LOAD || mem_d.uop == U_POP ||
-                                     mem_d.uop == U_RET  || mem_d.uop == U_IRET ||
-                                     mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
-                                     mem_d.uop == U_LR || mem_is_ld32);
-   wire mem_port_wr  = mem_valid && !mem_xsq && (mem_d.uop == U_STORE || mem_d.uop == U_PUSH ||
-                                     mem_d.uop == U_ENTER ||
-                                     (mem_d.uop == U_CALL && mem_sp_we) ||
+   wire mem_port_rd  = mem_valid && !mem_xsq && !(EN_DC_H && mem_h && !(mem_retq && !mem_h1 && !mem_hok)) &&
+                                    (mem_prdq || mem_is_ld32);
+   wire mem_port_wr  = mem_valid && !mem_xsq && (mem_pwrq ||
+                                     (mem_callq && mem_sp_we) ||
                                      // MMU stage 1: an SC stores only on success
                                      // (its result, registered in EX, is mem_result[0] = 0)
-                                     (mem_d.uop == U_SC && !mem_result[0]));
+                                     (mem_scq && !mem_result[0]));
    wire mem_port_op  = mem_port_rd || mem_port_wr;
    // MEMGET32 spanning a dword: served by the read lookahead when the next
    // dword is in the same line, else a second read (f_memget32 exactly).
    wire ld32_span    = mem_is_ld32 && (mem_eaddr[2:0] > 3'd4);
    wire ld32_need2   = ld32_span && !m_next_valid;
    // LEAVERET: [R15+8] not in the same line -> second read (same path)
-   wire lr_need2     = mem_valid && mem_d.uop == U_LEAVERET && !m_next_valid;
+   wire lr_need2     = mem_valid && mem_lvrq && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
    // EN_ST1: the store issues this edge onto a completely idle port (no
    // chaining — registers only) and leaves MEM with it
@@ -2885,7 +2969,7 @@ module pipeline_core
    // address is checked from the captured answer, a register, the cycle after)
    // (not for an access-faulted op: nothing may hold MEM for it — its
    // squash, mem_xsq_go, acts on the edge it leaves MEM)
-   wire ret_h_wait   = EN_HRET && mem_valid && mem_d.uop == U_RET && mem_h && mem_h1 && !mem_xsq;
+   wire ret_h_wait   = EN_HRET && mem_valid && mem_retq && mem_h && mem_h1 && !mem_xsq;
    wire mem_busy     = mem_port_wait || wb_wait || ret_h_wait;
    // (timing: compare, then select — each candidate return address is a
    // register (the captured hit dword, the forwarded store dwords) or the
@@ -2908,7 +2992,7 @@ module pipeline_core
    wire ret_port_io  = m_io;
    wire ret_ne       = mem_ret_h ? ret_ne_h
                      : ret_port_io ? 1'b1
-                     : (mem_d.uop != U_LEAVERET || mem_xc == 2'd3) ? (m_rdata_dram[31:0] != mem_pred_tgt)
+                     : (!mem_lvrq || mem_xc == 2'd3) ? (m_rdata_dram[31:0] != mem_pred_tgt)
                      : (m_rdata_next_dram[31:0] != mem_pred_tgt);
    wire ras_miss     = EN_RAS && mem_valid && mem_pred && !mem_busy && !mem_xsq && ret_ne;
    wire ex_rd_op     = (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
@@ -3336,7 +3420,7 @@ module pipeline_core
    // CONSTRUCTION: M6 forwarding already gives every producer-in-EX
    // consumer a 1-bubble gap, and the combine completes inside it — no
    // interlock, no sched-model change needed.
-   wire mem_is_sh     = mem_valid && (mem_d.uop == U_SHIFT);
+   wire mem_is_sh     = mem_valid && mem_shq;   // (§10: registered class)
    wire ex_is_sh_hand = ex_valid && (ex_d.uop == U_SHIFT) && !ex_busy && !mem_busy;
    // (sddma2 timing: stage 1 also picks the kind — every kind becomes one
    // byte rotate of one register, r_src, by r_rk bytes, then a byte keep /
@@ -3466,24 +3550,43 @@ module pipeline_core
    // same fields, registered on the same edge — so the hit select, wb_h &&
    // wb_hok, is the LAST mux of the forward value instead of the first
    // ahead of the extraction: = the old f_ldext(wb_hit ? wb_hdw : port))
-   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2 : m_rdata_dram;
+   // (HW_PERF_PLAN §10 timing) the extraction reads the port's dword only;
+   // a direct MUL's product (mul_r2, a full dword: no extraction) and a
+   // hit's wb_hext are the last two selects — mul_r2 used to go through
+   // the extraction's byte / sign muxes behind the wb_mdir select (mul_r2
+   // -> ex_a / the multiplier, 11 levels).  = the old form (wb_lddw =
+   // wb_mdir ? mul_r2 : m_rdata_dram, extracted unless full or wb_mdir,
+   // then the hit select): asserted below.
+   wire  [63:0] wb_lddw = (EN_MUL2 && wb_mdir) ? mul_r2 : m_rdata_dram;   // (the old form's; sim)
    always_comb begin
       logic [7:0]  b8;
       logic [15:0] h16;
       logic [31:0] w32;
-      b8  = wb_lddw[(wb_ld_ea * 8) +: 8];
-      h16 = wb_lddw[(wb_ld_ea[2:1] * 16) +: 16];
-      w32 = wb_ld_ea[2] ? wb_lddw[63:32] : wb_lddw[31:0];
-      if (wb_ld_full || (EN_MUL2 && wb_mdir)) wb_ldval_p = wb_lddw;
+      b8  = m_rdata_dram[(wb_ld_ea * 8) +: 8];
+      h16 = m_rdata_dram[(wb_ld_ea[2:1] * 16) +: 16];
+      w32 = wb_ld_ea[2] ? m_rdata_dram[63:32] : m_rdata_dram[31:0];
+      if (wb_ld_full) wb_ldval_p = m_rdata_dram;
       else case (wb_ld_msz)
          2'd0:    wb_ldval_p = wb_ld_sgn ? {{56{b8[7]}},   b8}  : {56'b0, b8};
          2'd1:    wb_ldval_p = wb_ld_sgn ? {{48{h16[15]}}, h16} : {48'b0, h16};
          2'd2:    wb_ldval_p = wb_ld_sgn ? {{32{w32[31]}}, w32} : {32'b0, w32};
-         default: wb_ldval_p = wb_lddw;
+         default: wb_ldval_p = m_rdata_dram;
       endcase
-      wb_ldval = (EN_DC_H && wb_h && wb_hok && !(EN_MUL2 && wb_mdir)) ? wb_hext : wb_ldval_p;
+      wb_ldval = (EN_MUL2 && wb_mdir) ? mul_r2
+               : (EN_DC_H && wb_h && wb_hok) ? wb_hext : wb_ldval_p;
    end
 `ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({sp, sp_alt, umode}))
+      assert (push_kseg == (push_va[31:27] == 5'b10000))
+         else $fatal(1, "push_kseg != (push_va[31:27] == 10000) (sp %h sp_alt %h)", sp, sp_alt);
+   // (§10) wb_ldval = the old form: the hit select, then the extraction of
+   // wb_lddw (full for a direct MUL)
+   always_ff @(posedge clk) if (!rst && wb_valid && ((EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir)) &&
+                                !$isunknown({wb_ldval, wb_lddw}))
+      assert (wb_ldval == ((EN_DC_H && wb_h && wb_hok && !(EN_MUL2 && wb_mdir)) ? wb_hext
+                           : (wb_ld_full || (EN_MUL2 && wb_mdir)) ? wb_lddw
+                           : f_ldext(wb_lddw, wb_ld_ea, wb_ld_msz, wb_ld_sgn, 1'b0)))
+         else $fatal(1, "wb_ldval %h != the old select order (pc %h)", wb_ldval, wb_pc);
    // the hit's value is wb_hdw's extraction (the old form)
    always_ff @(posedge clk) if (!rst && EN_DC_H && wb_valid && wb_h && wb_hok && !(EN_MUL2 && wb_mdir))
       assert (wb_hext == f_ldext(wb_hdw, wb_ld_ea, wb_ld_msz, wb_ld_sgn, wb_ld_full))
@@ -3530,40 +3633,58 @@ module pipeline_core
    wire fs_a = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rs1;
    wire fs_b = mem_is_sh && mem_fwd_ok && mem_d.rd == dec.rs2;
    wire fs_c = mem_is_sh && mem_fwd_ok && mem_d.rd == id_rd;
+   // (HW_PERF_PLAN §10 timing) likewise the WB forward of a fast load / a
+   // direct MUL (wb_fwd_v = wb_ldval: the port's extraction, the hit's
+   // wb_hext or mul_r2) is the select just before the shift's, from
+   // registers (wl_a / wl_b / wl_c: WB forwards and MEM does not); the
+   // other candidates take wb_value, wb_fwd_v's other leg.  (The response
+   // -> extraction -> wb_fwd_v -> the forward muxes -> ex_a / ex_b / the TLB
+   // keys / the multiplier family.)  The shift-last assertion below checks
+   // each operand against the old form.
+   wire wb_ldf = (EN_LD_FWD && wb_ld) || (EN_MUL2 && wb_mdir);
+   wire wl_a = b_wb && wb_ldf && wb_rd == id_rs1  && !(mem_fwd_ok && mem_d.rd == id_rs1);
+   wire wl_b = b_wb && wb_ldf && wb_rd == dec.rs2 && !(mem_fwd_ok && mem_d.rd == dec.rs2);
+   wire wl_c = b_wb && wb_ldf && wb_rd == id_rd   && !(mem_fwd_ok && mem_d.rd == id_rd);
    wire [31:0] t_ta_n = t_sp ? ((mem_valid && mem_sp_we) ? mem_sp_new
                               : (wb_valid && wb_sp_we)   ? wb_sp_new : sp)
                       : (t_mem && t_md == 2'b10) ? 32'd0
                       : (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh[31:0]
-                      : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v[31:0]
+                      : (b_wb       && wb_rd    == id_rs1) ? wb_value[31:0]
                       : rf[id_rs1][31:0];
    wire [31:0] t_tb_n = t_m8 ? 32'hFFFF_FFF8
                       : (!t_mem || t_md == 2'b00) ? 32'd0
                       : (t_md != 2'b11) ? id_var1
                       : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh[31:0]
-                      : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v[31:0]
+                      : (b_wb       && wb_rd    == dec.rs2) ? wb_value[31:0]
                       : rf[dec.rs2][31:0];
-   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0] : t_ta_n;
-   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;
+   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0]
+                      : (wl_a && !t_sp && !(t_mem && t_md == 2'b10)) ? wb_ldval[31:0] : t_ta_n;
+   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0]
+                      : (wl_b && !t_m8 && t_mem && t_md == 2'b11)    ? wb_ldval[31:0] : t_tb_n;
    // the ID -> EX operand latches' D values (the forward muxes)
    wire [63:0] ex_a_d = fs_a ? f_wsh(id_w, w_sh2)
+                      : wl_a ? f_wsh(id_w, wb_ldval)
                       : f_wsh(id_w, (mem_fwd_ok && mem_d.rd == id_rs1) ? mem_res_nsh
-                                  : (b_wb       && wb_rd    == id_rs1) ? wb_fwd_v
+                                  : (b_wb       && wb_rd    == id_rs1) ? wb_value
                                   : rf[id_rs1]);
    wire [63:0] ex_c_d = fs_c ? w_sh2
+                      : wl_c ? wb_ldval
                       : (mem_fwd_ok && mem_d.rd == id_rd)  ? mem_res_nsh
-                      : (b_wb       && wb_rd    == id_rd)  ? wb_fwd_v
+                      : (b_wb       && wb_rd    == id_rd)  ? wb_value
                       : rf[id_rd];
    wire [63:0] ex_b_d = (fs_b && !id_b_one && !id_b_imm) ? f_wsh(id_w, w_sh2)
+                      : (wl_b && !id_b_one && !id_b_imm) ? f_wsh(id_w, wb_ldval)
                       : f_wsh(id_w,
                           id_b_one ? 64'd1
                         : id_b_imm
                           ? (id_b_sext ? {{32{id_var1[31]}}, id_var1} : {32'b0, id_var1})
                         : (mem_fwd_ok && mem_d.rd == dec.rs2) ? mem_res_nsh
-                        : (b_wb       && wb_rd    == dec.rs2) ? wb_fwd_v
+                        : (b_wb       && wb_rd    == dec.rs2) ? wb_value
                         : rf[dec.rs2]);
    wire        ex_txpg_d = fs_a ? f_xpg(t_lr, t_l32, w_sh2[15:0])
+                         : wl_a ? f_xpg(t_lr, t_l32, wb_ldval[15:0])
                          : (mem_fwd_ok && mem_d.rd == id_rs1) ? f_xpg(t_lr, t_l32, mem_res_nsh[15:0])
-                         : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_fwd_v[15:0])
+                         : (b_wb       && wb_rd    == id_rs1) ? f_xpg(t_lr, t_l32, wb_value[15:0])
                          : f_xpg(t_lr, t_l32, rf[id_rs1][15:0]);
 `ifndef SYNTHESIS
    always_ff @(posedge clk) if (!rst && !$isunknown({mem_result_eff, ex_a_d, ex_b_d, ex_c_d}))
@@ -3713,6 +3834,9 @@ module pipeline_core
          mem_h <= 1'b0; mem_h1 <= 1'b0; wb_h <= 1'b0; wb_hok <= 1'b0; mem_hok <= 1'b0; mem_fq <= 1'b0;
          wb_mul <= 1'b0; wb_mdir <= 1'b0; mem_mage <= 2'd0;
          mem_lkq <= 1'b0; mem_mulq <= 1'b0; mem_mulf <= 1'b0; wb_mulf <= 1'b0;
+         mem_prdq <= 1'b0; mem_pwrq <= 1'b0; mem_callq <= 1'b0; mem_scq <= 1'b0;
+         mem_retq <= 1'b0; mem_lvrq <= 1'b0; mem_fbrq <= 1'b0;
+         mem_l32q <= 1'b0; mem_fldq <= 1'b0; mem_shq <= 1'b0;
          mem_fastq <= 1'b0; ex_lb_a <= 1'b0; ex_lb_b <= 1'b0; id_ldc <= 1'b0;
          ras_ptr <= '0; ras_cnt <= '0; id_ras_ret <= 1'b0; ex_pred <= 1'b0; mem_pred <= 1'b0;
          id_bp_unc <= 1'b0; id_bp_cnd <= 1'b0; id_bp_fbr <= 1'b0; ex_ptk <= 1'b0; mem_ptk <= 1'b0;
@@ -3893,7 +4017,7 @@ module pipeline_core
                         rdy_armed  <= !m_ready;
                         irq_xc     <= 1'b1;
                      end
-                  end else if (EN_TLB && te && push_va[31:27] != 5'b10000) begin
+                  end else if (EN_TLB && te && !push_kseg) begin   // (§10: = push_va[31:27] != 10000)
                      // MMU stage 3: with TE = 1 the frame push needs SP - 8 in
                      // kseg — otherwise DOUBLE_FAULT: park 6 (debug halt when
                      // attached), writing none of ECAUSE / EADDR / TLB_HI
@@ -4867,6 +4991,18 @@ module pipeline_core
                               ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET || ex_d.uop == U_LR ||
                               (EN_MUL2 && ex_d.uop == U_MUL));
                mem_mulq   <= EN_MUL2 && ex_d.uop == U_MUL;
+               mem_prdq   <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_RET ||
+                              ex_d.uop == U_IRET || ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET ||
+                              ex_d.uop == U_LR);
+               mem_pwrq   <= (ex_d.uop == U_STORE || ex_d.uop == U_PUSH || ex_d.uop == U_ENTER);
+               mem_callq  <= ex_d.uop == U_CALL;
+               mem_scq    <= ex_d.uop == U_SC;
+               mem_retq   <= ex_d.uop == U_RET;
+               mem_lvrq   <= ex_d.uop == U_LEAVERET;
+               mem_fbrq   <= ex_d.uop == U_FBR;
+               mem_l32q   <= ex_d.uop == U_LOAD32;
+               mem_fldq   <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
+               mem_shq    <= ex_d.uop == U_SHIFT;
                mem_fastq  <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE) &&
                              !ex_misal && exo_iaddr[31:28] != 4'hF;
                mem_mulf   <= EN_MUL2 && ex_d.uop == U_MUL && exo_fmask != '0;
@@ -5102,9 +5238,9 @@ module pipeline_core
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
                      id_b_sext <= w_dec.sgn;
-                     id_ser    <= w_decf.serialize || w_xser || w_eiser;
+                     id_ser    <= w_pd_ser || w_xser || w_eiser;   // (§10: = w_decf.serialize)
                      id_eiser  <= w_eiser;
-                     id_isei   <= w_is_ei && !w_decf.serialize && !w_xser;
+                     id_isei   <= w_is_ei && !w_pd_ser && !w_xser;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
                      id_rpend   <= 1'b1;
@@ -5133,7 +5269,7 @@ module pipeline_core
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
                      id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
-                     id_legal   <= w_dec.legal;  id_privop <= f_priv(w_dec, w_op);   // (tmg)
+                     id_legal   <= w_pd_legal;  id_privop <= w_pd_priv;   // (tmg; §10 the candidate predecode)
                      id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
@@ -5165,6 +5301,9 @@ module pipeline_core
                   mem_d.wreg   <= 1'b0;
                   mem_d.is_mem <= 1'b0;
                   mem_lkq      <= 1'b0;  mem_mulq <= 1'b0;  mem_mulf <= 1'b0;  mem_fastq <= 1'b0;
+                  mem_prdq     <= 1'b0;  mem_pwrq <= 1'b0;  mem_callq <= 1'b0;  mem_scq <= 1'b0;
+                  mem_retq     <= 1'b0;  mem_lvrq <= 1'b0;  mem_fbrq <= 1'b0;
+                  mem_l32q     <= 1'b0;  mem_fldq <= 1'b0;  mem_shq  <= 1'b0;
                   ev_pcz       = 1'b1;
                   id_valid     <= 1'b0;
                   ex_valid     <= 1'b0;
@@ -5875,6 +6014,17 @@ module pipeline_core
       if (mem_valid)
          assert (mem_lkq == (mem_loadlk || (EN_MUL2 && mem_d.uop == U_MUL)) && mem_mulq == (EN_MUL2 && mem_d.uop == U_MUL))
             else $fatal(1, "mem_lkq / mem_mulq drift: pc=%h", mem_pc);
+      if (mem_valid)
+         assert (mem_prdq == (mem_d.uop == U_LOAD || mem_d.uop == U_POP || mem_d.uop == U_RET ||
+                              mem_d.uop == U_IRET || mem_d.uop == U_LEAVE || mem_d.uop == U_LEAVERET ||
+                              mem_d.uop == U_LR) &&
+                 mem_pwrq == (mem_d.uop == U_STORE || mem_d.uop == U_PUSH || mem_d.uop == U_ENTER) &&
+                 mem_callq == (mem_d.uop == U_CALL) && mem_scq == (mem_d.uop == U_SC) &&
+                 mem_retq == (mem_d.uop == U_RET) && mem_lvrq == (mem_d.uop == U_LEAVERET) &&
+                 mem_fbrq == (mem_d.uop == U_FBR) && mem_l32q == (mem_d.uop == U_LOAD32) &&
+                 mem_fldq == (mem_d.uop == U_LOAD || mem_d.uop == U_POP || mem_d.uop == U_LEAVE) &&
+                 mem_shq == (mem_d.uop == U_SHIFT))
+            else $fatal(1, "§10 MEM port-class drift: pc=%h uop=%0d", mem_pc, mem_d.uop);
       if (id_valid)
          assert (id_rs1 == dec.rs1 && id_rd == dec.rd)
             else $fatal(1, "id_rs1/id_rd predecode drift: op=%h", id_op);

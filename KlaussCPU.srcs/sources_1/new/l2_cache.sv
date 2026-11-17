@@ -404,18 +404,46 @@ module l2_cache #(
     wire  [1:0] rb_p = e_c ^ rb_k;
     wire        rb_h = rb_p[0];
     logic [255:0] rb_buf;               // e_buf with this beat merged
+    // (HW_PERF_PLAN §10 timing: the lanes by an explicit case — the old
+    // computed part-selects, rb_buf[191 - 128*rb_h -: 64] for beat 0 (the
+    // dword at +8) and [255 - 128*rb_h -: 64] for beat 1 (the dword at +0),
+    // were synthesised as range compares with two CARRY4 chains in front of
+    // every lane select: e_c / e_bc -> o_mem_read_data, 14 levels)
     always_comb begin
         rb_buf = e_buf;
-        if (!e_bc[0]) rb_buf[191 - 128*rb_h -: 64] = app_rd_data;   // beat 0: the dword at +8
-        else          rb_buf[255 - 128*rb_h -: 64] = app_rd_data;   // beat 1: the dword at +0
+        case ({e_bc[0], rb_h})
+            2'b00: rb_buf[191:128] = app_rd_data;
+            2'b01: rb_buf[ 63:  0] = app_rd_data;
+            2'b10: rb_buf[255:192] = app_rd_data;
+            2'b11: rb_buf[127: 64] = app_rd_data;
+        endcase
     end
+    // the requester's half of a narrow (128-bit) answer, duplicated
+    wire [127:0] rb_half = rb_h ? rb_buf[127:0] : rb_buf[255:128];
+`ifndef SYNTHESIS
+    // the old computed part-select forms
+    logic [255:0] rb_buf_ref;
+    always_comb begin
+        rb_buf_ref = e_buf;
+        if (!e_bc[0]) rb_buf_ref[191 - 128*rb_h -: 64] = app_rd_data;
+        else          rb_buf_ref[255 - 128*rb_h -: 64] = app_rd_data;
+    end
+    always_ff @(posedge clk) if (!$isunknown({e_bc, rb_h, app_rd_data, e_buf})) begin
+        assert (rb_buf == rb_buf_ref) else $fatal(1, "l2 rb_buf != the part-select form");
+        assert (rb_half == rb_buf_ref[255 - 128*rb_h -: 128]) else $fatal(1, "l2 rb_half != the part-select form");
+    end
+`endif
     wire rb_sec_done = app_rd_data_valid && e_bc[0] && (e_n == 3'd1 || rb_k[0]);
     // the fill writes port B on this edge (has priority over the front end)
     wire eng_bwr = (e_st == E_RD) && e_alloc && rb_sec_done;
 
     // drain beat data
     wire [1:0]  dr_s  = {wb_dh, e_p[1]};
-    wire [127:0] dr_chunk = wbd_q[255 - 128*e_p[0] -: 128];
+    wire [127:0] dr_chunk = e_p[0] ? wbd_q[127:0] : wbd_q[255:128];   // (= wbd_q[255 - 128*e_p[0] -: 128])
+`ifndef SYNTHESIS
+    always_ff @(posedge clk) if (!$isunknown({e_p, wbd_q}))
+        assert (dr_chunk == wbd_q[255 - 128*e_p[0] -: 128]) else $fatal(1, "l2 dr_chunk != the part-select form");
+`endif
     wire [31:0] dr_m  = wb_m[wb_dh][32*e_p[1] +: 32];
     wire [7:0]  dr_m0 = dr_m[16 - 16*e_p[0] +: 8];
     wire [7:0]  dr_m1 = dr_m[24 - 16*e_p[0] +: 8];
@@ -742,7 +770,7 @@ module l2_cache #(
                         r_hx <= 4'd0;
                         // read hit: the sector from the data output register
                         o_mem_read_data <= q_wide ? d_mux
-                                                  : {2{d_mux[255 - 128*q_addr[4] -: 128]}};
+                                                  : {2{q_addr[4] ? d_mux[127:0] : d_mux[255:128]}};
                         o_mem_ready <= 1'b1;
                         r_served    <= 1'b1;
                         if (q_dma) ev_dma_hit <= 1'b1;
@@ -947,7 +975,7 @@ module l2_cache #(
                 end
                 if (rb_sec_done && e_rsp) begin
                     // the requester's sector (or burst) is in
-                    o_mem_read_data <= e_wide ? rb_buf : {2{rb_buf[255 - 128*rb_h -: 128]}};
+                    o_mem_read_data <= e_wide ? rb_buf : {2{rb_half}};
                     o_mem_ready <= 1'b1;
                     r_served    <= 1'b1;
                     e_rsp       <= 1'b0;

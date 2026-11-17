@@ -733,7 +733,9 @@ module KlaussCPU #(
    // idle — entering PIPE_RUN (the core issues nothing for several cycles
    // after start) and leaving it (only after park && bus_idle) — so a
    // one-cycle lag only delays the FSM's first access by a cycle.
-   logic       r_pipe_owns = 1'b0;
+   // (HW_PERF_PLAN §10 timing: replicated — ~110 loads, the port's address /
+   // data muxes; a 1.2 ns route on the MMIO strobe paths)
+   (* max_fanout = 24 *) logic r_pipe_owns = 1'b0;
    always_ff @(posedge i_Clk) r_pipe_owns <= (st.SM == PIPE_RUN);
    wire        w_pipe_owns = r_pipe_owns;
    wire [31:0] pip_m_addr;
@@ -771,6 +773,20 @@ module KlaussCPU #(
    (* keep = "true" *) logic r_pipe_owns_rdy = 1'b0;
    always_ff @(posedge i_Clk) r_pipe_owns_rdy <= (st.SM == PIPE_RUN);
    wire        w_pip_ready = r_pipe_owns_rdy && (pip_m_io ? w_split_ready_q : dram_mem.ready);
+   // (HW_PERF_PLAN §10 timing) the bus splitter's region decode, done on
+   // each master's registered address before the ownership select (the
+   // core's m_io register; the FSM's st.mem_addr), the select from its own
+   // kept replica of r_pipe_owns: = the decode of cpu_mem.addr (asserted
+   // in bus_splitter).
+   (* keep = "true" *) logic r_pipe_owns_dec = 1'b0;
+   always_ff @(posedge i_Clk) r_pipe_owns_dec <= (st.SM == PIPE_RUN);
+   function automatic logic f_eth_rgn(logic [31:0] a);   // 0xF006-0xF008: the LiteEth bridge
+      return a[27:16] == 12'h006 || a[27:16] == 12'h007 || a[27:16] == 12'h008;
+   endfunction
+   wire        w_st_io    = st.mem_addr[31:28] == 4'hF;
+   wire        w_bus_io   = r_pipe_owns_dec ? pip_m_io : w_st_io;
+   wire        w_bus_eth  = r_pipe_owns_dec ? (pip_m_io && f_eth_rgn(pip_m_addr))
+                                            : (w_st_io && f_eth_rgn(st.mem_addr));
 `ifndef SYNTHESIS
    always_ff @(posedge i_Clk)
       assert (w_pip_ready == (w_pipe_owns && (pip_m_io ? w_split_ready_q : dram_mem.ready)))
@@ -942,7 +958,9 @@ module KlaussCPU #(
        .o_eth_byte_en(w_eth_byte_en),
        .i_eth_read_data(w_eth_read_data),
        .i_eth_ready(w_eth_ready),
-       .o_ready_q(w_split_ready_q)
+       .o_ready_q(w_split_ready_q),
+       .i_is_mmio(w_bus_io),
+       .i_is_eth(w_bus_eth)
    );
 
    // -------------------------------------------------------------------------
@@ -1667,7 +1685,9 @@ module KlaussCPU #(
    // ==========================================================================
    // (w_calib_done declared above the mem_read_write instantiation — see note there)
    wire [63:0] w_boot_dword;        // boot_rom read data (1-cycle latency)
-   logic  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
+   // (HW_PERF_PLAN §10 timing: replicated — it addresses the boot ROM's 32
+   // RAMB36, spread over the die: 0 levels, an 8.9 ns route in fable_b6)
+   (* max_fanout = 8 *) logic  [14:0] r_boot_dw_addr;      // doubleword index into the ROM / DDR
    logic  [15:0] r_boot_len_dw;       // image length in doublewords (from word 0)
    logic  [ 2:0] r_boot_phase;        // sub-state within NO_PROGRAM:
                                     //   0=wait DDR calib, 1=read word 0 (image length),
