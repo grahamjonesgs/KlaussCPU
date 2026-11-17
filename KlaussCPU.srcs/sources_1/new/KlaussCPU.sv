@@ -762,7 +762,20 @@ module KlaussCPU #(
    // (§8 timing: the core's registered m_io = pip_m_addr[31:28] == F; b2's
    // worst, pip_m_addr -> the decode -> w_pip_ready -> icinv -> pc)
    wire        pip_m_io;
-   wire        w_pip_ready = w_pipe_owns && (pip_m_io ? w_split_ready_q : dram_mem.ready);
+   // (§9 review timing, fable_b5's worst at +0.024: r_pipe_owns (fanout
+   // ~110: the port's address / data muxes) -> w_pip_ready -> the core's
+   // MEM logic -> m_addr CE.  The ready's ownership term comes from a
+   // replica of r_pipe_owns with that one load (kept: synthesis would
+   // merge it back), so it sits next to the ready's LUT.  The same
+   // function, asserted below.)
+   (* keep = "true" *) logic r_pipe_owns_rdy = 1'b0;
+   always_ff @(posedge i_Clk) r_pipe_owns_rdy <= (st.SM == PIPE_RUN);
+   wire        w_pip_ready = r_pipe_owns_rdy && (pip_m_io ? w_split_ready_q : dram_mem.ready);
+`ifndef SYNTHESIS
+   always_ff @(posedge i_Clk)
+      assert (w_pip_ready == (w_pipe_owns && (pip_m_io ? w_split_ready_q : dram_mem.ready)))
+         else $fatal(1, "w_pip_ready != r_pipe_owns && (m_io ? split ready : DRAM ready)");
+`endif
 
    // Pipeline core — the execution engine (owns rf / flags / SP / PC /
    // int_mask; single retire at WB; see pipeline_core.sv + PIPELINE_IMPL.md).
