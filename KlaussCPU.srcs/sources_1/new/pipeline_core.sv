@@ -913,6 +913,13 @@ module pipeline_core
    // fable_b6's worst)
    logic [15:0] it_vpn;
    logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
+   // (HW_PERF_PLAN §10 timing) four kept copies of the fetch-port CAM's key,
+   // loaded with it_vpn / it_asid: each serves a quarter of the 32 entries
+   // (it_vpn's ~42 loads across the CAM: it_vpn -> the CAM -> the PFN mux
+   // -> ut_pa led the alternate placement's list; a max_fanout attribute
+   // was not honoured).  Asserted equal to it_vpn / it_asid.
+   (* keep = "true" *) logic [15:0] it_vpnc  [0:3];
+   (* keep = "true" *) logic [7:0]  it_asidc [0:3];
    wire  [15:0] look_vpn = pf_sel ? pf_line[27:12] : miss_dw[28:13];
    logic [15:0] r_look_vpn = '0, r_look_pa = '0;
    logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
@@ -2778,22 +2785,11 @@ module pipeline_core
    wire        t_perm = t_tlbs && tlb_d_hit && !tlb_d_pok;
    wire        t_dn   = t_seg || (t_tlbs && !tlb_d_pok);     // = t_seg || t_miss || t_perm
    wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[10:0]} : tva;
-   // (HW_PERF_PLAN §10 timing) the two carry candidates of t_pahi, for the
-   // registers that hold it (t1_pahi, mem_pa2hi): each stores both and the
-   // carry c15, and selects after the register — the c15 select no longer
-   // sits between the CAM's PFN OR-tree and their D inputs (the TLB's
-   // q_a / q_b -> the CAM -> d_pfn1 -> t1_pahi / mem_pa2hi, the alternate
-   // placement's worst, +0.007).  = t_pahi at load (asserted).
-   wire [15:0] t_palt  = t_kseg ? {5'b0, tva[10:0]} : tva;
-   wire [15:0] t_pahi0 = t_tlbs ? {5'b0, tlb_d_pfn0} : t_palt;
-   wire [15:0] t_pahi1 = t_tlbs ? {5'b0, tlb_d_pfn1} : t_palt;
    // (sim only: mmu_tlb's exact-match check — from the EA adder, the old
    // form, so it checks the CAM independently of the select above)
    assign tlb_d_vpn = ex_mph ? ex_ea_q[31:16] : exo_eaddr[31:16];
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
-   logic [15:0] t1_pahi0, t1_pahi1;
-   logic        t1_c15;
-   wire  [15:0] t1_pahi = t1_c15 ? t1_pahi1 : t1_pahi0;
+   logic [15:0] t1_pahi;
    wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
    wire ex_x3    = EN_TLB && ex_mph && ex_xpg_q;                // in its 2nd-page cycle
    wire d1_dn    = ex_x3 ? t1_dn   : t_dn;
@@ -2852,15 +2848,7 @@ module pipeline_core
                                            : (!mem_qu2 && !mem_qtseg && mq_tmiss));
    wire  mem_xs_tlb = mem_qtchk && (mq_dn1 ? (!mem_qu1 && !mq_d1seg && mq_d1tlb)
                                            : (!mem_qu2 && !mem_qtseg && mq_ttlb));
-   logic [15:0] mem_pa2hi0, mem_pa2hi1;  // (stage 3) the 2nd page's PA[31:16], per carry
-   logic        mem_pa2c;                //   candidate, and the carry (§10)
-   wire  [15:0] mem_pa2hi = mem_pa2c ? mem_pa2hi1 : mem_pa2hi0;
-`ifndef SYNTHESIS
-   logic [15:0] t1_pahi_ref, mem_pa2hi_ref;   // the old single registers
-   always_ff @(posedge clk) if (!rst && !$isunknown({t1_pahi_ref, mem_pa2hi_ref}))
-      assert (t1_pahi == t1_pahi_ref && mem_pa2hi == mem_pa2hi_ref)
-         else $fatal(1, "t1_pahi / mem_pa2hi carry-candidate form != the old registers");
-`endif
+   logic [15:0] mem_pa2hi;               // (stage 3) the 2nd page's PA[31:16]
    logic        mem_xpg;                 // ... the op crosses a page
    // MEM -> WB exception record: wb_xc = the WB op is an exception op
    // (ILLEGAL / TRAP / misaligned / U_EXC), with its cause and EADDR
@@ -3898,6 +3886,7 @@ module pipeline_core
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
          ut_v <= '0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_um <= '0; ut_ok <= '0; ut_miss <= '0; ut_rp <= '0;
+         for (int q = 0; q < 4; q++) begin it_vpnc[q] <= '0; it_asidc[q] <= '0; end
          ut_tl <= '0; ut_neg <= '0;
          for (int k = 0; k < UT_N; k++) begin ut_vpn[k] <= '0; ut_pa[k] <= '0; ut_ti[k] <= '0; end
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
@@ -4709,6 +4698,7 @@ module pipeline_core
                   // registered before it; it covers the page next cycle)
                   if (!it_ref && !tlb_psel && !ut_q) begin
                      it_ref <= 1'b1;  it_vpn <= miss_dw[28:13];  it_asid <= tlb_asid;
+                     for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end
                   end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted)) && !(IC32 && (lp_v || li_q))) begin
@@ -5038,10 +5028,7 @@ module pipeline_core
                // kept for the 2nd-page cycle (§11.9)
                if (ex_mpu_hold && !ex_mph) begin
                   t1_dn <= t_dn;  t1_seg <= t_seg;  t1_miss <= t_miss;  t1_tlb <= t_miss || t_perm;
-                  t1_pahi0 <= t_pahi0;  t1_pahi1 <= t_pahi1;  t1_c15 <= tlb_d_c15;
-`ifndef SYNTHESIS
-                  t1_pahi_ref <= t_pahi;
-`endif
+                  t1_pahi <= t_pahi;
                end
             end else begin
                ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
@@ -5138,10 +5125,7 @@ module pipeline_core
                               exo_iaddr[15:0]};
                sn_pra     <= exo_iaddr[IC_SNW+4:5];
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
-               mem_pa2hi0 <= t_pahi0;  mem_pa2hi1 <= t_pahi1;  mem_pa2c <= tlb_d_c15;   // a page-crossing op's 2nd page
-`ifndef SYNTHESIS
-               mem_pa2hi_ref <= t_pahi;
-`endif
+               mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
                mem_xpg    <= ex_x3;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_mmq    <= ex_is_mm;   mem_mmpick <= ex_mmpick;
@@ -5489,6 +5473,7 @@ module pipeline_core
          // dropped and the lookup asks again afterwards
          if (tlb_pload) begin
             it_vpn <= tlb_hi_vpn_o;  it_asid <= tlb_hi_asid_o;  it_ref <= 1'b0;
+            for (int q = 0; q < 4; q++) begin it_vpnc[q] <= tlb_hi_vpn_o; it_asidc[q] <= tlb_hi_asid_o; end
          end
          // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
          // virtual copies (the I-cache, physically tagged, is kept)
@@ -5911,7 +5896,7 @@ module pipeline_core
          .d_st     (ex_mst),
          .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_pok0 (tlb_d_pok0),
          .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_pok1 (tlb_d_pok1), .d_c15 (tlb_d_c15),
-         .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
+         .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .f_vpnc (it_vpnc), .f_asidc (it_asidc), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr), .f_idx (tlb_f_idx), .w_idx (tlb_w_idx),
          // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
          .wk_we    (EN_WALK && wk_fin), .wk_vpn (exc_addr_q[31:16]),
@@ -6392,6 +6377,8 @@ module mmu_tlb
    output logic        d_pok0, d_pok1,  //   ... and it grants the access
    output logic        d_c15,
    input  logic [15:0] f_vpn,         // registers: the micro-ITLB refill, or TLB_HI for a TLBP
+   input  logic [15:0] f_vpnc [0:3],  // (§10) four copies of f_vpn / f_asid, each for a quarter of the entries
+   input  logic [7:0]  f_asidc [0:3],
    input  logic [7:0]  f_asid,
    output logic [15:0] hi_vpn_o,      // TLB_HI's VPN / ASID (the TLBP's search key)
    output logic [7:0]  hi_asid_o,
@@ -6510,7 +6497,18 @@ module mmu_tlb
 `endif
    // one fetch-port CAM: TLBP's key is loaded into f_vpn / f_asid while
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
-   wire [N-1:0] fm = f_match(f_vpn, f_asid);
+   // (§10: entry n compares with key copy n * 4 / N; = f_match(f_vpn, f_asid), asserted)
+   logic [N-1:0] fm;
+   always_comb
+      for (int n = 0; n < N; n++)
+         fm[n] = e_v[n] && e_vpn[n] == f_vpnc[(n * 4) / N] && (e_g[n] || e_asid[n] == f_asidc[(n * 4) / N]);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst) begin
+      for (int q = 0; q < 4; q++)
+         assert (f_vpnc[q] == f_vpn && f_asidc[q] == f_asid) else $fatal(1, "mmu_tlb: fetch key copy %0d drifted", q);
+      assert (fm == f_match(f_vpn, f_asid)) else $fatal(1, "mmu_tlb: fm != f_match");
+   end
+`endif
    assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
    // (timing: the permission is folded per entry, so the fault logic
    // reads one OR per carry candidate instead of the XWR muxes)
