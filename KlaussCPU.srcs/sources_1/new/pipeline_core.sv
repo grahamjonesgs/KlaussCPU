@@ -1658,6 +1658,25 @@ module pipeline_core
       assign w_pdk[k] = {w_pdf[k].serialize, f_priv(w_pdr[k], w_pdop[k]), w_pdr[k].legal};
    end
    wire [2:0] w_pd0 = w_pdk[0], w_pd1 = w_pdk[1], w_pd2 = w_pdk[2], w_pd3 = w_pdk[3];
+   // (§10, build 2's worst: ifb_dw -> w_op -> the raw decode's register
+   // fields -> id_rs1 / id_rd) the latch's raw-decode fields too, per
+   // candidate: {rs1, rd, use_rs1, use_rs2, use_rdd, fread, sp_rd | sp_wr,
+   // ldc, sgn}
+   (* keep = "true" *) logic [14:0] w_pdx [0:3];
+   for (genvar k = 0; k < 4; k++) begin : g_pdx
+      assign w_pdx[k] = {w_pdr[k].rs1, w_pdr[k].rd, w_pdr[k].use_rs1, w_pdr[k].use_rs2, w_pdr[k].use_rdd,
+                         w_pdr[k].fread, w_pdr[k].sp_rd || w_pdr[k].sp_wr,
+                         w_pdr[k].uop == U_ALU || w_pdr[k].uop == U_BOOL || w_pdr[k].uop == U_FBR,
+                         w_pdr[k].sgn};
+   end
+   wire [14:0] w_px = pc[2] ? (in0 ? w_pdx[1] : w_pdx[3]) : (in0 ? w_pdx[0] : w_pdx[2]);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst && !$isunknown({w_op, w_px}))
+      assert (w_px == {w_dec.rs1, w_dec.rd, w_dec.use_rs1, w_dec.use_rs2, w_dec.use_rdd, w_dec.fread,
+                       w_dec.sp_rd || w_dec.sp_wr,
+                       w_dec.uop == U_ALU || w_dec.uop == U_BOOL || w_dec.uop == U_FBR, w_dec.sgn})
+         else $fatal(1, "the candidate field predecode != the w_op decode (pc %h op %h)", pc, w_op);
+`endif
    wire [2:0] w_pd = pc[2] ? (in0 ? w_pd1 : w_pd3) : (in0 ? w_pd0 : w_pd2);
    wire w_pd_ser = w_pd[2], w_pd_priv = w_pd[1], w_pd_legal = w_pd[0];
 `ifndef SYNTHESIS
@@ -3083,7 +3102,13 @@ module pipeline_core
    wire        h_line_blk = EN_STLF ? (sf_a || sf_b || sf_c)
                                     : ((m_write_DV && m_addr[31:5] == exo_iaddr[31:5]) ||
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
-   wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && exo_iaddr[31:28] != 4'hF &&
+   // (HW_PERF_PLAN §10 timing: a hit-pipe load's MMIO test reads the VA
+   // page's carry-select sum ex_tpg (registers + one select), = the EA's
+   // [31:16] for every ex_hld op — none is a page-crossing op, so ex_mph is
+   // 0 — instead of the 32-bit EA adder: ex_var2 -> the adder ->
+   // exo_iaddr[28] -> h_base -> mem_h1, build 2 +0.153.  Asserted.)
+   wire        ex_hmmio   = ex_tpg[15:12] == 4'hF;      // = exo_iaddr[31:28] == F for ex_hld
+   wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && !ex_hmmio &&
                             !(DEBUG_EN && dbg_mx);
    wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
@@ -5010,7 +5035,7 @@ module pipeline_core
                mem_fldq   <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE);
                mem_shq    <= ex_d.uop == U_SHIFT;
                mem_fastq  <= (ex_d.uop == U_LOAD || ex_d.uop == U_POP || ex_d.uop == U_LEAVE) &&
-                             !ex_misal && exo_iaddr[31:28] != 4'hF;
+                             !ex_misal && !ex_hmmio;   // (§10: = exo_iaddr[31:28] != F)
                mem_mulf   <= EN_MUL2 && ex_d.uop == U_MUL && exo_fmask != '0;
                mem_h      <= h_elig;
                mem_h1     <= h_elig && !h_fwd;     // (a forwarded load needs no cache answer)
@@ -5234,16 +5259,16 @@ module pipeline_core
                      if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
                      id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
-                     id_rs1    <= w_dec.rs1;
-                     id_ldc    <= (w_dec.uop == U_ALU || w_dec.uop == U_BOOL || w_dec.uop == U_FBR);
-                     id_rd     <= w_dec.rd;
+                     id_rs1    <= w_px[14:11];   // (§10: the candidate predecode of w_dec.rs1)
+                     id_ldc    <= w_px[1];       //   (w_dec.uop is ALU / BOOL / FBR)
+                     id_rd     <= w_px[10:7];    //   (w_dec.rd)
                      id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
                                    (w_op[29:26] == 4'h3 && w_op[20]) ||
                                    (w_op[29:26] == 4'hD && w_op[21]) ||
                                    (EN_SHORT9 && w_op[29:26] == 4'hA && w_op[25:24] == 2'b11)) &&
                                   (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
                                    w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
-                     id_b_sext <= w_dec.sgn;
+                     id_b_sext <= w_px[0];       // (§10: w_dec.sgn)
                      id_ser    <= w_pd_ser || w_xser || w_eiser;   // (§10: = w_decf.serialize)
                      id_eiser  <= w_eiser;
                      id_isei   <= w_is_ei && !w_pd_ser && !w_xser;
@@ -5278,9 +5303,9 @@ module pipeline_core
                      id_legal   <= w_pd_legal;  id_privop <= w_pd_priv;   // (tmg; §10 the candidate predecode)
                      id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
-                     id_use_rs1 <= w_dec.use_rs1;  id_use_rs2 <= w_dec.use_rs2;
-                     id_use_rdd <= w_dec.use_rdd;  id_fread   <= w_dec.fread;
-                     id_sp_rw   <= w_dec.sp_rd || w_dec.sp_wr;
+                     id_use_rs1 <= w_px[6];  id_use_rs2 <= w_px[5];   // (§10: the candidate
+                     id_use_rdd <= w_px[4];  id_fread   <= w_px[3];   //  predecode of w_dec's)
+                     id_sp_rw   <= w_px[2];
                      id_pc    <= pc;
                      id_pc_nx <= w_pc_adv;
                      id_last_dw <= (w_op[31:30] == 2'b11) ? w_pc_p8[31:3]
@@ -5864,6 +5889,10 @@ module pipeline_core
          assert ((32'(ex_ta + ex_tb) >> 3) == (exo_iaddr >> 3) && ex_tlo3[2:0] == exo_eaddr[2:0])
             else $fatal(1, "ex_ta + ex_tb %h + %h != hit-pipe EA %h (pc %h)", ex_ta, ex_tb,
                         exo_iaddr, ex_pc);
+      // (§10) ... and the hit-pipe loads' MMIO test from ex_tpg
+      always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld && !$isunknown(exo_iaddr))
+         assert (!ex_mph && ex_hmmio == (exo_iaddr[31:28] == 4'hF))
+            else $fatal(1, "ex_hmmio != (exo_iaddr[31:28] == F) (pc %h)", ex_pc);
       // ... and f_pgeq is the page compare
       // (4-state sims: ex_ta / ex_tb / ex_tc / mem_eaddr are unreset, skip while X)
       always_ff @(posedge clk) if (ce && !rst && !$isunknown({ex_ta, ex_tb, ex_tc, mem_eaddr[31:16]}))
@@ -6345,6 +6374,11 @@ module mmu_tlb
    // §11.8: TLB_WALK {RR, EN}, TLB_WCNT (0 and unused without WALK)
    logic [IW-1:0] rr;
    logic [47:0]   wcnt;
+   // (HW_PERF_PLAN §10 timing) the walk counter's increment, kept apart:
+   // synthesis had folded MTSR TLB_WCNT's write-data select into the
+   // increment's carry chain, so the WB value (the MTSR data, a long route
+   // to the TLB) ran through 6 CARRY4s (build 2, +0.187)
+   (* keep = "true" *) wire [47:0] wcnt_p1 = wcnt + 48'd1;
 
    function automatic logic [N-1:0] f_match(logic [15:0] vpn, logic [7:0] a);
       logic [N-1:0] m;
@@ -6495,7 +6529,7 @@ module mmu_tlb
          if (hi_load) begin hi_v <= hi_vpn; hi_g <= 1'b0; hi_a <= asid; end
          wi_q  <= op_wi || (WALK && wk_we);
          inv_q <= op_inv;
-         if (WALK && wk_we) begin rr <= rr + 1'b1;  wcnt <= wcnt + 48'd1; end
+         if (WALK && wk_we) begin rr <= rr + 1'b1;  wcnt <= wcnt_p1; end
          if (wi_q) begin
             e_v[wd_idx] <= wd_v;  e_vpn[wd_idx] <= wd_e[38:23];  e_g[wd_idx] <= wd_e[22];
             e_asid[wd_idx] <= wd_e[21:14];  e_pfn[wd_idx] <= wd_e[13:3];  e_xwr[wd_idx] <= wd_e[2:0];

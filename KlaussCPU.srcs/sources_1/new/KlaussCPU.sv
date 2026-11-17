@@ -778,6 +778,23 @@ module KlaussCPU #(
    // core's m_io register; the FSM's st.mem_addr), the select from its own
    // kept replica of r_pipe_owns: = the decode of cpu_mem.addr (asserted
    // in bus_splitter).
+   // (HW_PERF_PLAN §10 timing) per-device copies of the MMIO address mux,
+   // each with its own kept replica of r_pipe_owns: the shared mux output
+   // (cpu_mem.addr -> o_mmio_addr, also the D-cache's address) fanned out
+   // to ~245 loads (every device's decode and read mux; 1.7 ns), build 2's
+   // m_addr -> the blitter's read mux -> r_mmio_read_data and r_pipe_owns
+   // -> the QSPI enables.  [0] SD, [1] QSPI, [2] AES / SHA / TRNG, [3] the
+   // blitter, [4] VGA, [5] core 2.  Each = w_mmio_addr (asserted).
+   (* keep = "true" *) logic [5:0] r_owns_dev = '0;
+   always_ff @(posedge i_Clk) r_owns_dev <= {6{st.SM == PIPE_RUN}};
+   wire [31:0] w_maddr [0:5];
+   for (genvar k = 0; k < 6; k++) begin : g_maddr
+      assign w_maddr[k] = r_owns_dev[k] ? pip_m_addr : st.mem_addr;
+`ifndef SYNTHESIS
+      always_ff @(posedge i_Clk) if (!$isunknown(w_mmio_addr))
+         assert (w_maddr[k] == w_mmio_addr) else $fatal(1, "w_maddr[%0d] != w_mmio_addr", k);
+`endif
+   end
    (* keep = "true" *) logic r_pipe_owns_dec = 1'b0;
    always_ff @(posedge i_Clk) r_pipe_owns_dec <= (st.SM == PIPE_RUN);
    function automatic logic f_eth_rgn(logic [31:0] a);   // 0xF006-0xF008: the LiteEth bridge
@@ -968,7 +985,7 @@ module KlaussCPU #(
    // the write/read strobes so that each peripheral module only sees strobes
    // intended for it. addr[15:0] is the offset within the device's window.
    // -------------------------------------------------------------------------
-   wire        w_sd_sel       = (w_mmio_addr[27:16] == 12'h000);
+   wire        w_sd_sel       = (w_maddr[0][27:16] == 12'h000);
    wire        w_sd_write_DV  = w_mmio_write_DV & w_sd_sel;
    wire        w_sd_read_DV   = w_mmio_read_DV  & w_sd_sel;
    wire [63:0] w_sd_read_data;
@@ -976,7 +993,7 @@ module KlaussCPU #(
    mmio_if sd_bus();
    assign sd_bus.write_DV   = w_sd_write_DV;
    assign sd_bus.read_DV    = w_sd_read_DV;
-   assign sd_bus.addr       = w_mmio_addr;
+   assign sd_bus.addr       = w_maddr[0];
    assign sd_bus.write_data = w_mmio_write_data;
    assign sd_bus.byte_en    = w_mmio_byte_en;
    // CMD and DAT[3:0] are bidirectional (IOBUFs, inferred here); in SPI mode
@@ -1047,7 +1064,7 @@ module KlaussCPU #(
    // MMIO_MAP.md.  Program / erase below PROT_FLOOR (the bitstream) are
    // refused in hardware.  CCLK only reaches the pin through STARTUPE2.
    // -------------------------------------------------------------------------
-   wire        w_qspi_sel      = (w_mmio_addr[27:16] == 12'h012);
+   wire        w_qspi_sel      = (w_maddr[1][27:16] == 12'h012);
    wire        w_qspi_write_DV = w_mmio_write_DV & w_qspi_sel;
    wire        w_qspi_read_DV  = w_mmio_read_DV  & w_qspi_sel;
    wire [63:0] w_qspi_read_data;
@@ -1057,7 +1074,7 @@ module KlaussCPU #(
    mmio_if qspi_bus();
    assign qspi_bus.write_DV   = w_qspi_write_DV;
    assign qspi_bus.read_DV    = w_qspi_read_DV;
-   assign qspi_bus.addr       = w_mmio_addr;
+   assign qspi_bus.addr       = w_maddr[1];
    assign qspi_bus.write_data = w_mmio_write_data;
    assign qspi_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
@@ -1097,7 +1114,7 @@ module KlaussCPU #(
    // -------------------------------------------------------------------------
    // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
-   wire        w_aes_sel      = (w_mmio_addr[27:16] == 12'h00A);
+   wire        w_aes_sel      = (w_maddr[2][27:16] == 12'h00A);
    wire        w_aes_write_DV = w_mmio_write_DV & w_aes_sel;
    wire        w_aes_read_DV  = w_mmio_read_DV  & w_aes_sel;
    wire [63:0] w_aes_read_data;
@@ -1105,7 +1122,7 @@ module KlaussCPU #(
    mmio_if aes_bus();
    assign aes_bus.write_DV   = w_aes_write_DV;
    assign aes_bus.read_DV    = w_aes_read_DV;
-   assign aes_bus.addr       = w_mmio_addr;
+   assign aes_bus.addr       = w_maddr[2];
    assign aes_bus.write_data = w_mmio_write_data;
    assign aes_bus.byte_en    = w_mmio_byte_en;
    localparam bit EN_AES  = CRYPTO_AES_EN;
@@ -1130,7 +1147,7 @@ module KlaussCPU #(
    // -------------------------------------------------------------------------
    // Crypto SHA-256 — device id 0x00B. See CRYPTO_PLAN.md §6 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
-   wire        w_sha_sel      = (w_mmio_addr[27:16] == 12'h00B);
+   wire        w_sha_sel      = (w_maddr[2][27:16] == 12'h00B);
    wire        w_sha_write_DV = w_mmio_write_DV & w_sha_sel;
    wire        w_sha_read_DV  = w_mmio_read_DV  & w_sha_sel;
    wire [63:0] w_sha_read_data;
@@ -1138,7 +1155,7 @@ module KlaussCPU #(
    mmio_if sha_bus();
    assign sha_bus.write_DV   = w_sha_write_DV;
    assign sha_bus.read_DV    = w_sha_read_DV;
-   assign sha_bus.addr       = w_mmio_addr;
+   assign sha_bus.addr       = w_maddr[2];
    assign sha_bus.write_data = w_mmio_write_data;
    assign sha_bus.byte_en    = w_mmio_byte_en;
    generate if (EN_SHA) begin : g_sha
@@ -1157,7 +1174,7 @@ module KlaussCPU #(
    // -------------------------------------------------------------------------
    // Crypto TRNG — device id 0x00C. See CRYPTO_PLAN.md §7 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
-   wire        w_trng_sel      = (w_mmio_addr[27:16] == 12'h00C);
+   wire        w_trng_sel      = (w_maddr[2][27:16] == 12'h00C);
    wire        w_trng_write_DV = w_mmio_write_DV & w_trng_sel;
    wire        w_trng_read_DV  = w_mmio_read_DV  & w_trng_sel;
    wire [63:0] w_trng_read_data;
@@ -1168,7 +1185,7 @@ module KlaussCPU #(
    mmio_if trng_bus();
    assign trng_bus.write_DV   = w_trng_write_DV;
    assign trng_bus.read_DV    = w_trng_read_DV;
-   assign trng_bus.addr       = w_mmio_addr;        // slave uses mmio.addr[15:0]
+   assign trng_bus.addr       = w_maddr[2];        // slave uses mmio.addr[15:0]
    assign trng_bus.write_data = w_mmio_write_data;
    assign trng_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
@@ -1184,7 +1201,7 @@ module KlaussCPU #(
    // a second DDR master (master B) on mem_read_write's arbiter. See
    // BLITTER_IMPLEMENTATION_PLAN.md and blitter-fpga-handoff.md.
    // -------------------------------------------------------------------------
-   wire        w_blit_sel      = (w_mmio_addr[27:16] == 12'h00E);
+   wire        w_blit_sel      = (w_maddr[3][27:16] == 12'h00E);
    wire        w_blit_write_DV = w_mmio_write_DV & w_blit_sel;
    wire        w_blit_read_DV  = w_mmio_read_DV  & w_blit_sel;
    wire [63:0] w_blit_read_data;
@@ -1205,7 +1222,7 @@ module KlaussCPU #(
    mmio_if blit_bus();
    assign blit_bus.write_DV   = w_blit_write_DV;
    assign blit_bus.read_DV    = w_blit_read_DV;
-   assign blit_bus.addr       = w_mmio_addr;
+   assign blit_bus.addr       = w_maddr[3];
    assign blit_bus.write_data = w_mmio_write_data;
    assign blit_bus.byte_en    = w_mmio_byte_en;
    (* KEEP_HIERARCHY = "yes" *)
@@ -1233,7 +1250,7 @@ module KlaussCPU #(
    // pixel CE). Registers, palette and the vsync IRQ (source 3); see
    // vga_ctrl.sv and VGA_PLAN.md.
    // -------------------------------------------------------------------------
-   wire        w_vga_sel      = (w_mmio_addr[27:16] == 12'h011);
+   wire        w_vga_sel      = (w_maddr[4][27:16] == 12'h011);
    wire        w_vga_write_DV = w_mmio_write_DV & w_vga_sel;
    wire        w_vga_read_DV  = w_mmio_read_DV  & w_vga_sel;
    wire [63:0] w_vga_read_data;
@@ -1242,7 +1259,7 @@ module KlaussCPU #(
    mmio_if vga_bus();
    assign vga_bus.write_DV   = w_vga_write_DV;
    assign vga_bus.read_DV    = w_vga_read_DV;
-   assign vga_bus.addr       = w_mmio_addr;
+   assign vga_bus.addr       = w_maddr[4];
    assign vga_bus.write_data = w_mmio_write_data;
    assign vga_bus.byte_en    = w_mmio_byte_en;
    // DDR master D (scanout) wires to mem_read_write (instantiated below).
@@ -1285,7 +1302,7 @@ module KlaussCPU #(
    // P1 scope: no DDR access, no interrupts, no LiteEth.  See
    // AMP_CORE2_PLAN.md and core2_subsys.sv for the register map.
    // -------------------------------------------------------------------------
-   wire        w_c2_sel      = (w_mmio_addr[27:16] == 12'h010);
+   wire        w_c2_sel      = (w_maddr[5][27:16] == 12'h010);
    wire        w_c2_write_DV = w_mmio_write_DV & w_c2_sel;
    wire        w_c2_read_DV  = w_mmio_read_DV  & w_c2_sel;
    wire [63:0] w_c2_read_data;
@@ -1310,7 +1327,7 @@ module KlaussCPU #(
    mmio_if c2_bus();
    assign c2_bus.write_DV   = w_c2_write_DV;
    assign c2_bus.read_DV    = w_c2_read_DV;
-   assign c2_bus.addr       = w_mmio_addr;
+   assign c2_bus.addr       = w_maddr[5];
    assign c2_bus.write_data = w_mmio_write_data;
    assign c2_bus.byte_en    = w_mmio_byte_en;
    if (EN_CORE2) begin : g_core2
