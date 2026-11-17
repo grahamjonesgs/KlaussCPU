@@ -1601,6 +1601,28 @@ module pipeline_core
                    w_op[15:8] == 8'h00 && w_op[3:0] == 4'h0;
    wire  w_eiser = w_is_ei && irq_ok;
    logic id_eiser, ex_eiser, mem_eiser;
+   // HW_PERF_PLAN §9 item 4 (Fable review): an EI latched as an ordinary op
+   // (nothing pending at its IF -> ID latch) is converted to the serialized
+   // form while it is still in ID or EX if an interrupt becomes pending —
+   // in particular one an older MMIO store enables (INT_MASK, INT_VECn,
+   // INT2_EN, a device's IRQ enable), which writes its register only while
+   // that store is in MEM, after an EI 0-1 instructions behind it has been
+   // latched.  In EX: the younger op in ID is squashed and fetch halts (as
+   // behind a serializer: nothing younger than the EI is in flight), and
+   // ex_eiser / mem_eiser carry it to wb_rfch, which refetches EI+4, so the
+   // next boundary takes the interrupt there (CPU_ARCHITECTURE §13.1).
+   // In ID: it simply becomes a serializer (id_ser / id_eiser).
+   // Why EX is always in time: the enabling store holds MEM until its MMIO
+   // ack, >= 3 cycles after its DV (the strobe delayed 2 + the splitter's
+   // register); its register is written at the DV's first edge and every
+   // source reaches irq_ok within 2 more cycles (r_eth_irq for INT2_EN),
+   // irq_ok_q within 3.  The EI, younger, is in EX at the latest on the
+   // store's last MEM cycle, and stays there (or in ID / IF) until then.
+   // irq_ok_q: registered (timing; a source that was pending one cycle
+   // before is pending — at worst the conversion costs a refetch).
+   // (id_isei / ex_isei: a plain EI, not serialized for another reason)
+   logic irq_ok_q = 1'b0;
+   logic id_isei, ex_isei;
    logic id_use_rs1, id_use_rs2, id_use_rdd, id_fread, id_sp_rw;
 
    // ISA v3 short 1-word forms (ISA_V3_PROPOSAL.md §3): the immediate lives in
@@ -3611,6 +3633,12 @@ module pipeline_core
    // clocked block (pure combinational locals to synthesis — never FFs);
    // r_ifq_p1 registers if_req_dw+1 at fill issue for the completion update.
    logic       ev_disp, ev_slide, ev_rebase, ev_fill, ev_pcz;
+   logic       ev_eicv;          // blocking event: an EI converted to serialized this edge (§9 item 4)
+   always_ff @(posedge clk) irq_ok_q <= !rst && irq_ok;
+   wire ex_eicv = EN_DIEI && ex_valid && ex_isei && !ex_eiser && irq_ok_q && !irq_active &&
+                  !(DEBUG_EN && (dbg_active || dbg_stepping));
+   wire id_eicv = EN_DIEI && id_valid && id_isei && !id_eiser && irq_ok_q && !irq_active &&
+                  !(DEBUG_EN && (dbg_active || dbg_stepping));
    logic       ev_bp;   // a breakpoint was taken in ID this edge (debug)
    logic [1:0] ev_adv;
    logic [28:0] r_ifq_p1;
@@ -3683,6 +3711,7 @@ module pipeline_core
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
          id_eiser <= 1'b0; ex_eiser <= 1'b0; mem_eiser <= 1'b0;
+         id_isei <= 1'b0; ex_isei <= 1'b0;
          id_rs1 <= 4'd0; id_rd <= 4'd0;
          for (int i = 0; i < 16; i++) rf[i] <= 64'b0;
          ic_lv <= '0;  lp_v <= 1'b0;  // (§5)
@@ -3698,6 +3727,7 @@ module pipeline_core
          // registers and only ev_icinst is late)
          ev_btic = 1'b0; ev_btarm = 1'b0; ev_nx = 1'b0; ev_ovr = 1'b0; ev_icinst = 1'b0; ev_icinst_idx = IC32 ? li_idx : '0;
          ev_mload = 1'b0;
+         ev_eicv = 1'b0;
          // (review M1: the op in ID — its line replaced by the last edge's
          // install; the IF -> ID latch below overrides)
          if (IC32) id_bunc <= id_unc_now;
@@ -4832,7 +4862,7 @@ module pipeline_core
                      end
                end
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
-               mem_eiser  <= ex_eiser;
+               mem_eiser  <= ex_eiser || ex_eicv;   // (§9 item 4: converted in EX)
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
                mem_ptk    <= ex_ptk;  mem_pc_next <= ex_pc_next;
                mem_succ   <= (ex_d.uop == U_CALL) ? exo_target : ex_pc_next;
@@ -4934,6 +4964,15 @@ module pipeline_core
                   id_valid   <= 1'b0;
                   ex_valid   <= 1'b0;
                   fetch_halt <= 1'b0;   // RESET resumes here
+               end else if (ex_eicv) begin
+                  // §9 item 4: the EI leaves EX serialized (mem_eiser above);
+                  // the ID op behind it is dropped, nothing dispatches, fetch
+                  // halts until its WB refetch at EI+4 (pc is rewritten there)
+                  ev_eicv     = 1'b1;
+                  ev_ovr      = 1'b1;
+                  id_valid   <= 1'b0;
+                  ex_valid   <= 1'b0;
+                  fetch_halt <= 1'b1;
                end else if (raw_stall) begin
                   ex_valid <= 1'b0;     // bubble; hold ID/pc
                end else begin
@@ -4954,6 +4993,7 @@ module pipeline_core
                   ex_alu_sub <= (dec.sub == 4'd1 || dec.sub == 4'd3 || dec.sub == 4'd7);
                   ex_alu_cf  <= (dec.sub == 4'd2 || dec.sub == 4'd3);
                   ex_eiser   <= id_eiser;
+                  ex_isei    <= id_isei;
                   ex_fwd_f   <= dec.fread && ex_f_fwdable;   // M6b flag forward
                   mul_cnt    <= 2'd0;
                   if (DEBUG_EN && id_valid && id_bp) begin
@@ -5036,6 +5076,7 @@ module pipeline_core
                      id_b_sext <= w_dec.sgn;
                      id_ser    <= w_decf.serialize || w_xser || w_eiser;
                      id_eiser  <= w_eiser;
+                     id_isei   <= w_is_ei && !w_decf.serialize && !w_xser;
                      id_ras_ret <= EN_RAS && (w_decf.uop == U_RET || w_decf.uop == U_LEAVERET);
                      id_bp_ctr  <= pht[pc[BP_IDXW+1:2]];
                      id_rpend   <= 1'b1;
@@ -5104,6 +5145,24 @@ module pipeline_core
                   if (DEBUG_EN) dbg_active <= 1'b0;
                end
             end
+         end
+
+         // §9 item 4: an EI held in EX (MEM busy — the enabling store waiting
+         // for its MMIO ack — or EX busy) is converted in place: it becomes
+         // serialized, the ID op behind it is dropped and fetch halts.  An
+         // EI waiting in ID becomes a serializer.  (The squashes below are
+         // older and win; one that kills the EI clears / sets fetch_halt
+         // itself, and an SMC squash of the ID op alone keeps it, ev_eicv.)
+         if (ex_eicv && (mem_busy || ex_busy)) begin
+            ev_eicv     = 1'b1;
+            ev_ovr      = 1'b1;
+            ex_eiser   <= 1'b1;
+            id_valid   <= 1'b0;
+            fetch_halt <= 1'b1;
+         end
+         if (id_eicv && (mem_busy || ex_busy || raw_stall)) begin
+            id_ser     <= 1'b1;
+            id_eiser   <= 1'b1;
          end
 
          // ---------------- ISA v3 B: taken fused branch (MEM redirect) ------
@@ -5253,7 +5312,7 @@ module pipeline_core
             // squashed here and re-arms fetch_halt when it re-dispatches.
             // (§3.3: a misaligned op that entered MEM this edge is older
             // than the squashed ID op — it parks, so fetch stays halted.)
-            fetch_halt <= ev_misal && !sq_ex;
+            fetch_halt <= (ev_misal || ev_eicv) && !sq_ex;
          end
 
          // SMC: an op latched into ID this edge from a now-stale IFB slot is

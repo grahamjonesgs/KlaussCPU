@@ -63,8 +63,8 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    logic         irq_ack;
    logic [1:0]   irq_ack_sel;
    logic [3:0]   int_mask_o;
-   logic         mask_wr = 0;
-   logic [3:0]   mask_wdata = '0;
+   logic         mask_wr;
+   logic [3:0]   mask_wdata;
    logic         ret_valid, ret_wr;
    logic [31:0]  ret_pc, ret_op, ret_wr_addr;
    logic [7:0]   ret_wr_be;
@@ -188,10 +188,6 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
             uart_s = {uart_s, string'(wd[7:0])};
             uart_n++;
          end
-         if (a[27:16] == 12'h00F && (a[15:0] & 16'hFFF8) == 16'h0000) begin
-            mask_wr    <= 1'b1;
-            mask_wdata <= wd[3:0];
-         end
          // a non-coherent writer (DMA / core 2): 0xF0FE_0000 = the address,
          // 0xF0FE_0008 = a dword written there behind the core's back (no
          // I-cache snoop: the core sees an MMIO store)
@@ -239,7 +235,6 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    always @(posedge clk) begin
       m_ready_q <= 1'b0;
       m_line_v <= 1'b0;
-      mask_wr <= 1'b0;
       mmio_seen <= !rst && m_ready && dv_mmio;
       if (!rst && mmio_hold) n_mmio_hold++;
       if (!rst && ld_pend) begin
@@ -298,6 +293,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          end
       end
    end
+
+   // INT_MASK (0xF00F_0000): written as in the SoC (KlaussCPU w_pip_mask_wr)
+   // — on the store's DV, while it is still in MEM waiting for its ack, not
+   // after it has completed (HW_PERF_PLAN §9 item 4: the precise-EI window)
+   assign mask_wr    = !rst && m_write_DV && m_addr[31:28] == 4'hF && m_addr[27:16] == 12'h00F &&
+                       (m_addr[15:0] & 16'hFFF8) == 16'h0000;
+   assign mask_wdata = m_wdata[3:0];
 
    // ---------------- timer IRQ model (as tb_pipeline_isa) -----------------
    int     irq_period = 0;

@@ -3129,6 +3129,43 @@ def ei_precise_take():
 
 
 @test
+def ei_enable_store():
+    """HW_PERF_PLAN §9 item 4 (Fable review): the INT_MASK store that
+    unmasks a pending timer IRQ 0, 1 or 2 instructions ahead of the EI
+    (warm code: the sequence runs twice through one subroutine, pass 1
+    storing 0).  The IRQ is taken right after the EI: one entry, frame PC =
+    EI + 4 (it used to be latched as an ordinary op before the mask
+    changed, and the DI behind it won)"""
+    out = []
+    for k in (0, 1, 2):
+        for pad in range(4):
+            for lat in (1, 3):
+                a = Asm()
+                a.setr(1, 0x08000000); a.setsp(1)
+                a.di(9)
+                a.set_int_mask(0)
+                a.setr(9, 150)
+                a.label('w'); a.dec(9); a.fbr('ne', 9, 0, 'w', imm=True)   # the timer pends
+                a.setr(5, 0xF00F0000); a.setr(1, 1)
+                a.setr(7, 0); a.call('seq')
+                a.setr(7, 1); a.call('seq')
+                a.halt()
+                for _ in range(pad):
+                    a.nop()
+                a.label('seq')
+                a.st(64, 7, 5)
+                for _ in range(k):
+                    a.nop()
+                a.label('ei'); a.ei(1)
+                a.di(2)
+                a.ret()
+                _irq_logger(a)
+                out.append((a, {'end': 'park', 'kind': '0', 'r2': 1, m(ELOG): 1, m(ELOG + 8): a.labels['ei'] + 4},
+                            ['+NO_IRQ_HANDLER', '+IRQ_PERIOD=400', f'+LAT={lat}']))
+    return out
+
+
+@test
 def ei_nothing_pending():
     """EI; DI with no interrupt pending (masked): nothing taken, EI is not
     serialized (same cycles as before precise EI)"""
