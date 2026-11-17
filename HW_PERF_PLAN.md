@@ -48,11 +48,28 @@ all_tests 31/32, board-check 16/16 (SRAM and flash boot), SD DMA checks
 clean; clang deflate / cxx-hello 30.18 / 77.67 s user+sys with the PGO /
 ThinLTO clang, unchanged vs its 30.2 / 77.5 s baseline.
 
-Next: **waiting on Graham.** On 2026-11-16 (relayed by the runtime
-session) Graham ended the clang-speed work after one last software item,
-a PGO / ThinLTO build of the native clang; there is no emulator re-rank
-and no further hardware item is queued. Graham decides the next RTL work.
-For reference, the current baseline (L2 + call-graph-ordered clang):
+Then (2026-11-17, Graham approved all of them): §9, the Fable 5.2 RTL
+review's confirmed findings, branch `fable` — reviewed, built, released
+2026-11-17 as `fable_release_5d61392.bit` (master fast-forwarded to
+`fable`; QSPI written, rollback entry in ~/.cache/kbuild/rollback/README.txt).
+Board: all_tests 31/31, board-check 16/16 (SRAM and flash boot), SD DMA
+checks clean, aliasjit PASS; clang deflate / cxx-hello 30.24 / 77.82 s
+user+sys, unchanged.
+
+Next (queued by Graham, 2026-11-17): **a timing-hardening pass.** Thin
+slack is a development cost, not a reliability one (sign-off already
+covers worst-case PVT and jitter): placement noise of about ±0.1 ns and
+BRAM at 126 / 135 tiles keep pushing untouched paths to the edge, and
+each of the last three rounds needed extra builds. The pass collects the
+worst paths from the last ~15 builds (tmg, sddma, fixes, fable) and
+restructures the recurring families (`ifb_dw` → `id_ser` / `id_privop`;
+`ex_a` → the compare / EA logic; the pipeline ready → MEM → `m_addr`;
+the L2's read data → `o_mem_read_data`; the multiplier's CE; `mem_d.uop`
+→ `ex_d`), aiming at a standing tier 1 margin of about +0.2 ns on two
+builds, with cycle counts identical. No other hardware item is queued;
+Graham decides the next RTL work after it. (The clang-speed work ended
+on 2026-11-16 after the PGO / ThinLTO native clang.) For reference, the
+current baseline (L2 + call-graph-ordered clang):
 I-fetch 37–51 % of cycles, D-cache stalls 30–38 %, L2 I-side hit rate
 37–44 %.
 

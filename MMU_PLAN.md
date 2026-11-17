@@ -1177,6 +1177,21 @@ base in EX, with the MEM replay above".
   alias. Code written through a *different* mapping (kernel writing user
   text) needs ICACHE_INV, which is what Linux's `flush_icache_*` hooks
   already provide.
+  **Alias stores in practice (2026-11-17).** A store that leaves MEM
+  speculatively posted (`EN_ST1`) is checked the next cycle by
+  `st_post_ok`, which includes the PA tag-shadow test `!sn_code`; a store
+  to resident code fails it, and `sq_spec` squashes everything younger
+  and refetches from the (already snooped) I-cache, so an alias store
+  is caught by PA. A store that cannot post speculatively (misaligned,
+  behind a full store queue, behind an outstanding load or a hit-miss)
+  falls back to the completion-time `smc_st` squash, which compares VAs
+  only, so in principle an alias write to code already in the
+  IFB / NLB / ID / EX can run stale once. That was not observed on the
+  board in four shapes (runtime `linux/userland/tests/icache/aliasjit.c`:
+  call-through, fall-through at gaps 0–7, and a triple store). Any taken
+  control transfer between the write and the code also refetches. The
+  rule stands: ICACHE_INV / RANGE_IINV (Linux, and `cacheflush(2)` /
+  `__clear_cache` for user JIT) is architecturally required.
 - **Frame pushes are not translated.** With `TE = 1` the kernel SP must be
   in the direct segment. Otherwise the core takes a double fault and parks
   with `park_kind` 6. Linux: no `VMAP_STACK`.
