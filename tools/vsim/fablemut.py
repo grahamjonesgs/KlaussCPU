@@ -17,6 +17,7 @@ ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 WORK = os.path.join(os.environ.get('VSIM_WORK', '/tmp/vsim'), 'fablemut')
 TOP, PC, BL = 'sources_1/new/KlaussCPU.sv', 'sources_1/new/pipeline_core.sv', 'sources_1/new/blitter_dma.sv'
 
+TPG_SUITE = [['test', 'tx_*', 'tlb_*'], ['tlbpage'], ['tlbdiff'], ['permfuzz', '--seeds', '6', '--fetch', '--remap']]
 EI_SUITE = [['test', 'ei_enable_store'], ['socei', '--srcs', 'mask', 'vec0', 'int2en', '--no-loop', '-j', '4']]
 
 # (name, what it breaks, file, suite (list of run.py argument lists), old, new)
@@ -47,6 +48,14 @@ MUTS = [
      "mem_eiser  <= ex_eiser || ex_eicv;", "mem_eiser  <= ex_eiser;"),
     ('ei_regok', 'the conversion takes the combinational irq_ok\'s previous value from a stale register', PC,
      EI_SUITE, "always_ff @(posedge clk) irq_ok_q <= !rst && irq_ok;", "always_ff @(posedge clk) irq_ok_q <= 1'b0;"),
+    # ---------------- §9 timing: the VA page by carry select ----------------
+    ('tpg_sel', 'the carry select picks the wrong sum (the VA page off by one when the offset carries)', PC,
+     TPG_SUITE, "wire [15:0] ex_tpg  = ex_tc ? ex_tpg1 : ex_tpg0;", "wire [15:0] ex_tpg  = ex_tc ? ex_tpg0 : ex_tpg1;"),
+    # (the same with the new equivalence assertion removed: the existing
+    # TLB tests must see it through behaviour / the CAM check alone)
+    ('tpg_sel_na', 'the same, without its equivalence assertion', PC, TPG_SUITE,
+     "wire [15:0] ex_tpg  = ex_tc ? ex_tpg1 : ex_tpg0;", "wire [15:0] ex_tpg  = ex_tc ? ex_tpg0 : ex_tpg1;",
+     "         assert (tva == (ex_mph ? ex_ea_q[31:16] : exo_eaddr[31:16]))", "         assert (1'b1)"),
     # ---------------- item 6: the loader ----------------
     ('ld_mixed', "the loader's nibbles as blocking writes next to the 'X' branch's NBA again (item 6)", TOP,
      [['socbreak', 'load_split5']],
@@ -63,13 +72,15 @@ def stage(name):
 
 
 def run_mut(m, keep=False):
-    name, what, f, suite, old, new = m
+    name, what, f, suite = m[:4]
     d = stage(name)
     p = os.path.join(d, 'KlaussCPU.srcs', f)
     t = open(p).read()
-    if t.count(old) != 1:
-        return name, 'BAD', f'pattern found {t.count(old)} times'
-    open(p, 'w').write(t.replace(old, new))
+    for old, new in zip(m[4::2], m[5::2]):     # (one or more textual changes)
+        if t.count(old) != 1:
+            return name, 'BAD', f'pattern found {t.count(old)} times'
+        t = t.replace(old, new)
+    open(p, 'w').write(t)
     env = dict(os.environ)
     env.update(VSIM_WORK=os.path.join(d, 'vw'), VSIM_GIT=ROOT, PYTHONDONTWRITEBYTECODE='1')
     killed, first = False, '?'

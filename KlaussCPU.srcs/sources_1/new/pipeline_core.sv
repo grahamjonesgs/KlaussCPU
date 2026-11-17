@@ -2613,17 +2613,31 @@ module pipeline_core
    // EA's page from the dispatch-time operand copies, no adder in front);
    // in a MEMGET32 / LEAVERET's 2nd cycle, ex_ea_q (its next page if it
    // crosses one; the CAM's copies are stepped alike).
-   wire [31:0] tva    = ex_mph ? ex_ea_q : exo_eaddr;
-   wire        t_useg = !tva[31];
-   wire        t_kseg = tva[31:27] == 5'b10000;                 // 0x8000_0000-0x87FF_FFFF
-   wire        t_kmap = tva[31:30] == 2'b11 && tva[31:28] != 4'hF;
+   // (HW_PERF_PLAN §9 timing) Only the VA's page, [31:16], is read here.  In
+   // the op's first cycle it is taken from the dispatch-time operands, as
+   // the CAM's key is (§11.9): ex_ta[31:16] + ex_tb[31:16] + the page
+   // offset's carry ex_tc, as a carry select — two 16-bit sums from
+   // registers, picked by the low half's carry — instead of the top of
+   // exo_eaddr's 32-bit carry chain (ex_a -> the EA adder -> the segment
+   // decode -> t_pahi -> t1_pahi / mem_pa2hi / mem_iaddr was fable_b3's
+   // worst family, +0.011).  = exo_eaddr[31:16] for every memory op in its
+   // first EX cycle (asserted below, with the old form).
+   wire [15:0] ex_tpg0 = ex_ta[31:16] + ex_tb[31:16];
+   wire [15:0] ex_tpg1 = ex_ta[31:16] + ex_tb[31:16] + 16'd1;
+   wire [15:0] ex_tpg  = ex_tc ? ex_tpg1 : ex_tpg0;
+   wire [15:0] tva     = ex_mph ? ex_ea_q[31:16] : ex_tpg;     // the VA's [31:16]
+   wire        t_useg = !tva[15];
+   wire        t_kseg = tva[15:11] == 5'b10000;                 // 0x8000_0000-0x87FF_FFFF
+   wire        t_kmap = tva[15:14] == 2'b11 && tva[15:12] != 4'hF;
    wire        t_tlbs = t_useg || t_kmap;
-   wire        t_seg  = (tva[31:30] == 2'b10 && !t_kseg) || (umode && !t_useg);
+   wire        t_seg  = (tva[15:14] == 2'b10 && !t_kseg) || (umode && !t_useg);
    wire        t_miss = t_tlbs && !tlb_d_hit;
    wire        t_perm = t_tlbs && tlb_d_hit && !tlb_d_pok;
    wire        t_dn   = t_seg || (t_tlbs && !tlb_d_pok);     // = t_seg || t_miss || t_perm
-   wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[26:16]} : tva[31:16];
-   assign tlb_d_vpn = tva[31:16];
+   wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[10:0]} : tva;
+   // (sim only: mmu_tlb's exact-match check — from the EA adder, the old
+   // form, so it checks the CAM independently of the select above)
+   assign tlb_d_vpn = ex_mph ? ex_ea_q[31:16] : exo_eaddr[31:16];
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
    logic [15:0] t1_pahi;
    wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
@@ -2978,7 +2992,7 @@ module pipeline_core
    // (timing, §11.9: written as one select of the TLB's PFN over a value
    // that does not depend on it, = (EN_TLB && te) ? {t_pahi, VA[15:0]} : exo_iaddr)
    wire        h_tsel     = EN_TLB && te && t_tlbs;
-   wire [15:0] h_alt      = (EN_TLB && te) ? (t_kseg ? {5'b0, tva[26:16]} : tva[31:16]) : exo_iaddr[31:16];
+   wire [15:0] h_alt      = (EN_TLB && te) ? (t_kseg ? {5'b0, tva[10:0]} : tva) : exo_iaddr[31:16];
    // (§11.9 timing: the page offset — the hit pipe's array index — from the
    // operands' own 16-bit add, ex_tlo, off the EA's uop mux; = exo_iaddr's
    // for the hit-pipe loads, asserted; [2:0] are unused there)
@@ -4896,7 +4910,7 @@ module pipeline_core
                mem_iaddr  <= {(EN_TLB && te && !ex_x3 && t_tlbs) ? {5'b0, tlb_d_pfn}
                              : !(EN_TLB && te) ? exo_iaddr[31:16]
                              : ex_x3 ? t1_pahi
-                             : t_kseg ? {5'b0, tva[26:16]} : tva[31:16],
+                             : t_kseg ? {5'b0, tva[10:0]} : tva,
                               exo_iaddr[15:0]};
                sn_pra     <= exo_iaddr[IC_SNW+4:5];
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
@@ -5685,6 +5699,11 @@ module pipeline_core
          assert (((ex_ta + ex_tb) >> 16) == {16'd0, exo_eaddr[31:16]})
             else $fatal(1, "ex_ta + ex_tb %h + %h != EA %h (pc %h uop %0d)", ex_ta, ex_tb,
                         exo_eaddr, ex_pc, ex_d.uop);
+      // ... and the carry-select page (§9 timing) is the old form, the VA's
+      // page from the EA adder (the translation reads it for memory ops)
+      always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_memop)
+         assert (tva == (ex_mph ? ex_ea_q[31:16] : exo_eaddr[31:16]))
+            else $fatal(1, "VA page select %h != EA %h (pc %h uop %0d)", tva, exo_eaddr, ex_pc, ex_d.uop);
       // ... and, for a hit-pipe load, its [31:3] (STLF's operand compares)
       always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld)
          assert ((32'(ex_ta + ex_tb) >> 3) == (exo_iaddr >> 3) && ex_tlo3[2:0] == exo_eaddr[2:0])
