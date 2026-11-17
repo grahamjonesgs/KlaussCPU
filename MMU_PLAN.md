@@ -1719,7 +1719,15 @@ at c15's carry chain.
   `t1_*`) and, with the CAM copies and `ex_ea_q` stepped to the next page,
   its second page in the second — one extra cycle instead of two. The
   segment checks read the EA adder in the first cycle and `ex_ea_q` in the
-  second (`tva`). Faults, `mem_iaddr`, `mem_pa2hi` and the §7.1 fault slot
+  second (`tva`). (HW_PERF_PLAN §9 timing, 2026-11-17: `tva` is now only
+  the VA's `[31:16]`, and in the first cycle it is
+  `ex_ta[31:16] + ex_tb[31:16] + c15` as a carry select — two 16-bit sums
+  of the dispatch-time operands, picked by the page offset's carry —
+  instead of the top of the 32-bit EA adder: `ex_a` → the EA adder → the
+  segment decode / the `t_pahi` select → `t1_pahi` / `mem_pa2hi` /
+  `mem_iaddr` was the worst path family after §9's fixes.  Asserted equal
+  to the EA adder's page for every memory op; the sim-only exact CAM check
+  keeps the EA adder's form.) Faults, `mem_iaddr`, `mem_pa2hi` and the §7.1 fault slot
   are as before, except that only `mem_xsq` (written as one select of the
   TLB's `pok` over CAM-independent terms) is decided at the EX → MEM edge:
   which dword faulted and whether the fault is a TLB miss / TLB-related

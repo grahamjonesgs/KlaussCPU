@@ -3084,13 +3084,61 @@ b3's worst: `ex_a` → the next-page EA → `mem_pa2hi` / `t1_pahi` (+0.011,
 +0.056; MMU §11.9's page-crossing path, 15 levels), the TLB's `q_a`
 (+0.049), the multiplier's CE (+0.058) — none in §9's logic.
 
-**Tier 1 meets (+0.011 / +0.024) but not the +0.03 margin target**, and
-that was the third build, so the work stopped there (no alt-place).  The
-candidate for an RTL restructure is the next-page EA → `mem_pa2hi` /
-`t1_pahi` family (registering the page-crossing PA one cycle earlier, as
-§11.9 did for `ex_xpg_q`).  Bitstream `~/.cache/kbuild/fable_e2523dd.bit`,
-md5 `9223823d22124b372878c66e3356a5ea` (build dir
-`~/.cache/kbuild/fable_b3`).  Not run on the board.
+b3 met tier 1 (+0.011 / +0.024) but not the +0.03 margin target; the
+work stopped there (no alt-place), and Graham approved a timing fix and a
+fourth build (`fable_e2523dd.bit`, md5
+`9223823d22124b372878c66e3356a5ea`, is kept; its build dir is not).
+
+### §9 timing: the VA page for the translation by carry select
+
+b3's worst family: `ex_a` → the 32-bit EA adder (`exo_eaddr`, 8 CARRY4)
+→ the segment decode (`t_tlbs`, `t_kseg`) and the `t_pahi` select →
+`t1_pahi` / `mem_pa2hi` / `mem_iaddr` (15 levels).  The translation reads
+only the VA's `[31:16]` (`tva`, now 16 bits).  In the op's first EX cycle
+it is now `ex_ta[31:16] + ex_tb[31:16] + ex_tc` as a carry select: two
+16-bit sums of the dispatch-time operands (registers), picked by the page
+offset's carry `ex_tc` — the operands MMU_PLAN §11.9 already gave the
+CAM's key.  `tva` feeds the segment checks, `t_pahi` (so `t1_pahi`,
+`mem_pa2hi`), `mem_iaddr`'s TE = 1 page and the hit pipe's `h_alt`.  The
+second-page cycle still reads `ex_ea_q`.  `(ex_ta + ex_tb)[31:16]` =
+`exo_eaddr[31:16]` for every memory op in its first cycle was already
+asserted (§11.9); a new assertion checks `tva` against the old form
+(`exo_eaddr[31:16]`, or `ex_ea_q[31:16]` in the 2nd cycle) for every
+memory op in EX, and mmu_tlb's sim-only exact CAM check keeps the EA
+adder's form, so it checks the CAM independently.  Logically the same:
+no cycle changes (below).  The TLB's `q_a` (+0.049 in b3: D-cache read
+data → forwarding → the CAM key copies) and the multiplier's CE (+0.058:
+WB forwarding into the multiplier) were different causes and were left
+alone.
+
+- **Mutations** (`fablemut.py`): `tpg_sel` (the carry select swapped:
+  the page one off whenever the offset carries) — killed by the new
+  assertion (`tx_*`); `tpg_sel_na` (the same, the new assertion removed) —
+  killed by behaviour, `tests.py tlb_data_segments` (wrong segment /
+  translation: wrong results and a timeout).
+- **Regression** on `56e59df` vs `d612472`: core (`l2_regress.sh core`:
+  five `test` configurations, `diff +TRACECYC` 169,092 = 169,092,
+  `--irq` 107,709 = 107,709, excdiff, mpudiff, tlbdiff, tlbpage, dcbzdiff,
+  dmtest, btfuzz, permfuzz 240 + 120 + 10 tb_soc + self-check), `fwdfuzz`
+  0 of 152 differing, `tecost` 60 seeds (TE = 1 cycles: supervisor 89,194,
+  user 92,770 — identical to `d612472`), `l2_regress.sh` soc36 (with
+  `socreset` / `socbreak` / `socsload` / `socei` as the smoke run) / soc8 /
+  socvar: 0 failing, socdiff traces and PIPE_RUN cycles identical in
+  every configuration (61,698 / 24,645 at MIGLAT 36; 42,251 / 21,338 at 8;
+  as before for L2 off, 8 ways, jittered and slow MIG).
+
+### §9 build 4
+
+| Build | Commit | Change | Tier 1 WNS / WHS | LUTs | FFs |
+|---|---|---|---|---|---|
+| **`fable_b4`** | **`56e59df`** | **+ the carry-select VA page** | **+0.122 / +0.019, met** | **40,856** | **27,348** |
+
+b4's worst paths: `m_addr` → `qspi_ctrl`'s divider CE (+0.122), `mem_d`
+→ the I-cache tag shadow's address (+0.131), the multiplier (+0.157); the
+EA → translation family is no longer among them.  **Bitstream
+`~/.cache/kbuild/fable_56e59df.bit`, md5
+`1a6864dba6d0ef13178313e9d832676c`** (build dir `~/.cache/kbuild/fable_b4`).
+Not run on the board.
 
 ## CPU_FEATURES additions
 
@@ -3267,5 +3315,7 @@ Decisions taken while implementing the frozen text above:
   variable; `permfuzz` adopted; `socreset` / `socbreak` / `socsload` /
   `socei` / `fablemut.py`.  Cycle-identical to `d612472`.  `e2523dd`,
   standard flow tier 1 +0.011 / +0.024 (met, below the +0.03 target after
-  three builds), `~/.cache/kbuild/fable_e2523dd.bit`.  Not yet run on the
-  board.
+  three builds), `~/.cache/kbuild/fable_e2523dd.bit`.  Then the VA page
+  for the translation by carry select (§9 timing): `56e59df`, tier 1
+  +0.122 / +0.019, `~/.cache/kbuild/fable_56e59df.bit`.  Not yet run on
+  the board.
