@@ -3133,10 +3133,13 @@ module pipeline_core
                                        (mem_valid && mem_port_wr && mem_iaddr[31:5] == exo_iaddr[31:5]));
    // (HW_PERF_PLAN §10 timing: a hit-pipe load's MMIO test reads the VA
    // page's carry-select sum ex_tpg (registers + one select), = the EA's
-   // [31:16] for every ex_hld op — none is a page-crossing op, so ex_mph is
-   // 0 — instead of the 32-bit EA adder: ex_var2 -> the adder ->
-   // exo_iaddr[28] -> h_base -> mem_h1, build 2 +0.153.  Asserted.)
-   wire        ex_hmmio   = ex_tpg[15:12] == 4'hF;      // = exo_iaddr[31:28] == F for ex_hld
+   // [31:16] for every ex_hld op in its first cycle — none is a page-
+   // crossing op, so without the MPU ex_mph is 0 for them — instead of the
+   // 32-bit EA adder: ex_var2 -> the adder -> exo_iaddr[28] -> h_base ->
+   // mem_h1, build 2 +0.153.  With EN_MPU an MPU hold's 2nd cycle (ex_mph)
+   // keeps the old form.  Asserted.)
+   wire        ex_hmmio   = (EN_MPU && ex_mph) ? (exo_iaddr[31:28] == 4'hF)
+                                               : (ex_tpg[15:12] == 4'hF);   // = exo_iaddr[31:28] == F
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && !ex_hmmio &&
                             !(DEBUG_EN && dbg_mx);
    wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
@@ -5923,7 +5926,7 @@ module pipeline_core
                         exo_iaddr, ex_pc);
       // (§10) ... and the hit-pipe loads' MMIO test from ex_tpg
       always_ff @(posedge clk) if (ce && !rst && ex_valid && ex_hld && !$isunknown(exo_iaddr))
-         assert (!ex_mph && ex_hmmio == (exo_iaddr[31:28] == 4'hF))
+         assert ((EN_MPU || !ex_mph) && ex_hmmio == (exo_iaddr[31:28] == 4'hF))
             else $fatal(1, "ex_hmmio != (exo_iaddr[31:28] == F) (pc %h)", ex_pc);
       // ... and f_pgeq is the page compare
       // (4-state sims: ex_ta / ex_tb / ex_tc / mem_eaddr are unreset, skip while X)

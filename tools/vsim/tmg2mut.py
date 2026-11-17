@@ -36,10 +36,11 @@ MUTS = [
      "            2'b00: rb_buf[191:128] = app_rd_data;\n            2'b01: rb_buf[ 63:  0] = app_rd_data;",
      "            2'b00: rb_buf[ 63:  0] = app_rd_data;\n            2'b01: rb_buf[191:128] = app_rd_data;",
      "        assert (rb_buf == rb_buf_ref) else", "        assert (1'b1) else"),
-    ('l2_half_na', "a narrow answer's half swapped (no assertion)", L2, L2S,
+    # (a narrow, 128-bit DDR answer: no master of the A7 configuration asks for
+    # one — the I-cache's 32 B lines read wide — so only the assertion sees it)
+    ('l2_half', "a narrow answer's half swapped", L2, L2S,
      "wire [127:0] rb_half = rb_h ? rb_buf[127:0] : rb_buf[255:128];",
-     "wire [127:0] rb_half = rb_h ? rb_buf[255:128] : rb_buf[127:0];",
-     "        assert (rb_half == rb_buf_ref[255 - 128*rb_h -: 128]) else", "        assert (1'b1) else"),
+     "wire [127:0] rb_half = rb_h ? rb_buf[255:128] : rb_buf[127:0];"),
     # ---------------- WB forward: the load / MUL value late ----------------
     ('wbl_mul', "a direct MUL's WB value taken from the port extraction", PC, FWD,
      "      wb_ldval = (EN_MUL2 && wb_mdir) ? mul_r2", "      wb_ldval = (EN_MUL2 && wb_mdir && 1'b0) ? mul_r2"),
@@ -117,10 +118,17 @@ MUTS = [
     ('wcnt', "TLB_WCNT counts by 2", PC, [['test', 'wk_*'], ['socwalk']],
      "wire [47:0] wcnt_p1 = wcnt + 48'd1;", "wire [47:0] wcnt_p1 = wcnt + 48'd2;"),
     ('hmmio', "the hit pipe's MMIO test on the wrong nibble value", PC, [['test']],
-     "wire        ex_hmmio   = ex_tpg[15:12] == 4'hF;", "wire        ex_hmmio   = ex_tpg[15:12] == 4'hE;"),
+     ": (ex_tpg[15:12] == 4'hF);   // = exo_iaddr[31:28] == F", ": (ex_tpg[15:12] == 4'hE);   // = exo_iaddr[31:28] == F"),
     ('hmmio_na', "the same, without its assertion", PC, [['socmmio', '--base', BASE], ['test', 'mmio_*']],
-     "wire        ex_hmmio   = ex_tpg[15:12] == 4'hF;", "wire        ex_hmmio   = ex_tpg[15:12] == 4'hE;",
-     "         assert (!ex_mph && ex_hmmio == (exo_iaddr[31:28] == 4'hF))", "         assert (1'b1)"),
+     ": (ex_tpg[15:12] == 4'hF);   // = exo_iaddr[31:28] == F", ": (ex_tpg[15:12] == 4'hE);   // = exo_iaddr[31:28] == F",
+     "         assert ((EN_MPU || !ex_mph) && ex_hmmio == (exo_iaddr[31:28] == 4'hF))", "         assert (1'b1)"),
+    # ---------------- round 3 ----------------
+    ('fkey', "the fetch-CAM key copies not loaded by a micro-ITLB miss", PC, TLB,
+     "for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end", ""),
+    ('fkey_na', "the same, without the copies' assertions", PC, TLB + [['permfuzz', '--seeds', '6', '--fetch', '--remap']],
+     "for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end", "",
+     "assert (f_vpnc[q] == f_vpn && f_asidc[q] == f_asid) else", "assert (1'b1) else",
+     "assert (fm == f_match(f_vpn, f_asid)) else", "assert (1'b1) else"),
 ]
 
 def stage(name):
