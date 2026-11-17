@@ -41,8 +41,6 @@ MUTS = [
     # ---------------- item 4: precise EI ----------------
     ('ei_none', 'no conversion in EX (item 4)', PC, EI_SUITE,
      "wire ex_eicv = EN_DIEI && ex_valid", "wire ex_eicv = 1'b0 && ex_valid"),
-    ('ei_hold', 'no conversion of an EI held in EX (MEM busy: the store waits for its ack)', PC, EI_SUITE,
-     "if (ex_eicv && (mem_busy || ex_busy)) begin", "if (1'b0) begin"),
     ('ei_disp', 'a converted EI leaves EX without the ID op squashed / fetch halted', PC, EI_SUITE,
      "               end else if (ex_eicv) begin\n", "               end else if (1'b0) begin\n"),
     ('ei_rfch', 'a converted EI leaving EX is not carried to wb_rfch', PC, EI_SUITE,

@@ -109,7 +109,7 @@ sec_core() {
    t permfuzz X=1 -- $R permfuzz --seeds 40 --fetch --remap
    t permfuzz_walk X=1 -- $R permfuzz --seeds 20 --fetch --remap --walk --irq
    t permfuzz_soc X=1 -- $R permfuzz --seeds 10 --soc --walk --fetch
-   t permfuzz_self X=1 -- $R permfuzz --selfcheck --seeds 6
+   t permfuzz_self X=1 -- $R permfuzz --selfcheck --seeds 12
 }
 
 secs=("$@")

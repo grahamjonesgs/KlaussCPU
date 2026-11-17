@@ -1607,17 +1607,19 @@ module pipeline_core
    // in particular one an older MMIO store enables (INT_MASK, INT_VECn,
    // INT2_EN, a device's IRQ enable), which writes its register only while
    // that store is in MEM, after an EI 0-1 instructions behind it has been
-   // latched.  In EX: the younger op in ID is squashed and fetch halts (as
-   // behind a serializer: nothing younger than the EI is in flight), and
-   // ex_eiser / mem_eiser carry it to wb_rfch, which refetches EI+4, so the
-   // next boundary takes the interrupt there (CPU_ARCHITECTURE §13.1).
-   // In ID: it simply becomes a serializer (id_ser / id_eiser).
-   // Why EX is always in time: the enabling store holds MEM until its MMIO
-   // ack, >= 3 cycles after its DV (the strobe delayed 2 + the splitter's
-   // register); its register is written at the DV's first edge and every
-   // source reaches irq_ok within 2 more cycles (r_eth_irq for INT2_EN),
-   // irq_ok_q within 3.  The EI, younger, is in EX at the latest on the
-   // store's last MEM cycle, and stays there (or in ID / IF) until then.
+   // latched.  In EX, decided on the edge the EI leaves EX: the younger op
+   // in ID is squashed, nothing dispatches and fetch halts (as behind a
+   // serializer: nothing younger than the EI is in flight), and mem_eiser
+   // carries it to wb_rfch, which refetches EI+4, so the next boundary
+   // takes the interrupt there (CPU_ARCHITECTURE §13.1).  In ID: it simply
+   // becomes a serializer (id_ser / id_eiser; performance only — the EX
+   // decision covers it).
+   // Why that is always in time: the enabling store holds MEM until its
+   // MMIO ack, >= 3 cycles after its DV (the strobe delayed 2 + the
+   // splitter's register); its register is written at the DV's first edge
+   // and every source reaches irq_ok within 2 cycles of it (r_eth_irq for
+   // INT2_EN), irq_ok_q within 3 — by the ack's cycle.  The EI, younger,
+   // can leave EX at the earliest on that cycle's edge.
    // irq_ok_q: registered (timing; a source that was pending one cycle
    // before is pending — at worst the conversion costs a refetch).
    // (id_isei / ex_isei: a plain EI, not serialized for another reason)
@@ -5147,19 +5149,13 @@ module pipeline_core
             end
          end
 
-         // §9 item 4: an EI held in EX (MEM busy — the enabling store waiting
-         // for its MMIO ack — or EX busy) is converted in place: it becomes
-         // serialized, the ID op behind it is dropped and fetch halts.  An
-         // EI waiting in ID becomes a serializer.  (The squashes below are
-         // older and win; one that kills the EI clears / sets fetch_halt
-         // itself, and an SMC squash of the ID op alone keeps it, ev_eicv.)
-         if (ex_eicv && (mem_busy || ex_busy)) begin
-            ev_eicv     = 1'b1;
-            ev_ovr      = 1'b1;
-            ex_eiser   <= 1'b1;
-            id_valid   <= 1'b0;
-            fetch_halt <= 1'b1;
-         end
+         // §9 item 4: an EI waiting in ID becomes a serializer (it then
+         // dispatches with fetch halted behind it: nothing to squash).  An
+         // EI held in EX is converted as it leaves EX (the dispatch branch
+         // above), which is never before the enabling store's MMIO ack.
+         // (The squashes below are older and win; one that kills the EI
+         // clears / sets fetch_halt itself, and an SMC squash of the ID op
+         // alone keeps it halted, ev_eicv.)
          if (id_eicv && (mem_busy || ex_busy || raw_stall)) begin
             id_ser     <= 1'b1;
             id_eiser   <= 1'b1;

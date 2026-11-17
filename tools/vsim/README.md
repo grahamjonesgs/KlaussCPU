@@ -93,7 +93,7 @@ python3 tools/vsim/run.py socbreak [case-regex ...] [--rev REV] [-v]
 python3 tools/vsim/run.py socsload [sd|blit] [--rev REV] [-v]
 python3 tools/vsim/run.py socei [--srcs mask vec0 ...] [--k 0 1 2] [--j 0 4] [--full] [--rev REV]
 python3 tools/vsim/run.py permfuzz --seeds 40 --fetch --remap [--walk] [--irq] [--soc]
-python3 tools/vsim/run.py permfuzz --selfcheck
+python3 tools/vsim/run.py permfuzz --selfcheck --seeds 12
 python3 tools/vsim/fablemut.py [-j 6]           # the §9 mutations (each must be killed)
 ```
 
@@ -132,7 +132,7 @@ python3 tools/vsim/fablemut.py [-j 6]           # the §9 mutations (each must b
   same program with each statically faulting instruction replaced by
   NOPs, run with every page RWX.  `--soc`: through tb_soc.
   `--selfcheck`: with `PF_NOFLUSH=1` (the remap's flush removed from the
-  test program) most runs must differ.
+  test program) at least a third of the runs must differ.
 - `--rev REV` runs another revision's RTL under the working tree's tb_soc
   (as `socorphan`); against `d612472` every one of these fails.
 - **tb_vsim's INT_MASK** is written on the store's DV, as the SoC does

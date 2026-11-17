@@ -2598,6 +2598,15 @@ def cmd_tecost(a):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'permfuzz':
+        # (its own options: argparse.REMAINDER does not take leading --options)
+        sys.modules.setdefault('run', sys.modules[__name__])
+        import permfuzz
+        rc = permfuzz.main(sys.argv[2:])
+        if BTIC_FAILS or CONS_FAILS:      # (the gates main() registers for the other commands)
+            print(f'BTIC / consistency checks failed: {" ".join((BTIC_FAILS + CONS_FAILS)[:10])}')
+            rc = 1
+        sys.exit(rc)
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
     b = sub.add_parser('build'); b.add_argument('--rev')
@@ -2797,9 +2806,6 @@ def main():
     elif a.cmd == 'socei':
         import socei
         sys.exit(socei.cmd_socei(a))
-    elif a.cmd == 'permfuzz':
-        import permfuzz
-        sys.exit(permfuzz.main(a.args))
     else:
         sys.exit(cmd_diff(a))
 
