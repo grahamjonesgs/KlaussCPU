@@ -57,7 +57,7 @@
 module blitter_dma (
     input             i_Clk,
     input             i_Rst_L,
-    input             i_soft_rst,      // HW_PERF_PLAN §9: the UART S command — as i_Rst_L
+    input             i_soft_rst,      // HW_PERF_PLAN §9: the UART S command — resets the engine
 
     // -------- MMIO peripheral bus (slave). Offsets use mmio.addr[15:0]. --------
     mmio_if.slave     mmio,
@@ -157,15 +157,17 @@ module blitter_dma (
 
     assign o_irq = r_done & r_irq_en;
 
-    // CPU_RESETN, or a UART S load (a running blit stops: it would write DDR
-    // under the image being loaded; the arbiter releases its grant)
+    // The engine's reset: CPU_RESETN, or a UART S load (HW_PERF_PLAN §9: a
+    // running blit stops — it would write DDR under the image being loaded;
+    // the arbiter releases its grant).  The registers (BLIT_CHUNK included)
+    // survive a program load, as before; DONE (r_done) is the engine's.
     wire w_rst_L = i_Rst_L && !i_soft_rst;
 
     // =========================================================================
     // MMIO write / read
     // =========================================================================
     always_ff @(posedge i_Clk) begin
-        if (!w_rst_L) begin
+        if (!i_Rst_L) begin
             r_dst_addr        <= 32'h0;
             r_dst_stride      <= 32'h0;
             r_src_addr        <= 32'h0;

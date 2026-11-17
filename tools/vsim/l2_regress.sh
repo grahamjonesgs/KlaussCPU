@@ -17,7 +17,11 @@
 #   eq       the L2_EN = 0 equivalence: VSIM_L2=0 against $BASE under the
 #            same tb_soc (identical traces and PIPE_RUN cycles)
 #   core     the core regression (5 configurations), diff / excdiff /
-#            mpudiff / tlbdiff / tlbpage / dcbzdiff / dmtest, btfuzz
+#            mpudiff / tlbdiff / tlbpage / dcbzdiff / dmtest, btfuzz,
+#            permfuzz (and its PF_NOFLUSH self-check)
+# soc36 / socvar also run the HW_PERF_PLAN §9 targets: socreset, socbreak,
+# socsload (the SoC FSM under CPU_RESETN / UART breaks / S loads), socei
+# (precise EI behind an enabling MMIO store).
 # $BASE: the master revision the L2 branch is compared against (d7f3994).
 set -u
 cd "$(dirname "$0")/../.."
@@ -61,6 +65,10 @@ sec_soc36() {
    t socvga_m36 X=1 -- $R socvga
    t socframe_m36 X=1 -- $R socframe          # HW_PERF_PLAN §8 item 1
    t socorphan_m36 X=1 -- $R socorphan        # §8 item 3d
+   t socreset_m36 X=1 -- $R socreset          # §9 item 1
+   t socbreak_m36 X=1 -- $R socbreak          # §9 item 2
+   t socsload_m36 X=1 -- $R socsload          # §9 item 3
+   t socei_m36 X=1 -- $R socei                # §9 item 4
 }
 sec_soc8() {
    soc_set m8 VSIM_SOC_PLUS=+MIGLAT=8
@@ -70,6 +78,8 @@ sec_socvar() {
    soc_set nol2 VSIM_L2=0
    t socl2_nol2 VSIM_L2=0 -- $R socl2
    t socorphan_nol2 VSIM_L2=0 -- $R socorphan
+   t socreset_nol2 VSIM_L2=0 -- $R socreset
+   t socsload_nol2 VSIM_L2=0 -- $R socsload
    soc_set w8 VSIM_L2_WAYS=8
    t socl2_w8 VSIM_L2_WAYS=8 -- $R socl2
    soc_set jit "VSIM_SOC_PLUS=+MIGLAT=8 +MIGJIT=20 +MIGRDY=30"
@@ -96,6 +106,10 @@ sec_core() {
    t dcbzdiff X=1 -- $R dcbzdiff --seeds 200
    t dmtest X=1 -- $R dmtest
    t btfuzz X=1 -- $R btfuzz --seeds 300
+   t permfuzz X=1 -- $R permfuzz --seeds 40 --fetch --remap
+   t permfuzz_walk X=1 -- $R permfuzz --seeds 20 --fetch --remap --walk --irq
+   t permfuzz_soc X=1 -- $R permfuzz --seeds 10 --soc --walk --fetch
+   t permfuzz_self X=1 -- $R permfuzz --selfcheck --seeds 6
 }
 
 secs=("$@")

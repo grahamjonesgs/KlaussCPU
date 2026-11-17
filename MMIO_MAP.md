@@ -70,7 +70,11 @@ mirror of core 1's `clock_ms` (lwIP `sys_now`).
 
 - All MMIO registers are accessible as 8/16/32/64-bit loads and stores. The
   width of the load/store determines how many bytes of the register are
-  read/written; bits outside the register-defined width read as 0.
+  read/written; bits outside the register-defined width read as 0.  A store
+  narrower than the register is not guaranteed to leave its other bytes
+  alone (see the compiler notes below: they are then undefined); some
+  registers ignore the byte enables altogether (e.g. `CACHE_OP_ADDR` /
+  `CACHE_OP_LEN`) — write each register with one store of its width.
 - **MMIO is never cached.** The splitter sits in front of the cache, so reads
   always reflect current device state and writes take effect immediately.
 - MMIO writes complete in a single cycle (no read-data path involved).
@@ -181,7 +185,10 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
   in the FIFO.
 - **Program load** (LOAD_COMPLETE) with `SD_MODE` = 1 resets the whole
   controller as `CPU_RESETN` does (SD_MODE and `pwr_en` cleared, FIFO
-  emptied); with `SD_MODE` = 0 it changes nothing.
+  emptied); with `SD_MODE` = 0 it changes nothing.  A UART load does the
+  same already at its start, the `S` command (HW_PERF_PLAN §9): a running
+  DMA stops instead of writing DDR under the image being loaded (its DDR
+  adapter finishes the one transaction in flight).
 - **Pins**: CMD and DAT[3:0] are bidirectional with pull-ups. In SPI mode
   CMD (MOSI), DAT3 (CS_n), DAT1 and DAT2 are always driven and DAT0 is an
   input, as before.
@@ -369,8 +376,8 @@ implementation-defined, so they live in MMIO here rather than as CSRs.
 | 0x0018  | `ICACHE_INFO`        | R  | 64    | Read-only geometry of core 1's fetch I-cache, in `CACHE_INFO`'s format (`[7:0]` ways, `[23:8]` sets, `[31:24]` line bytes, `[63:32]` total bytes). Current build: `64'h0001_0000_2008_0001` (direct-mapped, 2048 sets, 32 B/line, 64 KiB; HW_PERF_PLAN.md §5). The 16 KiB bitstreams (HW_PERF_PLAN.md §2) read `64'h0000_4000_1004_0001` (1024 sets, 16 B/line). Reads 0 on older bitstreams (8 KiB I-cache, 512 sets, 16 B lines). Build parameters `CORE1_IC_LINES`, `CORE1_IC_LB`. Software that walks code by I-cache line must take the line size from `[31:24]`. |
 | 0x0020  | `L2_INFO`            | R  | 64    | Read-only geometry of the unified L2 (HW_PERF_PLAN.md §6), in `CACHE_INFO`'s format. Current build: `64'h0002_0000_4002_0004` (4 ways, 512 sets, 64 B lines, 128 KiB); an 8-way build reads `64'h0002_0000_4001_0008`. Each 64 B line is two 32 B sectors with their own valid and dirty bits. Reads 0 on bitstreams without an L2 (`CPU_FEATURES[26]` = 0). |
 | 0x0028  | `L2_CTRL`            | RW | 9     | The L2's control (see "L2 cache" below). Write `[0]` EN, `[1]` WBINV: **1** = enable; **3** = write back every dirty line and invalidate the whole L2, stay enabled; **0** (or 2) = write back and invalidate, then bypass (disabled). Read: `[0]` EN (the value last written, 1 after reset / program load), `[8]` BUSY (a write-back walk is running). **A write while BUSY = 1 is ignored.** Reads 0 without an L2. |
-| 0x0030  | `CACHE_OP_ADDR`      | RW | 32    | The range operations' start: a **physical** address, `[4:0]` read 0. Reset 0 (`CPU_RESETN`). Reads 0 on bitstreams without the range ops (`CPU_FEATURES[27]` = 0). |
-| 0x0038  | `CACHE_OP_LEN`       | RW | 32    | Their length in bytes; 0 = no-op. Reset 0. |
+| 0x0030  | `CACHE_OP_ADDR`      | RW | 32    | The range operations' start: a **physical** address, `[4:0]` read 0. Reset 0 (`CPU_RESETN`). Reads 0 on bitstreams without the range ops (`CPU_FEATURES[27]` = 0). Write it with a 32- or 64-bit store: the byte enables are ignored, so a narrower store writes the whole register from its lane-replicated data — the result is undefined. |
+| 0x0038  | `CACHE_OP_LEN`       | RW | 32    | Their length in bytes; 0 = no-op. Reset 0. As `CACHE_OP_ADDR`: a 32- or 64-bit store; a narrower one leaves the register undefined. |
 | 0x0040  | `CNT_READ_HITS`      | R  | 64    | Read accesses that hit a valid cache line. |
 | 0x0048  | `CNT_READ_MISSES`    | R  | 64    | Read accesses that missed and triggered a DDR refill. |
 | 0x0050  | `CNT_WRITE_HITS`     | R  | 64    | Write accesses that hit a valid cache line (including DCBZ hits). |
@@ -1121,6 +1128,13 @@ row-major; independent src/dst (and mask) strides let a rect be a sub-region of
 a larger buffer. There is **no clipping in hardware** — pass an exact, pre-clipped
 rect. The blitter shares the CPU's 100 MHz clock, so there is no clock-domain
 crossing on its register or interrupt interface.
+
+**Reset:** `CPU_RESETN` resets the engine and the registers.  A UART load
+(break + `S`, HW_PERF_PLAN §9) stops a running blit at once — it would
+otherwise keep writing DDR under the image being loaded — by resetting the
+engine (BUSY and DONE cleared); the registers, `BLIT_CHUNK` included, are
+kept.  A program load that is not a UART `S` (the resident boot copy)
+changes nothing here.
 
 | Offset | Reg           | RW | Width | Description |
 |--------|---------------|----|-------|-------------|

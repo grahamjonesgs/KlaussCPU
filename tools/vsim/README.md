@@ -85,6 +85,59 @@ python3 tools/vsim/run.py tecost --seeds 60          # cycle cost of TE = 1 on r
   grant held at the end, no D-cache request waiting > 2,000 cycles; with
   the L2 also in runtime bypass (§8 item 3d and its review).
 
+## The SoC FSM, precise EI, MMU permissions (HW_PERF_PLAN.md §9)
+
+```
+python3 tools/vsim/run.py socreset [case-regex ...] [--rev REV] [-v]
+python3 tools/vsim/run.py socbreak [case-regex ...] [--rev REV] [-v]
+python3 tools/vsim/run.py socsload [sd|blit] [--rev REV] [-v]
+python3 tools/vsim/run.py socei [--srcs mask vec0 ...] [--k 0 1 2] [--j 0 4] [--full] [--rev REV]
+python3 tools/vsim/run.py permfuzz --seeds 40 --fetch --remap [--walk] [--irq] [--soc]
+python3 tools/vsim/run.py permfuzz --selfcheck
+python3 tools/vsim/fablemut.py [-j 6]           # the §9 mutations (each must be killed)
+```
+
+- **`socreset` / `socbreak` / `socsload`** (`socfsm.py`) run tb_soc with
+  a probe appended (a separate build, `soc_*_fr`) that drives CPU_RESETN
+  and the UART RX line (`uart_rx_tb` in tb_soc).  The probe checks that
+  every boot-copy ack the FSM takes follows a D-cache write latch of
+  `st.mem_addr` (`BAD-ACK`: a stale ready taken as the ack), detects hangs,
+  compares the FSM's retire count with the pipeline's, and counts SD DMA /
+  blitter grants while the UART loader runs.
+  - `socreset`: CPU_RESETN pulses of 1-200 cycles during a read miss,
+    short-release-long shapes, release bounce in the power-up copy, two
+    glitches with a boot write miss in the shadow, a press during the
+    crash dump's DDR reads.  The program corrupts DDR dword 0 and reboots:
+    it must boot with the ROM's dword 0.
+  - `socbreak`: a UART break swept over 48 offsets through the boot copy
+    and 40 over the crash dump's first DDR read (two passes: the first
+    finds that read's cycle); breaks + 'A' while a program runs; a break +
+    'A' inside a .kbt stream.  Coverage: some pulse must land on a boot ack
+    and on an HCF read ack.
+  - `socsload`: break + S + .kbt while an SD DMA read / back-to-back
+    blitter FILLs run, with the S placed on a tenure (two passes: the
+    grant rises of a run without the S).  No SD / blitter grant after a
+    200-cycle grace, none held at the end, the image intact; a blitter
+    grant held at the S must be released by the orphaned-grant guard.
+- **`socei`** (`socei.py`): `[enabling store] nop*k EI nop*j DI` for
+  INT_MASK, INT_VEC0-3, INT2_EN and VGA_CTRL.VSYNC_IRQ_EN, warm code, 4-8
+  alignments; every cell must be `1@+4` (one entry, frame PC = EI + 4).
+  Plus a loop of `{INT_MASK = 0; nop; INT_MASK = 1; nop*k; EI; nop*j; DI}`
+  that must take interrupts.  `tests.py ei_enable_store` is the core-TB
+  version.
+- **`permfuzz`** (`permfuzz.py`, from the review's MMU pass): random
+  user-mode programs under TE = 1 whose data window straddles two pages
+  with random permissions, kernel / MMIO probes, fetch through pages with
+  and without X, remaps with three flush methods; the reference is the
+  same program with each statically faulting instruction replaced by
+  NOPs, run with every page RWX.  `--soc`: through tb_soc.
+  `--selfcheck`: with `PF_NOFLUSH=1` (the remap's flush removed from the
+  test program) most runs must differ.
+- `--rev REV` runs another revision's RTL under the working tree's tb_soc
+  (as `socorphan`); against `d612472` every one of these fails.
+- **tb_vsim's INT_MASK** is written on the store's DV, as the SoC does
+  (`w_pip_mask_wr`), not after the store completed.
+
 ## The L2 (HW_PERF_PLAN.md §6)
 
 - **tb_soc's DDR** is the behavioural MIG (`sim_1/new/mig_model.sv`) behind
@@ -137,8 +190,14 @@ These are applied only to copies under `$VSIM_WORK`; the RTL is unchanged.
   `for`-loop NBAs to `ic_vhi`/`ic_vlo`/`rf` into whole-array assignments.
 - `uart_send_msg.sv`: the mixed blocking/NBA `i_msg_count` reset becomes
   blocking.
+- `KlaussCPU.sv` of revisions before HW_PERF_PLAN §9: the UART loader's
+  NBA `o_ram_write_value <= 32'h0` becomes blocking (Verilator dropped the
+  loader's blocking nibble writes next to it, so every S load failed its
+  checksum).  Since §9 the loader packs the nibbles in a local variable
+  and needs no patch.
 - `tb_soc.sv`: print PIPE_RUN cycles at HALTED; add an `ODDR` behavioural
-  stub.
+  stub; the §9 probe (`socfsm.py`) for socreset / socbreak / socsload.
+  (`+IDLEMAX=<n>`: tb_soc's no-retire deadlock limit, default 600,000.)
 
 ## Adding a test
 

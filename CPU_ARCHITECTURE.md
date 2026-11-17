@@ -450,9 +450,15 @@ Linux `local_irq_enable()` / `local_irq_disable()` pairs rely on. An `EI`
 with no interrupt pending costs nothing. A debugger single-step never takes
 an interrupt. `IRET` restoring enable = 1 and `MTSR STATUS` (both
 serializing) take a pending interrupt at the first boundary after they
-commit. (Implementation: an `EI` latched with an interrupt pending
-serializes, commits at WB and refetches at EI+4; the next boundary takes
-the interrupt.)
+commit. "Pending" includes what every older instruction did: an `EI` right
+behind the store that unmasks or enables the source (`INT_MASK`,
+`INT_VECn`, `INT2_EN`, a device's IRQ enable) takes it at EI+4 too.
+(Implementation: an `EI` latched with an interrupt pending serializes,
+commits at WB and refetches at EI+4; the next boundary takes the
+interrupt.  One latched with nothing pending is converted to that form
+while it is still in ID or EX if an interrupt becomes pending — the
+enabling MMIO store writes its register only in MEM and holds MEM until
+its ack, so the `EI` is still in EX then; HW_PERF_PLAN §9 item 4.)
 
 A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`
 and interrupts are not disabled by `DI`.
