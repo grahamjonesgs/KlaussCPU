@@ -105,10 +105,14 @@ module tb_soc;
       cpu_resetn = 1'b1;
    end
 
+   // the UART RX line (idle high); tools/vsim/run.py's reset / break / load
+   // probes (HW_PERF_PLAN §9) drive it: breaks, commands, .kbt streams
+   logic uart_rx_tb = 1'b1;
+
    KlaussCPU dut (
       .CPU_RESETN (cpu_resetn),
       .i_Clk_board(clk100),
-      .i_uart_rx  (1'b1),
+      .i_uart_rx  (uart_rx_tb),
       .i_load_H   (1'b0),
       .o_uart_tx  (o_uart_tx),
       .o_led      (o_led),
@@ -531,6 +535,8 @@ module tb_soc;
    longint last_i = -1;
    int     idle_n = 0;
    longint maxi = 0;
+   longint idle_max = 600000;
+   initial void'($value$plusargs("IDLEMAX=%d", idle_max));
    always @(posedge dut.i_Clk) begin
       if (dut.st.SM == HALTED) begin
          // the D-cache's memory transactions (its DDR traffic without an L2)
@@ -577,7 +583,9 @@ module tb_soc;
          idle_n++;
          // generous: a legitimate HCF crash dump emits ~1k UART bytes with no
          // retires; only a genuinely stuck pipe survives this long
-         if (idle_n > 600000) begin
+         // (+IDLEMAX=<n>: longer, for runs that load a program over the
+         // UART at 330 cycles a character)
+         if (idle_n > idle_max) begin
             $display("TB_SOC: DEADLOCK sm=%0d pc=%08x i=%0d", dut.st.SM, dut.pipeline_core_i.pc, icount);
             $fclose(uart_f); $fclose(trace_f);
             $finish;

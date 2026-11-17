@@ -129,7 +129,7 @@ module tb_blitter;
    wire blit_irq;
 
    blitter_dma dut_blit (
-      .i_Clk(clk), .i_Rst_L(rst_l),
+      .i_Clk(clk), .i_Rst_L(rst_l), .i_soft_rst(1'b0),
       .mmio(blit_bus),
       .o_dma_req(dma_req), .o_dma_done(dma_done),
       .o_dma_write_DV(dma_w), .o_dma_read_DV(dma_r),

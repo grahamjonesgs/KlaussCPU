@@ -10,9 +10,10 @@
 // but the hit path is only 2 cycles and misses are DDR-dominated
 // (~20-50 cycles).
 //
-// 64-bit data bus: 128-bit cache line holds 2 × 64-bit doublewords.
-// Doubleword offset within line: cpu.addr[3] (0=upper [127:64], 1=lower [63:0])
-// Cache index: addr[3+INDEX_BITS:4], Tag: addr[31:4+INDEX_BITS]
+// 64-bit data bus: a 256-bit (32 B) cache line holds 4 × 64-bit doublewords,
+// in descending order: doubleword offset cpu.addr[4:3] = 0 is the upper
+// [255:192], 3 the lower [63:0] (read_data_next = the next one, offset + 1).
+// Cache index: addr[4+INDEX_BITS:5], Tag: addr[31:5+INDEX_BITS]
 //
 // External interface: cpu.write_DV, cpu.read_DV, cpu.addr[31:0],
 // cpu.write_data[63:0], cpu.byte_en[7:0], cpu.read_data[63:0],
@@ -70,6 +71,14 @@ module mem_read_write #(
     // DDR2 calibration complete — passed up so the boot-ROM copy (KlaussCPU.v)
     // waits for DDR before writing the resident netboot image into it.
     output            o_calib_done,
+
+    // HW_PERF_PLAN §9 item 1: the CPU-side FSM is in WAIT — no request of
+    // the port's latched and unanswered, so no ready is still to come for
+    // one (a ready set on the edge into WAIT is visible in its first cycle
+    // only).  The boot copy starts only then: after a short CPU_RESETN the
+    // FSM was still answering the dead pipeline's read, and its ready was
+    // taken as boot dword 0's ack (the write lost).
+    output            o_cpu_idle,
 
     // -------------------------------------------------------------------------
     // DMA master port (master B) — second DDR2 requestor, used by the blitter.
@@ -589,6 +598,7 @@ module mem_read_write #(
     localparam MAINT                 = 16'd16384; // cache flush/invalidate walk (sub-FSM below)
 
     logic [15:0] state = WAIT;
+    assign o_cpu_idle = state == WAIT;
 
     // -------------------------------------------------------------------------
     // Maintenance sub-FSM (inside the MAINT state). Walks r_cache_index 0..N-1,

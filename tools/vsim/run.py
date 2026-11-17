@@ -300,16 +300,17 @@ def _btic_note(name, st, log, gate=True):
     return bad and gate
 
 
-def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
+def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False, probe=None):
     """full SoC (sim_1/new/tb_soc.sv: behavioural DDR, real cache / bus /
     MMIO / HCF) under Verilator.  tb_soc reads netboot.mem from its cwd.
     crypto_full: KlaussCPU with every optional crypto block (the default
-    build is the lean A7 one)."""
+    build is the lean A7 one).  probe: (name, text) — SystemVerilog appended
+    to the sim copy of tb_soc (a separate build, tagged with the name)."""
     ic = ic_geom()
     l2, l2w = l2_cfg()
     tag = (rev or 'wt') + ('_cfull' if crypto_full else '') + ('_nowalk' if nowalk else '') + \
           (f'_ic{ic[0]}x{ic[1]}' if ic else '') + ('' if l2 else '_nol2') + (f'_l2w{l2w}' if l2w != 4 else '') + \
-          ('_tbwt' if tb_wt else '') + \
+          ('_tbwt' if tb_wt else '') + (f'_{probe[0]}' if probe else '') + \
           ''.join(f'_{k}{os.environ[k]}' for k in ('VSIM_L2_SPEC', 'VSIM_L2_XTRA') if k in os.environ)
     d = os.path.join(WORK, 'soc_' + re.sub(r'[^A-Za-z0-9_.-]', '_', tag))
     src = os.path.join(d, 'src')
@@ -330,6 +331,13 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
             # mixed blocking / NBA on i_msg_count mis-simulates in Verilator
             # 5.020 (BLKANDNBLK waived); the IDLE reset is equivalent blocking
             t = t.replace('i_msg_count <= 0;', 'i_msg_count = 0;')
+        if n == 'KlaussCPU.sv' and "o_ram_write_value[7:4]   = return_hex_from_ascii" in t:
+            # revisions before HW_PERF_PLAN §9 item 6: the UART loader mixed
+            # the NBA `o_ram_write_value <= 32'h0` with blocking nibble
+            # writes, and Verilator (BLKANDNBLK waived) drops the nibbles —
+            # every S load then fails its checksum.  The blocking clear is
+            # equivalent (nothing reads it later in that branch).
+            t = t.replace("o_ram_write_value <= 32'h0;", "o_ram_write_value = 32'h0;")
         open(os.path.join(src, n), 'w').write(t)
         allsrc += t
     tbp = os.path.join(ROOT, 'KlaussCPU.srcs', 'sim_1', 'new', 'tb_soc.sv')
@@ -385,6 +393,9 @@ def build_soc(rev=None, crypto_full=False, nowalk=False, tb_wt=False):
         # the current revision has a BTIC but the signal-name test failed
         # (a renamed signal): a silent skip would make every BTIC check vacuous
         raise SystemExit('tb_soc BTIC probe skipped: lp_pa / ic_tagsh not found in the current sources')
+    if probe:
+        k = tb.rindex('endmodule')
+        tb = tb[:k] + probe[1] + tb[k:]
     open(os.path.join(src, 'tb_soc.sv'), 'w').write(tb)
     open(os.path.join(src, 'unisim_stubs.v'), 'w').write(ODDR_STUB)
     h = hashlib.sha1((allsrc + tb).encode()).hexdigest()
@@ -2667,6 +2678,23 @@ def main():
     tc = sub.add_parser('tecost'); tc.add_argument('--seeds', type=int, default=60)
     tc.add_argument('--seed0', type=int, default=1); tc.add_argument('--rev')
     tc.add_argument('--plus', nargs='*', default=[])
+    # HW_PERF_PLAN §9 (Fable review fixes): the SoC FSM under CPU_RESETN
+    # pulses / UART breaks / S loads (socfsm.py), precise EI behind an
+    # enabling MMIO store (socei.py), the MMU permission fuzzer (permfuzz.py)
+    for nm in ('socreset', 'socbreak', 'socsload'):
+        sp = sub.add_parser(nm); sp.add_argument('only', nargs='*', help='case names (regexes); default all')
+        sp.add_argument('--rev', help="another revision's RTL under the working tree's tb_soc")
+        sp.add_argument('-v', '--verbose', action='store_true')
+    se = sub.add_parser('socei'); se.add_argument('--rev', help="another revision's RTL under the working tree's tb_soc")
+    se.add_argument('--srcs', nargs='+', help='sources (default all: see socei.py)')
+    se.add_argument('--k', type=int, nargs='+', default=[0, 1, 2], help='NOPs between the store and the EI')
+    se.add_argument('--j', type=int, nargs='+', default=[0, 4], help='NOPs between the EI and the DI')
+    se.add_argument('--full', action='store_true', help='8 alignments for every source (default: 8 for mask / vec0, 4 else)')
+    se.add_argument('--no-loop', dest='loop', action='store_false')
+    se.add_argument('-j', '--jobs', type=int, default=8)
+    pf = sub.add_parser('permfuzz', help='the MMU permission fuzzer (permfuzz.py; its own options follow)',
+                        add_help=False)
+    pf.add_argument('args', nargs=argparse.REMAINDER)
     sd = sub.add_parser('socdiff'); sd.add_argument('--base', required=True)
     sd.add_argument('--cycles', action='store_true', help='also require identical PIPE_RUN cycles per program')
     sd.add_argument('--seeds', type=int, default=10); sd.add_argument('--seed0', type=int, default=1)
@@ -2763,6 +2791,15 @@ def main():
         sys.exit(cmd_tecost(a))
     elif a.cmd == 'btfuzz':
         sys.exit(cmd_btfuzz(a))
+    elif a.cmd in ('socreset', 'socbreak', 'socsload'):
+        import socfsm
+        sys.exit(getattr(socfsm, 'cmd_' + a.cmd)(a))
+    elif a.cmd == 'socei':
+        import socei
+        sys.exit(socei.cmd_socei(a))
+    elif a.cmd == 'permfuzz':
+        import permfuzz
+        sys.exit(permfuzz.main(a.args))
     else:
         sys.exit(cmd_diff(a))
 

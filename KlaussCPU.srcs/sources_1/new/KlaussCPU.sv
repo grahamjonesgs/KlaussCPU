@@ -950,6 +950,12 @@ module KlaussCPU #(
    // (sd_spi), and INT2_EN.
    logic r_load_pulse = 1'b0;
    always_ff @(posedge i_Clk) r_load_pulse <= (st.SM == LOAD_COMPLETE);
+   // HW_PERF_PLAN §9 item 3: the UART S command (the start of a load),
+   // registered in the FSM — also resets the SD controller iff SD_MODE = 1
+   // (its DMA engine) and the blitter, which would otherwise keep writing
+   // DDR under the image being loaded.  An orphaned DDR grant of either is
+   // released by the arbiter (w_grant_orphaned, §8 item 3d).
+   logic r_s_rst = 1'b0;
    // INT2_EN: CPU_RESETN and program load return it to Ethernet only, so a
    // freshly loaded program sees source 2 exactly as on older bitstreams.
    always_ff @(posedge i_Clk) begin
@@ -962,7 +968,7 @@ module KlaussCPU #(
    sd_spi sd_spi_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
-       .i_load_rst(r_load_pulse),
+       .i_load_rst(r_load_pulse || r_s_rst),
        .mmio(sd_bus),
        .o_irq(w_sd_irq),
        .i_sd_cd(i_SD_CD),
@@ -1157,6 +1163,7 @@ module KlaussCPU #(
    blitter_dma blitter_dma_i (
        .i_Clk(i_Clk),
        .i_Rst_L(~w_reset_H),
+       .i_soft_rst(r_s_rst),         // §9 item 3: the UART S command
        .mmio(blit_bus),
        .o_dma_req(w_blit_dma_req),
        .o_dma_done(w_blit_dma_done),
@@ -1505,6 +1512,7 @@ module KlaussCPU #(
    // SystemVerilog (xvlog -sv) doesn't implicitly net it at first use and then
    // flag a redeclaration; the boot-ROM block below consumes it.
    wire        w_calib_done;
+   wire        w_dc_idle;      // the D-cache's CPU-side FSM idle (§9 item 1: the boot copy's start)
 
    mem_read_write #(.L2_EN(CORE1_L2_EN), .L2_WAYS(CORE1_L2_WAYS)) mem_read_write (
        .i_Clk_board(i_Clk_board),   // board oscillator -> clk_wiz -> MIG 200MHz ref
@@ -1543,6 +1551,7 @@ module KlaussCPU #(
 
        // DDR2 ready — gates the resident boot-ROM copy below.
        .o_calib_done(w_calib_done),
+       .o_cpu_idle(w_dc_idle),
 
        // DMA master port — driven by the 2D blitter (device 0x00E).
        .i_dma_req(w_blit_dma_req),
@@ -1982,41 +1991,24 @@ rams_sp_nc rams_sp_nc1 (
          r_hcf_stack_loaded <= 1'b0;
          for (i = 0; i < 16; i = i + 1)
             r_trace_buf[i] <= 64'b0;
+         // HW_PERF_PLAN §9 item 1: the FSM's own memory request dies with the
+         // reset.  A DV held through it at an unchanged address (boot dword
+         // 0) is never a new request to the D-cache's served-DV guard — the
+         // boot copy then waited for ever, and no later press recovered it.
+         st.mem_write_DV  <= 1'b0;
+         st.mem_read_DV   <= 1'b0;
+         r_s_rst          <= 1'b0;
 
-      end // if (w_reset_H)
-      // Break received: arm the flag so next byte is treated as a command
-      else if (w_uart_break) begin
-         r_break_received <= 1'b1;
-         // The pipeline's 1-cycle dispatch ack must be consumed even on a
-         // branch that skips the PIPE_RUN arm, or the timer source stays
-         // pending and the ISR re-enters straight after its IRET.
-         if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
-            r_timer_interrupt <= 1'b0;
-      end
-      // Command characters are only accepted after a break
-      else if (w_uart_rx_DV & r_break_received) begin
-         r_break_received <= 1'b0;  // consume the break — one command per break
-         if (pip_irq_ack && pip_irq_ack_sel == 2'd0)
-            r_timer_interrupt <= 1'b0;   // same ack-consume as the break branch
-         case (w_uart_rx_value)
-            8'h53: begin // 'S' — load start
-               st.SM <= LOADING_BYTE;
-               r_load_byte_counter <= 0;
-               o_ram_write_addr <= 32'h0;
-               r_ram_next_write_addr <= 32'h0;
-               r_checksum <= 16'h0;
-               r_old_checksum <= 16'h0;
-               st.RGB_LED_1 <= 12'h0;
-               st.RGB_LED_2 <= 12'h0;
-               st.led <= 16'h0;
-               st.mem_write_DV <= 1'b0;
-               st.mem_read_DV <= 1'b0;
-            end
-            // Any other byte after break: silently ignored
-         endcase
       end else begin
+         // HW_PERF_PLAN §9 item 2: a UART break or command byte no longer
+         // pre-empts the state arms (they used to sit above this case in an
+         // else-if chain, so a one-cycle w_mem_ready — a boot-copy write's
+         // ack, an HCF read's — or the PIPE_RUN arm's retire / LCD / IRQ-ack
+         // bookkeeping in that cycle was lost).  The break / command logic
+         // runs after the case and the MMIO handler, below.
          r_msg_send_DV  <= 1'b0;
          st.rx_fifo_read <= 1'b0;
+         r_s_rst        <= 1'b0;
 
          // (frozen while the debugger holds core 1, so no tick is lost)
          if (w_dbg_freeze) begin
@@ -2051,7 +2043,12 @@ rams_sp_nc rams_sp_nc1 (
                   case (r_boot_phase)
                      3'd0: begin
                         // Wait for DDR calibration, then present word 0.
-                        if (w_calib_done) begin
+                        // §9 item 1: and for the D-cache to be idle — after a
+                        // short CPU_RESETN it may still be answering a request
+                        // of the dead pipeline (or of this copy before the
+                        // press), and that ready must not be taken as phase
+                        // 4's ack (it comes before phase 3 here, or not at all).
+                        if (w_calib_done && w_dc_idle) begin
                            r_boot_dw_addr <= 15'd0;
                            r_boot_phase   <= 3'd1;
                         end
@@ -2146,9 +2143,7 @@ rams_sp_nc rams_sp_nc1 (
                   r_ram_next_write_addr[3:0]
                };
 
-               if (w_uart_rx_DV) begin
-
-
+               if (w_uart_rx_DV && !r_break_received) begin   // a data byte (§9 item 2)
                   case (w_uart_rx_value)
                      8'h58: // End char X
                         begin
@@ -2171,22 +2166,31 @@ rams_sp_nc rams_sp_nc1 (
                      end
                      8'h0a: ;  // ignore LF
                      8'h0d: ;  // ignore CR
-                     default: begin
+                     default: begin : load_nibble
                         // Pack hex pairs into o_ram_write_value in little-endian byte order:
                         // first hex pair (stream byte 0) → bits[7:0], last (byte 3) → bits[31:24].
                         // This makes mem_byte[N] land at bits[8(N%4)+7:8(N%4)] of the 32-bit
                         // word, matching the CPU's LE byte-lane mapping in MEMGET8 / STIDX8 etc.
+                        // (§9 item 6: the word with this nibble is built in a
+                        // local variable — o_ram_write_value itself takes only
+                        // NBAs.  It used to be written blocking here and by
+                        // an NBA in the 'X' branch, which Verilator mis-
+                        // simulates; the logic is unchanged: the word and
+                        // checksum below see the new nibble as before.)
+                        logic [31:0] v;
+                        v = o_ram_write_value;
                         case (r_load_byte_counter)
-                           0: o_ram_write_value[7:4]   = return_hex_from_ascii(w_uart_rx_value);
-                           1: o_ram_write_value[3:0]   = return_hex_from_ascii(w_uart_rx_value);
-                           2: o_ram_write_value[15:12] = return_hex_from_ascii(w_uart_rx_value);
-                           3: o_ram_write_value[11:8]  = return_hex_from_ascii(w_uart_rx_value);
-                           4: o_ram_write_value[23:20] = return_hex_from_ascii(w_uart_rx_value);
-                           5: o_ram_write_value[19:16] = return_hex_from_ascii(w_uart_rx_value);
-                           6: o_ram_write_value[31:28] = return_hex_from_ascii(w_uart_rx_value);
-                           7: o_ram_write_value[27:24] = return_hex_from_ascii(w_uart_rx_value);
+                           0: v[7:4]   = return_hex_from_ascii(w_uart_rx_value);
+                           1: v[3:0]   = return_hex_from_ascii(w_uart_rx_value);
+                           2: v[15:12] = return_hex_from_ascii(w_uart_rx_value);
+                           3: v[11:8]  = return_hex_from_ascii(w_uart_rx_value);
+                           4: v[23:20] = return_hex_from_ascii(w_uart_rx_value);
+                           5: v[19:16] = return_hex_from_ascii(w_uart_rx_value);
+                           6: v[31:28] = return_hex_from_ascii(w_uart_rx_value);
+                           7: v[27:24] = return_hex_from_ascii(w_uart_rx_value);
                            default: ;
                         endcase  //r_load_byte_counter
+                        o_ram_write_value <= v;
                         if (r_load_byte_counter == 7) begin
                            r_load_byte_counter <= 0;
                            case (st.RGB_LED_1)
@@ -2204,16 +2208,16 @@ rams_sp_nc rams_sp_nc1 (
                            // Place 32-bit word in the correct half of the 64-bit doubleword.
                            // Little-endian layout: addr[2]==0 → LOW half [31:0]; addr[2]==1 → HIGH half [63:32].
                            if (r_ram_next_write_addr[2] == 1'b0) begin
-                              st.mem_write_data <= {32'b0, o_ram_write_value};
+                              st.mem_write_data <= {32'b0, v};
                               st.mem_byte_en    <= 8'h0F;
                            end else begin
-                              st.mem_write_data <= {o_ram_write_value, 32'b0};
+                              st.mem_write_data <= {v, 32'b0};
                               st.mem_byte_en    <= 8'hF0;
                            end
                            st.mem_write_DV <= 1'b1;
 
                            r_old_checksum <= r_checksum;
-                           r_checksum <= r_checksum + o_ram_write_value[31:16] + o_ram_write_value[15:0];
+                           r_checksum <= r_checksum + v[31:16] + v[15:0];
                         end // if (r_load_byte_counter==7)
                             else
                             begin
@@ -2830,7 +2834,44 @@ rams_sp_nc rams_sp_nc1 (
                default: ;
             endcase
          end
-      end  // else if (w_reset_H)
+
+         // UART break / command (§9 item 2: in parallel with the state arms).
+         // A break arms r_break_received; the next byte is a command, not
+         // data (LOADING_BYTE and the RX FIFO take only bytes with
+         // !r_break_received).  The S command's assignments come last, so
+         // they win over the arm's and the MMIO handler's on this edge.
+         if (w_uart_break) begin
+            r_break_received <= 1'b1;
+         end else if (w_uart_rx_DV && r_break_received) begin
+            r_break_received <= 1'b0;  // consume the break — one command per break
+            case (w_uart_rx_value)
+               8'h53: begin // 'S' — load start
+                  st.SM <= LOADING_BYTE;
+                  r_load_byte_counter <= 0;
+                  o_ram_write_addr <= 32'h0;
+                  r_ram_next_write_addr <= 32'h0;
+                  r_checksum <= 16'h0;
+                  r_old_checksum <= 16'h0;
+                  st.RGB_LED_1 <= 12'h0;
+                  st.RGB_LED_2 <= 12'h0;
+                  st.led <= 16'h0;
+                  st.mem_write_DV <= 1'b0;
+                  st.mem_read_DV <= 1'b0;
+                  r_pip_start <= 1'b0;
+                  // an S during a HALT / crash-dump TX break ends that break
+                  r_break_active  <= 1'b0;
+                  r_break_counter <= 12'd0;
+                  // §9 item 3: stop the DDR masters a running program may
+                  // have started (the SD DMA engine, the blitter) — they
+                  // would write DDR under the new image.  An orphaned grant
+                  // is released by the arbiter (§8 item 3d).
+                  r_s_rst <= 1'b1;
+               end
+               // Any other byte after break: silently ignored
+               default: ;
+            endcase
+         end
+      end  // else (not w_reset_H)
    end  // always_ff @(posedge i_Clk)
 
    //=========================================================================

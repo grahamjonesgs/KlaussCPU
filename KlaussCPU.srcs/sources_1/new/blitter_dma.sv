@@ -57,6 +57,7 @@
 module blitter_dma (
     input             i_Clk,
     input             i_Rst_L,
+    input             i_soft_rst,      // HW_PERF_PLAN §9: the UART S command — as i_Rst_L
 
     // -------- MMIO peripheral bus (slave). Offsets use mmio.addr[15:0]. --------
     mmio_if.slave     mmio,
@@ -156,11 +157,15 @@ module blitter_dma (
 
     assign o_irq = r_done & r_irq_en;
 
+    // CPU_RESETN, or a UART S load (a running blit stops: it would write DDR
+    // under the image being loaded; the arbiter releases its grant)
+    wire w_rst_L = i_Rst_L && !i_soft_rst;
+
     // =========================================================================
     // MMIO write / read
     // =========================================================================
     always_ff @(posedge i_Clk) begin
-        if (!i_Rst_L) begin
+        if (!w_rst_L) begin
             r_dst_addr        <= 32'h0;
             r_dst_stride      <= 32'h0;
             r_src_addr        <= 32'h0;
@@ -358,7 +363,7 @@ module blitter_dma (
     wire [127:0] w_dma_rd_swap = {i_dma_read_data[63:0], i_dma_read_data[127:64]};
 
     always_ff @(posedge i_Clk) begin
-        if (!i_Rst_L) begin
+        if (!w_rst_L) begin
             state          <= S_IDLE;
             r_busy         <= 1'b0;
             r_done         <= 1'b0;
