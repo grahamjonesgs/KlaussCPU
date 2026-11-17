@@ -624,7 +624,25 @@ module KlaussCPU #(
    // DV as before; the extra held cycle changes nothing.
    logic       r_mmio_write_dv_d;      // write strobe delayed 1
    logic       r_mmio_write_dv_d2;     // write strobe delayed 2 → ack
-   wire        w_mmio_ready = r_mmio_write_dv_d2 | r_mmio_read_dv_d2;
+   // HW_PERF_PLAN §9 review MINOR 1: a write to SD's own IRQ enable,
+   // SDM_IRQEN (0xF000_0130), is acked 2 cycles later (DV + 4 instead of
+   // + 2, the core sees it at + 5).  An EI right behind an enabling store
+   // is converted to its precise form only if the interrupt is pending
+   // (irq_ok_q) by the store's ack (pipeline_core, §9 item 4); SD's level
+   // reaches irq_ok 4 cycles after the DV (sd_native registers its MMIO
+   // inputs, then r_irq_en, then o_irq; then r_eth_irq), irq_ok_q at + 5.
+   // r_sdie_q[i] = the SDM_IRQEN write strobe delayed i + 1: its normal ack
+   // is masked, and its own is a 1-cycle pulse on the strobe's rise delayed
+   // 4 — a pulse, so its tail can never bridge into the ack of the next
+   // access (which comes 2 cycles after that access's DV), keeping the
+   // low-ready cycle the ready-edge protocol above needs.  Every other
+   // register (SDM_FIFO / the data PIO included) keeps its latency.
+   wire        w_sdie_wr = w_mmio_write_DV && w_mmio_addr[27:16] == 12'h000 &&
+                           w_mmio_addr[15:3] == 13'h0026;      // 0x130..0x137
+   logic [4:0] r_sdie_q = '0;
+   always_ff @(posedge i_Clk) r_sdie_q <= {r_sdie_q[3:0], w_sdie_wr};
+   wire        w_mmio_ready = (r_mmio_write_dv_d2 && !r_sdie_q[1]) || (r_sdie_q[3] && !r_sdie_q[4]) ||
+                              r_mmio_read_dv_d2;
    wire w_mem_ready;
    logic [31:0] r_opcode_mem;
    logic [31:0] r_var1_mem;

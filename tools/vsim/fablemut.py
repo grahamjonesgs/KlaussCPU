@@ -18,6 +18,7 @@ WORK = os.path.join(os.environ.get('VSIM_WORK', '/tmp/vsim'), 'fablemut')
 TOP, PC, BL = 'sources_1/new/KlaussCPU.sv', 'sources_1/new/pipeline_core.sv', 'sources_1/new/blitter_dma.sv'
 
 TPG_SUITE = [['test', 'tx_*', 'tlb_*'], ['tlbpage'], ['tlbdiff'], ['permfuzz', '--seeds', '6', '--fetch', '--remap']]
+SDIE_SUITE = [['socei', '--srcs', 'sdirqen', '--no-loop', '-j', '4']]
 EI_SUITE = [['test', 'ei_enable_store'], ['socei', '--srcs', 'mask', 'vec0', 'int2en', '--no-loop', '-j', '4']]
 
 # (name, what it breaks, file, suite (list of run.py argument lists), old, new)
@@ -48,6 +49,17 @@ MUTS = [
      "mem_eiser  <= ex_eiser || ex_eicv;", "mem_eiser  <= ex_eiser;"),
     ('ei_regok', 'the conversion takes the combinational irq_ok\'s previous value from a stale register', PC,
      EI_SUITE, "always_ff @(posedge clk) irq_ok_q <= !rst && irq_ok;", "always_ff @(posedge clk) irq_ok_q <= 1'b0;"),
+    # ---------------- §9 review MINOR 1: SDM_IRQEN's stretched write ack ----------------
+    ('sdie_none', "SDM_IRQEN's write ack not stretched (acked at DV + 2 as every register)", TOP, SDIE_SUITE,
+     "wire        w_mmio_ready = (r_mmio_write_dv_d2 && !r_sdie_q[1]) || (r_sdie_q[3] && !r_sdie_q[4]) ||",
+     "wire        w_mmio_ready = r_mmio_write_dv_d2 || 1'b0 ||"),
+    ('sdie_short', "SDM_IRQEN's write ack stretched by 1 cycle, not 2", TOP, SDIE_SUITE,
+     "(r_sdie_q[3] && !r_sdie_q[4])", "(r_sdie_q[2] && !r_sdie_q[3])"),
+    ('sdie_lvl', "SDM_IRQEN's ack a level (the strobe delayed 4), not a pulse: its tail bridges the next ack", TOP,
+     SDIE_SUITE, "(r_sdie_q[3] && !r_sdie_q[4])", "r_sdie_q[3]"),
+    # ---------------- §9 review MINOR 2: S against a START in its reset cycle ----------------
+    ('s_bstart', "S's reset does not clear the blitter's start pulse (a START store in its cycle runs a blit)", BL,
+     [['socsload', 'blits']], "            if (i_soft_rst) r_start_pulse <= 1'b0;\n", ""),
     # ---------------- §9 timing: the VA page by carry select ----------------
     ('tpg_sel', 'the carry select picks the wrong sum (the VA page off by one when the offset carries)', PC,
      TPG_SUITE, "wire [15:0] ex_tpg  = ex_tc ? ex_tpg1 : ex_tpg0;", "wire [15:0] ex_tpg  = ex_tc ? ex_tpg0 : ex_tpg1;"),

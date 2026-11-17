@@ -18,6 +18,10 @@ Sources (the enabling store):
   vec2   INT_VEC2 0 -> H        (SD CMD_DONE with SDM_IRQEN, INT2_EN = 2, INT_MASK[2])
   vec3   INT_VEC3 0 -> H        (VSYNC_PENDING with VSYNC_IRQ_EN, INT_MASK[3])
   int2en INT2_EN 1 -> 3         (SD CMD_DONE pending, INT_VEC2, INT_MASK[2])
+  sdirqen SDM_IRQEN 0 -> CMD_DONE (SD CMD_DONE pending, INT2_EN = 2, INT_VEC2,
+                               INT_MASK[2]; §9 review MINOR 1: the slowest
+                               source, sd_native's registered path + r_eth_irq,
+                               whose MMIO write ack the SoC stretches)
   vga    VGA_CTRL VSYNC_IRQ_EN  (VSYNC_PENDING, INT_VEC3, INT_MASK[3])
 (The blitter's IRQ_EN is written only together with START, which clears
 DONE: that store never makes an interrupt pending itself — DONE comes at
@@ -33,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 IC, VGA, BLT, SD = 0xF00F0000, 0xF0110000, 0xF00E0000, 0xF0000000
 LOG = 0x20000          # [0] entries, [8*k] k-th frame PC
 H = 0x1000             # the handler
-SRCS = ('mask', 'vec0', 'vec1', 'vec2', 'vec3', 'int2en', 'vga')
+SRCS = ('mask', 'vec0', 'vec1', 'vec2', 'vec3', 'int2en', 'sdirqen', 'vga')
 
 
 def _run():
@@ -52,7 +56,7 @@ def handler(s, src):
         s.setr(1, VGA); s.setr(2, 2); s.st(64, 2, 1, 0x18); s.setr(2, 8); s.st(64, 2, 1, 0x00)
     elif src == 'vec1':
         s.setr(1, BLT); s.setr(2, 2); s.st(64, 2, 1, 0x08)
-    elif src in ('vec2', 'int2en'):
+    elif src in ('vec2', 'int2en', 'sdirqen'):
         s.setr(1, SD); s.setr(2, 0); s.st(64, 2, 1, 0x130)
     s.pop(3); s.pop(2); s.pop(1)
     s.iret()
@@ -101,7 +105,7 @@ def prog(src, k, j, pad, loop=0):
         a.label('pw'); a.ld(64, 1, 13, 0x08); a.setr(2, 2); a.alu('and', 1, 1, 2)
         a.fbr('eq', 1, 0, 'pw', imm=True)                  # until DONE
         a.setr(1, 2); a.st(64, 1, 15, 0x00)                # INT_MASK = 2
-    elif src in ('vec2', 'int2en'):
+    elif src in ('vec2', 'int2en', 'sdirqen'):
         a.setr(14, SD)
         a.setr(1, (1 << 18) | (1 << 17) | 1); a.st(64, 1, 14, 0)     # SD mode, power, CLK
         a.setr(1, 0xFFFFFFFF); a.st(64, 1, 14, 0x128)                # clear the status
@@ -109,10 +113,16 @@ def prog(src, k, j, pad, loop=0):
         a.setr(1, (1 << 8) | 13); a.st(64, 1, 14, 0x100)             # CMD13, R1
         a.label('pw'); a.ld(64, 1, 14, 0x128); a.setr(2, 1 << 8); a.alu('and', 1, 1, 2)
         a.fbr('eq', 1, 0, 'pw', imm=True)                  # until CMD_DONE
-        a.setr(1, 1 << 8); a.st(64, 1, 14, 0x130)          # SDM_IRQEN = CMD_DONE: the SD level is up
-        if src == 'vec2':
-            a.setr(1, 2); a.st(64, 1, 15, 0x50)            # INT2_EN = SD
+        if src != 'sdirqen':
+            a.setr(1, 1 << 8); a.st(64, 1, 14, 0x130)      # SDM_IRQEN = CMD_DONE: the SD level is up
         else:
+            # SDM_IRQEN = 0 and an MMIO store right behind it: its stretched
+            # ack must leave the low-ready cycle before the next one's
+            a.setr(1, 0); a.setr(2, 0x10000)
+            a.st(64, 1, 14, 0x130); a.st(64, 2, 14, 0x108)
+        if src != 'int2en':
+            a.setr(1, 2); a.st(64, 1, 15, 0x50)            # INT2_EN = SD
+        if src != 'vec2':
             a.st(64, 3, 15, 0x20)                          # INT_VEC2 = H
         a.setr(1, 4); a.st(64, 1, 15, 0x00)                # INT_MASK = 4
     # r4 = the enabling value, r5 = the address it goes to; r6 = pass 1's (disabling) value
@@ -122,6 +132,8 @@ def prog(src, k, j, pad, loop=0):
         a.setr(5, IC + 0x10 + 8 * int(src[3])); a.setr(4, H); a.setr(6, 0)
     elif src == 'int2en':
         a.setr(5, IC + 0x50); a.setr(4, 3); a.setr(6, 1)
+    elif src == 'sdirqen':
+        a.setr(5, SD + 0x130); a.setr(4, 1 << 8); a.setr(6, 0)
     elif src == 'vga':
         a.setr(5, VGA); a.setr(4, 24); a.setr(6, 8)
     a.setr(1, 1)

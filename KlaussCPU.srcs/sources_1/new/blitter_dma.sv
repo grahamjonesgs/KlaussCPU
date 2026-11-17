@@ -211,6 +211,13 @@ module blitter_dma (
                     default: ;
                 endcase
             end
+            // §9 review MINOR 2: the S command's reset kills a START
+            // written in its cycle too.  r_pipe_owns lags st.SM by one
+            // cycle, so the dying pipeline's held DV can still be a CTRL
+            // START store in the cycle r_s_rst is high: its pulse, a cycle
+            // later, would reach the engine after the reset and run a blit
+            // with the old registers under the image being loaded.
+            if (i_soft_rst) r_start_pulse <= 1'b0;
         end
     end
 

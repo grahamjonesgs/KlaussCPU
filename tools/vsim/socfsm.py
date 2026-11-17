@@ -114,6 +114,27 @@ PROBE = r"""
       fr_gr_q = g;
    end
    always @(posedge dut.i_Clk) if (dut.st.SM == LOADING_BYTE && !fr_ld_q) $display("FR t=%0d S takes effect", fr_t);
+   // --- §9 review MINOR 2: CTRL START stores reaching the idle blitter
+   // (their DV rises, while a program runs: the placement of an S on
+   // one), one in the cycle of the S's reset pulse (coverage: the blitter
+   // idle, so the store would set its start pulse), and blits the engine
+   // starts while the loader runs (each one is a failure)
+   int fr_bs_n = 0, fr_bl_st_ld = 0; bit fr_bs_q = 0, fr_bb_q = 0, fr_bs_s = 0;
+   always @(posedge dut.i_Clk) begin
+      automatic bit c = dut.w_blit_write_DV && dut.w_mmio_addr[15:0] == 16'h0000 && dut.w_mmio_write_data[0] &&
+                        !dut.blitter_dma_i.r_busy;
+      if (dut.st.SM == PIPE_RUN && c && !fr_bs_q && fr_bs_n < fr_gr_max) begin
+         fr_bs_n++; $display("FR t=%0d blit start store", fr_t);
+      end
+      fr_bs_q = c;
+      if (dut.r_s_rst && c) fr_bs_s = 1;
+      // (one started in the cycle of the reset pulse dies with it)
+      if (dut.st.SM == LOADING_BYTE && dut.blitter_dma_i.r_busy && !fr_bb_q && !dut.r_s_rst) begin
+         fr_bl_st_ld++; $display("FR t=%0d blit started while the loader runs", fr_t);
+      end
+      fr_bb_q = dut.blitter_dma_i.r_busy;
+   end
+   final $display("FR blit starts while loading=%0d start store at S=%0d", fr_bl_st_ld, fr_bs_s);
    final $display("FR final retired fsm=%0d tb=%0d acks=%0d bad_acks=%0d ld_sd_grant=%0d ld_sd_wr=%0d ld_blit_grant=%0d grants vga=%0d blit=%0d sd=%0d",
                   dut.r_instr_count, fr_ret, fr_acks, fr_bad, fr_sd_ld, fr_sdw_ld, fr_bl_ld,
                   dut.mem_read_write.r_grant_vga, dut.mem_read_write.r_grant_blit,
@@ -266,6 +287,8 @@ PROBE = r"""
 """
 
 MARK, MAGIC = 0x300000, 0x13579BDF
+# socsload blits: the S placed this many cycles from a START store's DV rise
+BLITS_D = tuple(int(x) for x in os.environ.get('BLITS_D', '-2,-1,0,1,2').split(','))
 FR = ('fr', PROBE)
 
 
@@ -597,9 +620,22 @@ def cmd_socsload(a):
     bl.setr(4, 2); bl.st(64, 4, 13, 0x08)                             # DONE: clear
     bl.setr(4, 0x11); bl.st(64, 4, 13, 0x00)                          # START, FILL, IRQ_EN
     bl.jmp('top')
+    # §9 review MINOR 2: back-to-back 16-pixel FILLs (no IRQ), a START store
+    # every few dozen cycles; the S is placed on their DVs (cases blits_*)
+    bs = Asm()
+    bs.setr(13, 0xF00E0000)
+    for off, v in ((0x10, 0x500000), (0x18, 1280), (0x30, 16), (0x38, 1), (0x40, 0x1234)):
+        bs.setr(1, v); bs.st(64, 1, 13, off)
+    bs.setr(12, 1); bs.setr(11, 2)
+    bs.label('top')
+    bs.ld(64, 4, 13, 0x08); bs.alu('and', 4, 4, 12)                    # STATUS.BUSY
+    bs.fbr('ne', 4, 0, 'top', imm=True)
+    bs.st(64, 11, 13, 0x08)                                           # DONE: clear
+    bs.st(64, 12, 13, 0x00)                                           # START, FILL
+    bs.jmp('top')
     kt = kbt(tiny_loaded(), os.path.join(run.WORK, 'fr_tiny.kbt'))
     fails = n = 0
-    cov = {'sd': 0, 'blit': 0}
+    cov = {'sd': 0, 'blit': 0, 'blits': 0}
     cases = [('sd', s, 1, 0, kp), ('blit', bl, 2, 0, kp)]
     # the S placed 2 / 5 / 9 cycles after later grant rises (a short load):
     # the run is deterministic up to the S, so pass 1 (offset 0) gives the
@@ -617,6 +653,21 @@ def cmd_socsload(a):
             fails += 1
         for g, d in zip(later, (2, 5, 9)):
             cases.append((tag, img, what, g + d - int(ts.group(1)), kt))
+    # the S's reset pulse placed around the first cycles of later START
+    # stores' DVs (before the §9 review fix, the one in the pulse's cycle
+    # started a blit while the loader ran)
+    if not a.only or 'blits' in a.only:
+        r = go(exe, bs, 'fr_sload_blits_p1', ['+FR_MODE=8', '+FR_WHAT=2', f'+FR_KBT={kt}'])
+        ts = re.search(r'FR t=(\d+) S takes effect', r['log'])
+        r = go(exe, bs, 'fr_sload_blits_p1n', ['+FR_MODE=8', '+FR_WHAT=2', '+FR_NOS', '+FR_GRMAX=100000'])
+        sts = [int(x) for x in re.findall(r'FR t=(\d+) blit start store', r['log'])]
+        later = [g for g in sts if ts and g > int(ts.group(1)) + 50][:2] if ts else []
+        if len(later) < 2:
+            print(f'FAIL socsload blits: pass 1 found no START stores after the S ({len(sts)} stores)')
+            fails += 1
+        for g in later:
+            for d in BLITS_D:
+                cases.append(('blits', bs, 2, g + d - int(ts.group(1)), kt))
     for tag, img, what, off, kf in cases:
         if a.only and tag not in a.only:
             continue
@@ -629,12 +680,21 @@ def cmd_socsload(a):
                            f'blit={f["ld_bl"]} cycles')
             if f['g_vga'] or f['g_blit'] or f['g_sd']:
                 bad.append(f'a grant held at the end: vga={f["g_vga"]} blit={f["g_blit"]} sd={f["g_sd"]}')
+        mb = re.search(r'FR blit starts while loading=(\d+) start store at S=(\d)', r['log'])
+        if not mb:
+            bad.append('no blit-starts line')
+        else:
+            if int(mb.group(1)):
+                bad.append(f'{mb.group(1)} blits started while the loader ran')
+            if tag == 'blits':
+                cov['blits'] += mb.group(2) == '1'
         m = re.search(r'FR at S grants sd/blit/vga=([01]{3}) orphan releases=(\d+)', r['log'])
         if not m:
             bad.append('no grant-at-S line')
         else:
             held = m.group(1)[what - 1] == '1'
-            cov[tag] += held
+            if tag != 'blits':
+                cov[tag] += held
             # (the blitter's reset drops its req mid-tenure: the arbiter's
             # orphaned-grant guard must release the grant.  The SD engine's
             # DDR adapter is not reset — it finishes its one transaction and
@@ -658,7 +718,9 @@ def cmd_socsload(a):
     for k, v in cov.items():
         if not a.only or k in a.only:
             if not v:
-                print(f'FAIL socsload coverage: no S found the {k} grant held')
+                print(f'FAIL socsload coverage: ' + ('no S pulse found a START store' if k == 'blits'
+                                                     else f'no S found the {k} grant held'))
                 fails += 1
-    print(f'socsload: {fails} failing of {n} (runs whose S found the grant held: sd {cov["sd"]}, blit {cov["blit"]})')
+    print(f'socsload: {fails} failing of {n} (runs whose S found the grant held: sd {cov["sd"]}, blit {cov["blit"]}; '
+          f'whose S pulse found a START store: blits {cov["blits"]})')
     return 1 if fails else 0

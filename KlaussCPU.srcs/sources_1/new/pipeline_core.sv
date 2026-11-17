@@ -1618,12 +1618,22 @@ module pipeline_core
    // later in the block are older and win: one that kills the EI clears /
    // sets fetch_halt itself, and an SMC squash of the ID op alone on the
    // conversion edge keeps fetch halted (ev_eicv).
-   // Why that is always in time: the enabling store holds MEM until its
-   // MMIO ack, >= 3 cycles after its DV (the strobe delayed 2 + the
-   // splitter's register); its register is written at the DV's first edge
-   // and every source reaches irq_ok within 2 cycles of it (r_eth_irq for
-   // INT2_EN), irq_ok_q within 3 — by the ack's cycle.  The EI, younger,
-   // can leave EX at the earliest on that cycle's edge.
+   // Why that is always in time: the enabling store (MMIO: never posted)
+   // holds MEM until its ack, and the EI, younger, can leave EX at the
+   // earliest on the edge of the ack's cycle; so the conversion sees a
+   // source the store enables iff irq_ok_q is high in that cycle, i.e.
+   // irq_ok rises no later than one cycle before it.  With the store's DV
+   // first high in cycle T, the SoC's ack reaches the core in T+3 (the
+   // strobe delayed 2 + the splitter's register), and each enable reaches
+   // irq_ok by: INT_MASK, INT_VECn, VGA_CTRL's VSYNC_IRQ_EN T+1 (slack 1);
+   // INT2_EN T+2 (r_eth_irq; slack 0).  SD's own SDM_IRQEN reaches it in
+   // T+4 (sd_native's registered MMIO inputs, r_irq_en, o_irq, r_eth_irq),
+   // so the SoC acks that one register in T+5 (KlaussCPU.sv r_sdie_q,
+   // §9 review MINOR 1; slack 0).  An Ethernet EV_ENABLE store's ack comes
+   // through the LiteEth bridge, ~2 cycles after its irq_ok.  The
+   // blitter's IRQ_EN is written only with START, which clears DONE.
+   // (socei.py covers every source above but Ethernet; a source 1 cycle
+   // late shows as an imprecise cell there.)
    // irq_ok_q: registered (timing; a source that was pending one cycle
    // before is pending — at worst the conversion costs a refetch).
    // (id_isei / ex_isei: a plain EI, not serialized for another reason)
