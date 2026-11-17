@@ -449,8 +449,24 @@ module tb_soc;
    // does not.  4,000 cycles later the run ends with the consistency
    // checker's count (an answer to the dead master's read delivered to the
    // D-cache is a wrong read answer).
+   // +RSTORPH_ANY (review of §8): at the k-th start of any DMA tenure —
+   // no read need be accepted below (a master between transactions).
+   // After the press the run reports, at its end, the grants still held
+   // and the D-cache's progress (its DDR answers after the release, the
+   // longest run of cycles its request waited): an arbiter that never
+   // releases an orphaned grant hangs every later miss.
    int rst_k = 0, rst_seen = 0;
-   bit rst_go = 0, rst_c_q = 0;
+   bit rst_go = 0, rst_c_q = 0, rst_any = 0, rst_post = 0;
+   longint rst_ans = 0, rst_wait = 0, rst_wmax = 0;
+   initial rst_any = $test$plusargs("RSTORPH_ANY");
+   always @(posedge dut.i_Clk) if (rst_post) begin
+      if (dut.mem_read_write.w_cache_ddr_ready) rst_ans++;
+      if ((dut.mem_read_write.o_ddr_mem_read_DV || dut.mem_read_write.o_ddr_mem_write_DV) &&
+          !dut.mem_read_write.w_cache_ddr_ready) begin
+         rst_wait++;
+         if (rst_wait > rst_wmax) rst_wmax = rst_wait;
+      end else rst_wait = 0;
+   end
    always @(posedge dut.i_Clk) if (rst_k != 0 && !rst_go) begin
       // (the read accepted below: the L2's front end busy with a DMA read,
       // or ddr2_control in a read state)
@@ -465,7 +481,7 @@ module tb_soc;
                          dut.mem_read_write.r_grant_sd ||
 `endif
                          dut.mem_read_write.r_grant_c2) &&
-                        dut.mem_read_write.mig_read_DV && dut.mem_read_write.o_ddr_mem_read_DV && acc;
+                        (rst_any || (dut.mem_read_write.mig_read_DV && dut.mem_read_write.o_ddr_mem_read_DV && acc));
       if (c && !rst_c_q) begin
          rst_seen++;
          if (rst_seen == rst_k) rst_go = 1;
@@ -496,7 +512,16 @@ module tb_soc;
          cpu_resetn = 1'b0;
          repeat (40) @(posedge clk100);
          cpu_resetn = 1'b1;
+         rst_post = 1;
          repeat (4000) @(posedge dut.i_Clk);
+         $display("TB_SOC: RSTORPH after grants vga=%0d blit=%0d sd=%0d c2=%0d cache_answers=%0d cache_wait_max=%0d",
+                  dut.mem_read_write.r_grant_vga, dut.mem_read_write.r_grant_blit,
+`ifdef SD_DMA_PROBE
+                  dut.mem_read_write.r_grant_sd,
+`else
+                  1'b0,
+`endif
+                  dut.mem_read_write.r_grant_c2, rst_ans, rst_wmax);
          $display("TB_SOC: RSTORPH done consistency checks=%0d errors=%0d", cc_n, cc_err);
          $finish;
       end

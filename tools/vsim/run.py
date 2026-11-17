@@ -2030,7 +2030,7 @@ def cmd_socframe(a):
     return 1 if fails else 0
 
 
-def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False):
+def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False, bypass=False):
     """HW_PERF_PLAN §6: 640 x 480 RGB565 scanout of a framebuffer at 4 MiB
     under heavy CPU traffic: a strided walk over `span` bytes (D-cache and L2
     misses, dirty victims on both levels, so the L2's write buffer drains),
@@ -2049,6 +2049,13 @@ def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False):
     a.setr(1, 4); a.st(64, 1, 15, 0x18)                 # clear the underflow count
     a.setr(1, 1); a.st(64, 1, 15, 0x00)                 # SCANOUT_EN, RGB565, native
     a.setr(14, 0xF0050000)
+    if bypass:
+        # (§8 review) the L2 in runtime bypass: L2_CTRL = 0 (write back,
+        # invalidate, then disabled); the periodic walks below write 2
+        a.setr(1, 0); a.st(64, 1, 14, 0x28)
+        a.label('bpoll')
+        a.ld(64, 1, 14, 0x28); a.setr(12, 0x100); a.alu('and', 1, 1, 12)
+        a.fbr('ne', 1, 0, 'bpoll', imm=True)
     a.setr(10, 0x100000)                                # data base
     a.setr(9, (lines * 3200) // 40)                     # iterations (~40 cycles each at best)
     a.setr(8, 0)                                        # offset
@@ -2072,7 +2079,7 @@ def _vga_prog(lines, wbinv_every=1500, flush_every=0, span=0x80000, blit=False):
     a.dec(7)
     a.fbr('ne', 7, 0, 'nowrap', imm=True)
     a.setr(7, wbinv_every)
-    a.setr(1, 3); a.st(64, 1, 14, 0x28)                 # L2_CTRL: WBINV (ignored without the L2)
+    a.setr(1, 2 if bypass else 3); a.st(64, 1, 14, 0x28)   # L2_CTRL: WBINV (ignored without the L2)
     a.label('poll')
     a.ld(64, 1, 14, 0x28); a.setr(12, 0x100); a.alu('and', 1, 1, 12)
     a.fbr('ne', 1, 0, 'poll', imm=True)
@@ -2112,29 +2119,55 @@ def cmd_socvga(a):
 
 def cmd_socorphan(a):
     """HW_PERF_PLAN §8 item 3d: CPU_RESETN pressed while a DMA master (VGA
-    scanout; with --blit the blitter's FILL too) holds the DDR grant with a
-    read below and the D-cache waits (tb_soc +RSTORPH=<k>, the k-th such
-    moment): the masters reset, the memory system does not.  The arbiter
-    must not hand the bus to the D-cache before the dead master's read has
-    been answered, or that answer reaches the D-cache (a wrong read answer:
-    tb_soc's consistency checker)."""
+    scanout; with blit the blitter's FILLs too) holds the DDR grant
+    (tb_soc +RSTORPH=<k>, the k-th such moment): the masters reset, the
+    memory system does not.  'read': a read of that master is accepted
+    below while the D-cache waits — the arbiter must not hand the bus to
+    the D-cache before that read is answered, or the answer reaches the
+    D-cache (a wrong read answer: tb_soc's consistency checker).  'any'
+    (+RSTORPH_ANY, §8 review): any moment of a tenure, a read pending or
+    not.  Every run must also end with no grant held, and no D-cache
+    request may wait more than 2,000 cycles after the press: an orphaned
+    grant that is never released hangs every later miss.
+    With the L2, also in runtime bypass (L2_CTRL = 0)."""
     exe = build_soc(a.rev, tb_wt=bool(a.rev))      # (an older RTL under this tb_soc)
-    fails = 0
-    for blit in (False, True):
-        prog = _vga_prog(40, 1500, span=0x80000, blit=blit)
-        for k in a.k:
-            tag = f'orph_{int(blit)}_{k}'
-            r = run_soc(exe, prog, tag, timeout=3600, gate=False,
-                        plus=['+VGA_V0=478', f'+RSTORPH={k}'] + a.plus)
-            m = re.search(r'RSTORPH done consistency checks=(\d+) errors=(\d+)', r['log'])
-            g = re.search(r'RSTORPH reset at grant (\S+ \S+ \S+ \S+)', r['log'])
-            ok = bool(m and g) and int(m.group(2)) == 0
-            fails += not ok
-            print(f'{"pass" if ok else "FAIL"} socorphan blit={int(blit)} k={k} {g and g.group(1)} '
-                  f'checks={m and m.group(1)} errors={m and m.group(2)} ' +
-                  ' '.join(l for l in r['log'].splitlines() if 'FATAL' in l)[:300])
-            shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
-    print(f'{fails} failing')
+    l2, _ = l2_cfg()
+    fails = n = 0
+    for bypass in ((False, True) if l2 else (False,)):
+        for mode in a.modes:
+            for blit in (False, True):
+                prog = _vga_prog(40, 1500, span=0x80000, blit=blit, bypass=bypass)
+                for k in a.k:
+                    tag = f'orph_{int(bypass)}{mode}_{int(blit)}_{k}'
+                    plus = ['+VGA_V0=478', f'+RSTORPH={k}'] + (['+RSTORPH_ANY'] if mode == 'any' else []) + a.plus
+                    r = run_soc(exe, prog, tag, timeout=3600, gate=False, plus=plus)
+                    m = re.search(r'RSTORPH done consistency checks=(\d+) errors=(\d+)', r['log'])
+                    g = re.search(r'RSTORPH reset at grant (\S+ \S+ \S+ \S+)', r['log'])
+                    f = re.search(r'RSTORPH after grants vga=(\d) blit=(\d) sd=(\d) c2=(\d) '
+                                  r'cache_answers=(\d+) cache_wait_max=(\d+)', r['log'])
+                    bad = []
+                    if not (m and g and f):
+                        bad.append('no RSTORPH report')
+                    else:
+                        if int(m.group(2)):
+                            bad.append(f'{m.group(2)} wrong answers')
+                        if any(int(f.group(i)) for i in range(1, 5)):
+                            bad.append('grant held at the end: ' + ' '.join(
+                                f'{nm}={f.group(i)}' for i, nm in enumerate(('vga', 'blit', 'sd', 'c2'), 1)))
+                        if int(f.group(6)) > 2000:
+                            # (the D-cache need not have work after the press —
+                            # an early press finds none — but a request of its
+                            # own must not wait)
+                            bad.append(f'no progress: cache_answers={f.group(5)} wait_max={f.group(6)}')
+                    n += 1
+                    fails += bool(bad)
+                    if bad or a.verbose:
+                        print(f'{"FAIL" if bad else "pass"} socorphan bypass={int(bypass)} {mode or "read"} '
+                              f'blit={int(blit)} k={k} {g and g.group(1)} checks={m and m.group(1)} '
+                              f'{f and f.group(0)[22:]} ' + '; '.join(bad) + ' ' +
+                              ' '.join(l for l in r['log'].splitlines() if 'FATAL' in l)[:200])
+                    shutil.rmtree(os.path.join(WORK, 'socruns', tag), ignore_errors=True)
+    print(f'{fails} failing of {n}')
     return 1 if fails else 0
 
 
@@ -2617,6 +2650,8 @@ def main():
     sx.add_argument('--seed0', type=int, default=0); sx.add_argument('-v', '--verbose', action='store_true')
     sor = sub.add_parser('socorphan'); sor.add_argument('--rev')
     sor.add_argument('--k', type=int, nargs='+', default=[1, 2, 3, 5, 8, 13])
+    sor.add_argument('--modes', nargs='+', default=['', 'any'], help="'' (a read accepted below) and/or 'any'")
+    sor.add_argument('-v', '--verbose', action='store_true')
     sor.add_argument('--plus', action='append', default=[])
     sfr = sub.add_parser('socframe'); sfr.add_argument('--rev', help="another revision's RTL (its own tb_soc)")
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)

@@ -121,7 +121,11 @@ module ddr2_control (
    localparam WRITE_B1 = 4'd6;   // push the second 64-bit write beat (2:1 UI)
    localparam READ_CMD2 = 4'd7;  // BL16 spike: issue the 2nd pipelined BL8 read command
    logic [3:0] state = IDLE;
-   assign o_fe_idle = state == IDLE;
+   // (§8 review: WAIT is the controller's resting state — IDLE lasts only
+   // until the answered request's DV drops.  Neither holds an accepted
+   // request: an answer's ready leaves on the edge into IDLE, and WAIT
+   // moves to READ / WRITE on the (synchronised) DV it accepts.)
+   assign o_fe_idle = state == IDLE || (state == WAIT && !synced_write_dv && !synced_read_dv);
 
    logic rd_beat = 1'b0;           // 0 = awaiting beat0 (line[63:0]), 1 = beat1 (line[127:64])
    // 32 B lines: a pipelined dual-BL8 read returns 4 beats reassembled into the
