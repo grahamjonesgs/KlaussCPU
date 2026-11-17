@@ -41,8 +41,12 @@ Then, released together on 2026-11-16 as `sddma_release_3ae5ed6.bit`
   user+sys).
 
 Then (2026-11-17, Graham: "the known correctness issues, then stop"):
-§8, branch `fixes` — reviewed, built (`fixes_1d6a04b.bit`, tier 1), not
-on the board.
+§8, branch `fixes` — reviewed, built, released 2026-11-17 as
+`fixes_release_1d6a04b.bit` (master fast-forwarded to `fixes`; QSPI
+written, rollback entry in ~/.cache/kbuild/rollback/README.txt). Board:
+all_tests 31/32, board-check 16/16 (SRAM and flash boot), SD DMA checks
+clean; clang deflate / cxx-hello 30.18 / 77.67 s user+sys with the PGO /
+ThinLTO clang, unchanged vs its 30.2 / 77.5 s baseline.
 
 Next: **waiting on Graham.** On 2026-11-16 (relayed by the runtime
 session) Graham ended the clang-speed work after one last software item,
