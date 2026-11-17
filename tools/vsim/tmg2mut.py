@@ -22,19 +22,21 @@ BASE = os.environ.get('TMG2MUT_BASE', 'e298fc6')   # origin/master at the start 
 CORE = [['test'], ['diff', '--base', BASE, '--seeds', '12', '--lats', '1', '3']]
 FWD = [['test'], ['fwdfuzz', '--base', BASE, '--seeds', '8'], ['diff', '--base', BASE, '--seeds', '12', '--lats', '1', '3']]
 SOC = [['socdiff', '--base', BASE, '--seeds', '6'], ['socmmio', '--base', BASE]]
+# (the L2's DDR read path: socdiff's small programs hit in the L2 after the boot copy wrote them)
+L2S = [['socl2']]
 TLB = [['test', 'tx_*', 'tlb_*', 'wk_*'], ['tlbpage'], ['tlbdiff']]
 
 # (name, what it breaks, file, suite (list of run.py argument lists), old, new[, old2, new2 ...])
 MUTS = [
     # ---------------- L2: the read beat's lanes by case ----------------
-    ('l2_lane', 'beat 0 merged into the wrong half of the sector', L2, SOC,
+    ('l2_lane', 'beat 0 merged into the wrong half of the sector', L2, L2S,
      "            2'b00: rb_buf[191:128] = app_rd_data;\n            2'b01: rb_buf[ 63:  0] = app_rd_data;",
      "            2'b00: rb_buf[ 63:  0] = app_rd_data;\n            2'b01: rb_buf[191:128] = app_rd_data;"),
-    ('l2_lane_na', 'the same, without its equivalence assertion', L2, SOC,
+    ('l2_lane_na', 'the same, without its equivalence assertion', L2, L2S,
      "            2'b00: rb_buf[191:128] = app_rd_data;\n            2'b01: rb_buf[ 63:  0] = app_rd_data;",
      "            2'b00: rb_buf[ 63:  0] = app_rd_data;\n            2'b01: rb_buf[191:128] = app_rd_data;",
      "        assert (rb_buf == rb_buf_ref) else", "        assert (1'b1) else"),
-    ('l2_half_na', "a narrow answer's half swapped (no assertion)", L2, SOC,
+    ('l2_half_na', "a narrow answer's half swapped (no assertion)", L2, L2S,
      "wire [127:0] rb_half = rb_h ? rb_buf[127:0] : rb_buf[255:128];",
      "wire [127:0] rb_half = rb_h ? rb_buf[255:128] : rb_buf[127:0];",
      "        assert (rb_half == rb_buf_ref[255 - 128*rb_h -: 128]) else", "        assert (1'b1) else"),
@@ -54,7 +56,7 @@ MUTS = [
     ('wl_b_na', 'an immediate operand replaced by a WB load whose rd matches the rs2 field (no assertion)', PC, FWD,
      "(wl_b && !id_b_one && !id_b_imm) ? f_wsh(id_w, wb_ldval)", "(wl_b && !id_b_one) ? f_wsh(id_w, wb_ldval)",
      '         else $fatal(1, "shift-last forward form (pc %h)", id_pc);', '         else ;'),
-    ('wl_c_na', "ex_c's WB load forward ignores the MEM producer (no assertion)", PC, FWD,
+    ('wl_c_na', "ex_c's WB load forward ignores the MEM producer (no assertion)", PC, [['test', 'fwd_wl_prio']] + FWD,
      "wire wl_c = b_wb && wb_ldf && wb_rd == id_rd   && !(mem_fwd_ok && mem_d.rd == id_rd);",
      "wire wl_c = b_wb && wb_ldf && wb_rd == id_rd;",
      '         else $fatal(1, "shift-last forward form (pc %h)", id_pc);', '         else ;'),
@@ -72,7 +74,8 @@ MUTS = [
      "      assert (w_pd_ser == w_decf.serialize && w_pd_priv == f_priv(w_dec, w_op) && w_pd_legal == w_dec.legal)",
      "      assert (1'b1)"),
     ('lcy', "the last word's carry for LEN 11 from pc[26:2]", PC, [['test']],
-     "(w_op[31:30] == 2'b11 && &pc[26:3])", "(w_op[31:30] == 2'b11 && &pc[26:2])"),
+     "return (len == 2'b11 && &p[26:3]) || (len == 2'b10 && &p[26:2]);",
+     "return (len == 2'b11 && &p[26:2]) || (len == 2'b10 && &p[26:2]);"),
     ('pkseg', "the frame's kseg test without the SP - 8 borrow", PC, TLB,
      "return (v[26:3] == 24'd0) ? (v[31:27] == 5'b10001) : (v[31:27] == 5'b10000);",
      "return v[31:27] == 5'b10000;"),
@@ -93,11 +96,11 @@ MUTS = [
      "wire        nlb0_dw_ok     = in0 ? nlb0_ok_b1 : nlb0_ok_pc;", "wire        nlb0_dw_ok     = in0 ? nlb0_ok_pc : nlb0_ok_b1;",
      '         else $fatal(1, "nlb*_dw_ok != the miss_dw form (pc %h)", pc);', '         else ;'),
     # ---------------- SoC: the bus region predecode ----------------
-    ('bus_eth', 'the LiteEth region without 0xF008', TOP, [['soceth'], ['socmmio', '--base', BASE]],
+    ('bus_eth', 'the LiteEth region without 0xF007 (the RX slots)', TOP, [['soceth'], ['socmmio', '--base', BASE]],
      "return a[27:16] == 12'h006 || a[27:16] == 12'h007 || a[27:16] == 12'h008;",
-     "return a[27:16] == 12'h006 || a[27:16] == 12'h007;"),
-    ('bus_fsm', "the FSM's accesses never MMIO", TOP, [['socframe'], ['socbreak', 'load_split.*']],
-     "wire        w_bus_io   = r_pipe_owns_dec ? pip_m_io : w_st_io;", "wire        w_bus_io   = r_pipe_owns_dec ? pip_m_io : 1'b0;"),
+     "return a[27:16] == 12'h006 || a[27:16] == 12'h008;"),
+    ('bus_pip', "the pipeline's accesses never MMIO", TOP, [['socmmio', '--base', BASE]],
+     "wire        w_bus_io   = r_pipe_owns_dec ? pip_m_io : w_st_io;", "wire        w_bus_io   = r_pipe_owns_dec ? 1'b0 : w_st_io;"),
     # ---------------- round 2 ----------------
     ('pdx_sel', "the field predecode's slot-0 / slot-1 candidates swapped", PC, [['test']],
      "wire [14:0] w_px = pc[2] ? (in0 ? w_pdx[1] : w_pdx[3]) : (in0 ? w_pdx[0] : w_pdx[2]);",

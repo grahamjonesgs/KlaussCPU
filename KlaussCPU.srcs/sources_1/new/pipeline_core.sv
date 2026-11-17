@@ -618,7 +618,10 @@ module pipeline_core
    endfunction
 
    // ------------------------------------------- IF: 2-dword window (IFB model)
-   logic [63:0] ifb_dw [0:1];
+   // (HW_PERF_PLAN §10 timing: replicated — after the candidate predecode
+   // each op-word bit feeds four decode cones besides the window mux, ~50
+   // loads, 1.5 ns: ifb_dw -> the predecode -> id_privop / id_ser)
+   (* max_fanout = 16 *) logic [63:0] ifb_dw [0:1];
    logic [28:0] ifb_base;          // dword address of slot 0
    logic [1:0]  ifb_val;
    // MMU stage 3: per-slot fetch-fault tags.  A slot served by a fake fill
@@ -908,8 +911,15 @@ module pipeline_core
    // (HW_PERF_PLAN §10 timing: replicated — the fetch-port CAM's key, ~40
    // loads across the 32 entries: it_vpn -> the CAM -> the PFN mux -> ut_pa,
    // fable_b6's worst)
-   (* max_fanout = 12 *) logic [15:0] it_vpn;
-   (* max_fanout = 12 *) logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
+   logic [15:0] it_vpn;
+   logic [7:0]  it_asid;          // the fetch-port CAM's ASID (ASID, or TLB_HI's for a TLBP)
+   // (HW_PERF_PLAN §10 timing) four kept copies of the fetch-port CAM's key,
+   // loaded with it_vpn / it_asid: each serves a quarter of the 32 entries
+   // (it_vpn's ~42 loads across the CAM: it_vpn -> the CAM -> the PFN mux
+   // -> ut_pa led the alternate placement's list; a max_fanout attribute
+   // was not honoured).  Asserted equal to it_vpn / it_asid.
+   (* keep = "true" *) logic [15:0] it_vpnc  [0:3];
+   (* keep = "true" *) logic [7:0]  it_asidc [0:3];
    wire  [15:0] look_vpn = pf_sel ? pf_line[27:12] : miss_dw[28:13];
    logic [15:0] r_look_vpn = '0, r_look_pa = '0;
    logic        r_look_um = 1'b0, r_look_hit = 1'b0, r_look_ok = 1'b0, r_look_miss = 1'b0;
@@ -1592,7 +1602,26 @@ module pipeline_core
    // w_last_pc below.
    wire [4:0]  w_lt0 = pc[31:27];
    wire [4:0]  w_lt1 = pc[31:27] + 5'd1;
-   wire        w_lcy = (w_op[31:30] == 2'b11 && &pc[26:3]) || (w_op[31:30] == 2'b10 && &pc[26:2]);
+   function automatic logic f_lcy(logic [1:0] len, logic [26:2] p);   // pc + 4*(len-1) carries past bit 26
+      return (len == 2'b11 && &p[26:3]) || (len == 2'b10 && &p[26:2]);
+   endfunction
+   wire        w_lcy = f_lcy(w_op[31:30], pc[26:2]);
+`ifndef SYNTHESIS
+   // (self-check at time 0, as the running programs never place an
+   // instruction across a 128 MiB boundary: every LEN at the last three
+   // words below each boundary and the first above it)
+   initial begin : lcy_check
+      for (int k = 0; k < 32; k++)
+         for (int d = -12; d <= 4; d += 4)
+            for (int ln = 0; ln < 4; ln++) begin
+               logic [31:0] p, last;
+               p = 32'(k) * 32'h0800_0000 + 32'(d);
+               last = (ln == 3) ? p + 32'd8 : (ln == 2) ? p + 32'd4 : p;
+               if ((f_lcy(2'(ln), p[26:2]) ? p[31:27] + 5'd1 : p[31:27]) != last[31:27])
+                  $fatal(1, "f_lcy self-check: pc %h LEN %0d", p, ln);
+            end
+   end
+`endif
    function automatic logic f_s1t(logic [4:0] t);           // [31:28] == F
       return t[4:1] == 4'hF;
    endfunction
@@ -3854,6 +3883,7 @@ module pipeline_core
          wb_um_we <= 1'b0; wb_lr <= 1'b0; wb_sc <= 1'b0; mem_mmq <= 1'b0;
          m_vav <= 1'b0; sq_vav <= 1'b0; m_vahi <= '0; sq_vahi <= '0;
          ut_v <= '0; it_ref <= 1'b0; it_vpn <= '0; it_asid <= '0; ut_um <= '0; ut_ok <= '0; ut_miss <= '0; ut_rp <= '0;
+         for (int q = 0; q < 4; q++) begin it_vpnc[q] <= '0; it_asidc[q] <= '0; end
          ut_tl <= '0; ut_neg <= '0;
          for (int k = 0; k < UT_N; k++) begin ut_vpn[k] <= '0; ut_pa[k] <= '0; ut_ti[k] <= '0; end
          ifb_ft <= 2'b00; ifb_fm <= 2'b00; if_fflt <= 1'b0; if_fmiss <= 1'b0;
@@ -4665,6 +4695,7 @@ module pipeline_core
                   // registered before it; it covers the page next cycle)
                   if (!it_ref && !tlb_psel && !ut_q) begin
                      it_ref <= 1'b1;  it_vpn <= miss_dw[28:13];  it_asid <= tlb_asid;
+                     for (int q = 0; q < 4; q++) begin it_vpnc[q] <= miss_dw[28:13]; it_asidc[q] <= tlb_asid; end
                   end
                end else if (!mem_port_op && mem_xc == 2'd0 && !st_post && !sq_v && !ld_out && !irq_active && !w_early_ld
                             && !wb_hmiss && !(DEBUG_EN && (dbg_active || dbg_halted)) && !(IC32 && (lp_v || li_q))) begin
@@ -5439,6 +5470,7 @@ module pipeline_core
          // dropped and the lookup asks again afterwards
          if (tlb_pload) begin
             it_vpn <= tlb_hi_vpn_o;  it_asid <= tlb_hi_asid_o;  it_ref <= 1'b0;
+            for (int q = 0; q < 4; q++) begin it_vpnc[q] <= tlb_hi_vpn_o; it_asidc[q] <= tlb_hi_asid_o; end
          end
          // MMU stage 3: a TLB / ASID / TE change discards the fetch side's
          // virtual copies (the I-cache, physically tagged, is kept)
@@ -5861,7 +5893,7 @@ module pipeline_core
          .d_st     (ex_mst),
          .d_hit0 (tlb_d_hit0), .d_pfn0 (tlb_d_pfn0), .d_pok0 (tlb_d_pok0),
          .d_hit1 (tlb_d_hit1), .d_pfn1 (tlb_d_pfn1), .d_pok1 (tlb_d_pok1), .d_c15 (tlb_d_c15),
-         .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
+         .f_vpn    (tlb_f_vpn), .f_asid (it_asid), .f_vpnc (it_vpnc), .f_asidc (it_asidc), .hi_vpn_o (tlb_hi_vpn_o), .hi_asid_o (tlb_hi_asid_o),
          .f_hit (tlb_f_hit), .f_pfn (tlb_f_pfn), .f_xwr (tlb_f_xwr), .f_idx (tlb_f_idx), .w_idx (tlb_w_idx),
          // §11.8 walker: its refill (VPN = the VA's, G = 0, the ASID SR)
          .wk_we    (EN_WALK && wk_fin), .wk_vpn (exc_addr_q[31:16]),
@@ -6342,6 +6374,8 @@ module mmu_tlb
    output logic        d_pok0, d_pok1,  //   ... and it grants the access
    output logic        d_c15,
    input  logic [15:0] f_vpn,         // registers: the micro-ITLB refill, or TLB_HI for a TLBP
+   input  logic [15:0] f_vpnc [0:3],  // (§10) four copies of f_vpn / f_asid, each for a quarter of the entries
+   input  logic [7:0]  f_asidc [0:3],
    input  logic [7:0]  f_asid,
    output logic [15:0] hi_vpn_o,      // TLB_HI's VPN / ASID (the TLBP's search key)
    output logic [7:0]  hi_asid_o,
@@ -6460,7 +6494,18 @@ module mmu_tlb
 `endif
    // one fetch-port CAM: TLBP's key is loaded into f_vpn / f_asid while
    // the TLBP is in MEM (MMU stage 3 timing: no probe mux, all registers)
-   wire [N-1:0] fm = f_match(f_vpn, f_asid);
+   // (§10: entry n compares with key copy n * 4 / N; = f_match(f_vpn, f_asid), asserted)
+   logic [N-1:0] fm;
+   always_comb
+      for (int n = 0; n < N; n++)
+         fm[n] = e_v[n] && e_vpn[n] == f_vpnc[(n * 4) / N] && (e_g[n] || e_asid[n] == f_asidc[(n * 4) / N]);
+`ifndef SYNTHESIS
+   always_ff @(posedge clk) if (!rst) begin
+      for (int q = 0; q < 4; q++)
+         assert (f_vpnc[q] == f_vpn && f_asidc[q] == f_asid) else $fatal(1, "mmu_tlb: fetch key copy %0d drifted", q);
+      assert (fm == f_match(f_vpn, f_asid)) else $fatal(1, "mmu_tlb: fm != f_match");
+   end
+`endif
    assign hi_vpn_o = hi_v;  assign hi_asid_o = hi_a;
    // (timing: the permission is folded per entry, so the fault logic
    // reads one OR per carry candidate instead of the XWR muxes)

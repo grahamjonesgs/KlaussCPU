@@ -6975,3 +6975,36 @@ def tx_wrap():
         a, e, p = _te_prog(body, False, None, logs=logs, plus=plus)
         out.append((a, e, p))
     return out
+
+
+@test
+def fwd_wl_prio():
+    """HW_PERF_PLAN §10: a fast load in WB and a younger producer of the
+    same register in MEM: the MEM value wins for every ID -> EX operand —
+    rs1 (an ALU op and an address base), rs2, and a store's data (ex_c) —
+    now that the WB load / MUL forward is a separate, later select"""
+    out = []
+    for plus in ([], ['+LAT=1'], ['+LAT=3'], ['+HIT=70'], ['+HIT=95', '+LAT=2']):
+        a = Asm()
+        a.dword(DATA, 0x1111)
+        a.setr(1, DATA); a.setr(2, 0x40)
+        # store data (ex_c): LD r3; ADDI r3 <- r2 + 7 (in MEM as the ST dispatches); ST r3
+        a.ld(64, 3, 1)
+        a.addi_s(3, 2, 7)
+        a.st(64, 3, 1, 8)
+        # rs1: LD r4; ADDI r4; ADD r5 <- r4 + r2
+        a.ld(64, 4, 1)
+        a.addi_s(4, 2, 9)
+        a.alu('add', 5, 4, 2)
+        # rs2: LD r6; ADDI r6; ADD r7 <- r2 + r6
+        a.ld(64, 6, 1)
+        a.addi_s(6, 2, 11)
+        a.alu('add', 7, 2, 6)
+        # address base (rs1 of a load): LD r8; SETR r8 <- DATA + 8; LD r9 <- [r8]
+        a.ld(64, 8, 1)
+        a.setr(8, DATA + 8)
+        a.ld(64, 9, 8)
+        a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', m(DATA + 8): 0x47, 'r5': 0x89, 'r7': 0x8B,
+                        'r9': 0x47}, plus))
+    return out
