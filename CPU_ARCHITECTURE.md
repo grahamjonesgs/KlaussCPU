@@ -458,7 +458,10 @@ commits at WB and refetches at EI+4; the next boundary takes the
 interrupt.  One latched with nothing pending is converted to that form
 as it leaves EX if an interrupt is pending by then — the enabling MMIO
 store writes its register only in MEM and holds MEM until its ack, so the
-`EI` cannot have left EX before; HW_PERF_PLAN §9 item 4.)
+`EI` cannot have left EX before, and the SoC acks each enable no earlier
+than the cycle its source can be pending: SD's own `SDM_IRQEN`, the
+slowest, is acked 2 cycles later than other registers; HW_PERF_PLAN §9
+item 4 and §9 review.)
 
 A source is dispatched when `INT_MASK[n] & INT_PENDING[n] & (INT_VECn != 0)`
 and interrupts are not disabled by `DI`.

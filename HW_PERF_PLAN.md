@@ -3140,6 +3140,94 @@ EA → translation family is no longer among them.  **Bitstream
 `1a6864dba6d0ef13178313e9d832676c`** (build dir `~/.cache/kbuild/fable_b4`).
 Not run on the board.
 
+### §9 review
+
+Review of `e2523dd` and 56e59df's timing change (the reviewer's tests:
+`~/.cache/kbuild/review-tests/fable-rv`): the §9 fixes approved by
+Graham, with two MINOR findings, both gaps in them.  Fixed in `2216433`.
+
+- **MINOR 1: precise EI was late behind SD's own IRQ enable store,
+  `SDM_IRQEN` (0xF000_0130).**  Item 4's "every source reaches `irq_ok`
+  within 2 cycles of the DV" did not hold for it: with the store's DV
+  first high in T, `sd_native` registers its MMIO inputs (`r_in_wr`, T+1),
+  writes `r_irq_en` (T+2) and registers `o_irq` (T+3); `r_eth_irq` puts
+  `irq_ok` at T+4 and `irq_ok_q` at T+5, but the SoC's write ack reached
+  the core at T+3.  An EI 0 or 1 instructions behind the store was not
+  converted (`sei_sd.py`: 10 of 80 cells imprecise on `e2523dd`, `0` /
+  `1@+16` / `1@+20`).
+  **Fix** (SoC, `KlaussCPU.sv` `r_sdie_q`): a write to that dword (offset
+  0x130..0x137 of device 0x000) masks the normal ack (the strobe delayed
+  2) and is acked by a 1-cycle pulse on the strobe's rise delayed 4: the
+  core sees it at T+5, the cycle `irq_ok_q` rises.  A pulse, not the
+  delayed level: the level's tail (to 4 cycles after the DV falls) would
+  bridge into the ack of an MMIO access issued 2 cycles after the
+  completion (acked 2 cycles after its DV), leaving no low-ready cycle,
+  and the ready-edge protocol would never re-arm (the LVGL hang's
+  mechanism; mutation `sdie_lvl` deadlocks).  Every other register —
+  `SDM_FIFO`, the data PIO and the rest of SD included — keeps its
+  latency; an `SDM_IRQEN` write costs 2 more cycles.
+  **The other enables** (DV in T, the ack at T+3; `irq_ok` by): INT_MASK,
+  INT_VECn and VGA_CTRL's VSYNC_IRQ_EN T+1 (1 cycle of slack); INT2_EN
+  T+2 (through `r_eth_irq`; slack 0); Ethernet EV_ENABLE acked through the
+  LiteEth bridge, ~2 cycles after its `irq_ok` (the reviewer's figure; not
+  in tb_soc); the blitter's IRQ_EN is written only with START, which
+  clears DONE.  INT2_EN's zero slack is left as it is: it is a fixed
+  register chain, no variable latency, and `socei`'s `int2en` and
+  `sdirqen` sources fail on any source a cycle late (mutation
+  `sdie_short`, `SDM_IRQEN` acked 1 cycle early: 6 of 24 cells fail).  A
+  margin would not be free (another tag, a cycle on every INT2_EN
+  write).  `pipeline_core.sv`'s item 4 comment now states this guarantee
+  per source; CPU_ARCHITECTURE §13.1 says the SoC acks an enable no
+  earlier than its source can be pending.
+  **Tests**: `socei` source `sdirqen` (`SDM_IRQEN` 0 → CMD_DONE with
+  CMD_DONE pending, INT2_EN = SD, INT_VEC2, INT_MASK[2]; its setup has an
+  SD store right behind an `SDM_IRQEN` store).  `890a09a`: 10 of 24
+  `sdirqen` cells fail (k = 0, 1); `2216433`: 0.  `sei_sd.py`: 80 of 80
+  `1@+4`.
+- **MINOR 2: an `S` could still let one blit start during the load.**
+  `r_s_rst` is a 1-cycle pulse, and the blitter's MMIO block (with
+  `r_start_pulse`) was reset only by `i_Rst_L`.  `r_pipe_owns` lags
+  `st.SM` by a cycle, so in the pulse's cycle the dying pipeline's held DV
+  can still be a CTRL START store: `r_start_pulse` set a cycle later,
+  after the engine's reset, and the engine ran a blit with the old
+  registers while the loader ran.
+  **Fix** (`blitter_dma.sv`): the soft reset also clears `r_start_pulse`
+  (one line, the smallest of the three options: the SD controller already
+  drops a store in its reset cycle, as `sd_native`'s registered `r_in_wr`
+  is reset).  A START store before the pulse's cycle starts the engine,
+  which the pulse resets; one after it is not the pipeline's
+  (`r_pipe_owns` = 0).
+  **Tests**: `socsload` cases `blits_*`: back-to-back 16-pixel FILLs, the
+  `S` placed −2..+2 cycles from the DV rise of two later START stores (a
+  run without the `S` gives them), with the tiny .kbt.  The probe counts
+  blits the engine starts while the loader runs (outside the pulse's own
+  cycle) — each is a failure, in every `socsload` case — and, as
+  coverage, runs whose pulse found a START store reaching the idle
+  blitter.  The old grant checks miss this: a short blit ends inside
+  their 200-cycle grace.  `890a09a` (`--rev`): 4 of 10 fail ("1 blits
+  started while the loader ran"); `2216433`: 0 of 10, 4 runs covered.
+- **Mutations** (`fablemut.py`): `sdie_none` (no stretch: 10 of 24
+  `sdirqen` cells fail), `sdie_short` (1 cycle, not 2: 6 fail),
+  `sdie_lvl` (the delayed level, not a pulse: 24 of 24 fail, deadlock),
+  `s_bstart` (the start pulse not cleared: `blits_81`); with `s_blit`
+  re-run: 5 of 5 killed.
+- **Regression** on `2216433` vs `d612472`: core `test` (2,242 pass), `diff` 40 seeds × LAT
+  1 / 3 / 7 `+TRACECYC` 0 differing, 169,092 = 169,092 cycles, `diff
+  --irq` 107,709 = 107,709; `l2_regress.sh` soc36 0 failing (socdiff
+  61,698 / 24,645 cycles as before, `socorphan` 48, `socreset` 47,
+  `socbreak` 93, `socsload` 18, `socei` 245); L2 off `socsload` 18,
+  `socorphan` 24; `socsddma` 402 runs, `socsdabort --rounds 4`,
+  `sddmamut.py` 42 of 42 killed: all passing.  `sei_sd.py`: 80 of 80
+  `1@+4`.
+- **Build** (standard flow, `fable_b5`): tier 1 **+0.024** / +0.006, met, but
+  **below the +0.03 target**; 40,903 LUTs, 27,522 FFs.  Worst path:
+  `r_pipe_owns` → `w_pip_ready` → the core's MEM logic → `m_addr` CE
+  (8 levels; unchanged logic — `w_pip_ready` takes the splitter's
+  registered ready, so the new ack term only feeds that register's D),
+  then `pc` → `ifb_dw` (+0.045), the multiplier (+0.077), `m_addr` →
+  `qspi_ctrl` (+0.107).  Bitstream left in the build dir (md5
+  `7f306efbf4b3f3e2832de25f0c3ca00d`), not released; waits for a decision.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
