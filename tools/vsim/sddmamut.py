@@ -123,11 +123,12 @@ MUTS = [
      "cc_st && cc_done && mem_wdata[6] && !mem_wdata[3] && r_cop_nz && !mem_wdata[2] && !mem_wdata[1];"),
     # ---------------- the tmg review's forward mutants (fwdfuzz) ----------------
     ('fwd_tb_md', "t_tb_d takes a MEM shift's result for any mode, not only [rs1+rs2] (tmg review)", PC, 'fwd',
-     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0] : t_tb_n;",
-     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem)    ? w_sh2[31:0] : t_tb_n;"),
+     # (HW_PERF_PLAN §10: the WB load forward now follows on the next line)
+     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem && t_md == 2'b11)    ? w_sh2[31:0]",
+     "   wire [31:0] t_tb_d = (fs_b && !t_m8 && t_mem)    ? w_sh2[31:0]"),
     ('fwd_ta_md', "t_ta_d takes a MEM shift's result for an [imm] access (tmg review)", PC, 'fwd',
-     "   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0] : t_ta_n;",
-     "   wire [31:0] t_ta_d = (fs_a && !t_sp) ? w_sh2[31:0] : t_ta_n;"),
+     "   wire [31:0] t_ta_d = (fs_a && !t_sp && !(t_mem && t_md == 2'b10)) ? w_sh2[31:0]",
+     "   wire [31:0] t_ta_d = (fs_a && !t_sp) ? w_sh2[31:0]"),
     # ---------------- RANGE_IINV (tb_soc) ----------------
     ('iinv_nomask', 'the range sweep clears nothing', PC, ['iinv', 'iinv_wide'],
      "         wire we = swst ? (!r_sw_rng || r_sw_mask[b])", "         wire we = swst ? (!r_sw_rng)"),

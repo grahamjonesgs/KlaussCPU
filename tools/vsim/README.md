@@ -95,6 +95,7 @@ python3 tools/vsim/run.py socei [--srcs mask vec0 ...] [--k 0 1 2] [--j 0 4] [--
 python3 tools/vsim/run.py permfuzz --seeds 40 --fetch --remap [--walk] [--irq] [--soc]
 python3 tools/vsim/run.py permfuzz --selfcheck --seeds 12
 python3 tools/vsim/fablemut.py [-j 6]           # the §9 mutations (each must be killed)
+python3 tools/vsim/tmg2mut.py [-j 6]            # the §10 timing restructures' mutations (each must be killed)
 ```
 
 - **`socreset` / `socbreak` / `socsload`** (`socfsm.py`) run tb_soc with

@@ -56,7 +56,11 @@ Board: all_tests 31/31, board-check 16/16 (SRAM and flash boot), SD DMA
 checks clean, aliasjit PASS; clang deflate / cxx-hello 30.24 / 77.82 s
 user+sys, unchanged.
 
-Next (queued by Graham, 2026-11-17): **a timing-hardening pass.** Thin
+Then (queued by Graham, 2026-11-17): **a timing-hardening pass** — done
+on branch `tmg2` (§10), not merged: the recurring families restructured
+and a TLB pblock; tier 1 minimum over two placements +0.066 → +0.089, the
++0.20 / +0.15 target not reached (a wall of 7-10-level paths; pipelining
+is Graham's decision).  The original queue entry: Thin
 slack is a development cost, not a reliability one (sign-off already
 covers worst-case PVT and jitter): placement noise of about ±0.1 ns and
 BRAM at 126 / 135 tiles keep pushing untouched paths to the edge, and
@@ -3271,6 +3275,341 @@ them.  **Bitstream `~/.cache/kbuild/fable_5d61392.bit`, md5
 `bb30bdadd0b13fbec710706ec3dcf949`** (build dir
 `~/.cache/kbuild/fable_b6`).  Not run on the board.
 
+## 10. Timing hardening (2026-11-17, branch `tmg2`)
+
+Graham queued this after §9: thin slack costs builds, not reliability.
+In each of the last three rounds, untouched paths drifted negative and
+needed 3-6 builds.  The goal was a standing margin:
+
+- tier 1 WNS ≥ +0.20 in the standard flow;
+- ≥ +0.15 with an alternate placer directive (ExtraTimingOpt) from the
+  same opt checkpoint;
+- WHS ≥ 0 in both;
+- cycle counts identical to `e298fc6` (the fable release, RTL `5d61392`,
+  tier 1 +0.109 / +0.023).
+
+Branch `tmg2` from `e298fc6`; not merged.
+
+**Outcome.**  The restructures removed the recurring families they
+targeted, and the standard flow met +0.239 once (build 3).  The target is
+**not** reached as a standing margin.  Across the final configuration's
+placements the minimum is +0.089 (standard +0.124 / +0.024, ExtraTimingOpt +0.089 / +0.008).  Fable's own two placements
+give +0.109 (standard) and +0.066 (its ExtraTimingOpt re-place, measured
+here).  The design now sits on a broad wall of 7-10-level paths with ~1 ns
+nets, and the worst path changes family with every placement (below).
+
+### §10 data: the families before
+
+The worst 150 unique-endpoint setup paths come from ten routed checkpoints
+still on disk:
+
+- `l2b_b2` and its ExtraPostPlacementOpt re-place;
+- `tmg_b3`;
+- `sddma_b3` and its ExtraTimingOpt re-place;
+- `fixes_b4`;
+- `fable_b3` … `fable_b6`.
+
+They are grouped by start → end and logic.  The tools are
+`~/.cache/kbuild/tmg2_rpt/` `paths.tcl` / `fams.tcl` / `fam2.py`.
+"n" counts the builds (of 10) with a path of that family below +0.25;
+levels / route are the worst path's LUT levels and the net share of its
+data path.
+
+| # | Family | Worst | n < +0.25 (of 10) | levels / route |
+|---|---|---|---|---|
+| 1 | D-cache line BRAM → hit-copy BRAM (fixed in `tmg`) | -0.187 | 2 | 3 / 69 % |
+| 2 | hit pipe → `wb_hext` | -0.144 | 3 | 12 / 71 % |
+| 3 | TLB data CAM `q_a` / `q_b` → `t1_pahi` / `mem_pa2hi` / `r_h_tag` | -0.105 | 6 | 7 / 86 % |
+| 4 | WB / MEM forward → the TLB key copies | -0.102 | 3 | 12 / 78 % |
+| 5 | `id_op` → `ex_d` (fixed in `tmg`) | -0.042 | 1 | 8 / 82 % |
+| 6 | ALU → `mem_result` | -0.001 | 4 | 22 / 61 % |
+| 7 | IRQ / RAS compare / ready → `pc`, `pos`, `pf_look`, `r_in0` | +0.011 | 7 | 10 / 76 % |
+| 8 | `ex_a` → EA → translation (fixed in §9) | +0.011 | 1 | 15 / 64 % |
+| 9 | `ifb_dw` / `r_in0` → ID latch decode (`id_ser`, `id_privop`, …) | +0.017 | 5 | 10 / 83 % |
+| 10 | MEM / ready → `m_addr` (fixed in §9 b6) | +0.024 | 3 | 8 / 85 % |
+| 11 | `pc` / `r_base_p1` → `ifb_dw` | +0.045 | 2 | 9 / 74 % |
+| 12 | forward → multiplier operand / CE | +0.058 | 3 | 10 / 77 % |
+| 13 | QSPI internal (fixed in `tmg`) | +0.063 | 2 | 11 / 73 % |
+| 14 | L2 `e_c` / `e_bc` → `o_mem_read_data` / `e_buf` / `s_buf` | +0.067 | 2 | 14 / 62 % |
+| 15 | forward / ready → `ex_a` / `ex_b` | +0.077 | 7 | 10 / 78 % |
+| 16 | `m_addr` / `r_pipe_owns` → MMIO strobes / read mux | +0.107 | 3 | 9 / 84 % |
+| 17 | `it_vpn` → fetch CAM → `ut_pa` | +0.109 | 4 | 8 / 76 % |
+| 18 | → I-cache tag shadow address | +0.122 | 3 | 7 / 85 % |
+| 19 | 0-level BRAM / LUTRAM address routes | +0.156 | 3 | 0 / 95 % |
+| 20 | `mem_d.uop` / ready → `ex_d` R/S, `ex_pred_tgt` CE | +0.158 | 4 | 8 / 83 % |
+| 21 | VGA palette → `r_vga_*` | +0.214 | 1 | 6 / 83 % |
+| 22 | multiplier DSP cascade → `mul_pipe1` | +0.238 | 1 | 2 / 23 % |
+| 23 | L2 other | +0.270 | 0 | 7 / 78 % |
+
+After (the same classification; "·" = not among that run's worst 150
+endpoints, i.e. above about +0.35):
+
+| Family | fable b6 / alt | b3 / alt | b4 | b5 / alt | b6 / alt | **b7 / alt** |
+|---|---|---|---|---|---|---|
+| TLB q_a/q_b/e_vpn -> t1_pahi/mem_pa2hi/r_h_tag | +0.142 / +0.298 | +0.239 / +0.007 | +0.240 | +0.236 / +0.011 | +0.115 / +0.291 | +0.164 / +0.178 |
+| ID predecode ifb -> id_ser/id_privop/id_* | · / · | +0.240 / +0.046 | +0.273 | +0.505 / +0.059 | +0.182 / +0.450 | · / · |
+| VGA palette -> r_vga_* | +0.290 / +0.236 | · / · | · | · / +0.308 | · / +0.065 | +0.462 / +0.185 |
+| m_addr/st/owns -> MMIO regs (qspi, mmio_rdata, st, eth, uart) | +0.408 / +0.066 | +0.253 / +0.325 | +0.108 | +0.352 / +0.133 | +0.376 / +0.486 | · / +0.281 |
+| fetch -> ifb_dw | +0.535 / +0.405 | +0.444 / +0.517 | +0.237 | +0.066 / +0.147 | +0.110 / +0.379 | +0.291 / +0.215 |
+| micro-ITLB it_vpn -> ut_* | +0.109 / +0.099 | +0.371 / +0.080 | +0.345 | +0.504 / +0.261 | +0.119 / +0.461 | · / · |
+| IRQ / ready -> pc, pos, pf_look, r_in0, bt | +0.203 / +0.228 | +0.271 / +0.211 | +0.241 | +0.436 / +0.114 | +0.194 / +0.304 | +0.124 / +0.089 |
+| fwd/ready -> ex_a/ex_b operands | +0.239 / +0.216 | · / +0.312 | +0.090 | · / · | +0.134 / +0.304 | +0.277 / +0.376 |
+| MEM/ready -> m_addr (D/CE) | · / · | · / · | · | +0.556 / +0.404 | +0.194 / +0.097 | +0.163 / +0.504 |
+| mem_d/ready -> ex_d R/S, ex_pred_tgt CE | · / · | · / · | · | · / · | · / · | · / +0.153 |
+| 0-level BRAM/LUTRAM addr routes | +0.156 / · | · / · | · | · / · | · / · | · / · |
+| multiplier (fwd/CE -> DSP operand) | +0.427 / +0.411 | · / · | +0.182 | +0.453 / +0.373 | +0.259 / +0.299 | +0.290 / +0.352 |
+| ex_a -> EA/translation (pa2hi/t1_pahi/iaddr/r_h_tag) | +0.544 / · | +0.391 / · | +0.186 | · / · | · / +0.532 | +0.300 / · |
+| multiplier DSP internal | +0.238 / · | +0.530 / +0.466 | · | · / +0.401 | +0.299 / · | +0.366 / +0.422 |
+| ALU -> mem_result | +0.423 / · | +0.325 / +0.225 | +0.308 | +0.531 / +0.314 | +0.191 / +0.398 | +0.394 / +0.385 |
+| hit pipe -> wb_hext | +0.376 / +0.197 | +0.397 / · | · | +0.476 / +0.215 | +0.198 / +0.262 | +0.409 / +0.396 |
+| L2 other | · / +0.429 | +0.240 / +0.414 | · | +0.519 / +0.231 | +0.313 / · | · / +0.331 |
+| WB/MEM fwd -> TLB key q_a/q_b | +0.518 / +0.402 | · / · | · | · / · | · / +0.442 | · / · |
+| -> I-cache tag shadow / ic_data addr | +0.546 / · | · / · | · | · / · | · / +0.537 | · / · |
+| id_op -> ex_d (fixed tmg) | · / · | · / · | · | +0.558 / · | · / · | · / · |
+| qspi internal | +0.579 / · | · / · | · | · / · | · / · | · / · |
+
+### §10 restructures
+
+Every logic change is cycle-neutral and has a simulation assertion of the
+new form against the old one (`ifndef SYNTHESIS`).  Its mutations are in
+`tools/vsim/tmg2mut.py`: the plain one is killed by the assertion, and the
+`_na` variants remove the assertion and must be killed by behaviour.  The
+attribute-only changes (`max_fanout`, `keep`) have no mutation.
+
+| # | Family | Change | Assertion | Mutations |
+|---|---|---|---|---|
+| 1 | L2 `e_c` / `e_bc` → `o_mem_read_data` / `e_buf` / `s_buf` (14 levels) | the read beat's lane merge `rb_buf[191 - 128*rb_h -: 64]` / `[255 - …]`, the narrow answer's half and the drain chunk as explicit cases: the computed part-selects had been synthesised as range compares with two CARRY4 chains in front of every lane | `rb_buf`, `rb_half`, `dr_chunk` = the part-select forms | `l2_lane`, `l2_lane_na`, `l2_half` (socl2; a narrow DDR answer is not asked for in the A7 configuration, so only its assertion sees `l2_half`) |
+| 2 | WB forward → `ex_a` / `ex_b` / `ex_c` / the TLB keys / the multiplier (`mul_r2` / `cpu.read_data` → 11 levels) | the extraction reads the port dword only; a direct MUL's `mul_r2` and a hit's `wb_hext` are the last selects of `wb_ldval`; the WB fast-load / MUL forward (`wl_a` / `wl_b` / `wl_c`, from registers) is a select just before the shift's in every operand (`ex_a_d`, `ex_b_d`, `ex_c_d`, `t_ta_d`, `t_tb_d`, `ex_txpg_d`); the other candidates take `wb_value` | `wb_ldval` = the old select order; each operand = its old form (the shift-last assertion, extended) | `wbl_mul`, `wbl_ext_na`, `wl_a`, `wl_a_na`, `wl_b_na`, `wl_c_na` (new test `fwd_wl_prio`), `wl_ta_na` |
+| 3 | `ifb_dw` → `w_op` → the decode → `id_ser` / `id_privop` / `id_legal` / `id_rs1` / `id_rd` (10 levels; `sddma_b3` +0.041, `tmg2_b2` +0.059) | the IF → ID latch's serialize / privilege / legality bits and the raw decode's register fields and use flags (`rs1`, `rd`, `use_rs1/2/rdd`, `fread`, `sp_rw`, `ldc`, `sgn`) decoded from each of the window's four candidate words (kept), `in0` / `pc[2]` pick last; `ifb_dw` replicated (`max_fanout` 16). Written as module-level `dec_t` nets: a function wrapping `f_decode_raw` was synthesised by Vivado 2025.2 as constant 0 (build 1, see below) | `w_pd` / `w_px` = the `w_op` decode | `pd_sel`, `pd_sel_na`, `pdx_sel`, `pdx_rs1_na`, `pdx_use_na` |
+| 4 | `pc` → `pc + 4` / `+ 8` (8 CARRY4) → the last word's region test → `w_fx` → `id_ser` / `id_fx*` | `w_last_pc[31:27]` is `pc[31:27]` or `pc[31:27] + 1`: both candidates' tests from `pc`, the carry an AND of `pc[26:2]` / `[26:3]`, LEN picks last (`f_lcy`) | `w_s1b` / `w_tsb` = the `w_last_pc` form; a time-0 self-check of `f_lcy` at every 128 MiB boundary | `lcy` (the self-check) |
+| 5 | `umode` → `SP − 8` (8 CARRY4) → the TE = 1 frame-in-kseg test → `irq_xc` → the `m_addr` enables (`sddma_b3` +0.235) | `push_va[31:27] == 10000` as a borrow select on SP[31:27] per candidate SP (`f_pkseg`), `umode` last | `push_kseg` = the `push_va` form | `pkseg` |
+| 6 | `mem_d.uop` → `mem_busy` → the MEM / EX enables → `ex_d` resets / `ex_pred_tgt` CE (`sddma_b3` +0.158) | the MEM op's port classes registered at EX → MEM like `mem_lkq` (`mem_prdq`, `mem_pwrq`, `mem_callq`, `mem_scq`, `mem_retq`, `mem_lvrq`, `mem_fbrq`, `mem_l32q`, `mem_fldq`, `mem_shq`; cleared by the TRAP conversion): `mem_port_rd / _wr`, `mem_is_ld32`, `mem_fastld`, `mem_is_sh`, the hit-RET hold, the LEAVERET lookahead, `h_miss_now`, the FBR resolution and the RAS compare's select read them | each = its `mem_d.uop` decode while `mem_valid` | `cls_prd_na`, `cls_trap`, `cls_sh_na` |
+| 7 | `pc` / `r_base_p1` → `miss_dw` → the NLB compare → the serve select (fanout ~180) → `ifb_dw` (`fable_b5` +0.045) | compare, then select: each NLB entry compared with both `miss_dw` candidates (kept), `in0` picks | `nlb*_dw_ok` = the `miss_dw` form | `nlb_sel`, `nlb_sel_na` |
+| 8 | `r_pipe_owns` / `m_addr` → the port's address mux → the splitter's region decode → the MMIO strobes / read mux (`fable_b5` +0.107 … +0.139; `tmg2_b2` +0.091) | the splitter's `is_mmio` / `is_eth` decoded on each master's registered address (the core's `m_io`; `st.mem_addr`) before the ownership select (new ports `i_is_mmio` / `i_is_eth`); per-device copies of the MMIO address mux (SD, QSPI, crypto, blitter, VGA, core 2), each with its own kept ownership replica — the shared mux output had ~245 loads (1.7 ns); `r_pipe_owns` replicated (`max_fanout` 24) | the predecoded region = the decode of `cpu.addr` (bus_splitter); each `w_maddr[k]` = `w_mmio_addr` | `bus_eth`, `bus_pip`, `maddr_sel`, `maddr_sd_na` |
+| 9 | `wb_value` → MTSR TLB_WCNT → 6 CARRY4 → `wcnt` (`tmg2_b2` +0.187) | the walk counter's increment kept apart (synthesis had folded the write-data select into its carry chain) | — (no logic change; the increment's value is checked by the walker tests) | `wcnt` |
+| 10 | `ex_var2` → the 32-bit EA adder → `exo_iaddr[28]` → `h_base` → `mem_h1` (`tmg2_b2` +0.153) | a hit-pipe load's MMIO test from the carry-select VA page `ex_tpg` (the §9 sum); in an MPU hold's 2nd cycle (`EN_MPU`) the old form | `ex_hmmio` = `exo_iaddr[31:28] == F` for every `ex_hld` op (and `ex_mph` only with the MPU) | `hmmio`, `hmmio_na` |
+| 11 | `it_vpn` → the fetch-port CAM → the PFN mux → `ut_pa` (`fable_b6` +0.109) | four kept copies of the fetch-CAM key (`it_vpnc` / `it_asidc`), each for a quarter of the entries (a `max_fanout` attribute was not honoured: fanout 42 in build 3) | the copies = `it_vpn` / `it_asid`; `fm` = `f_match` | `fkey`, `fkey_na` |
+| 12 | 0-level register → BRAM / LUTRAM address routes (8.9-9.3 ns of route: `r_boot_dw_addr` → the boot ROM, `r_bt_wbase` → the BTIC arrays, `if_req_dw` → the I-cache tag LUTRAM) | `max_fanout` 8 / 16 / 32 | — (attributes only) | — |
+
+**Reverted:** deferring the TLB's `c15` select into `t1_pahi` /
+`mem_pa2hi` (two carry candidates registered, selected after the
+register; with the key copies of restructure 11 removed) was built in
+round 4 (builds 5 / 6).  It placed worse in both builds and was reverted:
+no measured gain.  The round-3 changes (restructure 11, the `ifb_dw`
+replicas) stay; that configuration had the best minimum.
+
+**Found on the way:**
+
+- **Vivado bug.**  Vivado 2025.2 synthesised a function wrapping
+  `f_decode_raw` / `f_decode` (the first form of restructure 3) as a
+  constant 0.  Every op was then illegal, and `opt_design` swept ~12k
+  LUTs, the multiplier and the boot ROM.  Verilator simulated it
+  correctly.  Build 1's +0.285 is therefore void.  Every later build was
+  checked for the post-place LUT / BRAM / DSP counts and for constant-
+  driven LUT1s in the synthesised netlist (`tmg2_rpt/b1/probe4.tcl`).
+- **MPU configuration.**  Restructure 10's first form read `ex_tpg` in an
+  MPU hold's second cycle as well, where the EA comes from `ex_ea_q`.
+  `test_mpu` / `mpudiff` (VSIM_MPU_EN = 1) caught it; it was fixed in
+  `e551b11`.  The A7 build (TE, no MPU) is unaffected.
+
+### §10 floorplan
+
+`KlaussCPU.srcs/constrs_1/new/floorplan.xdc` (implementation only):
+one pblock holding `mmu_tlb` in a ~26 × 38-slice block at
+SLICE_X20Y130:X45Y167, ~70 % full.  Unconstrained, the placer sometimes
+pushed the TLB into a corner of the core (X7-34, Y165-191 in build 3's
+ExtraTimingOpt re-place, where the TLB → `mem_pa2hi` family led at
++0.007).
+
+| Experiment (from an opt checkpoint) | Explore | ExtraTimingOpt |
+|---|---|---|
+| build 4, no pblock (build_fast / alt script) | +0.090 | +0.075 |
+| build 4 + the TLB pblock (E1) | +0.124 | +0.204 |
+| build 4 + the TLB pblock + the core in clock regions X0Y2-X0Y3 + X1Y2 (E2) | +0.087 | **−0.038** |
+| build 5, no pblock | +0.066 | +0.011 |
+| build 6 = build 5 + the TLB pblock | +0.110 | +0.065 |
+
+The core pblock was dropped.  The core is ~19.5k LUTs: the region is too
+tight to compress it, and constraining it only moved the wall.  The TLB
+pblock raised the minimum in both comparisons, so it is kept.  A banked
+boot ROM was considered: its 32 RAMB36 hold an 11k-dword image, so
+512 × 72 tiles would need ~22.  The `ram_decomp = "power"` attribute left
+it at 32 tiles, and a hand-banked ROM needs a 22:1 output mux and boot
+re-verification.  It is left as a future item, as is LUTRAM for small
+arrays (none of the BRAMs is tiny: the boot ROM, the I-cache 17 / 5, the
+D-cache 32, the L2 33, VGA / SD / LiteEth 1 / 1 / 3 + 8).
+
+### §10 builds
+
+Standard flow (`build_fast -resynth` in a `git archive` copy, under the
+lock), plus the ExtraTimingOpt re-place from each opt checkpoint
+(`build_alt_place.tcl`; "routed" WNS, before its tier-2 phys_opt).
+(¹) Build 4's re-place ran through `tmg2_rpt/fp.tcl`: the same placer
+directive, with `phys_opt` / route Explore instead of AggressiveExplore.
+
+| Build | Commit | Change | Standard tier 1 WNS / WHS | ExtraTimingOpt WNS / WHS | Worst families (standard; alt) |
+|---|---|---|---|---|---|
+| `fable_b6` (release) | `5d61392` | — | +0.109 / +0.023 | +0.066 / +0.020 (measured here) | micro-ITLB; — |
+| `tmg2_b1` | `2f6765a` | round 1 | (+0.285, **void**: f_idpd synthesised as constant 0) | — | — |
+| `tmg2_b2` | `a64a8f7` | round 1, the predecode as nets | +0.059 / +0.037 | — | `ifb_dw` → `id_rs1`; `m_addr` → MMIO read mux; `ex_var2` → `mem_h1` |
+| `tmg2_b3` | `2e9b311` | + round 2 | **+0.239 / +0.015** | +0.007 / +0.024 | TLB CAM → `mem_iaddr`; TLB CAM → `mem_pa2hi`, ID decode, micro-ITLB |
+| `tmg2_b4` | `68b1f7f` | + round 3 (fetch-CAM key copies, `ifb_dw` replicas) | +0.090 / +0.029 | +0.075 / +0.017 (¹) | ready → `ex_a`, `m_addr` → QSPI CE; VGA scanout, D-cache writeback data |
+| `tmg2_b5` | `af69674` | + c15 after the register, − key copies | +0.066 / +0.024 | +0.011 / +0.037 | `r_base_p1` → `ifb_dw`; TLB CAM → `mem_pa2hi` |
+| `tmg2_b6` | `af69674` + XDC | + the TLB pblock | +0.110 / +0.044 | +0.065 / +0.031 | `r_base_p1` → `ifb_dw`, TLB CAM; VGA scanout |
+| **`tmg2_b7`** | **`fe83ff4`** | **round 3 RTL (= `e551b11`) + the TLB pblock** | **+0.124 / +0.024** | **+0.089 / +0.008** | `m_io` → the BTIC BRAM read enables (9 levels), `r_h_tq0` → `m_addr` CE, TLB CAM → `mem_pa2hi` +0.164; `mem_xsa` → the BTIC enables / `ex_d` resets |
+
+### §10 the wall
+
+**The wall.**  The restructures removed the families they targeted: the
+L2 read mux, the WB load / MUL forward, the ID latch decode, the bus
+region decode, the MMIO address fanout, the MEM port classes, the NLB
+match.  None of them is the worst path in any build after `tmg2_b3`.
+But each build's worst path is a *different* family, and they all sit
+between about +0.1 and +0.25.  The design is now a broad wall of 7-10-LUT
+paths whose nets average ~1 ns (60-90 % of each path):
+
+- the TLB data CAM → t1_pahi / mem_pa2hi / mem_iaddr / the hit pipe's tag;
+- the ID decode;
+- the micro-ITLB refill;
+- the pipeline-advance cone (the port ready → mem_busy → the ID → EX
+  operand enables, fanouts of 400-900);
+- the MMIO strobes;
+- if_look → ifb_dw;
+- the BTIC write enables;
+- the ALU → mem_result;
+- the RAS compare → pos / pc;
+- the VGA scanout.
+
+A placement moves any one of them by ±0.1-0.2 ns.  Placer directives and
+pblocks only change which one wins.  The tier 1 minimum over two
+placements of one netlist was +0.007 (`tmg2_b3`) and +0.075 (`tmg2_b4`).
+
+A standing +0.2 in both flows needs about one LUT level (~1 ns) off most
+of these families at once.  That means pipelining, which changes cycle
+counts and is outside this pass.  Rough costs, from the
+structures (not measured):
+
+- translate in MEM instead of EX (a 2-stage TLB): +1 cycle on a hit-pipe
+  load with TE = 1 (tecost's TE = 1 cost, now +0.7 % in user mode, would
+  roughly double or triple);
+- a predecode stage between IF and ID: +1 cycle on every redirect
+  (taken-branch mispredict, RAS miss, IRQ / exception entry; ~2-4 % on
+  the clang workloads at the measured branch rates);
+- a registered pipeline-advance enable (the port's ready taken a cycle
+  late): +1 cycle per D-cache miss / MMIO access completion (~1 % on
+  socbench);
+- a registered MMIO read path: +1 cycle per MMIO read (poll loops only).
+
+Each would be its own measured proposal (socdiff / tecost / the clang
+board run).
+
+### §10 regression
+
+On the final RTL (`e551b11`; `fe83ff4` and the branch head add only the
+XDC and documents), against BASE = `e298fc6`; all
+passing:
+
+- core (`l2_regress.sh core`):
+  - `test` in the five configurations (default, DEBUG_EN, MPU_EN,
+    TLB_N = 16, no walker; new test `fwd_wl_prio`);
+  - `diff +TRACECYC` 169,092 = 169,092;
+  - `diff --irq` 107,709 = 107,709;
+  - excdiff, mpudiff, tlbdiff, tlbpage, dcbzdiff 200, dmtest,
+    btfuzz 300;
+  - permfuzz 240 + 120 + 10 tb_soc, plus the self-check.
+- `fwdfuzz` 40 seeds: 0 of 480 differing.
+- `tecost` 60 seeds: identical to `e298fc6` (supervisor TE = 0 / 1:
+  88,713 / 89,194; user 92,135 / 92,770).
+- `l2_regress.sh` `soc36` (with `socframe`, `socorphan` 48, `socreset` 47,
+  `socbreak` 93, `socsload` 18, `socei`), `soc8` and `socvar` (L2 off,
+  8 ways, jittered, slow MIG): socdiff traces and PIPE_RUN cycles
+  identical in every configuration:
+
+  | Configuration | socdiff | socdiff, span 64 |
+  |---|---|---|
+  | MIGLAT 36 | 61,698 | 24,645 |
+  | MIGLAT 8 | 42,251 | 21,338 |
+  | L2 off | 69,249 | 25,610 |
+  | 8 ways | 61,698 | 24,645 |
+  | jittered | 52,150 | 22,944 |
+  | slow MIG | 78,533 | 27,530 |
+
+- `socsddma`, `socsdabort --rounds 4`: 0 failing.
+- mutations: `tmg2mut.py` 31 of 31 killed (the plain ones by the new
+  assertions, the `_na` variants by behaviour, `lcy` by its time-0 self-
+  check); `fablemut.py` 17 of 17; `sddmamut.py` 42 of 42 (two patterns
+  updated to the new `t_ta_d` / `t_tb_d` text); `l2mut.py`: running at the time of this commit (see the next commit).
+
+### §10 utilisation
+
+Placed:
+
+| Build | LUTs | FFs | BRAM tiles | DSPs |
+|---|---|---|---|---|
+| `fable_b6` (release) | 40,968 | 27,452 | 126 | 20 |
+| `tmg2_b3` | 41,706 | 27,990 | 126 | 20 |
+| `tmg2_b4` | 42,225 | 28,423 | 126 | 20 |
+| **`tmg2_b7`** (final) | **42,346** | **28,467** | **126** | **20** |
+
+(+1,378 LUTs, +1,015 FFs against the release; BRAM and DSP unchanged)
+
+The increase is the candidate predecode (four decode cones of the op
+word), the per-device MMIO address muxes and the replicas (`ifb_dw`,
+`r_pipe_owns`, `r_bt_wbase`, `if_req_dw`, `r_boot_dw_addr`).
+
+### §10 left
+
+**Result against the target.**  The final configuration (`fe83ff4`: the
+round 1-3 RTL plus the TLB pblock) is standard +0.124 / +0.024 and
+ExtraTimingOpt +0.089 / +0.008.  Its minimum is +0.089, against fable's
++0.066 (+0.109 / +0.023 standard, +0.066 / +0.020 re-placed).  The
+minimum rises by 0.023 ns.  The target (≥ +0.20 / ≥ +0.15) is **not**
+met.
+
+Every run's tier 1 WNS in this pass:
+
+| Configuration | Standard | ExtraTimingOpt | Minimum |
+|---|---|---|---|
+| fable `5d61392` (release) | +0.109 / +0.023 | +0.066 / +0.020 | +0.066 |
+| rounds 1 + 2 (`2e9b311`) | +0.239 / +0.015 | +0.007 / +0.024 | +0.007 |
+| + round 3 (`68b1f7f`) | +0.090 / +0.029 | +0.075 / +0.017 | +0.075 |
+| + round 4 (`af69674`) | +0.066 / +0.024 | +0.011 / +0.037 | +0.011 |
+| round 4 + the TLB pblock | +0.110 / +0.044 | +0.065 / +0.031 | +0.065 |
+| **round 3 + the TLB pblock (`fe83ff4`)** | **+0.124 / +0.024** | **+0.089 / +0.008** | **+0.089** |
+
+`fe83ff4` also ran as `fp.tcl`'s Explore / ExtraTimingOpt (`phys_opt` /
+route Explore instead of the alt script's AggressiveExplore): +0.124 /
++0.024 and +0.204 / +0.008.
+
+The standard flow is deterministic for a given netlist and XDC, so
+"standard ≥ +0.20 on two builds" cannot be shown without a second netlist.
+Each new netlist so far has been a new draw from the same distribution
+(+0.059 … +0.239).
+
+**The worst families left** (final configuration, both flows):
+
+- the BTIC lookup's BRAM read enables from the MEM state (`m_io` /
+  `mem_xsa` → the advance → `bt_*` ENARDEN, 7-9 levels, +0.089 / +0.124);
+- the D-cache hit pipe's tag → `m_addr` CE (+0.163);
+- the TLB data CAM → `mem_pa2hi` / `t1_pahi` (+0.164 / +0.178);
+- `mem_xsa` → the `ex_d` resets (+0.153).
+
+Not seen in the final runs but each the worst in some other run: the ID
+latch decode, the micro-ITLB refill, the RAS compare → `pos`, the
+pipeline-advance cone → `ex_a`, the MMIO strobes, the VGA scanout.
+
+**Future items** (none cycle-changing):
+
+- the BTIC read enable from registers only (read every cycle, gate the
+  result);
+- a banked boot ROM: ~10 RAMB36 freed, with a 22:1 output mux;
+- LUTRAM for the tag shadow `ic_tagsh` (2 RAMB18).
+
+Beyond those, the margin needs pipelining (see the wall), which is
+Graham's decision.
+
+**Not done:** the board.  Not run on it (this task does not program it).
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -3457,3 +3796,9 @@ Decisions taken while implementing the frozen text above:
   from a replica of `r_pipe_owns`.  `5d61392`, tier 1 +0.109 / +0.023,
   `~/.cache/kbuild/fable_5d61392.bit`.  Cycle-identical to `d612472`.
   Not yet run on the board.
+- 2026-11-17: §10 timing hardening on `tmg2` (from `e298fc6`): twelve
+  cycle-neutral restructures with assertions and `tmg2mut.py` mutations,
+  a TLB pblock (`constrs_1/new/floorplan.xdc`).  `fe83ff4`: standard tier 1
+  +0.124 / +0.024, ExtraTimingOpt +0.089 / +0.008 (fable: +0.109 / +0.066),
+  `~/.cache/kbuild/tmg2_fe83ff4.bit`.  Cycle-identical to `e298fc6`.  Not
+  merged; not run on the board.
