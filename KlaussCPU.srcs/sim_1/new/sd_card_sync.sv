@@ -19,7 +19,10 @@
 // bad CRC on DAT0; +SDC_WRTOK=<n> the n-th block written gets CRC status
 // 101 (not stored); +SDC_BUSY=<clocks> write busy (8); +SDC_NAC=<clocks>
 // command end to the first read block (8); +SDC_GAP=<clocks> between read
-// blocks (2); +SDC_V verbose.  At the end of the run the tb prints
+// blocks (2); +SDC_HS high-speed timing (SD_NATIVE_PLAN.md §9: the card
+// drives on the rising edge it sees, half a clock earlier than in default
+// speed, as an HS card does after CMD6; no CMD6 here, it starts so);
+// +SDC_V verbose.  At the end of the run the tb prints
 // "SDC: ..." with the counters.
 // ---------------------------------------------------------------------------
 module sd_card_sync (
@@ -38,7 +41,7 @@ module sd_card_sync (
 
     // configuration
     int  rd_crc_n = -1, wr_tok_n = -1, wr_busy = 8, n_ac = 8, n_gap = 2;
-    bit  w4 = 1'b1, verbose = 1'b0;
+    bit  w4 = 1'b1, verbose = 1'b0, hs = 1'b0;
     int  blen = 512;
     // counters
     int  n_cmds = 0, blocks_read = 0, blocks_written = 0, wr_bad = 0, host_err = 0, rd_bad_sent = 0;
@@ -50,6 +53,7 @@ module sd_card_sync (
         void'($value$plusargs("SDC_GAP=%d", n_gap));
         if ($test$plusargs("SDC_W1")) w4 = 1'b0;
         verbose = $test$plusargs("SDC_V");
+        hs = $test$plusargs("SDC_HS");
     end
 
     logic [63:0] wmem [longint];          // written dwords, by card byte address
@@ -225,8 +229,8 @@ module sd_card_sync (
                     default: ;
                 endcase
             end
-            // ---------------- falling edge: drive ----------------
-            if (fall) begin
+            // ---------------- falling edge (HS: the rising edge): drive ----------------
+            if (hs ? rise : fall) begin
                 if (d_rel) begin dat_oe <= 4'h0; dat_o <= 4'hF; d_rel = 1'b0; end
                 // the response, then an R1b's busy on DAT0
                 if (r_n > 0 && r_wait == 0) begin

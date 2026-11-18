@@ -12,7 +12,7 @@
 # the unisims_ver library and glbl.
 # Work dir: $SDSIM_WORK (default ~/.cache/sdsim).  No waveforms are dumped.
 # Usage: tools/sdsim/run_sd_tb.sh [native|compat|dma|all]
-set -e
+set -e -o pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 S=$ROOT/KlaussCPU.srcs
 WORK=${SDSIM_WORK:-$HOME/.cache/sdsim}
@@ -20,12 +20,14 @@ export PATH=/opt/xilinx/2025.2/Vivado/bin:$PATH
 GLBL=/opt/xilinx/2025.2/Vivado/data/verilog/src/glbl.v
 which=${1:-all}
 rc=0
-# the lock-step reference (SD_M0)
+# the lock-step reference (SD_M0), from the git repository $SD_M0_GIT
+# (default: this tree's; a copy outside git, e.g. a mutant, names its origin)
 M0_REV=${SD_M0_REV:-6dcbcfb}
+M0_GIT=${SD_M0_GIT:-$ROOT}
 mkdir -p "$WORK"
-git -C "$ROOT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_native.sv" \
+git -C "$M0_GIT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_native.sv" \
     | sed -e 's/\bsd_native\b/sd_native_m0/g' > "$WORK/sd_native_m0.sv"
-git -C "$ROOT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_spi.sv" \
+git -C "$M0_GIT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_spi.sv" \
     | sed -e 's/\bsd_spi\b/sd_spi_m0/g' -e 's/\bsd_native\b/sd_native_m0/g' > "$WORK/sd_spi_m0.sv"
 M0="$WORK/sd_native_m0.sv $WORK/sd_spi_m0.sv"
 run() {   # $1 = top, rest = sources

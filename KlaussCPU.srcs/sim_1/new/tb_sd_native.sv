@@ -562,6 +562,10 @@ module tb_sd_native;
                 check_true("typical card: a run of >= 3 passing phases", brun >= 3);
                 begin real m; check_true("typical card: the centre has >= 3 ns margin", hs_pred(best, 0, m) && m >= 3.0); end
             end
+            // phases 7..15 act as 6 (pm[6] passes, pm[0] fails here)
+            check_true("typical card: phase 6 passes, 0 fails", pm[6] && !pm[0]);
+            mw(SDM_CFG, cfg_hs(7, 0, 1));  hs_try(64'(20100), ok);  check_true("phase 7 acts as 6", ok);
+            mw(SDM_CFG, cfg_hs(15, 0, 1)); hs_try(64'(20101), ok);  check_true("phase 15 acts as 6", ok);
             mw(SDM_CFG, cfg_hs(best, 0));                         // CLK_ON off
             mw(SDM_TIMEOUT, {32'd12_500_000, 32'd5_000_000});
 

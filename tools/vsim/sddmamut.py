@@ -167,7 +167,7 @@ def run_mut(m, keep=False):
     if suite == 'unit':
         out, killed = '', False
         for seed in (1, 2):
-            env.update(SDSIM_WORK=os.path.join(d, 'sdsim'), SDDMA_SEED=str(seed))
+            env.update(SDSIM_WORK=os.path.join(d, 'sdsim'), SDDMA_SEED=str(seed), SD_M0_GIT=ROOT)
             r = subprocess.run(['bash', os.path.join(d, 'tools/sdsim/run_sd_tb.sh'), 'dma'], env=env,
                                capture_output=True, text=True, timeout=3600)
             out += r.stdout + r.stderr

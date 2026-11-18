@@ -816,8 +816,43 @@ def t_abort(rounds=40, write=False, fifo=False, tight=False, wbinv_every=150, bl
     return a
 
 
+def t_hs(write, phase=2, n=16):
+    """SD high speed (SD_NATIVE_PLAN.md §9): a DMA read / write of n blocks
+    at 50 MHz with the HS sampling at sample phase `phase`, the card in
+    HS timing (+SDC_HS).  The synchronous card changes its lines a cycle
+    after the edge it sees, so in this model every phase samples a valid
+    bit (the eye is a whole clock): the test is the HS strobe / sample path
+    through the SoC, not the window (tb_sd_native sweeps that).  r4 = error
+    bits, r12 = mismatches (read)."""
+    a = SdAsm().prologue(div=0)
+    cfg = 1 | 2 | (phase << 4)
+    A, B0 = 0x00280000, 4000 + 64 * phase
+    if write:
+        a.fill(A, B0, n)
+        a.cache_op(RCLEAN, A, n * 512)
+    else:
+        a.cache_op(RINV, A, n * 512)
+    a.dma(25 if write else 18, B0, A, 512, n, write, cfg=cfg)
+    a.wait_done(); a.mov(4, 3)
+    if not write:
+        a.cache_op(RINV, A, n * 512)
+        a.check(A, B0, n)
+    a.stop()
+    a.halt()
+    exp = {'r4': 0} if write else {'r4': 0, 'r12': 0}
+    chk = {'host_err': 0}
+    if write:
+        chk.update(wr_bad=0, wr_blocks=n)
+    return a, exp, ['+SDC_HS'], chk
+
+
 def tests():
     return [
+        (f'hs_rd_p{p}', *t_hs(False, p)) for p in range(7)
+    ] + [
+        ('hs_wr_p2', *t_hs(True, 2)),
+        ('hs_wr_p5', *t_hs(True, 5)),
+    ] + [
         ('rd_m3_nowait', *t_m3(False)),
         ('rd_m3_queued', *t_m3(False, 'queued')),
         ('rd_m3_wait', *t_m3(False, 'wait')),
