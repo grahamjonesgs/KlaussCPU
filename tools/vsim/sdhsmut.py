@@ -4,7 +4,8 @@ sample phases, the IDDR / IDELAY input path, the strobe skip after a line
 release, the IOB pads and their next-value logic, and the default-speed
 equivalence (the lock-step against the phase-2 controller, 6dcbcfb).
 
-Each mutation is one textual change to an RTL file.  The mutant's sources
+Each mutation is one textual change to an RTL file (or to the board test's
+pick(), which tb_sd_native runs through DPI-C).  The mutant's sources
 (KlaussCPU.srcs/sources_1/new, sim_1/new and tools/) are copied to
 $VSIM_WORK/sdhsmut/<name> and its suite runs there:
   'hs'     tb_sd_native, high-speed tests only (+HS_ONLY: the phase sweeps
@@ -27,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 WORK = os.path.join(os.environ.get('VSIM_WORK', '/tmp/vsim'), 'sdhsmut')
 SN, SS, TOP = 'sources_1/new/sd_native.sv', 'sources_1/new/sd_spi.sv', 'sources_1/new/KlaussCPU.sv'
+SB = '../tools/board/sd_hs_test.c'      # (relative to KlaussCPU.srcs, as the RTL files)
 
 # (name, what it breaks, file, suite, old, new)
 MUTS = [
@@ -89,6 +91,9 @@ MUTS = [
      "    wire [3:0] w_din  = w_smp[4:1];", "    wire [3:0] w_din  = w_q1[4:1];"),
     ('hs_strobe2', 'the HS strobe two cycles early (r_samp): the sample 20 ns early with it', SN, 'hs',
      "    wire       w_samp = r_cfg_hs ? r_samp_dd : r_samp;", "    wire       w_samp = r_samp;"),
+    # ---------------- the board test's pick() (tb_sd_native +HS_ONLY, DPI-C) ----------------
+    ('pick_alias', "sd_hs_test.c's pick() keeps a phase p <= 2 (may take bit j - 1) instead of p + 4", SB, 'hs',
+     "    if (bi >= 0 && pp[bi] <= 2 && ok[bi + 4]) *best_p = pp[bi] + 4;", ""),
     # ---------------- the SoC (tb_soc, sd_card_sync +SDC_HS) ----------------
     ('top_tristate', "the top's CMD tristate inverted (the card can never answer)", TOP, ['hs_rd_p2'],
      "   assign io_SD_CMD = w_sd_cmd_t ? 1'bz : w_sd_cmd_o;", "   assign io_SD_CMD = w_sd_cmd_t ? w_sd_cmd_o : 1'bz;"),

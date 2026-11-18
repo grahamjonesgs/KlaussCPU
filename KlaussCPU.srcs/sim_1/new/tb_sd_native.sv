@@ -446,17 +446,24 @@ module tb_sd_native;
 
     // a counted multi-block read that parks CLK many times: the FIFO fills
     // (8 blocks) before the drain starts, then every other block the drain
-    // pauses long enough for the FIFO to fill and CLK to park again
-    task automatic flow_read(input string what, input longint blk, input int n);
+    // pauses long enough for the FIFO to fill and CLK to park again.
+    // expect_loss: the phase is known to lose the start bit after a park
+    // (SD_NATIVE_PLAN.md §9.3, a phase that takes bit j - 1): the read must
+    // fail at the first park, block 8, with DATA_CRC + DATA_END, the 8 blocks
+    // before it intact; then the read is stopped and the card checked in tran
+    task automatic flow_read(input string what, input longint blk, input int n, input bit expect_loss = 0);
         logic [63:0] s, w;
-        int bad = 0, parks = 0;
+        int bad = 0, parks = 0, drained = 0;
         fifo_reset(); clr_status(); set_blk(512, n);
         cmd_start(18, 32'(blk), RT_R1, 1, 0);
         begin longint t = ncyc; do mr(SDM_FIFO, w); while (w < 512 && ncyc - t < 1_000_000); end
         check({what, ": FIFO fills to 8 blocks"}, w, 512);
         for (int b = 0; b < n; b++) begin
             longint t = ncyc;
-            do status(s); while (!s[B_THRESH] && ncyc - t < 2_000_000);
+            do status(s); while (!s[B_THRESH] && !(expect_loss && (s & ERR_MASK) != 0 && !s[B_DATA_BUSY])
+                                 && ncyc - t < 2_000_000);
+            if (expect_loss && !s[B_THRESH]) break;               // the read has ended (in error)
+            drained++;
             if (b % 2 == 0 && b + 8 < n) begin
                 // (the FIFO is full here: a block's time later it is full
                 // again after this block's drain, and CLK must be parked)
@@ -480,10 +487,28 @@ module tb_sd_native;
         end
         wait_data(s);
         check({what, ": data"}, bad, 0);
-        check({what, ": DATA_DONE, no error"}, s & (ERR_MASK | (64'h1 << B_DATA_DONE)), 64'h1 << B_DATA_DONE);
-        mr(SDM_BLKDONE, w); check({what, ": BLKDONE"}, w, n);
-        check_true({what, ": CLK parked (FIFO full) each time"}, parks == (n - 8 + 1) / 2);
-        do_cmd({what, ": CMD12"}, 12, 0, RT_R1B, s);
+        if (expect_loss) begin
+            logic [63:0] cfg;
+            check({what, ": fails with DATA_CRC + DATA_END"}, s & (ERR_MASK | (64'h1 << B_DATA_DONE)),
+                  (64'h1 << B_DAT_CRC) | (64'h1 << B_DAT_END));
+            mr(SDM_BLKDONE, w); check({what, ": BLKDONE (the block after the first park lost)"}, w, 8);
+            $display("%s: %0d blocks drained, then SDM_STATUS %h, BLKDONE %0d (as expected)", what, drained,
+                     s[31:0], w);
+            check({what, ": the 8 blocks before it drained intact"}, drained, 8);
+            // stop the card (CMD12 with [13]), let it finish with CLK running
+            cmd_start(12, 0, RT_R1B, 0, 0, 1); wait_cmd(s);
+            mr(SDM_CFG, cfg);
+            mw(SDM_CFG, cfg | CFG_CLKON); repeat (2000) @(posedge clk); mw(SDM_CFG, cfg);
+            wait_card_idle();
+            fifo_reset(); clr_status();
+            do_cmd({what, ": CMD13 afterwards"}, 13, {rca, 16'h0}, RT_R1, s);
+            check({what, ": the card back in tran"}, r0[12:9], 4);
+        end else begin
+            check({what, ": DATA_DONE, no error"}, s & (ERR_MASK | (64'h1 << B_DATA_DONE)), 64'h1 << B_DATA_DONE);
+            mr(SDM_BLKDONE, w); check({what, ": BLKDONE"}, w, n);
+            check_true({what, ": CLK parked (FIFO full) each time"}, parks == (n - 8 + 1) / 2);
+            do_cmd({what, ": CMD12"}, 12, 0, RT_R1B, s);
+        end
         wait_card_idle();
     endtask
 
@@ -510,12 +535,35 @@ module tb_sd_native;
         check({what, " sweep matches the timing model"}, mism, 0);
     endtask
 
+    // tools/board/sd_hs_test.c's pick() (the board's and the reference
+    // driver's choice of phase and tap), compiled with -DHOST_TEST and
+    // imported (run_sd_tb.sh: xsc): pass01[ti * 7 + p] = phase p passes at
+    // tap PICK_TAPS[ti]
+    import "DPI-C" function void sdhs_pick(input byte pass01[35], input int ntap,
+                                           output int best_p, output int best_t, output int centre);
+    localparam int PICK_TAPS[5] = '{0, 8, 16, 24, 31};      // sd_hs_test.c's TAPS
+    // sweep the phases at every tap of sd_hs_test.c's table (each sweep
+    // checked against the timing model), then pick() on the table
+    task automatic hs_pick(input string what, output int bp, output int bt, output logic [6:0] pm0);
+        byte tbl[35];
+        logic [6:0] pm;
+        int c;
+        for (int ti = 0; ti < 5; ti++) begin
+            hs_sweep(what, PICK_TAPS[ti], pm);
+            if (ti == 0) pm0 = pm;
+            for (int p = 0; p < 7; p++) tbl[ti * 7 + p] = byte'(pm[p]);
+        end
+        sdhs_pick(tbl, 5, bp, bt, c);
+        $display("HS pick %s: phase %0d tap %0d (the window's centre %0d ps mod 20 ns)", what, bp, bt, c);
+        check_true({what, ": pick() finds a setting"}, bp >= 0 && bt >= 0);
+    endtask
+
     task automatic hs_tests();
         // =========================================================== high speed (phase 3)
         begin
             logic [3:0] g1;
             logic [6:0] pm;
-            int lo, hi, best;
+            int lo, hi, best, pbest, tbest;
             bit ok;
             card_up();
             // ---- CMD6 at default speed: check (mode 0), then switch (mode 1)
@@ -538,15 +586,19 @@ module tb_sd_native;
             t_out = 4.0; t_in = 1.5;
             card.hs_odly = 14.0; card.hs_oh = 2.5;
             mw(SD_CTRL, CTRL_ON | 64'd0);
-            hs_sweep("worst card", 0, pm);
+            hs_pick("worst card", pbest, tbest, pm);            // taps 0, 8, 16, 24, 31
             check_true("worst card: some phase passes", pm != 0);
             check_true("worst card: some phase fails", pm != 7'h7F);
             check_true("worst card: failures were CRC errors", hs_crc_errs > 0);
-            hs_sweep("worst card", 16, pm);
-            hs_sweep("worst card", 31, pm);
+            // pick()'s setting reads with CLK parking (the board test's
+            // final check)
+            mw(SDM_CFG, cfg_hs(pbest, tbest));
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd5_000_000});
+            flow_read("HS worst card, pick()'s setting, CMD18 x16, flow control", 23100, 16);
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd4000});
             // a typical card (tODLY 7)
             card.hs_odly = 7.0;
-            hs_sweep("typical card", 0, pm);
+            hs_pick("typical card", pbest, tbest, pm);
             // the centre of the longest run of passing phases (what a driver
             // does; the 7 phases span 1.5 clocks, so a run that wraps the
             // 20 ns period appears whole)
@@ -603,13 +655,31 @@ module tb_sd_native;
             card.n_gap = 1;
             flow_read("HS CMD18 x16, N_AC 1, flow control", 22400, 16);
             card.n_gap = 2;
+            // pick()'s setting for the typical card: the centre's phase p <= 2
+            // moved to p + 4 (here a phase that takes bit j + 1), with CLK
+            // parks, at N_AC 2 and 1
+            check_true("typical card: pick() takes a phase >= 3", pbest >= 3);
+            mw(SDM_CFG, cfg_hs(pbest, tbest));
+            flow_read("HS typical card, pick()'s setting, CMD18 x16, flow control", 23500, 16);
+            card.n_gap = 1;
+            flow_read("HS typical card, pick()'s setting, N_AC 1, flow control", 23600, 16);
+            card.n_gap = 2;
+            mw(SDM_CFG, cfg_hs(best, 0));
 
             // ---- the late phases (one SD clock or more after the edge): a
             // slow card behind slow pads, every transition at +8..22 ns
             t_out = 5.0; t_in = 3.0; card.hs_odly = 14.0; card.hs_oh = 9.0;
             mw(SDM_TIMEOUT, {32'd12_500_000, 32'd4000});
-            hs_sweep("slow card", 0, pm);                         // eye 23.6 .. 38.6 ns (mod 20)
+            hs_pick("slow card", pbest, tbest, pm);               // eye 23.6 .. 38.6 ns (mod 20) at tap 0
             check_true("slow card: phase 5 (35 ns) passes", pm[5]);
+            // the bit j - 1 alias (SD_NATIVE_PLAN.md §9.3): at tap 0 phase 0
+            // (10 ns) samples in the eye of the bit launched one rising edge
+            // earlier (the card's hold and the pads reach past 10 ns), the
+            // same instant as phase 4 (30 ns, bit j); both pass a single
+            // block.  pick() must take phase 4, not 0 (the window's centre
+            // is at ~10 ns mod 20, where phase 0 comes first)
+            check_true("slow card: phases 0 and 4 pass a single block (the same instant)", pm[0] && pm[4]);
+            check_true("slow card: pick() takes a phase >= 3 (never bit j - 1)", pbest >= 3);
             mw(SDM_CFG, cfg_hs(5, 0));                            // 35 ns
             mw(SDM_TIMEOUT, {32'd12_500_000, 32'd5_000_000});
             flow_read("HS phase 5 CMD18 x16, flow control", 22500, 16);
@@ -621,6 +691,20 @@ module tb_sd_native;
             do_cmd("HS phase 5 CMD12", 12, 0, RT_R1B, st);
             check_written("HS phase 5 CMD25", 22600, 4, 62);
             wait_card_idle();
+            // the hazard, documented: phase 0 (bit j - 1) with N_AC 2 loses
+            // the start bit of the block after the first CLK park (the
+            // lines hold e + 3, the start bit, while parked, and it is taken
+            // again in e + 2's slot and then as the first data bit).  If
+            // this ever passes, the behaviour changed: revisit §9.3 / pick()
+            check("slow card: N_AC 2", card.n_gap, 2);
+            mw(SDM_CFG, cfg_hs(0, 0));
+            flow_read("HS slow card phase 0 (bit j - 1), N_AC 2: the start bit after a park is lost", 23200, 16, 1);
+            // phase 4, the same instant one bit later: passes
+            mw(SDM_CFG, cfg_hs(4, 0));
+            flow_read("HS slow card phase 4 (bit j), CMD18 x16, flow control", 23300, 16);
+            // and pick()'s setting
+            mw(SDM_CFG, cfg_hs(pbest, tbest));
+            flow_read("HS slow card, pick()'s setting, CMD18 x16, flow control", 23400, 16);
 
             // ---- back to default speed: CMD6 at 50 MHz (status in HS
             // timing), then 25 MHz with the default sampling
