@@ -1,10 +1,11 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// sd_native — native SD-bus host engine (1-bit / 4-bit, default speed), the
-// SD_MODE = 1 half of the SD controller.  Instantiated by sd_spi, which owns
-// SD_CTRL (clk_div, pwr_en, SD_MODE), the SPI shifter, SD_BUF and the pin
-// mux.  Register map, sequencing and FIFO rules: SD_NATIVE_PLAN.md §4
-// (frozen v1) and MMIO_MAP.md "SD card".
+// sd_native — native SD-bus host engine (1-bit / 4-bit, default speed and
+// high speed), the SD_MODE = 1 half of the SD controller.  Instantiated by
+// sd_spi, which owns SD_CTRL (clk_div, pwr_en, SD_MODE), the SPI shifter,
+// SD_BUF, the pin mux and the pads (IOB registers, ODDR, IDDR, IDELAYE2).
+// Register map, sequencing and FIFO rules: SD_NATIVE_PLAN.md §4 (frozen
+// v1), §8 (DMA), §9 (high speed) and MMIO_MAP.md "SD card".
 //
 // Everything runs on i_Clk; there is no new clock domain.
 //
@@ -15,13 +16,19 @@
 //              for another whole block; write: no whole block in the FIFO)
 //              parks it between blocks — flow control.
 //   Drive      outputs change on the fabric edge that drives CLK low (the
-//              card samples on the rising edge, half a period later).
-//   Sample     inputs go through one (IOB) flip-flop on every edge; the
-//              value captured on the edge that drives CLK low — the last
-//              moment before the card's next output change, which in
-//              default speed follows the falling edge (tODLY <= 14 ns) —
-//              is used the cycle after (ev_samp).  At 25 MHz that leaves
-//              ~20 ns of setup and the output path delay as hold.
+//              card samples on the rising edge, half a period later; at
+//              50 MHz that is 10 ns of setup and of hold, against the HS
+//              card's 6 / 2 ns).  The pins are the parent's IOB registers,
+//              loaded with this module's o_*_nx (the next values).
+//   Sample     inputs come from the parent's IDDRs (both edges).  Default
+//              (SDM_CFG[1] = 0): the value captured on the edge that drives
+//              CLK low — the last moment before the card's next output
+//              change, which in default speed follows the falling edge
+//              (tODLY <= 14 ns) — is used the cycle after (r_samp).  At
+//              25 MHz that leaves ~20 ns of setup and the output path delay
+//              as hold.  High speed (SDM_CFG[1] = 1): the sample instant is
+//              one of seven, 5 ns apart (SDM_CFG[7:4]), see "Input
+//              sampling" below.
 //
 //   FIFO       512 × 64 bits (one RAMB36), first-word-fall-through head
 //              register.  Read blocks are written behind a shadow pointer
@@ -60,15 +67,33 @@ module sd_native #(
     output logic [63:0] o_rdata,         // for the address of the previous cycle; 0 outside 0x100..0x1F8
     output logic        o_irq,           // registered level
 
-    // pins (the parent muxes them with the SPI path)
+    // pins (the parent muxes them with the SPI path).  o_* are the
+    // registered values (as every phase so far); o_*_nx are their values
+    // for the next cycle, which the parent's IOB output registers take so
+    // that the pins change on the same edge as o_* (SD_NATIVE_PLAN.md §9).
     output logic        o_clk,
     output logic        o_cmd,
     output logic        o_cmd_oe,
     output logic [3:0]  o_dat,
     output logic [3:0]  o_dat_oe,
-    input  logic        i_cmd,
-    input  logic [3:0]  i_dat,
+    output logic        o_clk_nx,
+    output logic        o_cmd_nx,
+    output logic        o_cmd_oe_nx,
+    output logic [3:0]  o_dat_nx,
+    output logic [3:0]  o_dat_oe_nx,
+    // inputs from the parent's IDDRs (SAME_EDGE) on CMD and DAT[3:0]:
+    // after the rising edge E, *_q1 = the pin at E, *_q2 = the pin at
+    // E - 5 ns (the falling edge before it), both after the input delay
+    input  logic        i_cmd_q1,
+    input  logic        i_cmd_q2,
+    input  logic [3:0]  i_dat_q1,
+    input  logic [3:0]  i_dat_q2,
     input  logic        i_cd,
+    // the input delay line (IDELAYE2 VAR_LOAD on CMD / DAT[3:0]): its tap
+    // (SDM_CFG[12:8]), a load strobe, and IDELAYCTRL's RDY (synchronised)
+    output logic [4:0]  o_idly_tap,
+    output logic        o_idly_ld,
+    input  logic        i_idly_rdy,
 
     // DDR master (DMA): the blitter / core-2 contract of mem_read_write —
     // req (level) until the grant, one 16 B transaction (DV until ready),
@@ -96,8 +121,11 @@ module sd_native #(
                            O_FIFO    = 8'h48, O_DMA    = 8'h50, O_BLKDONE = 8'h58,
                            O_DATA    = 8'h80, O_CAPS   = 8'hF8;
 
-    // v1, 4-bit, no HS, 8 blocks; [10] DMA
-    localparam logic [63:0] CAPS = 64'h0000_0000_0008_0101 | (DMA_EN ? 64'h400 : 64'h0);
+    // v1, [8] 4-bit, [9] high speed (phase 3: the HS sample phases and the
+    // input delay), [10] DMA, [11] the input delay line (SDM_CFG[12:8]),
+    // [23:16] 8 blocks of FIFO, [27:24] the number of HS sample phases (7)
+    localparam int HS_PHASES = 7;
+    localparam logic [63:0] CAPS = 64'h0000_0000_0008_0B01 | (64'(HS_PHASES) << 24) | (DMA_EN ? 64'h400 : 64'h0);
     // DDR: a DMA may touch only [0, 128 MiB) (SD DMA spec v1.2: DMA_ERR past it)
     localparam int DDR_LG = 27;
 
@@ -130,16 +158,16 @@ module sd_native #(
     endfunction
 
     // -----------------------------------------------------------------------
-    // Pin inputs: one flip-flop each (IOB), sampled every edge.  CD gets a
-    // two-flop synchroniser (asynchronous mechanical switch).
+    // Pin inputs.  CMD and DAT[3:0] come from the parent's IDDRs (i_*_q1 is
+    // the old IOB input flip-flop: the pin sampled on every rising edge).
+    // CD gets a two-flop synchroniser (asynchronous mechanical switch), and
+    // IDELAYCTRL's RDY one more (it is synchronised in the parent already).
     // -----------------------------------------------------------------------
-    (* IOB = "TRUE" *) logic       r_cmd_in;
-    (* IOB = "TRUE" *) logic [3:0] r_dat_in;
     (* ASYNC_REG = "TRUE" *) logic [1:0] r_cd_sync;
+    logic r_idly_rdy;
     always_ff @(posedge i_Clk) begin
-        r_cmd_in  <= i_cmd;
-        r_dat_in  <= i_dat;
-        r_cd_sync <= {r_cd_sync[0], i_cd};
+        r_cd_sync  <= {r_cd_sync[0], i_cd};
+        r_idly_rdy <= i_idly_rdy;
     end
 
     // -----------------------------------------------------------------------
@@ -154,6 +182,9 @@ module sd_native #(
     logic [27:0] r_irq_en;           // only [4], [9:8], [27:16] are kept
     logic [31:0] r_tmo_data, r_tmo_busy;
     logic        r_cfg_w4, r_cfg_clkon;
+    logic        r_cfg_hs;            // SDM_CFG[1]: sample the inputs at the HS phase
+    logic [3:0]  r_cfg_phase;         // SDM_CFG[7:4]: the HS sample phase (0..6; 7..15 act as 6)
+    logic [4:0]  r_cfg_tap;           // SDM_CFG[12:8]: the input delay tap (78 ps each)
     logic [15:0] r_blkdone;
     // DMA registers: SDM_DMA_ADDR (always the first byte not yet
     // transferred), SDM_CFG[16] DMA_EN, SDM_STATUS[27] DMA_ERR (sticky)
@@ -205,17 +236,90 @@ module sd_native #(
     // DMA_EN = 0 written (any SDM_CFG write with [16] clear): aborts a DMA
     wire w_cfg_dma_off = DMA_EN && w_wr1 && (w_off == O_CFG) && !r_in_wdata[16];
 
+    // the input delay tap: loaded into the five IDELAYE2s (VAR_LOAD) the
+    // cycle after any SDM_CFG write, and held at 0 through a reset
+    logic r_idly_ld;
+    always_ff @(posedge i_Clk) r_idly_ld <= i_rst || (w_wr && w_off == O_CFG);
+    assign o_idly_tap = r_cfg_tap;
+    assign o_idly_ld  = r_idly_ld;
+
     // -----------------------------------------------------------------------
     // Clock generator
     // -----------------------------------------------------------------------
     logic        r_clk;
     logic [15:0] r_div_cnt;
-    logic        r_samp;            // ev_fall delayed one cycle: r_*_in holds the sample
+    logic        r_samp;            // ev_fall delayed one cycle: i_*_q1 holds the sample
+    logic        r_samp_d, r_samp_dd;   // ... two cycles: r_hs_s holds the HS sample
     logic [3:0]  r_trail;           // trailing clocks (N_RC / N_CC)
     logic        w_run;
     wire w_tick  = (r_div_cnt >= i_clk_div);
     wire ev_fall = r_clk && w_tick;
     assign o_clk = r_clk;
+    // r_clk's next value (the clock generator below; the parent's ODDR
+    // takes it, so the CLK pin changes on the edge r_clk does)
+    wire w_clk_nx = (i_rst || !i_sd_mode) ? 1'b0
+                  : (!r_clk && !w_run)    ? 1'b0          // parked low
+                  : w_tick                ? ~r_clk : r_clk;
+    assign o_clk_nx = w_clk_nx;
+
+    // -----------------------------------------------------------------------
+    // Input sampling (SD_NATIVE_PLAN.md §4.9, §9)
+    //
+    // Default (SDM_CFG[1] = 0, as phases 1-2): the engines take the pins as
+    // sampled on the fabric edge that drives CLK low (i_*_q1, the cycle
+    // after ev_fall: r_samp).  The card's outputs change after the falling
+    // edge (default speed), so the sample is the last moment before its
+    // next change.
+    //
+    // High speed (SDM_CFG[1] = 1): the card drives after the RISING edge
+    // (tODLY <= 14 ns, tOH >= 2.5 ns), so the valid window at the input
+    // moves with the pad and card delays and is found by calibration.  The
+    // IDDRs give the pins at every edge, rising and falling (5 ns apart);
+    // a history of them lets the sample come from any of seven instants,
+    // phase p = SDM_CFG[7:4] (0..6; 7..15 act as 6).  At clk_div = 0 the bit
+    // the card launched on the rising edge R (the fabric edge on which the
+    // CLK register, and the pin's ODDR, go high) is sampled at
+    //       R + 10 + 5p ns   (p = 0..6: 10, 15, ... 40 ns after R),
+    // at the IDDR's D input (after IBUF and the IDELAY tap), i.e. from half a
+    // CLK period to two periods after the edge that launched it.  The engine
+    // takes it two cycles after the default point (r_samp_dd), from a
+    // register (r_hs_s); in general (any clk_div) the sample instant is the
+    // fabric edge that drives CLK low (F) plus 5p - 20 ns.
+    //
+    // History (registered every cycle; E = the last rising edge):
+    //   m = 0: q1 = pin(E)      m = 1: q2 = pin(E - 5)    m = 2: h1[1] = pin(E - 10)
+    //   m = 3: h2[1]            m = 4: h1[2]              m = 5: h2[2]   m = 6: h1[3]
+    // r_hs_s takes candidate m = 6 - p in the cycle after F + 10, so it
+    // holds pin(F + 10 - 5m) = pin(F - 20 + 5p) when r_samp_dd strobes.
+    // -----------------------------------------------------------------------
+    wire  [4:0] w_q1 = {i_dat_q1, i_cmd_q1};
+    wire  [4:0] w_q2 = {i_dat_q2, i_cmd_q2};
+    logic [4:0] r_h1 [1:3];
+    logic [4:0] r_h2 [1:2];
+    logic [4:0] r_hs_s;
+    logic [4:0] w_hs_cand;
+    wire  [2:0] w_ph = (r_cfg_phase > 4'd6) ? 3'd6 : r_cfg_phase[2:0];
+    always_comb begin
+        case (3'd6 - w_ph)
+            3'd0:    w_hs_cand = w_q1;
+            3'd1:    w_hs_cand = w_q2;
+            3'd2:    w_hs_cand = r_h1[1];
+            3'd3:    w_hs_cand = r_h2[1];
+            3'd4:    w_hs_cand = r_h1[2];
+            3'd5:    w_hs_cand = r_h2[2];
+            default: w_hs_cand = r_h1[3];
+        endcase
+    end
+    always_ff @(posedge i_Clk) begin
+        r_h1[1] <= w_q1;     r_h1[2] <= r_h1[1];  r_h1[3] <= r_h1[2];
+        r_h2[1] <= w_q2;     r_h2[2] <= r_h2[1];
+        r_hs_s  <= w_hs_cand;
+    end
+    // what the engines use: the strobe, CMD and DAT[3:0]
+    wire       w_samp = r_cfg_hs ? r_samp_dd : r_samp;
+    wire [4:0] w_smp  = r_cfg_hs ? r_hs_s    : w_q1;
+    wire       w_cin  = w_smp[0];
+    wire [3:0] w_din  = w_smp[4:1];
 
     // -----------------------------------------------------------------------
     // Command engine state
@@ -230,6 +334,13 @@ module sd_native #(
     logic [127:0] r_c_sh;
     logic [31:0] r_c_busy;
     logic        r_c_ok_p, r_c_err_p;    // response finished OK / with an error (one-cycle pulses)
+    // HS: strobes to ignore after the host lets go of a line it drove (CMD
+    // after a command, DAT0 after a write block's end bit).  The HS strobe
+    // comes two cycles after the default one and its sample up to 20 ns
+    // before the default instant, so the first two after the release can
+    // still hold the host's own CRC / end bit; the card's answer (N_CR >= 2,
+    // the CRC token 2 clocks after the end bit) never comes that early.
+    logic [1:0]  r_c_skip, r_d_skip;
 
     // -----------------------------------------------------------------------
     // Data engine state
@@ -332,8 +443,8 @@ module sd_native #(
     wire w_rx_half  = (r_d_units == 15'd1) && r_d_sz4[0];
 
     // receive: next shifter value and the end-of-block checks
-    wire [63:0] w_rx_next = r_d_w4 ? {r_d_sh[59:0], r_dat_in} : {r_d_sh[62:0], r_dat_in[0]};
-    wire w_blk_end_ok = r_d_w4 ? (r_dat_in == 4'hF) : r_dat_in[0];
+    wire [63:0] w_rx_next = r_d_w4 ? {r_d_sh[59:0], w_din} : {r_d_sh[62:0], w_din[0]};
+    wire w_blk_end_ok = r_d_w4 ? (w_din == 4'hF) : w_din[0];
     wire w_blk_crc_ok = r_d_w4 ? ((r_d_crc[0] | r_d_crc[1] | r_d_crc[2] | r_d_crc[3]) == 16'h0)
                                : (r_d_crc[0] == 16'h0);
     wire w_rd_last_blk = (r_d_cnt != 16'd0) && (r_blkdone + 16'd1 == r_d_cnt);
@@ -346,7 +457,7 @@ module sd_native #(
     // is dropped with FIFO_ERR (spec v1.2).
     logic      w_dma_pop, w_dma_push;   // the DMA engine's pop / push (below)
     logic [63:0] w_dma_pword;
-    wire w_eng_we  = r_samp && (r_d_state == D_RD_DATA) && w_rx_wordb;
+    wire w_eng_we  = w_samp && (r_d_state == D_RD_DATA) && w_rx_wordb;
     wire w_eng_pop = ev_fall && (((r_d_state == D_WR_WAIT) && w_blk_ready)
                               || ((r_d_state == D_WR_DATA) && (r_d_units != 15'd1) && w_tx_wordb));
     wire w_cpu_pop = w_new_rd && w_win && (w_off == O_DATA) && r_head_v && !w_dma_busy;
@@ -358,7 +469,7 @@ module sd_native #(
     // Flow control: park CLK between blocks.  The read decision is also
     // taken combinationally on the end bit's sample, so that even at
     // clk_div = 0 no clock follows the end bit.
-    wire w_rd_hold_now = r_samp && (r_d_state == D_RD_CRC) && (r_d_aux == 5'd16)
+    wire w_rd_hold_now = w_samp && (r_d_state == D_RD_CRC) && (r_d_aux == 5'd16)
                          && w_blk_end_ok && w_blk_crc_ok && !w_rd_last_blk && !r_rd_room;
     wire w_hold = (r_d_state == D_RD_HOLD) || ((r_d_state == D_WR_WAIT) && !w_blk_ready) || w_rd_hold_now;
     assign w_run = i_sd_mode && (w_c_active || (!w_hold && (r_cfg_clkon || w_d_active || (r_trail != 4'd0))));
@@ -376,7 +487,7 @@ module sd_native #(
     wire w_thresh    = (w_thresh_rd || w_thresh_wr) && !w_dma_busy;
     wire w_err_any   = (|r_err) || r_dma_err;
     wire [31:0] w_status = {w_err_any, 3'b0, r_dma_err, r_err, 6'b0, r_data_done, r_cmd_done,
-                            2'b0, w_dma_busy, w_thresh, ~r_cd_sync[1], r_dat_in[0], w_dbusy, w_c_active};
+                            1'b0, r_idly_rdy, w_dma_busy, w_thresh, ~r_cd_sync[1], i_dat_q1[0], w_dbusy, w_c_active};
     // CARD_PRESENT = NOT the CD pin: the Nexys A7 slot's card-detect switch
     // pulls SD_CD low with a card inserted (measured on the board, 2026-11-10;
     // SD_STATUS[1] keeps reporting the raw pin for compatibility).
@@ -403,18 +514,87 @@ module sd_native #(
             r_clk     <= 1'b0;
             r_div_cnt <= 16'd0;
             r_samp    <= 1'b0;
+            r_samp_d  <= 1'b0;
+            r_samp_dd <= 1'b0;
         end else begin
-            r_samp <= ev_fall;
+            r_samp    <= ev_fall;
+            r_samp_d  <= r_samp;
+            r_samp_dd <= r_samp_d;
+            r_clk     <= w_clk_nx;
             if (!r_clk && !w_run) begin
                 r_div_cnt <= 16'd0;                 // parked low
             end else if (w_tick) begin
                 r_div_cnt <= 16'd0;
-                r_clk     <= ~r_clk;
             end else begin
                 r_div_cnt <= r_div_cnt + 16'd1;
             end
         end
     end
+
+    // -----------------------------------------------------------------------
+    // The pin outputs' next values (o_*_nx).  The engine block below still
+    // assigns o_cmd / o_cmd_oe / o_dat / o_dat_oe as it always has; this
+    // repeats exactly those assignments as a function of the current state,
+    // so the parent's IOB registers (which take o_*_nx) hold what o_* will
+    // hold, on the same edge.  Checked every cycle in simulation (below);
+    // in synthesis the o_* registers lose their loads and are removed.
+    // -----------------------------------------------------------------------
+    logic       nx_cmd, nx_cmd_oe;
+    logic [3:0] nx_dat, nx_dat_oe;
+    always_comb begin
+        nx_cmd = o_cmd;  nx_cmd_oe = o_cmd_oe;
+        nx_dat = o_dat;  nx_dat_oe = o_dat_oe;
+        if (i_rst || !i_sd_mode) begin
+            nx_cmd = 1'b1;  nx_cmd_oe = 1'b0;
+            nx_dat = 4'hF;  nx_dat_oe = 4'h0;
+        end else begin
+            // command engine (C_WAIT: the start bit; C_SEND: the frame)
+            if (ev_fall) begin
+                if (r_c_state == C_WAIT && r_trail == 4'd0) begin
+                    nx_cmd = r_c_tx[39];  nx_cmd_oe = 1'b1;
+                end else if (r_c_state == C_SEND) begin
+                    if (r_c_cnt < 8'd40)       nx_cmd = r_c_tx[39];
+                    else if (r_c_cnt < 8'd47)  nx_cmd = r_c_crc[6];
+                    else if (r_c_cnt == 8'd47) nx_cmd = 1'b1;
+                    else begin                 nx_cmd = 1'b1;  nx_cmd_oe = 1'b0; end
+                end
+            end
+            // data engine (write)
+            if (ev_fall) begin
+                case (r_d_state)
+                    D_WR_WAIT: if (w_blk_ready) begin
+                        nx_dat    = r_d_w4 ? 4'h0 : 4'hE;
+                        nx_dat_oe = r_d_w4 ? 4'hF : 4'h1;
+                    end
+                    D_WR_DATA: nx_dat = r_d_w4 ? r_d_sh[63:60] : {3'b111, r_d_sh[63]};
+                    D_WR_CRC:  for (int i = 0; i < 4; i++)
+                                   nx_dat[i] = (r_d_w4 || i == 0) ? r_d_crc[i][15] : 1'b1;
+                    D_WR_END:  nx_dat = 4'hF;
+                    D_WR_REL:  nx_dat_oe = 4'h0;
+                    default: ;
+                endcase
+            end
+            // a stop or a data command releases DAT at once
+            if (w_acc_stop || w_acc_data) begin
+                nx_dat = 4'hF;  nx_dat_oe = 4'h0;
+            end
+        end
+    end
+    assign o_cmd_nx = nx_cmd;  assign o_cmd_oe_nx = nx_cmd_oe;
+    assign o_dat_nx = nx_dat;  assign o_dat_oe_nx = nx_dat_oe;
+
+`ifndef SYNTHESIS
+    // o_* (the engine's registers) must equal the o_*_nx of the cycle before
+    logic        r_nx_chk = 1'b0;
+    logic [10:0] r_nx_q;
+    always_ff @(posedge i_Clk) begin
+        r_nx_chk <= 1'b1;
+        r_nx_q   <= {w_clk_nx, nx_cmd, nx_cmd_oe, nx_dat, nx_dat_oe};
+        if (r_nx_chk && {r_clk, o_cmd, o_cmd_oe, o_dat, o_dat_oe} !== r_nx_q)
+            $fatal(1, "sd_native: pin next-value mismatch: regs %b, next of the cycle before %b",
+                   {r_clk, o_cmd, o_cmd_oe, o_dat, o_dat_oe}, r_nx_q);
+    end
+`endif
 
     // -----------------------------------------------------------------------
     // Registers, status, FIFO pointers and both engines
@@ -435,10 +615,12 @@ module sd_native #(
             r_tmo_data  <= 32'd2_500_000;
             r_tmo_busy  <= 32'd12_500_000;
             r_cfg_w4    <= 1'b0;  r_cfg_clkon <= 1'b0;
+            r_cfg_hs    <= 1'b0;  r_cfg_phase <= 4'd0;  r_cfg_tap <= 5'd0;
             r_blkdone   <= 16'h0;
             r_trail     <= 4'd0;
             r_c_state   <= C_IDLE;
             r_c_ok_p    <= 1'b0;  r_c_err_p <= 1'b0;
+            r_c_skip    <= 2'd0;  r_d_skip  <= 2'd0;
             r_c_tx      <= 40'h0; r_c_crc <= 7'h0; r_c_cnt <= 8'h0;
             r_c_idx     <= 6'h0;  r_c_rtype <= 3'd0;
             r_c_sh      <= 128'h0;
@@ -471,6 +653,8 @@ module sd_native #(
             if (w_wr && w_off == O_IRQEN) r_irq_en <= r_in_wdata[27:0] & IRQ_MASK[27:0];
             if (w_wr && w_off == O_TMO)   begin r_tmo_data <= r_in_wdata[31:0]; r_tmo_busy <= r_in_wdata[63:32]; end
             if (w_wr && w_off == O_CFG)   begin r_cfg_w4 <= r_in_wdata[0]; r_cfg_clkon <= r_in_wdata[2];
+                                                r_cfg_hs <= r_in_wdata[1]; r_cfg_phase <= r_in_wdata[7:4];
+                                                r_cfg_tap <= r_in_wdata[12:8];
                                                 r_cfg_dma <= DMA_EN && r_in_wdata[16]; end
             // SDM_DMA_ADDR: ignored while DMA_BUSY (it is the live address
             // then); the engine advances it past every word it moves
@@ -568,14 +752,17 @@ module sd_native #(
                                     r_trail    <= 4'd8;
                                     r_c_state  <= C_IDLE;
                                 end else begin
+                                    r_c_skip   <= r_cfg_hs ? 2'd2 : 2'd0;
                                     r_c_state  <= C_RWAIT;
                                 end
                             end
                         end
                     end
                     C_RWAIT: begin
-                        if (r_samp) begin
-                            if (!r_cmd_in) begin
+                        if (w_samp && r_c_skip != 2'd0) begin
+                            r_c_skip <= r_c_skip - 2'd1;          // (HS) still the host's own bits
+                        end else if (w_samp) begin
+                            if (!w_cin) begin
                                 r_c_cnt   <= 8'd0;
                                 r_c_crc   <= 7'h0;
                                 r_c_state <= C_RECV;
@@ -591,25 +778,25 @@ module sd_native #(
                         end
                     end
                     C_RECV: begin
-                        if (r_samp) begin
+                        if (w_samp) begin
                             r_c_cnt <= r_c_cnt + 8'd1;
-                            r_c_sh  <= {r_c_sh[126:0], r_cmd_in};
+                            r_c_sh  <= {r_c_sh[126:0], w_cin};
                             // CRC7 over everything it covers, then the 7 CRC
                             // bits themselves: a good response leaves 0.
                             if (r_c_rtype == 3'd3) begin
-                                if (r_c_cnt >= 8'd7 && r_c_cnt <= 8'd133) r_c_crc <= f_crc7(r_c_crc, r_cmd_in);
+                                if (r_c_cnt >= 8'd7 && r_c_cnt <= 8'd133) r_c_crc <= f_crc7(r_c_crc, w_cin);
                             end else begin
-                                if (r_c_cnt <= 8'd45) r_c_crc <= f_crc7(r_c_crc, r_cmd_in);
+                                if (r_c_cnt <= 8'd45) r_c_crc <= f_crc7(r_c_crc, w_cin);
                             end
                             if ((r_c_rtype == 3'd3) ? (r_c_cnt == 8'd134) : (r_c_cnt == 8'd46)) begin
-                                // r_cmd_in is the end bit
+                                // w_cin is the end bit
                                 logic e_end, e_crc, e_idx;
-                                e_end = !r_cmd_in;
+                                e_end = !w_cin;
                                 e_crc = (r_c_rtype != 3'd4) && (r_c_crc != 7'h0);
                                 e_idx = ((r_c_rtype == 3'd1) || (r_c_rtype == 3'd2)) && (r_c_sh[44:39] != r_c_idx);
                                 if (r_c_rtype == 3'd3) begin
                                     r_resp1 <= r_c_sh[126:63];
-                                    r_resp0 <= {r_c_sh[62:0], r_cmd_in};
+                                    r_resp0 <= {r_c_sh[62:0], w_cin};
                                 end else begin
                                     r_resp1 <= 64'h0;
                                     r_resp0 <= {26'h0, r_c_sh[44:7]};
@@ -636,9 +823,9 @@ module sd_native #(
                         end
                     end
                     C_BUSY: begin       // R1b: DAT0 low while the card is busy
-                        if (r_samp) begin
+                        if (w_samp) begin
                             if (r_c_cnt < 8'(BUSY_SKIP)) r_c_cnt <= r_c_cnt + 8'd1;
-                            if (r_c_cnt >= 8'(BUSY_SKIP) && r_dat_in[0]) begin
+                            if (r_c_cnt >= 8'(BUSY_SKIP) && w_din[0]) begin
                                 r_cmd_done <= 1'b1;
                                 r_c_ok_p   <= 1'b1;
                                 r_trail    <= 4'd8;
@@ -680,8 +867,8 @@ module sd_native #(
                     D_RD_START: begin
                         if (r_c_err_p) begin
                             r_d_state <= D_IDLE;            // response error: abort, no DATA_DONE
-                        end else if (r_samp) begin
-                            if (!r_dat_in[0]) begin
+                        end else if (w_samp) begin
+                            if (!w_din[0]) begin
                                 r_d_units <= r_d_w4 ? {2'b0, r_d_sz4, 3'b0} : {r_d_sz4, 5'b0};
                                 r_d_wpos  <= 6'd0;
                                 for (int i = 0; i < 4; i++) r_d_crc[i] <= 16'h0;
@@ -699,10 +886,10 @@ module sd_native #(
                         if (r_c_err_p) begin
                             r_wp      <= r_wc;
                             r_d_state <= D_IDLE;
-                        end else if (r_samp) begin
+                        end else if (w_samp) begin
                             r_d_sh <= w_rx_next;
                             for (int i = 0; i < 4; i++)
-                                if (r_d_w4 || i == 0) r_d_crc[i] <= f_crc16(r_d_crc[i], r_dat_in[i]);
+                                if (r_d_w4 || i == 0) r_d_crc[i] <= f_crc16(r_d_crc[i], w_din[i]);
                             if (w_eng_we) begin
                                 if (w_full) r_err[E_FIFO] <= 1'b1;   // only if the FIFO was not reset first
                                 else        r_wp <= r_wp + 10'd1;
@@ -719,11 +906,11 @@ module sd_native #(
                         if (r_c_err_p) begin
                             r_wp      <= r_wc;
                             r_d_state <= D_IDLE;
-                        end else if (r_samp) begin
+                        end else if (w_samp) begin
                             r_d_aux <= r_d_aux + 5'd1;
                             if (r_d_aux != 5'd16) begin
                                 for (int i = 0; i < 4; i++)
-                                    if (r_d_w4 || i == 0) r_d_crc[i] <= f_crc16(r_d_crc[i], r_dat_in[i]);
+                                    if (r_d_w4 || i == 0) r_d_crc[i] <= f_crc16(r_d_crc[i], w_din[i]);
                             end else begin
                                 if (w_blk_end_ok && w_blk_crc_ok) begin
                                     r_wc      <= r_wp;              // the block becomes visible
@@ -821,12 +1008,15 @@ module sd_native #(
                         if (ev_fall) begin
                             o_dat_oe  <= 4'h0;
                             r_d_aux   <= 5'd0;
+                            r_d_skip  <= r_cfg_hs ? 2'd2 : 2'd0;
                             r_d_state <= D_WR_TOK;
                         end
                     end
                     D_WR_TOK: begin     // CRC status token: start bit within 8 clocks
-                        if (r_samp) begin
-                            if (!r_dat_in[0]) begin
+                        if (w_samp && r_d_skip != 2'd0) begin
+                            r_d_skip <= r_d_skip - 2'd1;          // (HS) still the host's own bits
+                        end else if (w_samp) begin
+                            if (!w_din[0]) begin
                                 r_d_aux   <= 5'd0;
                                 r_d_state <= D_WR_TST;
                             end else if (r_d_aux == 5'(TOK_WIN)) begin
@@ -839,11 +1029,11 @@ module sd_native #(
                         end
                     end
                     D_WR_TST: begin     // 3 status bits, then the token's end bit
-                        if (r_samp) begin
-                            r_d_tok <= {r_d_tok[2:0], r_dat_in[0]};
+                        if (w_samp) begin
+                            r_d_tok <= {r_d_tok[2:0], w_din[0]};
                             r_d_aux <= r_d_aux + 5'd1;
                             if (r_d_aux == 5'd3) begin
-                                if (r_d_tok[2:0] == 3'b010 && r_dat_in[0]) begin
+                                if (r_d_tok[2:0] == 3'b010 && w_din[0]) begin
                                     r_d_aux   <= 5'd0;
                                     r_d_tmo   <= 32'h0;
                                     r_d_state <= D_WR_BUSY;
@@ -856,9 +1046,9 @@ module sd_native #(
                         end
                     end
                     D_WR_BUSY: begin
-                        if (r_samp) begin
+                        if (w_samp) begin
                             if (r_d_aux < 5'(BUSY_SKIP)) r_d_aux <= r_d_aux + 5'd1;
-                            if (r_d_aux >= 5'(BUSY_SKIP) && r_dat_in[0]) begin
+                            if (r_d_aux >= 5'(BUSY_SKIP) && w_din[0]) begin
                                 r_blkdone <= r_blkdone + 16'd1;
                                 if (w_rd_last_blk) begin
                                     r_data_done <= 1'b1;
@@ -1204,7 +1394,7 @@ module sd_native #(
             O_STATUS:  o_rdata = {32'h0, w_status};
             O_IRQEN:   o_rdata = {36'h0, r_irq_en};
             O_TMO:     o_rdata = {r_tmo_busy, r_tmo_data};
-            O_CFG:     o_rdata = {47'h0, r_cfg_dma, 13'h0, r_cfg_clkon, 1'b0, r_cfg_w4};
+            O_CFG:     o_rdata = {47'h0, r_cfg_dma, 3'h0, r_cfg_tap, r_cfg_phase, 1'b0, r_cfg_clkon, r_cfg_hs, r_cfg_w4};
             O_DMA:     o_rdata = DMA_EN ? {r_dma_addr, 3'b000} : 64'h0;
             O_FIFO:    o_rdata = {54'h0, w_level};
             O_BLKDONE: o_rdata = {48'h0, r_blkdone};

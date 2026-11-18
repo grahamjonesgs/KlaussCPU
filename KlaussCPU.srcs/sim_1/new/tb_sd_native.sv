@@ -14,6 +14,8 @@
 module tb_sd_native;
     logic clk = 0, rst_l = 0, load_rst = 0;
     always #5 clk = ~clk;
+    logic clkref = 0;               // IDELAYCTRL's 200 MHz reference
+    always #2.5 clkref = ~clkref;
 
     mmio_if bus();
     wire        sck, reset_n, irq;
@@ -23,24 +25,97 @@ module tb_sd_native;
     wire [3:0]  sd_dat;
     logic       cd = 1'b0;          // SD_CD pin, active low: 0 = card inserted
 
-    assign sd_cmd = cmd_oe ? cmd_o : 1'bz;
-    for (genvar i = 0; i < 4; i++) begin : g_d
-        assign sd_dat[i] = dat_oe[i] ? dat_o[i] : 1'bz;
-    end
+    // Pad and trace delays (0 except in the high-speed tests): the host's
+    // outputs (CLK, CMD, DAT) reach the card t_out after the IOB register's
+    // edge, and the bus reaches the host's IDELAY / IDDR t_in later.
+    real        t_out = 0.0, t_in = 0.0;
+    logic       sck_card = 1'b0;
+    logic       host_cmd_d = 1'bz;
+    logic [3:0] host_dat_d = 4'bzzzz;
+    logic       sd_cmd_in;
+    logic [3:0] sd_dat_in;
+    always @(sck) sck_card <= #(t_out) sck;
+    always @(cmd_o, cmd_oe) host_cmd_d <= #(t_out) (cmd_oe ? cmd_o : 1'bz);
+    always @(dat_o, dat_oe) host_dat_d <= #(t_out) {dat_oe[3] ? dat_o[3] : 1'bz, dat_oe[2] ? dat_o[2] : 1'bz,
+                                                    dat_oe[1] ? dat_o[1] : 1'bz, dat_oe[0] ? dat_o[0] : 1'bz};
+    assign sd_cmd = host_cmd_d;
+    assign sd_dat = host_dat_d;
+    always @(sd_cmd) sd_cmd_in <= #(t_in) sd_cmd;
+    always @(sd_dat) sd_dat_in <= #(t_in) sd_dat;
     pullup (sd_cmd);
     pullup (sd_dat[0]); pullup (sd_dat[1]); pullup (sd_dat[2]); pullup (sd_dat[3]);
 
     sd_spi dut (
-        .i_Clk(clk), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus), .o_irq(irq),
+        .i_Clk(clk), .i_clk_ref(clkref), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus), .o_irq(irq),
         .i_sd_cd(cd), .o_sd_reset_n(reset_n), .o_sd_sck(sck),
-        .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .i_sd_cmd(sd_cmd),
-        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat(sd_dat),
+        .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .o_sd_cmd_t(), .i_sd_cmd(sd_cmd_in),
+        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .o_sd_dat_t(), .i_sd_dat(sd_dat_in),
         // the SD DMA port: idle here (no DMA_EN data command; tb_sd_dma tests it)
         .o_dma_req(), .o_dma_done(), .o_dma_write_DV(), .o_dma_read_DV(), .o_dma_addr(),
         .o_dma_write_data(), .o_dma_wdf_mask(), .i_dma_read_data(128'h0), .i_dma_ready(1'b0),
         .i_dma_grant(1'b0)
     );
-    sd_card_model card (.clk(sck), .pwr(!reset_n), .cmd(sd_cmd), .dat(sd_dat));
+    sd_card_model card (.clk(sck_card), .pwr(!reset_n), .cmd(sd_cmd), .dat(sd_dat));
+`define M0_DMA_RDATA 128'h0
+`define M0_DMA_READY 1'b0
+`define M0_DMA_GRANT 1'b0
+`define M0_DMA_OUT   {dut.o_dma_req, dut.o_dma_done, dut.o_dma_write_DV, dut.o_dma_read_DV, dut.o_dma_addr, dut.o_dma_write_data, dut.o_dma_wdf_mask}
+
+`ifdef SD_M0
+    // ---------------- lock-step reference (SD_NATIVE_PLAN.md §9) ----------------
+    // sd_spi_m0 / sd_native_m0 are sd_spi.sv / sd_native.sv as of 6dcbcfb (the
+    // phase-2 / DMA release; run_sd_tb.sh renames them).  Same MMIO, same pins
+    // in.  Until the DUT first sets SDM_CFG[1] (high-speed sampling), every
+    // pin and every read must match cycle for cycle: the default-speed and
+    // SPI behaviour is unchanged.  Read data differs only where phase 3 added
+    // bits: SDM_CAPS, SDM_STATUS[6] (IDELAY_RDY), SDM_CFG[12:4] and [1].
+    mmio_if bus_m0();
+    always_comb begin
+        bus_m0.write_DV = bus.write_DV; bus_m0.read_DV = bus.read_DV; bus_m0.addr = bus.addr;
+        bus_m0.write_data = bus.write_data; bus_m0.byte_en = bus.byte_en;
+    end
+    wire        m0_sck, m0_reset_n, m0_irq, m0_cmd_o, m0_cmd_oe;
+    wire [3:0]  m0_dat_o, m0_dat_oe;
+    wire        m0_req, m0_done, m0_wdv, m0_rdv;
+    wire [31:0] m0_addr;
+    wire [127:0] m0_wdata;
+    wire [15:0] m0_mask;
+    sd_spi_m0 m0 (
+        .i_Clk(clk), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus_m0), .o_irq(m0_irq),
+        .i_sd_cd(cd), .o_sd_reset_n(m0_reset_n), .o_sd_sck(m0_sck),
+        .o_sd_cmd(m0_cmd_o), .o_sd_cmd_oe(m0_cmd_oe), .i_sd_cmd(sd_cmd),
+        .o_sd_dat(m0_dat_o), .o_sd_dat_oe(m0_dat_oe), .i_sd_dat(sd_dat),
+        .o_dma_req(m0_req), .o_dma_done(m0_done), .o_dma_write_DV(m0_wdv), .o_dma_read_DV(m0_rdv),
+        .o_dma_addr(m0_addr), .o_dma_write_data(m0_wdata), .o_dma_wdf_mask(m0_mask),
+        .i_dma_read_data(`M0_DMA_RDATA), .i_dma_ready(`M0_DMA_READY), .i_dma_grant(`M0_DMA_GRANT)
+    );
+    bit     m0_on = 1;
+    longint m0_cycles = 0;
+    int     m0_mism = 0;
+    logic [15:0] m0_prev_addr = 0;
+    always @(posedge clk) begin
+        // (HS sampling changes what the engines see: off for good once an
+        // engine runs with it)
+        if (dut.native_i.r_cfg_hs && (dut.native_i.r_c_state != 0 || dut.native_i.r_d_state != 0)) m0_on = 0;
+        m0_prev_addr <= bus.addr[15:0];
+    end
+    always @(negedge clk) if (m0_on && rst_l) begin
+        logic [63:0] rmask;
+        rmask = (m0_prev_addr == 16'h1F8) ? 64'h0 : (m0_prev_addr == 16'h128) ? ~64'h40
+              : (m0_prev_addr == 16'h140) ? ~64'h1FF2 : ~64'h0;
+        m0_cycles++;
+        if ({sck, cmd_o, cmd_oe, dat_o, dat_oe, reset_n, irq, `M0_DMA_OUT} !==
+            {m0_sck, m0_cmd_o, m0_cmd_oe, m0_dat_o, m0_dat_oe, m0_reset_n, m0_irq,
+             m0_req, m0_done, m0_wdv, m0_rdv, m0_addr, m0_wdata, m0_mask}
+            || ((bus.read_data ^ bus_m0.read_data) & rmask) !== 64'h0) begin
+            m0_mism++;
+            if (m0_mism <= 5)
+                $display("[%0t] M0 LOCKSTEP MISMATCH: pins %b/%b %b/%b %b/%b %b/%b rd %h/%h", $time,
+                         sck, m0_sck, cmd_o, m0_cmd_o, dat_o, m0_dat_o, dat_oe, m0_dat_oe,
+                         bus.read_data, bus_m0.read_data);
+        end
+    end
+`endif
 
     localparam logic [31:0] BASE = 32'hF000_0000;
     localparam logic [15:0] SD_CTRL = 16'h000, SDM_CMD = 16'h100, SDM_ARG = 16'h108,
@@ -248,15 +323,374 @@ module tb_sd_native;
     int    n0;
     longint t0;
 
+    // =====================================================================
+    // High speed (phase 3) helpers
+    // =====================================================================
+    localparam logic [63:0] CFG_W4 = 64'h1, CFG_HS = 64'h2, CFG_CLKON = 64'h4;
+    function automatic logic [63:0] cfg_hs(input int phase, input int tap, input bit clkon = 0);
+        return CFG_W4 | CFG_HS | (clkon ? CFG_CLKON : 0) | (64'(phase) << 4) | (64'(tap) << 8);
+    endfunction
+    localparam logic [63:0] CTRL_ON = (64'h1 << 18) | (64'h1 << 17);
+
+    // power-cycle the slot and bring the card up to 4-bit transfer state at
+    // 25 MHz, default speed (as at the start of the test)
+    task automatic card_up();
+        logic [63:0] s;
+        mw(SDM_CFG, 0);
+        mw(SD_CTRL, (64'h1 << 18) | 64'd124);                    // power off
+        repeat (500) @(posedge clk);
+        mw(SD_CTRL, CTRL_ON | 64'd124);                           // 400 kHz
+        repeat (100) @(posedge clk);
+        mw(SDM_CFG, CFG_CLKON);
+        begin longint t = ncyc; int n = sck_rises;
+              while (sck_rises - n < 80 && ncyc - t < 100000) @(posedge clk); end
+        mw(SDM_CFG, 0);
+        do_cmd("up CMD0", 0, 0, RT_NONE, s);
+        do_cmd("up CMD8", 8, 32'h1AA, RT_R1, s);
+        mw(SD_CTRL, CTRL_ON | 64'd9);
+        for (int i = 0; i < 6; i++) begin
+            do_cmd("up CMD55", 55, 0, RT_R1, s);
+            do_cmd("up ACMD41", 41, 32'h40FF_8000, RT_R3, s);
+            if (r0[31]) break;
+        end
+        do_cmd("up CMD2", 2, 0, RT_R2, s);
+        do_cmd("up CMD3", 3, 0, RT_R1, s);
+        rca = r0[31:16];
+        do_cmd("up CMD7", 7, {rca, 16'h0}, RT_R1B, s);
+        do_cmd("up CMD55", 55, {rca, 16'h0}, RT_R1, s);
+        do_cmd("up ACMD6", 6, 2, RT_R1, s);
+        mw(SDM_CFG, CFG_W4);
+        mw(SD_CTRL, CTRL_ON | 64'd1);                             // 25 MHz
+        check("card up: tran, 4-bit, default speed", {card.st == 4, card.w4, card.hs}, 3'b110);
+    endtask
+
+    // CMD6 (64-byte status), checked against the card's; returns the
+    // function group 1 result nibble (status byte 16 [3:0])
+    task automatic cmd6(input string what, input logic [31:0] arg, output logic [3:0] g1, input bit expect_ok = 1);
+        logic [63:0] s, w;
+        int bad = 0;
+        fifo_reset(); set_blk(64, 1); clr_status();
+        cmd_start(6, arg, RT_R1, 1, 0);
+        wait_data(s);
+        g1 = 4'hX;
+        if (expect_ok) begin
+            check({what, " CMD6 DATA_DONE"}, s[B_DATA_DONE], 1);
+            check({what, " CMD6 no error"}, s & ERR_MASK, 0);
+        end
+        for (int k = 0; k < 8; k++) begin
+            logic [63:0] e;
+            for (int j = 0; j < 8; j++) e[8*j +: 8] = card.sw_status[k*8 + j];
+            pop(w);
+            if (k == 2) g1 = w[3:0];                              // byte 16
+            if (w !== e) bad++;
+        end
+        if (expect_ok) check({what, " CMD6 status block"}, bad, 0);
+        wait_card_idle();
+    endtask
+
+    // the sample phase / tap that the timing model says passes: the bit the
+    // card launches on the rising edge R is valid at the host IDDR from
+    // R + t_out + hs_odly + t_in + tap*78 ps to 20 ns later + (hs_oh - hs_odly);
+    // phase p samples at R + 10 + 5p (SD_NATIVE_PLAN.md §9.3)
+    localparam real TAP_NS = 1000.0 / (2.0 * 32.0 * 200.0) ;   // 78.125 ps
+    // The sample stream is periodic in the SD clock: T and T + 20 ns see
+    // the same eye (one bit apart, and the engines align on start bits), so
+    // a phase passes if T falls in the eye modulo 20 ns.
+    function automatic bit hs_pred(input int p, input int tap, output real margin);
+        real d, lo, hi, t;
+        d  = t_out + t_in + 0.6 + tap * TAP_NS;            // (+ the IDELAYE2 model's 600 ps)
+        lo = d + card.hs_odly;
+        hi = 20.0 + d + card.hs_oh;
+        t  = 10.0 + 5.0 * p;
+        while (t > lo + 20.0) t = t - 20.0;
+        while (t < lo) t = t + 20.0;
+        // t in [lo, lo + 20): inside the eye if below hi; margin to the
+        // nearer edge (negative: the distance into the bad window)
+        if (t < hi) margin = (t - lo < hi - t) ? t - lo : hi - t;
+        else        margin = -((t - hi < lo + 20.0 - t) ? t - hi : lo + 20.0 - t);
+        return t < hi;
+    endfunction
+
+    // one block read at the current settings: 1 = response, data and CRC good
+    int hs_crc_errs = 0, hs_other_errs = 0;
+    logic [63:0] hs_last_st;
+    task automatic hs_try(input longint blk, output bit ok);
+        logic [63:0] s, w;
+        int bad = 0;
+        fifo_reset(); clr_status(); set_blk(512, 1);
+        cmd_start(17, 32'(blk), RT_R1, 1, 0);
+        wait_cmd(s);
+        begin longint t = ncyc; do status(s); while (s[B_DATA_BUSY] && ncyc - t < 200000); end
+        if (s[B_DATA_BUSY]) begin
+            // a response error leaves no data phase; a missed start bit
+            // times out: stop it
+            cmd_start(12, 0, RT_R1B, 0, 0, 1); wait_cmd(w);
+        end
+        wait_card_idle();
+        status(s);
+        hs_last_st = s;
+        if (s[B_DAT_CRC] || s[B_CMD_CRC]) hs_crc_errs++;
+        else if (s & ERR_MASK) hs_other_errs++;
+        ok = s[B_DATA_DONE] && (s & ERR_MASK) == 0;
+        if (ok) begin
+            for (int k = 0; k < 64; k++) begin
+                pop(w);
+                if (w !== card_word(blk * 512 + k * 8)) bad++;
+            end
+            if (bad) ok = 0;
+        end
+        // a failed phase may leave the card mid-frame: CLK_ON lets it finish
+        // (the sweep runs with CLK_ON), then make sure it is in tran
+        clr_status();
+    endtask
+
+    // a counted multi-block read that parks CLK many times: the FIFO fills
+    // (8 blocks) before the drain starts, then every other block the drain
+    // pauses long enough for the FIFO to fill and CLK to park again
+    task automatic flow_read(input string what, input longint blk, input int n);
+        logic [63:0] s, w;
+        int bad = 0, parks = 0;
+        fifo_reset(); clr_status(); set_blk(512, n);
+        cmd_start(18, 32'(blk), RT_R1, 1, 0);
+        begin longint t = ncyc; do mr(SDM_FIFO, w); while (w < 512 && ncyc - t < 1_000_000); end
+        check({what, ": FIFO fills to 8 blocks"}, w, 512);
+        for (int b = 0; b < n; b++) begin
+            longint t = ncyc;
+            do status(s); while (!s[B_THRESH] && ncyc - t < 2_000_000);
+            if (b % 2 == 0 && b + 8 < n) begin
+                // (the FIFO is full here: a block's time later it is full
+                // again after this block's drain, and CLK must be parked)
+                int r0n;
+                for (int k = 0; k < 64; k++) begin
+                    pop(w);
+                    if (w !== card_word((blk + b) * 512 + k * 8)) bad++;
+                end
+                repeat (4000) @(posedge clk);
+                r0n = sck_rises; repeat (1000) @(posedge clk);
+                if (sck_rises == r0n && sck == 1'b0) parks++;
+                continue;
+            end
+            for (int k = 0; k < 64; k++) begin
+                pop(w);
+                if (w !== card_word((blk + b) * 512 + k * 8)) begin
+                    bad++;
+                    if (bad < 4) $display("FAIL %s: block %0d word %0d got %h exp %h", what, b, k, w, card_word((blk + b) * 512 + k * 8));
+                end
+            end
+        end
+        wait_data(s);
+        check({what, ": data"}, bad, 0);
+        check({what, ": DATA_DONE, no error"}, s & (ERR_MASK | (64'h1 << B_DATA_DONE)), 64'h1 << B_DATA_DONE);
+        mr(SDM_BLKDONE, w); check({what, ": BLKDONE"}, w, n);
+        check_true({what, ": CLK parked (FIFO full) each time"}, parks == (n - 8 + 1) / 2);
+        do_cmd({what, ": CMD12"}, 12, 0, RT_R1B, s);
+        wait_card_idle();
+    endtask
+
+    // sweep the phases at one tap; check against the model; pass mask out
+    task automatic hs_sweep(input string what, input int tap, output logic [6:0] pass);
+        int mism = 0;
+        string line;
+        line = "";
+        for (int p = 0; p < 7; p++) begin
+            bit ok, pr;
+            real m;
+            mw(SDM_CFG, cfg_hs(p, tap, 1));
+            hs_try(64'(20000 + p), ok);
+            pr = hs_pred(p, tap, m);
+            pass[p] = ok;
+            line = {line, $sformatf(" %0d:%s(%0.1f,%03h)", p, ok ? "P" : ".", m, hs_last_st[27:16])};
+            if (ok != pr && (m > 0.3 || m < -0.3)) begin
+                mism++;
+                $display("FAIL %s tap %0d phase %0d: %s, the model says %s (margin %0.2f ns)", what, tap, p,
+                         ok ? "passes" : "fails", pr ? "pass" : "fail", m);
+            end
+        end
+        $display("HS sweep %s tap %2d:%s", what, tap, line);
+        check({what, " sweep matches the timing model"}, mism, 0);
+    endtask
+
+    task automatic hs_tests();
+        // =========================================================== high speed (phase 3)
+        begin
+            logic [3:0] g1;
+            logic [6:0] pm;
+            int lo, hi, best;
+            bit ok;
+            card_up();
+            // ---- CMD6 at default speed: check (mode 0), then switch (mode 1)
+            cmd6("CMD6 check HS", 32'h00FF_FFF1, g1);
+            check("CMD6 check: group 1 function 1 available", g1, 1);
+            check("CMD6 check does not switch", card.hs, 0);
+            cmd6("CMD6 check unsupported fn 3", 32'h00FF_FFF3, g1);
+            check("CMD6 check: function 3 not supported (F)", g1, 4'hF);
+            read_cmd("default speed after a CMD6 check", 17, 21000, 1, 1);
+            wait_card_idle();
+            n0 = card.n_switch;
+            cmd6("CMD6 switch to HS", 32'h80FF_FFF1, g1);
+            check("CMD6 switch: group 1 = 1", g1, 1);
+            check("card switched to high speed", {card.hs, card.n_switch - n0}, {1'b1, 32'd1});
+
+            // ---- the phase sweep at 50 MHz.  Pad delays as the routed
+            // design's (OLOGIC + OBUF ~4.0 ns, IBUF ~1.5 + IDELAY 0.8 ns,
+            // §9.4), a spec-worst card (tODLY 14, tOH 2.5): a ~8.5 ns eye
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd4000});
+            t_out = 4.0; t_in = 1.5;
+            card.hs_odly = 14.0; card.hs_oh = 2.5;
+            mw(SD_CTRL, CTRL_ON | 64'd0);
+            hs_sweep("worst card", 0, pm);
+            check_true("worst card: some phase passes", pm != 0);
+            check_true("worst card: some phase fails", pm != 7'h7F);
+            check_true("worst card: failures were CRC errors", hs_crc_errs > 0);
+            hs_sweep("worst card", 16, pm);
+            hs_sweep("worst card", 31, pm);
+            // a typical card (tODLY 7)
+            card.hs_odly = 7.0;
+            hs_sweep("typical card", 0, pm);
+            // the centre of the longest run of passing phases (what a driver
+            // does; the 7 phases span 1.5 clocks, so a run that wraps the
+            // 20 ns period appears whole)
+            begin
+                int run = 0, brun = 0, bend = -1;
+                for (int p = 0; p < 7; p++) begin
+                    run = pm[p] ? run + 1 : 0;
+                    if (run > brun) begin brun = run; bend = p; end
+                end
+                lo = bend - brun + 1; hi = bend;
+                best = (lo + hi + 1) / 2;
+                $display("HS typical card: phases %0d..%0d pass, centre %0d (%0d ns)", lo, hi, best, 10 + 5 * best);
+                check_true("typical card: a run of >= 3 passing phases", brun >= 3);
+                begin real m; check_true("typical card: the centre has >= 3 ns margin", hs_pred(best, 0, m) && m >= 3.0); end
+            end
+            mw(SDM_CFG, cfg_hs(best, 0));                         // CLK_ON off
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd5_000_000});
+
+            // ---- multi-block read / write at 50 MHz, with flow control
+            read_cmd("HS CMD18 x8", 18, 22000, 8, 8);
+            do_cmd("HS CMD12 after CMD18 x8", 12, 0, RT_R1B, st);
+            wait_card_idle();
+            flow_read("HS CMD18 x24, flow control", 22100, 24);
+            fifo_reset(); clr_status(); set_blk(512, 12);
+            cmd_start(25, 22200, RT_R1, 1, 1);
+            push_blocks(22200, 0, 12, 61, 1);
+            wait_data(st);
+            check("HS CMD25 x12 DATA_DONE", st[B_DATA_DONE], 1);
+            check("HS CMD25 x12 no error", st & ERR_MASK, 0);
+            mr(SDM_BLKDONE, d); check("HS CMD25 BLKDONE", d, 12);
+            do_cmd("HS CMD12 after CMD25", 12, 0, RT_R1B, st);
+            check_written("HS CMD25 x12", 22200, 12, 61);
+            wait_card_idle();
+            read_cmd("HS read back the written blocks", 18, 22200, 12, 12);
+            do_cmd("HS CMD12 after the read back", 12, 0, RT_R1B, st);
+            wait_card_idle();
+            // open-ended read stopped by CMD12 [13]
+            fifo_reset(); clr_status(); set_blk(512, 0);
+            cmd_start(18, 22300, RT_R1, 1, 0);
+            drain_check("HS open-ended read", 22300, 5, 64);
+            cmd_start(12, 0, RT_R1B, 0, 0, 1);
+            wait_cmd(st); wait_data(st);
+            check("HS open-ended + stop: DATA_DONE", st[B_DATA_DONE], 1);
+            check("HS open-ended + stop: no error", st & ERR_MASK, 0);
+            wait_card_idle();
+            fifo_reset();
+            // a card that starts the next block after only 1 clock (N_AC
+            // 1, below the spec's 2): the CLK park after the end bit still
+            // loses no start bit
+            card.n_gap = 1;
+            flow_read("HS CMD18 x16, N_AC 1, flow control", 22400, 16);
+            card.n_gap = 2;
+
+            // ---- the late phases (one SD clock or more after the edge): a
+            // slow card behind slow pads, every transition at +8..22 ns
+            t_out = 5.0; t_in = 3.0; card.hs_odly = 14.0; card.hs_oh = 9.0;
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd4000});
+            hs_sweep("slow card", 0, pm);                         // eye 23.6 .. 38.6 ns (mod 20)
+            check_true("slow card: phase 5 (35 ns) passes", pm[5]);
+            mw(SDM_CFG, cfg_hs(5, 0));                            // 35 ns
+            mw(SDM_TIMEOUT, {32'd12_500_000, 32'd5_000_000});
+            flow_read("HS phase 5 CMD18 x16, flow control", 22500, 16);
+            fifo_reset(); clr_status(); set_blk(512, 4);
+            cmd_start(25, 22600, RT_R1, 1, 1);
+            push_blocks(22600, 0, 4, 62, 1);
+            wait_data(st);
+            check("HS phase 5 CMD25 x4", st & (ERR_MASK | (64'h1 << B_DATA_DONE)), 64'h1 << B_DATA_DONE);
+            do_cmd("HS phase 5 CMD12", 12, 0, RT_R1B, st);
+            check_written("HS phase 5 CMD25", 22600, 4, 62);
+            wait_card_idle();
+
+            // ---- back to default speed: CMD6 at 50 MHz (status in HS
+            // timing), then 25 MHz with the default sampling
+            t_out = 4.0; t_in = 1.5; card.hs_odly = 7.0; card.hs_oh = 2.5;
+            mw(SDM_CFG, cfg_hs(best, 0));
+            n0 = card.n_switch;
+            cmd6("CMD6 back to default speed", 32'h80FF_FFF0, g1);
+            check("CMD6 back: group 1 = 0", g1, 0);
+            check("card back at default speed", {card.hs, card.n_switch - n0}, {1'b0, 32'd1});
+            mw(SD_CTRL, CTRL_ON | 64'd1);
+            mw(SDM_CFG, CFG_W4);
+            read_cmd("default speed again", 18, 22700, 3, 3);
+            do_cmd("CMD12", 12, 0, RT_R1B, st);
+            wait_card_idle();
+
+            // ---- reset in high speed: the program-load reset (SD_MODE = 1)
+            // mid-transfer clears SDM_CFG (HS off, phase, tap) and cuts the
+            // slot (the card back to default speed); CPU_RESETN the same
+            cmd6("CMD6 to HS again", 32'h80FF_FFF1, g1);
+            mw(SD_CTRL, CTRL_ON | 64'd0);
+            mw(SDM_CFG, cfg_hs(best, 9));
+            mr(SDM_CFG, d); check("SDM_CFG HS / phase / tap readback", d, cfg_hs(best, 9));
+            fifo_reset(); clr_status(); set_blk(512, 20);
+            cmd_start(18, 22800, RT_R1, 1, 0);
+            t0 = ncyc;
+            do mr(SDM_FIFO, d); while (d < 128 && ncyc - t0 < 1_000_000);
+            @(negedge clk); load_rst = 1; @(negedge clk); load_rst = 0;
+            repeat (3) @(posedge clk);
+            mr(SDM_CFG, d);  check("reset in HS: SDM_CFG 0", d, 0);
+            mr(SD_CTRL, d);  check("reset in HS: SD_CTRL", d, 64'h0001_00F9);
+            check("reset in HS: slot off, every line low", {reset_n, sck, cmd_oe, cmd_o, dat_oe, dat_o}, {1'b1, 1'b0, 1'b1, 1'b0, 4'hF, 4'h0});
+            check("reset in HS: tap reloaded to 0", dut.g_in[0].idly.CNTVALUEOUT, 0);
+            repeat (100) @(posedge clk);
+            check("reset in HS: card back at default speed", card.hs, 0);
+            t_out = 0.0; t_in = 0.0;
+            card_up();
+            read_cmd("default speed after a reset in HS", 18, 22900, 4, 4);
+            do_cmd("CMD12", 12, 0, RT_R1B, st);
+            wait_card_idle();
+            // CPU_RESETN in HS
+            cmd6("CMD6 to HS (CPU_RESETN)", 32'h80FF_FFF1, g1);
+            mw(SD_CTRL, CTRL_ON | 64'd0);
+            mw(SDM_CFG, cfg_hs(3, 4));
+            @(negedge clk); rst_l = 0; repeat (3) @(negedge clk); rst_l = 1;
+            repeat (3) @(posedge clk);
+            mr(SDM_CFG, d);  check("CPU_RESETN in HS: SDM_CFG 0", d, 0);
+            mr(SD_CTRL, d);  check("CPU_RESETN in HS: SD_CTRL", d, 64'h0001_00F9);
+            repeat (100) @(posedge clk);
+            check("CPU_RESETN in HS: card back at default speed", card.hs, 0);
+            begin longint t = ncyc; do status(st); while (!st[6] && ncyc - t < 10000); end
+            check("IDELAY_RDY again after CPU_RESETN", st[6], 1);
+            card_up();
+            read_cmd("default speed after CPU_RESETN in HS", 17, 23000, 1, 1);
+            wait_card_idle();
+        end
+
+    endtask
+
     initial begin
         bus.write_DV = 0; bus.read_DV = 0; bus.addr = 0; bus.write_data = 0; bus.byte_en = 0;
-        repeat (5) @(posedge clk);
+        repeat (12) @(posedge clk);       // past the unisim GSR (100 ns)
         rst_l = 1;
         repeat (3) @(posedge clk);
+        if ($test$plusargs("HS_ONLY")) begin       // the high-speed tests only
+            hs_tests();
+            $display("card: %0d commands, host_err %0d, tim_err %0d", card.n_cmds, card.host_err, card.tim_err);
+            if (errors == 0 && card.host_err == 0 && card.tim_err == 0 && contention == 0) $display("TB_SD PASS (HS only, %0d checks)", checks);
+            else $display("TB_SD FAIL %0d (of %0d checks)", errors, checks);
+            $finish;
+        end
 
         // =========================================================== reset values
         mr(SD_CTRL, d);      check("SD_CTRL reset", d, 64'h0001_00F9);
-        mr(SDM_CAPS, d);     check("SDM_CAPS ([10]: the SD DMA engine)", d, 64'h0008_0501);
+        mr(SDM_CAPS, d);     check("SDM_CAPS ([9] HS, [10] DMA, [11] IDELAY, [27:24] 7 phases)", d, 64'h0708_0F01);
         mr(SDM_TIMEOUT, d);  check("SDM_TIMEOUT reset", d, {32'd12_500_000, 32'd2_500_000});
         mr(SDM_CFG, d);      check("SDM_CFG reset", d, 0);
         mr(SDM_BLK, d);      check("SDM_BLK reset", d, 64'h0001_0200);
@@ -276,14 +710,14 @@ module tb_sd_native;
         mw(SDM_BLK, 64'h0001_0003);              mr(SDM_BLK, d);  check("SDM_BLK size 3 reads 0", d, 64'h0001_0000);
         mw(SDM_IRQ_EN, 64'hFFFF_FFFF_FFFF_FFFF); mr(SDM_IRQ_EN, d); check("SDM_IRQ_EN mask ([27] DMA_ERR)", d, 64'h0FFF_0310);
         mw(SDM_IRQ_EN, 0);
-        mw(SDM_CFG, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_CFG, d);  check("SDM_CFG reserved bits read 0 ([16] DMA_EN)", d, 64'h1_0005);
+        mw(SDM_CFG, 64'hFFFF_FFFF_FFFF_FFFF);    mr(SDM_CFG, d);  check("SDM_CFG reserved bits read 0 ([16] DMA_EN, [12:8] tap, [7:4] phase, [1] HS)", d, 64'h1_1FF7);
         mw(SDM_CFG, 0);
         mw(SDM_TIMEOUT, 64'h0000_1111_0000_2222); mr(SDM_TIMEOUT, d); check("SDM_TIMEOUT", d, 64'h0000_1111_0000_2222);
         mw(SDM_TIMEOUT, {32'd12_500_000, 32'd2_500_000});
         mw(SDM_DMA, 64'hFFFF_FFFF);              mr(SDM_DMA, d);  check("SDM_DMA_ADDR ([2:0] read 0)", d, 64'hFFFF_FFF8);
-        mw(SDM_CAPS, 0);                          mr(SDM_CAPS, d); check("SDM_CAPS read-only", d, 64'h0008_0501);
+        mw(SDM_CAPS, 0);                          mr(SDM_CAPS, d); check("SDM_CAPS read-only", d, 64'h0708_0F01);
         mr(SDM_CMD, d);                           check("SDM_CMD reads 0", d, 0);
-        mw(SDM_STATUS, 64'hFFFF_FFFF);            status(st);      check("SDM_STATUS W1C on clean", st, 64'h08);
+        mw(SDM_STATUS, 64'hFFFF_FFFF);            status(st);      check("SDM_STATUS W1C on clean ([6] IDELAY_RDY)", st, 64'h48);
 
         // =========================================================== SDM_CMD ignored in SPI mode
         n0 = sck_rises;
@@ -922,12 +1356,20 @@ module tb_sd_native;
         mr(SDM_ARG, d);     check("load reset (SPI mode): SDM regs unchanged", d, 64'h55);
         check("load reset (SPI mode): slot still powered", reset_n, 0);
 
+        hs_tests();
+
         // =========================================================== summary
         repeat (100) @(posedge clk);
         check("card saw no host protocol errors", card.host_err, 0);
         check("no line contention", contention, 0);
+        check("host output setup / hold at the card", card.tim_err, 0);
         $display("card: %0d commands, %0d blocks read, %0d written, %0d rejected",
                  card.n_cmds, card.blocks_read, card.blocks_written, card.blocks_rejected);
+`ifdef SD_M0
+        $display("M0 lock-step: %0d cycles compared with 6dcbcfb, %0d mismatches", m0_cycles, m0_mism);
+        check("lock-step with the phase-2 controller (default speed / SPI)", m0_mism, 0);
+        check_true("lock-step compared", m0_cycles > 100000);
+`endif
         if (errors == 0) $display("TB_SD PASS (%0d checks)", checks);
         else             $display("TB_SD FAIL %0d (of %0d checks)", errors, checks);
         $finish;

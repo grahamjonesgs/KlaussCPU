@@ -63,6 +63,9 @@ module mem_read_write #(
     // the top level so KlaussCPU.v can drive both LiteEth's sys-clock
     // input and the PHY's ETH_REFCLK pin (via ODDR).
     output            clk_50,
+    // the 200 MHz clk_wiz output (the MIG's system and IDELAYCTRL reference),
+    // also the SD controller's IDELAYCTRL reference (sd_spi, bank 35)
+    output            o_clk_200,
 
     // MIG ui_clk (100 MHz at 2:1) exposed to the top so the WHOLE CPU runs on it,
     // synchronous with the cache↔MIG interface (no async CDC needed).
@@ -247,6 +250,7 @@ module mem_read_write #(
     // DDR2 interface
     // -------------------------------------------------------------------------
     wire        sys_clk_i;
+    assign      o_clk_200 = sys_clk_i;
     // The cache FSM (and the whole CPU above) runs on the MIG ui_clk so it is
     // SYNCHRONOUS with the cache↔MIG interface. `i_Clk` is kept as the name every
     // `always_ff @(posedge i_Clk)` already uses — it's now an internal net driven by

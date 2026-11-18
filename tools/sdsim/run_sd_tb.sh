@@ -4,6 +4,12 @@
 #   tb_sd_spi_compat  SPI mode against the old sd_spi (sd_spi_ref)
 #   tb_sd_dma         the SD DMA engine against sd_card_model and a DDR port
 #                     model (SDDMA_SEED=<n>: its random latencies)
+# tb_sd_native and tb_sd_dma also run a lock-step reference (SD_M0): sd_spi /
+# sd_native as of $SD_M0_REV (default 6dcbcfb, the release before phase 3),
+# renamed *_m0, on the same MMIO and pins; until the high-speed sampling is
+# first enabled every pin and read must match it cycle for cycle.
+# The pads use the Xilinx primitives (ODDR, IDDR, IDELAYE2, IDELAYCTRL):
+# the unisims_ver library and glbl.
 # Work dir: $SDSIM_WORK (default ~/.cache/sdsim).  No waveforms are dumped.
 # Usage: tools/sdsim/run_sd_tb.sh [native|compat|dma|all]
 set -e
@@ -11,21 +17,31 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 S=$ROOT/KlaussCPU.srcs
 WORK=${SDSIM_WORK:-$HOME/.cache/sdsim}
 export PATH=/opt/xilinx/2025.2/Vivado/bin:$PATH
+GLBL=/opt/xilinx/2025.2/Vivado/data/verilog/src/glbl.v
 which=${1:-all}
 rc=0
+# the lock-step reference (SD_M0)
+M0_REV=${SD_M0_REV:-6dcbcfb}
+mkdir -p "$WORK"
+git -C "$ROOT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_native.sv" \
+    | sed -e 's/\bsd_native\b/sd_native_m0/g' > "$WORK/sd_native_m0.sv"
+git -C "$ROOT" show "$M0_REV:KlaussCPU.srcs/sources_1/new/sd_spi.sv" \
+    | sed -e 's/\bsd_spi\b/sd_spi_m0/g' -e 's/\bsd_native\b/sd_native_m0/g' > "$WORK/sd_spi_m0.sv"
+M0="$WORK/sd_native_m0.sv $WORK/sd_spi_m0.sv"
 run() {   # $1 = top, rest = sources
     local top=$1; shift
     local d=$WORK/$top
     rm -rf "$d"; mkdir -p "$d"; cd "$d"
-    xvlog -sv "$@" > xvlog.log 2>&1 || { tail -20 xvlog.log; return 1; }
-    xelab -debug off "$top" > xelab.log 2>&1 || { grep -i error xelab.log | head; return 1; }
-    xsim "$top" -R $XSIM_ARGS > xsim.log 2>&1 || true
-    grep -E "^TB_|FAIL|compared|card:" xsim.log | head -40
+    xvlog -sv $XVLOG_DEFS "$@" $GLBL > xvlog.log 2>&1 || { tail -20 xvlog.log; return 1; }
+    xelab -debug off -L unisims_ver -s "${top}_sim" "work.$top" work.glbl > xelab.log 2>&1 || { grep -i error xelab.log | head; return 1; }
+    xsim "${top}_sim" -R $XSIM_ARGS > xsim.log 2>&1 || true
+    grep -E "^TB_|FAIL|compared|card:|^HS |^M0 " xsim.log | head -60
     grep -qE "^TB_[A-Z]+ PASS" xsim.log
 }
 # mmio_if.sv has no `timescale: compile it after a file that sets one
 if [ "$which" = native ] || [ "$which" = all ]; then
-    run tb_sd_native $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv \
+    XVLOG_DEFS="-d SD_M0" \
+    run tb_sd_native $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv $M0 \
         $S/sim_1/new/sd_card_model.sv $S/sim_1/new/tb_sd_native.sv || rc=1
 fi
 if [ "$which" = compat ] || [ "$which" = all ]; then
@@ -33,8 +49,8 @@ if [ "$which" = compat ] || [ "$which" = all ]; then
         $S/sim_1/new/sd_spi_ref.sv $S/sim_1/new/tb_sd_spi_compat.sv || rc=1
 fi
 if [ "$which" = dma ] || [ "$which" = all ]; then
-    XSIM_ARGS="-testplusarg SEED=${SDDMA_SEED:-1} ${SDDMA_PLUS:-}" \
-    run tb_sd_dma $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv \
+    XSIM_ARGS="-testplusarg SEED=${SDDMA_SEED:-1} ${SDDMA_PLUS:-}" XVLOG_DEFS="-d SD_M0" \
+    run tb_sd_dma $S/sources_1/new/sd_native.sv $S/sources_1/new/mmio_if.sv $S/sources_1/new/sd_spi.sv $M0 \
         $S/sim_1/new/sd_card_model.sv $S/sim_1/new/tb_sd_dma.sv || rc=1
 fi
 exit $rc

@@ -11,8 +11,24 @@
 // 4-bit data with one CRC16 per line, write CRC status token + busy, a
 // sparse byte backing store (absent bytes read as f_pat(addr)).
 //
-// Timing: the card samples CMD/DAT on the rising edge of CLK and drives its
-// outputs T_ODLY after the falling edge (default-speed card timing).
+// Timing: the card samples CMD/DAT on the rising edge of CLK.  Default speed:
+// it drives its outputs T_ODLY after the falling edge.  High speed (after
+// CMD6 switches function group 1 to 1, until CMD0 / CMD6 back to 0 / power
+// off): it drives after the RISING edge, half a clock earlier, as a real
+// card does: a line whose level changes is undefined (a random level) from
+// hs_oh after the edge (tOH, 2.5 ns) until hs_odly (tODLY, <= 14 ns), when
+// it takes the new level.  The host's sample must fall in the window in
+// between (at the card: hs_odly .. 20 + hs_oh ns after the edge at 50 MHz);
+// the testbench adds its pad delays around the card.
+// Host-output timing: every host-driven change of CMD / DAT is checked to be
+// at least t_isu before and t_ih after a rising edge (HS: 6 / 2 ns; default
+// speed 5 / 5 ns); tim_err counts violations.
+//
+// CMD6 (SWITCH_FUNC, R1 + a 64-byte status block on DAT, SD spec 4.3.10):
+// function group 1 (access mode) supports 0 (default) and 1 (high speed;
+// hs_supported); groups 2..6 support only 0.  Mode 0 checks, mode 1
+// switches; the status block reports the result and the switch takes effect
+// after the block's end bit.
 //
 // Host-protocol checks (host_err counts them, each with a message): command
 // start/transmission/end bits and CRC7, >= 74 clocks with CMD high after
@@ -57,6 +73,14 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     int r1b_busy    = 4;      // R1b busy clocks (CMD7, CMD12 after a write)
     int long_busy   = 4000;
     int acmd41_busy_n = 2;    // ACMD41 reports busy this many times first
+    // high speed
+    bit  hs = 0;              // output timing: 1 = high speed (after the rising edge)
+    bit  hs_supported = 1;    // CMD6 function group 1 function 1
+    real hs_odly = 6.0;       // HS: the new level is valid this long after the rising edge
+    real hs_oh   = 2.5;       // HS: the old level is held this long (then undefined until hs_odly)
+    int  n_switch = 0;        // CMD6 switches done (mode 1)
+    logic [3:0] fg1 = 4'h0;   // the selected function of group 1
+    int  sw_pending = -1;     // CMD6 mode 1: the group-1 function to switch to after the status block
     int inj_no_resp = -1, inj_rsp_crc = -1, inj_rsp_end = -1, inj_rsp_idx = -1;
     int inj_rd_crc_blk = -1, inj_rd_end_blk = -1, inj_rd_nodata = 0;
     int inj_wr_badtok_blk = -1, inj_wr_notok_blk = -1, inj_wr_longbusy_blk = -1;
@@ -142,23 +166,111 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
         $display("[%0t] SDCARD host protocol error: %s", $time, s);
     endtask
 
-    // ---------------- line drivers (T_ODLY after the falling edge) ----------------
-    task automatic drv_cmd(input logic v);
-        cmd_o <= #(T_ODLY) v; cmd_oe <= #(T_ODLY) 1'b1;
+    // ---------------- line drivers ----------------
+    // Every drive follows an oedge(): the falling edge in default speed
+    // (T_ODLY later), the rising edge in high speed (clk_hs, 10 ps after
+    // clk, so that an oedge() right after @(posedge clk) is that same rising
+    // edge: everything the card sends moves half a clock earlier, as on a
+    // real HS card) with the new level hs_odly after it and, if the line's
+    // level changes, a random level from hs_oh to hs_odly.
+    localparam real HS_D = 0.01;
+    logic clk_hs = 1'b0;
+    always @(clk) clk_hs <= #(HS_D) clk;
+    task automatic oedge();
+        if (hs) @(posedge clk_hs); else @(negedge clk);
     endtask
+    // the level a driver presents (1 when released: the pull-up)
+    function automatic logic lvl(input logic oe, input logic v);
+        return oe ? v : 1'b1;
+    endfunction
+    task automatic drv_cmd(input logic v);
+        if (hs) begin
+            if (lvl(cmd_oe, cmd_o) !== v && hs_odly > hs_oh) begin
+                cmd_o <= #(hs_oh - HS_D) 1'($urandom); cmd_oe <= #(hs_oh - HS_D) 1'b1;
+            end
+            cmd_o <= #(hs_odly - HS_D) v; cmd_oe <= #(hs_odly - HS_D) 1'b1;
+        end else begin
+            cmd_o <= #(T_ODLY) v; cmd_oe <= #(T_ODLY) 1'b1;
+        end
+    endtask
+    // (a release first drives the line high, then lets go: the pull-up's
+    // rise is the card's own change, not the host's, for the timing check)
     task automatic rel_cmd();
-        cmd_oe <= #(T_ODLY) 1'b0; cmd_o <= #(T_ODLY) 1'b1;
+        if (hs) begin
+            if (lvl(cmd_oe, cmd_o) !== 1'b1 && hs_odly > hs_oh) begin
+                cmd_o <= #(hs_oh - HS_D) 1'($urandom); cmd_oe <= #(hs_oh - HS_D) 1'b1;
+            end
+            cmd_o <= #(hs_odly - HS_D) 1'b1; cmd_oe <= #(hs_odly - HS_D) 1'b0;
+        end else begin
+            cmd_o <= #(T_ODLY) 1'b1; cmd_oe <= #(T_ODLY) 1'b0;
+        end
     endtask
     task automatic drv_dat(input logic [3:0] v, input logic [3:0] m);
         for (int i = 0; i < 4; i++) if (m[i]) begin
-            dat_o[i] <= #(T_ODLY) v[i]; dat_oe[i] <= #(T_ODLY) 1'b1;
+            if (hs) begin
+                if (lvl(dat_oe[i], dat_o[i]) !== v[i] && hs_odly > hs_oh) begin
+                    dat_o[i] <= #(hs_oh - HS_D) 1'($urandom); dat_oe[i] <= #(hs_oh - HS_D) 1'b1;
+                end
+                dat_o[i] <= #(hs_odly - HS_D) v[i]; dat_oe[i] <= #(hs_odly - HS_D) 1'b1;
+            end else begin
+                dat_o[i] <= #(T_ODLY) v[i]; dat_oe[i] <= #(T_ODLY) 1'b1;
+            end
         end
     endtask
     task automatic rel_dat(input logic [3:0] m);
         for (int i = 0; i < 4; i++) if (m[i]) begin
-            dat_oe[i] <= #(T_ODLY) 1'b0; dat_o[i] <= #(T_ODLY) 1'b1;
+            if (hs) begin
+                if (lvl(dat_oe[i], dat_o[i]) !== 1'b1 && hs_odly > hs_oh) begin
+                    dat_o[i] <= #(hs_oh - HS_D) 1'($urandom); dat_oe[i] <= #(hs_oh - HS_D) 1'b1;
+                end
+                dat_o[i] <= #(hs_odly - HS_D) 1'b1; dat_oe[i] <= #(hs_odly - HS_D) 1'b0;
+            end else begin
+                dat_o[i] <= #(T_ODLY) 1'b1; dat_oe[i] <= #(T_ODLY) 1'b0;
+            end
         end
     endtask
+
+    // ---------------- host output timing (setup / hold at the rising edge) ----------------
+    real t_isu_hs = 6.0, t_ih_hs = 2.0, t_isu_ds = 5.0, t_ih_ds = 5.0;
+    realtime last_rise = -1000.0, last_chg = -1000.0;
+    string last_chg_what = "";
+    int  tim_err = 0;
+    always @(posedge clk) if (pwr) begin
+        if (last_chg > 0 && $realtime - last_chg < (hs ? t_isu_hs : t_isu_ds)) begin
+            tim_err++;
+            if (tim_err <= 5) $display("[%0t] SDCARD host setup violation: %s %0.2f ns before the rising edge (hs %0d, card oe %b/%b)",
+                                       $time, last_chg_what, $realtime - last_chg, hs, cmd_oe, dat_oe);
+        end
+        last_rise = $realtime;
+    end
+    // host-driven changes: the card is not driving that line
+    function automatic void host_chg(input string what);
+        last_chg = $realtime - 0.001;
+        last_chg_what = what;
+        if (last_rise > 0 && last_chg - last_rise < (hs ? t_ih_hs : t_ih_ds)) begin
+            tim_err++;
+            if (tim_err <= 5) $display("[%0t] SDCARD host hold violation: %s changed %0.2f ns after the rising edge",
+                                       $time, what, last_chg - last_rise);
+        end
+    endfunction
+    // (a change in the same time step as the card's own driver changed, e.g.
+    // its release to the pull-up, is the card's)
+    realtime card_t [5];
+    always @(cmd_o, cmd_oe)       card_t[0] = $realtime;
+    always @(dat_o[0], dat_oe[0]) card_t[1] = $realtime;
+    always @(dat_o[1], dat_oe[1]) card_t[2] = $realtime;
+    always @(dat_o[2], dat_oe[2]) card_t[3] = $realtime;
+    always @(dat_o[3], dat_oe[3]) card_t[4] = $realtime;
+    task automatic line_chg(input int i, input logic v, input string nm);
+        realtime t = $realtime;
+        #0.001;
+        if (pwr && card_t[i] != t && !(i == 0 ? cmd_oe : dat_oe[i - 1])) host_chg($sformatf("%s -> %b", nm, v));
+    endtask
+    always @(cmd)    line_chg(0, cmd, "CMD");
+    always @(dat[0]) line_chg(1, dat[0], "DAT0");
+    always @(dat[1]) line_chg(2, dat[1], "DAT1");
+    always @(dat[2]) line_chg(3, dat[2], "DAT2");
+    always @(dat[3]) line_chg(4, dat[3], "DAT3");
 
     // ---------------- power ----------------
     // (a power cut also ends a data transfer in progress and drops a command
@@ -167,6 +279,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     bit rd_active = 0, wr_active = 0, wr_busy_phase = 0, stop_req = 0;
     always @(pwr) begin
         st = S_IDLE; app_next = 0; acmd41_n = 0; ocr_ready = 0; w4 = 0; rca = 0;
+        hs = 0; fg1 = 4'h0; sw_pending = -1;
         first_cmd = 1; pwr_clk = 0;
         cmd_oe = 0; dat_oe = 0;
         if (!pwr) begin
@@ -188,10 +301,10 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
     task automatic send_bits(input logic [135:0] v, input int n);
         repeat (n_cr) @(posedge clk);
         for (int i = n - 1; i >= 0; i--) begin
-            @(negedge clk); drv_cmd(v[i]);
+            oedge(); drv_cmd(v[i]);
         end
         @(posedge clk); line_end = clk_n;
-        @(negedge clk); rel_cmd();
+        oedge(); rel_cmd();
     endtask
 
     task automatic send_r48(input logic [5:0] idx, input logic [31:0] arg, input bit nocrc = 0);
@@ -218,9 +331,9 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
 
     task automatic r1b_busy_after(input int n);
         if (n <= 0) return;
-        @(negedge clk);                   // busy from the second clock after the end bit
-        @(negedge clk); drv_dat(4'h0, 4'h1);
-        repeat (n) @(negedge clk);
+        oedge();                          // busy from the second clock after the end bit
+        oedge(); drv_dat(4'h0, 4'h1);
+        repeat (n) oedge();
         rel_dat(4'h1);
     endtask
 
@@ -231,27 +344,27 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
         logic [3:0]  lines;
         lines = w4 ? 4'hF : 4'h1;
         for (int i = 0; i < 4; i++) c[i] = 0;
-        @(negedge clk); drv_dat(4'h0, lines);                  // start bit
+        oedge(); drv_dat(4'h0, lines);                  // start bit
         for (int k = 0; k < len; k++) begin
             if (w4) begin
                 for (int h = 1; h >= 0; h--) begin
                     logic [3:0] nib; nib = h ? b[k][7:4] : b[k][3:0];
-                    @(negedge clk); drv_dat(nib, 4'hF);
+                    oedge(); drv_dat(nib, 4'hF);
                     for (int i = 0; i < 4; i++) c[i] = crc16_step(c[i], nib[i]);
                 end
             end else begin
                 for (int j = 7; j >= 0; j--) begin
-                    @(negedge clk); drv_dat({3'b111, b[k][j]}, 4'h1);
+                    oedge(); drv_dat({3'b111, b[k][j]}, 4'h1);
                     c[0] = crc16_step(c[0], b[k][j]);
                 end
             end
         end
         if (bad_crc) c[0][3] = ~c[0][3];
         for (int j = 15; j >= 0; j--) begin
-            @(negedge clk); drv_dat({c[3][j], c[2][j], c[1][j], c[0][j]}, lines);
+            oedge(); drv_dat({c[3][j], c[2][j], c[1][j], c[0][j]}, lines);
         end
-        @(negedge clk); drv_dat(bad_end ? 4'hE : 4'hF, lines);   // end bit
-        @(negedge clk); rel_dat(lines);
+        oedge(); drv_dat(bad_end ? 4'hE : 4'hF, lines);   // end bit
+        oedge(); rel_dat(lines);
     endtask
 
     task automatic rd_sender(input longint blk, input bit multi, input int kind);
@@ -274,6 +387,9 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                     default: b[k] = sd_status[k];
                 endcase
             send_block(b, len, nb == inj_rd_crc_blk, nb == inj_rd_end_blk);
+            if (kind == 2 && sw_pending >= 0) begin       // CMD6 mode 1: switch after the end bit
+                fg1 = 4'(sw_pending); hs = (sw_pending == 1); sw_pending = -1; n_switch++;
+            end
             if (nb == inj_rd_crc_blk) inj_rd_crc_blk = -1;
             if (nb == inj_rd_end_blk) inj_rd_end_blk = -1;
             nb++; blocks_read++;
@@ -292,7 +408,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                 begin wait (stop_req); if (pwr) repeat (2) @(posedge clk); end
             join_any
             disable fork;
-            if (pwr) @(negedge clk);
+            if (pwr) oedge();
             rel_dat(4'hF);
             rd_active = 0;
             if (st == S_DATA) st = S_TRAN;
@@ -343,20 +459,20 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
                 wr_busy_phase = 1;
                 tok = (nb == inj_wr_badtok_blk) ? 3'b101 : 3'b010;
                 repeat (2) @(posedge clk);
-                @(negedge clk); drv_dat(4'h0, 4'h1);
-                for (int j = 2; j >= 0; j--) begin @(negedge clk); drv_dat({3'b111, tok[j]}, 4'h1); end
-                @(negedge clk); drv_dat(4'hF, 4'h1);
+                oedge(); drv_dat(4'h0, 4'h1);
+                for (int j = 2; j >= 0; j--) begin oedge(); drv_dat({3'b111, tok[j]}, 4'h1); end
+                oedge(); drv_dat(4'hF, 4'h1);
                 if (tok == 3'b010) begin
                     for (int k = 0; k < blen; k++) mem[(blk + nb) * 512 + k] = b[k];
                     blocks_written++;
                     busy = (nb == inj_wr_longbusy_blk) ? long_busy : wr_busy;
                     if (nb == inj_wr_longbusy_blk) inj_wr_longbusy_blk = -1;
-                    @(negedge clk); drv_dat(4'h0, 4'h1);
-                    repeat (busy) @(negedge clk);
+                    oedge(); drv_dat(4'h0, 4'h1);
+                    repeat (busy) oedge();
                 end else begin
                     inj_wr_badtok_blk = -1;
                     blocks_rejected++;
-                    @(negedge clk);
+                    oedge();
                 end
                 rel_dat(4'h1);
                 @(posedge clk); wr_ref = clk_n;
@@ -381,6 +497,38 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             wr_active = 0;
             if (st == S_RCV) st = S_TRAN;
         end join_none
+    endtask
+
+    // ---------------- CMD6 status (SD spec 4.3.10, 512 bits, byte 0 first) ----------------
+    // bytes 0-1 max current (mA), 2-13 the support bits of groups 6..1 (16
+    // bits each), 14-16 the function selected (or 0xF: not supported) in
+    // groups 6..1 (4 bits each, group 6 in byte 14's high nibble, group 1 in
+    // byte 16's low nibble), 17 the structure version (1), 18-29 the busy
+    // bits of groups 6..1 (0), the rest reserved (0).
+    task automatic build_sw_status(input logic [31:0] arg);
+        logic [3:0] req [1:6];
+        logic [3:0] res [1:6];
+        for (int g = 1; g <= 6; g++) begin
+            req[g] = arg[4*(g-1) +: 4];
+            if (req[g] == 4'hF)                                 res[g] = (g == 1) ? fg1 : 4'h0;   // no change
+            else if (req[g] == 4'h0)                            res[g] = 4'h0;
+            else if (g == 1 && req[g] == 4'h1 && hs_supported)  res[g] = 4'h1;
+            else                                                res[g] = 4'hF;                    // not supported
+        end
+        for (int i = 0; i < 64; i++) sw_status[i] = 8'h00;
+        sw_status[0]  = 8'h00; sw_status[1]  = 8'h64;         // 100 mA
+        sw_status[2]  = 8'h80; sw_status[3]  = 8'h01;         // group 6: function 0 (and bit 15)
+        sw_status[4]  = 8'h80; sw_status[5]  = 8'h01;         // group 5
+        sw_status[6]  = 8'h80; sw_status[7]  = 8'h01;         // group 4
+        sw_status[8]  = 8'h80; sw_status[9]  = 8'h01;         // group 3
+        sw_status[10] = 8'h80; sw_status[11] = 8'h01;         // group 2
+        sw_status[12] = 8'h80; sw_status[13] = hs_supported ? 8'h03 : 8'h01;   // group 1: 0 (and 1)
+        sw_status[14] = {res[6], res[5]};
+        sw_status[15] = {res[4], res[3]};
+        sw_status[16] = {res[2], res[1]};
+        sw_status[17] = 8'h01;
+        // mode 1, group 1 named and supported: the switch, after the status block
+        sw_pending = (arg[31] && req[1] != 4'hF && res[1] != 4'hF) ? int'(res[1]) : -1;
     endtask
 
     // ---------------- command receiver ----------------
@@ -452,6 +600,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             6'd0: begin
                 if (dat[3] !== 1'b1) herr("CMD0 with DAT3 low (SPI mode)");
                 st = S_IDLE; acmd41_n = 0; ocr_ready = 0; w4 = 0; rca = 0;
+                hs = 0; fg1 = 4'h0;                // CMD0: every function back to 0
             end
             6'd2: if (st == S_READY) begin send_r2(idx, cid); st = S_IDENT; end
             6'd3: if (st == S_IDENT || st == S_STBY) begin
@@ -461,6 +610,7 @@ module sd_card_model #(parameter real T_ODLY = 6.0) (
             end
             6'd6: if (st == S_TRAN) begin
                 logic [31:0] s; s = status32();
+                build_sw_status(arg);
                 st = S_DATA; start_read(0, 0, 2); send_r48(idx, s);
             end
             6'd7: begin

@@ -156,7 +156,29 @@ endmodule
 module ODDR #(parameter DDR_CLK_EDGE = "SAME_EDGE", parameter INIT = 1'b0, parameter SRTYPE = "SYNC")
    (output reg Q, input C, input CE, input D1, input D2, input R, input S);
    initial Q = INIT;
-   always @(posedge C) Q <= D1;
+   always @(posedge C) Q <= R ? 1'b0 : D1;
+endmodule
+// the SD pads (sd_spi, SD_NATIVE_PLAN.md §9): IDDR SAME_EDGE (Q1 = D at the
+// rising edge, Q2 = D at the falling edge before it), the delay line as a
+// wire, IDELAYCTRL always ready
+module IDDR #(parameter DDR_CLK_EDGE = "SAME_EDGE", parameter INIT_Q1 = 1'b0, parameter INIT_Q2 = 1'b0,
+              parameter SRTYPE = "SYNC")
+   (output reg Q1, output reg Q2, input C, input CE, input D, input R, input S);
+   reg qn;
+   initial begin Q1 = INIT_Q1; Q2 = INIT_Q2; qn = INIT_Q2; end
+   always @(negedge C) qn <= D;
+   always @(posedge C) begin Q1 <= D; Q2 <= qn; end
+endmodule
+module IDELAYE2 #(parameter IDELAY_TYPE = "FIXED", parameter DELAY_SRC = "IDATAIN", parameter integer IDELAY_VALUE = 0,
+                  parameter HIGH_PERFORMANCE_MODE = "FALSE", parameter SIGNAL_PATTERN = "DATA",
+                  parameter real REFCLK_FREQUENCY = 200.0, parameter CINVCTRL_SEL = "FALSE", parameter PIPE_SEL = "FALSE")
+   (output DATAOUT, output [4:0] CNTVALUEOUT, input IDATAIN, input DATAIN, input C, input LD, input [4:0] CNTVALUEIN,
+    input CE, input INC, input REGRST, input CINVCTRL, input LDPIPEEN);
+   assign DATAOUT = IDATAIN;
+   assign CNTVALUEOUT = 5'd0;
+endmodule
+module IDELAYCTRL (output RDY, input REFCLK, input RST);
+   assign RDY = 1'b1;
 endmodule
 '''
 
@@ -1190,8 +1212,10 @@ def _socsd_progs():
     a.ld(64, 4, 15, 0x1F8); a.ld(64, 5, 15, 0x120); a.ld(64, 6, 15, 0x138)
     a.ld(64, 7, 15, 0x000); a.ld(64, 8, 15, 0x128); a.ld(64, 9, 15, 0x148)   # r8 SDM_STATUS: DAT0 driven low (slot off at reset), CARD_PRESENT 1 (tb_soc ties SD_CD = 0 = card in)
     a.halt()
-    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x00080501, 'r5': 0x00010200,
-                              'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x8, 'r9': 0}))
+    # r4 SDM_CAPS: [9] HS, [10] DMA, [11] IDELAY, [27:24] 7 HS phases (phase 3);
+    # r8 [6] IDELAY_RDY (the tb's IDELAYCTRL stub is always ready)
+    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x07080F01, 'r5': 0x00010200,
+                              'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x48, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
     for k in range(8):

@@ -17,6 +17,8 @@
 module tb_sd_spi_compat;
     logic clk = 0, rst_l = 0, load_rst = 0;
     always #5 clk = ~clk;
+    logic clkref = 0;               // IDELAYCTRL's 200 MHz reference
+    always #2.5 clkref = ~clkref;
 
     mmio_if bus_n();
     mmio_if bus_r();
@@ -26,10 +28,10 @@ module tb_sd_spi_compat;
     wire        sck_r, reset_n_r, mosi_r, cs_n_r, dat1_r, dat2_r;
 
     sd_spi dut (
-        .i_Clk(clk), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus_n), .o_irq(irq_n),
+        .i_Clk(clk), .i_clk_ref(clkref), .i_Rst_L(rst_l), .i_load_rst(load_rst), .mmio(bus_n), .o_irq(irq_n),
         .i_sd_cd(cd), .o_sd_reset_n(reset_n_n), .o_sd_sck(sck_n),
-        .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .i_sd_cmd(cmd_o),
-        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .i_sd_dat({dat_o[3:1], miso}),
+        .o_sd_cmd(cmd_o), .o_sd_cmd_oe(cmd_oe), .o_sd_cmd_t(), .i_sd_cmd(cmd_o),
+        .o_sd_dat(dat_o), .o_sd_dat_oe(dat_oe), .o_sd_dat_t(), .i_sd_dat({dat_o[3:1], miso}),
         // the SD DMA port: idle here (no DMA_EN data command; tb_sd_dma tests it)
         .o_dma_req(), .o_dma_done(), .o_dma_write_DV(), .o_dma_read_DV(), .o_dma_addr(),
         .o_dma_write_data(), .o_dma_wdf_mask(), .i_dma_read_data(128'h0), .i_dma_ready(1'b0),
@@ -96,7 +98,7 @@ module tb_sd_spi_compat;
     endfunction
 
     initial begin
-        repeat (5) @(posedge clk);
+        repeat (12) @(posedge clk);       // past the unisim GSR (100 ns)
         rst_l = 1;
         for (int n = 0; n < 40000; n++) begin
             logic [15:0] off;

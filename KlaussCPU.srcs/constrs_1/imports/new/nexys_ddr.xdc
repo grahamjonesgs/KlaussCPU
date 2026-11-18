@@ -284,12 +284,26 @@ set_false_path -from [get_ports i_load_H]
 set_false_path -from [get_ports CPU_RESETN]
 set_false_path -from [get_ports i_SPI_LCD_MISO]
 set_false_path -from [get_ports i_QSPI_DQ1]
-# SD card: at most 25 MHz in phase 1 (SD_NATIVE_PLAN.md §4.6). Outputs change
-# on the fabric edge that drives CLK low and the inputs are sampled on that
-# same edge (IOB flip-flop), so each direction has about half a CLK period of
-# margin at 10 ns granularity; like the other slow pins, no I/O delays.
+# SD card (SD_NATIVE_PLAN.md §4.6, §9).  Every SD I/O path is a fixed,
+# placement-independent hard path, so the pins keep their false paths:
+#   - outputs: CLK leaves through an ODDR, CMD / DAT[3:0] through the OLOGIC
+#     output and tristate flip-flops (IOB = TRUE in sd_spi), all on ui_clk:
+#     clock-to-pad = OLOGIC clk-to-Q + OBUF, the same for every pin, and the
+#     data change mid-way between CLK's rising edges (half a period of setup
+#     and hold at the card, minus the board skew);
+#   - inputs: IBUF -> IDELAYE2 -> IDDR in the ILOGIC (and the SPI shifter's
+#     MISO straight from the IBUF, as before).  In high speed (50 MHz) the
+#     window in which the card's data are valid moves with the card's tODLY
+#     and the pad delays, and the sample point is calibrated at run time
+#     (SDM_CFG[7:4] phase in 5 ns steps, [12:8] the IDELAY tap in 78 ps),
+#     not fixed by the tools; the per-phase window is computed from these
+#     paths' delays (report_timing on the false paths; SD_NATIVE_PLAN §9.4).
+# The only timed SD paths are internal: the next-value logic into the IOB
+# registers, the IDDR outputs into sd_native, the tap / LD into the IDELAYs.
 set_false_path -from [get_ports {i_SD_CD io_SD_CMD io_SD_DAT[*]}]
 set_false_path -to   [get_ports {o_SD_SCK o_SD_RESET io_SD_CMD io_SD_DAT[*]}]
+# IDELAYCTRL's RDY is asynchronous (two-flop synchroniser in sd_spi)
+set_false_path -to [get_cells -quiet -hier -filter {NAME =~ sd_spi_i/r_idc_rdy_sync_reg[0]}]
 
 set_false_path -to [get_ports {o_led[*]}]
 set_false_path -to [get_ports {o_LED_RGB_1[*]}]
