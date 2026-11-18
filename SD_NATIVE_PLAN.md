@@ -2,7 +2,9 @@
 
 Status: **phases 0–2 done (2026-11-10)**: release candidate `5648f75` on
 klaussCPU branch `mmu-sd`, board-validated (results §6.1; implementation notes
-§4.9). Register map v1 frozen. Phase 3 (high speed) not started.
+§4.9). Register map v1 frozen. Phase 3 (high speed, 50 MHz): RTL, simulation and
+build on branch `sdhs` (2026-11-18, approved by Graham), awaiting board
+bring-up; §9.
 Phase 4 (DMA, SD DMA spec v1.2, §8): RTL and simulation on branch `sddma`
 (2026-11-16), not yet built.
 (Graham's go-ahead, relayed by the runtime session.)
@@ -403,7 +405,8 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
   - this is the plan's one real timing risk, and it is confined to
     high-speed mode.
 - **Fallbacks for high speed:** IDELAYE2, which needs an IDELAYCTRL in bank
-  35, or stopping at 25 MHz.
+  35, or stopping at 25 MHz.  (Phase 3, §9: the IDDR phases and an
+  IDELAYE2 on every input, with its IDELAYCTRL, both built in.)
 
 ### 4.7 Registers (all 64-bit, device `0xF000_0000`)
 
@@ -417,15 +420,15 @@ All four CPU interrupt sources are taken: timer, blitter, Ethernet, VGA.
 | 0x110 | `SDM_RESP0` | R | response [63:0] (48-bit: [31:0] = status/OCR/RCA) |
 | 0x118 | `SDM_RESP1` | R | R2 response [127:64] |
 | 0x120 | `SDM_BLK` | RW | `[11:0]` block size (multiple of 4, 4–2048; `[1:0]` read 0; a block takes ceil(size/8) words, §4.3), `[31:16]` block count (0 = open-ended) |
-| 0x128 | `SDM_STATUS` | R/W1C | **live** (read-only): `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0 level, `[3]` CARD_PRESENT (1 = card in; the Nexys A7 SD_CD pin is active low, so this is its inverse, while SPI's `SD_STATUS[1]` stays the raw pin), `[4]` FIFO_THRESH (§4.5). **sticky** (write-1-to-clear): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT (no read start bit), `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR (token ≠ 010), `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT (R1b or write busy), `[26]` FIFO_ERR (push to a full FIFO), `[27]` DMA_ERR (§8). live `[5]` DMA_BUSY (§8). `[31]` ERR_ANY (live) = OR of `[27:16]` |
+| 0x128 | `SDM_STATUS` | R/W1C | **live** (read-only): `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0 level, `[3]` CARD_PRESENT (1 = card in; the Nexys A7 SD_CD pin is active low, so this is its inverse, while SPI's `SD_STATUS[1]` stays the raw pin), `[4]` FIFO_THRESH (§4.5). **sticky** (write-1-to-clear): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT (no read start bit), `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR (token ≠ 010), `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT (R1b or write busy), `[26]` FIFO_ERR (push to a full FIFO), `[27]` DMA_ERR (§8). live `[5]` DMA_BUSY (§8), `[6]` IDELAY_RDY (§9.2). `[31]` ERR_ANY (live) = OR of `[27:16]` |
 | 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same bit positions as `SDM_STATUS` (`[4]`, `[9:8]`, `[27:16]`); others ignored |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` data timeout (read start bit), `[63:32]` busy timeout (R1b / write busy), both in CLK cycles. Reset 2 500 000 / 12 500 000 (100 ms / 500 ms at 25 MHz); software rescales for other clocks |
-| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit, `[2]` CLK_ON (free-running clock). Reserved until phase 3, reading 0: `[1]` high-speed edge, `[7:4]` HS sample phase. `[16]` DMA_EN (§8). Reset 0 |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit, `[2]` CLK_ON (free-running clock). Phase 3 (§9.2): `[1]` HS_SAMPLE, `[7:4]` HS sample phase, `[12:8]` IDELAY tap. `[16]` DMA_EN (§8). Reset 0 |
 | 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in words; writing `[31]` resets the FIFO |
 | 0x150 | `SDM_DMA_ADDR` | RW | §8: 64-bit PA, `[2:0]` read 0, the first byte not yet transferred; writes ignored while DMA_BUSY |
 | 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command (§4.3); reset by an `SDM_CMD` with the data flag |
 | 0x180 | `SDM_DATA` | RW | FIFO port: load pops, store pushes (64-bit) |
-| 0x1F8 | `SDM_CAPS` | R | `[7:0]` version (1), `[8]` 4-bit, `[9]` high speed (0 until phase 3), `[10]` DMA (§8), `[23:16]` FIFO size in 512-byte blocks (8) |
+| 0x1F8 | `SDM_CAPS` | R | `[7:0]` version (1), `[8]` 4-bit, `[9]` high speed (1 from phase 3, §9.2), `[10]` DMA (§8), `[11]` input delay line (§9.2), `[23:16]` FIFO size in 512-byte blocks (8), `[27:24]` HS sample phases (7) |
 | 0x200–0x3F8 | `SD_BUF` | RW | scratch RAM, as today |
 
 Registers elsewhere:
@@ -791,3 +794,281 @@ FIFO reset waits for one transaction: at most about 2,800 cycles.
   SD > blitter > core 2, held off (like the blitter) while a data-cache miss
   is in flight or a maintenance walk is pending or running.
 
+
+## 9. High speed at 50 MHz (phase 3, branch `sdhs`, 2026-11-18)
+
+Approved by Graham 2026-11-18.  `sd_spi.sv` (the pads), `sd_native.sv` (the
+sampling), `KlaussCPU.sv` / `mem_read_write.sv` (the 200 MHz reference and
+the tristate wiring), `nexys_ddr.xdc` (notes; the false paths stay).
+Default speed and SPI are unchanged cycle for cycle and pin for pin (§9.5).
+
+### 9.1 Structure
+
+- **Outputs: IOB registers on the old edges.**  CLK leaves through an ODDR
+  (`DDR_CLK_EDGE` SAME_EDGE, D1 = D2, a forwarded clock), CMD and DAT[3:0]
+  through the OLOGIC output and tristate flip-flops (`IOB = TRUE`; Vivado
+  replicates DAT[3:1]'s equal tristate controls for packing).  Each pad
+  register is loaded with the **next value** of what phase 2 drove through
+  its LUT mux: the SD_CTRL fields', the SPI shifter's SCK / MOSI and
+  `sd_native`'s `o_*_nx` (an always_comb repeating the engines' output
+  assignments).  So every pin changes on the same edge as before, now with
+  a fixed clock-to-pad delay; CMD / DAT still change on the fabric edge that
+  drives CLK low, mid-way between CLK's rising edges (10 ns of setup and
+  of hold at 50 MHz against the HS card's 6 / 2 ns; the CLK and data pads
+  have the same clock-to-pad delay).  The tristate registers hold T
+  (1 = released) and drive the OBUFTs directly (`o_sd_cmd_t` /
+  `o_sd_dat_t`): an inverter in between would keep them out of the IOB.
+- **Inputs: IDELAYE2 → IDDR.**  CMD and DAT[3:0] go IBUF → IDELAYE2
+  (VAR_LOAD, 32 taps of 78 ps with a 200 MHz reference, HIGH_PERFORMANCE)
+  → IDDR (SAME_EDGE: after a rising edge E, Q1 = the pin at E, Q2 = the pin
+  at E − 5 ns).  Q1 is phase 2's IOB input flip-flop.  The SPI shifter's
+  MISO still takes the pin straight from the IBUF (a legal second load; a
+  mini build confirmed the placement: IBUF → IDELAY → ILOGIC IDDR, and the
+  IBUF → fabric route).  CD is unchanged.
+- **IDELAYCTRL** (`IODELAY_GROUP` SD_IODELAY, placed in X1Y2, bank 35's
+  clock region; the MIG's is in X1Y1 with its own group) runs on the
+  clk_wiz 200 MHz output that is already the MIG's system / reference
+  clock (a BUFG; `mem_read_write.o_clk_200`).  RST: 64 cycles after
+  `CPU_RESETN` (the reference runs before ui_clk does: the MIG's PLL and
+  MMCM lock on it).  RDY → two flip-flops → `SDM_STATUS[6]`.  No data path
+  crosses between the 200 MHz and ui_clk; the tap and its load strobe are
+  on ui_clk (the IDELAYs' C).  No change to the MIG.
+
+### 9.2 Registers (phase 3)
+
+| Register | Bits | Meaning |
+|---|---|---|
+| `SDM_CFG` (0x140) | `[1]` HS_SAMPLE | 1: the engines take the inputs at the HS sample phase `[7:4]`; 0: the default-speed point (the edge that drives CLK low, as phases 1–2) |
+| | `[7:4]` HS_PHASE | 0–6 (7–15 act as 6); the sample instant below |
+| | `[12:8]` IDELAY_TAP | 0–31: CMD and DAT[3:0] delayed by tap × 78 ps (on top of the line's fixed ~0.6–0.8 ns), i.e. the sample instant moves tap × 78 ps **earlier** relative to the data.  Loaded the cycle after any `SDM_CFG` write; reset (and reloaded) to 0 |
+| `SDM_STATUS` (0x128) | `[6]` IDELAY_RDY (live) | IDELAYCTRL calibrated (1 a few µs after `CPU_RESETN`); while 0 the taps are uncalibrated (the data still pass) |
+| `SDM_CAPS` (0x1F8) | `[9]` = 1, `[11]` = 1, `[27:24]` = 7 | high speed; the delay line; the number of HS phases.  Value `0x0000_0000_0708_0F01`.  Version stays 1 (the plan does not bump it) |
+
+All reset to 0 (CPU_RESETN and the native-mode program-load reset), as the
+rest of `SDM_CFG`.  Software changes `[1]`, `[7:4]`, `[12:8]` only while
+CMD_BUSY = DATA_BUSY = DMA_BUSY = 0 (a change mid-frame can drop or repeat
+a sample; a tap change can glitch the delayed lines).
+
+### 9.3 The sample instant, and the engines in HS
+
+- **Mapping (clk_div = 0, 50 MHz).**  Let R be the fabric edge on which the
+  CLK register (and so the ODDR) goes high; the pin rises ~4 ns later
+  (clock-to-pad).  The bit the card launches on that rising edge is
+  sampled at the IDDR's D input (after the IBUF and the delay line)
+  **10 + 5p ns after R** (p = HS_PHASE: 10, 15, … 40 ns), minus 78 ps per
+  tap.  For any clk_div the instant is **F − 20 + 5p ns**, F the fabric
+  edge that drives CLK low.
+- **How.**  The IDDR gives every edge (rising: Q1, falling: Q2); a history
+  of three Q1 and two Q2 registers holds the last 30 ns of each line in
+  5 ns steps.  `r_hs_s` takes candidate m = 6 − p (m = 0: Q1, 1: Q2,
+  2: Q1 a cycle ago, …, 6: Q1 three cycles ago) in the cycle after F + 10;
+  the engines use it on `r_samp_dd`, the default strobe (`r_samp`, the
+  cycle after F) two cycles later.  With SDM_CFG[1] = 0 the engines take
+  Q1 on `r_samp`, exactly phase 2's input flip-flop and strobe.
+- **Periodic.**  The sample stream is periodic in the 20 ns clock: phase p
+  and p + 4 sample the same point of the data eye, one bit apart, and both
+  work because the engines align on start bits.  So the seven phases cover
+  the 20 ns period one and a half times (any eye position is covered, and
+  a run of passing phases that wraps the period appears whole).
+- **The release skip.**  The HS strobe comes two cycles after the default
+  one and samples up to 20 ns before the default instant, so the first
+  strobes after the host lets go of a line can still hold the host's own
+  bits: the last CRC bit, which may be 0, was taken as a response start bit
+  (the first simulation found it at every odd phase).  In HS the command
+  engine ignores the first two strobes after it releases CMD (C_RWAIT),
+  and the data engine the first two after it releases DAT0 at a write
+  block's end (D_WR_TOK).  The card's answer never comes that early (N_CR
+  ≥ 2 clocks; the CRC token 2 clocks after the end bit), and the windows
+  still count 64 + 2 / 8 real samples.
+- **Flow control.**  A read parks CLK after a block's end bit when the
+  FIFO has no room for another block.  Which bit a strobe takes depends on
+  where the eye is: with T = 10 + 5p in the eye of the bit launched on
+  rising edge R_j, slot j takes that bit; a phase that passes one clock
+  later (T − 20 in the eye) takes the next bit, R_j+1's; a phase that
+  passes one clock earlier (only with a card whose output hold reaches
+  past R + 10 ns) takes R_j−1's.  So the park follows 1, 2 or 3 rising
+  edges after the edge that launched the end bit (default speed: 1).  The
+  card has then sent at most that many bits after the end bit; the strobe
+  of the first of them may land in D_RD_HOLD and be ignored, and the
+  lines hold the last one while CLK is parked, so the samples after the
+  restart go on with it (a held bit can be taken in place of the one
+  before it).  Only the first bit after the end bit can be skipped, so no
+  start bit is lost for a card with N_AC ≥ 2 (the spec's minimum) at any
+  phase, nor with N_AC = 1 at the phases that take bit j or j + 1 (the
+  testbench runs N_AC = 1 at the centre phase; the mutation `hs_strobe2`,
+  which takes bit j − 1, loses a start bit there).  The calibration sweep
+  reads with the FIFO filling and CLK parking, so a phase that broke the
+  flow control would fail it.
+- **Writes** are unchanged by HS: the outputs follow `ev_fall`; the CRC
+  token, busy and R1b use the HS samples.
+
+### 9.4 I/O timing and the predicted window
+
+From the routed design (`tools/sd_io_timing.tcl` on build 1, `5a6b2aa`;
+slow / fast corner; every pad register in its IOB, the ODDR in
+OLOGIC_X1Y132, the IDDRs and IDELAYs in X1Y113–121, all clocked by
+ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
+
+| Path | Slow | Fast |
+|---|---|---|
+| CLK: ODDR C → pad (OLOGIC + OBUF, LVCMOS33 12 mA slow) | 4.022 | 1.428 |
+| CMD / DAT[3:0]: OLOGIC flip-flop C → pad | 4.009–4.035 | 1.415–1.441 |
+| CMD / DAT tristate (T) C → pad | 4.105–4.130 | 1.017 |
+| pad → IDDR D (IBUF + IDELAYE2 at tap 0) | 2.296–2.322 | 0.492–0.518 |
+
+- **Outputs (the card samples on the rising edge).**  CLK and CMD / DAT
+  leave with the same clock-to-pad delay (within 0.03 ns); the data change
+  on the fabric edge between two rising edges, so at the card they change
+  10 ns after and 10 ns before a rising edge, less the board's skew between
+  the traces: 4 ns of setup margin (tISU 6 ns) and 8 ns of hold (tIH 2 ns).
+- **Inputs: the window at the IDDR**, for the bit launched on the rising
+  edge R (the fabric edge at the ODDR), with 0.3 ns of board trace each way
+  (assumed): valid from R + clock-to-pad + 0.3 + tODLY + 0.3 + pad-to-IDDR
+  until 20 ns later less (tODLY − tOH), at one corner (a chip's delays move
+  together):
+
+| Card | Corner | Valid (ns after R) | Phases that pass (margin, ns) |
+|---|---|---|---|
+| spec worst (tODLY 14, tOH 2.5) | slow | 20.9 – 29.4 | 3 (25 ns, 4.1) |
+| spec worst | fast | 16.5 – 25.0 | 2 (20 ns, 3.5), 6 (≡ 2) |
+| typical (tODLY 7) | slow | 13.9 – 29.4 | 1 (1.1), **2 (6.1)**, 3 (4.4), 5, 6 |
+| typical | fast | 9.5 – 25.0 | 0 (0.5), **1 (5.5)**, **2 (5.0)**, 4, 5, 6 |
+
+  So on the board (room temperature, between the corners) expect phases
+  2 and 3 for a slow card and a passing run centred on about phase 2 for a
+  typical one; the IDELAY taps (−0.6 … −2.4 ns from a phase) fill the 5 ns
+  steps between them.  The real tODLY / tOH, the traces and the pads at
+  50 MHz are only measurable on the board: that is what
+  `tools/board/sd_hs_test.c`'s sweep table shows (the simulation's sweeps
+  check the mechanism against the same model, §9.5).
+
+### 9.5 Verification
+
+- **Default speed and SPI unchanged** (the requirement: cycle for cycle,
+  pin for pin, with `SDM_CFG[1]` = 0 and the reset values):
+  - `tb_sd_native` and `tb_sd_dma` run a **lock-step reference**: sd_spi /
+    sd_native as of `6dcbcfb` (the release before phase 3; renamed
+    `*_m0` by `run_sd_tb.sh`) on the same MMIO and pins.  Every pin (SCK,
+    CMD and DAT with their enables, SD_RESET, the interrupt, the DMA port)
+    and every read must match in every cycle until the DUT first runs an
+    engine with HS sampling; reads differ only in the new bits
+    (`SDM_CAPS`, `SDM_STATUS[6]`, `SDM_CFG[12:4]` / `[1]`).  679,817
+    cycles (tb_sd_native) and 4,785,053 (tb_sd_dma): 0 mismatches.
+  - `sd_spi` checks every cycle (simulation only) that the pads carry
+    exactly what phase 2's mux of the registers did, and that the SD_CTRL /
+    SPI next values are the registers' next values; `sd_native` checks its
+    `o_*_nx` against its output registers.  Any difference is a `$fatal`.
+  - `tb_sd_spi_compat` (SPI against the d9cf6c2 controller): PASS.
+- **Card model** (`sd_card_model.sv`): high-speed output timing after the
+  rising edge (the line undefined, a random level, from tOH to tODLY when
+  it changes; 2.5 / 6–14 ns), CMD6 per the spec (64-byte status, groups
+  1–6, mode 0 check / mode 1 switch after the block; CMD0, power off and
+  CMD6 function 0 back to default speed), and host output setup / hold
+  checks at the card (HS 6 / 2 ns, default 5 / 5 ns: 0 violations).  The
+  testbench adds pad delays: CLK / CMD / DAT out 4.0 ns, in 1.5 ns (+ the
+  IDELAYE2 model's 0.6 ns), as the routed design's.
+- **`tb_sd_native` high-speed tests** (`+HS_ONLY` runs just these): CMD6
+  check and switch at 25 MHz (status block compared); phase sweeps at
+  50 MHz for a spec-worst card (tODLY 14: an 8.5 ns eye) at taps 0 / 16 /
+  31, a typical card (tODLY 7) and a slow card behind slow pads — every
+  phase's pass / fail **matches the timing model** (failures are
+  CMD_CRC / CMD_IDX errors); phases 7 and 15 act as 6; the centre of the
+  typical card's passing run (phase 2, 20 ns, ≥ 3 ns margin); CMD18 ×8,
+  CMD18 ×24 with the drain paused so that CLK parks at every second block,
+  CMD25 ×12 and the read-back, an open-ended read stopped by CMD12, a card
+  with N_AC = 1 (below the spec's 2) under the same parking, a late phase
+  (35 ns) with a slow card, CMD6 back to default speed at 50 MHz, and a
+  program-load reset and a CPU_RESETN in high speed (SDM_CFG back to 0,
+  the tap reloaded, the card powered off and back at default speed,
+  IDELAY_RDY again).  542 checks, PASS.
+- **`tb_sd_dma` at 50 MHz** (after the default-speed suite): CMD6 switch,
+  DMA CMD18 ×32 at **24.3 MB/s** (the 25 MB/s bus less the command
+  overhead), CMD18 ×24 and CMD25 ×12 with a slow DDR (grants up to 400,
+  latencies up to 300 cycles: the FIFO fills and CLK parks), CMD25 ×16,
+  and 16 random sizes / counts / lanes / latencies; (m1) on every one.
+  808 checks, PASS (seeds 2, 3: 809 / 803, lock-step clean).
+- **SoC (Verilator)**: `sd_card_sync` gained `+SDC_HS` (it drives on the
+  rising edge it sees); `socsddma` gained `hs_rd_p0`..`p6` and
+  `hs_wr_p2` / `p5` (DMA at 50 MHz with the HS sampling at each phase);
+  the stubs gained IDDR, IDELAYE2 and IDELAYCTRL.  `socsd` 3 / 3,
+  `socsddma` 411 / 411 (402 + 9), `socsdabort --rounds 4` 16 / 16.
+
+### 9.6 Mutations, regression, build
+
+- **`tools/vsim/sdhsmut.py`: 27 of 27 killed.**  HS sampling (`+HS_ONLY`
+  suite): the phase index off by one, Q2 taken as Q1, a history stage
+  skipped, the HS strobe one or two cycles early, SDM_CFG[1] ignored, no
+  phase clamp, no / a one-strobe CMD release skip, no DAT0 release skip,
+  the tap never loaded / not reloaded at reset, the IDDR outputs swapped,
+  the tap not read back.  Default speed and the pads (full suite, lock-step
+  and the `$fatal` checks): the HS sample or strobe in default speed, a
+  3-strobe DAT0 skip in default speed, the CLK pad a cycle late, the
+  ODDR's D2 inverted, the next-value logic missing the start bit / sending
+  the wrong nibble, the SPI MOSI next value (tb_sd_spi_compat), CAPS[9],
+  STATUS[6].  DMA at 50 MHz: the data lines' default sample in HS.  SoC:
+  the top's CMD tristate inverted, a 3-strobe DAT0 skip (hs_wr_*).  (A
+  skip after a CMD release in default speed is an equivalent mutant: the
+  first default-speed strobes after a release are the end bit / pull-up;
+  so is the HS strobe two cycles early with its sample 20 ns early in the
+  DMA suite, by the 20 ns periodicity, though `+HS_ONLY`'s N_AC = 1 test
+  kills it.)
+- **`tools/vsim/sddmamut.py`: 42 of 42 killed** on this branch (its unit
+  mutants now also run the lock-step and the 50 MHz DMA section;
+  `run_sd_tb.sh` takes the reference from `SD_M0_GIT` in the mutants'
+  copies, which are outside git).
+- **Core / SoC regression** (`BASE=6dcbcfb tools/vsim/l2_regress.sh core
+  soc36`): 0 failing of 39; the CPU is untouched and the cycle counts are
+  identical to master (`diff` 169,092 = 169,092, `diff_irq` 107,709 =
+  107,709, `socdiff` PIPE_RUN 61,698 = 61,698 and 24,645 = 24,645), and
+  `socsd` / `socsload` / `socreset` / `socbreak` pass with the new pads.
+- **Build 1** (`5a6b2aa`, standard `build_fast -resynth`, 22m44s):
+  **tier 1 WNS +0.043, WHS +0.014** (met; no tier 2), the worst paths the
+  usual pipeline wall (`ex_d.uop` → the BTIC enables, 7 levels).  The SD
+  paths: +0.600 (the clock-run logic → the CLK ODDR's D), +0.604 (the MMIO
+  address → SD_CTRL's next value → the CMD tristate), the rest above.
+  42,159 LUTs (master 42,346), 28,466 FFs (28,467), 126 BRAM, 20 DSP;
+  `sd_native` 1,481 LUTs / 1,557 FFs (master 1,545 / 1,510: the output
+  muxes gone, the history, strobes and CFG bits added); 21 IDELAYE2
+  (+5), 2 IDELAYCTRL (+1), 69 OLOGIC (+6), ILOGIC unchanged.  Critical
+  warnings and methodology checks as master's.  Bitstream
+  `~/.cache/kbuild/sdhs_5a6b2aa.bit`, md5 `d0600c0a542c9af0b5e202962ccc3e00`.
+- **Board** (main session): `tools/board/sd_hs_test.c`, read only —
+  `tools/board/build.sh sd_hs_test -O2`, then load and run the ELF; it
+  prints the 25 MHz reference checksum, the CMD6 status, the phase × tap
+  table, the chosen setting and the 50 MHz PIO / DMA reads (same checksum,
+  MB/s), and ends with `SDHS PASS` / `SDHS FAIL`.  Options:
+  `DEFS="-DLBA=<n> -DSIZE_MIB=<n> -DSWEEP_BLKS=<n> -DSWEEP_REP=<n> -DREPEAT=<n>"`.
+
+### 9.7 Software
+
+**Driver (Linux `sd_native.c`, runtime session).**
+- Discovery: `SDM_CAPS[9]` → `MMC_CAP_SD_HIGHSPEED`, `f_max` 50 MHz;
+  `[27:24]` phases, `[11]` taps.
+- The mmc core sends CMD6 (mode 0, then mode 1 `0x80FF_FFF1`, 64-byte
+  status) at 25 MHz, then `set_ios` with `MMC_TIMING_SD_HS` and 50 MHz:
+  write `clk_div` 0 and `SDM_CFG` = 4-bit | `[1]` | phase << 4 | tap << 8
+  (with no command or data running), and double `SDM_TIMEOUT`.  Back to
+  legacy timing / ≤ 25 MHz: `[1]` = 0.
+- The phase: the board test's sweep gives the board's value (§9.4 predicts
+  about phase 2); a driver can use it as a default (module parameter) and
+  calibrate itself: at each phase (0–6, optionally taps 0 / 8 / 16 / 24),
+  a CMD13 (the RCA from the CMD7 it has sent) — its R1's CRC checks the CMD
+  line, which shares the DAT lines' pads and timing — or a block read of a
+  known block; take the centre of the widest passing run, counting phase
+  p + 4 as p (`tools/board/sd_hs_test.c`'s `pick()`).  After a failed try:
+  CMD12 with `[13]`, a few µs of CLK_ON, FIFO reset, W1C.  A CRC error at
+  50 MHz later can re-run it.
+- Nothing else changes: the FIFO, DMA (24.3 MB/s in simulation), the
+  interrupt and the error bits are as at 25 MHz.
+
+**Emulator (klausscc `src/emu/sd`).**
+- `SDM_CAPS` `0x0708_0B01` | `[10]` with `--sd-dma` (i.e. `0x0708_0F01`);
+  `SDM_CFG` keeps `[1]`, `[7:4]`, `[12:8]` (read back); `SDM_STATUS[6]` = 1.
+- The card (`card.rs` `switch_status`): group 1 supports functions 0 and 1
+  (support bits `0x8003`), a request for 1 reports 1 in mode 0 and switches
+  in mode 1 (after the status block); CMD0 and a power cycle return to 0;
+  structure version 1.
+- Timing: transfers at `clk_div` 0 take half as long as at 1 (check that
+  the model's block timing scales with `clk_div` down to 0).  Every phase passes (no window): an
+  optional `--sd-hs-window lo..hi` failing the phases outside it with
+  CMD_CRC_ERR / DATA_CRC_ERR would let the driver's calibration be tested.

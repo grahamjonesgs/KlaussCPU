@@ -84,6 +84,23 @@ current baseline (L2 + call-graph-ordered clang):
 I-fetch 37–51 % of cycles, D-cache stalls 30–38 %, L2 I-side hit rate
 37–44 %.
 
+Then (approved by Graham 2026-11-18): **SD high speed at 50 MHz**
+(SD_NATIVE_PLAN.md phase 3, §9), branch `sdhs` (off master 6dcbcfb).
+The SD pads become IOB registers (CLK through an ODDR) loaded with the
+next value of the old pin mux, so default speed and SPI keep every pin
+edge (lock-step against 6dcbcfb in simulation); the inputs go through
+an IDELAYE2 (78 ps taps, its own IDELAYCTRL in bank 35 on the MIG's
+200 MHz) into an IDDR; `SDM_CFG[1]` / `[7:4]` / `[12:8]` select the
+high-speed sampling, one of seven sample instants 5 ns apart, and the
+tap; `SDM_CAPS[9]` / `[11]`.  No core or cache change (cycle counts
+identical to master).  Status: RTL, simulation (lock-step with master
+in default speed, phase sweeps against the timing model, DMA at
+24.3 MB/s; sdhsmut 27 / 27, sddmamut 42 / 42) and build 1 done
+(`5a6b2aa`, tier 1 WNS +0.043 / WHS +0.014, `sdhs_5a6b2aa.bit`);
+awaiting board bring-up with `tools/board/sd_hs_test.c` (main session),
+then the Linux driver's CMD6 + calibration (runtime session) and the
+emulator.
+
 ## Estimates (runtime session, 2026-11-11)
 
 Board counters come from the current kernel. Miss counts come from the

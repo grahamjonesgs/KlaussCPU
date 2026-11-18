@@ -150,8 +150,9 @@ Present when `CPU_FEATURES[21]` = 1 (`sd_native.sv`; the design, sequencing
 rules and every corner case are in [SD_NATIVE_PLAN.md](SD_NATIVE_PLAN.md)
 §4, frozen register map v1). With `SD_MODE` = 0 (the reset value) the block
 is exactly the SPI controller above. With `SD_MODE` = 1 a hardware engine
-drives the 1-bit or 4-bit SD bus at default speed (≤ 25 MHz in this
-bitstream): CLK = 100 MHz / (2·(`clk_div`+1)), commands with CRC7 and
+drives the 1-bit or 4-bit SD bus at default speed (≤ 25 MHz) or, on
+bitstreams with `SDM_CAPS[9]`, high speed (50 MHz, `clk_div` 0, after CMD6;
+below): CLK = 100 MHz / (2·(`clk_div`+1)), commands with CRC7 and
 48/136-bit responses, data blocks with a CRC16 per line, write CRC tokens and
 busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 (`pwr_en` = 0 for ≥ 10 ms). `SD_CTRL[16]` (cs_n) is ignored in SD mode.
@@ -163,15 +164,15 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 | 0x110 | `SDM_RESP0` | R | 48-bit response: `[31:0]` argument field, `[37:32]` index echo, `[63:38]` 0. R2: response bits `[63:0]` (CRC7 and end bit in `[7:0]`) |
 | 0x118 | `SDM_RESP1` | R | R2: response bits `[127:64]`; 0 after a 48-bit response |
 | 0x120 | `SDM_BLK` | RW | `[11:0]` block size in bytes (multiple of 4, 4–2048; `[1:0]` read 0; 0 acts as 8), `[31:16]` block count (0 = open-ended). Reset `0x0001_0200`. Latched by each data command. A block takes ceil(size/8) FIFO words; when size mod 8 = 4 its last word holds the final 4 bytes in `[31:0]` (`[63:32]` = 0 on reads, ignored on writes) |
-| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR, `[27]` DMA_ERR (a DMA refused up front, or an open-ended DMA's block that would leave DDR); `[31]` ERR_ANY (live OR of `[27:16]`). Live `[5]` DMA_BUSY: the DMA engine owns the FIFO and DDR — 0 means every DMA write has been accepted at the L2 / DDR and none will be issued. |
+| 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR, `[27]` DMA_ERR (a DMA refused up front, or an open-ended DMA's block that would leave DDR); `[31]` ERR_ANY (live OR of `[27:16]`). Live `[5]` DMA_BUSY: the DMA engine owns the FIFO and DDR — 0 means every DMA write has been accepted at the L2 / DDR and none will be issued. Live `[6]` IDELAY_RDY (`SDM_CAPS[11]`): the input delay line's IDELAYCTRL is calibrated (1 a few µs after `CPU_RESETN`; while 0 the taps are not calibrated). |
 | 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[27:16]`) |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` read start-bit timeout, `[63:32]` busy timeout, in CLK cycles. Reset 2 500 000 / 12 500 000 (100 / 500 ms at 25 MHz) |
-| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply), `[16]` DMA_EN (sampled by each data command; writing `SDM_CFG` with `[16]` = 0 aborts a DMA). Reserved (read 0): `[1]` the high-speed edge and `[7:4]` the HS sample phase (SD_NATIVE_PLAN phase 3) |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[1]` HS_SAMPLE (high-speed input sampling at the phase `[7:4]`; 0 = the default-speed sample point), `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply), `[7:4]` HS_PHASE (0–6; 7–15 act as 6), `[12:8]` IDELAY_TAP (0–31, 78 ps each), `[16]` DMA_EN (sampled by each data command; writing `SDM_CFG` with `[16]` = 0 aborts a DMA). Other bits read 0. Reset 0. Change `[1]`, `[7:4]`, `[12:8]` only with CMD_BUSY = DATA_BUSY = DMA_BUSY = 0. Bitstreams before `SDM_CAPS[9]` read `[1]`, `[12:4]` as 0 |
 | 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in 64-bit words; write `[31]` = 1 to empty the FIFO (also sets the direction latch to NONE) |
 | 0x150 | `SDM_DMA_ADDR` | RW | 64-bit physical address, `[2:0]` read 0: always the first byte not yet transferred (it advances as the DMA moves words). Writes are ignored while DMA_BUSY |
 | 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command |
 | 0x180 | `SDM_DATA` | RW | FIFO port: a 64-bit load pops a word (0 if empty), a 64-bit store pushes one (dropped + FIFO_ERR if full). Byte 0 of the block in `[7:0]` |
-| 0x1F8 | `SDM_CAPS` | R | `0x0008_0501`: version 1, 4-bit, no high speed, `[10]` the DMA engine, 8 × 512-byte FIFO (`0x0008_0101` on bitstreams without the DMA) |
+| 0x1F8 | `SDM_CAPS` | R | `0x0708_0F01`: `[7:0]` version 1, `[8]` 4-bit, `[9]` high speed (`SDM_CFG[1]`, `[7:4]`), `[10]` the DMA engine, `[11]` the input delay line (`SDM_CFG[12:8]`, `SDM_STATUS[6]`), `[23:16]` 8 × 512-byte FIFO, `[27:24]` the number of HS sample phases (7). Older bitstreams: `0x0008_0501` (DMA, no high speed), `0x0008_0101` |
 
 - **Interrupt**: `|(SDM_STATUS & SDM_IRQ_EN)`, a level, cascaded on
   interrupt source 2 through `INT2_EN[1]` (Timers / interrupts below).
@@ -191,7 +192,45 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
   adapter finishes the one transaction in flight).
 - **Pins**: CMD and DAT[3:0] are bidirectional with pull-ups. In SPI mode
   CMD (MOSI), DAT3 (CS_n), DAT1 and DAT2 are always driven and DAT0 is an
-  input, as before.
+  input, as before.  On `SDM_CAPS[9]` bitstreams every output leaves through
+  an IOB register (CLK through an ODDR) on the same edges as before, and
+  CMD / DAT come in through an IDELAYE2 and an IDDR.
+
+#### High speed (`SDM_CAPS[9]`, SD_NATIVE_PLAN.md §9)
+
+After the card has switched to high speed (CMD6 mode 1, argument
+`0x80FF_FFF1`, a 64-byte status block whose byte 16 `[3:0]` reads 1), set
+`clk_div` = 0 (50 MHz) and `SDM_CFG` = `[0]` 4-bit | `[1]` HS_SAMPLE |
+phase << 4 | tap << 8.  An HS card drives its outputs after CLK's
+**rising** edge (tODLY ≤ 14 ns, held ≥ 2.5 ns after the next), so the
+window in which the data are valid at the FPGA moves with the card and the
+pad delays: the sample instant is calibrated.
+
+- **The sample instant** (at `clk_div` 0): the bit the card launches on a
+  rising edge of CLK is sampled **10 + 5·p ns** after the fabric edge that
+  raises the CLK pin's register (the pin itself rises ~4 ns later: the
+  clock-to-pad delay), at the input register after the IBUF and the delay
+  line, **minus tap × 78 ps** (the tap delays the data).  p = 0…6:
+  10, 15, … 40 ns.  The sample stream is periodic in the 20 ns clock:
+  phase p and p + 4 sample the same point of the eye, one bit apart, and
+  both work (the engines align on start bits).  In general (any `clk_div`)
+  the instant is F − 20 + 5·p ns, F the fabric edge that drives CLK low.
+- **Calibration**: read a known block (or the CMD6 / SCR data) at each
+  phase (and tap), note which pass (a failing phase shows CMD_CRC_ERR /
+  CMD_IDX_ERR / DATA_CRC_ERR), and take the centre of the widest passing
+  run, counting phase p + 4 as phase p.  After a failed try send CMD12 with
+  `[13]`, give the card a few µs of CLK_ON, and reset the FIFO.
+  `tools/board/sd_hs_test.c` is the reference implementation; the
+  predicted passing phases are in SD_NATIVE_PLAN.md §9.4.
+- **Outputs** are unchanged: CMD / DAT change on the fabric edge that drives
+  CLK low, 10 ns from each rising edge at 50 MHz (the HS card needs 6 ns
+  setup, 2 ns hold).
+- **Back to default speed**: CMD6 `0x80FF_FFF0` (at 50 MHz with the HS
+  sampling), then `clk_div` 1 and `SDM_CFG[1]` = 0.  CMD0, a slot power
+  cycle, `CPU_RESETN` and the native-mode program-load reset all return
+  the card or the controller (`SDM_CFG` = 0) to default speed.
+- **Timeouts** count CLK cycles: double `SDM_TIMEOUT` at 50 MHz to keep
+  the same times.
 
 #### SD DMA (`SDM_CAPS[10]`, SD DMA spec v1.2)
 
