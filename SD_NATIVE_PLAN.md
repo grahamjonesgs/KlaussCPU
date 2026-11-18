@@ -1017,7 +1017,7 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
   `run_sd_tb.sh` takes the reference from `SD_M0_GIT` in the mutants'
   copies, which are outside git).
 - **Core / SoC regression** (`BASE=6dcbcfb tools/vsim/l2_regress.sh core
-  soc36`): 0 failing of 39; the CPU is untouched and the cycle counts are
+  soc36`): 0 failing of 34; the CPU is untouched and the cycle counts are
   identical to master (`diff` 169,092 = 169,092, `diff_irq` 107,709 =
   107,709, `socdiff` PIPE_RUN 61,698 = 61,698 and 24,645 = 24,645), and
   `socsd` / `socsload` / `socreset` / `socbreak` pass with the new pads.
