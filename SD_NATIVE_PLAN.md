@@ -500,7 +500,12 @@ this (the register map is unchanged):
   sampling on the rising edge at 25 MHz would leave about 20 − 14 − pad
   delays, i.e. no margin. The host samples instead on the fabric edge that
   drives CLK low, i.e. just before the card's next change: ~20 ns of setup
-  at 25 MHz, and the output path delay (clock-to-pad, ≥ 4 ns) as hold.
+  at 25 MHz, and the output path delay (CLK's clock-to-pad, then the card,
+  then the input pad) as hold.  (Phase 3, routed, §9.4: CLK's clock-to-pad
+  is 4.02 ns at the slow corner but 1.43 ns at the fast one, and pad-to-IDDR
+  0.49 ns, so the hold is ≈ 1.9 ns at the fast corner before the traces and
+  the card's own output delay are added: smaller than "≥ 4 ns", still
+  positive.)
   Outputs change on that same edge (the card samples on the rising edge,
   half a period later). Inputs go through one IOB flip-flop; CD through a
   two-flop synchroniser (`SDM_STATUS[3]`; `SD_STATUS[1]` stays the raw pin).
@@ -849,6 +854,19 @@ rest of `SDM_CFG`.  Software changes `[1]`, `[7:4]`, `[12:8]` only while
 CMD_BUSY = DATA_BUSY = DMA_BUSY = 0 (a change mid-frame can drop or repeat
 a sample; a tap change can glitch the delayed lines).
 
+**Every `SDM_CFG` write reloads the tap** (`sd_native.sv` `r_idly_ld`: the
+IDELAYE2s' LD the cycle after any write to the register, whichever bits
+change), the DMA abort (`[16]` DMA_EN = 0, written while DMA_BUSY = 1 and
+a read may be running) included.  So **every `SDM_CFG` write, the abort
+included, must carry the current HS fields, `[0] | [1] | [7:4] | [12:8]`**:
+a write that carries them loads the same tap again (the delay does not
+change); one that drops them (an abort written as `SDM_CFG = 1`, say)
+switches to the default-speed sample and tap 0 in the middle of the
+transfer.  `tools/board/sd_hs_test.c` follows the rule (its `dma_rd()` and
+`recover()` take the current value).  A possible RTL change for a later
+bitstream (not in `5a6b2aa`): load the tap only on reset or when `[12:8]`
+changes (§9.8).
+
 ### 9.3 The sample instant, and the engines in HS
 
 - **Mapping (clk_div = 0, 50 MHz).**  Let R be the fabric edge on which the
@@ -885,20 +903,45 @@ a sample; a tap change can glitch the delayed lines).
   where the eye is: with T = 10 + 5p in the eye of the bit launched on
   rising edge R_j, slot j takes that bit; a phase that passes one clock
   later (T − 20 in the eye) takes the next bit, R_j+1's; a phase that
-  passes one clock earlier (only with a card whose output hold reaches
-  past R + 10 ns) takes R_j−1's.  So the park follows 1, 2 or 3 rising
-  edges after the edge that launched the end bit (default speed: 1).  The
-  card has then sent at most that many bits after the end bit; the strobe
-  of the first of them may land in D_RD_HOLD and be ignored, and the
-  lines hold the last one while CLK is parked, so the samples after the
-  restart go on with it (a held bit can be taken in place of the one
-  before it).  Only the first bit after the end bit can be skipped, so no
-  start bit is lost for a card with N_AC ≥ 2 (the spec's minimum) at any
-  phase, nor with N_AC = 1 at the phases that take bit j or j + 1 (the
-  testbench runs N_AC = 1 at the centre phase; the mutation `hs_strobe2`,
-  which takes bit j − 1, loses a start bit there).  The calibration sweep
-  reads with the FIFO filling and CLK parking, so a phase that broke the
-  flow control would fail it.
+  passes one clock earlier takes R_j−1's.  That needs the card's output
+  hold plus the pad delays and the tap to reach past R_j + T, so only
+  p ≤ 2 (T = 10 … 20 ns) can take bit j − 1 (a slow card or slow pads, or
+  a spec-worst card at a high tap); p = 3 … 6 (T ≥ 25 ns) never do.  So the park follows 1, 2 or 3 rising edges
+  after the edge that launched the end bit e (default speed: 1).  The card
+  has then sent that many bits after e, and the lines hold the last one
+  while CLK is parked: the samples after the restart go on with it (a held
+  bit is taken in place of the one before it).
+  - **Bit j and j + 1 phases.**  At most e + 1, the first bit after the
+    end bit, is replaced (or its strobe lands in D_RD_HOLD and is
+    ignored): no start bit is lost with N_AC ≥ 2 (the spec's minimum),
+    nor with N_AC = 1 (the testbench runs N_AC = 1 at the typical card's
+    centre phase and at pick()'s setting, a j + 1 phase).
+  - **Bit j − 1 phases lose a start bit** (corrected after the review:
+    the first text said that only e + 1 could be skipped, so that no start
+    bit was lost with N_AC ≥ 2 at any phase).  The park follows three
+    rising edges: the card has sent e + 1 … e + 3 and the lines hold
+    e + 3, which replaces e + 2 (e + 2's slot takes a second copy of
+    e + 3).  With N_AC = 2 e + 3 is the start bit: it is seen in e + 2's
+    slot and again in e + 3's, where it is taken as the first data bit,
+    and the block fails with DATA_CRC + DATA_END.  (With N_AC = 1 the
+    start bit e + 2 itself is replaced.)  The testbench reproduces it: the
+    slow card (t_out 5, t_in 3, tODLY 14, tOH 9) at phase 0 tap 0 with
+    N_AC 2 reads 8 blocks, then loses block 8, the first after a park
+    (SDM_STATUS `0x0060_0000`, BLKDONE 8 of 16); phase 4 (bit j) passes;
+    the spec-worst card at phase 0 tap 31 fails the same way.  A
+    single-block read, and a multi-block read that never parks, pass at
+    such a phase, so a sweep that does not park cannot see it.  (The
+    mutation `hs_strobe2`, which takes bit j − 1 at the centre phase,
+    loses a start bit the same way.)
+  - **The rule: prefer p + 4.**  Phase p + 4 samples the same instant as
+    p one bit later, i.e. bit j or j + 1, never j − 1.  So when the chosen
+    phase is p ≤ 2 and p + 4 also passes at the same tap, use p + 4
+    (`tools/board/sd_hs_test.c`'s `pick()`, which `tb_sd_native` runs
+    through DPI-C on its sweeps: slow card phase 0 → 4, typical card 2 →
+    6), and verify the final setting with a multi-block read that parks
+    CLK.  The board test's sweep does park: the first try of each cell
+    holds the drain back until the FIFO is full after every block
+    (`rd_parked()`), and a cell passes only if that try passes too.
 - **Writes** are unchanged by HS: the outputs follow `ev_fall`; the CRC
   token, busy and R1b use the HS samples.
 
@@ -936,7 +979,8 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
 
   So on the board (room temperature, between the corners) expect phases
   2 and 3 for a slow card and a passing run centred on about phase 2 for a
-  typical one; the IDELAY taps (−0.6 … −2.4 ns from a phase) fill the 5 ns
+  typical one (which `pick()` then moves to phase 6, the same instant one
+  bit later, §9.3); the IDELAY taps (−0.6 … −2.4 ns from a phase) fill the 5 ns
   steps between them.  The real tODLY / tOH, the traces and the pads at
   50 MHz are only measurable on the board: that is what
   `tools/board/sd_hs_test.c`'s sweep table shows (the simulation's sweeps
@@ -969,18 +1013,28 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
   IDELAYE2 model's 0.6 ns), as the routed design's.
 - **`tb_sd_native` high-speed tests** (`+HS_ONLY` runs just these): CMD6
   check and switch at 25 MHz (status block compared); phase sweeps at
-  50 MHz for a spec-worst card (tODLY 14: an 8.5 ns eye) at taps 0 / 16 /
-  31, a typical card (tODLY 7) and a slow card behind slow pads — every
-  phase's pass / fail **matches the timing model** (failures are
-  CMD_CRC / CMD_IDX errors); phases 7 and 15 act as 6; the centre of the
+  50 MHz for a spec-worst card (tODLY 14: an 8.5 ns eye), a typical card
+  (tODLY 7) and a slow card behind slow pads, each at the board test's
+  five taps (0 / 8 / 16 / 24 / 31) — every phase's pass / fail **matches
+  the timing model** (failures are CMD_CRC / CMD_IDX errors) — and
+  `sd_hs_test.c`'s `pick()` (DPI-C, `-DHOST_TEST`) on each table: worst
+  card phase 3 tap 8, typical card phase 6 tap 0 (the centre's phase 2
+  moved to 6), slow card phase 4 tap 0 (phase 0 moved to 4), each then
+  read with CLK parking (CMD18 ×16; the typical card's also at N_AC 1);
+  phases 7 and 15 act as 6; the centre of the
   typical card's passing run (phase 2, 20 ns, ≥ 3 ns margin); CMD18 ×8,
   CMD18 ×24 with the drain paused so that CLK parks at every second block,
   CMD25 ×12 and the read-back, an open-ended read stopped by CMD12, a card
   with N_AC = 1 (below the spec's 2) under the same parking, a late phase
-  (35 ns) with a slow card, CMD6 back to default speed at 50 MHz, and a
+  (35 ns) with a slow card; **the bit j − 1 hazard** (§9.3), asserted so
+  that a change of behaviour is noticed: the slow card at phase 0 tap 0
+  passes a single block but a parked CMD18 ×16 with N_AC 2 fails exactly
+  as described (8 blocks intact, then DATA_CRC + DATA_END, BLKDONE 8; the
+  card stopped and back in tran), while phase 4, the same instant, passes;
+  CMD6 back to default speed at 50 MHz, and a
   program-load reset and a CPU_RESETN in high speed (SDM_CFG back to 0,
   the tap reloaded, the card powered off and back at default speed,
-  IDELAY_RDY again).  542 checks, PASS.
+  IDELAY_RDY again).  602 checks, PASS (`+HS_ONLY`: 262).
 - **`tb_sd_dma` at 50 MHz** (after the default-speed suite): CMD6 switch,
   DMA CMD18 ×32 at **24.3 MB/s** (the 25 MB/s bus less the command
   overhead), CMD18 ×24 and CMD25 ×12 with a slow DDR (grants up to 400,
@@ -995,7 +1049,9 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
 
 ### 9.6 Mutations, regression, build
 
-- **`tools/vsim/sdhsmut.py`: 27 of 27 killed.**  HS sampling (`+HS_ONLY`
+- **`tools/vsim/sdhsmut.py`: 28 of 28 killed** (27 at `5a6b2aa`; the
+  review fix-up added `pick_alias`, `sd_hs_test.c`'s `pick()` without the
+  p + 4 rule, killed by `+HS_ONLY`'s pick() checks).  HS sampling (`+HS_ONLY`
   suite): the phase index off by one, Q2 taken as Q1, a history stage
   skipped, the HS strobe one or two cycles early, SDM_CFG[1] ignored, no
   phase clamp, no / a one-strobe CMD release skip, no DAT0 release skip,
@@ -1035,9 +1091,13 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
 - **Board** (main session): `tools/board/sd_hs_test.c`, read only —
   `tools/board/build.sh sd_hs_test -O2`, then load and run the ELF; it
   prints the 25 MHz reference checksum, the CMD6 status, the phase × tap
-  table, the chosen setting and the 50 MHz PIO / DMA reads (same checksum,
-  MB/s), and ends with `SDHS PASS` / `SDHS FAIL`.  Options:
-  `DEFS="-DLBA=<n> -DSIZE_MIB=<n> -DSWEEP_BLKS=<n> -DSWEEP_REP=<n> -DREPEAT=<n>"`.
+  table (the first try of each cell parks CLK after every block; `*` marks
+  a cell whose parked try failed), the chosen setting and its parked read
+  (VERIFY_BLKS blocks, CLK parked after each), the 50 MHz PIO / DMA reads
+  (same checksum, MB/s), and ends with `SDHS PASS` / `SDHS FAIL`.  Read
+  only: CMD0/2/3/6/7/8/12/13/17/18/55 and ACMD6/41, no `SDM_DATA` store, no
+  write command.  Options: `DEFS="-DLBA=<n> -DSIZE_MIB=<n> -DSWEEP_BLKS=<n>
+  -DSWEEP_REP=<n> -DREPEAT=<n> -DVERIFY_BLKS=<n>"`.
 
 ### 9.7 Software
 
@@ -1055,9 +1115,21 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
   a CMD13 (the RCA from the CMD7 it has sent) — its R1's CRC checks the CMD
   line, which shares the DAT lines' pads and timing — or a block read of a
   known block; take the centre of the widest passing run, counting phase
-  p + 4 as p (`tools/board/sd_hs_test.c`'s `pick()`).  After a failed try:
+  p + 4 as p (`tools/board/sd_hs_test.c`'s `pick()`).  **Then prefer
+  p + 4**: if the chosen phase is p ≤ 2 and p + 4 also passes at the same
+  tap, use p + 4 (a phase p ≤ 2 can take the bit launched one clock early
+  and lose a block's start bit after a CLK park, §9.3; `pick()` does
+  this).  A CMD13 or a single-block read cannot see that hazard: **verify
+  the final choice with a multi-block read that parks CLK** (hold the
+  drain back until the FIFO is full, i.e. `SDM_FIFO[9:0]` = 512 words,
+  after each block, as `sd_hs_test.c`'s `rd_parked()`), and fall back to
+  the next candidate (or 25 MHz) if it fails.  After a failed try:
   CMD12 with `[13]`, a few µs of CLK_ON, FIFO reset, W1C.  A CRC error at
   50 MHz later can re-run it.
+- **Every `SDM_CFG` write carries the HS fields** (§9.2): the tap is
+  reloaded on every write, the DMA abort (`DMA_EN` = 0) included, so the
+  driver keeps a shadow of `[0] | [1] | [7:4] | [12:8]` and ORs it into
+  every write (CLK_ON, DMA_EN on and off, the abort).
 - Nothing else changes: the FIFO, DMA (24.3 MB/s in simulation), the
   interrupt and the error bits are as at 25 MHz.
 
@@ -1072,3 +1144,55 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
   the model's block timing scales with `clk_div` down to 0).  Every phase passes (no window): an
   optional `--sd-hs-window lo..hi` failing the phases outside it with
   CMD_CRC_ERR / DATA_CRC_ERR would let the driver's calibration be tested.
+
+### 9.8 Review fix-up (2026-11-19), and the next RTL change
+
+The adversarial review of `sdhs` (sources and bitstream `5a6b2aa`) found
+one major and two minor problems, all fixed in software, tests and these
+notes; **the RTL and the XDC are unchanged** and `sdhs_5a6b2aa.bit` stays
+as built:
+
+- **Major: a bit j − 1 phase loses a start bit after a CLK park** (§9.3).
+  `pick()` now moves p ≤ 2 to p + 4; `tb_sd_native` asserts the failure at
+  phase 0 and the pass at phase 4 for the slow card, and runs `pick()`
+  (DPI-C) on its sweeps (`sdhsmut` `pick_alias`: without the rule the
+  testbench fails).
+- **Minor: the board sweep never parked CLK** (`rd()` drains about as fast
+  as the bus fills).  The first try of every cell is now `rd_parked()`,
+  and the chosen setting is verified with a parked read before the
+  throughput runs.
+- **Minor: the IDELAY tap is reloaded on every `SDM_CFG` write**, the
+  DMA abort included: documented as a software rule (§9.2, §9.7,
+  MMIO_MAP); `sd_hs_test.c` follows it.
+- **Note, the IDELAYCTRL RDY false path** (`nexys_ddr.xdc`:
+  `set_false_path -to [get_cells -quiet -hier -filter {NAME =~
+  sd_spi_i/r_idc_rdy_sync_reg[0]}]`): checked on the routed checkpoint of
+  build 1 (`sdhs_b1`, the build of `sdhs_5a6b2aa.bit`, md5 matched).  The
+  pattern **matches** exactly one cell, `sd_spi_i/r_idc_rdy_sync_reg[0]`
+  (in `-filter`'s `=~` the brackets are literal: `[1]` is not matched,
+  and the escaped `\[0\]` matches nothing).  `report_timing` to its D shows
+  the path from `idelayctrl_sd/RDY` with *Timing Exception: False Path*,
+  slack inf, no path group; `report_exceptions -ignored` lists the
+  constraint as *Non-existent path*, because RDY has no timing arc from a
+  clock (the path is unclocked with or without the constraint);
+  `check_timing`: 0 unconstrained internal endpoints, 0 no-clock pins.  So
+  there is no unconstrained or failing arc on `r_idc_rdy_sync`, and the
+  XDC is left as is.
+- **Note, default-speed input hold** is ≈ 1.9 ns at the fast corner, not
+  "≥ 4 ns" (§4.9 corrected).
+
+For the next RTL change (each alters the sources, so the next bitstream;
+none is needed for correctness now):
+
+1. `sd_native.sv` `r_idly_ld`: load the IDELAY tap only on reset or when
+   `[12:8]` changes (keep the reset reload), so that a DMA abort or a
+   CLK_ON write cannot touch the delay line.  Software keeps the §9.2 rule
+   either way (older bitstreams).
+2. `sd_native.sv`, the comment above the next-value logic: "in synthesis
+   the o_* registers lose their loads and are removed" is wrong — the
+   next values start from the current outputs (`nx_cmd = o_cmd`, …), so the
+   o_* registers keep that load and stay.  Reword it.
+3. `nexys_ddr.xdc`, the RDY false path: drop `-quiet` (so that a rename of
+   the synchroniser is reported rather than silently matching nothing), or
+   drop the line (the path is unclocked anyway; ASYNC_REG on
+   `r_idc_rdy_sync` stays).

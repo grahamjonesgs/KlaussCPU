@@ -167,7 +167,7 @@ busy, and PIO through a 4 KiB FIFO. Switching modes needs a slot power cycle
 | 0x128 | `SDM_STATUS` | R/W1C | live: `[0]` CMD_BUSY, `[1]` DATA_BUSY, `[2]` DAT0, `[3]` CARD_PRESENT (1 = a card is in; the inverse of the raw, active-low `SD_CD` pin), `[4]` FIFO_THRESH; sticky (W1C): `[8]` CMD_DONE, `[9]` DATA_DONE, `[16]` CMD_TIMEOUT, `[17]` CMD_CRC_ERR, `[18]` CMD_END_ERR, `[19]` CMD_IDX_ERR, `[20]` DATA_TIMEOUT, `[21]` DATA_CRC_ERR, `[22]` DATA_END_ERR, `[23]` WRITE_CRC_ERR, `[24]` WRITE_NO_TOKEN, `[25]` BUSY_TIMEOUT, `[26]` FIFO_ERR, `[27]` DMA_ERR (a DMA refused up front, or an open-ended DMA's block that would leave DDR); `[31]` ERR_ANY (live OR of `[27:16]`). Live `[5]` DMA_BUSY: the DMA engine owns the FIFO and DDR — 0 means every DMA write has been accepted at the L2 / DDR and none will be issued. Live `[6]` IDELAY_RDY (`SDM_CAPS[11]`): the input delay line's IDELAYCTRL is calibrated (1 a few µs after `CPU_RESETN`; while 0 the taps are not calibrated). |
 | 0x130 | `SDM_IRQ_EN` | RW | interrupt enables, same positions (`[4]`, `[9:8]`, `[27:16]`) |
 | 0x138 | `SDM_TIMEOUT` | RW | `[31:0]` read start-bit timeout, `[63:32]` busy timeout, in CLK cycles. Reset 2 500 000 / 12 500 000 (100 / 500 ms at 25 MHz) |
-| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[1]` HS_SAMPLE (high-speed input sampling at the phase `[7:4]`; 0 = the default-speed sample point), `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply), `[7:4]` HS_PHASE (0–6; 7–15 act as 6), `[12:8]` IDELAY_TAP (0–31, 78 ps each), `[16]` DMA_EN (sampled by each data command; writing `SDM_CFG` with `[16]` = 0 aborts a DMA). Other bits read 0. Reset 0. Change `[1]`, `[7:4]`, `[12:8]` only with CMD_BUSY = DATA_BUSY = DMA_BUSY = 0. Bitstreams before `SDM_CAPS[9]` read `[1]`, `[12:4]` as 0 |
+| 0x140 | `SDM_CFG` | RW | `[0]` 4-bit bus, `[1]` HS_SAMPLE (high-speed input sampling at the phase `[7:4]`; 0 = the default-speed sample point), `[2]` CLK_ON (free-running clock, e.g. the 74 power-up clocks; flow-control stops still apply), `[7:4]` HS_PHASE (0–6; 7–15 act as 6), `[12:8]` IDELAY_TAP (0–31, 78 ps each), `[16]` DMA_EN (sampled by each data command; writing `SDM_CFG` with `[16]` = 0 aborts a DMA). Other bits read 0. Reset 0. Change `[1]`, `[7:4]`, `[12:8]` only with CMD_BUSY = DATA_BUSY = DMA_BUSY = 0. **Every write reloads the IDELAY tap** from `[12:8]`, the DMA abort (`[16]` = 0) included: every `SDM_CFG` write must carry the current `[0]`, `[1]`, `[7:4]`, `[12:8]` (keep a shadow and OR it in). Bitstreams before `SDM_CAPS[9]` read `[1]`, `[12:4]` as 0 |
 | 0x148 | `SDM_FIFO` | R/W | `[9:0]` level in 64-bit words; write `[31]` = 1 to empty the FIFO (also sets the direction latch to NONE) |
 | 0x150 | `SDM_DMA_ADDR` | RW | 64-bit physical address, `[2:0]` read 0: always the first byte not yet transferred (it advances as the DMA moves words). Writes are ignored while DMA_BUSY |
 | 0x158 | `SDM_BLKDONE` | R | `[15:0]` good blocks in the current data command |
@@ -218,8 +218,15 @@ pad delays: the sample instant is calibrated.
 - **Calibration**: read a known block (or the CMD6 / SCR data) at each
   phase (and tap), note which pass (a failing phase shows CMD_CRC_ERR /
   CMD_IDX_ERR / DATA_CRC_ERR), and take the centre of the widest passing
-  run, counting phase p + 4 as phase p.  After a failed try send CMD12 with
-  `[13]`, give the card a few µs of CLK_ON, and reset the FIFO.
+  run, counting phase p + 4 as phase p.  Then, if the chosen phase is
+  p ≤ 2 and p + 4 also passes at the same tap, use p + 4: a phase p ≤ 2
+  can sample the bit launched one clock early (a slow card, slow pads or a
+  high tap), which loses the next block's start bit when CLK parks between
+  blocks (the FIFO full) although single blocks read fine; p + 4 is the
+  same instant one bit later and never does (SD_NATIVE_PLAN.md §9.3).
+  Verify the final setting with a multi-block read that parks CLK (drain
+  each block only once `SDM_FIFO[9:0]` reads 512).  After a failed try send
+  CMD12 with `[13]`, give the card a few µs of CLK_ON, and reset the FIFO.
   `tools/board/sd_hs_test.c` is the reference implementation; the
   predicted passing phases are in SD_NATIVE_PLAN.md §9.4.
 - **Outputs** are unchanged: CMD / DAT change on the fabric edge that drives
