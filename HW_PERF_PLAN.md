@@ -97,9 +97,19 @@ identical to master).  Status: RTL, simulation (lock-step with master
 in default speed, phase sweeps against the timing model, DMA at
 24.3 MB/s; sdhsmut 27 / 27, sddmamut 42 / 42) and build 1 done
 (`5a6b2aa`, tier 1 WNS +0.043 / WHS +0.014, `sdhs_5a6b2aa.bit`);
-awaiting board bring-up with `tools/board/sd_hs_test.c` (main session),
-then the Linux driver's CMD6 + calibration (runtime session) and the
-emulator.
+Opus review: no blocker; its MAJOR (a phase whose sample takes bit j − 1
+loses a start bit across a CLK park) and two MINORs fixed in software,
+tests and docs (`ee5882f`, no synthesised change).  Released 2026-11-19
+as `sdhs_release_5a6b2aa.bit` (master fast-forwarded to `sdhs`; QSPI
+written, rollback entry in ~/.cache/kbuild/rollback/README.txt).  Board:
+all_tests 31/31, dcbz, hwprop, sd_native_test; `sd_hs_test` PASS
+(window ~18.7 ns, phase 6 tap 8, 23.2–23.8 MB/s against 12.1 at
+25 MHz); the Linux HS driver (runtime 0c0c3af) board-check 18/18 (SRAM
+and flash boot), stress clean (md5 of the rust / toolchain / rootfs
+images ×3 and 346 MB write / sync / md5 ×2 at 50 MHz, run twice, no mmc
+errors); cold rustc hello 20.1 → 15.9 s, clang deflate 36.5 → 33.0 s,
+cxx-hello 82.1 → 80.8 s.  Emulator: klausscc `sdhs` (SDM_CAPS HS,
+`--sd-no-hs`, `--sd-hs-window`).
 
 ## Estimates (runtime session, 2026-11-11)
 

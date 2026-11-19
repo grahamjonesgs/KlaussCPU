@@ -1132,6 +1132,19 @@ ui_clk with no skew between them, 7.185 ns insertion at the slow corner):
   every write (CLK_ON, DMA_EN on and off, the abort).
 - Nothing else changes: the FIFO, DMA (24.3 MB/s in simulation), the
   interrupt and the error bits are as at 25 MHz.
+- **As implemented (runtime 0c0c3af, `sd_native.c`), three corrections to
+  the sequence above:**
+  - the core's CMD6 switch runs at `f_init` (400 kHz), not 25 MHz:
+    `mmc_sd_switch_hs` comes before `mmc_set_clock(max)`;
+  - the core sends ACMD6 at 50 MHz on the 1-bit bus before
+    `execute_sd_hs_tuning`, so the driver also sweeps in `prepare`
+    (1-bit, then 4-bit; CMD6-status probes; a parked read of
+    2 × fifo_blks blocks verifies the choice; the 6 / 8 default last);
+  - the switch back to default speed is done at `clk_div` ≥ 3 with
+    `HS_SAMPLE` 0 (F = R + 20 ns at 25 MHz falls before a late HS eye,
+    §9.3 / §9.4); 25 MHz again once the switch status confirms it.
+  Board (2026-11-19): "50 MHz high speed: phase 6, tap 8 (SDM_CFG 0x863),
+  window 18.7 ns", the same choice as `sd_hs_test`.
 
 **Emulator (klausscc `src/emu/sd`).**
 - `SDM_CAPS` `0x0708_0B01` | `[10]` with `--sd-dma` (i.e. `0x0708_0F01`);
