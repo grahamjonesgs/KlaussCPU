@@ -362,11 +362,15 @@ is fully off, channel 15 is maximum brightness (~25 % duty cycle in hardware).
 | 0x0000 | `RGB1`  | RW | 12    | `[11:8]` R, `[7:4]` G, `[3:0]` B | RGB LED 1 |
 | 0x0008 | `RGB2`  | RW | 12    | `[11:8]` R, `[7:4]` G, `[3:0]` B | RGB LED 2 |
 
-Reading returns the last value written (or boot default `0x000`).
+Reading returns the last value written. A successful program load
+(`LOAD_COMPLETE`) sets both to `0x000`; before that the loader uses
+`RGB1` as its activity light (it toggles between `0x050` and `0x005`
+while a program is received), so a program sees `0x000` unless it has
+written the register.
 
-Legacy opcodes that touch the same registers (kept for now):
-`RGB1R/RGB2R/RGB1V/RGB2V` — see `opcode_select.vh` `0x305?` / `0x306?` /
-`0x3074` / `0x3075`.
+Write each register with a 16-, 32- or 64-bit store. The byte enables
+are ignored and the core replicates a narrower store's data across the
+lanes, so a byte store of `b` writes `{b[3:0], b}`.
 
 ### 7-Segment Display — base `0xF003_0000`
 
@@ -387,11 +391,18 @@ digits and pads them automatically.
 | 0x0010 | `SEG_ALL`  | R  | 64    | concatenation `{upper_padded, lower_padded}`  |
 
 Read width is wider than write width because reads return the raw padded
-(`{4'h0, digit}` per byte) representation.
+(`{4'h0, digit}` per byte) representation. Read `SEG_ALL` with a 64-bit
+load.
 
-Legacy opcodes that touch the same registers:
-`7SEGV1/7SEGV2/7SEGR1/7SEGR2/7SEGR/7SEGBLANK` — see `opcode_select.vh`
-`0x4xxx` block.
+Each byte of the padded value selects a glyph: `0x00`–`0x0F` the hex
+digit, and `0x20` "V", `0x21` "-", `0x22` blank, `0x23` "H", `0x24` "L",
+`0x25` "P" (`Seven_seg_LED_Display_Controller.sv`). After `SEG_BLANK`,
+and when a program starts (`LOAD_COMPLETE`), each display reads
+`0x2222_2222`.
+
+The byte enables are ignored, as for the RGB LEDs: write `SEG_LOW` /
+`SEG_HIGH` with a 16-bit or wider store, and `SEG_ALL` with a 32- or
+64-bit store.
 
 ### LEDs and switches — base `0xF004_0000`
 
@@ -400,10 +411,12 @@ Legacy opcodes that touch the same registers:
 | 0x0000 | `LEDS`     | RW | 16    | 16-bit LED bar                           |
 | 0x0008 | `SWITCHES` | R  | 16    | live state of the 16 board slide switches|
 
-Writes to `SWITCHES` are dropped. Reading `LEDS` returns the last value written.
+Writes to `SWITCHES` are dropped. Reading `LEDS` returns the last value
+written; a program load clears it to 0.
 
-Legacy opcodes: `LEDR/LEDV` (set), `SWITCHR` (read switches) — see
-`opcode_select.vh` `0x3xxx` block.
+Write `LEDS` with a 16-bit or wider store. The byte enables are ignored
+and the core replicates a byte store's data across the lanes, so a byte
+store of `b` lights `{b, b}`.
 
 ### Cache controller — base `0xF005_0000`
 
@@ -1677,7 +1690,7 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define SEG_BASE        (MMIO_BASE + 0x00030000u)
 #define REG_SEG_LOW     (*(volatile uint32_t *)(SEG_BASE + 0x0000))
 #define REG_SEG_HIGH    (*(volatile uint32_t *)(SEG_BASE + 0x0008))
-#define REG_SEG_ALL     (*(volatile uint32_t *)(SEG_BASE + 0x0010))
+#define REG_SEG_ALL     (*(volatile uint64_t *)(SEG_BASE + 0x0010))  /* reads 64 bits */
 #define REG_SEG_BLANK   (*(volatile uint32_t *)(SEG_BASE + 0x0018))
 
 /* LEDs / switches (0xF004_0xxx) */
