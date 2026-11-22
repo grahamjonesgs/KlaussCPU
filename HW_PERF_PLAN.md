@@ -3663,7 +3663,22 @@ WATCH, `ECAUSE[12:9]`; SRs 0x40–0x43; `CPU_FEATURES[29:28]`). Cycle-identical
 to master while unused. Board test: `tools/board/ustep_test.c` (prints
 `USTEP PASS` / `USTEP FAIL`).
 
-BUILD_RESULTS_PLACEHOLDER
+**Build** (`1813b9c`, standard `build_fast` flow): tier 1 WNS +0.094 / WHS
++0.029, `~/.cache/kbuild/ustep_1813b9c.bit` (md5
+`3ec31f70b6e16eb862b49c1e480a3416`). 42,889 LUTs, 28,586 FFs, 126 BRAM
+tiles, 20 DSPs. The worst paths are the pre-existing fetch-window family
+(`r_base_p1` → `ifb_dw`); the slack into every new register is ≥ +0.89 ns
+(`us_arm` +0.888, `mem_wph` +0.900, 8–9 levels). No new Synth 8-3332 / 8-4767
+on the new logic (the first build, `9506ef7`, had `mem_wfire` read `sq_spec`
+before its declaration, Synth 8-6901: moved; same result).
+
+**Regression** (against master `3926075`): `l2_regress.sh core soc36 soc8
+socvar` 0 failing (traces and PIPE_RUN cycles identical); `diff --plus
++TRACECYC` cycle-identical also with `VSIM_EXC_EN=0`, `VSIM_MPU_EN=1`,
+`VSIM_DEBUG_EN=1`; `VSIM_EXC_EN=0 test` fails exactly master's set;
+`fwdfuzz` 480 runs; `udbgfuzz` (60 + 40 seeds, with IRQs) clean;
+`socustep` (the board test on tb_soc) USTEP PASS; `ustepmut.py` 58 of 58
+killed. Not yet run on the board.
 
 ## CPU_FEATURES additions
 
@@ -3863,3 +3878,7 @@ Decisions taken while implementing the frozen text above:
   runtime checks clean, clang unchanged; QSPI = `tmg2_release_fe83ff4.bit`
   (md5 56f288e6…), flash boot board-check 16/16; master fast-forwarded to
   `tmg2`.  No hardware item queued; Graham decides the next RTL work.
+- 2026-11-22: §11 user single step and watchpoints (MMU_PLAN §13) on
+  `ustep`: `1813b9c`, standard flow tier 1 WNS +0.094 / WHS +0.029,
+  `~/.cache/kbuild/ustep_1813b9c.bit`; cycle-identical to master while
+  unused.  Board test `tools/board/ustep_test.c`.  Not yet run on the board.

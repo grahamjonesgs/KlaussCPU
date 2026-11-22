@@ -2218,3 +2218,8 @@ an entry.
   variants. The user retire lines must equal the plain run's, and the
   handler's log must equal an independent Python model of §13.
 - `ustepmut.py`: 58 mutations, every one killed.
+- `run.py socustep`: the board test (`tools/board/ustep_test.c`) on tb_soc.
+
+**Build** (`1813b9c`): tier 1 WNS +0.094 / WHS +0.029, 42,889 LUTs, 28,586
+FFs, 126 BRAM (≈ +0.7k LUTs, +0.1k FFs); the new registers have ≥ 0.89 ns
+of slack. Bitstream `~/.cache/kbuild/ustep_1813b9c.bit` (HW_PERF_PLAN §11).
