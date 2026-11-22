@@ -7116,6 +7116,8 @@ def ud_step_basic():
             P['sys'] = a.syscall()
             P['s3'] = a.setr(3, 0xF0000000)
             P['ld'] = a.ld(64, 4, 3)
+            P['s3b'] = a.setr(3, DATA + 1)
+            P['ldm'] = a.ld(16, 4, 3)
             P['jmp'] = a.jmp('E')
             a.nop()
             a.label('F')
@@ -7129,7 +7131,8 @@ def ud_step_basic():
             return [s(P['s1'], P['add']), s(P['add'], P['fbr']), s(P['fbr'], a.labels['T']),
                     s(P['call'], P['inc']), s(P['inc'], P['ret']), s(P['ret'], P['sys']),
                     (X_SYSCALL, 0, P['s3'], 3), s(P['s3'], P['ld']),
-                    (X_ACC_LD, 0xF0000000, P['ld'], 3), s(P['jmp'], hp), (X_PRIV, HALT_W, hp, 3)]
+                    (X_ACC_LD, 0xF0000000, P['ld'], 3), s(P['s3b'], P['ldm']),
+                    (X_MISAL_LD, DATA + 1, P['ldm'], 3), s(P['jmp'], hp), (X_PRIV, HALT_W, hp, 3)]
         out.append(_udprog(body, entries=ents, plus=plus, exp={'r1': 6, 'r2': 10, 'r4': 0, 'sp': 0x08000000 - 24}))
     return out
 
@@ -7343,10 +7346,16 @@ def uw_sizes():
                     if ctrl & 0xFF:
                         cases.append((sz, st, ea, wa, ctrl, hit))
 
+    # (half the cases split the EA between rs1 and rs2 at random: every
+    # carry of the EA's operands — the watch compare is carry-free on them)
+    import random as _r
+    rnd = _r.Random(13)
+    cases = [c + ((rnd.getrandbits(32) if rnd.random() < 0.5 else rnd.randrange(0, 0x100)),) for c in cases]
+
     def emit(a, c):
-        sz, st, ea, wa, ctrl, hit = c
+        sz, st, ea, wa, ctrl, hit, k = c
         _uwcfg(a, (wa, ctrl))
-        a.setr(9, ea & ~0xFF); a.setr(10, ea & 0xFF); a.setr64(11, 0x1122334455667788)
+        a.setr(9, (ea - k) & 0xFFFFFFFF); a.setr(10, k); a.setr64(11, 0x1122334455667788)
         at = a.st_rr(sz, 11, 9, 10) if st else a.ld_rr(sz, 4, 9, 10)
         return [(X_WATCH | 1 << 9 | st << 11, ea, at + 4, 1)] if hit else []
     out = []
@@ -7525,11 +7534,16 @@ def uw_supervisor():
     a.di(3); a.ei(1); at = a.ld(64, 5, 9); ents.append((X_WATCH | 1 << 9, d, at + 4, 0))
     a.ei(1); a.di(3); a.ld(64, 5, 9)                            # no hit
     a.ei(1)
+    # an LCD op right behind a watched load (a hit-pipe load leaves MEM on
+    # its fire edge): squashed before it strobes, sent once after the handler
+    at = a.ld(64, 5, 9); ents.append((X_WATCH | 1 << 9, d, at + 4, 0))
+    a.raw(0x70000010)                                           # LCDCMD r1
     a.halt()
     _udhandler(a)
-    e = {'end': 'park', 'kind': '0'}
+    e = {'end': 'park', 'kind': '0', 'lcd_n': '1'}
     e.update(_udexp(ents))
     out.append((a, e, []))
+    out.append((a, e, ['+HIT=100']))
     # EVEC = 0: a supervisor hit-able store does nothing
     a = Asm()
     a.setr(9, DATA + 0x398); a.setr(2, DATA + 0x398); a.mtsr('wp0_addr', 2)

@@ -1122,15 +1122,16 @@ def cmd_socmmio(a):
         if not same:
             fails += 1
             print(f'DIFF seed={sd} lines {len(tb_.splitlines())}/{len(open(rn["trace"]).read().splitlines())}')
-    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x03F0_200D = stage 1
+    # CPU_FEATURES (0xF00F_0048) on the working tree: 0x33F0_200D = stage 1
     # + LR/SC + the 32-entry TLB, no MPU, lean crypto (TRNG only), native SD,
-    # DCBZ, STATUS.MAL64, ETH_RX_SLOTS, the TLB walker ([25]): the A7
+    # DCBZ, STATUS.MAL64, ETH_RX_SLOTS, the TLB walker ([25]), the user
+    # single step and watchpoints ([29:28], MMU_PLAN §13): the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
     l2, l2w = l2_cfg()
-    if f'r2=00000000{0x0FF0200D if l2 else 0x0BF0200D:08x}' not in last:
+    if f'r2=00000000{0x3FF0200D if l2 else 0x3BF0200D:08x}' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -1188,7 +1189,7 @@ def cmd_soccrypto(a):
             want = {'r1': 0x1122334455667788, 'r2': 0x99, 'r3': 3, 'r4': 3, 'r6': 0x03FF200D | _l2bit()}
             ok = all(got[k] == v for k, v in want.items()) and (got['r5'] & 2)
         else:
-            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x03F0200D | _l2bit()}
+            want = {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0, 'r5': 0, 'r6': 0x33F0200D | _l2bit()}
             ok = all(got[k] == v for k, v in want.items())
         ok = ok and 'HALTED' in r['log']
         fails += not ok
@@ -1214,7 +1215,7 @@ def _socsd_progs():
     a.halt()
     # r4 SDM_CAPS: [9] HS, [10] DMA, [11] IDELAY, [27:24] 7 HS phases (phase 3);
     # r8 [6] IDELAY_RDY (the tb's IDELAYCTRL stub is always ready)
-    progs.append(('regs', a, {'r1': 0x03F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x07080F01, 'r5': 0x00010200,
+    progs.append(('regs', a, {'r1': 0x33F0200D | _l2bit(), 'r2': 1, 'r3': 0, 'r4': 0x07080F01, 'r5': 0x00010200,
                               'r6': (12500000 << 32) | 2500000, 'r7': 0x000100F9, 'r8': 0x48, 'r9': 0}))
     a = Asm(); a.setr(15, SD)
     a.setr(9, 0x80000000); a.st(64, 9, 15, 0x148)                      # FIFO reset
@@ -1964,7 +1965,7 @@ def cmd_socwalk(a):
         report(f'evict shadow {kind}', allok and bool(seen), f'read met its own line in the writeback at pad={seen}')
     # 4. CPU_FEATURES[25] with TLB_WALK = 0 (and 1 for reference)
     from kasm import Asm
-    for nw, want in ((False, 0x03F0200D | _l2bit()), (True, 0x01F0200D | _l2bit())):
+    for nw, want in ((False, 0x33F0200D | _l2bit()), (True, 0x31F0200D | _l2bit())):
         f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
         g = _soc_regs(run_soc(build_soc(None, nowalk=nw), f, f'sw_feat{int(nw)}', trace=True))
         report(f'CPU_FEATURES {"TLB_WALK=0" if nw else "default"}', bool(g) and g.get('r2') == want,
@@ -2503,7 +2504,7 @@ def cmd_soceth(a):
     a.ld(64, 7, 15, 0x08)                                              # 0
     a.setr(3, 1); a.st(64, 3, 15, 0x00); a.ld(64, 8, 15, 0x00)         # 1 -> 2
     a.halt()
-    exp = {'r1': 0x03F0200D | _l2bit(), 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
+    exp = {'r1': 0x33F0200D | _l2bit(), 'r2': 0x802, 'r4': 0x805, 'r5': 0x802, 'r6': 0x808, 'r7': 0, 'r8': 0x802}
     r = run_soc(exe, a, 'soceth', trace=True)
     last = open(r['trace']).read().strip().splitlines()[-1] if 'HALTED' in r['log'] else ''
     regs = {k: int(v, 16) for k, v in re.findall(r'(r\d+)=([0-9a-f]{16})', last)}
