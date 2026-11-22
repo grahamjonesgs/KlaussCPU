@@ -2030,7 +2030,11 @@ watchpoints keep their behaviour; with the user step armed:
   DM attached and EXC_PASS = 0): after resume, the next instruction to
   execute is the stepped one;
 - a debugger write of register 21 (`{DI, UM}`) with UM = 0 disarms the step
-  (it is armed in user mode only); a write with UM = 1 keeps it.
+  (it is armed in user mode only); a write with UM = 1 keeps it;
+- a debugger write of `EVEC` = 0 while a STEP or WATCH entry is pending
+  (only possible from the DM, while halted) is **undefined**: the RTL does
+  not re-check `EVEC` when it takes the pending entry, and klausscc drops
+  it. Clear the step (register 21 with UM = 0) before clearing `EVEC`.
 
 ### 13.3 Watchpoints (WATCH)
 
