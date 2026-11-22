@@ -34,6 +34,9 @@ MPU_EN, MPU_R, MPU_W, MPU_X, MPU_G = 1, 2, 4, 8, 16     # MPU_BASEn [4:0]
 SR.update({'tlb_hi': 0x30, 'tlb_lo': 0x31, 'tlb_index': 0x32, 'asid': 0x33, 'tlbvec': 0x34,
            'tlb_ptb': 0x35, 'tlb_walk': 0x36, 'tlb_wcnt': 0x37})   # (0x35-0x37: MMU_PLAN §11.8)
 TLB_V, TLB_R, TLB_W, TLB_X = 1, 2, 4, 8                  # TLB_LO [3:0]
+# MMU_PLAN.md §13: the user watchpoints
+SR.update({'wp0_addr': 0x40, 'wp0_ctrl': 0x41, 'wp1_addr': 0x42, 'wp1_ctrl': 0x43})
+WP_R, WP_W, WP_U = 1 << 8, 1 << 9, 1 << 10               # WPn_CTRL (BE in [7:0])
 
 
 def H(length, cls):

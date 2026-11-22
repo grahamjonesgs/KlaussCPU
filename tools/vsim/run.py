@@ -2700,6 +2700,11 @@ def main():
     sfr = sub.add_parser('socframe'); sfr.add_argument('--rev', help="another revision's RTL (its own tb_soc)")
     sm = sub.add_parser('socmmio'); sm.add_argument('--base', required=True)
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
+    ud = sub.add_parser('udbgfuzz', help='MMU_PLAN §13: user single step / watchpoint fuzzer (udbg.py)')
+    ud.add_argument('--seeds', type=int, default=30); ud.add_argument('--seed0', type=int, default=0)
+    ud.add_argument('--mode', choices=('all', 'step', 'watch'), default='all')
+    ud.add_argument('--irq', action='store_true'); ud.add_argument('-v', '--verbose', action='store_true')
+    ud.add_argument('--plus', action='append', default=[])
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
     x.add_argument('--seed0', type=int, default=1); x.add_argument('--lats', type=int, nargs='+', default=[3])
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
@@ -2774,6 +2779,9 @@ def main():
         sys.exit(cmd_test(a))
     elif a.cmd == 'socdiff':
         sys.exit(cmd_socdiff(a))
+    elif a.cmd == 'udbgfuzz':
+        import udbg
+        sys.exit(udbg.cmd_udbgfuzz(a, build, run))
     elif a.cmd == 'excdiff':
         sys.exit(cmd_excdiff(a))
     elif a.cmd == 'dmtest':

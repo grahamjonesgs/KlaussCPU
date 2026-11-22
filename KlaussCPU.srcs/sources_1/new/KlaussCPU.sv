@@ -1486,7 +1486,8 @@ module KlaussCPU #(
                // native SD controller (SD_NATIVE_PLAN.md), [22] DCBZ and
                // [23] STATUS.MAL64 (HW_PERF_PLAN.md §1 / §4; both need
                // stage 1), [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3), [25]
-               // the hardware TLB walker (MMU_PLAN.md §11.8).
+               // the hardware TLB walker (MMU_PLAN.md §11.8), [28] / [29] the
+               // user single step / watchpoints (MMU_PLAN.md §13).
                // Reads 0 on earlier bitstreams (a reserved offset).
                16'h0048: r_mmio_read_data_comb = {40'b0, CORE1_EXC_EN, CORE1_EXC_EN,
                                                   1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
@@ -1497,7 +1498,9 @@ module KlaussCPU #(
                                                  | 64'h0100_0000   // [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3)
                                                  | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0}
                                                  | {37'b0, CORE1_L2_EN, 26'b0}    // [26] the L2 (HW_PERF_PLAN.md §6)
-                                                 | 64'h0800_0000;                 // [27] the cache range ops (SD DMA spec v1.2)
+                                                 | 64'h0800_0000                  // [27] the cache range ops (SD DMA spec v1.2)
+                                                 // [28] user single step, [29] the user watchpoints (MMU_PLAN.md §13)
+                                                 | {34'b0, CORE1_EXC_EN, CORE1_EXC_EN, 28'b0};
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;

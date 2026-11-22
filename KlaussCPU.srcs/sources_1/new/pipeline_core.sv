@@ -87,7 +87,12 @@ module pipeline_core
    // I-cache with a sweep of only those lines; every other fetch-side copy
    // (window, NLB, BTIC, a pending install) goes as for ICACHE_INV.  With
    // 16 B lines it is a whole ICACHE_INV.  0: bit 6 is ignored (core 2).
-   parameter bit RIINV_EN = 1'b0
+   parameter bit RIINV_EN = 1'b0,
+   // MMU_PLAN.md §13: user-mode single step (frame bit 45 SS, ECAUSE 14
+   // STEP) and the two data watchpoints (SRs 0x40-0x43, ECAUSE 15 WATCH;
+   // needs EXC_EN).  0 = SS is ignored, the SRs are ILLEGAL (core 2: off,
+   // with EXC_EN).
+   parameter bit UDBG_EN = 1'b1
 )
 (
    input  logic         clk,
@@ -394,11 +399,14 @@ module pipeline_core
    localparam int DZ_LB   = 5;                 // log2(D-cache line bytes)
    // HW_PERF_PLAN.md §4: STATUS[10] MAL64 (needs EXC_EN: MTSR STATUS).
    localparam bit EN_MAL64 = EXC_EN;
+   // MMU_PLAN.md §13: user single step and watchpoints
+   localparam bit EN_UDBG = EXC_EN && UDBG_EN;
    // Exception causes (ECAUSE, MMU_PLAN.md §4.1)
    localparam logic [3:0] X_ILL = 4'd1, X_PRIV = 4'd2, X_TRAP = 4'd3, X_SYSCALL = 4'd4,
                           X_MISAL_LD = 4'd5, X_MISAL_ST = 4'd6, X_ACC_LD = 4'd7,
                           X_ACC_ST = 4'd8, X_ACC_FE = 4'd9, X_MISAL_FE = 4'd10,
-                          X_TLB_LD = 4'd11, X_TLB_ST = 4'd12, X_TLB_FE = 4'd13;
+                          X_TLB_LD = 4'd11, X_TLB_ST = 4'd12, X_TLB_FE = 4'd13,
+                          X_STEP = 4'd14, X_WATCH = 4'd15;     // (§13)
    // PRED 5/6/7 compare as EQ/LT/ULT on the 32-bit-shifted operands.  A
    // function of the same 4 bits f_cmp_op already reads (no extra level).
    function automatic logic [2:0] f_fbr_pred(logic [2:0] p);
@@ -486,7 +494,7 @@ module pipeline_core
    // EVEC / ECAUSE / EADDR / SCRATCH0-1 / TP / CYCLE live in mmu_sr (a
    // kept hierarchy, timing); these are its outputs (names kept for tb_vsim)
    logic [31:0] evec, eaddr;
-   logic [8:0]  ecause;          // [8] GUARD (stage 2)
+   logic [12:0] ecause;          // [8] GUARD (stage 2); [12:9] SSTEP / WRITE / WP1 / WP0 (§13)
    // MMU stage 2: mmu_mpu's outputs (see its instance at the end)
    logic        mpu_en;          // STATUS[8]
    // MMU stage 3: mmu_tlb's outputs (see its instance at the end)
@@ -611,6 +619,29 @@ module pipeline_core
    assign dbg_o.sp_alt     = sp_alt;
    assign dbg_o.um         = umode;
    assign dbg_o.dis        = irq_dis;
+   // ------------------------------- MMU_PLAN.md §13: user single step / watch
+   // us_arm: a single step is armed (an IRET to user mode with frame SS = 1
+   // and EVEC != 0); us_lat: its one instruction has been latched into ID
+   // (the next boundary takes STEP: no further latch, no interrupt); us_ret:
+   // ... and has retired (a JTAG debug halt in between: after resume the
+   // instruction is still to be counted unless it retired); us_ent: the
+   // boundary has been taken (irq_active) for STEP.  wp_ent: a watchpoint
+   // hit's boundary (irq_active) — the entry is WATCH; wp_hits / wp_st /
+   // wp_addr: its ECAUSE bits and EADDR.  Every entry disarms all of it.
+   logic        us_arm, us_lat, us_ret, us_ent;
+   logic        wp_ent, wp_st;
+   logic [1:0]  wp_hits;
+   logic [31:0] wp_addr;
+   logic [3:0]  exc_ux_q;         // the entry's ECAUSE[12:9] (0 for every other cause)
+   logic        wb_ussa;          // the WB op is an IRET arming a step
+   // WPn_ADDR / WPn_CTRL (SRs 0x40-0x43): the doubleword VA[31:3] (and it
+   // minus 1, for the 2nd doubleword of a two-access op), BE, R, W, U
+   logic [28:0] wp_k   [0:1];
+   logic [28:0] wp_km1 [0:1];
+   logic [7:0]  wp_be  [0:1];
+   logic [1:0]  wp_r, wp_w, wp_u;
+   logic        ud_go;            // watch hits taken: EVEC != 0, no JTAG debugger attached (registered)
+   logic        ud_evnz;          // EVEC != 0 (registered; EVEC changes only behind a serializing MTSR)
    // TRAP / ILLEGAL / HALT -> debug-halt cause
    function automatic logic [2:0] f_dbg_park_cause(logic [2:0] kind);
       return (kind == 3'd1 || kind == 3'd5 || kind == 3'd6) ? DBG_CAUSE_TRAP
@@ -1446,12 +1477,14 @@ module pipeline_core
                // the SR at WB, serializing.
                if (!op[21] && op[7:4] == 4'h0 &&
                    (op[19:12] <= 8'd8 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
-                    (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)))) begin
+                    (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)) ||
+                    (EN_UDBG && op[19:14] == 6'b0100_00))) begin   // (§13: 0x40-0x43)
                   d.legal = 1'b1; d.wreg = 1'b1;
                   d.uop = (op[19:12] == 8'd0) ? U_GETST : U_MOV64;
                end else if (op[21] && op[11:8] == 4'h0 &&
                             (op[19:12] <= 8'd7 || (EN_MPU && op[19:12] >= 8'h10 && op[19:12] <= 8'h2F) ||
-                             (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)))) begin
+                             (EN_TLB && op[19:12] >= 8'h30 && op[19:12] <= (EN_WALK ? 8'h37 : 8'h34)) ||
+                             (EN_UDBG && op[19:14] == 6'b0100_00))) begin   // (§13: 0x40-0x43)
                   d.legal = 1'b1; d.uop = U_UNARY; d.sub = 4'd0; d.use_rs1 = 1'b1;
                   d.mtsr = 1'b1; d.serialize = 1'b1;
                end
@@ -2944,6 +2977,18 @@ module pipeline_core
    // MMU stage 1: an access-fault op in MEM squashes EX / ID on the edge it
    // leaves MEM (as fbr_taken: only !wb_wait holds it there)
    wire mem_xsq_go   = EN_EXC && mem_valid && mem_xsq && !wb_wait;
+   // MMU_PLAN.md §13.3: the MEM op hit a user watchpoint (its EX compare,
+   // registered): mem_wp2 = only its 2nd doubleword hit (EADDR), mem_wpm =
+   // which watchpoints, mem_wps = a store.  In its first MEM cycle it
+   // squashes everything younger (EX / ID) and takes the boundary behind
+   // it (mem_wfire), as an access fault squashes (mem_xsq_go) — but the op
+   // itself completes.  mem_ysq_go: either squash, for the younger ops'
+   // EX-edge side effects (LCD, RAS push, early issue, PHT training).  (An
+   // op that also faults is an exception op: mem_xsq wins, no WATCH.)
+   logic       mem_wph, mem_wp2, mem_wps;
+   logic [1:0] mem_wpm;
+   wire mem_ysq_go   = EN_EXC && mem_valid && (mem_xsq || (EN_UDBG && mem_wph)) && !wb_wait;
+   wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !mem_xsq && !sq_spec && !wb_wait;
    // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
    // its port request — every younger port user holds off until it issues.
    wire wb_hmiss     = EN_DC_H && wb_valid && wb_h && !wb_hok && !ld_out;
@@ -3161,7 +3206,7 @@ module pipeline_core
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
-                       !ld_out && !fbr_taken && !mem_xsq_go && !(DEBUG_EN && dbg_mx) &&
+                       !ld_out && !fbr_taken && !mem_ysq_go && !(DEBUG_EN && dbg_mx) &&
                        // (stage 2: no early issue with the MPU on — its
                        // decision must not reach the EX->MEM enables)
                        !xlt_q;
@@ -3410,7 +3455,7 @@ module pipeline_core
    // 2b predictor training write (declared after mem_busy / ras_miss / sq_ex)
    wire pht_we_mem   = EN_BP && mem_valid && mem_bp_fbr && !wb_wait;   // as it leaves MEM
    wire pht_we_ex    = EN_BP && ex_valid && ex_bp_cnd && !ex_busy && !mem_busy &&
-                       !fbr_taken && !sq_ex && !mem_xsq_go;   // (no ras_miss term: training only)
+                       !fbr_taken && !sq_ex && !mem_ysq_go;   // (no ras_miss term: training only)
    assign pht_we = pht_we_mem || pht_we_ex;
    assign pht_wa = pht_we_mem ? mem_bp_idx : ex_bp_idx;
    assign pht_wd = pht_we_mem ? f_sat2(mem_bp_ctr, mem_result[0]) : f_sat2(ex_bp_ctr, ex_bcvt_t[0]);
@@ -3837,11 +3882,71 @@ module pipeline_core
    // or an EX squash kills the op, so it must not send.  (Nor the EN_ST1
    // squash: the op is refetched and would send again.)
    assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
-                     !mem_xsq_go && !sq_spec;
+                     !mem_ysq_go && !sq_spec;
    // A load's EX-side watchpoint compares (hit pipe, early issue) fire only
    // for a load that really leaves EX: not one an older op kills this edge,
    // nor one with an access fault (it never reads)
-   wire ex_wp_ok   = !fbr_taken && !ras_miss && !sq_ex && !mem_xsq_go && !sq_spec && !ex_ufault;
+   wire ex_wp_ok   = !fbr_taken && !ras_miss && !sq_ex && !mem_ysq_go && !sq_spec && !ex_ufault;
+
+   // ---------------- MMU_PLAN.md §13.3: the user watchpoints' EX compare ----
+   // Each data access of the EX op against WPn, from the EA's dispatch-time
+   // operands ex_ta / ex_tb (EA = ex_ta + ex_tb) with the carry-free
+   // A + B = K compare (§11.9) — no EA adder in front — and only REGISTERED
+   // (mem_wph): in its first MEM cycle the op squashes everything younger
+   // and the boundary behind it is taken for WATCH (mem_wfire), while the
+   // op itself completes.  Doubleword 0: EA[31:3] = K (DCBZ: EA[31:5] =
+   // K[28:2], the whole line).  Doubleword 1 (a spanning MEMGET32 /
+   // LEAVERET: EA = ex_ta, ex_tb = 0): ex_ta[31:3] = K - 1.
+   function automatic logic f_cf27(logic [26:0] a, logic [26:0] b, logic cin, logic [26:0] k);
+      logic ok;
+      ok = ((a[0] ^ b[0] ^ k[0]) == cin);
+      for (int i = 1; i < 27; i++)
+         ok = ok & ((a[i] ^ b[i] ^ k[i]) == ((a[i-1] & b[i-1]) | ((a[i-1] | b[i-1]) & ~k[i-1])));
+      return ok;
+   endfunction
+   wire [2:0] ex_wea  = ex_tlo3[2:0];                         // EA[2:0]
+   wire ex_wld = ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP || ex_d.uop == U_RET ||
+                 ex_d.uop == U_LEAVE || ex_d.uop == U_LEAVERET || ex_d.uop == U_LR;     // (not IRET)
+   wire ex_wst = ex_d.uop == U_STORE || ex_d.uop == U_PUSH || ex_d.uop == U_ENTER || ex_d.uop == U_SC ||
+                 (ex_d.uop == U_CALL && ex_bcvt_t[0]);
+   wire ex_wzl = EN_DCBZ && ex_d.zl;
+   logic [7:0] ex_wm0, ex_wm1;                                 // bytes touched in doubleword 0 / 1
+   always_comb begin
+      logic [15:0] m32;
+      m32 = 16'h000F << ex_wea;
+      ex_wm0 = 8'hFF;  ex_wm1 = 8'h00;
+      if ((ex_d.uop == U_LOAD || ex_d.uop == U_STORE) && !ex_wzl) begin
+         case (ex_d.msz)
+            2'd0:    ex_wm0 = 8'h01 << ex_wea;
+            2'd1:    ex_wm0 = 8'h03 << {ex_wea[2:1], 1'b0};
+            2'd2:    ex_wm0 = ex_wea[2] ? 8'hF0 : 8'h0F;
+            default: ex_wm0 = 8'hFF;
+         endcase
+      end else if (ex_d.uop == U_LR || ex_d.uop == U_SC) begin
+         ex_wm0 = (ex_d.msz == 2'd2) ? (ex_wea[2] ? 8'hF0 : 8'h0F) : 8'hFF;
+      end else if (ex_d.uop == U_LOAD32) begin
+         ex_wm0 = m32[7:0];  ex_wm1 = m32[15:8];
+      end else if (ex_d.uop == U_LEAVERET) begin
+         ex_wm1 = 8'hFF;
+      end
+   end
+   wire ex_wgate = EN_UDBG && ex_valid && ud_go && !ex_misal && (ex_wld || ex_wst);
+   logic [1:0] ex_wh0, ex_wh;                                  // per WP: dw 0 hit / any hit
+   always_comb begin
+      for (int n = 0; n < 2; n++) begin
+         logic hi, lo, d1, kind, mode;
+         hi   = f_cf27(ex_ta[31:5], ex_tb[31:5], ex_tlo5[5], wp_k[n][28:2]);
+         lo   = f_sum_eq({14'b0, ex_ta[4:3]}, {14'b0, ex_tb[4:3]}, ex_tlo3[3], {14'b0, wp_k[n][1:0]}, 2);
+         d1   = ex_ta[31:3] == wp_km1[n];
+         kind = (ex_wld && wp_r[n]) || (ex_wst && wp_w[n]);
+         mode = umode || (!wp_u[n] && !ex_dis_eff);
+         ex_wh0[n] = ex_wgate && kind && mode && hi && (ex_wzl || lo) && ((ex_wm0 & wp_be[n]) != 8'h00);
+         ex_wh[n]  = ex_wh0[n] ||
+                     (ex_wgate && kind && mode && d1 && ((ex_wm1 & wp_be[n]) != 8'h00));
+      end
+   end
+   // (a failing SC stores nothing: no write hit)
+   wire ex_whit = (ex_wh != 2'b00) && !(ex_d.uop == U_SC && !ex_sc_ok);
 
    // M12 pos-tracker plumbing: event flags are BLOCKING-assigned inside the
    // clocked block (pure combinational locals to synthesis — never FFs);
@@ -3923,6 +4028,8 @@ module pipeline_core
          dbg_stepping <= 1'b0; dbg_step_done <= 1'b0; dbg_skip <= 1'b0; id_bp <= 1'b0;
          dbg_watch_req <= 1'b0; dbg_watch_addr <= '0;
          dbg_mx <= 1'b0; dbg_mem_done <= 1'b0; dbg_mem_rdata <= '0;
+         us_arm <= 1'b0; us_lat <= 1'b0; us_ret <= 1'b0; us_ent <= 1'b0; wp_ent <= 1'b0;
+         wb_ussa <= 1'b0; mem_wph <= 1'b0; exc_ux_q <= '0;
          id_use_rs1 <= 1'b0; id_use_rs2 <= 1'b0; id_use_rdd <= 1'b0;
          id_fread <= 1'b0; id_sp_rw <= 1'b0;
          id_b_one <= 1'b0; id_b_imm <= 1'b0; id_b_sext <= 1'b0; id_w <= 1'b0; id_ser <= 1'b0;
@@ -3952,6 +4059,8 @@ module pipeline_core
          // vector (MMU_PLAN.md §3.1); a debugger resume keeps them
          if (EN_EXC && start) begin
             umode <= 1'b0;                 // (EVEC / ECAUSE / EADDR: mmu_sr)
+            // (§13: nothing armed; WPn: their own block)
+            us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0;  us_ent <= 1'b0;  wp_ent <= 1'b0;
             res_valid <= 1'b0; exc_ent <= 1'b0;
             wk <= 1'b0;  wk_fin <= 1'b0;   // (§11.8: unreachable on core 1, as exc_ent)
          end
@@ -3973,6 +4082,10 @@ module pipeline_core
                dbg_watch_req <= 1'b0;
                dbg_active    <= 1'b0;
             end
+            // §13.2: a debugger resume with a user step armed — its
+            // instruction counts again unless it retired before the halt
+            // (a halt taken after it: STEP at the first boundary)
+            if (EN_UDBG && !start) us_lat <= us_ret;
          end
 
          irq_ack <= 1'b0;
@@ -4038,6 +4151,9 @@ module pipeline_core
                irq_active  <= 1'b0;
                exc_ent     <= 1'b0;
                wk          <= 1'b0;
+               // (§13.2: not an entry — a step stays armed, and the
+               // re-executed instruction is the stepped one)
+               if (EN_UDBG) us_lat <= 1'b0;
             end else if (!irq_xc) begin
                // wait for full drain + a free port, then push the frame
                if (!id_valid && !ex_valid && !mem_valid && !wb_valid
@@ -4050,7 +4166,9 @@ module pipeline_core
                   // All older stores have retired here (pipeline empty,
                   // mem_xc==0), so irq_ready is now final for this boundary.
                   // (MMU stage 1: an exception entry, exc_ent, never abandons)
-                  if (!(EN_EXC && exc_ent) && (!irq_ready || (EN_DIEI && irq_dis))) begin
+                  // (§13: nor a STEP / WATCH boundary)
+                  if (!(EN_EXC && exc_ent) && !(EN_UDBG && (us_ent || wp_ent)) &&
+                      (!irq_ready || (EN_DIEI && irq_dis))) begin
                      // (7a: a DI that committed during the drain also abandons)
                      irq_active <= 1'b0;   // abandon: fetch resumes at pc
                   end else if (EN_WALK && wk) begin
@@ -4067,6 +4185,7 @@ module pipeline_core
                            irq_active <= 1'b0;
                            exc_ent    <= 1'b0;
                            parked     <= 1'b1;
+                           if (EN_UDBG) begin us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0; end
                            park_kind  <= 3'd2;
                            if (DEBUG_EN && dbg_i.attached) begin
                               park_kind <= 3'd4;  running <= 1'b0;  dbg_cause <= f_dbg_park_cause(3'd2);
@@ -4091,6 +4210,9 @@ module pipeline_core
                      fetch_halt <= 1'b1;   // (review 3: an IRQ entry's must not re-take / dispatch)
                      park_kind  <= 3'd6;
                      park_pc    <= exc_ent ? exc_epc_q : pc;
+                     if (EN_UDBG) begin
+                        us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0;  us_ent <= 1'b0;  wp_ent <= 1'b0;
+                     end
                      park_op    <= 32'b0;
                      if (DEBUG_EN && dbg_i.attached) begin
                         park_kind <= 3'd4;  running <= 1'b0;  dbg_cause <= DBG_CAUSE_TRAP;
@@ -4107,7 +4229,8 @@ module pipeline_core
                      // (stage 3: with TE = 1 the push is not translated: PA =
                      // SP - 8 - 0x8000_0000, SP - 8 in kseg — checked above)
                      m_addr     <= (EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va; m_io <= f_io((EN_TLB && te) ? {5'b0, push_va[26:0]} : push_va);
-                     m_wdata    <= {19'b0, EN_EXC && umode, EN_DIEI && irq_dis, int_mask,
+                     // (§13: frame bit 45 SS = the armed single step)
+                     m_wdata    <= {18'b0, EN_UDBG && us_arm, EN_EXC && umode, EN_DIEI && irq_dis, int_mask,
                                     flags.zero, flags.zero, flags.carry,
                                     flags.overflow, flags.sign,
                                     (flags.sign ^ flags.overflow), flags.carry,
@@ -4117,6 +4240,21 @@ module pipeline_core
                      m_vav      <= 1'b0;
                      rdy_armed  <= !m_ready;
                      irq_xc     <= 1'b1;
+                     // MMU_PLAN.md §13: a STEP / WATCH boundary becomes an
+                     // exception entry here (the frame above has the PC of
+                     // the next instruction: pc, exc_ent still 0); WATCH
+                     // wins, with SSTEP when the step also completed.  The
+                     // stepped instruction's PC is id_pc: nothing has been
+                     // latched since it.
+                     if (EN_UDBG && (us_ent || wp_ent)) begin
+                        exc_ent     <= 1'b1;
+                        exc_cause_q <= wp_ent ? X_WATCH : X_STEP;
+                        exc_addr_q  <= wp_ent ? wp_addr : id_pc;
+                        exc_vec_q   <= evec;
+                        exc_guard_q <= 1'b0;
+                        exc_tlb_q   <= 1'b0;
+                        exc_ux_q    <= {us_ent, wp_ent && wp_st, wp_ent ? wp_hits : 2'b00};
+                     end
                   end
                end
             end else if (EN_WALK && wk && w_mrdy) begin
@@ -4146,6 +4284,10 @@ module pipeline_core
                end else
                   sp     <= sp - 32'd8;
                if (EN_EXC) res_valid <= 1'b0;
+               // MMU_PLAN.md §13.2: every entry disarms (the frame has SS)
+               if (EN_UDBG) begin
+                  us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0;  us_ent <= 1'b0;  wp_ent <= 1'b0;
+               end
                ev_pcz              = 1'b1;
                if (EN_EXC && exc_ent) begin
                   // exception: interrupts off (the old DI is in the frame)
@@ -4206,6 +4348,10 @@ module pipeline_core
                umode     <= wb_um_new;
                if (wb_um_new) sp_alt <= wb_spalt_new;
                res_valid <= 1'b0;
+               // §13.2: an IRET to user mode with SS = 1 (and EVEC != 0)
+               // arms a single step (an instruction latched on this very
+               // edge counts: the dispatch below reads wb_ussa too)
+               if (EN_UDBG) begin us_arm <= wb_ussa;  us_lat <= 1'b0;  us_ret <= 1'b0; end
             end
             if (wb_park && (wb_exc_go || (EN_WALK && wb_wk))) begin
                // MMU stage 1: the exception op commits nothing and retires
@@ -4226,6 +4372,7 @@ module pipeline_core
                   if (!wb_exc_go) begin park_pc <= wb_pc;  park_op <= wb_op; end
                end
                exc_cause_q <= wb_xcause;
+               exc_ux_q    <= '0;
                // (an older MTSR to EVEC / TLBVEC has committed: both are final)
                exc_vec_q   <= (EN_TLB && wb_xcause >= X_TLB_LD && wb_xcause <= X_TLB_FE &&
                                tlb_vec != 32'b0) ? tlb_vec : evec;
@@ -4248,6 +4395,7 @@ module pipeline_core
                end
             end else begin
                ret_valid <= 1'b1; ret_pc <= wb_pc; ret_op <= wb_op;
+               if (EN_UDBG && us_lat) us_ret <= 1'b1;   // (§13.2: the stepped instruction retired)
                // MMU stage 1: MTSR writes its SR, then fetch restarts behind it
                if ((EN_EXC || EN_DIEI) && wb_rfch) begin
                   // (USP here; every other SR is written by mmu_sr / mmu_mpu /
@@ -4331,7 +4479,7 @@ module pipeline_core
 
          lcd_rst_wr <= 1'b0;
          if (ex_valid && ex_d.uop == U_LCDRST && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
-             !mem_xsq_go && !sq_spec) begin
+             !mem_ysq_go && !sq_spec) begin
             lcd_rst_n  <= ex_var1[0];
             lcd_rst_wr <= 1'b1;
          end
@@ -4964,6 +5112,9 @@ module pipeline_core
             // forwarding to a younger op carries the right value.
             wb_um_we   <= EN_EXC && mem_valid && mem_d.uop == U_IRET && !mem_xsq;
             wb_um_new  <= m_rdata[44];
+            // MMU_PLAN.md §13.2: frame SS (bit 45) with PM = 1 arms a step
+            wb_ussa    <= EN_UDBG && mem_valid && mem_d.uop == U_IRET && !mem_xsq && m_rdata[45] &&
+                          m_rdata[44] && ud_evnz;
             wb_spalt_new <= mem_sp_new;
             if (EN_EXC && mem_valid && mem_d.uop == U_IRET && m_rdata[44])
                wb_sp_new <= sp_alt;
@@ -5103,7 +5254,7 @@ module pipeline_core
                // mispredicted RET redirects costs only a later RAS miss, and the
                // m_rdata compare would sit on the RAS write enable)
                if (EN_RAS && ex_valid && ex_d.uop == U_CALL && exo_taken &&
-                   !fbr_taken && !sq_ex && !sq_spec && !mem_xsq_go) begin
+                   !fbr_taken && !sq_ex && !sq_spec && !mem_ysq_go) begin
                   ras[ras_ptr] <= ex_pc_next;
                   ras_ptr      <= ras_ptr + 1'b1;
                   if (ras_cnt != (RAS_PW+1)'(RAS_DEPTH)) ras_cnt <= ras_cnt + 1'b1;
@@ -5138,6 +5289,11 @@ module pipeline_core
                // is; MEM gates its port access, WB its commit, and in its
                // first MEM cycle it squashes EX / ID (mem_xsq_go).
                mem_xsa    <= ex_fa;                // (= ex_ufault, as two registers)
+               // MMU_PLAN.md §13.3: a user watchpoint hit (registered only)
+               mem_wph    <= ex_whit;
+               mem_wpm    <= ex_wh;
+               mem_wps    <= ex_wst;
+               mem_wp2    <= ex_wh0 == 2'b00;
                mem_xsp    <= ex_fb && !(tlb_d_c15 ? tlb_d_pok1 : tlb_d_pok0);
                mem_xs_st  <= ex_mst;               // direction (cause)
                mem_xs_g   <= ex_xg;                // GUARD denial (stage 2, ECAUSE[8])
@@ -5269,6 +5425,14 @@ module pipeline_core
                      dbg_cause_q <= dbg_watch_req ? DBG_CAUSE_WATCH
                                   : dbg_step_done ? DBG_CAUSE_STEP : DBG_CAUSE_REQ;
                      id_valid    <= 1'b0;
+                  end else if (EN_UDBG && us_lat && running && !fetch_halt && !irq_active
+                               && !(DEBUG_EN && dbg_active)) begin
+                     // MMU_PLAN.md §13.2: the stepped instruction has been
+                     // latched (and dispatches now, or did): take the STEP
+                     // boundary — no further latch, no interrupt first
+                     irq_active <= 1'b1;
+                     us_ent     <= 1'b1;
+                     id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
                                && !(DEBUG_EN && dbg_active) && irq_take) begin
                      // take the IRQ at this boundary instead of fetching; the
@@ -5280,6 +5444,9 @@ module pipeline_core
                   end else if (running && !fetch_halt && !irq_active
                                && !(DEBUG_EN && dbg_active) && fetch_ok) begin
                      id_valid <= 1'b1;
+                     // §13.2: with a step armed (or being armed by the IRET
+                     // committing on this edge) this is the stepped one
+                     if (EN_UDBG && (us_arm || (wb_valid && wb_ussa))) us_lat <= 1'b1;
                      if (DEBUG_EN) begin
                         id_bp         <= dbg_bp_hit;
                         dbg_skip      <= 1'b0;
@@ -5374,6 +5541,7 @@ module pipeline_core
                   ex_valid     <= 1'b0;
                   fetch_halt   <= 1'b1;
                   irq_active   <= 1'b0;
+                  if (EN_UDBG) us_ent <= 1'b0;   // (§13: a stepped op's fault comes instead)
                   if (DEBUG_EN) dbg_active <= 1'b0;
                end
             end
@@ -5400,6 +5568,38 @@ module pipeline_core
             div_ph     <= MD_IDLE;
             fetch_halt <= 1'b1;
             irq_active <= 1'b0;
+            if (EN_UDBG) us_ent <= 1'b0;   // (§13: a stepped op's fault comes instead)
+         end
+         // MMU_PLAN.md §13.3: a watchpoint hit in MEM.  The op completes;
+         // everything younger (EX / ID, and the EX op if it would enter MEM
+         // on this edge) is squashed, fetch is pointed at the op's
+         // successor and the boundary behind it is taken for WATCH (an IRQ
+         // or debug boundary already taken becomes it; a STEP boundary
+         // already taken stays, as SSTEP).  The successor: mem_succ (a
+         // CALL's target), a predicted return's target (a mispredicted one:
+         // the ras_miss redirect below wins); an unpredicted RET / LEAVERET
+         // redirects itself as it leaves MEM (fetch is halted behind it).
+         // Older than the fbr / ras block below (a mispredicted return's
+         // ras_miss redirect wins); an EN_ST1 squash (sq_spec) kills the op
+         // instead (mem_wfire excludes it).
+         if (mem_wfire) begin
+            if (DEBUG_EN) begin dbg_active <= 1'b0;  id_bp <= 1'b0; end
+            ev_ovr     = 1'b1;
+            if (!mem_busy) mem_valid <= 1'b0;   // (the EX op entering MEM)
+            ex_valid   <= 1'b0;
+            id_valid   <= 1'b0;
+            dly_on     <= 1'b0;
+            div_ph     <= MD_IDLE;
+            if (!(mem_retq || mem_lvrq) || mem_pred) begin
+               ev_pcz  = 1'b1;
+               pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_succ;
+            end
+            irq_active <= 1'b1;
+            wp_ent     <= 1'b1;
+            wp_hits    <= mem_wpm;
+            wp_st      <= mem_wps;
+            wp_addr    <= mem_wp2 ? {mem_ea_raw[31:3] + 29'd1, 3'b000} : mem_ea_raw;
+            mem_wph    <= 1'b0;          // (once: the op may stay in MEM)
          end
          if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
@@ -5536,6 +5736,7 @@ module pipeline_core
          if (smc_hit_lat && ev_disp && !sq_any) begin
             ev_ovr   = 1'b1;
             if (DEBUG_EN) id_bp <= 1'b0;
+            if (EN_UDBG) us_lat <= 1'b0;   // (§13.2: the dropped op was the stepped one, if any)
             id_valid <= 1'b0;
             ifb_val_n  = 2'b00;
             ev_pcz   = 1'b1;
@@ -5801,10 +6002,41 @@ module pipeline_core
          if (start) mal64 <= 1'b0;
       end
    assign sr_ent_we = EN_EXC && irq_active && irq_xc && w_mrdy && exc_ent && !(EN_WALK && wk);
+   // MMU_PLAN.md §13.3: WP0_ADDR / WP0_CTRL / WP1_ADDR / WP1_CTRL (SRs
+   // 0x40-0x43), written by an MTSR as it commits (serializing: no memory
+   // op is in EX before the refetch), 0 after reset and at program load.
+   // ud_go / ud_evnz: registered from EVEC (and the debugger's attach),
+   // which change only behind a serializing MTSR / while halted.
+   always_ff @(posedge clk)
+      if (rst) begin
+         for (int n = 0; n < 2; n++) begin wp_k[n] <= '0; wp_km1[n] <= '1; wp_be[n] <= '0; end
+         wp_r <= '0;  wp_w <= '0;  wp_u <= '0;  ud_go <= 1'b0;  ud_evnz <= 1'b0;
+      end else if (ce) begin
+         ud_evnz <= EN_UDBG && evec != 32'b0;
+         ud_go   <= EN_UDBG && evec != 32'b0 && !(DEBUG_EN && dbg_i.attached);
+         if (EN_UDBG && mtsr_commit && wb_op[19:14] == 6'b0100_00) begin
+            if (!wb_op[12]) begin
+               wp_k[wb_op[13]]   <= wb_value[31:3];
+               wp_km1[wb_op[13]] <= wb_value[31:3] - 29'd1;
+            end else begin
+               wp_be[wb_op[13]] <= wb_value[7:0];
+               wp_r[wb_op[13]]  <= wb_value[8];
+               wp_w[wb_op[13]]  <= wb_value[9];
+               wp_u[wb_op[13]]  <= wb_value[10];
+            end
+         end
+         if (start) begin
+            for (int n = 0; n < 2; n++) begin wp_k[n] <= '0; wp_km1[n] <= '1; wp_be[n] <= '0; end
+            wp_r <= '0;  wp_w <= '0;  wp_u <= '0;
+         end
+      end
+   wire [63:0] wp_rdata = id_op[12] ? {53'b0, wp_u[id_op[13]], wp_w[id_op[13]], wp_r[id_op[13]], wp_be[id_op[13]]}
+                                    : {32'b0, wp_k[id_op[13]], 3'b000};
    logic [63:0] sr_rdata;
    // MFSR: SRs 0x10-0x2F are the MPU's (an SR number's low nibble alone
    // would alias 0-8)
-   assign id_srv = (EN_TLB && id_op[19:16] == 4'h3) ? tlb_rdata
+   assign id_srv = (EN_UDBG && id_op[19:16] == 4'h4) ? wp_rdata
+                 : (EN_TLB && id_op[19:16] == 4'h3) ? tlb_rdata
                  : (EN_MPU && id_op[19:16] != 4'h0) ? {32'b0, mpu_rdata} : sr_rdata;
    generate if (EN_EXC) begin : g_sr
       (* keep_hierarchy = "yes" *)
@@ -5815,7 +6047,7 @@ module pipeline_core
          .mtsr_idx   (wb_op[15:12]),
          .mtsr_wdata (wb_value),
          .ent_we     (sr_ent_we),
-         .ent_cause  ({exc_guard_q, 4'b0, exc_cause_q}),
+         .ent_cause  ({exc_ux_q, exc_guard_q, 4'b0, exc_cause_q}),
          .ent_addr   (exc_addr_q),
          .ridx       (id_op[15:12]),
          .sp_alt,
@@ -6143,6 +6375,37 @@ module pipeline_core
          assert (id_ser == (dec.serialize || id_eiser))
             else $fatal(1, "id serialize predecode drift: op=%h", id_op);
    end
+   // MMU_PLAN.md §13: the user single step and watchpoints.  us_nret counts
+   // the instructions retired since the step was armed: at most one, and
+   // exactly one when STEP (or WATCH with SSTEP) is taken; the STEP EADDR
+   // (id_pc) is that instruction's PC; an armed step is only ever seen in
+   // user mode (never inside a handler or an ISR); the boundaries are
+   // taken (irq_active) whenever pending; a watch squash never meets an
+   // SMC squash.
+   int          us_nret = 0;
+   logic [31:0] us_last_pc = '0;
+   always_ff @(posedge clk) if (rst) begin
+      us_nret <= 0;
+   end else if (EN_UDBG) begin
+      if (wb_valid && !wb_wait && !wb_park && us_arm) begin
+         assert (us_nret == 0) else $fatal(1, "ustep: a 2nd instruction retired under one arm: pc=%h", wb_pc);
+         us_nret <= us_nret + 1;  us_last_pc <= wb_pc;
+      end
+      if (EN_EXC && wb_valid && wb_um_we && !wb_wait) us_nret <= 0;
+      if (irq_active && !irq_xc && us_ent && !id_valid && !ex_valid && !mem_valid && !wb_valid &&
+          mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !ld_out && !wk) begin
+         assert (us_nret == 1 && id_pc == us_last_pc && us_lat && us_arm)
+            else $fatal(1, "ustep: STEP after %0d instructions (id_pc %h, last %h)", us_nret, id_pc, us_last_pc);
+      end
+      assert (!us_arm || umode) else $fatal(1, "ustep: armed in supervisor mode: pc=%h", pc);
+      assert (!us_lat || us_arm) else $fatal(1, "ustep: us_lat without us_arm");
+      assert (!us_ent || (irq_active && us_lat)) else $fatal(1, "ustep: STEP boundary without irq_active / us_lat");
+      assert (!wp_ent || irq_active) else $fatal(1, "uwatch: WATCH boundary without irq_active");
+      assert (!(mem_wfire && (sq_any || smc_hit_lat))) else $fatal(1, "uwatch: watch squash meets an SMC squash: pc=%h", mem_pc);
+      if (wb_valid && !wb_wait && wb_park && wb_xc)
+         assert (!us_ent && !wp_ent) else $fatal(1, "ustep: an exception op with a STEP / WATCH boundary pending");
+      if (mem_wfire) assert (!irq_xc && !exc_ent) else $fatal(1, "uwatch: fire during an entry");
+   end
    // MMU_PLAN §11.8 walker: it runs only inside an exception entry with the
    // pipe drained and fetch halted, and owns the port while a read is out;
    // its EVEC = 0 fallback parks as kind 2, which every TLB miss parks as
@@ -6186,13 +6449,13 @@ module mmu_sr (
    input  logic [3:0]  mtsr_idx,
    input  logic [63:0] mtsr_wdata,
    input  logic        ent_we,       // an exception entry completes
-   input  logic [8:0]  ent_cause,    // {GUARD, 4'b0, cause}
+   input  logic [12:0] ent_cause,    // {SSTEP, WRITE, WP1, WP0, GUARD, 4'b0, cause} (§13)
    input  logic [31:0] ent_addr,
    input  logic [3:0]  ridx,         // MFSR SR number (low 4 bits; 0-8 decode)
    input  logic [31:0] sp_alt,
    output logic [63:0] rdata,
    output logic [31:0] evec,
-   output logic [8:0]  ecause,
+   output logic [12:0] ecause,
    output logic [31:0] eaddr
 );
    // SR -> RAM slot: EADDR (3) 0, SCRATCH0 (5) 1, SCRATCH1 (6) 2, TP (7) 3
@@ -6222,7 +6485,7 @@ module mmu_sr (
          if (rwe) sv[wa] <= 1'b1;
          if (mtsr_we) case (mtsr_idx)
             4'd1: evec   <= {mtsr_wdata[31:2], 2'b00};
-            4'd2: ecause <= mtsr_wdata[8:0];
+            4'd2: ecause <= mtsr_wdata[12:0];
             default: ;                    // STATUS: no writable bits; USP: core
          endcase
          if (ent_we) ecause <= ent_cause;
@@ -6236,7 +6499,7 @@ module mmu_sr (
    always_comb begin
       case (ridx)
          4'd1:    rdata = {32'b0, evec};
-         4'd2:    rdata = {55'b0, ecause};
+         4'd2:    rdata = {51'b0, ecause};
          4'd4:    rdata = {32'b0, sp_alt};
          4'd8:    rdata = cycle;
          default: rdata = rs[2] ? rram : 64'b0;   // EADDR / SCRATCH0-1 / TP

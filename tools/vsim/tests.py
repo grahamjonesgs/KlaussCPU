@@ -7008,3 +7008,657 @@ def fwd_wl_prio():
         out.append((a, {'end': 'park', 'kind': '0', m(DATA + 8): 0x47, 'r5': 0x89, 'r7': 0x8B,
                         'r9': 0x47}, plus))
     return out
+
+
+# ================================ MMU_PLAN.md §13: user single step / watch
+# _udhandler logs every exception entry at UDLOG + 32 i: ECAUSE, EADDR, the
+# frame PC (frame[31:0]) and frame >> 44 ({SS, PM}); XD + 32 counts them.
+# A user HALT (PRIVILEGED, EADDR = the HALT word) halts (logged); STEP /
+# WATCH / SYSCALL return; other faults are stepped over (+4).  With
+# cfg=True a SYSCALL instead loads WP0 / WP1 from r5-r8 (ADDR, CTRL, ADDR,
+# CTRL) and returns, unlogged — so user code configures its watchpoints.
+X_STEP, X_WATCH = 14, 15
+SSTEP = 1 << 12
+UDLOG = XD + 0x40
+from kasm import WP_R, WP_W, WP_U
+
+
+def _udhandler(a, name='h', cfg=False, skip=True):
+    a.label(name)
+    a.push(13); a.push(14)
+    a.mfsr(13, 'ecause'); a.alui('and', 13, 13, 0xFF, sgn=False)
+    if cfg:
+        a.fbr('ne', 13, X_SYSCALL, name + '_l', imm=True)
+        a.mtsr('wp0_addr', 5); a.mtsr('wp0_ctrl', 6); a.mtsr('wp1_addr', 7); a.mtsr('wp1_ctrl', 8)
+        a.jmp(name + '_r')
+        a.label(name + '_l')
+    a.setr(14, XD); a.ld(64, 13, 14, 32); a.inc(13); a.st(64, 13, 14, 32)
+    a.shift_n('shl', 13, 13, 5); a.alu('add', 14, 14, 13); a.addi_s(14, 14, 0x40 - 32)
+    a.mfsr(13, 'ecause'); a.st(64, 13, 14, 0)
+    a.mfsr(13, 'eaddr');  a.st(64, 13, 14, 8)
+    a.getsp(13); a.ld(64, 13, 13, 16); a.shift_n('shl', 13, 13, 32); a.shift_n('shr', 13, 13, 32)
+    a.st(64, 13, 14, 16)
+    a.getsp(13); a.ld(64, 13, 13, 16); a.shift_n('shr', 13, 13, 44); a.st(64, 13, 14, 24)
+    a.mfsr(13, 'ecause'); a.alui('and', 13, 13, 0xFF, sgn=False)
+    a.addi_s(14, 13, -X_STEP)
+    a.fbr('ule', 14, 1, name + '_r', imm=True)
+    a.fbr('eq', 13, X_SYSCALL, name + '_r', imm=True)
+    a.fbr('ne', 13, X_PRIV, name + '_s', imm=True)
+    a.mfsr(13, 'eaddr'); a.setr(14, HALT_W)
+    a.fbr('ne', 13, 14, name + '_s')
+    a.halt()
+    a.label(name + '_s')
+    if skip:
+        a.getsp(13); a.ld(64, 14, 13, 16); a.addi_s(14, 14, 4); a.st(64, 14, 13, 16)
+    a.label(name + '_r')
+    a.pop(14); a.pop(13)
+    a.iret()
+
+
+def _ud_user(a, ucode='u', ss=1, mask=0, pm=1, usp=USP):
+    """IRET into ucode with frame PM / SS"""
+    a.setr(1, usp); a.mtsr('usp', 1)
+    a.leapc(2, ucode)
+    a.setr64(3, (pm << 44) | (ss << 45) | (mask << 39)); a.alu('or', 2, 2, 3)
+    a.push(2)
+    a.iret()
+
+
+def _udexp(entries, count=None):
+    """entries: (ecause, eaddr, frame pc, frame >> 44)"""
+    e = {m(XD + 32): len(entries) if count is None else count}
+    for i, (c, ea, fp, hi) in enumerate(entries):
+        o = UDLOG + 32 * i
+        e.update({m(o): c, m(o + 8): ea, m(o + 16): fp, m(o + 24): hi})
+    return e
+
+
+def _udprog(body, ss=1, cfg=False, mask=0, plus=(), exp=None, entries=None, wps=None, pre=None):
+    """supervisor prologue (EVEC, optional WPs = [(addr, ctrl)] x <= 2),
+    then body in user mode (IRET with SS = ss) ending in HALT"""
+    a = Asm()
+    _xsetup(a)
+    for n, (addr, ctrl) in enumerate(wps or []):
+        a.setr(1, addr); a.mtsr(f'wp{n}_addr', 1)
+        a.setr(1, ctrl); a.mtsr(f'wp{n}_ctrl', 1)
+    if pre:
+        pre(a)
+    _ud_user(a, ss=ss, mask=mask)
+    a.label('u')
+    info = body(a) or {}
+    hp = a.halt()
+    _udhandler(a, cfg=cfg)
+    e = {'end': 'park', 'kind': '0'}
+    if entries is not None:
+        ents = entries(a, info, hp) if callable(entries) else entries
+        e.update(_udexp(ents))
+    e.update(exp or {})
+    return a, e, list(plus)
+
+
+@test
+def ud_step_basic():
+    """§13.2: a stepped user routine — straight code, a taken FBR, CALL /
+    RET, a SYSCALL (entry with SS = 1, frame = next), a faulting load
+    (ACCESS_LOAD with SS = 1, stepped over by the handler), a JMP; one STEP
+    per retired instruction, EADDR = its PC, frame = the next PC"""
+    out = []
+    for plus in ([], ['+LAT=1'], ['+LAT=7'], ['+HIT=70']):
+        P = {}
+
+        def body(a):
+            P['s1'] = a.setr(1, 5)
+            P['add'] = a.alu('add', 2, 1, 1)
+            P['fbr'] = a.fbr('eq', 1, 5, 'T', imm=True)
+            P['skp'] = a.nop()
+            a.label('T')
+            P['call'] = a.call('F')
+            P['sys'] = a.syscall()
+            P['s3'] = a.setr(3, 0xF0000000)
+            P['ld'] = a.ld(64, 4, 3)
+            P['jmp'] = a.jmp('E')
+            a.nop()
+            a.label('F')
+            P['inc'] = a.inc(1)
+            P['ret'] = a.ret()
+            a.label('E')
+            return P
+
+        def ents(a, P, hp):
+            s = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+            return [s(P['s1'], P['add']), s(P['add'], P['fbr']), s(P['fbr'], a.labels['T']),
+                    s(P['call'], P['inc']), s(P['inc'], P['ret']), s(P['ret'], P['sys']),
+                    (X_SYSCALL, 0, P['s3'], 3), s(P['s3'], P['ld']),
+                    (X_ACC_LD, 0xF0000000, P['ld'], 3), s(P['jmp'], hp), (X_PRIV, HALT_W, hp, 3)]
+        out.append(_udprog(body, entries=ents, plus=plus, exp={'r1': 6, 'r2': 10, 'r4': 0, 'sp': 0x08000000 - 24}))
+    return out
+
+
+@test
+def ud_step_arm_rules():
+    """§13.2: SS arms only on an IRET to user mode with EVEC != 0: an IRET
+    to supervisor with SS = 1 steps nothing; EVEC = 0 at the IRET steps
+    nothing (the user HALT then parks as ILLEGAL, kind 2); SS = 0 steps
+    nothing"""
+    out = []
+    # supervisor target
+    a = Asm()
+    _xsetup(a)
+    a.leapc(2, 's'); a.setr64(3, 1 << 45); a.alu('or', 2, 2, 3); a.push(2); a.iret()
+    a.label('s')
+    a.setr(1, 1); a.inc(1); a.inc(1)
+    a.syscall()
+    a.inc(1)
+    a.halt()
+    _udhandler(a)
+    e = {'end': 'park', 'kind': '0', 'r1': 4}
+    e.update(_udexp([(X_SYSCALL, 0, a.labels['s'] + 20, 0)]))
+    out.append((a, e, []))
+    # EVEC = 0
+    a = Asm()
+    _ud_user(a, ss=1)
+    a.label('u')
+    a.setr(1, 1); a.inc(1)
+    hp = a.halt()
+    out.append((a, {'end': 'park', 'kind': '2', 'pc': hp, 'r1': 2, m(XD + 32): 0}, []))
+    # SS = 0
+    out.append(_udprog(lambda a: (a.setr(1, 1), a.inc(1), a.inc(1)) and None, ss=0,
+                       entries=lambda a, P, hp: [(X_PRIV, HALT_W, hp, 1)], exp={'r1': 3}))
+    return out
+
+
+@test
+def ud_step_irq():
+    """§13.2: stepping a user loop under timer IRQs: exactly one STEP per
+    user instruction (the loop's dynamic count), never one in the ISR
+    (the core asserts that too), and the program's result intact.  An
+    interrupt pending at the arming IRET is taken first (frame SS = 1)."""
+    out = []
+    for per in (61, 79, 97, 131):   # (the TB's ISR takes ~57 cycles: shorter periods livelock, stepped or not)
+        a = Asm()
+        _xsetup(a)
+        _ud_user(a, ss=1, mask=1)
+        a.label('u')
+        a.setr(1, 0); a.setr(2, 40)
+        a.label('l'); a.alu('add', 1, 1, 2); a.push(1); a.pop(3); a.dec(2)
+        a.fbr('ne', 2, 0, 'l', imm=True)
+        a.halt()
+        # a counting handler: STEP count at XD, EADDR outside the user code at XD+8
+        a.label('h')
+        a.push(13); a.push(14)
+        a.mfsr(13, 'ecause'); a.alui('and', 13, 13, 0xFF, sgn=False)
+        a.addi_s(13, 13, -X_STEP); a.fbr('ne', 13, 0, 'h_n', imm=True)
+        a.setr(14, XD); a.ld(64, 13, 14); a.inc(13); a.st(64, 13, 14)
+        a.mfsr(13, 'eaddr'); a.setr(14, a.labels['u']); a.alu('sub', 13, 13, 14)
+        a.setr(14, a.pc - a.labels['u']); a.fbr('ult', 13, 14, 'h_r')
+        a.setr(14, XD); a.ld(64, 13, 14, 8); a.inc(13); a.st(64, 13, 14, 8)
+        a.jmp('h_r')
+        a.label('h_n')
+        a.halt()                                    # the user HALT (PRIVILEGED)
+        a.label('h_r')
+        a.pop(14); a.pop(13)
+        a.iret()
+        out.append((a, {'end': 'park', 'kind': '0', 'r1': 820, m(XD): 2 + 5 * 40, m(XD + 8): 0,
+                        'm00180000': 'nonzero'}, [f'+IRQ_PERIOD={per}']))
+    return out
+
+
+@test
+def ud_step_lrsc():
+    """§13.2: a stepped SC always fails (every entry and IRET clear the
+    reservation); unstepped, the same LR / SC succeeds"""
+    out = []
+    for ss in (0, 1):
+        def body(a):
+            a.setr(9, DATA); a.setr(8, 0x55)
+            a.lr(64, 4, 9); a.sc(64, 5, 8, 9)
+        out.append(_udprog(body, ss=ss, exp={'r5': ss, m(DATA): 0 if ss else 0x55}))
+    return out
+
+
+@test
+def ud_step_flow():
+    """§13.2: the frame PC is the architectural successor whatever the
+    predictor did: a JMPcc not taken and taken (mispredicted), a CALL whose
+    return address the callee overwrites (RET: a RAS miss), an indirect
+    CALLR into ENTER / LEAVERET, a serializing MTSR TP, and a store that
+    rewrites the next instruction (SMC: the new one runs)"""
+    out = []
+    for plus in ([], ['+LAT=1'], ['+HIT=70'], ['+LAT=5']):
+        P = {}
+        seq = []
+
+        def body(a):
+            E = lambda k, f: (P.__setitem__(k, f()), seq.append(k))
+            E('s1', lambda: a.setr(1, 0))
+            E('cmp', lambda: a.cmpi_s(1, 0))
+            E('jnt', lambda: a.jmp('A', cond='ne'))
+            E('n1', lambda: a.nop())
+            E('cmp2', lambda: a.cmpi_s(1, 1))
+            E('jt', lambda: a.jmp('B', cond='ne'))
+            a.nop()
+            a.label('B')
+            E('call', lambda: a.call('G'))
+            a.nop()
+            a.label('R2')
+            P['R2'] = a.labels['R2']
+            E('lp', lambda: a.leapc(9, 'H'))
+            E('cr', lambda: a.jmpr(9, link=True))
+            E('tp', lambda: a.mtsr('tp', 1))
+            while (a.pc + 8 + 8 + 4) % 8:
+                E(f'pad{a.pc}', lambda: a.nop())
+            E('s10', lambda: a.leapc(10, 'NEWI'))
+            E('lda', lambda: a.ld_abs(64, 6, DATA + 0x100))
+            E('st', lambda: a.st(64, 6, 10))
+            a.label('NEWI')
+            E('newi', lambda: a.setr(7, 0x11))
+            E('jmp', lambda: a.jmp('E'))
+            a.label('A'); a.nop()
+            a.label('G')
+            E('g0', lambda: a.leapc(8, 'R2'))
+            E('g1', lambda: a.getsp(11))
+            E('g2', lambda: a.st(64, 8, 11))
+            E('g3', lambda: a.ret())
+            a.label('H')
+            E('h0', lambda: a.enter(0))
+            E('h1', lambda: a.leaveret())
+            a.label('E')
+            return P
+        a, e, pl = _udprog(body, plus=plus, exp={'r7': 0x22})
+        assert a.labels['NEWI'] % 8 == 0
+        a.dword(DATA + 0x100, 0x22 << 32 | (2 << 30 | 2 << 26 | 15 << 22 | 7 << 8))
+        order = ['s1', 'cmp', 'jnt', 'n1', 'cmp2', 'jt', 'call', 'g0', 'g1', 'g2', 'g3', 'lp', 'cr',
+                 'h0', 'h1', 'tp'] + [k for k in seq if k.startswith('pad')] + ['s10', 'lda', 'st', 'newi', 'jmp']
+        hp = a.labels['E']
+        ents = [(X_STEP | SSTEP, P[k], P[order[i + 1]] if i + 1 < len(order) else hp, 3)
+                for i, k in enumerate(order)] + [(X_PRIV, HALT_W, hp, 3)]
+        e.update(_udexp(ents))
+        e[m(DATA + 0x100)] = 0x22 << 32 | (2 << 30 | 2 << 26 | 15 << 22 | 7 << 8)
+        out.append((a, e, pl))
+    return out
+
+
+def _uwcfg(a, wp0=(0, 0), wp1=(0, 0)):
+    """user code: configure WP0 / WP1 through the cfg SYSCALL"""
+    a.setr(5, wp0[0]); a.setr(6, wp0[1]); a.setr(7, wp1[0]); a.setr(8, wp1[1])
+    a.syscall()
+
+
+def _uw_bytes(sz, ea):
+    e = ea & 7
+    return {8: 1 << e, 16: 3 << (e & 6), 32: 0xF0 if e & 4 else 0x0F, 64: 0xFF}[sz]
+
+
+def _uw_chunks(cases, emit_case, ss=0, cap=26, plus=()):
+    """cases -> programs of at most cap logged entries each; emit_case(a,
+    case) returns the expected log entries (after the access executes)"""
+    out, cur = [], []
+    def flush():
+        if not cur:
+            return
+        batch = list(cur)
+        ents = []
+
+        def body(a):
+            for c in batch:
+                ents.extend(emit_case(a, c))
+        a, e, p = _udprog(body, ss=ss, cfg=True, plus=plus)
+        hp = a.insn_starts[a.insn_starts.index(a.labels['h']) - 1]
+        e.update(_udexp(ents + [(X_PRIV, HALT_W, hp, 1 | ss << 1)]))
+        out.append((a, e, p))
+        cur.clear()
+    n = 0
+    for c in cases:
+        cur.append(c)
+        n += 1
+        if n >= cap:
+            flush(); n = 0
+    flush()
+    return out
+
+
+@test
+def uw_sizes():
+    """§13.3: 8 / 16 / 32 / 64-bit loads and stores (reg + reg form) at every
+    legal offset of a doubleword (64-bit: every offset, the aligned-down
+    doubleword with MAL64 = 0) against WP0 configured through a SYSCALL:
+    BE = exactly the touched bytes / one of them (hit), their complement,
+    the next doubleword, the wrong direction (no hit), U = 1 (a user access
+    hits).  EADDR = the raw EA, frame = the next instruction."""
+    cases = []
+    base = DATA + 0x200
+    for sz in (8, 16, 32, 64):
+        for st in (0, 1):
+            for off in range(8):
+                if off % (sz // 8) and sz < 64:
+                    continue
+                ea = base + 0x40 + off
+                bt = _uw_bytes(sz, ea)
+                rw = WP_W if st else WP_R
+                lo = bt & -bt
+                for k, (wa, ctrl, hit) in enumerate([(ea, bt | rw, 1), (ea & ~7, lo | rw | WP_U, 1),
+                                                     (ea, (~bt & 0xFF) | WP_R | WP_W, 0),
+                                                     (ea + 8, 0xFF | WP_R | WP_W, 0),
+                                                     (ea, 0xFF | (WP_R if st else WP_W), 0)]):
+                    if ctrl & 0xFF:
+                        cases.append((sz, st, ea, wa, ctrl, hit))
+
+    def emit(a, c):
+        sz, st, ea, wa, ctrl, hit = c
+        _uwcfg(a, (wa, ctrl))
+        a.setr(9, ea & ~0xFF); a.setr(10, ea & 0xFF); a.setr64(11, 0x1122334455667788)
+        at = a.st_rr(sz, 11, 9, 10) if st else a.ld_rr(sz, 4, 9, 10)
+        return [(X_WATCH | 1 << 9 | st << 11, ea, at + 4, 1)] if hit else []
+    out = []
+    for plus in ([], ['+HIT=70', '+LAT=2']):
+        out += _uw_chunks(cases, emit, plus=plus)
+    return out
+
+
+@test
+def uw_stack():
+    """§13.3: the stack and frame ops — PUSH, PUSHV, POP, CALL (frame = its
+    target), RET (frame = the return address, RAS-predicted), ENTER,
+    LEAVE, LEAVERET on either doubleword (the 2nd only: EADDR = its start),
+    and a CALLcc not taken (no access, no hit)"""
+    out = []
+    for plus in ([], ['+HIT=70'], ['+LAT=1']):
+        ents = []
+
+        def body(a):
+            W = lambda dw, rw: _uwcfg(a, (dw, 0xFF | rw))
+            sp = USP
+            W(sp - 8, WP_W); at = a.push(1); ents.append((X_WATCH | 1 << 9 | 1 << 11, sp - 8, at + 4, 1))
+            W(sp - 8, WP_R); at = a.pop(2); ents.append((X_WATCH | 1 << 9, sp - 8, at + 4, 1))
+            W(sp - 8, WP_W); at = a.pushv(0x77); ents.append((X_WATCH | 1 << 9 | 1 << 11, sp - 8, at + 8, 1))
+            a.pop(2)
+            W(sp - 8, WP_W); at = a.call('F'); ents.append((X_WATCH | 1 << 9 | 1 << 11, sp - 8, a.labels.get('F', 0), 1))
+            ret_at = at + 4
+            a.setr(1, 1); a.cmpi_s(1, 0)
+            at = a.call('F', cond='eq'); a.nop()                       # not taken: no hit
+            W(sp - 8, WP_R); a.call('G')
+            a.label('RG')
+            # ENTER / LEAVE / LEAVERET
+            W(sp - 8, WP_W); at = a.call('K')
+            a.jmp('Z')
+            a.label('F'); a.ret()
+            a.label('G'); g = a.ret()                                    # RET: hit, frame = RG
+            ents.append((X_WATCH | 1 << 9, sp - 8, a.labels['RG'], 1))
+            a.label('K')                                                  # (the CALL to K hit: frame = K)
+            ents.append((X_WATCH | 1 << 9 | 1 << 11, sp - 8, a.labels['K'], 1))
+            W(sp - 16, WP_W); at = a.enter(1)                            # R15 pushed at SP - 8 = USP - 16
+            ents.append((X_WATCH | 1 << 9 | 1 << 11, sp - 16, at + 4, 1))
+            W(sp - 16, WP_R); at = a.leave()                             # LEAVE: [R15] = USP - 16
+            ents.append((X_WATCH | 1 << 9, sp - 16, at + 4, 1))
+            a.ret()
+            a.label('Z')
+            a.call('L1'); a.call('L2')
+            a.jmp('Y')
+            a.label('L1'); a.enter(0)                                    # R15 = USP - 16
+            W(sp - 8, WP_R); at = a.leaveret()                           # 2nd dword (the return address)
+            ents.append((X_WATCH | 1 << 9, sp - 8, a.labels['Z'] + 4, 1))
+            a.label('L2'); a.enter(0)
+            W(sp - 16, WP_R); at = a.leaveret()                          # 1st dword (saved R15)
+            ents.append((X_WATCH | 1 << 9, sp - 16, a.labels['Z'] + 8, 1))
+            a.label('Y')
+        a, e, p = _udprog(body, ss=0, cfg=True, plus=plus)
+        hp = a.labels['Y']
+        # (fix the CALL-to-F frame: F's label was not known when recorded)
+        ents[3] = (ents[3][0], ents[3][1], a.labels['F'], 1)
+        e.update(_udexp(ents + [(X_PRIV, HALT_W, hp, 1)]))
+        out.append((a, e, p))
+    return out
+
+
+@test
+def uw_ld32_dcbz():
+    """§13.3: MEMGET32 at every offset with WP0 on its first doubleword and
+    WP1 on the next (only bytes it really touches hit; the 2nd doubleword
+    alone: EADDR = its start); DCBZ with a WP on each doubleword of its line
+    (EADDR = the raw rs1)"""
+    cases = []
+    b = DATA + 0x300
+    for off in range(8):
+        for be0, be1 in ((0xFF, 0), (0, 0x01), (0, 0x0F), (0, 0x80), (0x80, 0x01), (0x0F, 0)):
+            cases.append(('l32', b + off, be0, be1))
+    for k in range(4):
+        for be in (0xFF, 0x80):
+            cases.append(('dz', b + 0x40 + 0x13, k, be))
+
+    def emit(a, c):
+        if c[0] == 'l32':
+            _, ea, be0, be1 = c
+            _uwcfg(a, (ea & ~7, be0 | WP_R) if be0 else (0, 0), ((ea & ~7) + 8, be1 | WP_R) if be1 else (0, 0))
+            a.setr(9, ea)
+            at = a.ld(32, 4, 9)
+            m32 = 0xF << (ea & 7)
+            h0 = bool(m32 & be0)
+            h1 = bool((m32 >> 8) & be1)
+            if not (h0 or h1):
+                return []
+            return [(X_WATCH | h0 << 9 | h1 << 10, ea if h0 else (ea & ~7) + 8, at + 4, 1)]
+        _, ea, k, be = c
+        _uwcfg(a, ((ea & ~31) + 8 * k, be | WP_W))
+        a.setr(9, ea)
+        at = a.dcbz(9)
+        return [(X_WATCH | 1 << 9 | 1 << 11, ea, at + 4, 1)]
+    out = []
+    for plus in ([], ['+HIT=70', '+LAT=1']):
+        out += _uw_chunks(cases, emit, plus=plus)
+    return out
+
+
+@test
+def uw_cases():
+    """§13.3 / §13.4: LR hits (R); a successful SC hits (W), a failing one
+    does not; a user MMIO load and a misaligned 16-bit load on a watched
+    doubleword take their fault, not WATCH; both WPs on one access set both
+    bits; step + watch on one instruction is one WATCH with SSTEP"""
+    out = []
+    # LR / SC, faults, both WPs (unstepped)
+    ents = []
+
+    def body(a):
+        d = DATA + 0x380
+        _uwcfg(a, (d, 0xFF | WP_W))
+        a.setr(9, d); a.setr(8, 0x99)
+        a.lr(64, 4, 9)                                           # (W only: no hit)
+        at = a.sc(64, 3, 8, 9); ents.append((X_WATCH | 1 << 9 | 1 << 11, d, at + 4, 1))
+        at = a.sc(64, 2, 8, 9)                                   # no reservation: fails, no store
+        _uwcfg(a, (d, 0xFF | WP_R | WP_W))
+        at = a.lr(64, 4, 9); ents.append((X_WATCH | 1 << 9, d, at + 4, 1))
+        a.sc(64, 10, 8, 9)                                       # the WATCH entry cleared the reservation
+        _uwcfg(a, (0xF0000000, 0xFF | WP_R | WP_W | WP_U))
+        a.setr(9, 0xF0000000)
+        at = a.ld(64, 4, 9); ents.append((X_ACC_LD, 0xF0000000, at, 1))
+        _uwcfg(a, (d, 0xFF | WP_R))
+        a.setr(9, d + 1)
+        at = a.ld(16, 4, 9); ents.append((X_MISAL_LD, d + 1, at, 1))
+        _uwcfg(a, (d, 0x0F | WP_R), (d, 0x01 | WP_R | WP_U))
+        a.setr(9, d)
+        at = a.ld(8, 4, 9, 0); ents.append((X_WATCH | 3 << 9, d, at + 4, 1))
+        _uwcfg(a, (d, 0x0F | WP_R), (d, 0xF0 | WP_R))
+        at = a.ld(8, 4, 9, 5); ents.append((X_WATCH | 1 << 10, d + 5, at + 4, 1))
+    a, e, p = _udprog(body, ss=0, cfg=True)
+    hp = a.insn_starts[a.insn_starts.index(a.labels['h']) - 1]
+    e.update(_udexp(ents + [(X_PRIV, HALT_W, hp, 1)]))
+    e.update({'r3': 0, 'r2': 1, 'r10': 1, m(DATA + 0x380): 0x99})
+    out.append((a, e, p))
+    # step + watch: SSTEP on the WATCH of the stepped instruction
+    P = {}
+
+    def body2(a):
+        d = DATA + 0x388
+        P['s9'] = a.setr(9, d)
+        P['st'] = a.st(64, 9, 9)
+        P['ld'] = a.ld(64, 4, 9)
+        P['n'] = a.nop()
+    a, e, p = _udprog(body2, ss=1, wps=[(DATA + 0x388, 0xFF | WP_W)])
+    hp = P['n'] + 4
+    s = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+    e.update(_udexp([s(P['s9'], P['st']), (X_WATCH | SSTEP | 1 << 9 | 1 << 11, DATA + 0x388, P['ld'], 3),
+                     s(P['ld'], P['n']), s(P['n'], hp), (X_PRIV, HALT_W, hp, 3)]))
+    out.append((a, e, p))
+    return out
+
+
+@test
+def uw_supervisor():
+    """§13.3 supervisor rules: U = 1 never hits in supervisor mode; U = 0
+    hits only with DI = 0 in program order (a DI just before the access
+    blocks it, an EI just before enables it); a kernel read of a user-only
+    watched address does not hit; EVEC = 0: no hit at all"""
+    out = []
+    a = Asm()
+    _xsetup(a)
+    d = DATA + 0x390
+    a.setr(9, d); a.setr(1, 1)
+    ents = []
+    a.setr(2, d); a.mtsr('wp0_addr', 2); a.setr(2, 0xFF | WP_R | WP_W | WP_U); a.mtsr('wp0_ctrl', 2)
+    a.ld(64, 4, 9); a.st(64, 1, 9)                              # U = 1: no hit
+    a.setr(2, 0xFF | WP_R | WP_W); a.mtsr('wp0_ctrl', 2)
+    at = a.st(64, 1, 9); ents.append((X_WATCH | 1 << 9 | 1 << 11, d, at + 4, 0))
+    a.di(3)
+    a.ld(64, 4, 9)                                              # DI = 1: no hit
+    a.ei(1)
+    at = a.ld(64, 4, 9); ents.append((X_WATCH | 1 << 9, d, at + 4, 0))
+    a.di(3); a.ei(1); at = a.ld(64, 5, 9); ents.append((X_WATCH | 1 << 9, d, at + 4, 0))
+    a.ei(1); a.di(3); a.ld(64, 5, 9)                            # no hit
+    a.ei(1)
+    a.halt()
+    _udhandler(a)
+    e = {'end': 'park', 'kind': '0'}
+    e.update(_udexp(ents))
+    out.append((a, e, []))
+    # EVEC = 0: a supervisor hit-able store does nothing
+    a = Asm()
+    a.setr(9, DATA + 0x398); a.setr(2, DATA + 0x398); a.mtsr('wp0_addr', 2)
+    a.setr(2, 0xFF | WP_R | WP_W); a.mtsr('wp0_ctrl', 2)
+    a.setr(1, 7); a.st(64, 1, 9); a.ld(64, 4, 9)
+    a.halt()
+    out.append((a, {'end': 'park', 'kind': '0', 'r4': 7, 'exc_n': '0'}, []))
+    return out
+
+
+@test
+def uw_irq():
+    """§13.3: a watched store in a user loop under timer IRQs: one WATCH per
+    iteration, the result intact"""
+    out = []
+    for per in (61, 89, 131):
+        a = Asm()
+        _xsetup(a)
+        a.setr(1, DATA + 0x3A0); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_W | WP_U); a.mtsr('wp0_ctrl', 1)
+        _ud_user(a, ss=0, mask=1)
+        a.label('u')
+        a.setr(9, DATA + 0x3A0); a.setr(2, 50); a.setr(1, 0)
+        a.label('l'); a.alu('add', 1, 1, 2); a.st(64, 1, 9); a.st(64, 1, 9, 8); a.dec(2)
+        a.fbr('ne', 2, 0, 'l', imm=True)
+        a.halt()
+        a.label('h')
+        a.push(13); a.push(14)
+        a.mfsr(13, 'ecause'); a.setr(14, X_WATCH | 1 << 9 | 1 << 11)
+        a.fbr('ne', 13, 14, 'h_n')
+        a.setr(14, XD); a.ld(64, 13, 14); a.inc(13); a.st(64, 13, 14)
+        a.pop(14); a.pop(13); a.iret()
+        a.label('h_n'); a.halt()
+        out.append((a, {'end': 'park', 'kind': '0', 'r1': 1275, m(XD): 50, m(DATA + 0x3A0): 1275,
+                        'm00180000': 'nonzero'}, [f'+IRQ_PERIOD={per}']))
+    return out
+
+
+@test
+def ud_sr():
+    """§13.1: WPn_ADDR keeps [31:3], WPn_CTRL [10:0]; ECAUSE is 13 bits; all
+    four are 0 after reset; user MFSR / MTSR of them is PRIVILEGED"""
+    a = Asm()
+    _xsetup(a)
+    a.setr(12, DATA); a.setr(3, 0)
+    for sr in ('wp0_addr', 'wp0_ctrl', 'wp1_addr', 'wp1_ctrl'):
+        a.mfsr(2, sr); a.alu('or', 3, 3, 2)
+    a.st(64, 3, 12, 40); a.setr(3, 0x77); a.st(64, 3, 12, 48)
+    a.setr64(1, -1)
+    for i, sr in enumerate(('wp0_addr', 'wp0_ctrl', 'wp1_addr', 'wp1_ctrl', 'ecause')):
+        a.mtsr(sr, 1); a.mfsr(2, sr); a.st(64, 2, 12, 8 * i)
+    a.setr(1, 0)
+    for sr in ('wp0_ctrl', 'wp1_ctrl'):
+        a.mtsr(sr, 1)
+    _ud_user(a, ss=0)
+    a.label('u')
+    a.mfsr(1, 'wp0_addr'); a.mtsr('wp1_ctrl', 1); a.mfsr(1, 'wp1_ctrl'); a.mtsr('wp0_addr', 1)
+    a.halt()
+    _uhandler(a)
+    exp = {'end': 'park', 'kind': '0', m(DATA + 40): 0, m(DATA + 48): 0x77, m(DATA): 0xFFFFFFF8, m(DATA + 8): 0x7FF,
+           m(DATA + 16): 0xFFFFFFF8, m(DATA + 24): 0x7FF, m(DATA + 32): 0x1FFF, m(XD + 32): 5}
+    for i in range(5):
+        exp[m(XLOG + 8 * i)] = X_PRIV
+    return a, exp, []
+
+
+@test
+def ud_te_walk():
+    """§13.2 / §13.3 with TE = 1 and the hardware walker: a stepped user
+    store whose page the walker refills (no entry: the store re-executes
+    and is the stepped one) hits WP0 by its VA (WATCH + SSTEP, EADDR = the
+    VA); WP1 on another VA of the same PA does not hit; a jump to a code
+    page the walker refills is stepped onto it"""
+    if NOEXC or NOWALK:
+        return []
+    out = []
+    for plus in ([], ['+LAT=1'], ['+HIT=70']):
+        a = Asm()
+        _xsetup(a)
+        _wk_tables(a, {0x0003: _wk_pte(3, TLB_RWX), 0x0100: _wk_pte(1, TLB_V | TLB_R | TLB_W)})
+        _wk_on(a)
+        a.setr(1, KSP); a.setsp(1)
+        a.setr(1, 0x0100_0010); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_W | WP_U); a.mtsr('wp0_ctrl', 1)
+        a.setr(1, 0x0001_0018); a.mtsr('wp1_addr', 1); a.setr(1, 0xFF | WP_W); a.mtsr('wp1_ctrl', 1)
+        a.setr(1, 0x200); a.mtsr('status', 1)                      # TE (the next fetch walks page 0)
+        _ud_user(a, ss=1)
+        a.label('u')
+        P = {}
+        P['s9'] = a.setr(9, 0x0100_0010)
+        P['st1'] = a.st(64, 9, 9)
+        P['st2'] = a.st(64, 9, 9, 8)
+        P['j'] = a.jmp_abs(0x30000)
+        _udhandler(a)
+        _place(a, 0x30000, lambda s: (s.setr(4, 5), s.inc(4), s.halt()))
+        s = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+        e = {'end': 'park', 'kind': '0', 'r4': 6, m(DATA + 0x10): 0x0100_0010, m(DATA + 0x18): 0x0100_0010,
+             'wk_n': (3, 99)}
+        e.update(_udexp([s(P['s9'], P['st1']), (X_WATCH | SSTEP | 1 << 9 | 1 << 11, 0x0100_0010, P['st2'], 3),
+                         s(P['st2'], P['j']), s(P['j'], 0x30000), s(0x30000, 0x30008), s(0x30008, 0x3000C),
+                         (X_PRIV, HALT_W, 0x3000C, 3)]))
+        out.append((a, e, plus))
+    return out
+
+
+@test
+def ud_debugger():
+    """§13.2: the JTAG debug module wins and the user step survives it: a
+    DM breakpoint on a stepped user instruction, then DM single steps
+    (across the STEP entry), then a resume — the step log is exactly the
+    one without the debugger.  §13.3: with the debugger attached the user
+    watchpoints are off.  (VSIM_DEBUG_EN=1 builds only)"""
+    if not _os0.environ.get('VSIM_DEBUG_EN') == '1':
+        return []
+    out = []
+    base = ud_step_basic()[0]
+    a, e, _ = base
+    labels = sorted(a.insn_starts)
+    u = a.labels['u']
+    for k, steps in ((1, 0), (1, 3), (2, 1), (5, 2), (6, 4), (8, 2)):
+        bp = [p for p in labels if p >= u][k]
+        e2 = dict(e); e2['dh_n'] = str(1 + steps)
+        out.append((a, e2, [f'+DBG_BP0={bp:x}', f'+DBG_STEPS={steps}']))
+    # attached: no WATCH
+    ents = []
+
+    def body(a):
+        a.setr(9, DATA + 0x3B0); a.st(64, 9, 9)
+    a, e, p = _udprog(body, ss=0, wps=[(DATA + 0x3B0, 0xFF | WP_W)])
+    hp = a.insn_starts[a.insn_starts.index(a.labels['h']) - 1]
+    e.update(_udexp([(X_PRIV, HALT_W, hp, 1)]))
+    e['kind'] = '4'                       # (the handler's HALT debug-halts while attached)
+    out.append((a, e, ['+DBG_ATTACHED']))
+    return out
