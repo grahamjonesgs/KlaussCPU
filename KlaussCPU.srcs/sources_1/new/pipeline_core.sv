@@ -2988,7 +2988,6 @@ module pipeline_core
    logic       mem_wph, mem_wp2, mem_wps;
    logic [1:0] mem_wpm;
    wire mem_ysq_go   = EN_EXC && mem_valid && (mem_xsq || (EN_UDBG && mem_wph)) && !wb_wait;
-   wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !mem_xsq && !sq_spec && !wb_wait;
    // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
    // its port request — every younger port user holds off until it issues.
    wire wb_hmiss     = EN_DC_H && wb_valid && wb_h && !wb_hok && !ld_out;
@@ -3052,6 +3051,9 @@ module pipeline_core
    // overlap fetch-side code: everything younger is squashed — see sq_spec
    // below the dispatch)
    wire sq_spec      = EN_ST1 && st_spec && !st_post_ok;
+   // (MMU_PLAN.md §13.3: the watch squash, see mem_ysq_go — declared after
+   // sq_spec, which kills the MEM op instead)
+   wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !mem_xsq && !sq_spec && !wb_wait;
    // (not on the sq_spec edge: the MEM store is younger than the store that
    // squashes, and the squash never clears sq_v — it would still write)
    wire sq_enq_now   = EN_SQ && EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
