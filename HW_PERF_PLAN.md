@@ -3924,4 +3924,12 @@ Decisions taken while implementing the frozen text above:
   cold rustc hello unchanged.  Opus review: one MAJOR (a stepped, watched
   unpredicted RET / LEAVERET lost SSTEP) and three MINORs, fixed in
   `60bcc36`: tier 1 +0.040 / +0.024, `~/.cache/kbuild/ustep_60bcc36.bit`;
-  still cycle-identical to master while unused.  Not yet on the board.
+  still cycle-identical to master while unused.
+- 2026-11-23: `60bcc36` released: SRAM all_tests 31/31, dcbz, hwprop,
+  sd_hs_test, ustep_test USTEP PASS (incl. the unpredicted RET / LEAVERET
+  case); runtime board-check --boot 19/19, cold rustc hello 16.14 / 15.64 s
+  (15.9 baseline).  QSPI = `ustep_release_60bcc36.bit` (rollback entry in
+  ~/.cache/kbuild/rollback/README.txt); flash boot CPU_FEATURES 0x3FF0_200D,
+  USTEP PASS, board-check 19/19.  Master fast-forwarded to `ustep`.  The
+  kernel's PTRACE_SINGLESTEP / hw-breakpoint support and the klausscc model
+  are the runtime session's, against MMU_PLAN §13.
