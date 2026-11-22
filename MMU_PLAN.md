@@ -112,7 +112,9 @@ Debugger resume clears nothing.
 One 64-bit frame for both interrupts and exceptions:
 
 ```
-[63:45] = 0            reserved
+[63:46] = 0            reserved
+[45]    = SS           single step armed (§13; 0 in every frame unless
+                       CPU_FEATURES[28])                (IRET to user mode arms)
 [44]    = PM           previous mode: 1 = user        (restored by IRET)  NEW
 [43]    = DI disable                                   (restored by IRET)
 [42:39] = INT_MASK                                     (restored by IRET)
@@ -232,7 +234,9 @@ MEMGET32, byte, 64-bit and stack accesses never raise MISALIGNED.
 | 9 | ACCESS_FETCH | user fetch from `0xF…` (§3.6); stage 2/3 execute permission | the instruction | address of its first faulting word |
 | 10 | MISALIGNED_FETCH | user-mode PC with `[1:0] != 0` | the PC | the PC |
 | 11–13 | TLB_MISS_LOAD / _STORE / _FETCH | stage 3 (§11.3) | the instruction | faulting VA |
-| 14–255 | reserved | | | |
+| 14 | STEP | user single step (§13.2) | **the next instruction** | PC of the stepped instruction |
+| 15 | WATCH | data watchpoint hit (§13.3) | **the next instruction** | the access address (§13.3) |
+| 16–255 | reserved | | | |
 
 - **Priority** when several causes apply to one instruction:
   MISALIGNED_FETCH > ACCESS_FETCH > ILLEGAL > PRIVILEGED > (TRAP, SYSCALL)
@@ -427,7 +431,7 @@ fail:
 |---|---|---|---|
 | 0x00 | `STATUS` | R (**user mode too**), W (supervisor) | `[0]` UM (read-only), `[1]` DI (read-only, the committed bit), `[8]` MPU_EN (stage 2), `[9]` TE (stage 3), `[10]` MAL64 (HW_PERF_PLAN.md §4: 1 = a 64-bit load / store with EA[2:0] ≠ 0 raises MISALIGNED_*; 0 after reset and at program load). Other bits read 0. Writes to UM and DI are ignored; use IRET / DI / EI. |
 | 0x01 | `EVEC` | RW | exception vector, `[1:0]` read 0 |
-| 0x02 | `ECAUSE` | RW | §4.1 code in `[7:0]`; `[8]` GUARD = this ACCESS_* fault was a denial by an MPU GUARD region (stage 2, §10.2), else 0 |
+| 0x02 | `ECAUSE` | RW | §4.1 code in `[7:0]`; `[8]` GUARD = this ACCESS_* fault was a denial by an MPU GUARD region (stage 2, §10.2), else 0; `[12:9]` the user-debug bits WP0 / WP1 / WRITE / SSTEP (§13.4), else 0 |
 | 0x03 | `EADDR` | RW | `[31:0]` |
 | 0x04 | `USP` | RW | `SP_ALT`, which is the user SP while in supervisor mode |
 | 0x05 | `SCRATCH0` | RW | 64-bit |
@@ -437,6 +441,7 @@ fail:
 | 0x10–0x2F | `MPU_BASEn` / `MPU_LIMITn` | supervisor | stage 2 (§10.1) |
 | 0x30–0x34 | `TLB_HI`, `TLB_LO`, `TLB_INDEX`, `ASID`, `TLBVEC` | supervisor | stage 3 (§11.3) |
 | 0x35–0x37 | `TLB_PTB`, `TLB_WALK`, `TLB_WCNT` | supervisor | the hardware TLB walker (§11.8); ILLEGAL where it is not built |
+| 0x40–0x43 | `WP0_ADDR`, `WP0_CTRL`, `WP1_ADDR`, `WP1_CTRL` | supervisor | user-usable data watchpoints (§13.3); ILLEGAL where they are not built |
 
 `STATUS` is readable in user mode so that code like Zephyr's
 `arch_is_user_context()` can test the mode without a syscall. `TP` serves
@@ -472,6 +477,9 @@ bitstream.
 | `[23]` | `STATUS[10]` MAL64 (HW_PERF_PLAN.md §4; branch `perf-hw`) |
 | `[24]` | `ETH_RX_SLOTS` at `0xF007_0000`: LiteEth built with 8 RX slots, software chooses 2..8 (HW_PERF_PLAN.md §3, MMIO_MAP.md Ethernet) |
 | `[25]` | the hardware TLB walker, SRs 0x35–0x37 (§11.8; branch `tlbwalk`) |
+| `[26]`, `[27]` | the L2 and the cache range operations (HW_PERF_PLAN.md) |
+| `[28]` | user single step: frame bit 45 SS, ECAUSE 14 STEP (§13.2; branch `ustep`) |
+| `[29]` | data watchpoints: SRs 0x40–0x43, ECAUSE 15 WATCH, ECAUSE[12:9] (§13.3; branch `ustep`) |
 
 If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's MMIO window reads 0, ignores writes and
 completes in the normal MMIO time (MMIO_MAP.md).
@@ -1917,3 +1925,205 @@ the new assertions are X-safe in 4-state simulators, and `tx_kmap`,
     priority and EADDR (§4.1); parking does not write ECAUSE/EADDR (§4.4).
     The emulator first proposed the aligned-down EADDR for A=1 accesses;
     the raw EA was kept.
+
+---
+
+## 13. User-mode debug: single step and watchpoints (2026-11-22, branch `ustep`)
+
+**Why.** lldb-server under Linux needs `PTRACE_SINGLESTEP` and hardware
+watchpoints for user programs (Graham's request, relayed by the runtime
+session 2026-11-22). The JTAG debug module (DEBUG_PLAN.md) has a step and
+two watchpoints, but they halt the whole core and are not in the release
+bitstream. This section adds a kernel-usable version that raises
+exceptions instead. This is the contract for klausscc, the kernel and
+lldb-server.
+
+### 13.1 Summary of the encodings
+
+| Item | Encoding |
+|---|---|
+| Frame bit 45 **SS** | single step armed. Pushed by every entry (= the armed state, §13.2), read by IRET. Bits [63:46] stay reserved (0, ignored by IRET). |
+| ECAUSE 14 **STEP** | frame PC = the next instruction; EADDR = the PC of the stepped instruction |
+| ECAUSE 15 **WATCH** | frame PC = the next instruction; EADDR = the access address (§13.3) |
+| `ECAUSE[9]` WP0 | WATCH: watchpoint 0 matched |
+| `ECAUSE[10]` WP1 | WATCH: watchpoint 1 matched (both may be set) |
+| `ECAUSE[11]` WRITE | WATCH: the access was a store (0 = a load) |
+| `ECAUSE[12]` SSTEP | the entry also completes a single step: always 1 with STEP, 1 with WATCH when the watched instruction was the stepped one |
+| SR `0x40` / `0x42` **`WP0_ADDR` / `WP1_ADDR`** | `[31:3]` the watched doubleword's VA. `[2:0]` and `[63:32]` ignored on write, read 0. |
+| SR `0x41` / `0x43` **`WP0_CTRL` / `WP1_CTRL`** | `[7:0]` BE: byte mask within the doubleword (bit *i* = byte *i*, little-endian: the byte at `ADDR + i`); `[8]` R: loads hit; `[9]` W: stores hit; `[10]` U: user-mode accesses only. Other bits ignored on write, read 0. A watchpoint is **enabled** when `R` or `W` is set and `BE ≠ 0`. |
+| `CPU_FEATURES[28]` | user single step (SS, STEP) |
+| `CPU_FEATURES[29]` | the two watchpoints (SRs 0x40–0x43, WATCH) |
+
+`ECAUSE[12:9]` are 0 for every other entry. `ECAUSE` is 13 bits: MTSR
+writes `[12:0]`, MFSR reads them zero-extended. The kernel compares
+`ECAUSE[7:0]` for the cause, as with `[8]` GUARD.
+
+The four WP SRs are supervisor-only: MFSR / MTSR of them in user mode raise
+PRIVILEGED. Where the feature is not built (`CPU_FEATURES[29]` = 0: core 2,
+older bitstreams) they are ILLEGAL like any unknown SR. MTSR to them
+serializes, as every MTSR does, so the next instruction is checked against
+the new value. SR numbers 0x40–0x43 have `[19:16]` = 4, so none of the
+existing SR decoders sees them (`mmu_sr` decodes `[19:16]` = 0, the MPU 1–2,
+the TLB 3; §10.3's aliasing note).
+
+With `CPU_FEATURES[28]` = 1 the A7 bitstream reads **`0x3FF0_200D`**
+(`0x0FF0_200D` plus `[29:28]`).
+
+**Reset and program load** (`start`, i.e. every LOAD_COMPLETE: core 1 is
+held in reset through every load) clear the step state and both
+watchpoints: `WPn_ADDR` = `WPn_CTRL` = 0, nothing armed. A debugger resume
+clears nothing.
+
+### 13.2 Single step (STEP)
+
+**Arming.** An IRET whose popped frame has **PM = 1 and SS = 1** arms a
+single step, **if `EVEC` ≠ 0** at that moment. An IRET to supervisor mode
+(PM = 0) ignores SS, and so does an IRET with `EVEC` = 0 (nothing could
+take the exception). SS in a frame never does anything else.
+
+**The step.** While armed, the core executes exactly one instruction, the
+one at the frame PC. Before the next instruction, and before any interrupt,
+it takes **STEP** (14):
+- frame PC = the next instruction to execute: the fall-through, or the
+  target of a taken branch, CALL, RET or LEAVERET, whatever the prediction
+  was (a mispredicted branch, a RAS or BTIC redirect, and a refetch after a
+  store into the following code all resolve before the entry);
+- `EADDR` = the PC of the stepped instruction;
+- `ECAUSE` = 14 | SSTEP (`0x100E`);
+- frame SS = 1, PM = 1; entry as §3.3 (DI set, vector `EVEC`, never
+  `TLBVEC`).
+
+**Disarming.** Every exception or interrupt entry pushes the armed state as
+frame bit 45 and disarms. So the handler and every ISR run unarmed, and only
+an IRET of a user frame with SS = 1 re-arms. A successful hardware TLB walk
+(§11.8) is not an entry: the step stays armed and the re-executed
+instruction is the stepped one.
+
+**Exactly one instruction per arm completes**, and the STEP exception comes
+after it. All the cases:
+
+| Case | What happens |
+|---|---|
+| An interrupt is pending at the arming IRET | It may be taken at the first boundary, before the stepped instruction: the frame has SS = 1 and the PC of the not-yet-executed instruction. The ISR runs unarmed; its IRET re-arms. The step itself never takes an interrupt between the instruction and STEP. |
+| The stepped instruction faults (any §4.1 cause, TLB miss falling back) | The fault is taken as now (precise, frame PC = the instruction, nothing done) with SS = 1 in its frame. No STEP. The kernel's IRET of that frame re-arms, and the retried instruction is the stepped one. |
+| The stepped instruction is SYSCALL | SYSCALL entry: frame PC = next, SS = 1. No STEP. Linux reports the step at syscall exit (it IRETs with SS = 1 and the step happens on the instruction after; or it reports and clears SS). |
+| A TLB miss the walker refills | No entry; the instruction re-executes and is then the stepped one. |
+| The stepped instruction hits a watchpoint | One entry: WATCH with SSTEP = 1 (§13.4). |
+| Privileged instructions (WAIT, HALT, DI, EI, IRET, …) | PRIVILEGED in user mode: a fault, as above. |
+| Multi-word instructions (2 or 3 words) | One instruction. |
+| LR / SC | Each is one instruction. **Every entry clears the reservation** (§3.3) and IRET clears it, so a stepped SC always fails and an LR … SC loop stepped one instruction at a time never completes. The debugger must step over an LR … SC sequence as a whole (a breakpoint after the loop's exit branch), as on RISC-V, MIPS and Arm; lldb's RISC-V atomic-sequence handling is the model. |
+| DCBZ, stores into the next instruction | Ordinary stores; the refetch after self-modifying code resolves before STEP, so the frame PC's instruction is fetched afresh after IRET. |
+| A branch / CALL / RET (correct or mispredicted, BTIC hit or not) | frame PC = the architectural successor. |
+
+**Never in supervisor mode.** The step arms only on an IRET to user mode
+and disarms on any entry, so it cannot step into a handler or an ISR, and a
+kernel cannot single-step itself with it (use the JTAG debug module).
+
+**The JTAG debug module wins.** Its halt request, step, breakpoints and
+watchpoints keep their behaviour; with the user step armed:
+- a DM halt taken before the stepped instruction, or a DM breakpoint on it:
+  after resume that instruction is still the stepped one;
+- a DM halt (or DM step) taken after the stepped instruction: STEP is
+  taken at the first boundary after resume;
+- the stepped instruction debug-halts (ILLEGAL / TRAP / MISALIGNED with the
+  DM attached and EXC_PASS = 0): after resume, the next instruction to
+  execute is the stepped one.
+
+### 13.3 Watchpoints (WATCH)
+
+**What is compared.** Each data access of an instruction, at doubleword
+granularity, against each enabled watchpoint *n*:
+- the access's doubleword VA (`EA[31:3]`, the address the program uses;
+  with `TE` = 1 the VA, not the PA) equals `WPn_ADDR[31:3]`;
+- the bytes it touches in that doubleword overlap `WPn_CTRL.BE`;
+- it is a load and `R` = 1, or a store and `W` = 1;
+- the mode: a user-mode access always qualifies; a supervisor-mode access
+  qualifies only if `U` = 0 **and DI = 0** (interrupts enabled, in program
+  order: an older DI / EI counts).
+
+The bytes an access touches:
+
+| Access | Doublewords and bytes |
+|---|---|
+| 8 / 16 / 32-bit load or store, LR.W / SC.W | its bytes in its doubleword |
+| 64-bit (A = 1, or A = 0 with any alignment: the memory system uses the aligned-down doubleword, HW_PERF_PLAN §4 MAL64 = 0), LR.D / SC.D | all 8 bytes of `EA[31:3]` |
+| MEMGET32 (32-bit `[rs1]` load) | its 4 bytes; spanning a doubleword boundary (`EA[2:0]` > 4): the bytes in each of the two doublewords |
+| PUSH, PUSHV, CALL (taken), ENTER | a store of all 8 bytes at `SP − 8` (aligned down) |
+| POP, RET, LEAVE | a load of all 8 bytes at `SP` / `R15` (aligned down) |
+| LEAVERET | loads of both doublewords `[R15]` and `[R15 + 8]` |
+| DCBZ | a store of all bytes of all four doublewords of the 32 B line |
+
+Not watched: the IRET frame read, the frame push of any entry, hardware TLB
+walker reads, instruction fetches, JTAG debugger accesses, DMA. A
+conditional CALL that is not taken, a failing SC (no store) and a faulting
+instruction (§4.1: the access did not happen) do not hit.
+
+**Enabling.** Hits are taken only while `EVEC` ≠ 0 and the JTAG debugger
+is not attached (`DMCONTROL[3]`): while attached the DM owns watching, and
+the user watchpoints are ignored. The two sets of comparators are separate.
+
+**The exception.** A hitting instruction **completes**: its access, its
+register / flag / SP writes and its PC redirect all happen. Then, before the
+next instruction and before any interrupt, the core takes **WATCH** (15):
+- frame PC = the next instruction (a CALL's target, a RET / LEAVERET's
+  return address);
+- `ECAUSE` = 15 | WP0 << 9 | WP1 << 10 | WRITE << 11 | SSTEP << 12;
+- `EADDR` = the instruction's effective address as for a fault (§4.1: the
+  raw `base + offset`, not aligned down; DCBZ: its `rs1`), except when only
+  the **second** doubleword of a two-access instruction (spanning MEMGET32,
+  LEAVERET) hit: then that doubleword's start address;
+- entry as §3.3 (DI set, `EVEC`); frame SS = the armed step state.
+
+The exception is precise: no later instruction has executed. Because it is
+taken after the access, re-running from the frame PC does not repeat the
+access, so the kernel simply reports and IRETs (no "step over the
+watchpoint" dance).
+
+**Anti-loop rule.** Supervisor accesses hit only with DI = 0. Exception
+entry sets DI, so a handler (including the WATCH handler) cannot hit before
+it re-enables interrupts, and a watch on kernel data can never recurse in
+the entry path. Interrupt entry does not set DI: an ISR's accesses with
+interrupts enabled do hit, which is fine (each hit is taken after its
+access). A kernel that watches its own data must not touch it with
+interrupts enabled inside the WATCH handler, or must disable the
+watchpoint first. With `U` = 1 (what ptrace uses) kernel accesses, including
+`copy_to_user` / `copy_from_user` to the watched user address, never hit.
+
+**Cases.**
+
+| Case | What happens |
+|---|---|
+| The instruction also faults | The fault is taken; no WATCH (the access did not happen). The retried instruction may hit. |
+| Two watchpoints match one access | One WATCH, both WP bits set. |
+| A two-access instruction matching in both doublewords | One WATCH; EADDR = the raw EA (the first doubleword hit). |
+| An interrupt is pending | WATCH first; the interrupt is taken after the handler enables interrupts (or after its IRET). |
+| Watched SC that fails | No hit (no store). |
+| DCBZ | A store to the whole line. |
+| A hit on the stepped instruction | §13.4. |
+
+### 13.4 Step and watch on the same instruction
+
+One entry: **WATCH** with **SSTEP** = 1. The single step is complete (the
+instruction ran); `EADDR` is the access address, and the frame PC is the
+next instruction, as for STEP. The frame has SS = 1 (the arm in force when
+the entry was taken). A kernel that reports both and continues stepping
+IRETs with SS = 1 (one more instruction, then STEP); one that stops
+stepping clears frame bit 45 first.
+
+### 13.5 Interaction summary for the kernel (ptrace)
+
+- `PTRACE_SINGLESTEP`: set bit 45 in the user frame and IRET; on STEP
+  (ECAUSE[7:0] = 14) or WATCH with SSTEP, report `SIGTRAP` / `TRAP_TRACE`.
+  On `PTRACE_CONT` clear bit 45. Every entry already cleared the hardware
+  arm; only the frame bit matters.
+- Signal delivery, syscalls and faults during a step: the frame bit is the
+  whole state; the kernel decides by keeping or clearing it before its IRET.
+- Context switch: the WP SRs are per-thread state; the kernel saves and
+  restores them (or rewrites them on each return to a traced thread). With
+  `U` = 1 no kernel code ever hits them.
+- Watch hits: `SIGTRAP` / `TRAP_HWBKPT` with `si_addr` = EADDR; the WP bits
+  identify which watchpoint for lldb.
+
+### 13.6 Pipeline (as built)
+
+(Filled in with the RTL; see below.)
