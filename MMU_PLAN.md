@@ -1997,7 +1997,8 @@ it takes **STEP** (14):
 frame bit 45 and disarms. So the handler and every ISR run unarmed, and only
 an IRET of a user frame with SS = 1 re-arms. A successful hardware TLB walk
 (§11.8) is not an entry: the step stays armed and the re-executed
-instruction is the stepped one.
+instruction is the stepped one. A DOUBLE_FAULT park (§11.3: the entry's
+frame push outside kseg) disarms too, like the entry it replaces.
 
 **Exactly one instruction per arm completes**, and the STEP exception comes
 after it. All the cases:
@@ -2011,7 +2012,7 @@ after it. All the cases:
 | The stepped instruction hits a watchpoint | One entry: WATCH with SSTEP = 1 (§13.4). |
 | Privileged instructions (WAIT, HALT, DI, EI, IRET, …) | PRIVILEGED in user mode: a fault, as above. |
 | Multi-word instructions (2 or 3 words) | One instruction. |
-| LR / SC | Each is one instruction. **Every entry clears the reservation** (§3.3) and IRET clears it, so a stepped SC always fails and an LR … SC loop stepped one instruction at a time never completes. The debugger must step over an LR … SC sequence as a whole (a breakpoint after the loop's exit branch), as on RISC-V, MIPS and Arm; lldb's RISC-V atomic-sequence handling is the model. |
+| LR / SC | Each is one instruction. **Every entry clears the reservation** (§3.3) and IRET clears it, so a stepped SC always fails and an LR … SC loop stepped one instruction at a time never completes. The debugger must step over an LR … SC sequence as a whole (a breakpoint after the loop's exit branch), as on RISC-V, MIPS and Arm; lldb's RISC-V atomic-sequence handling is the model. A watchpoint hit inside the loop livelocks it the same way (§13.3). |
 | DCBZ, stores into the next instruction | Ordinary stores; the refetch after self-modifying code resolves before STEP, so the frame PC's instruction is fetched afresh after IRET. |
 | A branch / CALL / RET (correct or mispredicted, BTIC hit or not) | frame PC = the architectural successor. |
 
@@ -2027,7 +2028,9 @@ watchpoints keep their behaviour; with the user step armed:
   taken at the first boundary after resume;
 - the stepped instruction debug-halts (ILLEGAL / TRAP / MISALIGNED with the
   DM attached and EXC_PASS = 0): after resume, the next instruction to
-  execute is the stepped one.
+  execute is the stepped one;
+- a debugger write of register 21 (`{DI, UM}`) with UM = 0 disarms the step
+  (it is armed in user mode only); a write with UM = 1 keeps it.
 
 ### 13.3 Watchpoints (WATCH)
 
@@ -2098,6 +2101,7 @@ watchpoint first. With `U` = 1 (what ptrace uses) kernel accesses, including
 | A two-access instruction matching in both doublewords | One WATCH; EADDR = the raw EA (the first doubleword hit). |
 | An interrupt is pending | WATCH first; the interrupt is taken after the handler enables interrupts (or after its IRET). |
 | Watched SC that fails | No hit (no store). |
+| A hit inside an LR … SC retry loop | **Livelock.** Every entry clears the reservation (§3.3), so a watch that hits the LR (a read watch on its address) or any other instruction between the LR and the SC makes the SC fail every time, and the loop retries forever. The same holds on Arm and RISC-V. A watch hitting the SC itself is harmless (it is taken after the store). Debuggers must disable such a watchpoint, or step over the whole sequence with it disabled, as for the single step (§13.2). |
 | DCBZ | A store to the whole line. |
 | A hit on the stepped instruction | §13.4. |
 
@@ -2127,8 +2131,9 @@ stepping clears frame bit 45 first.
 ### 13.6 Pipeline (as built)
 
 `pipeline_core` parameter `UDBG_EN` (default 1; `EN_UDBG = EXC_EN &&
-UDBG_EN`, so core 2, `EXC_EN = 0`, has none of it). `KlaussCPU` reports
-`CPU_FEATURES[29:28]` = `CORE1_EXC_EN`. With SS never set and both
+UDBG_EN`, so core 2, `EXC_EN = 0`, has none of it). `KlaussCPU` passes its
+parameter `CORE1_UDBG_EN` (default 1) to it and reports
+`CPU_FEATURES[29:28]` = `CORE1_EXC_EN && CORE1_UDBG_EN`. With SS never set and both
 watchpoints disabled the core is cycle-identical to master (`run.py diff
 --base master --plus +TRACECYC`: same traces and cycle stamps).
 
@@ -2150,11 +2155,19 @@ boundary has been taken).
   (nothing has been latched since the stepped instruction), vector `EVEC`.
   The frame's PC is the fetch `pc` at the drain, so every redirect of the
   stepped instruction (EX, MEM, its own MTSR / SMC refetch at WB) is in it.
+- A watch fire (`mem_wfire`, below) with `us_lat` set also sets `us_ent`:
+  the firing op is then the stepped one (nothing older is left, nothing
+  younger has been latched), so the entry is WATCH + SSTEP whether or not
+  the `us_lat` boundary came first. It need not: an unpredicted RET /
+  LEAVERET (an empty RAS) is a serializer, `fetch_halt` holds the boundary
+  off, and the op fires in its first MEM cycle (the review of `1813b9c`).
 - An exception op created after the boundary (`ex_misal`, the MEM access
   fault `mem_xsq_go`) cancels `us_ent` with `irq_active`, as it cancels an
   IRQ boundary; the fault's own entry follows.
-- Every entry completion clears all four. A successful walk (`wk_fin`)
-  clears `us_lat` only. A debugger resume sets `us_lat <= us_ret`.
+- Every entry completion clears all four, and so does the DOUBLE_FAULT
+  park. A successful walk (`wk_fin`) clears `us_lat` only. A debugger
+  resume sets `us_lat <= us_ret`; a debugger write of register 21 with
+  UM = 0 clears `us_arm`, `us_lat` and `us_ret`.
 - Frame bit 45 = `us_arm` at the push.
 
 **Watch.**
@@ -2192,7 +2205,8 @@ boundary has been taken).
 **A predicted return does fire behind younger ops.** An assertion that a
 predicted RET / LEAVERET never fires with an op latched behind it failed in
 `udbgfuzz` seed 54 (a LEAVERET at `+LAT=1`); the `pc` write for that case is
-needed, and the `m_pc_ret` mutation is killed by that seed.
+needed, and the `m_pc_ret` mutation is killed by that seed (since the
+generator's injected returns, by seed 9).
 
 **Assertions** (simulation): at most one instruction retires per arm and
 exactly one before STEP, with `EADDR` (`id_pc`) its PC; armed implies user
@@ -2205,21 +2219,65 @@ an entry.
 - `tests.py` `ud_*`: every §13.2 case, including the walker refilling a
   stepped data and code page under TE = 1, an LR / SC, IRQs, the arming
   rules, the predictor cases, and the JTAG debug module (breakpoints and DM
-  steps on and around stepped instructions, `VSIM_DEBUG_EN=1`).
+  steps on and around stepped instructions; `ud_dm_um`, a debugger write
+  of UM = 0 under a DM breakpoint; `ud_dbl_dm`, a STEP entry's DOUBLE_FAULT
+  as a debug halt, the debugger moving SP_ALT into kseg and resuming;
+  `VSIM_DEBUG_EN=1`).
 - `tests.py` `uw_*`: every size, alignment and byte mask, with the EA split
   at random between rs1 and rs2 (all the operand carries); the stack and
   frame ops; MEMGET32 / DCBZ; LR / SC; faults; both watchpoints; step +
   watch; the supervisor rules (U, DI in program order, an IRET's frame
-  read, an LCD op behind a watched load); `EVEC` = 0; IRQs.
+  read, an LCD op behind a watched load); `EVEC` = 0; IRQs;
+  `uw_ret_unpred` (a stepped and an unstepped RET / LEAVERET with an empty
+  RAS, watched: WATCH + SSTEP); `uw_sq_spec` (a watched load in MEM on the
+  EN_ST1 squash edge: squashed before it fires, one WATCH).
 - `tests.py` `ud_sr`, and `ud_board_routines` (the board test's routines).
 - `run.py udbgfuzz` (`udbg.py`): randprog in user mode with injected
-  exceptions, DCBZ and LR / SC groups, random watchpoints chosen from the
-  run's own accesses, with and without the step, IRQs, `+LAT` / `+HIT`
-  variants. The user retire lines must equal the plain run's, and the
-  handler's log must equal an independent Python model of §13.
-- `ustepmut.py`: 58 mutations, every one killed.
+  exceptions, DCBZ and LR / SC groups and unbalanced returns (a RET, or
+  ENTER 0 + LEAVERET, with no CALL: unpredicted with an empty RAS,
+  mispredicted inside a function, whose own return then finds the RAS
+  empty), random watchpoints chosen from the run's own accesses, with and
+  without the step, IRQs, `+LAT` / `+HIT` variants; every fourth non-IRQ
+  seed (`--mode sup`: every seed) also runs the program in supervisor mode
+  with injected DI / EI, against the U / DI rules. The user retire lines
+  must equal the plain run's, and the handler's log must equal an
+  independent Python model of §13.
+- `ustepmut.py`: 68 mutations, every one killed (`m_sstep_fz`: the MAJOR
+  below, by `udbgfuzz` alone; `m_sup_di` / `m_sup_u`: the supervisor
+  rules, by `udbgfuzz --mode sup` alone).
 - `run.py socustep`: the board test (`tools/board/ustep_test.c`) on tb_soc.
+
+**Review of `1813b9c`** (an adversarial Opus review, 2026-11-23):
+- MAJOR, fixed: a stepped, watched RET / LEAVERET with an empty RAS lost
+  SSTEP — ECAUSE `0x020F` instead of `0x120F` (EADDR and the frame PC were
+  right, frame SS = 1), so the kernel's IRET stepped one more instruction:
+  a double step. The return serializes at dispatch (`fetch_halt`), the
+  `us_lat` boundary needs `!fetch_halt`, and `mem_wfire` fired first (its
+  first MEM cycle), so `us_ent` stayed 0. Fix: the fire sets `us_ent` when
+  `us_lat` is set (above). SSTEP no longer depends anywhere on the boundary
+  being taken before the fire. `udbgfuzz` missed it: randprog's calls
+  are balanced, so every return was predicted; the injected unbalanced
+  returns find it (`m_sstep_fz`), as does board routine D.
+- MINOR, fixed: a debugger write of register 21 with UM = 0 left the step
+  armed in supervisor mode (the `!us_arm || umode` assertion fired).
+- MINOR, documented: the LR / SC livelock under a watch (§13.3).
+- MINOR, covered: `mem_wfire`'s `!sq_spec` term (`uw_sq_spec`,
+  `m_sqspec`; the review's store-into-code test had taken the completion
+  SMC path instead) and the DOUBLE_FAULT park's disarm (`ud_dbl_dm`,
+  `dbl_disarm`); `udbgfuzz` now covers the supervisor U / DI rules.
+- Defensive code: the review's mutations `x_ras`, `x_pht`, `x_early` (the
+  RAS push, PHT training and early load issue of a younger op gated by the
+  access-fault squash alone, not the watch squash), `x_smc` (an SMC latch
+  drop keeping `us_lat`), `x_ussa` (no count for a latch on the arming
+  IRET's commit edge), `x_iretlat` (an IRET commit keeping `us_lat`),
+  `x_once` (`mem_wph` not cleared at the fire) and `x_dly` (the fire not
+  resetting DIV / DELAY) survive every suite: by the review's analysis they
+  are unreachable or cost performance only. The code stays as written.
+- NOTE: `CPU_FEATURES[29:28]` from `CORE1_UDBG_EN` (above).
 
 **Build** (`1813b9c`): tier 1 WNS +0.094 / WHS +0.029, 42,889 LUTs, 28,586
 FFs, 126 BRAM (≈ +0.7k LUTs, +0.1k FFs); the new registers have ≥ 0.89 ns
 of slack. Bitstream `~/.cache/kbuild/ustep_1813b9c.bit` (HW_PERF_PLAN §11).
+After the review's fix-up (`60bcc36`): tier 1 WNS +0.040 / WHS +0.024
+(the worst path is the pre-existing load-hit `wb_hext` → `mem_result`),
+42,861 LUTs, 28,667 FFs, 126 BRAM; `~/.cache/kbuild/ustep_60bcc36.bit`.

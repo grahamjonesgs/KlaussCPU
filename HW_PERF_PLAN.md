@@ -3678,7 +3678,44 @@ socvar` 0 failing (traces and PIPE_RUN cycles identical); `diff --plus
 `VSIM_DEBUG_EN=1`; `VSIM_EXC_EN=0 test` fails exactly master's set;
 `fwdfuzz` 480 runs; `udbgfuzz` (60 + 40 seeds, with IRQs) clean;
 `socustep` (the board test on tb_soc) USTEP PASS; `ustepmut.py` 58 of 58
-killed. Not yet run on the board.
+killed.
+
+**Board (2026-11-23):** `ustep_1813b9c.bit` in SRAM: all_tests 31/31,
+dcbz_test, hwprop, sd_hs_test, `ustep_test` USTEP PASS; runtime:
+board-check --boot 19/19, cold rustc hello unchanged (16.15 / 15.24 s
+against 15.9 s).
+
+**Review and fix-up (2026-11-23).** An adversarial Opus review of
+`1813b9c` (MMU_PLAN §13.6 lists it): one MAJOR — a stepped, watched RET /
+LEAVERET with an empty return stack reported WATCH without SSTEP (frame
+SS = 1, so the kernel stepped one more instruction); fixed in the watch
+fire (`us_lat` → `us_ent`), with no cycle change. MINORs: a debugger write
+of UM = 0 now disarms the step; the LR / SC livelock under a watch is
+documented (MMU_PLAN §13.3); tests for the `!sq_spec` term and the
+DOUBLE_FAULT disarm; `udbgfuzz` now injects unbalanced returns and runs a
+supervisor-mode program against the U / DI rules. `CPU_FEATURES[29:28]`
+now follow a top-level `CORE1_UDBG_EN`. The board test gained routine D
+(stepped, watched unpredicted RET / LEAVERET). No encoding change.
+
+**Build** (`60bcc36`, standard `build_fast` flow): tier 1 WNS +0.040 / WHS
++0.024, `~/.cache/kbuild/ustep_60bcc36.bit` (md5
+`82b1c4f2fa554c60257a2fad1875ff98`). 42,861 LUTs, 28,667 FFs, 126 BRAM
+tiles, 20 DSPs (synthesis: 25,708 registers against 25,716; the post-place
+difference is replication). The worst path is the pre-existing load-hit
+`wb_hext` → `mem_result`. No Synth 8-3332 / 8-4767; the 8-3333 / 8-3886
+differences are register-merge naming (`dbg_watch_addr`, constant UART
+message bits), none on the §13 logic.
+
+**Regression** (against master `3926075`): `l2_regress.sh core soc36 soc8
+socvar` 0 failing (all five `test` configurations, the ud_ / uw_ tests
+included; traces and PIPE_RUN cycles identical); `diff --plus +TRACECYC`
+cycle-identical also with `VSIM_EXC_EN=0`, `VSIM_MPU_EN=1`,
+`VSIM_DEBUG_EN=1` (and `VSIM_EXC_EN=0 --irq`); `VSIM_EXC_EN=0 test` fails
+master's set plus the ud_ / uw_ tests (they need exceptions); `fwdfuzz` 488
+runs; the review's `cycid.py` (exception-rich user / supervisor programs,
+`+TRACECYC`) 0 of 360 differing; `udbgfuzz` 1,650 runs, 1,650 with IRQs,
+200 `--mode sup`, 275 with `VSIM_DEBUG_EN=1` (fresh seeds) clean;
+`socustep` USTEP PASS (routine D included); `ustepmut.py` 68 of 68 killed.
 
 ## CPU_FEATURES additions
 
@@ -3881,4 +3918,10 @@ Decisions taken while implementing the frozen text above:
 - 2026-11-22: §11 user single step and watchpoints (MMU_PLAN §13) on
   `ustep`: `1813b9c`, standard flow tier 1 WNS +0.094 / WHS +0.029,
   `~/.cache/kbuild/ustep_1813b9c.bit`; cycle-identical to master while
-  unused.  Board test `tools/board/ustep_test.c`.  Not yet run on the board.
+  unused.  Board test `tools/board/ustep_test.c`.
+- 2026-11-23: `1813b9c` on the board in SRAM: all_tests 31/31, dcbz,
+  hwprop, sd_hs_test, ustep_test USTEP PASS; board-check --boot 19/19,
+  cold rustc hello unchanged.  Opus review: one MAJOR (a stepped, watched
+  unpredicted RET / LEAVERET lost SSTEP) and three MINORs, fixed in
+  `60bcc36`: tier 1 +0.040 / +0.024, `~/.cache/kbuild/ustep_60bcc36.bit`;
+  still cycle-identical to master while unused.  Not yet on the board.

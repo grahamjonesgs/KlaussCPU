@@ -128,9 +128,10 @@ MUTS = [
     ('m_pc_succ', 'the successor is the fall-through (a CALL\'s target lost)', PC, WATCH,
      "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_succ;", "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_pc_next;"),
     # (a predicted return CAN fire behind younger ops: udbgfuzz seed 54, a
-    # LEAVERET at +LAT=1, found when an assertion claimed otherwise)
+    # LEAVERET at +LAT=1, found when an assertion claimed otherwise; since
+    # the generator's injected returns (review of 1813b9c) seed 9 kills it)
     ('m_pc_ret', 'a predicted return does not point fetch at its target', PC,
-     WATCH + [['udbgfuzz', '--seed0', '54', '--seeds', '1', '--mode', 'watch']],
+     WATCH + [['udbgfuzz', '--seed0', '9', '--seeds', '1', '--mode', 'watch']],
      "if (!(mem_retq || mem_lvrq) || mem_pred) begin\n               ev_pcz  = 1'b1;",
      "if (!(mem_retq || mem_lvrq)) begin\n               ev_pcz  = 1'b1;"),
     # (not mutated: 'start clears the WPs' — core 1 is reset through every
