@@ -32,6 +32,9 @@ module KlaussCPU #(
     // MMU stage 1 on core 1 (MMU_PLAN.md): exceptions, user mode, SYSCALL,
     // MFSR/MTSR, LR/SC.  Reported in CPU_FEATURES (0xF00F_0048).
     parameter bit CORE1_EXC_EN = 1'b1,
+    // MMU_PLAN.md §13 on core 1 (needs stage 1): the user single step and
+    // the two user data watchpoints.  CPU_FEATURES[28] / [29].
+    parameter bit CORE1_UDBG_EN = 1'b1,
     // MMU stage 2 (the 16-region MPU) on core 1.  CPU_FEATURES[1], [7:4].
     // An optional build feature: off on the Nexys A7 for timing margin
     // (Graham, 2026-11-09; Zephyr runs in supervisor mode).
@@ -877,7 +880,8 @@ module KlaussCPU #(
 
    pipeline_core #(.DEBUG_EN(DEBUG_EN), .EXC_EN(CORE1_EXC_EN), .MPU_EN(CORE1_MPU_EN),
                    .TLB_EN(CORE1_TLB_EN), .TLB_N(CORE1_TLB_N), .TLB_WALK(CORE1_TLB_WALK),
-                   .IC_LINES(CORE1_IC_LINES), .IC_LB(CORE1_IC_LB), .RIINV_EN(1'b1)) pipeline_core_i (
+                   .IC_LINES(CORE1_IC_LINES), .IC_LB(CORE1_IC_LB), .RIINV_EN(1'b1),
+                   .UDBG_EN(CORE1_UDBG_EN)) pipeline_core_i (
       .clk        (i_Clk),
       .ce         (1'b1),           // core 1 runs full-rate; ce exists for core 2
       .rst        (w_reset_H || w_pip_hold_rst),
@@ -1500,7 +1504,7 @@ module KlaussCPU #(
                                                  | {37'b0, CORE1_L2_EN, 26'b0}    // [26] the L2 (HW_PERF_PLAN.md §6)
                                                  | 64'h0800_0000                  // [27] the cache range ops (SD DMA spec v1.2)
                                                  // [28] user single step, [29] the user watchpoints (MMU_PLAN.md §13)
-                                                 | {34'b0, CORE1_EXC_EN, CORE1_EXC_EN, 28'b0};
+                                                 | {34'b0, {2{CORE1_EXC_EN && CORE1_UDBG_EN}}, 28'b0};
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
                16'h0058: r_mmio_read_data_comb = {62'b0, w_sd_irq, r_eth_irq_raw}; // INT2_PENDING
                default:  r_mmio_read_data_comb = 64'h0;

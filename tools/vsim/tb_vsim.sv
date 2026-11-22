@@ -339,17 +339,32 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
    bit          dbg_mw = 0, dbg_mw_go = 0;
    logic [31:0] dbg_mw_a;
    logic [63:0] dbg_mw_d;
+   // +DBG_RI=<reg> +DBG_RV=<hex>: at the first halt (after a +DBG_MW
+   // write), before resuming, the debugger writes the register (reg_we,
+   // the debugger's numbering: 20 SP_ALT, 21 {DI, UM}, ...)
+   // +DBG_NRES=<n>: at most n resumes — the next halt stays, and ends the run
+   // +DBG_DRV: the driver without a breakpoint (halts from TRAP / HALT /
+   // DOUBLE_FAULT with +DBG_ATTACHED)
+   bit          dbg_rw = 0, dbg_left = 0;
+   logic [4:0]  dbg_rw_i;
+   logic [63:0] dbg_rw_d;
+   int          dbg_nres = -1, dbg_nres_n = 0;
    always @(posedge clk) if (!rst && dbg_drv) begin
-      dbg_i.resume <= 1'b0;  dbg_i.step <= 1'b0;  dbg_i.mem_req <= 1'b0;
+      dbg_i.resume <= 1'b0;  dbg_i.step <= 1'b0;  dbg_i.mem_req <= 1'b0;  dbg_i.reg_we <= 1'b0;
       if (dbg_mw_go && dut.dbg_mem_done) dbg_mw_go <= 0;
       if (parked && park_kind == 3'd4 && !dbg_i.resume && dbg_mw && !dbg_mw_go) begin
          dbg_mw <= 0;  dbg_mw_go <= 1;
          dbg_i.mem_req <= 1'b1;  dbg_i.mem_we <= 1'b1;  dbg_i.mem_addr <= dbg_mw_a;
          dbg_i.mem_wdata <= dbg_mw_d;  dbg_i.mem_be <= 8'hFF;
-      end else if (parked && park_kind == 3'd4 && !dbg_i.resume && !dbg_mw && !dbg_mw_go) begin
+      end else if (parked && park_kind == 3'd4 && !dbg_i.resume && dbg_rw && !dbg_mw && !dbg_mw_go) begin
+         dbg_rw <= 0;
+         dbg_i.reg_we <= 1'b1;  dbg_i.reg_idx <= dbg_rw_i;  dbg_i.reg_wdata <= dbg_rw_d;
+      end else if (parked && park_kind == 3'd4 && !dbg_i.resume && !dbg_mw && !dbg_mw_go && !dbg_rw) begin
          if (dbg_gap < 4) dbg_gap <= dbg_gap + 1;      // let the halt settle
+         else if (dbg_nres >= 0 && dbg_nres_n >= dbg_nres) dbg_left <= 1;
          else begin
             dbg_gap <= 0;
+            dbg_nres_n <= dbg_nres_n + 1;
             dbg_i.resume <= 1'b1;
             if (dbg_stepped < dbg_steps) begin dbg_i.step <= 1'b1; dbg_stepped <= dbg_stepped + 1; end
             else if (dbg_plain_done < dbg_plain) dbg_plain_done <= dbg_plain_done + 1;   // plain resume, bp stays
@@ -670,7 +685,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       // (+PARK_HOLD=<n>: keep running n cycles first, so anything that still
       // moves after a park — a re-taken IRQ, a dispatch — trips the core's
       // assertions)
-      if (!rst && parked && park_kind != 3'd3 && !(dbg_drv && park_kind == 3'd4) && bus_idle && !in_flight) begin
+      if (!rst && parked && park_kind != 3'd3 && !(dbg_drv && park_kind == 3'd4 && !dbg_left) && bus_idle && !in_flight) begin
          if (park_hold_n >= park_hold) done("park");
          park_hold_n++;
       end
@@ -746,12 +761,20 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          logic [31:0] bpa;
          if ($value$plusargs("DBG_BP0=%h", bpa)) begin
             dbg_drv = 1;  dbg_i.bp_en[0] = 1'b1;  dbg_i.bp_addr[0] = bpa;
+         end
+         if ($test$plusargs("DBG_DRV")) dbg_drv = 1;
+         if (dbg_drv) begin
             void'($value$plusargs("DBG_STEPS=%d", dbg_steps));
             void'($value$plusargs("DBG_PLAIN=%d", dbg_plain));
             if ($value$plusargs("DBG_MW=%h", dbg_mw_a)) begin
                dbg_mw = 1;
                void'($value$plusargs("DBG_MD=%h", dbg_mw_d));
             end
+            if ($value$plusargs("DBG_RI=%d", dbg_rw_i)) begin
+               dbg_rw = 1;
+               void'($value$plusargs("DBG_RV=%h", dbg_rw_d));
+            end
+            void'($value$plusargs("DBG_NRES=%d", dbg_nres));
          end
       end
       void'($value$plusargs("PARK_HOLD=%d", park_hold));

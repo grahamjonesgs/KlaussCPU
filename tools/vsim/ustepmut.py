@@ -165,7 +165,39 @@ MUTS = [
     ('ecause_w', 'MTSR ECAUSE keeps 9 bits', PC, [['test', 'ud_sr']],
      "4'd2: ecause <= mtsr_wdata[12:0];", "4'd2: ecause <= {4'b0, mtsr_wdata[8:0]};"),
     ('feat', 'CPU_FEATURES[29:28] not reported', TOP, [['socmmio', '--base', 'master']],
-     "| {34'b0, CORE1_EXC_EN, CORE1_EXC_EN, 28'b0};", "| {34'b0, 1'b0, 1'b0, 28'b0};"),
+     "| {34'b0, {2{CORE1_EXC_EN && CORE1_UDBG_EN}}, 28'b0};", "| {34'b0, 2'b00, 28'b0};"),
+    # ---------------- review of 1813b9c (2026-11-23) ----------------
+    # MAJOR: a stepped unpredicted RET / LEAVERET (an empty RAS serializes,
+    # fetch_halt holds the STEP boundary off) fires in its first MEM cycle:
+    # the entry lost SSTEP (a double step).  Killed by the directed test and,
+    # separately, by udbgfuzz (its injected unbalanced returns) alone.
+    ('m_sstep', 'a watch fire before the STEP boundary drops SSTEP', PC, [['test', 'uw_ret_unpred']],
+     "            if (us_lat) us_ent <= 1'b1;\n", ""),
+    ('m_sstep_fz', 'the same, against udbgfuzz alone', PC, [['udbgfuzz', '--seeds', '12', '--mode', 'watch']],
+     "            if (us_lat) us_ent <= 1'b1;\n", ""),
+    ('dm_um', 'a debugger write of UM = 0 leaves the step armed', PC, [(DBG, ['test', 'ud_dm_um'])],
+     "                           if (EN_UDBG && !dbg_i.reg_wdata[0]) begin us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0; end\n", ""),
+    ('m_sqspec', 'mem_wfire ignores the EN_ST1 squash (sq_spec)', PC, [['test', 'uw_sq_spec']],
+     "wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !mem_xsq && !sq_spec && !wb_wait;",
+     "wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !mem_xsq && !wb_wait;"),
+    ('dbl_disarm', 'a DOUBLE_FAULT park keeps the step armed', PC, [(DBG, ['test', 'ud_dbl_dm'])],
+     "                     if (EN_UDBG) begin\n                        us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0;  us_ent <= 1'b0;  wp_ent <= 1'b0;\n                     end\n                     park_op    <= 32'b0;",
+     "                     park_op    <= 32'b0;"),
+    ('m_sup_di', 'a supervisor access hits whatever DI says (udbgfuzz --mode sup)', PC,
+     [['udbgfuzz', '--seeds', '8', '--mode', 'sup']],
+     "mode = umode || (!wp_u[n] && !ex_dis_eff);", "mode = umode || !wp_u[n];"),
+    ('m_sup_u', 'a supervisor access hits a U = 1 watchpoint (udbgfuzz --mode sup)', PC,
+     [['udbgfuzz', '--seeds', '8', '--mode', 'sup']],
+     "mode = umode || (!wp_u[n] && !ex_dis_eff);", "mode = umode || !ex_dis_eff;"),
+    # (the reviewer's further mutations that the suites kill)
+    ('x_uxq', 'ECAUSE[12:9] not cleared at a WB exception record', PC, BOTH,
+     "               exc_cause_q <= wb_xcause;\n               exc_ux_q    <= '0;\n", "               exc_cause_q <= wb_xcause;\n"),
+    ('x_busy', 'the fire kills MEM even when it is busy', PC, WATCH,
+     "            if (!mem_busy) mem_valid <= 1'b0;   // (the EX op entering MEM)\n",
+     "            mem_valid <= 1'b0;   // (the EX op entering MEM)\n"),
+    ('x_idv', 'the fire keeps the ID op', PC, WATCH,
+     "            ex_valid   <= 1'b0;\n            id_valid   <= 1'b0;\n            dly_on     <= 1'b0;\n            div_ph     <= MD_IDLE;\n            if (!(mem_retq",
+     "            ex_valid   <= 1'b0;\n            dly_on     <= 1'b0;\n            div_ph     <= MD_IDLE;\n            if (!(mem_retq"),
 ]
 
 

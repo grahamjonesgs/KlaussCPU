@@ -16,6 +16,11 @@ flagged relative is an offset into the routine.
      address), a spanning MEMGET32 hitting only its 2nd doubleword
      (EADDR = its start), both watchpoints on one access, R-only vs a store.
   C  step + watch (SS = 1): WATCH with SSTEP on the stepped store.
+  D  step + watch on unpredicted returns (SS = 1; MMU_PLAN §13.6, the
+     review of 1813b9c): four RETs with no CALL drain the return stack,
+     then a RET reading a watched [SP] and a LEAVERET watched on its 2nd
+     doubleword — both serialize (an empty RAS) and must report WATCH
+     with SSTEP (one step, not two).
 """
 import os
 import sys
@@ -122,6 +127,41 @@ def routine_c():
     return a, exp, d
 
 
+def routine_d():
+    """returns (a, exp, wp0 address, wp1 address)"""
+    a = Asm(base=0)
+    P = {}
+    d = DATA + 0x300
+    seq = []
+    for k in range(4):                                       # (RAS_DEPTH = 4: empty after these)
+        seq.append(a.leapc(5, f'D{k}')); seq.append(a.push(5)); seq.append(a.ret())
+        a.label(f'D{k}')
+    seq.append(a.push(6))                                    # (the watched slot: USP - 16)
+    seq.append(a.leapc(5, 'R')); seq.append(a.push(5))
+    P['ret'] = a.ret()
+    seq.append(P['ret'])
+    a.label('R')
+    seq.append(a.pop(6))
+    seq.append(a.setr(6, d)); seq.append(a.leapc(5, 'R2')); seq.append(a.st(64, 5, 6, 8))
+    seq.append(a.setr(5, 0x1234)); seq.append(a.st(64, 5, 6, 0)); seq.append(a.setr(15, d))
+    P['lr'] = a.leaveret()
+    seq.append(P['lr'])
+    a.label('R2')
+    hp = a.halt()
+    seq.append(hp)
+    exp = []
+    for i, at in enumerate(seq[:-1]):
+        nx = seq[i + 1]
+        if at == P['ret']:
+            exp.append((WATCH | SSTEP | 1 << 9, USP - 16, 0, nx, 3))
+        elif at == P['lr']:
+            exp.append((WATCH | SSTEP | 1 << 10, d + 8, 0, nx, 3))
+        else:
+            exp.append((STEP | SSTEP, at, 1, nx, 3))
+    exp.append((PRIV, HALT_W, 0, hp, 3))
+    return a, exp, USP - 16, d + 8
+
+
 def emit(name, a, exp, f):
     ws = a.assemble()
     f.write(f'static const uint32_t {name}[{len(ws)}] = {{\n')
@@ -144,6 +184,8 @@ def main():
         a, e = routine_b(); emit('USTEP_B', a, e, f)
         a, e, d = routine_c(); emit('USTEP_C', a, e, f)
         f.write(f'#define USTEP_C_WP 0x{d:08X}u\n')
+        a, e, w0, w1 = routine_d(); emit('USTEP_D', a, e, f)
+        f.write(f'#define USTEP_D_WP0 0x{w0:08X}u\n#define USTEP_D_WP1 0x{w1:08X}u\n')
     print(out)
 
 

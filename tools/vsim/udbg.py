@@ -22,6 +22,14 @@ Checks, per seed and variant:
   specified, and the frame PC = the next instruction (after skipping the
   injected words, which fault and are stepped over by the handler);
 - every simulator assertion holds (the core's §13 invariants).
+
+The user program also carries injected unbalanced returns (a RET, or ENTER
+0 + LEAVERET, of a pushed address with no CALL): unpredicted with an empty
+RAS, mispredicted inside a randprog function, whose own return then finds
+the RAS empty.  On every fourth non-IRQ seed (or every seed with --mode
+sup) the program also runs in supervisor mode (frame PM = 0) with injected
+DI / EI, against the §13.3 supervisor rules: U = 0 watchpoints only, and
+only with DI = 0 in program order (no step: it arms only to user mode).
 """
 import random
 
@@ -100,11 +108,15 @@ def accesses(words, pc, regs, sp, after_regs, after_sp):
     return []
 
 
-def watch_hit(acc, wps):
-    """§13.3 for a user-mode instruction: (hits bitmask, store, eaddr)"""
+def watch_hit(acc, wps, sup=False, dis=False):
+    """§13.3 for a user-mode instruction (sup: a supervisor one, with DI =
+    dis in program order — only U = 0 watchpoints, only with DI = 0):
+    (hits bitmask, store, eaddr)"""
     hits, eaddr, first_hit, store = 0, None, False, False
     for dw, m, st, raw, first in acc:
         for n, (k, be, rr, ww, uu) in enumerate(wps):
+            if sup and (uu or dis):
+                continue
             if (rr and not st) or (ww and st):
                 if dw == (k >> 3) & 0x1FFFFFFF and m & be:
                     hits |= 1 << n
@@ -119,13 +131,22 @@ def watch_hit(acc, wps):
 
 
 # ---------------------------------------------------------------- the program
-def gen(seed, p_inj=0.0, irq=False, extra=0.0, lrsc=False):
+DI_W, EI_W = (1 << 30) | (0xB << 26) | 6 << 16, (1 << 30) | (0xB << 26) | 7 << 16
+
+
+def gen(seed, p_inj=0.0, irq=False, extra=0.0, lrsc=False, rets=0.0, didi=0.0):
     """randprog `seed` in user mode behind the fixed prologue; p_inj:
     injected exception words; extra: injected DCBZ (and, with lrsc, LR / SC
-    of the same value: only where no entry can fall between them)"""
+    of the same value: only where no entry can fall between them); rets:
+    injected unbalanced returns — a RET, or ENTER 0 + LEAVERET, of a pushed
+    return address with no CALL: unpredicted where the RAS is empty (at the
+    top level), mispredicted inside a randprog function (whose own return
+    then finds the RAS empty); didi: injected DI / EI (supervisor programs:
+    the §13.3 DI rule)"""
     import randprog
     from tests import _xsetup
     rnd = random.Random(seed * 104729 + 7)
+    rnd2 = random.Random(seed * 7919 + 13)     # (the rets / didi draws: rnd's sequence unchanged)
     words_x = [0x6C080000, 0x6C040000, 0x7C000000, 0x6C060000, 0x6C070000, 0x6C401000, 0x6C020000,
                0x6C030000, 0x70000010]
 
@@ -135,6 +156,9 @@ def gen(seed, p_inj=0.0, irq=False, extra=0.0, lrsc=False):
             self.inj = False
             self.injs = set()
             _xsetup(self)
+            # (DI: the prologue's own accesses — the frame push — never hit a
+            # U = 0 watchpoint; the IRET restores DI = 0 from the frame)
+            self.di(1)
             for i, sr in enumerate(('wp0_addr', 'wp0_ctrl', 'wp1_addr', 'wp1_ctrl')):
                 self.ld_abs(64, 1, CFG + 8 * i)
                 self.mtsr(sr, 1)
@@ -166,6 +190,24 @@ def gen(seed, p_inj=0.0, irq=False, extra=0.0, lrsc=False):
                         self.setr(13, DATA + 8 * rnd.randrange(0, 0x100))
                         self.lr(64, 14, 13); self.sc(64, 14, 14, 13)
                     self.pop(14); self.pop(13)
+                if rets and rnd2.random() < rets:
+                    lbl = f'_ur{len(self.labels)}'
+                    self.push(13)
+                    self.leapc(13, lbl); self.push(13)
+                    if rnd2.random() < 0.5:
+                        self.ret()
+                    else:
+                        self.enter(0); self.leaveret()   # (R15 and SP restored)
+                    self.label(lbl)
+                    self.pop(13)
+                if didi and rnd2.random() < didi:
+                    self.push(13)
+                    k = rnd2.random()
+                    if k < 0.4:
+                        self.di(13)
+                    else:
+                        self.setr(13, int(k < 0.85)); self.ei(13)
+                    self.pop(13)
                 self.inj = True
             return super().emit(*ws)
 
@@ -201,13 +243,14 @@ def gen(seed, p_inj=0.0, irq=False, extra=0.0, lrsc=False):
     return a
 
 
-def configure(a, wps=None, ss=False, mask=0):
-    """write the data dwords: wps = [(addr, be, r, w, u)] x 2"""
+def configure(a, wps=None, ss=False, mask=0, sup=False):
+    """write the data dwords: wps = [(addr, be, r, w, u)] x 2; sup: the
+    program runs in supervisor mode (frame PM = 0)"""
     wps = wps or [(0, 0, 0, 0, 0), (0, 0, 0, 0, 0)]
     for i, (k, be, rr, ww, uu) in enumerate(wps):
         a.data[CFG + 16 * i] = k & 0xFFFFFFFF
         a.data[CFG + 16 * i + 8] = be | rr << 8 | ww << 9 | uu << 10
-    a.data[CFG + 32] = 1 << 44 | int(ss) << 45 | mask << 39
+    a.data[CFG + 32] = int(not sup) << 44 | int(ss) << 45 | mask << 39
 
 
 # ---------------------------------------------------------------- the checker
@@ -225,8 +268,9 @@ def parse_trace(path):
 STATS = {}
 
 
-def check(a, tr_plain, tr_run, wps, ss):
-    """returns a list of problems"""
+def check(a, tr_plain, tr_run, wps, ss, sup=False):
+    """returns a list of problems (sup: a supervisor-mode program — no step,
+    the §13.3 U / DI rules, its HALT parks: no final log entry)"""
     bad = []
     img = {}
     for i, w in enumerate(a.assemble()):
@@ -248,9 +292,12 @@ def check(a, tr_plain, tr_run, wps, ss):
             cur.append(int(t['wr'].split('/')[2], 16))
             if len(cur) == 3:
                 log.append(tuple(cur)); cur = []
-    if not log or (log[-1][0] & 0xFF) != 2 or log[-1][1] != HALT_W:
+    if sup:
+        halt_pc = a.uhi - 4                    # (randprog's last word: its HALT parks)
+    elif not log or (log[-1][0] & 0xFF) != 2 or log[-1][1] != HALT_W:
         return bad + [f'no final HALT entry in the log ({log[-1:] if log else "empty"})']
-    halt_pc = log[-1][2] & 0xFFFFFFFF
+    else:
+        halt_pc = log[-1][2] & 0xFFFFFFFF
     # the model
     pre = None
     for t in tr_run:
@@ -258,9 +305,21 @@ def check(a, tr_plain, tr_run, wps, ss):
             break
         pre = t
     exp = []
+    dis = False                                # (DI in program order: the frame's DI = 0)
     for i, t in enumerate(ur):
         acc = accesses(words, t['pc'], pre['regs'], pre['sp'], t['regs'], t['sp'])
-        hits, st, ea = watch_hit(acc, wps) if wps else (0, False, None)
+        hits, st, ea = watch_hit(acc, wps, sup, dis) if wps else (0, False, None)
+        w0 = words(t['pc'])
+        if w0 & 0xFFFFF0FF == DI_W:
+            dis = True
+        elif w0 & 0xFFFFFF0F == EI_W:
+            dis = not (pre['regs'][(w0 >> 4) & 0xF] & 1)
+        if sup and hits:
+            STATS['sup'] = STATS.get('sup', 0) + 1
+        if sup and wps and dis and watch_hit(acc, wps, sup, False)[0]:
+            STATS['sup_di'] = STATS.get('sup_di', 0) + 1     # (a hit DI = 1 blocks)
+        if wps and acc and (w0 >> 26) & 0xF == 9 and (w0 >> 22) & 0xF in (6, 10) and hits:
+            STATS['ret'] = STATS.get('ret', 0) + 1           # (RET / LEAVERET hits)
         if hits:
             w0 = words(t['pc'])
             kind = ('dcbz' if w0 & 0xFFFFFF0F == 0x5F002000 else 'stack' if (w0 >> 26) & 0xF in (8, 9)
@@ -298,7 +357,7 @@ def check(a, tr_plain, tr_run, wps, ss):
                 break
             j += 1
         want_ss = int(ss)
-        if g[0] != cause or g[1] != ea or f != nxt or (fr >> 44) & 1 != 1 or (fr >> 45) & 1 != want_ss:
+        if g[0] != cause or g[1] != ea or f != nxt or (fr >> 44) & 1 != int(not sup) or (fr >> 45) & 1 != want_ss:
             bad.append(f'entry {i} (insn at {at:08x}): got ecause={g[0]:x} eaddr={g[1]:08x} frame={fr:016x}; '
                        f'want ecause={cause:x} eaddr={ea if ea is None else hex(ea)} next={nxt:08x} ss={want_ss}')
             if len(bad) > 4:
@@ -358,43 +417,54 @@ def cmd_udbgfuzz(a, build, run):
         if a.mode in ('all', 'watch'):
             variants.append(('watch', True, False))
             variants.append(('wstep', True, True))
-        if a.mode != 'step' and not irq and s % 4 == 3:
+        if a.mode in ('all', 'watch') and not irq and s % 4 == 3:
             variants = [('watch', True, False)]      # (LR / SC: no entry may fall between them)
         lrsc = not irq and not any(v[2] for v in variants)
-        prog = gen(s, p_inj=p_inj, irq=irq, extra=0.06, lrsc=lrsc)
-        configure(prog, None, ss=False, mask=1 if irq else 0)
-        st0, tr0 = run(exe, prog, f'ud0_{s}', plus, trace=True)
-        if st0.get('end') != 'park' or 'fatal' in st0['log'].lower():
-            fails += 1
-            print(f'FAIL seed={s} plain run: end={st0.get("end")} ' + st0['log'][-300:])
-            continue
-        trp = parse_trace(tr0)
-        accs = plain_accesses(prog, trp)
-        for name, w, ss in variants:
-            wps = rand_wps(rnd, accs) if w else None
-            if wps and lrsc:
-                # (a watched load's WATCH entry would clear the LR's
-                # reservation, and the SC fail where the plain run's
-                # succeeds — §13.2: correct, but not comparable)
-                wps = [(k, be, 0, 1, u) for k, be, r, w_, u in wps]
-            configure(prog, wps, ss=ss, mask=1 if irq else 0)
-            st, tr = run(exe, prog, f'ud{name}_{s}', plus, trace=True)
-            runs += 1
-            bad = []
-            if st.get('end') != 'park' or st.get('kind') != '0':
-                bad.append(f'end={st.get("end")} kind={st.get("kind")}')
-            if 'fatal' in st['log'].lower() or 'assert' in st['log'].lower():
-                bad.append('assertion: ' + ' '.join(l for l in st['log'].splitlines() if 'atal' in l)[:300])
-            if not bad:
-                bad = check(prog, trp, parse_trace(tr), wps, ss)
-                n_ent += sum(1 for t in parse_trace(tr) if t['wr'] and LOG <= int(t['wr'].split('/')[0], 16) < LOG + 0x10000) // 3
-            os.remove(tr)
-            if bad:
+        progs = []
+        if variants:
+            progs.append((False, gen(s, p_inj=p_inj, irq=irq, extra=0.06, lrsc=lrsc, rets=0.03), variants, lrsc))
+        # the program in supervisor mode (U = 0 watchpoints only, DI = 0 in
+        # program order; injected DI / EI): no IRQs — an IRQ handler's
+        # accesses (DI = 0) would hit too — and no injected exception words
+        if not irq and (a.mode == 'sup' or (a.mode in ('all', 'watch') and s % 4 == 1)):
+            progs.append((True, gen(s, extra=0.06, rets=0.03, didi=0.04), [('swatch', True, False)], False))
+        for sup, prog, variants, lrsc in progs:
+            tag = 's' if sup else ''
+            configure(prog, None, ss=False, mask=1 if irq else 0, sup=sup)
+            st0, tr0 = run(exe, prog, f'ud0{tag}_{s}', plus, trace=True)
+            if st0.get('end') != 'park' or 'fatal' in st0['log'].lower():
                 fails += 1
-                print(f'FAIL seed={s} {name} lat={lat} irq={irq} inj={len(prog.injs)} wps={wps}: ' + '; '.join(bad))
-            elif a.verbose:
-                print(f'pass seed={s} {name} lat={lat} irq={irq} inj={len(prog.injs)}')
-        os.remove(tr0)
+                print(f'FAIL seed={s} plain{tag} run: end={st0.get("end")} ' + st0['log'][-300:])
+                continue
+            trp = parse_trace(tr0)
+            accs = plain_accesses(prog, trp)
+            for name, w, ss in variants:
+                wps = rand_wps(rnd, accs) if w else None
+                if wps and lrsc:
+                    # (a watched load's WATCH entry would clear the LR's
+                    # reservation, and the SC fail where the plain run's
+                    # succeeds — §13.2: correct, but not comparable)
+                    wps = [(k, be, 0, 1, u) for k, be, r, w_, u in wps]
+                if wps and sup:
+                    wps = [(k, be, r, w_, u if rnd.random() < 0.3 else 0) for k, be, r, w_, u in wps]
+                configure(prog, wps, ss=ss, mask=1 if irq else 0, sup=sup)
+                st, tr = run(exe, prog, f'ud{name}_{s}', plus, trace=True)
+                runs += 1
+                bad = []
+                if st.get('end') != 'park' or st.get('kind') != '0':
+                    bad.append(f'end={st.get("end")} kind={st.get("kind")}')
+                if 'fatal' in st['log'].lower() or 'assert' in st['log'].lower():
+                    bad.append('assertion: ' + ' '.join(l for l in st['log'].splitlines() if 'atal' in l)[:300])
+                if not bad:
+                    bad = check(prog, trp, parse_trace(tr), wps, ss, sup)
+                    n_ent += sum(1 for t in parse_trace(tr) if t['wr'] and LOG <= int(t['wr'].split('/')[0], 16) < LOG + 0x10000) // 3
+                os.remove(tr)
+                if bad:
+                    fails += 1
+                    print(f'FAIL seed={s} {name} lat={lat} irq={irq} inj={len(prog.injs)} wps={wps}: ' + '; '.join(bad))
+                elif a.verbose:
+                    print(f'pass seed={s} {name} lat={lat} irq={irq} inj={len(prog.injs)}')
+            os.remove(tr0)
     print(f'{fails} failing of {runs} runs ({n_ent} logged entries); watch hits by kind: {STATS}')
     return 1 if fails else 0
 

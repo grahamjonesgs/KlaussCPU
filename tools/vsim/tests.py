@@ -7711,12 +7711,17 @@ def ud_board_routines():
     UB = 0x00610000
     out = []
     for name, (ra, ss, cfg) in {'A': (g.routine_a, 1, False), 'B': (g.routine_b, 0, True),
-                                'C': (lambda: g.routine_c()[:2], 1, False)}.items():
+                                'C': (lambda: g.routine_c()[:2], 1, False),
+                                'D': (lambda: g.routine_d()[:2], 1, False)}.items():
         r, exp = ra()
         a = Asm()
         _xsetup(a)
         if name == 'C':
             a.setr(1, g.routine_c()[2]); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_W); a.mtsr('wp0_ctrl', 1)
+        if name == 'D':
+            _, _, w0, w1 = g.routine_d()
+            a.setr(1, w0); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_R | WP_U); a.mtsr('wp0_ctrl', 1)
+            a.setr(1, w1); a.mtsr('wp1_addr', 1); a.setr(1, 0xFF | WP_R | WP_U); a.mtsr('wp1_ctrl', 1)
         a.setr(1, g.USP); a.mtsr('usp', 1)
         a.setr(2, UB); a.setr64(3, (1 << 44) | (ss << 45)); a.alu('or', 2, 2, 3)
         a.push(2); a.iret()
@@ -7730,4 +7735,135 @@ def ud_board_routines():
         e.update(_udexp(ents))
         for plus in ([], ['+HIT=70']):
             out.append((a, e, plus))
+    return out
+
+
+@test
+def uw_ret_unpred():
+    """§13.2 / §13.3 (review of 1813b9c, MAJOR): a stepped RET / LEAVERET
+    with an empty RAS is unpredicted — it serializes (fetch halted behind
+    it), so its watch fires in its first MEM cycle before the STEP boundary
+    is taken; the entry is still WATCH + SSTEP (frame SS = 1: one step, not
+    two).  RET reading a watched [SP]; LEAVERET watched on its first or
+    second doubleword; and the same without the step (WATCH alone)"""
+    out = []
+    s_ = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+    for plus in ([], ['+LAT=1'], ['+LAT=7'], ['+HIT=70']):
+        for ss in (1, 0):
+            P = {}
+
+            def body(a):
+                P['lea'] = a.leapc(5, 'R')
+                P['push'] = a.push(5)
+                P['ret'] = a.ret()                              # (no CALL: the RAS is empty)
+                a.label('R')
+                return P
+
+            def ents(a, P, hp, ss=ss):
+                e = [s_(P['lea'], P['push']), s_(P['push'], P['ret'])] if ss else []
+                e.append((X_WATCH | 1 << 9 | (SSTEP if ss else 0), USP - 8, hp, 3 if ss else 1))
+                return e + [(X_PRIV, HALT_W, hp, 3 if ss else 1)]
+            out.append(_udprog(body, ss=ss, wps=[(USP - 8, 0xFF | WP_R | WP_U)], entries=ents, plus=plus))
+            for wpdw in ((1, 0) if ss else (1,)):
+                P = {}
+
+                def pre(a):
+                    a.leapc(5, 'R'); a.setr(6, DATA); a.st(64, 5, 6, 8); a.setr(5, 0x1234); a.st(64, 5, 6, 0)
+
+                def body(a):
+                    P['s15'] = a.setr(15, DATA)
+                    P['lr'] = a.leaveret()                      # (no CALL: the RAS is empty)
+                    a.label('R')
+                    return P
+
+                def ents(a, P, hp, ss=ss, wpdw=wpdw):
+                    e = [s_(P['s15'], P['lr'])] if ss else []
+                    e.append((X_WATCH | 1 << 9 | (SSTEP if ss else 0), DATA + 8 * wpdw, hp, 3 if ss else 1))
+                    return e + [(X_PRIV, HALT_W, hp, 3 if ss else 1)]
+                out.append(_udprog(body, ss=ss, wps=[(DATA + 8 * wpdw, 0xFF | WP_R | WP_U)], entries=ents,
+                                   pre=pre, plus=plus, exp={'r15': 0x1234}))
+    return out
+
+
+@test
+def uw_sq_spec():
+    """§13.3: a watched load in MEM on the edge an EN_ST1 store that posted
+    speculatively turns out to overlap code (sq_spec): the squash kills the
+    load before its watch fires (mem_wfire excludes sq_spec) and it re-runs
+    from the store's successor — one WATCH, not two.  The store rewrites an
+    executed (I-cache valid) code dword with the same two NOPs"""
+    out = []
+    d = DATA + 0x3C0
+    for fill in range(0, 4):
+        for plus in ([], ['+LAT=1'], ['+LAT=6'], ['+HIT=70']):
+            P = {}
+
+            def body(a, fill=fill):
+                while a.pc % 16:
+                    a.nop()
+                a.label('L'); a.nop(); a.nop()                  # an executed code dword
+                a.setr64(1, (0x6C000000 << 32) | 0x6C000000)    # the same two NOPs
+                a.leapc(2, 'L'); a.setr(9, d); a.setr(4, 0)
+                for _ in range(fill + 3):
+                    a.nop()
+                P['st'] = a.st(64, 1, 2)                        # posts; overlaps code -> sq_spec
+                P['ld'] = a.ld(64, 4, 9)                        # watched: in MEM on the squash edge
+                P['inc'] = a.inc(4)
+                return P
+
+            def ents(a, P, hp):
+                return [(X_WATCH | 1 << 9, d, P['inc'], 1), (X_PRIV, HALT_W, hp, 1)]
+            out.append(_udprog(body, ss=0, wps=[(d, 0xFF | WP_R | WP_U)], entries=ents, plus=plus,
+                               exp={'r4': 1}))
+    return out
+
+
+@test
+def ud_dm_um():
+    """§13.2: a debugger write of register 21 ({DI, UM}) with UM = 0 while a
+    user step is armed (a DM breakpoint on a stepped user instruction)
+    disarms it: the rest runs in supervisor mode unstepped, and the HALT
+    parks.  (VSIM_DEBUG_EN=1 builds only)"""
+    if not _os0.environ.get('VSIM_DEBUG_EN') == '1':
+        return []
+    out = []
+    for k in (0, 1, 3):
+        for plus in ([], ['+LAT=1'], ['+HIT=70']):
+            P = {}
+
+            def body(a):
+                P['i'] = [a.setr(1, 5), a.inc(1), a.alu('add', 2, 1, 1), a.inc(2), a.inc(1)]
+                return P
+            s_ = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+            a, e, p = _udprog(body, ss=1, plus=plus, exp={'r1': 7, 'r2': 13})
+            ii = P['i']
+            e.update(_udexp([s_(ii[j], ii[j + 1]) for j in range(k)]))
+            out.append((a, e, p + [f'+DBG_BP0={ii[k]:x}', '+DBG_RI=21', '+DBG_RV=0']))
+    return out
+
+
+@test
+def ud_dbl_dm():
+    """§13.2: a DOUBLE_FAULT park (TE = 1, the STEP entry's frame push
+    outside kseg) disarms the step: with the debugger attached it is a
+    debug halt; the debugger moves the kernel SP (SP_ALT) into kseg and
+    resumes — the rest runs unstepped, the user HALT enters PRIVILEGED
+    normally (SS = 0).  (VSIM_DEBUG_EN=1 builds only)"""
+    if not _os0.environ.get('VSIM_DEBUG_EN') == '1' or NOEXC:
+        return []
+    out = []
+    for plus in ([], ['+LAT=1'], ['+HIT=70']):
+        a = Asm()
+        _xsetup(a)
+        _tlb_set(a, 2, 0xC000, 0x004, TLB_RWX, g=1)     # the kernel stack: kmap VA 0xC000_xxxx, not kseg
+        _te_on(a, 0xC0000010)
+        _ud_user(a, ss=1)
+        a.label('u')
+        P = [a.setr(1, 5), a.inc(1), a.inc(1)]
+        hp = a.halt()
+        _udhandler(a)
+        e = {'end': 'park', 'kind': '4', 'r1': 7}
+        e.update(_udexp([(X_PRIV, HALT_W, hp, 1)]))
+        out.append((a, e, plus + ['+DBG_DRV', '+DBG_ATTACHED', '+DBG_NRES=1', '+DBG_RI=20',
+                                  f'+DBG_RV={KSP:x}']))
     return out

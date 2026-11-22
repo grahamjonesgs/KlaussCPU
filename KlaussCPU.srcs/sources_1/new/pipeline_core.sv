@@ -5602,6 +5602,13 @@ module pipeline_core
             wp_st      <= mem_wps;
             wp_addr    <= mem_wp2 ? {mem_ea_raw[31:3] + 29'd1, 3'b000} : mem_ea_raw;
             mem_wph    <= 1'b0;          // (once: the op may stay in MEM)
+            // §13.2: with us_lat set the firing op is the stepped one
+            // (nothing older is left in the pipeline, nothing younger has
+            // been latched), so the entry is WATCH + SSTEP — whether or not
+            // its STEP boundary was taken first.  An unpredicted RET /
+            // LEAVERET (an empty RAS) serializes: fetch_halt holds the us_lat
+            // boundary off, and the op fires in its first MEM cycle.
+            if (us_lat) us_ent <= 1'b1;
          end
          if (fbr_taken || ras_miss) begin
             if (DEBUG_EN && ev_bp) dbg_active <= 1'b0;   // the ID op was wrong-path
@@ -5782,7 +5789,12 @@ module pipeline_core
                5'd19:   int_mask <= dbg_i.reg_wdata[3:0];
                // MMU stage 1: SP_ALT, {DI, UM}
                5'd20:   if (EN_EXC) sp_alt <= dbg_i.reg_wdata[31:0];
-               5'd21:   if (EN_EXC) begin umode <= dbg_i.reg_wdata[0]; irq_dis <= dbg_i.reg_wdata[1]; end
+               // (§13.2: a user step is armed in user mode only — a write
+               // of UM = 0 disarms it, as an exception entry would)
+               5'd21:   if (EN_EXC) begin
+                           umode <= dbg_i.reg_wdata[0]; irq_dis <= dbg_i.reg_wdata[1];
+                           if (EN_UDBG && !dbg_i.reg_wdata[0]) begin us_arm <= 1'b0;  us_lat <= 1'b0;  us_ret <= 1'b0; end
+                        end
                default: if (dbg_i.reg_idx < 5'd16) rf[dbg_i.reg_idx[3:0]] <= dbg_i.reg_wdata;
             endcase
          end

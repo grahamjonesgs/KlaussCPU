@@ -2703,7 +2703,7 @@ def main():
     sm.add_argument('--seeds', type=int, default=20); sm.add_argument('--seed0', type=int, default=1)
     ud = sub.add_parser('udbgfuzz', help='MMU_PLAN §13: user single step / watchpoint fuzzer (udbg.py)')
     ud.add_argument('--seeds', type=int, default=30); ud.add_argument('--seed0', type=int, default=0)
-    ud.add_argument('--mode', choices=('all', 'step', 'watch'), default='all')
+    ud.add_argument('--mode', choices=('all', 'step', 'watch', 'sup'), default='all')
     ud.add_argument('--irq', action='store_true'); ud.add_argument('-v', '--verbose', action='store_true')
     ud.add_argument('--plus', action='append', default=[])
     su = sub.add_parser('socustep', help='MMU_PLAN §13: the board test ustep_test.c on tb_soc')
