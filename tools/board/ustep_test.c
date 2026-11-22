@@ -137,7 +137,7 @@ static int run_user(const char *name, const uint32_t *code, unsigned nw, const s
 static volatile uint64_t kvar = 0x1234;
 
 int main(void) {
-    printf("USTEP test (MMU_PLAN.md §13)\n");
+    printf("USTEP test (MMU_PLAN.md section 13)\n");
     uint64_t f = FEAT;
     printf("  CPU_FEATURES %016llx\n", (unsigned long long)f);
 #ifndef USTEP_SIM   // (tools/vsim tb_vsim has no CPU_FEATURES: SRC=ustep_test DEFS=-DUSTEP_SIM build.sh ustep_sim)

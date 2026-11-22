@@ -397,3 +397,47 @@ def cmd_udbgfuzz(a, build, run):
         os.remove(tr0)
     print(f'{fails} failing of {runs} runs ({n_ent} logged entries); watch hits by kind: {STATS}')
     return 1 if fails else 0
+
+
+def elf_boot_mem(elf, path, llvm_bin=None):
+    """a tools/board ELF (linked at 0x20) as a tb_soc boot image"""
+    import os, struct, subprocess
+    b = llvm_bin or os.environ.get('KLAUSSCPU_LLVM_BIN', os.path.expanduser('~/Documents/src/klausscpu-llvm/build/bin'))
+    binp = path + '.bin'
+    subprocess.check_call([os.path.join(b, 'llvm-objcopy'), '-O', 'binary', elf, binp])
+    img = b'\0' * 0x20 + open(binp, 'rb').read()
+    img += b'\0' * (-len(img) % 8)
+    dws = list(struct.unpack(f'<{len(img) // 8}Q', img))
+    dws[0] = len(dws) * 8
+    with open(path, 'w') as f:
+        for v in dws:
+            f.write(f'{v:016X}\n')
+    return path
+
+
+def cmd_socustep(a, run_mod):
+    """run.py socustep: the board test (tools/board/ustep_test.c, built with
+    tools/board/build.sh) on tb_soc — the real D-cache, hit pipe, L2, bus
+    and CPU_FEATURES; its UART must end with 'USTEP PASS'"""
+    import os, subprocess
+    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    elf = a.elf or os.path.join(root, 'tools', 'board', 'out', 'ustep_test.elf')
+    if not a.elf:
+        subprocess.check_call([os.path.join(root, 'tools', 'board', 'build.sh'), 'ustep_test'],
+                              stdout=subprocess.DEVNULL)
+    exe = run_mod.build_soc(None)
+    fails = 0
+    for i, plus in enumerate([[]] + [[p] for p in a.plus]):
+        d = os.path.join(run_mod.WORK, 'socruns')
+        os.makedirs(d, exist_ok=True)
+        mem = elf_boot_mem(elf, os.path.join(d, f'ustep{i}.mem'))
+        r = run_mod.run_soc(exe, mem, f'socustep{i}', plus=plus)
+        ok = 'USTEP PASS' in r['uart'] and 'FAIL' not in r['uart'] and 'atal' not in r['log']
+        print(('pass' if ok else 'FAIL') + f' socustep {plus}')
+        if not ok or a.verbose:
+            print(r['uart'][-1500:])
+            if not ok:
+                print('\n'.join(l for l in r['log'].splitlines() if 'atal' in l or 'DEADLOCK' in l)[:600])
+        fails += not ok
+    print(f'{fails} failing')
+    return 1 if fails else 0

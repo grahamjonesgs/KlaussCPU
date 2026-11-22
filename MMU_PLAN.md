@@ -2126,4 +2126,95 @@ stepping clears frame bit 45 first.
 
 ### 13.6 Pipeline (as built)
 
-(Filled in with the RTL; see below.)
+`pipeline_core` parameter `UDBG_EN` (default 1; `EN_UDBG = EXC_EN &&
+UDBG_EN`, so core 2, `EXC_EN = 0`, has none of it). `KlaussCPU` reports
+`CPU_FEATURES[29:28]` = `CORE1_EXC_EN`. With SS never set and both
+watchpoints disabled the core is cycle-identical to master (`run.py diff
+--base master --plus +TRACECYC`: same traces and cycle stamps).
+
+**Step.** State: `us_arm` (armed), `us_lat` (its instruction has been
+latched into ID), `us_ret` (… and has retired), `us_ent` (the STEP
+boundary has been taken).
+- An IRET's MEM → WB edge registers `wb_ussa` = frame `[45] && [44]` and
+  `EVEC ≠ 0` (`ud_evnz`, registered); its WB commit sets `us_arm`.
+- The IF → ID latch sets `us_lat` while armed (or while the arming IRET
+  is in WB: an instruction latched on its commit edge is the stepped one).
+- A new case in the dispatch boundary chain, after the debug module's
+  `dbg_stop` and before `irq_take`: `us_lat` takes the boundary
+  (`irq_active`, `us_ent`) exactly as the debug module's step does (at the
+  stepped instruction's dispatch, or at the first boundary after a
+  predicted-taken / RAS dispatch or a serializer's refetch). Nothing is
+  latched and no interrupt is taken from then on.
+- The entry sequencer treats `us_ent` like an exception (no abandon). At
+  its frame push it becomes one: `exc_ent`, cause 14, `EADDR` = `id_pc`
+  (nothing has been latched since the stepped instruction), vector `EVEC`.
+  The frame's PC is the fetch `pc` at the drain, so every redirect of the
+  stepped instruction (EX, MEM, its own MTSR / SMC refetch at WB) is in it.
+- An exception op created after the boundary (`ex_misal`, the MEM access
+  fault `mem_xsq_go`) cancels `us_ent` with `irq_active`, as it cancels an
+  IRQ boundary; the fault's own entry follows.
+- Every entry completion clears all four. A successful walk (`wk_fin`)
+  clears `us_lat` only. A debugger resume sets `us_lat <= us_ret`.
+- Frame bit 45 = `us_arm` at the push.
+
+**Watch.**
+- Registers `wp_k[n]` (VA[31:3]), `wp_km1[n]` (K − 1, computed at the
+  MTSR), `wp_be`, `wp_r`, `wp_w`, `wp_u`, written by an MTSR to 0x40–0x43
+  as it commits at WB. MFSR reads them through a `[19:16]` = 4 leg of
+  `id_srv`. `ud_go` = `EVEC ≠ 0` and not attached, registered.
+- **EX compare, carry-free** on the EA's dispatch-time operands `ex_ta` +
+  `ex_tb` (§11.9): `EA[31:5]` = K[28:2] with the real carry into bit 5,
+  `EA[4:3]` = K[1:0] with the real carry into bit 3 (DCBZ: the line part
+  only); the 2nd doubleword of a spanning MEMGET32 / LEAVERET (`ex_tb` = 0)
+  as `ex_ta[31:3]` = K − 1. No EA adder is in front of it. The bytes come
+  from `EA[2:0]` (`ex_tlo3`) and the uop / size. Mode: `umode ||
+  (!U && !ex_dis_eff)` (DI in program order). A failing SC (`ex_sc_ok`)
+  and a misaligned op are excluded. Only registered: `mem_wph`,
+  `mem_wpm` (which), `mem_wps` (store), `mem_wp2` (2nd doubleword only).
+- **MEM.** `mem_wfire` = `mem_valid && mem_wph && !mem_xsq && !sq_spec &&
+  !wb_wait`, registers only. In the op's first such cycle it squashes EX
+  and ID (and the EX op that would enter MEM on this edge, if the op
+  leaves), resets DIV / DELAY, points `pc` at the op's successor
+  (`mem_succ`: the fall-through or a CALL's target; a predicted return's
+  `mem_pred_tgt`, which a `ras_miss` redirect later in the block
+  overrides; an unpredicted RET / LEAVERET redirects itself, fetch is
+  halted behind it), takes the boundary (`irq_active`, `wp_ent`; an IRQ
+  boundary already taken becomes it, a STEP boundary stays as SSTEP) and
+  records `{hits, store, EADDR}`. It fires once (`mem_wph` cleared). The
+  younger ops' EX-edge side effects (LCD strobe, LCDRST, RAS push, early
+  load issue, PHT training, the debug module's EX-side watch compares) are
+  gated by `mem_ysq_go` = the access-fault squash OR this one. The op itself
+  completes: port access, WB commit, its redirect.
+- The frame push makes it an exception (cause 15, `ECAUSE[12:9]` from
+  `exc_ux_q`, `EADDR`), like STEP.
+- `ECAUSE` in `mmu_sr` is 13 bits.
+
+**A predicted return does fire behind younger ops.** An assertion that a
+predicted RET / LEAVERET never fires with an op latched behind it failed in
+`udbgfuzz` seed 54 (a LEAVERET at `+LAT=1`); the `pc` write for that case is
+needed, and the `m_pc_ret` mutation is killed by that seed.
+
+**Assertions** (simulation): at most one instruction retires per arm and
+exactly one before STEP, with `EADDR` (`id_pc`) its PC; armed implies user
+mode (never inside a handler or an ISR); `us_lat` implies `us_arm`;
+`us_ent` / `wp_ent` imply `irq_active`; no exception op reaches WB with a
+STEP / WATCH boundary pending; a watch squash never meets an SMC squash or
+an entry.
+
+**Tests** (`tools/vsim`):
+- `tests.py` `ud_*`: every §13.2 case, including the walker refilling a
+  stepped data and code page under TE = 1, an LR / SC, IRQs, the arming
+  rules, the predictor cases, and the JTAG debug module (breakpoints and DM
+  steps on and around stepped instructions, `VSIM_DEBUG_EN=1`).
+- `tests.py` `uw_*`: every size, alignment and byte mask, with the EA split
+  at random between rs1 and rs2 (all the operand carries); the stack and
+  frame ops; MEMGET32 / DCBZ; LR / SC; faults; both watchpoints; step +
+  watch; the supervisor rules (U, DI in program order, an IRET's frame
+  read, an LCD op behind a watched load); `EVEC` = 0; IRQs.
+- `tests.py` `ud_sr`, and `ud_board_routines` (the board test's routines).
+- `run.py udbgfuzz` (`udbg.py`): randprog in user mode with injected
+  exceptions, DCBZ and LR / SC groups, random watchpoints chosen from the
+  run's own accesses, with and without the step, IRQs, `+LAT` / `+HIT`
+  variants. The user retire lines must equal the plain run's, and the
+  handler's log must equal an independent Python model of §13.
+- `ustepmut.py`: 58 mutations, every one killed.

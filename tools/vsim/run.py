@@ -2706,6 +2706,9 @@ def main():
     ud.add_argument('--mode', choices=('all', 'step', 'watch'), default='all')
     ud.add_argument('--irq', action='store_true'); ud.add_argument('-v', '--verbose', action='store_true')
     ud.add_argument('--plus', action='append', default=[])
+    su = sub.add_parser('socustep', help='MMU_PLAN §13: the board test ustep_test.c on tb_soc')
+    su.add_argument('--elf'); su.add_argument('-v', '--verbose', action='store_true')
+    su.add_argument('--plus', action='append', default=[], help='extra runs with this tb_soc plusarg')
     x = sub.add_parser('excdiff'); x.add_argument('--seeds', type=int, default=20)
     x.add_argument('--seed0', type=int, default=1); x.add_argument('--lats', type=int, nargs='+', default=[3])
     x.add_argument('--p', type=float, default=0.08); x.add_argument('--irq', action='store_true')
@@ -2783,6 +2786,9 @@ def main():
     elif a.cmd == 'udbgfuzz':
         import udbg
         sys.exit(udbg.cmd_udbgfuzz(a, build, run))
+    elif a.cmd == 'socustep':
+        import udbg
+        sys.exit(udbg.cmd_socustep(a, sys.modules[__name__]))
     elif a.cmd == 'excdiff':
         sys.exit(cmd_excdiff(a))
     elif a.cmd == 'dmtest':

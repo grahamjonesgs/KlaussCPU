@@ -481,7 +481,9 @@ Single-stepping under the debugger never takes interrupts.
 **Saved frame** (pushed on entry, popped by `IRET`):
 
 ```
-[63:45] = 0            (reserved)
+[63:46] = 0            (reserved)
+[45]    = SS           single step armed (§13.5; an IRET to user mode with
+                       SS = 1 arms a step)
 [44]    = PM           previous mode, 1 = user (restored by IRET; §13.2)
 [43]    = DI disable   (restored by IRET; 1 = disabled, so a frame built
                         by software with 0 here resumes enabled)
@@ -540,7 +542,9 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   MPU), bit 2 = the TLB (§13.4) and `[15:8]` = its entry count (32; 16 before 2026-11-11), and
   `[20:16]` = the crypto blocks present (AES, GCM, SHA-256, HMAC, TRNG;
   MMIO_MAP.md). The lean A7 MMU bitstream read `0x0010_100D`; with the
-  `perf-hw` features and the 32-entry TLB it reads `0x01F0_200D`. If
+  `perf-hw` features and the 32-entry TLB it reads `0x01F0_200D`; with the
+  walker, the L2, the cache range ops and the user single step /
+  watchpoints (`[25:21]`, `[29:28]`; §13.5) it reads `0x3FF0_200D`. If
   `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits:
   assume every crypto block is present. (A future bitstream without a TRNG
   would therefore read as 'all present'; that is acceptable while the TRNG
@@ -552,8 +556,10 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   re-executes it), except for SYSCALL, where it is the next instruction.
 - **Causes (`ECAUSE`)**: 1 ILLEGAL, 2 PRIVILEGED, 3 TRAP, 4 SYSCALL,
   5/6 MISALIGNED_LOAD/STORE, 7/8 ACCESS_LOAD/STORE, 9 ACCESS_FETCH,
-  10 MISALIGNED_FETCH. `EADDR` holds the instruction word for 1–3, 0 for
-  SYSCALL, and the address otherwise. The raw computed EA is used; when an
+  10 MISALIGNED_FETCH, 11–13 TLB_MISS_LOAD / _STORE / _FETCH (§13.4),
+  14 STEP and 15 WATCH (§13.5). `EADDR` holds the instruction word for
+  1–3, 0 for SYSCALL, the stepped instruction's PC for STEP, and the
+  address otherwise. The raw computed EA is used; when an
   op's second doubleword faults, that doubleword's start is used.
 - **Entry** (exceptions and interrupts, pipe drained): from user mode, the
   stack pointers swap (SP = kernel SP) and UM = 0. Then one frame is pushed
@@ -576,12 +582,13 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
 |---|---|---|
 | 0 | `STATUS` | `[0]` UM, `[1]` DI (read-only), `[8]` MPU_EN (§13.3; write in supervisor mode); readable in user mode |
 | 1 | `EVEC` | exception vector (`[1:0]` read 0); 0 = exceptions park |
-| 2 | `ECAUSE` | `[7:0]` cause, `[8]` GUARD (an MPU GUARD region denied the access) |
+| 2 | `ECAUSE` | `[7:0]` cause, `[8]` GUARD (an MPU GUARD region denied the access), `[12:9]` SSTEP / WRITE / WP1 / WP0 (§13.5) |
 | 3 | `EADDR` | `[31:0]` |
 | 4 | `USP` | the user SP (while in supervisor mode) |
 | 5, 6 | `SCRATCH0/1` | 64-bit, for the kernel |
 | 7 | `TP` | 64-bit thread pointer; read/write in user mode |
 | 8 | `CYCLE` | 64-bit core-cycle counter, read-only, readable in user mode; not ordered against older instructions |
+| 0x40–0x43 | `WP0_ADDR`, `WP0_CTRL`, `WP1_ADDR`, `WP1_CTRL` | the watchpoints (§13.5); supervisor only |
 
 Encodings: `SYSCALL` `0x6C08_0000`; `MFSR rd, sr` `0x6C40_0000 | sr<<12 |
 rd<<8`; `MTSR sr, rs1` `0x6C60_0000 | sr<<12 | rs1<<4` (ISA_ENCODING_V2_MAP.md
@@ -725,6 +732,36 @@ page-crossing two-access op), plus the refills (+1.5–2.4 % before
 count). Reset clears TE,
 ASID, TLBVEC and every V.
 
+### 13.5 User single step and watchpoints (MMU_PLAN.md §13)
+
+For ptrace (`PTRACE_SINGLESTEP`, hardware watchpoints) under Linux.
+`CPU_FEATURES[28]` = the step, `[29]` = the watchpoints.
+
+- **Step.** An IRET whose frame has PM = 1 and **SS (bit 45) = 1** arms a
+  single step (if `EVEC` ≠ 0). The core runs exactly one user instruction,
+  then takes **STEP** (ECAUSE 14 | SSTEP `[12]`) before the next one and
+  before any interrupt: frame PC = the next instruction (branch / call /
+  return target as taken), `EADDR` = the stepped instruction's PC, frame
+  SS = 1. Every exception or interrupt entry pushes the armed state as SS
+  and disarms; IRET of an SS = 1 user frame re-arms. So a fault or SYSCALL
+  of the stepped instruction is taken as usual with SS = 1 in its frame,
+  an interrupt may come before the stepped instruction (never after it),
+  and nothing in supervisor mode is ever stepped. Entries clear the LR/SC
+  reservation, so a stepped SC fails: step over LR … SC as a block.
+- **Watchpoints.** SRs `0x40` / `0x42` `WPn_ADDR` (`[31:3]` doubleword VA)
+  and `0x41` / `0x43` `WPn_CTRL` (`[7:0]` byte mask, `[8]` R, `[9]` W,
+  `[10]` U = user-mode accesses only); supervisor only. A data access
+  hits when its doubleword and bytes overlap and its direction is enabled;
+  a supervisor access only with U = 0 and interrupts enabled (DI = 0).
+  The instruction completes, then **WATCH** (ECAUSE 15, `[9]` WP0, `[10]`
+  WP1, `[11]` store, `[12]` SSTEP if it was also the stepped instruction)
+  is taken before the next one: frame PC = the next instruction, `EADDR` =
+  the effective address (the 2nd doubleword's start if only that one of a
+  spanning MEMGET32 / LEAVERET hit). Faulting accesses, a failing SC, an
+  IRET's frame read and entry pushes never hit; nor anything while
+  `EVEC` = 0 or the JTAG debugger is attached.
+- Reset and program load clear the step state and both watchpoints.
+
 ---
 
 ## 14. Pipeline Model (for scheduling)
@@ -858,6 +895,10 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
   version 2 reports both.
 - Resume refetches through the start path, so code patched while halted
   takes effect.
+- The kernel-usable user single step and watchpoints (§13.5) are separate:
+  while the debugger is attached the user watchpoints are off, and the
+  debugger's halt, step and breakpoints take priority over a user step
+  (which survives them: its instruction still counts once).
 
 Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 

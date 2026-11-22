@@ -3654,6 +3654,17 @@ DMA md5 1 B .. 32 MiB (DMA / PIO / O_DIRECT), dmaexec PASS, aliasjit PASS,
 clang -O2 deflate 29.74 s / cxx-hello 77.20 s user (fable 29.74 / 77.31).
 Written to QSPI as `tmg2_release_fe83ff4.bit`; flash boot board-check 16/16.
 
+## 11. User single step and watchpoints (2026-11-22, branch `ustep`)
+
+Requested by Graham via the runtime session (2026-11-22): `PTRACE_SINGLESTEP`
+and hardware watchpoints for lldb-server under Linux. Specification and
+as-built notes: MMU_PLAN.md §13 (frame bit 45 SS; ECAUSE 14 STEP, 15
+WATCH, `ECAUSE[12:9]`; SRs 0x40–0x43; `CPU_FEATURES[29:28]`). Cycle-identical
+to master while unused. Board test: `tools/board/ustep_test.c` (prints
+`USTEP PASS` / `USTEP FAIL`).
+
+BUILD_RESULTS_PLACEHOLDER
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -3663,6 +3674,8 @@ Written to QSPI as `tmg2_release_fe83ff4.bit`; flash boot board-check 16/16.
 | `[24]` | `ETH_RX_SLOTS` (§3) |
 | `[26]` | the unified L2 (§6) |
 | `[27]` | the cache range operations: RANGE_CLEAN / RANGE_INV / RANGE_IINV (§7; the SD DMA engine itself is `SDM_CAPS[10]`) |
+| `[28]` | the user single step: frame bit 45 SS, ECAUSE 14 STEP (§11; MMU_PLAN §13) |
+| `[29]` | the user watchpoints: SRs 0x40–0x43, ECAUSE 15 WATCH (§11; MMU_PLAN §13) |
 
 ## Implementation notes (§1 and §4, 2026-11-11)
 
