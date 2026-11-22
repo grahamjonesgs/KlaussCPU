@@ -127,12 +127,14 @@ MUTS = [
      "wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !sq_spec && !wb_wait;"),
     ('m_pc_succ', 'the successor is the fall-through (a CALL\'s target lost)', PC, WATCH,
      "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_succ;", "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_pc_next;"),
-    # (not mutated: the fire's pc write for a PREDICTED return — a return
-    # never leaves MEM in its first cycle (hit pipe: ret_h_wait; port: the
-    # wait), so nothing younger is latched yet when it fires and fetch is
-    # already at its target; the core asserts exactly that, uwatch_ret_young.
-    # The write stays, defensive.  Nor 'start clears the WPs': core 1 is
-    # reset through every program load, so start never comes alone.)
+    # (a predicted return CAN fire behind younger ops: udbgfuzz seed 54, a
+    # LEAVERET at +LAT=1, found when an assertion claimed otherwise)
+    ('m_pc_ret', 'a predicted return does not point fetch at its target', PC,
+     WATCH + [['udbgfuzz', '--seed0', '54', '--seeds', '1', '--mode', 'watch']],
+     "if (!(mem_retq || mem_lvrq) || mem_pred) begin\n               ev_pcz  = 1'b1;",
+     "if (!(mem_retq || mem_lvrq)) begin\n               ev_pcz  = 1'b1;"),
+    # (not mutated: 'start clears the WPs' — core 1 is reset through every
+    # program load, so start never comes alone)
     ('m_memv', 'the EX op entering MEM on the fire edge survives', PC, WATCH,
      "            if (!mem_busy) mem_valid <= 1'b0;   // (the EX op entering MEM)\n", ""),
     ('m_exv', 'the EX op survives the fire', PC, WATCH,

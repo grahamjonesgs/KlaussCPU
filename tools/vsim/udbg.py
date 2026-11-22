@@ -372,6 +372,11 @@ def cmd_udbgfuzz(a, build, run):
         accs = plain_accesses(prog, trp)
         for name, w, ss in variants:
             wps = rand_wps(rnd, accs) if w else None
+            if wps and lrsc:
+                # (a watched load's WATCH entry would clear the LR's
+                # reservation, and the SC fail where the plain run's
+                # succeeds — §13.2: correct, but not comparable)
+                wps = [(k, be, 0, 1, u) for k, be, r, w_, u in wps]
             configure(prog, wps, ss=ss, mask=1 if irq else 0)
             st, tr = run(exe, prog, f'ud{name}_{s}', plus, trace=True)
             runs += 1
