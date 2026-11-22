@@ -6405,6 +6405,10 @@ module pipeline_core
       if (wb_valid && !wb_wait && wb_park && wb_xc)
          assert (!us_ent && !wp_ent) else $fatal(1, "ustep: an exception op with a STEP / WATCH boundary pending");
       if (mem_wfire) assert (!irq_xc && !exc_ent) else $fatal(1, "uwatch: fire during an entry");
+      // (uwatch_ret_young) a predicted return fires with nothing younger
+      // latched: fetch is still at its target (the pc write is defensive)
+      if (mem_wfire && (mem_retq || mem_lvrq) && mem_pred)
+         assert (!id_valid && !ex_valid) else $fatal(1, "uwatch: a predicted return fires behind younger ops: pc=%h", mem_pc);
    end
    // MMU_PLAN §11.8 walker: it runs only inside an exception entry with the
    // pipe drained and fetch halted, and owns the port while a read is out;

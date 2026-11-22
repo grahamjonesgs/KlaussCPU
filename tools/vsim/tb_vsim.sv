@@ -679,6 +679,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
 
    task automatic done(input string why);
       integer f;
+      string uart_name;
+      // +UART=<file>: the UART output (tools/board programs run as images)
+      if ($value$plusargs("UART=%s", uart_name)) begin
+         f = $fopen(uart_name, "w");
+         $fwrite(f, "%s", uart_s);
+         $fclose(f);
+      end
       f = $fopen(out_name, "w");
       $fdisplay(f, "end=%s kind=%0d pc=%08x op=%08x", why, park_kind, park_pc, park_op);
       $fdisplay(f, "dbg_cause=%0d watch_addr=%08x", dbg_o.cause, dbg_o.watch_addr);

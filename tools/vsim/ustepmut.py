@@ -92,8 +92,9 @@ MUTS = [
      "wp_km1[wb_op[13]] <= wb_value[31:3] - 29'd1;", "wp_km1[wb_op[13]] <= wb_value[31:3] + 29'd1;"),
     ('w_m32', 'MEMGET32 bytes as a 3-byte access', PC, WATCH,
      "m32 = 16'h000F << ex_wea;", "m32 = 16'h0007 << ex_wea;"),
-    ('w_m16', '16-bit access bytes at the wrong lane', PC, WATCH,
-     "2'd1:    ex_wm0 = 8'h03 << {ex_wea[2:1], 1'b0};", "2'd1:    ex_wm0 = 8'h03 << ex_wea;"),
+    # (8'h03 << EA[2:0] would be equivalent: a 16-bit access is 2-aligned or traps)
+    ('w_m16', 'a 16-bit access compares only its low byte', PC, WATCH,
+     "2'd1:    ex_wm0 = 8'h03 << {ex_wea[2:1], 1'b0};", "2'd1:    ex_wm0 = 8'h01 << {ex_wea[2:1], 1'b0};"),
     ('w_m32w', '32-bit access bytes at the wrong half', PC, WATCH,
      "2'd2:    ex_wm0 = ex_wea[2] ? 8'hF0 : 8'h0F;\n            default: ex_wm0 = 8'hFF;\n         endcase\n      end else if (ex_d.uop == U_LR",
      "2'd2:    ex_wm0 = ex_wea[2] ? 8'h0F : 8'hF0;\n            default: ex_wm0 = 8'hFF;\n         endcase\n      end else if (ex_d.uop == U_LR"),
@@ -126,9 +127,12 @@ MUTS = [
      "wire mem_wfire    = EN_UDBG && mem_valid && mem_wph && !sq_spec && !wb_wait;"),
     ('m_pc_succ', 'the successor is the fall-through (a CALL\'s target lost)', PC, WATCH,
      "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_succ;", "pc      <= (mem_retq || mem_lvrq) ? mem_pred_tgt : mem_pc_next;"),
-    ('m_pc_ret', 'a predicted return does not point fetch at its target', PC, WATCH,
-     "if (!(mem_retq || mem_lvrq) || mem_pred) begin\n               ev_pcz  = 1'b1;",
-     "if (!(mem_retq || mem_lvrq)) begin\n               ev_pcz  = 1'b1;"),
+    # (not mutated: the fire's pc write for a PREDICTED return — a return
+    # never leaves MEM in its first cycle (hit pipe: ret_h_wait; port: the
+    # wait), so nothing younger is latched yet when it fires and fetch is
+    # already at its target; the core asserts exactly that, uwatch_ret_young.
+    # The write stays, defensive.  Nor 'start clears the WPs': core 1 is
+    # reset through every program load, so start never comes alone.)
     ('m_memv', 'the EX op entering MEM on the fire edge survives', PC, WATCH,
      "            if (!mem_busy) mem_valid <= 1'b0;   // (the EX op entering MEM)\n", ""),
     ('m_exv', 'the EX op survives the fire', PC, WATCH,
@@ -158,9 +162,6 @@ MUTS = [
      "   assign id_srv = (EN_TLB"),
     ('ecause_w', 'MTSR ECAUSE keeps 9 bits', PC, [['test', 'ud_sr']],
      "4'd2: ecause <= mtsr_wdata[12:0];", "4'd2: ecause <= {4'b0, mtsr_wdata[8:0]};"),
-    ('start_clr', 'program load keeps the watchpoints', PC, [['test', 'ud_sr']],
-     "         if (start) begin\n            for (int n = 0; n < 2; n++) begin wp_k[n] <= '0; wp_km1[n] <= '1; wp_be[n] <= '0; end\n            wp_r <= '0;  wp_w <= '0;  wp_u <= '0;\n         end\n",
-     ""),
     ('feat', 'CPU_FEATURES[29:28] not reported', TOP, [['socmmio', '--base', 'master']],
      "| {34'b0, CORE1_EXC_EN, CORE1_EXC_EN, 28'b0};", "| {34'b0, 1'b0, 1'b0, 28'b0};"),
 ]

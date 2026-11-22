@@ -1,2 +1,4 @@
 out/
 hwprop_snippets.h
+ustep_user.h
+__pycache__/

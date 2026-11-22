@@ -13,6 +13,7 @@ RT=${RT:-$HOME/Documents/src/klausscpu-runtime}
 BM=$RT/baremetal
 mkdir -p "$HERE/out"
 python3 "$HERE/gen_hwprop.py" > /dev/null
+python3 "$HERE/gen_ustep.py" > /dev/null
 "$B/clang" -target klausscpu-unknown-elf $OPT -isystem "$RT/picolibc-install/include" -I"$RT" -I"$HERE" \
   -nostdlib -ffunction-sections -fdata-sections -fPIC -D__IEEE_LITTLE_ENDIAN -D_LDBL_EQ_DBL \
   $DEFS -c -o "$HERE/out/$N.o" "$HERE/$SRC.c"

@@ -7339,7 +7339,9 @@ def uw_sizes():
                 bt = _uw_bytes(sz, ea)
                 rw = WP_W if st else WP_R
                 lo = bt & -bt
+                hi = 1 << (bt.bit_length() - 1)
                 for k, (wa, ctrl, hit) in enumerate([(ea, bt | rw, 1), (ea & ~7, lo | rw | WP_U, 1),
+                                                     (ea, hi | rw, 1),
                                                      (ea, (~bt & 0xFF) | WP_R | WP_W, 0),
                                                      (ea + 8, 0xFF | WP_R | WP_W, 0),
                                                      (ea, 0xFF | (WP_R if st else WP_W), 0)]):
@@ -7544,6 +7546,21 @@ def uw_supervisor():
     e.update(_udexp(ents))
     out.append((a, e, []))
     out.append((a, e, ['+HIT=100']))
+    # an IRET's frame read is never watched (supervisor, DI = 0, U = 0, R
+    # on the frame's doubleword: the IRET does not hit, the load after does)
+    a = Asm()
+    _xsetup(a)
+    fr = 0x08000000 - 8
+    a.setr(1, fr); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_R); a.mtsr('wp0_ctrl', 1)
+    a.leapc(2, 's'); a.push(2); a.iret()
+    a.label('s')
+    a.setr(9, fr); at = a.ld(64, 4, 9)
+    a.halt()
+    _udhandler(a)
+    e = {'end': 'park', 'kind': '0'}
+    e.update(_udexp([(X_WATCH | 1 << 9, fr, at + 4, 0)]))
+    out.append((a, e, []))
+    out.append((a, e, ['+HIT=100']))
     # EVEC = 0: a supervisor hit-able store does nothing
     a = Asm()
     a.setr(9, DATA + 0x398); a.setr(2, DATA + 0x398); a.mtsr('wp0_addr', 2)
@@ -7594,6 +7611,9 @@ def ud_sr():
     a.setr64(1, -1)
     for i, sr in enumerate(('wp0_addr', 'wp0_ctrl', 'wp1_addr', 'wp1_ctrl', 'ecause')):
         a.mtsr(sr, 1); a.mfsr(2, sr); a.st(64, 2, 12, 8 * i)
+    a.setr(1, 0x2A5); a.mtsr('wp0_ctrl', 1); a.mfsr(2, 'wp0_ctrl'); a.st(64, 2, 12, 56)   # W, BE A5
+    a.setr(1, 0x55A); a.mtsr('wp1_ctrl', 1); a.mfsr(2, 'wp1_ctrl'); a.st(64, 2, 12, 64)   # U, R, BE 5A
+    a.setr(1, 0x13579BDF); a.mtsr('wp1_addr', 1); a.mfsr(2, 'wp1_addr'); a.st(64, 2, 12, 72)
     a.setr(1, 0)
     for sr in ('wp0_ctrl', 'wp1_ctrl'):
         a.mtsr(sr, 1)
@@ -7603,7 +7623,8 @@ def ud_sr():
     a.halt()
     _uhandler(a)
     exp = {'end': 'park', 'kind': '0', m(DATA + 40): 0, m(DATA + 48): 0x77, m(DATA): 0xFFFFFFF8, m(DATA + 8): 0x7FF,
-           m(DATA + 16): 0xFFFFFFF8, m(DATA + 24): 0x7FF, m(DATA + 32): 0x1FFF, m(XD + 32): 5}
+           m(DATA + 16): 0xFFFFFFF8, m(DATA + 24): 0x7FF, m(DATA + 32): 0x1FFF, m(XD + 32): 5,
+           m(DATA + 56): 0x2A5, m(DATA + 64): 0x55A, m(DATA + 72): 0x13579BD8}
     for i in range(5):
         exp[m(XLOG + 8 * i)] = X_PRIV
     return a, exp, []
@@ -7675,4 +7696,38 @@ def ud_debugger():
     e.update(_udexp([(X_PRIV, HALT_W, hp, 1)]))
     e['kind'] = '4'                       # (the handler's HALT debug-halts while attached)
     out.append((a, e, ['+DBG_ATTACHED']))
+    return out
+
+
+@test
+def ud_board_routines():
+    """the board test's user routines (tools/board/gen_ustep.py) at its
+    USER_BASE, against their own expected logs — the same expectations
+    ustep_test.c checks on the board"""
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location('gen_ustep', _os0.path.join(_os0.path.dirname(_os0.path.abspath(__file__)),
+                                                                    '..', 'board', 'gen_ustep.py'))
+    g = _iu.module_from_spec(spec); spec.loader.exec_module(g)
+    UB = 0x00610000
+    out = []
+    for name, (ra, ss, cfg) in {'A': (g.routine_a, 1, False), 'B': (g.routine_b, 0, True),
+                                'C': (lambda: g.routine_c()[:2], 1, False)}.items():
+        r, exp = ra()
+        a = Asm()
+        _xsetup(a)
+        if name == 'C':
+            a.setr(1, g.routine_c()[2]); a.mtsr('wp0_addr', 1); a.setr(1, 0xFF | WP_W); a.mtsr('wp0_ctrl', 1)
+        a.setr(1, g.USP); a.mtsr('usp', 1)
+        a.setr(2, UB); a.setr64(3, (1 << 44) | (ss << 45)); a.alu('or', 2, 2, 3)
+        a.push(2); a.iret()
+        _udhandler(a, cfg=cfg)
+        ws = r.assemble()
+        ws += [0x6C000000] * (len(ws) & 1)
+        for i in range(0, len(ws), 2):
+            a.dword(UB + 4 * i, ws[i] | (ws[i + 1] << 32))
+        ents = [(c, ea + (UB if rel else 0), UB + fp, hi) for c, ea, rel, fp, hi in exp]
+        e = {'end': 'park', 'kind': '0'}
+        e.update(_udexp(ents))
+        for plus in ([], ['+HIT=70']):
+            out.append((a, e, plus))
     return out
