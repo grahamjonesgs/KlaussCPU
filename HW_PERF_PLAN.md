@@ -3717,6 +3717,38 @@ runs; the review's `cycid.py` (exception-rich user / supervisor programs,
 200 `--mode sup`, 275 with `VSIM_DEBUG_EN=1` (fresh seeds) clean;
 `socustep` USTEP PASS (routine D included); `ustepmut.py` 68 of 68 killed.
 
+## 12. 7-segment raw segments (2026-11-23, branch `seg7raw`)
+
+Requested by the runtime / Kl session for `lib/seg7.kl` (a software font:
+text, right-aligned decimals, decimal points). Spec: MMIO_MAP.md,
+7-Segment Display. `SEG_RAW` (0xF003_0020, RW 64) holds one segment byte
+per digit (bits 0–6 = a–g, 7 = DP; byte 0 = the rightmost digit), honours
+the byte enables, shares its storage with `SEG_ALL` and sets
+`SEG_MODE[0]` RAW (0xF003_0028, R). `SEG_ALL` / `SEG_BLANK` / `SEG_LOW` /
+`SEG_HIGH` and the loader / HCF display states leave raw mode; `SEG_LOW` /
+`SEG_HIGH` in raw mode blank the other half. Glyph codes 0x0B / 0x0D,
+which showed "8." / "0.", are now a lowercase "b" / "d". `CPU_FEATURES[30]`.
+A program that never stores `SEG_RAW` sees no change but the two glyphs.
+
+**Build** (`8ad3039`, standard flow): tier 1 WNS +0.082 / WHS +0.029
+(`f12f503`, before the review nits: +0.238 / +0.033 — placement noise).
+**Tests:** `run.py socseg` 7/7 (registers, narrow loads, cathodes through
+a tb_soc probe, glyph registers unchanged outside raw mode, a dropped
+`SEG_MODE` write, an S reload leaving raw mode, the b / d glyphs; it kills
+the review's three mutants), `socmmio` 0 differing against master,
+`socsload` / `socreset` / `socbreak` clean. **Review** (Opus, `f12f503`):
+no blocker / major; three test gaps and three nits fixed in `8ad3039`.
+Board test `tools/board/seg7_test.c`: 15 register checks plus a visual
+sequence (Graham checked it on the board).
+
+- 2026-11-23: `8ad3039` released: SRAM all_tests 32/32, `hw_seg7raw.kla`
+  33/33 (klausscc c2b070a), seg7_test 15/15, dcbz, hwprop, sd_hs_test,
+  sd_native_test, USTEP PASS; board-check --boot 19/19 and the runtime's
+  `mmio-test` PASS (driver 70a42ba). QSPI = `seg7raw_release_8ad3039.bit`
+  (rollback entry in ~/.cache/kbuild/rollback/README.txt); flash boot
+  CPU_FEATURES 0x7FF0_200D, the same checks, board-check 19/19. Master
+  fast-forwarded to `seg7raw`.
+
 ## CPU_FEATURES additions
 
 | Bit | Meaning |
@@ -3728,6 +3760,7 @@ runs; the review's `cycid.py` (exception-rich user / supervisor programs,
 | `[27]` | the cache range operations: RANGE_CLEAN / RANGE_INV / RANGE_IINV (§7; the SD DMA engine itself is `SDM_CAPS[10]`) |
 | `[28]` | the user single step: frame bit 45 SS, ECAUSE 14 STEP (§11; MMU_PLAN §13) |
 | `[29]` | the user watchpoints: SRs 0x40–0x43, ECAUSE 15 WATCH (§11; MMU_PLAN §13) |
+| `[30]` | the 7-segment `SEG_RAW` / `SEG_MODE` registers and the lowercase b / d glyphs (§12; MMIO_MAP.md) |
 
 ## Implementation notes (§1 and §4, 2026-11-11)
 
