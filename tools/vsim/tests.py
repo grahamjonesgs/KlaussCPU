@@ -2667,8 +2667,9 @@ def wp_mpu_denied_load():
 @test
 def wp_te_physical():
     """watchpoints compare physical addresses: with TE = 1 a load through
-    DATA's kseg alias fires a read watchpoint set on PA DATA (port path,
-    and the hit pipe with +HIT=100); DEBUG_EN builds only"""
+    DATA's kseg alias fires a read watchpoint set on PA DATA (port path, also
+    with +HIT=100: an armed read watchpoint turns the hit pipe off); DEBUG_EN
+    builds only"""
     dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
     out = []
     for plus in ([], ['+HIT=100']):
@@ -6800,9 +6801,10 @@ def tx_stlf_part():
 
 @test
 def tx_wp():
-    """TE = 1: a read watchpoint (on the PA) fires on a hit-pipe load whose
-    base is in another page than its EA (DEBUG_EN builds; without the debug
-    module it completes)"""
+    """TE = 1: a read watchpoint (on the PA) fires on a load whose base is
+    in another page than its EA, +HIT=100 (DEBUG_EN builds: with the
+    watchpoint armed the load issues to MEM, not the hit pipe; without the
+    debug module it completes)"""
     dbg = _os.environ.get('VSIM_DEBUG_EN') == '1'
     out = []
     for plus in (['+HIT=100'], ['+HIT=100', '+LAT=7']):

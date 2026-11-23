@@ -3889,7 +3889,8 @@ module pipeline_core
    // squash: the op is refetched and would send again.)
    assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
                      !mem_ysq_go && !sq_spec;
-   // A load's EX-side watchpoint compares (hit pipe, early issue) fire only
+   // A load's EX-side watchpoint compare (early issue; the hit pipe is off
+   // while a read watchpoint is armed, dbg_rwp) fires only
    // for a load that really leaves EX: not one an older op kills this edge,
    // nor one with an access fault (it never reads)
    wire ex_wp_ok   = !fbr_taken && !ras_miss && !sq_ex && !mem_ysq_go && !sq_spec && !ex_ufault;

@@ -896,6 +896,12 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
   version 2 reports both.
 - Resume refetches through the start path, so code patched while halted
   takes effect.
+- While a read watchpoint is armed (attached or not, until the next plain
+  program load clears it), loads skip the D-cache hit pipe and store-to-load
+  forwarding: same results, a few cycles slower per load.
+- Known gap: a read watchpoint is compared on an access's first doubleword
+  only, so LEAVERET's second read (the return-address slot) and the second
+  doubleword of a MEMGET32 that spans two never fire it.
 - The kernel-usable user single step and watchpoints (§13.5) are separate:
   while the debugger is attached the user watchpoints are off, and the
   debugger's halt, step and breakpoints take priority over a user step

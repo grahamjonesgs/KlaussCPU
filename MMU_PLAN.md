@@ -1279,8 +1279,8 @@ base in EX, with the MEM replay above".
 - **Frame push** (§11.3): PA = SP − 8 − `0x8000_0000`; SP − 8 not in kseg
   parks with kind 6 (HCF `ERR_DFAULT` 0x0B; a debug halt, cause TRAP, when a
   debugger is attached). Neither writes ECAUSE / EADDR / TLB_HI.
-- **Watchpoints** compare PAs (`mem_iaddr`, `h_addr`), like debugger memory
-  accesses.
+- **Watchpoints** compare PAs (`mem_iaddr`; with a debugger read watchpoint
+  armed, loads do not use the hit pipe), like debugger memory accesses.
 - **Entry count: 32 on the xc7a100t** (decision 2026-11-11, Graham with
   the runtime session; §11.7). The runtime measured, in the klausscc model
   of Linux, that 32 entries make Python start-up 1.47× and a Python loop
