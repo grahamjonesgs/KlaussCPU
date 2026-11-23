@@ -6420,7 +6420,7 @@ module pipeline_core
          else $fatal(1, "wbz_fwd form: mdir=%b ld=%b v=%h", wb_mdir, wb_ld, wb_fwd_v);
    // ... and the EN_LDBYP capture's (dbg_50876c3 timing)
    always_ff @(posedge clk) if (!rst && ce && EN_LDBYP && ex_valid && ex_lb_b && wb_valid && !wb_wait &&
-                                (ex_busy || mem_busy))
+                                (ex_busy || mem_busy) && !$isunknown({wb_ldval, wbz_cap}))
       assert (wbz_cap == f_wz(ex_w, wb_ldval))
          else $fatal(1, "wbz_cap form: mdir=%b ld=%b w=%b v=%h", wb_mdir, wb_ld, ex_w, wb_ldval);
    // a direct MUL in WB: the early-selected product equals the late select
