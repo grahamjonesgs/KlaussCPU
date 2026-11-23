@@ -1555,6 +1555,66 @@ module pipeline_core
          default: return (d.mtsr && op[19:12] != 8'd7) || d.tlbi;
       endcase
    endfunction
+   // (timing, build dbg_50876c3: ifb_dw -> the window mux -> w_dec.uop ->
+   // id_b_imm, 8 levels, -0.005, the DEBUG_EN build's worst; r_in0 -> ... ->
+   // id_b_one +0.100; ifb_dw -> the candidate predecode's f_priv of the raw
+   // decode -> id_privop, 8 levels, +0.120) the IF->ID latch's ex_b-select
+   // and privilege bits as flat functions of the op word's fields, not
+   // through the raw decode's uop tree (decoded per window candidate, as
+   // w_pdk / w_pdx are, and picked by in0 / pc[2] last: w_pdb, w_pd).
+   // f_b_one / f_b_imm equal the old forms for EVERY op word (an illegal
+   // or user-privileged op's id_b_* still reach lb2 / ex_b); f_privq equals
+   // f_priv of the raw decode for every LEGAL op word — id_privop is read
+   // only with id_legal (f_decode_q), and w_xser only matters for a legal
+   // op (an illegal one serializes anyway, w_pd_ser; an EI is legal).
+   // Checked exhaustively over all 2^32 op words against the decode forms
+   // (EXC_EN / MPU_EN / TLB_EN / TLB_WALK / UDBG_EN on and off), and
+   // asserted at the latch.
+   // = f_decode_raw(op).uop == U_ALU && op[29:26] == 4'h5: INC / DEC
+   function automatic logic f_b_one(logic [31:0] op);
+      return op[31:30] == 2'b01 && op[29:26] == 4'h5 && op[25:23] == 3'b111 && op[21:19] == 3'b001 &&
+             op[18:12] == 7'h0 && op[3:0] == 4'h0;
+   endfunction
+   // = (LEN != 01 || class 2 || class 3 SGN || class D IMM || P9 MULV) &&
+   //   f_decode_raw(op).uop in {MUL, DIV, MOD, BOOL, ALU, FBR}
+   // (class 1 / 5 ops are legal only with LEN = 01: never)
+   function automatic logic f_b_imm(logic [31:0] op);
+      logic [1:0] len;  logic [3:0] cls, alu;
+      len = op[31:30];  cls = op[29:26];  alu = op[25:22];
+      case (cls)
+         // ALU reg-imm (2-word, or the A5 short imm8): ADD..SBC with [21],
+         // AND / OR / XOR without (not LEAPC / MOV / SETR64)
+         4'h2: return ((len == 2'b10 && op[18:12] == 7'h0 && (!op[19] || alu == 4'd0)) || len == 2'b01) &&
+                      op[3:0] == 4'h0 &&
+                      ((alu[3:2] == 2'b00 && op[21]) || (alu[3:2] == 2'b01 && alu[1:0] != 2'b11 && !op[21]));
+         // compare: the 2-word form (BOOL / CMP), or the A3 short CMP
+         4'h3: return (len == 2'b10 && op[18:12] == 7'h0 && op[3:0] == 4'h0 &&
+                       (op[21] ? op[25:23] <= 3'd4 : (op[25:23] == 3'd0 && op[11:8] == 4'h0 && !op[22]))) ||
+                      (len == 2'b01 && op[20] && !op[21] && op[3:0] == 4'h0 && op[25:23] == 3'd0 &&
+                       op[11:8] == 4'h0 && (!op[22] || EN_SHORT9));
+         // MUL / DIV / MOD: the 2-word form, or P9 MULV simm8
+         4'hA: return (EN_SHORT9 && len == 2'b01 && op[25:24] == 2'd3 && op[22:20] == 3'b000 &&
+                       op[3:0] == 4'h0) ||
+                      (len == 2'b10 && op[3:0] == 4'h0 && op[21:20] == 2'b00 && op[18:12] == 7'h0 &&
+                       (!op[19] || (op[25:24] == 2'd0 && !op[22])) &&
+                       (op[25:24] == 2'd0 || (op[25:24] != 2'd3 && !op[22])));
+         // fused branch, IMM = 1 (simm4, or EN_FBR_W's imm32 word)
+         4'hD: return EN_FBR && op[21] && (EN_FBR_W || op[25:23] <= 3'd4) &&
+                      (len == 2'b01 || (EN_FBR_W && len == 2'b10 && op[3:0] == 4'h0));
+         default: return 1'b0;
+      endcase
+   endfunction
+   // = f_priv(f_decode_raw(op), op) for every op with f_decode_raw(op).legal
+   // (the legal ops of classes 9 / B / C, by their op fields only): LCD /
+   // LCDRST, IRET, HALT / WAIT / RESET / DELAY / DI / EI / the TLB ops,
+   // MFSR other than STATUS / TP / CYCLE, MTSR other than TP
+   function automatic logic f_privq(logic [31:0] op);
+      logic [3:0] cls, alu;  logic [5:0] sys;  logic [7:0] sr;
+      cls = op[29:26];  alu = op[25:22];  sys = op[21:16];  sr = op[19:12];
+      return cls == 4'hC || (cls == 4'h9 && alu == 4'd7) ||
+             (cls == 4'hB && alu == 4'd0 && sys != 6'd0 && sys != 6'd4 && sys != 6'd8 && sys <= 6'd12) ||
+             (cls == 4'hB && alu == 4'd1 && sr != 8'd7 && (op[21] || (sr != 8'd0 && sr != 8'd8)));
+   endfunction
    // um = user mode; fx / fxc = a fetch fault on this instruction (MMU
    // stage 1: user fetch from 0xF... (0) or a misaligned user PC (1)),
    // which wins over ILLEGAL and PRIVILEGED
@@ -1729,7 +1789,8 @@ module pipeline_core
    for (genvar k = 0; k < 4; k++) begin : g_pd
       assign w_pdr[k] = f_decode_raw(w_pdop[k]);
       assign w_pdf[k] = f_decode(w_pdop[k], 1'b0, 1'b0, 1'b0);
-      assign w_pdk[k] = {w_pdf[k].serialize, f_priv(w_pdr[k], w_pdop[k]), w_pdr[k].legal};
+      // (dbg_50876c3 timing: the privilege bit flat, f_privq — see f_b_imm)
+      assign w_pdk[k] = {w_pdf[k].serialize, f_privq(w_pdop[k]), w_pdr[k].legal};
    end
    wire [2:0] w_pd0 = w_pdk[0], w_pd1 = w_pdk[1], w_pd2 = w_pdk[2], w_pd3 = w_pdk[3];
    // (§10, build 2's worst: ifb_dw -> w_op -> the raw decode's register
@@ -1744,18 +1805,37 @@ module pipeline_core
                          w_pdr[k].sgn};
    end
    wire [14:0] w_px = pc[2] ? (in0 ? w_pdx[1] : w_pdx[3]) : (in0 ? w_pdx[0] : w_pdx[2]);
+   // (dbg_50876c3 timing) id_b_one / id_b_imm, per candidate from the flat
+   // f_b_one / f_b_imm (no uop tree), in0 / pc[2] last: was ifb_dw -> w_op
+   // -> w_dec.uop -> id_b_imm, -0.005 (8 levels)
+   (* keep = "true" *) logic [1:0] w_pdb [0:3];          // {b_one, b_imm}
+   for (genvar k = 0; k < 4; k++) begin : g_pdb
+      assign w_pdb[k] = {f_b_one(w_pdop[k]), f_b_imm(w_pdop[k])};
+   end
+   wire [1:0] w_pb = pc[2] ? (in0 ? w_pdb[1] : w_pdb[3]) : (in0 ? w_pdb[0] : w_pdb[2]);
 `ifndef SYNTHESIS
    always_ff @(posedge clk) if (!rst && !$isunknown({w_op, w_px}))
       assert (w_px == {w_dec.rs1, w_dec.rd, w_dec.use_rs1, w_dec.use_rs2, w_dec.use_rdd, w_dec.fread,
                        w_dec.sp_rd || w_dec.sp_wr,
                        w_dec.uop == U_ALU || w_dec.uop == U_BOOL || w_dec.uop == U_FBR, w_dec.sgn})
          else $fatal(1, "the candidate field predecode != the w_op decode (pc %h op %h)", pc, w_op);
+   // (every op word, legal or not: the old id_b_one / id_b_imm forms)
+   always_ff @(posedge clk) if (!rst && !$isunknown({w_op, w_pb}))
+      assert (w_pb == {w_dec.uop == U_ALU && w_op[29:26] == 4'h5,
+                       (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
+                        (w_op[29:26] == 4'h3 && w_op[20]) ||
+                        (w_op[29:26] == 4'hD && w_op[21]) ||
+                        (EN_SHORT9 && w_op[29:26] == 4'hA && w_op[25:24] == 2'b11)) &&
+                       (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
+                        w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR)})
+         else $fatal(1, "the candidate b-select predecode != the w_op decode (pc %h op %h)", pc, w_op);
 `endif
    wire [2:0] w_pd = pc[2] ? (in0 ? w_pd1 : w_pd3) : (in0 ? w_pd0 : w_pd2);
    wire w_pd_ser = w_pd[2], w_pd_priv = w_pd[1], w_pd_legal = w_pd[0];
 `ifndef SYNTHESIS
    always_ff @(posedge clk) if (!rst && !$isunknown({w_op, w_pd}))
-      assert (w_pd_ser == w_decf.serialize && w_pd_priv == f_priv(w_dec, w_op) && w_pd_legal == w_dec.legal)
+      assert (w_pd_ser == w_decf.serialize && (!w_dec.legal || w_pd_priv == f_priv(w_dec, w_op)) &&
+              w_pd_legal == w_dec.legal)
          else $fatal(1, "the candidate predecode != the w_op decode (pc %h op %h)", pc, w_op);
 `endif
    wire w_xser = EN_EXC && (w_fx || (fe_um && w_pd_priv));
@@ -2829,12 +2909,36 @@ module pipeline_core
    wire        t_miss = t_tlbs && !tlb_d_hit;
    wire        t_perm = t_tlbs && tlb_d_hit && !tlb_d_pok;
    wire        t_dn   = t_seg || (t_tlbs && !tlb_d_pok);     // = t_seg || t_miss || t_perm
-   wire [15:0] t_pahi = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[10:0]} : tva;
+   // (timing, build dbg_50876c3, with t1_pahi / mem_pa2hi's register
+   // enables below: = t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? ... : tva, as
+   // a select of each carry candidate's PFN over a value that does not
+   // depend on it, and the carry c15 last — as h_pg0 / h_pg1 — so each bit
+   // is one 5-input function of {c15, d_pfn0, d_pfn1, t_tlbs, tva}, not
+   // the shared tlb_d_pfn LUT and a second LUT behind it)
+   wire [15:0] t_palt = t_kseg ? {5'b0, tva[10:0]} : tva;
+   wire [15:0] t_pa0  = t_tlbs ? {5'b0, tlb_d_pfn0} : t_palt;
+   wire [15:0] t_pa1  = t_tlbs ? {5'b0, tlb_d_pfn1} : t_palt;
+   wire [15:0] t_pahi = tlb_d_c15 ? t_pa1 : t_pa0;
    // (sim only: mmu_tlb's exact-match check — from the EA adder, the old
    // form, so it checks the CAM independently of the select above)
    assign tlb_d_vpn = ex_mph ? ex_ea_q[31:16] : exo_eaddr[31:16];
    logic        t1_dn, t1_seg, t1_miss, t1_tlb;   // the 1st page, for the 2nd-page cycle
    logic [15:0] t1_pahi;
+   // (stage 3) the 1st page's translation (from its 1st cycle), kept for
+   // the 2nd-page cycle (§11.9).  (timing, build dbg_50876c3: the TLB
+   // entries -> the CAM -> d_pfn0 -> tlb_d_pfn -> t_pahi -> t1_pahi, 8
+   // levels, +0.009 / +0.031 / +0.084: the load enable, ex_busy &&
+   // ex_mpu_hold && !ex_mph, was merged into the last LUT behind the PFN.)
+   // Loaded on EVERY edge while !ex_mph — a register enable, so the D input
+   // is the PFN select alone: = the old load (in the EX -> MEM block, under
+   // !mem_busy && ex_busy && ex_mpu_hold && !ex_mph) wherever t1_* is read.
+   // Every read is behind ex_x3 (ex_mph), and ex_mph rises only on such an
+   // edge (ex_mph's set, in the same branch as the old load); both forms
+   // load t_* there, and neither loads again while ex_mph stays 1.
+   always_ff @(posedge clk) if (ce && !ex_mph) begin
+      t1_dn <= t_dn;  t1_seg <= t_seg;  t1_miss <= t_miss;  t1_tlb <= t_miss || t_perm;
+      t1_pahi <= t_pahi;
+   end
    wire ex_tchk  = EN_TLB && te && ex_valid && ex_memop && !ex_misal;
    wire ex_x3    = EN_TLB && ex_mph && ex_xpg_q;                // in its 2nd-page cycle
    wire d1_dn    = ex_x3 ? t1_dn   : t_dn;
@@ -2895,6 +2999,19 @@ module pipeline_core
                                            : (!mem_qu2 && !mem_qtseg && mq_ttlb));
    logic [15:0] mem_pa2hi;               // (stage 3) the 2nd page's PA[31:16]
    logic        mem_xpg;                 // ... the op crosses a page
+   // (timing, build dbg_50876c3: the CAM -> tlb_d_pfn -> t_pahi ->
+   // mem_pa2hi, 8 levels, +0.032 / +0.146 — the EX -> MEM enable, !mem_busy
+   // && !ex_busy, was merged into the last LUT behind the PFN.)  Loaded on
+   // EVERY edge while ex_mph — a register enable — instead of at EX -> MEM:
+   // the same value wherever it is read.  It is read only by a valid MEM op
+   // with mem_xpg (its 2nd access's m_addr, the 2nd-dword watchpoint
+   // compare: both behind mem_valid).  Such an op entered MEM on an EX ->
+   // MEM edge with ex_x3, so ex_mph = 1: both forms load t_pahi there.  That
+   // edge clears ex_mph, which rises again only on a !mem_busy && ex_busy
+   // edge — the MEM op leaves MEM on it and mem_valid <= 0 — so nothing
+   // reloads mem_pa2hi while the op can read it.  (An op entering with
+   // !ex_x3 has mem_xpg = 0 and never reads it.)
+   always_ff @(posedge clk) if (ce && ex_mph) mem_pa2hi <= t_pahi;
    // MEM -> WB exception record: wb_xc = the WB op is an exception op
    // (ILLEGAL / TRAP / misaligned / U_EXC), with its cause and EADDR
    logic        wb_xc;
@@ -3863,6 +3980,21 @@ module pipeline_core
                       : (wb_ld_msz == 2'd0) ? wbz_ld[wb_ld_ea]
                       : (wb_ld_msz == 2'd1) ? (wbz_ld[{wb_ld_ea[2:1], 1'b0}] && wbz_ld[{wb_ld_ea[2:1], 1'b1}])
                       : (wb_ld_ea[2] ? &wbz_ld[7:4] : &wbz_ld[3:0]);
+   // (timing, build dbg_50876c3: the port's read data -> wb_ldval's
+   // extraction (the LUTs shared with the ex_tb / ex_b / ex_c forwards) ->
+   // a 64-bit zero test -> ex_b_zero, 11 levels, +0.078: the EN_LDBYP
+   // capture's f_wz(ex_w, wb_ldval)) the capture's zero bit from the same
+   // byte-zero flags as wbz_fwd, with the EX op's ex_w for id_w: = f_wz(ex_w,
+   // wb_ldval) — exact for a direct MUL (mul_r2) and the port's dword, and
+   // for a hit by wb_hext = the extraction of wb_hdw (asserted with wb_valid).
+   // Asserted in every capture.
+   wire       wbz_lde  = ex_w ? &wbz_ld[3:0] : &wbz_ld;
+   wire       wbz_ldxe = (wb_ld_full || wb_ld_msz == 2'd3) ? wbz_lde
+                       : (wb_ld_msz == 2'd0) ? wbz_ld[wb_ld_ea]
+                       : (wb_ld_msz == 2'd1) ? (wbz_ld[{wb_ld_ea[2:1], 1'b0}] && wbz_ld[{wb_ld_ea[2:1], 1'b1}])
+                       : (wb_ld_ea[2] ? &wbz_ld[7:4] : &wbz_ld[3:0]);
+   (* keep = "true" *)
+   wire       wbz_cap  = (EN_MUL2 && wb_mdir) ? (ex_w ? &wbz_mr[3:0] : &wbz_mr) : wbz_ldxe;
    // (timing, §11.9 builds: kept, so synthesis does not fold ex_b_zero back
    // into a zero test of ex_b's forwarding mux — tlbx_b5's worst path)
    // (timing, §5 b4: the shifter's part of bz_mem from byte-zero flags of
@@ -4361,7 +4493,7 @@ module pipeline_core
             if (ex_lb_a) ex_a <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
             if (ex_lb_b) begin
                ex_b      <= ex_w ? {wb_ldval[31:0], 32'b0} : wb_ldval;
-               ex_b_zero <= f_wz(ex_w, wb_ldval);
+               ex_b_zero <= wbz_cap;   // (dbg_50876c3 timing: = f_wz(ex_w, wb_ldval), asserted)
             end
             ex_lb_a <= 1'b0;  ex_lb_b <= 1'b0;
          end
@@ -5240,12 +5372,8 @@ module pipeline_core
                mem_valid <= 1'b0;
                if (ex_is_mul) mul_cnt <= mul_cnt + 2'd1;
                if (ex_mpu_hold) begin ex_mph <= 1'b1;  ex_mok <= 1'b1; end
-               // (stage 3) the 1st page's translation (from its 1st cycle),
-               // kept for the 2nd-page cycle (§11.9)
-               if (ex_mpu_hold && !ex_mph) begin
-                  t1_dn <= t_dn;  t1_seg <= t_seg;  t1_miss <= t_miss;  t1_tlb <= t_miss || t_perm;
-                  t1_pahi <= t_pahi;
-               end
+               // ((stage 3) the 1st page's translation, t1_*: loaded while
+               // !ex_mph, see t_pahi)
             end else begin
                ex_mph     <= 1'b0;          // the op leaves EX (or EX was empty)
                ex_mok     <= 1'b0;
@@ -5327,7 +5455,8 @@ module pipeline_core
                               exo_iaddr[15:0]};
                sn_pra     <= exo_iaddr[IC_SNW+4:5];
                ev_mload = 1'b1;                     // (the tag-shadow guard, ri_v)
-               mem_pa2hi  <= t_pahi;                // a page-crossing two-access op's 2nd page
+               // (mem_pa2hi, a page-crossing two-access op's 2nd page: loaded
+               // while ex_mph, see t_pahi)
                mem_xpg    <= ex_x3;
                mem_wdata  <= exo_wdata;  mem_be <= exo_be;
                mem_mmq    <= ex_is_mm;   mem_mmpick <= ex_mmpick;
@@ -5514,16 +5643,11 @@ module pipeline_core
                      // (also the 2-word FBR: its word 1 is the imm32 rhs)
                      if (w_op[31] != w_op[30] && w_op[29:26] == 4'hD)
                         id_var2 <= {{17{w_op[20]}}, w_op[20:8], 2'b00};
-                     id_b_one  <= (w_dec.uop == U_ALU && w_op[29:26] == 4'h5);
+                     id_b_one  <= w_pb[1];       // (dbg_50876c3: the flat candidate predecode)
                      id_rs1    <= w_px[14:11];   // (§10: the candidate predecode of w_dec.rs1)
                      id_ldc    <= w_px[1];       //   (w_dec.uop is ALU / BOOL / FBR)
                      id_rd     <= w_px[10:7];    //   (w_dec.rd)
-                     id_b_imm  <= (w_op[31:30] != 2'b01 || w_op[29:26] == 4'h2 ||
-                                   (w_op[29:26] == 4'h3 && w_op[20]) ||
-                                   (w_op[29:26] == 4'hD && w_op[21]) ||
-                                   (EN_SHORT9 && w_op[29:26] == 4'hA && w_op[25:24] == 2'b11)) &&
-                                  (w_dec.uop == U_MUL || w_dec.uop == U_DIV || w_dec.uop == U_MOD ||
-                                   w_dec.uop == U_BOOL || w_dec.uop == U_ALU || w_dec.uop == U_FBR);
+                     id_b_imm  <= w_pb[0];       //   (= the old w_dec form, asserted at w_pb)
                      id_b_sext <= w_px[0];       // (§10: w_dec.sgn)
                      id_ser    <= w_pd_ser || w_xser || w_eiser;   // (§10: = w_decf.serialize)
                      id_eiser  <= w_eiser;
@@ -5556,7 +5680,7 @@ module pipeline_core
                                   (EN_FBR_W && w_op[29:26] == 4'hD && w_op[25] &&
                                    (w_op[24] || w_op[23]));
                      id_fx      <= w_fx;  id_fxc <= w_fxc;  id_fx2 <= w_fx2;  id_fxg <= w_fxg;
-                     id_legal   <= w_pd_legal;  id_privop <= w_pd_priv;   // (tmg; §10 the candidate predecode)
+                     id_legal   <= w_pd_legal;  id_privop <= w_pd_priv;   // (tmg; §10 the candidate predecode; f_privq)
                      id_fxm     <= w_fxm; id_fxl <= w_fxl;
                      id_mfsr    <= EN_EXC && w_op[31:26] == 6'b01_1011 && w_op[25:21] == 5'b00010;
                      id_use_rs1 <= w_px[6];  id_use_rs2 <= w_px[5];   // (§10: the candidate
@@ -6294,6 +6418,11 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown(wb_fwd_v))
       assert (wbz_fwd == f_wz(id_w, wb_fwd_v))
          else $fatal(1, "wbz_fwd form: mdir=%b ld=%b v=%h", wb_mdir, wb_ld, wb_fwd_v);
+   // ... and the EN_LDBYP capture's (dbg_50876c3 timing)
+   always_ff @(posedge clk) if (!rst && ce && EN_LDBYP && ex_valid && ex_lb_b && wb_valid && !wb_wait &&
+                                (ex_busy || mem_busy))
+      assert (wbz_cap == f_wz(ex_w, wb_ldval))
+         else $fatal(1, "wbz_cap form: mdir=%b ld=%b w=%b v=%h", wb_mdir, wb_ld, ex_w, wb_ldval);
    // a direct MUL in WB: the early-selected product equals the late select
    always_ff @(posedge clk) if (!rst && !$isunknown({mul_r2, mul_w[63:0]}))
       assert (!(EN_MUL2 && wb_valid && wb_mdir) || mul_r2 == mul_w[63:0])
@@ -6348,6 +6477,30 @@ module pipeline_core
    always_ff @(posedge clk) if (!rst && !$isunknown({ex_mok, ex_mph, ex_ufault, ex_dn1, ex_dn2}))
       assert (ex_mok == ex_mph && ex_ufault == (ex_dn1 || ex_dn2))
          else $fatal(1, "ex_mok stale: mph=%b", ex_mph);
+   // (dbg_50876c3 timing) t1_* / mem_pa2hi, loaded on register enables
+   // (!ex_mph / ex_mph), equal the old loads wherever they are read: the
+   // old forms, as sim-only shadows (t1_*: at !mem_busy && ex_busy &&
+   // ex_mpu_hold && !ex_mph; mem_pa2hi: at EX -> MEM), and t_pahi its old
+   // form
+   logic [15:0] t1_pahi_x, mem_pa2hi_x;
+   logic [3:0]  t1_x;
+   always_ff @(posedge clk) if (!rst && ce && !mem_busy) begin
+      if (ex_busy && ex_mpu_hold && !ex_mph) begin
+         t1_pahi_x <= t_pahi;  t1_x <= {t_dn, t_seg, t_miss, t_miss || t_perm};
+      end
+      if (!ex_busy) mem_pa2hi_x <= t_pahi;
+   end
+   always_ff @(posedge clk) if (!rst && EN_TLB) begin
+      if (ex_x3)
+         assert (t1_pahi == t1_pahi_x && {t1_dn, t1_seg, t1_miss, t1_tlb} == t1_x)
+            else $fatal(1, "t1_* != the old load: %h / %h", t1_pahi, t1_pahi_x);
+      if (mem_valid && mem_xpg)
+         assert (mem_pa2hi == mem_pa2hi_x)
+            else $fatal(1, "mem_pa2hi %h != the old load %h (pc %h)", mem_pa2hi, mem_pa2hi_x, mem_pc);
+      if (!$isunknown({t_tlbs, t_kseg, tva, tlb_d_pfn}))
+         assert (t_pahi == (t_tlbs ? {5'b0, tlb_d_pfn} : t_kseg ? {5'b0, tva[10:0]} : tva))
+            else $fatal(1, "t_pahi != its old form");
+   end
    // the snoop shadow's read address is the MEM op's I-line index (both
    // unreset: skipped while X in 4-state sims)
    always_ff @(posedge clk) if (!rst && !$isunknown({sn_pra, mem_iaddr[IC_SNW+4:5]}))
