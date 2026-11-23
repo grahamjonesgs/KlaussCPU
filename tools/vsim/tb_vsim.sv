@@ -636,6 +636,13 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       if (dut.dbg_watch_req && !wpg_w && wpg_i) wpg_irq++;
    end
 `endif
+   // +WPON / +WPOFF (see the plusargs): arm / disarm watchpoint 0 mid-run
+   int     wp_on = 0, wp_off = 0;
+   bit     wp0_en = 0;
+   always @(posedge clk) if (!rst) begin
+      if (wp_on > 0 && cyc == wp_on) dbg_i.wp_en[0] <= wp0_en;
+      if (wp_off > 0 && cyc == wp_off) dbg_i.wp_en[0] <= 1'b0;
+   end
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -809,15 +816,31 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
       void'($value$plusargs("LDLYN=%d", ldly_an));
       // debugger state without a debugger driver (DEBUG_EN builds only)
       if ($test$plusargs("DBG_ATTACHED")) dbg_i.attached = 1'b1;
-      // watchpoint 0 on a dword (read / write), without a debugger driver
+      // watchpoints 0 / 1 on a dword (read / write), without a debugger
+      // driver; +WPnBE=<hex>: its byte lanes (default FF)
       begin
          logic [31:0] wpa;
+         logic [7:0]  wpb;
          if ($value$plusargs("WP0RD=%h", wpa)) begin
             dbg_i.wp_en[0] = 1'b1; dbg_i.wp_rd[0] = 1'b1; dbg_i.wp_dw[0] = wpa[31:3]; dbg_i.wp_be[0] = 8'hFF;
          end
          if ($value$plusargs("WP0WR=%h", wpa)) begin
             dbg_i.wp_en[0] = 1'b1; dbg_i.wp_wr[0] = 1'b1; dbg_i.wp_dw[0] = wpa[31:3]; dbg_i.wp_be[0] = 8'hFF;
          end
+         if ($value$plusargs("WP1RD=%h", wpa)) begin
+            dbg_i.wp_en[1] = 1'b1; dbg_i.wp_rd[1] = 1'b1; dbg_i.wp_dw[1] = wpa[31:3]; dbg_i.wp_be[1] = 8'hFF;
+         end
+         if ($value$plusargs("WP1WR=%h", wpa)) begin
+            dbg_i.wp_en[1] = 1'b1; dbg_i.wp_wr[1] = 1'b1; dbg_i.wp_dw[1] = wpa[31:3]; dbg_i.wp_be[1] = 8'hFF;
+         end
+         if ($value$plusargs("WP0BE=%h", wpb)) dbg_i.wp_be[0] = wpb;
+         if ($value$plusargs("WP1BE=%h", wpb)) dbg_i.wp_be[1] = wpb;
+         // +WPON=<cyc> / +WPOFF=<cyc>: watchpoint 0 enabled only from / until
+         // that cycle (a debugger arming / disarming it while the core runs)
+         void'($value$plusargs("WPON=%d", wp_on));
+         void'($value$plusargs("WPOFF=%d", wp_off));
+         wp0_en = dbg_i.wp_en[0];
+         if (wp_on > 0) dbg_i.wp_en[0] = 1'b0;
       end
 `ifdef HAS_EXC
       if ($test$plusargs("DBG_EXCPASS")) dbg_i.exc_pass = 1'b1;

@@ -2998,6 +2998,10 @@ module pipeline_core
    // EX-edge side effects (LCD, RAS push, early issue, PHT training).  (An
    // op that also faults is an exception op: mem_xsq wins, no WATCH.)
    logic       mem_wph, mem_wp2, mem_wps;
+   // (DEBUG_EN watchpoints) the bytes the MEM op really reads / writes in
+   // its doubleword 0 / 1 (ex_wm0 / ex_wm1, registered): a load's port
+   // byte enables (mem_be) are FF whatever its size
+   logic [7:0] mem_dwm0, mem_dwm1;
    logic [1:0] mem_wpm;
    wire mem_ysq_go   = EN_EXC && mem_valid && (mem_xsq || (EN_UDBG && mem_wph)) && !wb_wait;
    // 1a stage 3: a hit-pipe load that missed (or conflicted) waits in WB for
@@ -3053,9 +3057,9 @@ module pipeline_core
    wire lr_need2     = mem_valid && mem_lvrq && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
    // (DEBUG_EN watchpoints) the 2nd doubleword of LEAVERET / a spanning
-   // MEMGET32: its PA (as the 2nd read's m_addr) and the bytes read there
+   // MEMGET32: its PA (as the 2nd read's m_addr); the bytes read there are
+   // mem_dwm1
    wire [28:0] mem_dw2 = mem_xpg ? {mem_pa2hi, 13'h0000} : mem_iaddr[31:3] + 29'd1;
-   wire [7:0]  mem_be2 = mem_lvrq ? 8'hFF : (8'hFF >> (4'd12 - {1'b0, mem_eaddr[2:0]}));
    // EN_ST1: the store issues this edge onto a completely idle port (no
    // chaining — registers only) and leaves MEM with it
    wire st_spec_now  = EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
@@ -4143,7 +4147,8 @@ module pipeline_core
          // mispredicted or unpredicted return — has been applied to pc; a
          // latch on this edge sets it again, below: last write wins)
          if (DEBUG_EN) begin
-            dbg_wpa <= |(dbg_i.wp_en & (dbg_i.wp_rd | dbg_i.wp_wr));
+            dbg_wpa <= |(dbg_i.wp_en & (dbg_i.wp_rd | dbg_i.wp_wr) &
+                         {|dbg_i.wp_be[1], |dbg_i.wp_be[0]});   // (no byte lanes: never hits)
             if (!id_valid && !ex_valid && !mem_valid) dbg_wph <= 1'b0;
          end
 
@@ -4160,7 +4165,10 @@ module pipeline_core
                park_kind     <= 3'd4;
                park_pc       <= pc;
                park_op       <= '0;
-               dbg_cause     <= dbg_cause_q;
+               // (a watchpoint hit while the boundary was taken for a step
+               // or a halt request — the stepped instruction's access, or
+               // one racing the request — is reported: WATCH wins)
+               dbg_cause     <= dbg_watch_req ? DBG_CAUSE_WATCH : dbg_cause_q;
                dbg_stepping  <= 1'b0;
                dbg_step_done <= 1'b0;
                dbg_watch_req <= 1'b0;
@@ -4587,6 +4595,26 @@ module pipeline_core
          st_spec <= 1'b0;
          if (st_spec) st_post_ok <= 1'b0;
 
+         // Watchpoints, the second doubleword of a two-doubleword read
+         // (LEAVERET's return address at [R15 + 8], a MEMGET32 spanning a
+         // doubleword): compared in MEM on registers — the 2nd dword's PA
+         // is next to the 1st, or (TE = 1, crossing a page) the start of
+         // mem_pa2hi's frame, as the 2nd read's m_addr.  Not tied to a port
+         // read: the line lookahead serves it without one.  An op in MEM
+         // completes (an access fault, mem_xsq, makes no access).  Once a
+         // hit is pending (!dbg_watch_req) it is not compared again, and a
+         // doubleword-0 hit on the same edge (the MEM-issue compare below;
+         // the early-load one at EX -> MEM came first) wins: watch_addr is
+         // doubleword 0's when both hit.
+         if (DEBUG_EN && mem_valid && !mem_xsq && !sq_spec && !dbg_watch_req && (mem_lvrq || ld32_span)) begin
+            for (int w = 0; w < 2; w++)
+               if (dbg_i.wp_en[w] && dbg_i.wp_rd[w] && mem_dw2 == dbg_i.wp_dw[w] &&
+                   (mem_dwm1 & dbg_i.wp_be[w]) != 8'h00) begin
+                  dbg_watch_req  <= 1'b1;
+                  dbg_watch_addr <= {mem_dw2, 3'b000};
+               end
+         end
+
          // ---------------- MEM port engine (extra_clock pattern) ----------------
          // (nothing issues for a MEM op the EN_ST1 squash kills this edge: a
          // store chained onto the draining posted store would write, and any
@@ -4661,9 +4689,11 @@ module pipeline_core
                   // so the park pc is its successor.
                   if (DEBUG_EN) begin
                      for (int w = 0; w < 2; w++)
+                        // (a read: the bytes it reads, mem_dwm0 — its
+                        // port enables are FF; a write: its enables)
                         if (dbg_i.wp_en[w] && f_dweq(mem_iaddr[31:3], dbg_i.wp_dw[w], mzl) &&
-                            (mem_be & dbg_i.wp_be[w]) != 8'h00 &&
-                            ((dbg_i.wp_rd[w] && mem_port_rd) || (dbg_i.wp_wr[w] && mem_port_wr))) begin
+                            ((dbg_i.wp_rd[w] && mem_port_rd && (mem_dwm0 & dbg_i.wp_be[w]) != 8'h00) ||
+                             (dbg_i.wp_wr[w] && mem_port_wr && (mem_be & dbg_i.wp_be[w]) != 8'h00))) begin
                            dbg_watch_req  <= 1'b1;
                            dbg_watch_addr <= mem_iaddr;
                         end
@@ -4737,23 +4767,6 @@ module pipeline_core
                end
             endcase
          end
-         // Watchpoints, the second doubleword of a two-doubleword read
-         // (LEAVERET's return address at [R15 + 8], a MEMGET32 spanning a
-         // doubleword): compared in MEM on registers — the 2nd dword's PA
-         // is next to the 1st, or (TE = 1, crossing a page) the start of
-         // mem_pa2hi's frame, as the 2nd read's m_addr.  Not tied to a port
-         // read: the line lookahead serves it without one.  An op in MEM
-         // completes (an access fault, mem_xsq, makes no access); the compare
-         // may repeat while it stays there.
-         if (DEBUG_EN && mem_valid && !mem_xsq && !sq_spec && (mem_lvrq || ld32_span)) begin
-            for (int w = 0; w < 2; w++)
-               if (dbg_i.wp_en[w] && dbg_i.wp_rd[w] && mem_dw2 == dbg_i.wp_dw[w] &&
-                   (mem_be2 & dbg_i.wp_be[w]) != 8'h00) begin
-                  dbg_watch_req  <= 1'b1;
-                  dbg_watch_addr <= {mem_dw2, 3'b000};
-               end
-         end
-
          // ---------------- debugger memory access (debug-halted only) ----------
          // The parked core's port is idle; one access at a time through the
          // same port (D-cache coherent, MMIO decoded by the SoC as usual).
@@ -5246,8 +5259,10 @@ module pipeline_core
                   mem_xc     <= 2'd1;
                   if (DEBUG_EN && ex_wp_ok) begin
                      for (int w = 0; w < 2; w++)
+                        // (the bytes it reads: ex_wm0, from ex_tlo3 — not
+                        // behind the EA adder as exo_be, which is FF here)
                         if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
-                            (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
+                            (ex_wm0 & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
                            dbg_watch_req  <= 1'b1;
                            dbg_watch_addr <= exo_iaddr;
                         end
@@ -5334,6 +5349,7 @@ module pipeline_core
                mem_xsa    <= ex_fa;                // (= ex_ufault, as two registers)
                // MMU_PLAN.md §13.3: a user watchpoint hit (registered only)
                mem_wph    <= ex_whit;
+               mem_dwm0   <= ex_wm0;  mem_dwm1 <= ex_wm1;
                mem_wpm    <= ex_wh;
                mem_wps    <= ex_wst;
                mem_wp2    <= ex_wh0 == 2'b00;

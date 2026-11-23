@@ -8213,33 +8213,41 @@ def dwp_resume():
 
 @test
 def dwp_irq():
-    """an IRQ pending while the watched store is in flight: the debug halt
-    still comes first, at the store's successor (the IRQ boundary is held
+    """an IRQ pending while the watched store (load: a read watchpoint) is
+    in flight: the debug halt still comes first, at its successor (the IRQ boundary is held
     off until the store has left MEM); each resume then takes the IRQ.  A
     loop of watched stores under a fast timer (+DBG_DRV, every halt's pc /
     cause checked); wpg_irq (TB) counts hits with an IRQ held behind them"""
     out = []
-    for per, v in ((97, ['+LAT=1']), (131, ['+LAT=3']), (173, ['+LAT=7']), (108, ['+HIT=70', '+LDLY=3'])):
+    for kind, per, v in (('wr', 97, ['+LAT=1']), ('wr', 131, ['+LAT=3']), ('wr', 173, ['+LAT=7']),
+                         ('wr', 108, ['+HIT=70', '+LDLY=3']),
+                         ('rd', 99, ['+LAT=1']), ('rd', 131, ['+LAT=3']), ('rd', 161, ['+LAT=7']),
+                         ('rd', 113, ['+HIT=70', '+LDLY=3'])):
         a = Asm()
         a.set_int_mask(1)
         a.setr(12, DATA + 0x20); a.setr(5, 0); a.setr(6, 0)
         a.label('lp')
         a.inc(5)
-        a.st(64, 5, 12)
+        if kind == 'wr':
+            a.st(64, 5, 12)
+        else:
+            a.st(64, 5, 12, 8)                 # (not watched: the read watchpoint is on DATA + 0x20)
+            a.ld(64, 5, 12, 8)
         succ = a.alu('add', 6, 6, 5)
         a.nop(); a.nop()
         a.fbr('ne', 5, 7, 'lp', imm=True)
         a.set_int_mask(0)
         a.setr(9, 9)
         a.halt()
-        e = {'end': 'park', 'kind': '0', 'r5': 7, 'r6': 28, 'r9': 9, m(DATA + 0x20): 7}
+        e = {'end': 'park', 'kind': '0', 'r5': 7, 'r6': 28, 'r9': 9, m(DATA + 0x20 + (kind == 'rd') * 8): 7}
         if DWP_DBG:
             e['m00180000'] = 'nonzero'      # (without the halts the loop ends before a tick)
             e['dh_n'] = '7'
             for k in range(7):
                 e[f'dh{k}'] = f'{succ:08x}:3'
             e['wpg_irq'] = 'nonzero'
-        out.append((a, e, ['+WP0WR=%x' % (DATA + 0x20), '+DBG_DRV', f'+IRQ_PERIOD={per}', '+PARK_HOLD=4'] + v))
+        wp = '+WP0WR=%x' % (DATA + 0x20) if kind == 'wr' else '+WP0RD=%x' % (DATA + 0x28)
+        out.append((a, e, [wp, '+DBG_DRV', f'+IRQ_PERIOD={per}', '+PARK_HOLD=4'] + v))
     return out
 
 
@@ -8292,4 +8300,237 @@ def dwp_ustep():
                 wp = '+WP0WR=%x' % (DATA + 0x3B0 if which == 'st' else slot)
                 p = p + [wp, '+DBG_ATTACHED', '+PARK_HOLD=4'] + v + (['+DBG_DRV', '+DBG_NRES=1'] if res else [])
                 out.append((a, e, p))
+    return out
+
+
+def _dwp_bytes_mask(op, off):
+    """(doubleword 0 mask, doubleword 1 mask) of the bytes op touches at off"""
+    n = {'ld8': 1, 'st8': 1, 'ld16': 2, 'st16': 2, 'ld32s': 4, 'st32': 4, 'mg32': 4, 'ld64': 8}[op]
+    m16 = ((1 << n) - 1) << off
+    return m16 & 0xFF, m16 >> 8
+
+
+@test
+def dwp_bytes():
+    """byte lanes: a watchpoint with BE != FF hits only an access that
+    really touches one of its bytes — 8 / 16 / 32-bit loads (a load's port
+    byte enables are FF) and stores, MEMGET32 at every offset (doubleword 0
+    through the early issue; doubleword 1 of a spanning one); a miss runs
+    to completion"""
+    out = []
+    cases = []
+    for be in (0x01, 0x80, 0x18):
+        for off in range(8):
+            cases += [('ld8', off, be, 0), ('st8', off, be, 0), ('mg32', off, be, 0)]
+            if off > 4:
+                cases.append(('mg32', off, be, 1))
+        for off in (0, 2, 4, 6):
+            cases += [('ld16', off, be, 0), ('st16', off, be, 0)]
+        for off in (0, 4):
+            cases += [('ld32s', off, be, 0), ('st32', off, be, 0)]
+    for i, (op, off, be, dw) in enumerate(cases):
+        a = Asm()
+        a.dword(DATA + 0x60, 0x8877665544332211); a.dword(DATA + 0x68, 0xFFEEDDCCBBAA9988)
+        a.setr(12, DATA + 0x60 + off); a.setr(3, 0x5A5A5A5A5A)
+        if op.startswith('st'):
+            a.st(int(op[2:]), 3, 12)
+        elif op == 'mg32':
+            a.ld(32, 6, 12)
+        else:
+            a.ld(int(op[2:4]), 6, 12, 0)       # ([rs1 + 0]: a 32-bit one is not MEMGET32)
+        succ = a.setr(9, 9)
+        a.halt()
+        m0, m1 = _dwp_bytes_mask(op, off)
+        hit = ((m1 if dw else m0) & be) != 0
+        wa = DATA + 0x60 + 8 * dw
+        kind = 'WR' if op.startswith('st') else 'RD'
+        plus = [f'+WP0{kind}={wa:x}', f'+WP0BE={be:02x}', '+PARK_HOLD=4', ['+LAT=3', '+LAT=1', '+HIT=70'][i % 3]]
+        if DWP_DBG and hit:
+            e = {'end': 'park', 'kind': '4', 'dbg_cause': '3', 'pc': succ, 'dh_n': '1', 'r9': 0}
+            if dw:
+                e['watch_addr'] = '%08x' % wa
+        else:
+            e = {'end': 'park', 'kind': '0', 'dh_n': '0', 'r9': 9}
+        out.append((a, e, plus))
+    return out
+
+
+@test
+def dwp_both_dw():
+    """a two-doubleword read hitting a watchpoint on each doubleword
+    (WP0 on the 2nd, WP1 on the 1st): the halt reports doubleword 0 (the access's
+    address, as for any doubleword-0 hit) —
+    a spanning MEMGET32 (same line, across lines), LEAVERET (same line,
+    across lines)"""
+    out = []
+    for kind in ('mg32', 'lvr'):
+        for x in (False, True):
+            a = Asm()
+            if kind == 'mg32':
+                b = DATA + (0x118 if x else 0x100)
+                a.dword(b, 0x8877665544332211); a.dword(b + 8, 0xFFEEDDCCBBAA9988)
+                a.setr(12, b + 6)
+                a.ld(32, 6, 12)
+                d0 = b
+                wa = b + 6                    # (the access's address)
+            else:
+                stk = DWP_STK_X if x else DWP_STK
+                a.setr(1, stk); a.setsp(1); a.setr(15, 0x1515)
+                a.leapc(3, 'back'); a.push(3); a.push(15)
+                a.getsp(15)
+                a.leaveret()
+                a.setr(8, 8)
+                a.halt()
+                a.label('back')
+                d0 = wa = stk - 16
+            succ = a.setr(9, 9)
+            a.halt()
+            for v in (['+LAT=1'], ['+LAT=3'], ['+HIT=70']):
+                e = ({'end': 'park', 'kind': '4', 'dbg_cause': '3', 'pc': succ, 'r9': 0, 'r8': 0, 'dh_n': '1',
+                      'watch_addr': '%08x' % wa} if DWP_DBG else {'end': 'park', 'kind': '0', 'r9': 9})
+                out.append((a, e, ['+WP0RD=%x' % (d0 + 8), '+WP1RD=%x' % d0, '+PARK_HOLD=4'] + v))
+    return out
+
+
+@test
+def dwp_dm_step():
+    """a debugger single step (+DBG_BP0 on the access, +DBG_STEPS=1) whose
+    instruction hits a watchpoint halts with cause WATCH (not STEP), at its
+    successor; the plain resume then completes the program"""
+    out = []
+    for kind in ('wr', 'rd', 'call'):
+        a = Asm()
+        a.dword(DATA + 0x40, 0x41)
+        a.setr(1, DWP_STK); a.setsp(1)
+        a.setr(12, DATA + 0x40); a.setr(3, 0x33)
+        if kind == 'wr':
+            at = a.st(64, 3, 12)
+            succ = a.setr(9, 9)
+            wp = '+WP0WR=%x' % (DATA + 0x40)
+        elif kind == 'rd':
+            at = a.ld(64, 6, 12)
+            succ = a.setr(9, 9)
+            wp = '+WP0RD=%x' % (DATA + 0x40)
+        else:
+            at = a.call('f')
+            a.halt()
+            a.label('f')
+            succ = a.setr(9, 9)
+            wp = '+WP0WR=%x' % (DWP_STK - 8)
+        a.halt()
+        for v in (['+LAT=1'], ['+LAT=3'], ['+HIT=70']):
+            e = {'end': 'park', 'kind': '0', 'r9': 9}
+            if DWP_DBG:
+                e.update({'dh_n': '2', 'dh0': f'{at:08x}:2', 'dh1': f'{succ:08x}:3'})
+            out.append((a, e, [wp, f'+DBG_BP0={at:x}', '+DBG_STEPS=1'] + v))
+    return out
+
+
+@test
+def dwp_xpage():
+    """TE = 1, a two-doubleword read crossing a page whose next page maps
+    to a frame not adjacent to the first (VA 0x0200_xxxx -> PA 0x4xxxx,
+    0x0201_xxxx -> PA 0x6xxxx): a read watchpoint on PA 0x60000 (its 2nd
+    doubleword) hits, watch_addr = 0x60000; one on the physically adjacent
+    PA 0x50000 does not.  MEMGET32 and LEAVERET.  With the second page
+    unmapped (a TLB miss: the handler steps over the op) neither a watch on
+    the first doubleword's PA nor on 0x50000 fires"""
+    if NOEXC:
+        return []
+    out = []
+    for kind in ('mg32', 'lvr'):
+        for mapped in (True, False):
+            for wa in ((0x60000, 0x50000) if mapped else (0x4FFF8, 0x50000)):
+                a = Asm()
+                _xsetup(a)
+                _tlb_set(a, 2, 0x0200, 0x004, TLB_V | TLB_R, g=1)
+                if mapped:
+                    _tlb_set(a, 3, 0x0201, 0x006, TLB_V | TLB_R, g=1)
+                _te_on(a)
+                a.setr(15, 0x1515)
+                if kind == 'mg32':
+                    a.setr(12, 0x0200FFFE)
+                    a.ld(32, 6, 12)
+                else:
+                    a.setr(15, 0x0200FFF8)
+                    a.leaveret()
+                a.setr(8, 8)
+                a.halt()
+                a.label('back')
+                succ = a.setr(9, 9)
+                a.halt()
+                _mpuhandler(a)
+                a.dword(0x4FFF8, 0x2222111100000000 if kind == 'mg32' else 0x1515)
+                a.dword(0x50000, 0x7777777777777777)
+                a.dword(0x60000, 0x4444333300000000 | 0x3333 if kind == 'mg32' else a.labels['back'])
+                hit = DWP_DBG and mapped and wa == 0x60000
+                if not mapped:
+                    e = {'end': 'park', 'kind': '0', 'dh_n': '0', 'r8': 8, m(FLOG): X_TLB_LD}
+                elif hit:
+                    e = {'end': 'park', 'kind': '4', 'dbg_cause': '3', 'dh_n': '1', 'r8': 0, 'r9': 0,
+                         'watch_addr': '00060000',
+                         'pc': succ if kind == 'lvr' else a.insn_starts[a.insn_starts.index(a.labels['back']) - 2]}
+                else:
+                    e = {'end': 'park', 'kind': '0', 'dh_n': '0'}
+                    e.update({'r8': 8} if kind == 'mg32' else {'r9': 9, 'r15': 0x1515})
+                if mapped and kind == 'mg32':
+                    e['r6'] = 0x33332222
+                for v in (['+LAT=3'], ['+HIT=70', '+LAT=1']):
+                    out.append((a, e, ['+WP0RD=%x' % wa, '+PARK_HOLD=4'] + v))
+    return out
+
+
+@test
+def dwp_arm_running():
+    """a watchpoint armed (+WPON) and disarmed (+WPOFF) while a loop of
+    stores to it runs, with a debugger resuming each halt: every halt after
+    the first one is at the store's successor (the first may catch the
+    store with younger instructions already in flight), the halts stop
+    once disarmed, the program's result is exact"""
+    if not DWP_DBG:
+        return []
+    out = []
+    for on, off, v in ((60, 0, ['+LAT=1']), (97, 0, ['+LAT=3']), (61, 400, ['+LAT=1']), (150, 700, ['+HIT=70'])):
+        a = Asm()
+        a.setr(12, DATA + 0x20); a.setr(5, 0); a.setr(6, 0); a.setr(7, 40)
+        a.label('lp')
+        a.inc(5)
+        a.st(64, 5, 12)
+        succ = a.alu('add', 6, 6, 5)
+        a.fbr('ne', 5, 7, 'lp')
+        a.setr(9, 9)
+        a.halt()
+        e = {'end': 'park', 'kind': '0', 'r5': 40, 'r6': 820, 'r9': 9, m(DATA + 0x20): 40}
+        if off:
+            e['dh_n'] = (1, 39)
+        else:
+            e['dh_n'] = (3, 40)
+        for k in (1, 2):
+            e[f'dh{k}'] = f'{succ:08x}:3'
+        plus = ['+WP0WR=%x' % (DATA + 0x20), f'+WPON={on}', '+DBG_DRV'] + ([f'+WPOFF={off}'] if off else []) + v
+        out.append((a, e, plus))
+    return out
+
+
+@test
+def dwp_uwatch():
+    """a debugger watchpoint and a §13.3 user watchpoint (no debugger
+    attached: the user watchpoints are on) on the same user store: the user
+    WATCH entry is taken first and the debug halt stops at the handler's
+    first instruction, nothing of it executed (CPU_ARCHITECTURE §15)"""
+    if not DWP_DBG or NOEXC:
+        return []
+    out = []
+    for v in (['+LAT=1'], ['+LAT=3'], ['+HIT=70']):
+        P = {}
+
+        def body(a):
+            P['s1'] = a.setr(9, DATA + 0x3B0)
+            P['st'] = a.st(64, 9, 9)
+            P['s2'] = a.setr(10, 0x55)
+            return P
+        a, e, p = _udprog(body, ss=0, wps=[(DATA + 0x3B0, 0xFF | WP_W)])
+        e.update({'kind': '4', 'dbg_cause': '3', 'pc': a.labels['h'], 'dh_n': '1', 'r10': 0,
+                  m(DATA + 0x3B0): DATA + 0x3B0, 'watch_addr': '%08x' % (DATA + 0x3B0)})
+        out.append((a, e, p + ['+WP0WR=%x' % (DATA + 0x3B0), '+PARK_HOLD=4'] + v))
     return out

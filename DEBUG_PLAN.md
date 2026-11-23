@@ -59,7 +59,10 @@ about 2x slower while armed (randprog, LAT = 3), unchanged when not.  A read
 watchpoint now also sees LEAVERET's return-address slot and a spanning
 MEMGET32's second doubleword (CPU_ARCHITECTURE §15).  A watchpoint armed
 while the core runs is precise from the first instruction latched after it.
-tools/vsim `dwp_*` tests (DEBUG_EN builds).
+Review fix-ups: read watchpoints compare the bytes a load really reads (a
+load's port byte enables are FF), a hit during a single step or a halt
+request reports WATCH, a watchpoint with no byte lanes does not slow the
+core.  tools/vsim `dwp_*` tests (DEBUG_EN builds).
 
 ---
 

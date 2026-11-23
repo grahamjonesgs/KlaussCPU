@@ -893,7 +893,18 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
   any redirect it makes applied), and a pending interrupt or user-step
   boundary waits for that too, so the debug halt comes first. Code runs
   about half as fast while a watchpoint is armed (random test programs in
-  the simulator); nothing changes while none is.
+  the simulator); nothing changes while none is. Interrupt handlers run as
+  slowly, so a timer faster than its handler can now starve the main
+  program (seen in simulation: only the handler runs). A watchpoint armed
+  while the core runs is precise from the next instruction on; one already
+  in flight may still halt late.
+- A watchpoint hits only an access that touches one of its byte-mask
+  bytes: the bytes a load really reads (8/16/32-bit, MEMGET32 at any
+  offset), the bytes a store writes. The watch address is the access's
+  address.
+- A watchpoint hit is reported as cause WATCH even when the halt was
+  already under way for a single step (the stepped instruction's access
+  hit) or a halt request.
 - HALT, TRAP and illegal instructions become debug halts while a debugger
   is attached.
 - A halt request stops a WAIT in place. A single step completes the WAIT as
@@ -910,11 +921,15 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
 - A read watchpoint also sees the second doubleword of a two-doubleword
   read: LEAVERET's return-address slot (`[R15 + 8]`) and the second
   doubleword of a MEMGET32 that spans two (only the bytes it really reads).
-  The halt's watch address is then that doubleword's.
+  The halt's watch address is then that doubleword's; if both doublewords
+  hit, it is the access's address (the first).
 - The kernel-usable user single step and watchpoints (§13.5) are separate:
   while the debugger is attached the user watchpoints are off, and the
   debugger's halt, step and breakpoints take priority over a user step
-  (which survives them: its instruction still counts once).
+  (which survives them: its instruction still counts once). With no
+  debugger attached the user watchpoints stay on: an access hitting a
+  debugger watchpoint and a user one takes the user WATCH entry first, and
+  the debug halt then stops at the WATCH handler's first instruction.
 
 Details: [DEBUG_PLAN.md](DEBUG_PLAN.md).
 
