@@ -31,6 +31,22 @@ Build the debugger bitstream with `tools/build_debug.sh` (a project copy
 with `debug_module.sv`, `dm_jtag.xdc` and `DEBUG_EN=1`; the checked-in
 project still builds `DEBUG_EN=0`).  Using it: `klausscpu-runtime/DEBUGGING.md`.
 
+**2026-11-23 rebuild on the MMU / L2 design** (master 94e8448 + branch
+`dbgtiming`): the read-watchpoint compare on the hit pipe's `h_addr` sat
+behind the TLB PFN (WNS -1.417 ns).  Now an armed debugger read watchpoint
+turns the hit pipe off and loads are compared at MEM issue (results equal,
+loads a few cycles slower; CPU_ARCHITECTURE §15).  Built in a git-archive
+copy with `debug_module.sv`, `dm_jtag.xdc`, `DEBUG_EN=1` and `build_fast.tcl
+-resynth`: tier 1 WNS -0.048, tier 2 +0.022, WHS +0.014 (a volatile test
+bitstream, not release grade; `~/.cache/kbuild/debug_66d1d3a.bit`).  Board,
+via the runtime session: a Kl `-g` bare-metal program under lldb (source
+breakpoint, locals incl. slices / tagged union / `[dyn]`, 3-frame backtrace,
+`next`, write watchpoint, continue, detach) matches the emulator, except the
+write watchpoint halts after the store's next younger instructions (here 2
+loads and a CALL: the halt is at the callee) — the documented non-precise
+stop ("next instruction boundary"), one instruction later than the
+2026-10-26 build since stores post through the store queue.
+
 ---
 
 ## 1. Decisions
