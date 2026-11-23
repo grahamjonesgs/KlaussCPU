@@ -3187,8 +3187,12 @@ module pipeline_core
    // keeps the old form.  Asserted.)
    wire        ex_hmmio   = (EN_MPU && ex_mph) ? (exo_iaddr[31:28] == 4'hF)
                                                : (ex_tpg[15:12] == 4'hF);   // = exo_iaddr[31:28] == F
+   // (DEBUG_EN: no hit pipe while a debugger read watchpoint is armed —
+   // the loads issue to MEM, whose registered mem_iaddr is compared there;
+   // a compare on h_addr, behind the TLB PFN, missed timing by 1.4 ns)
+   wire        dbg_rwp    = DEBUG_EN && |(dbg_i.wp_en & dbg_i.wp_rd);
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && !ex_hmmio &&
-                            !(DEBUG_EN && dbg_mx);
+                            !(DEBUG_EN && (dbg_mx || dbg_rwp));
    wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
    wire h_elig       = h_base && (!h_line_blk || h_fwd);
    // (stage 3: with TE = 1 the tag bits [31:16] are the PA — the cache
@@ -5233,16 +5237,8 @@ module pipeline_core
                mem_fwb  <= m_wdata;
                mem_fwc  <= sq_wdata;
                if (h_fwd) mem_hok <= 1'b1;
-               // (watchpoints compare physical addresses, as the MEM-issue
-               // compare on mem_iaddr: h_addr is the PA with TE = 1)
-               if (DEBUG_EN && h_elig && ex_wp_ok) begin
-                  for (int w = 0; w < 2; w++)
-                     if (dbg_i.wp_en[w] && h_addr[31:3] == dbg_i.wp_dw[w] &&
-                         (exo_be & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
-                        dbg_watch_req  <= 1'b1;
-                        dbg_watch_addr <= h_addr;
-                     end
-               end
+               // (no watchpoint compare here: with a read watchpoint armed
+               // h_elig is 0 — dbg_rwp — and the load is compared at MEM issue)
                mem_pc     <= ex_pc;    mem_op <= ex_op;   mem_d <= ex_d;
                mem_eiser  <= ex_eiser || ex_eicv;   // (§9 item 4: converted in EX)
                mem_pred   <= ex_valid && ex_pred;  mem_pred_tgt <= ex_pred_tgt;
