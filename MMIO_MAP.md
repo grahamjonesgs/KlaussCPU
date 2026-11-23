@@ -432,7 +432,10 @@ pattern: letters, a decimal point on any digit, blank leading digits.
 - **Writes.** The byte enables **are** honoured here, unlike the other
   7-segment registers: a 64-bit store at 0x20 sets all eight digits, a
   32-bit store at 0x20 / 0x24 the right / left four, a 16-bit or byte store
-  only its own digits. Any `SEG_RAW` store sets `SEG_MODE.RAW`.
+  only its own digits. Any `SEG_RAW` store sets `SEG_MODE.RAW`. Accesses
+  must be naturally aligned (a 64-bit access only at 0x20, a 32-bit one at
+  0x20 / 0x24, a 16-bit one at an even offset); a misaligned access to
+  `SEG_RAW` or `SEG_MODE` is undefined.
 - **Stored state.** `SEG_RAW` shares its storage with the glyph registers:
   it is the same 64 bits that `SEG_ALL` reads (`SEG_RAW` = `SEG_ALL` on a
   read). In glyph mode those bytes are glyph codes, so the first store into
@@ -446,9 +449,11 @@ pattern: letters, a decimal point on any digit, blank leading digits.
   `SEG_BLANK`, which set all eight digits as today, and by a write to
   `SEG_LOW` or `SEG_HIGH`, which in raw mode also **blanks the other four
   digits** (they held segment patterns); outside raw mode they leave them
-  alone as before. Reset, a program load (`LOAD_COMPLETE`), the loader's and
-  boot ROM's own displays and an HCF crash display clear it too. `HALT`
-  does not: a halted program's raw display stays up. A program that never
+  alone as before. The loader's states clear it too: `NO_PROGRAM` (the first
+  state after a reset, which also blanks the display), loading, a program
+  load (`LOAD_COMPLETE`), the boot ROM's own display, and an HCF crash
+  display. While `CPU_RESETN` is held the display is left as it was. `HALT`
+  does not clear it: a halted program's raw display stays up. A program that never
   writes `SEG_RAW` sees no change from earlier bitstreams (apart from the
   `0x0B` / `0x0D` glyphs).
 
