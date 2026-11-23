@@ -1999,6 +1999,34 @@ def cmd_socseg(a):
     bad = {k: (hex(g.get(k, -1)), hex(v)) for k, v in want.items() if not g or g.get(k) != v}
     report('SEG_RAW narrow loads', not bad, f'{bad}' if bad else '')
 
+    # programs that never store SEG_RAW: SEG_LOW / SEG_HIGH keep the other
+    # half in either order, and a store to SEG_MODE is dropped (review 1)
+    q = Asm()
+    q.setr(1, 0xF0030000)
+    q.setr(2, 0xABCD); q.st(64, 2, 1, 0x08); q.setr(2, 0x1234); q.st(64, 2, 1, 0x00); q.ld(64, 3, 1, 0x10)
+    q.setr(2, 0x5678); q.st(64, 2, 1, 0x00); q.setr(2, 0x9EF0); q.st(64, 2, 1, 0x08); q.ld(64, 4, 1, 0x10)
+    q.setr64(2, P); q.st(64, 2, 1, 0x28); q.ld(64, 5, 1, 0x28); q.ld(64, 6, 1, 0x10)
+    q.halt()
+    g = _soc_regs(run_soc(exe, q, 'seg_legacy', trace=True))
+    want = {'r3': 0x0A0B0C0D01020304, 'r4': 0x090E0F0005060708, 'r5': 0, 'r6': 0x090E0F0005060708}
+    bad = {k: (hex(g.get(k, -1)), hex(v)) for k, v in want.items() if not g or g.get(k) != v}
+    report('glyph registers unchanged; SEG_MODE write dropped', not bad, f'{bad}' if bad else '')
+
+    # a UART S reload leaves raw mode (the loader states' clear, review 1):
+    # the running program stores SEG_RAW and spins; the loaded one reads
+    # SEG_MODE and SEG_ALL
+    import socfsm
+    fx = build_soc(None, probe=socfsm.FR)
+    os.makedirs(WORK, exist_ok=True)
+    ld = Asm(); ld.setr(1, 0xF0030000); ld.ld(64, 5, 1, 0x28); ld.ld(64, 6, 1, 0x10); ld.setr(7, 0xC0FFEE); ld.halt()
+    kp = socfsm.kbt(ld, os.path.join(WORK, 'seg_reload.kbt'))
+    sp = Asm(); sp.setr(1, 0xF0030000); sp.setr64(2, P); sp.st(64, 2, 1, 0x20); sp.label('s'); sp.jmp('s')
+    r = socfsm.go(fx, sp, 'seg_reload', ['+FR_MODE=8', f'+FR_KBT={kp}'])
+    g = socfsm.regs(r['log'])
+    want = {'r5': 0, 'r6': 0x2222222222222222, 'r7': 0xC0FFEE}
+    bad = {k: (hex(g.get(k, -1)), hex(v)) for k, v in want.items() if not g or g.get(k) != v}
+    report('an S reload leaves raw mode', not bad and 'S takes effect' in r['log'], f'{bad}' if bad else '')
+
     # the glyphs: b / d (were "8." / "0."), 0, 8, and SEG_ALL leaves raw mode
     h = Asm()
     h.setr(1, 0xF0030000); h.setr64(3, P); h.st(64, 3, 1, 0x20)

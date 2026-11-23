@@ -10,6 +10,7 @@ module Seven_seg_LED_Display_Controller (
 );
 
    logic  [ 7:0] r_LED_Bytes;
+   logic         r_raw;            // i_raw, delayed with r_LED_Bytes
    logic  [19:0] r_refresh_counter;
    wire [ 2:0] r_LED_activating_counter;  // Which LED block to use
 
@@ -20,6 +21,7 @@ module Seven_seg_LED_Display_Controller (
    assign r_LED_activating_counter = r_refresh_counter[17:15];
 
    always_ff @(posedge i_sysclk) begin
+      r_raw <= i_raw;
       case (r_LED_activating_counter)
          3'b000: begin
             o_Anode_Activate <= 8'b11110111;
@@ -63,7 +65,7 @@ module Seven_seg_LED_Display_Controller (
    // Segments as per manual: dot then ABCDEFG ([7] DP, [6] A .. [0] G); high is off.
    // SEG_RAW (MMIO_MAP.md): byte bits 0..6 = segments a..g, bit 7 = DP, 1 = lit.
    always_ff @(posedge i_sysclk) begin
-      if (i_raw)
+      if (r_raw)
          o_LED_cathode <= ~{r_LED_Bytes[7], r_LED_Bytes[0], r_LED_Bytes[1], r_LED_Bytes[2],
                             r_LED_Bytes[3], r_LED_Bytes[4], r_LED_Bytes[5], r_LED_Bytes[6]};
       else

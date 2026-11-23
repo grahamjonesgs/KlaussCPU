@@ -371,6 +371,12 @@ module KlaussCPU #(
    wire [31:0] w_mmio_addr;
    wire [63:0] w_mmio_write_data;
    wire [ 7:0] w_mmio_byte_en;
+   // SEG_RAW mode (MMIO_MAP.md, 7-segment): st.seven_seg_value1/2 hold segment
+   // patterns, not glyph codes.  Set by a SEG_RAW store; cleared by SEG_LOW /
+   // HIGH / ALL / BLANK and by the loader / HCF states that write the display
+   // (NO_PROGRAM, the first state after a reset, so a held reset leaves the
+   // display as it was).  Read as SEG_MODE[0]; CPU_FEATURES[30].
+   logic r_seg_raw = 1'b0;
 
    // Ethernet block — bus_splitter routes 0xF006/F007/F008 to the bridge.
    wire        w_eth_write_DV;
@@ -1903,12 +1909,6 @@ module KlaussCPU #(
    );
 
 
-   // SEG_RAW mode (MMIO_MAP.md, 7-segment): st.seven_seg_value1/2 hold segment
-   // patterns, not glyph codes.  Set by a SEG_RAW store; cleared by reset, by
-   // SEG_LOW / HIGH / ALL / BLANK and by the loader / HCF states that write the
-   // display.  Read as SEG_MODE[0]; CPU_FEATURES[30].
-   logic r_seg_raw = 1'b0;
-
    Seven_seg_LED_Display_Controller Seven_seg_LED_Display_Controller1 (
        .i_sysclk(i_Clk),
        .i_reset(w_reset_H),
@@ -2071,7 +2071,6 @@ rams_sp_nc rams_sp_nc1 (
 
          st.SM <= NO_PROGRAM;
          st.SP <= 32'h800_0000;
-         r_seg_raw <= 1'b0;
          r_boot_active   <= 1'b1;   // arm the resident boot-ROM copy
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
