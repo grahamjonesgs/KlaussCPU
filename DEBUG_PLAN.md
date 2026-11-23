@@ -47,7 +47,7 @@ loads and a CALL: the halt is at the callee) — the documented non-precise
 stop ("next instruction boundary"), one instruction later than the
 2026-10-26 build since stores post through the store queue.
 
-**Precise watchpoints** (branch `dbgwprec`, RTL only — not yet built): a
+**Precise watchpoints** (2026-11-23, branch `dbgwprec`, merged): a
 debugger watchpoint now halts with the PC at the accessing instruction's
 architectural successor (the next instruction, a CALL's target, a RET /
 LEAVERET's return target) and nothing younger executed, as the emulator
@@ -62,7 +62,19 @@ while the core runs is precise from the first instruction latched after it.
 Review fix-ups: read watchpoints compare the bytes a load really reads (a
 load's port byte enables are FF), a hit during a single step or a halt
 request reports WATCH, a watchpoint with no byte lanes does not slow the
-core.  tools/vsim `dwp_*` tests (DEBUG_EN builds).
+core.  tools/vsim `dwp_*` tests (DEBUG_EN builds).  Timing: with a read
+watchpoint armed early load issue is off too (`dbg_rwp`), so every watch
+compare is in MEM on registers (the EX -> MEM `exo_iaddr` compare cost
+-0.18 ns, build `dbg_e8e8825`).  `50876c3` (DEBUG_EN = 1): tier 1 WNS
+-0.005, tier 2 +0.009, WHS +0.019 (volatile test bitstream
+`~/.cache/kbuild/debug_50876c3.bit`).  vsim: DEBUG_EN `test` 2729/2729 (351
+`dwp_*`), plain `test` 2683/2683, `dmtest`, `diff` 40 seeds x 1 / 3 / 7 equal
+cycles.  Board (runtime session, Kl `-g` locals.elf under lldb): the board's
+transcripts equal the emulator's line for line — a write watch on `counter`
+stops at 0x1928 (after the store; 7 -> 8; the earlier build stopped at the
+callee, 0x260), a read watch at 0x1920 (after the load), `next` over a
+watched store reports "watchpoint 1"; breakpoints, locals, backtrace,
+`next`, continue, detach unchanged.
 
 ---
 
