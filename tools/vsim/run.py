@@ -140,8 +140,9 @@ CONS_FATAL = 'FATAL consistency'
 
 def _l2bit():
     """CPU_FEATURES[26] (the L2) of the tb_soc build, and [27] (the cache
-    range ops, SD DMA spec v1.2: every build of this revision)"""
-    return ((1 << 26) if l2_cfg()[0] else 0) | (1 << 27)
+    range ops, SD DMA spec v1.2: every build of this revision) and [30]
+    (the 7-seg SEG_RAW / SEG_MODE, MMIO_MAP.md: likewise)"""
+    return ((1 << 26) if l2_cfg()[0] else 0) | (1 << 27) | (1 << 30)
 
 
 def l2_cfg():
@@ -1125,13 +1126,13 @@ def cmd_socmmio(a):
     # CPU_FEATURES (0xF00F_0048) on the working tree: 0x33F0_200D = stage 1
     # + LR/SC + the 32-entry TLB, no MPU, lean crypto (TRNG only), native SD,
     # DCBZ, STATUS.MAL64, ETH_RX_SLOTS, the TLB walker ([25]), the user
-    # single step and watchpoints ([29:28], MMU_PLAN §13): the A7
+    # single step and watchpoints ([29:28], MMU_PLAN §13), SEG_RAW ([30]): the A7
     from kasm import Asm
     f = Asm(); f.setr(1, 0xF00F0048); f.ld(64, 2, 1); f.halt()
     rf = run_soc(new, f, 'cpufeat', trace=True)
     last = open(rf['trace']).read().strip().splitlines()[-1]
     l2, l2w = l2_cfg()
-    if f'r2=00000000{0x3FF0200D if l2 else 0x3BF0200D:08x}' not in last:
+    if f'r2=00000000{0x7FF0200D if l2 else 0x7BF0200D:08x}' not in last:
         fails += 1
         print('CPU_FEATURES: ' + last[:200])
     # CACHE_INFO (0xF005_0008) and ICACHE_INFO (0xF005_0018, HW_PERF_PLAN
@@ -1919,6 +1920,100 @@ def _sw_events(log):
     return [dict(kv.split('=') for kv in l.split()[1:]) for l in log.splitlines() if l.startswith('WKEV ')]
 
 
+def _seg_cath(b):
+    """the cathode pattern (dot then ABCDEFG, 1 = off) of a SEG_RAW byte"""
+    v = (b >> 7 & 1) << 7
+    for i in range(7):
+        v |= (b >> i & 1) << (6 - i)
+    return ~v & 0xFF
+
+
+def cmd_socseg(a):
+    """MMIO_MAP.md 7-segment SEG_RAW / SEG_MODE (CPU_FEATURES[30]) and the
+    lowercase b / d glyphs through the SoC: the stores of every width and
+    their read-back, the mode flag after each glyph register, and the
+    cathodes the controller drives (tb_soc's SEG line at HALTED)"""
+    from kasm import Asm
+    exe = build_soc(None)
+    fails = 0
+
+    def report(name, ok, msg=''):
+        nonlocal fails
+        fails += not ok
+        print(f'{"pass" if ok else "FAIL"} {name} {msg}')
+
+    def spin(f, n=300000):          # > one full scan (2^18 cycles) of the 8 digits
+        f.setr(14, n); f.label('spin'); f.dec(14); f.fbr('ne', 14, 0, 'spin', imm=True)
+
+    def mode_into(f, k):            # r11 |= SEG_MODE << k
+        f.ld(64, 15, 1, 0x28); f.shift_n('shl', 15, 15, k); f.alu('or', 11, 11, 15)
+
+    P = 0x807F3F065B4F666D
+    FIN = 0x0102040810204080
+    f = Asm()
+    f.setr(1, 0xF0030000); f.setr(11, 0)
+    mode_into(f, 7)                                         # SEG_MODE after the load = 0
+    f.setr64(3, P); f.st(64, 3, 1, 0x20)
+    f.ld(64, 4, 1, 0x20); f.ld(64, 5, 1, 0x28)              # r4 = P, r5 = 1
+    f.setr(6, 0xAB); f.st(8, 6, 1, 0x23)                    # digit 3
+    f.setr(6, 0x11223344); f.st(32, 6, 1, 0x24)             # digits 7..4
+    f.setr(6, 0x5566); f.st(16, 6, 1, 0x20)                 # digits 1..0
+    f.ld(64, 6, 1, 0x20); f.ld(32, 7, 1, 0x24); f.ld(8, 8, 1, 0x23)
+    f.setr(10, 0x1234); f.st(64, 10, 1, 0x00)               # SEG_LOW in raw mode
+    f.ld(64, 10, 1, 0x10); mode_into(f, 0)                  # r10 = SEG_ALL
+    f.st(64, 3, 1, 0x20); mode_into(f, 1)                   # raw again
+    f.setr(12, 0xABCD); f.st(64, 12, 1, 0x08)               # SEG_HIGH in raw mode
+    f.ld(64, 12, 1, 0x10); mode_into(f, 2)
+    f.st(64, 3, 1, 0x20); f.setr(13, 0xDEADBEEF); f.st(64, 13, 1, 0x10)   # SEG_ALL
+    f.ld(64, 13, 1, 0x10); mode_into(f, 3)
+    f.st(8, 3, 1, 0x27); mode_into(f, 4)                    # one byte enters raw mode
+    f.st(64, 3, 1, 0x18); mode_into(f, 5)                   # SEG_BLANK
+    f.ld(64, 2, 1, 0x10)                                    # r2 |= blanked SEG_ALL (checked below)
+    f.setr64(3, FIN); f.st(64, 3, 1, 0x20); mode_into(f, 6)
+    f.setr(15, 0xF00F0048); f.ld(64, 9, 15)                 # r9 = CPU_FEATURES
+    spin(f); f.halt()
+    # 16-bit loads at 0x22 / 0x26
+    g9 = Asm()
+    g9.setr(1, 0xF0030000); g9.setr64(3, P); g9.st(64, 3, 1, 0x20)
+    g9.setr(6, 0xAB); g9.st(8, 6, 1, 0x23); g9.ld(16, 9, 1, 0x22); g9.ld(16, 10, 1, 0x26); g9.halt()
+
+    r = run_soc(exe, f, 'seg_raw', trace=True)
+    g = _soc_regs(r)
+    m = re.search(r'TB_SOC: SEG raw=(\d) cath=((?:[0-9a-fx]{2} ?){8})', r['log'])
+    v2 = (P & 0xFFFFFFFF)
+    d6 = 0x11223344 << 32 | 0xAB << 24 | (v2 & 0x00FF0000) | 0x5566
+    want = {'r2': 0x2222222222222222, 'r4': P, 'r5': 1, 'r6': d6, 'r7': 0x11223344, 'r8': 0xAB,
+            'r10': 0x2222222201020304, 'r11': 0b1010010, 'r12': 0x0A0B0C0D22222222,
+            'r13': 0x0D0E0A0D0B0E0E0F}
+    bad = {k: (hex(g.get(k, -1)), hex(v)) for k, v in want.items() if not g or g.get(k) != v}
+    report('SEG_RAW registers', not bad, f'{bad}' if bad else '')
+    feat = g and g.get('r9')
+    report('CPU_FEATURES[30]', bool(feat) and feat >> 30 & 1 == 1, hex(feat or 0))
+    wc = ' '.join(f'{_seg_cath(FIN >> 8 * k & 0xFF):02x}' for k in range(7, -1, -1))
+    got = m and (m.group(1), m.group(2).strip())
+    report('SEG_RAW cathodes', got == ('1', wc), f'got {got} want raw=1 {wc}')
+
+    r = run_soc(exe, g9, 'seg_raw16', trace=True)
+    g = _soc_regs(r)
+    want = {'r9': 0xAB << 8 | (P >> 16 & 0xFF), 'r10': P >> 48 & 0xFFFF}
+    bad = {k: (hex(g.get(k, -1)), hex(v)) for k, v in want.items() if not g or g.get(k) != v}
+    report('SEG_RAW narrow loads', not bad, f'{bad}' if bad else '')
+
+    # the glyphs: b / d (were "8." / "0."), 0, 8, and SEG_ALL leaves raw mode
+    h = Asm()
+    h.setr(1, 0xF0030000); h.setr64(3, P); h.st(64, 3, 1, 0x20)
+    h.setr(2, 0xBDBD0B8D); h.st(64, 2, 1, 0x10)
+    spin(h); h.halt()
+    r = run_soc(exe, h, 'seg_glyph', trace=True)
+    m = re.search(r'TB_SOC: SEG raw=(\d) cath=((?:[0-9a-fx]{2} ?){8})', r['log'])
+    gl = {0xB: 0xE0, 0xD: 0xC2, 0x0: 0x81, 0x8: 0x80}
+    wc = ' '.join(f'{gl[0xBDBD0B8D >> 4 * k & 0xF]:02x}' for k in range(7, -1, -1))
+    got = m and (m.group(1), m.group(2).strip())
+    report('glyphs b / d', got == ('0', wc), f'got {got} want raw=0 {wc}')
+    print(f'{fails} failing')
+    return 1 if fails else 0
+
+
 def cmd_socwalk(a):
     """the hardware walker through the real D-cache / bus / behavioural DDR
     (tb_soc), and CPU_FEATURES[25] with TLB_WALK = 0.  Each program's result
@@ -2681,6 +2776,7 @@ def main():
     sdv.add_argument('--plus', action='append', default=[]); sdv.add_argument('--keep', action='store_true')
     sdd = sub.add_parser('socsddma'); sdd.add_argument('only', nargs='*')
     sdd.add_argument('--plus', action='append', default=[]); sdd.add_argument('--keep', action='store_true')
+    sub.add_parser('socseg', help='MMIO_MAP.md 7-seg SEG_RAW / SEG_MODE and the b / d glyphs (tb_soc)')
     sw = sub.add_parser('socwalk'); sw.add_argument('-v', '--verbose', action='store_true')
     sub.add_parser('soceth')
     bp = sub.add_parser('socbench'); bp.add_argument('--plus', action='append', default=[])
@@ -2835,6 +2931,8 @@ def main():
         sys.exit(cmd_tlbdiff(a))
     elif a.cmd == 'socmmio':
         sys.exit(cmd_socmmio(a))
+    elif a.cmd == 'socseg':
+        sys.exit(cmd_socseg(a))
     elif a.cmd == 'tecost':
         sys.exit(cmd_tecost(a))
     elif a.cmd == 'btfuzz':

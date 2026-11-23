@@ -386,6 +386,8 @@ digits and pads them automatically.
 | 0x0008 | `SEG_HIGH` | W  | 16    | 4 hex digits → upper display, packed `[15:0]` |
 | 0x0010 | `SEG_ALL`  | W  | 32    | 8 hex digits across both displays, `[31:0]` (high → upper, low → lower) |
 | 0x0018 | `SEG_BLANK`| W  | —     | any write blanks both displays                |
+| 0x0020 | `SEG_RAW`  | RW | 64    | one segment pattern per digit (below); `CPU_FEATURES[30]` |
+| 0x0028 | `SEG_MODE` | R  | 1     | `[0]` RAW: the display shows `SEG_RAW` patterns; `CPU_FEATURES[30]` |
 | 0x0000 | `SEG_LOW`  | R  | 32    | raw padded value of lower display             |
 | 0x0008 | `SEG_HIGH` | R  | 32    | raw padded value of upper display             |
 | 0x0010 | `SEG_ALL`  | R  | 64    | concatenation `{upper_padded, lower_padded}`  |
@@ -395,14 +397,60 @@ Read width is wider than write width because reads return the raw padded
 load.
 
 Each byte of the padded value selects a glyph: `0x00`–`0x0F` the hex
-digit, and `0x20` "V", `0x21` "-", `0x22` blank, `0x23` "H", `0x24` "L",
-`0x25` "P" (`Seven_seg_LED_Display_Controller.sv`). After `SEG_BLANK`,
-and when a program starts (`LOAD_COMPLETE`), each display reads
-`0x2222_2222`.
+digit (`0x0B` and `0x0D` are a lowercase "b" and "d"), `0x10`–`0x19`
+"0."–"9." (the digit with its decimal point), and `0x20` "V", `0x21` "-",
+`0x22` blank, `0x23` "H", `0x24` "L", `0x25` "P"; any other code shows "-"
+(`Seven_seg_LED_Display_Controller.sv`). After `SEG_BLANK`, and when a
+program starts (`LOAD_COMPLETE`), each display reads `0x2222_2222`.
+(Bitstreams before `CPU_FEATURES[30]` showed `0x0B` as "8." and `0x0D` as
+"0.".)
 
 The byte enables are ignored, as for the RGB LEDs: write `SEG_LOW` /
 `SEG_HIGH` with a 16-bit or wider store, and `SEG_ALL` with a 32- or
 64-bit store.
+
+**`SEG_RAW` (0x0020) and `SEG_MODE` (0x0028)**, present when
+`CPU_FEATURES[30]` = 1 (on older bitstreams both read 0 and writes are
+dropped). `SEG_RAW` drives the segments directly, so software can show any
+pattern: letters, a decimal point on any digit, blank leading digits.
+
+- **Layout.** Byte *k* of `SEG_RAW` (`[8k+7:8k]`) is digit *k* counted from
+  the **right**: byte 0 is the rightmost digit (AN0, the same digit as
+  `SEG_ALL[3:0]`), byte 7 the leftmost. In each byte, bits 0–6 are
+  segments a–g and bit 7 is the decimal point; 1 = lit.
+
+  ```
+       a            bit 0 a   bit 4 e
+     f   b          bit 1 b   bit 5 f
+       g            bit 2 c   bit 6 g
+     e   c          bit 3 d   bit 7 DP
+       d   DP
+  ```
+
+  For example, "0" = `0x3F`, "1" = `0x06`, "8." = `0xFF`, "-" = `0x40`,
+  blank = `0x00`.
+- **Writes.** The byte enables **are** honoured here, unlike the other
+  7-segment registers: a 64-bit store at 0x20 sets all eight digits, a
+  32-bit store at 0x20 / 0x24 the right / left four, a 16-bit or byte store
+  only its own digits. Any `SEG_RAW` store sets `SEG_MODE.RAW`.
+- **Stored state.** `SEG_RAW` shares its storage with the glyph registers:
+  it is the same 64 bits that `SEG_ALL` reads (`SEG_RAW` = `SEG_ALL` on a
+  read). In glyph mode those bytes are glyph codes, so the first store into
+  raw mode should be a 64-bit one; a narrower one leaves the other digits'
+  glyph codes to be shown as segment patterns (for instance blank, `0x22`,
+  shows segments b and f).
+- **Reads.** A load of any width returns the stored bytes of its lanes
+  (a 32-bit load at 0x24 returns the left four digits). `SEG_MODE` reads
+  `[0]` = RAW, `[63:1]` = 0; writes to it are dropped.
+- **Leaving raw mode.** `RAW` is cleared by a write to `SEG_ALL` or
+  `SEG_BLANK`, which set all eight digits as today, and by a write to
+  `SEG_LOW` or `SEG_HIGH`, which in raw mode also **blanks the other four
+  digits** (they held segment patterns); outside raw mode they leave them
+  alone as before. Reset, a program load (`LOAD_COMPLETE`), the loader's and
+  boot ROM's own displays and an HCF crash display clear it too. `HALT`
+  does not: a halted program's raw display stays up. A program that never
+  writes `SEG_RAW` sees no change from earlier bitstreams (apart from the
+  `0x0B` / `0x0D` glyphs).
 
 ### LEDs and switches — base `0xF004_0000`
 
@@ -1120,6 +1168,9 @@ priority when several are pending: timer > blitter > Ethernet > VGA. The only in
 | `[25]` | the hardware TLB walker (SRs `TLB_PTB` / `TLB_WALK` / `TLB_WCNT`, MMU_PLAN.md §11.8) |
 | `[26]` | the unified L2 (`L2_INFO` / `L2_CTRL` at `0xF005_0020` / `0x0028`, counters `0xF00D_0118` …, HW_PERF_PLAN.md §6) |
 | `[27]` | the cache range operations (`CACHE_CTRL[6:4]`, `CACHE_OP_ADDR` / `CACHE_OP_LEN` at `0xF005_0030` / `0x0038`; SD DMA spec v1.2). The SD DMA engine itself is `SDM_CAPS[10]` |
+| `[28]` | the user-mode hardware single step (MMU_PLAN.md §13) |
+| `[29]` | the two data watchpoints, SRs `WP0_ADDR` … `WP1_CTRL` (MMU_PLAN.md §13) |
+| `[30]` | the 7-segment `SEG_RAW` / `SEG_MODE` registers (`0xF003_0020` / `0x0028`) and the lowercase "b" / "d" glyphs |
 
 The lean Nexys A7 MMU bitstream reads **`0x0010_100D`** (stage 1, LR/SC, a
 16-entry TLB, no MPU, TRNG only); the full crypto configuration reads
@@ -1129,7 +1180,10 @@ too: `0x0030_100D` lean, `0x003F_100D` full; with DCBZ, MAL64 and `ETH_RX_SLOTS`
 TLB (branch `tlb32`, `[15:8]` = 32) `0x01F0_200D` lean, `0x01FF_200D` full; with the
 hardware TLB walker (branch `tlbwalk`, `[25]`) `0x03F0_200D` lean, `0x03FF_200D` full; with the L2
 (branch `l2`, `[26]`) `0x07F0_200D` lean, `0x07FF_200D` full; with the range
-ops (branch `sddma`, `[27]`) **`0x0FF0_200D`** lean, `0x0FFF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
+ops (branch `sddma`, `[27]`) `0x0FF0_200D` lean, `0x0FFF_200D` full; with the user
+single step and watchpoints (branch `ustep`, `[29:28]`) `0x3FF0_200D` lean,
+`0x3FFF_200D` full; with `SEG_RAW` (branch `seg7raw`, `[30]`) **`0x7FF0_200D`**
+lean, `0x7FFF_200D` full. If `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits: assume every crypto block is present. (A future bitstream without a TRNG would therefore read as 'all present'; that is acceptable while the TRNG is mandatory.) An absent crypto block's window reads 0, ignores
 writes and completes in the normal MMIO time.
 
 **Reset values:** `INT_MASK = 0`, all four `INT_VECn = 0`, `TIMER_PERIOD =
@@ -1692,6 +1746,8 @@ Width of access maps directly to the load/store opcode the compiler emits.
 #define REG_SEG_HIGH    (*(volatile uint32_t *)(SEG_BASE + 0x0008))
 #define REG_SEG_ALL     (*(volatile uint64_t *)(SEG_BASE + 0x0010))  /* reads 64 bits */
 #define REG_SEG_BLANK   (*(volatile uint32_t *)(SEG_BASE + 0x0018))
+#define REG_SEG_RAW     (*(volatile uint64_t *)(SEG_BASE + 0x0020))  /* CPU_FEATURES[30] */
+#define REG_SEG_MODE    (*(volatile uint64_t *)(SEG_BASE + 0x0028))  /* [0] RAW */
 
 /* LEDs / switches (0xF004_0xxx) */
 #define IO_BASE         (MMIO_BASE + 0x00040000u)

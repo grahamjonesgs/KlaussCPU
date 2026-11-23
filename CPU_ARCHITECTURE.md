@@ -544,7 +544,8 @@ The full specification is MMU_PLAN.md §3–§6. In summary:
   MMIO_MAP.md). The lean A7 MMU bitstream read `0x0010_100D`; with the
   `perf-hw` features and the 32-entry TLB it reads `0x01F0_200D`; with the
   walker, the L2, the cache range ops and the user single step /
-  watchpoints (`[25:21]`, `[29:28]`; §13.5) it reads `0x3FF0_200D`. If
+  watchpoints (`[25:21]`, `[29:28]`; §13.5) it reads `0x3FF0_200D`, and
+  with the 7-segment `SEG_RAW` (`[30]`, MMIO_MAP.md) `0x7FF0_200D`. If
   `CPU_FEATURES[20]` = 0, the bitstream predates the crypto presence bits:
   assume every crypto block is present. (A future bitstream without a TRNG
   would therefore read as 'all present'; that is acceptable while the TRNG

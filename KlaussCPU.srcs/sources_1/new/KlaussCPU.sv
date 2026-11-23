@@ -1431,7 +1431,11 @@ module KlaussCPU #(
                16'h0000: r_mmio_read_data_comb = {32'b0, st.seven_seg_value2};
                16'h0008: r_mmio_read_data_comb = {32'b0, st.seven_seg_value1};
                16'h0010: r_mmio_read_data_comb = {st.seven_seg_value1, st.seven_seg_value2};
-               default:  r_mmio_read_data_comb = 64'h0;
+               // SEG_RAW (0x20..0x27) and SEG_MODE (0x28..0x2F, [0] RAW), decoded
+               // on [15:3] so a narrow load picks its lanes.
+               default:  r_mmio_read_data_comb =
+                            (r_mmio_addr_q[15:3] == 13'h0004) ? {st.seven_seg_value1, st.seven_seg_value2} :
+                            (r_mmio_addr_q[15:3] == 13'h0005) ? {63'b0, r_seg_raw} : 64'h0;
             endcase
          end
          12'h004: begin  // LEDs (RW) and switches (RO)
@@ -1491,7 +1495,8 @@ module KlaussCPU #(
                // [23] STATUS.MAL64 (HW_PERF_PLAN.md §1 / §4; both need
                // stage 1), [24] ETH_RX_SLOTS (HW_PERF_PLAN.md §3), [25]
                // the hardware TLB walker (MMU_PLAN.md §11.8), [28] / [29] the
-               // user single step / watchpoints (MMU_PLAN.md §13).
+               // user single step / watchpoints (MMU_PLAN.md §13), [30] the 7-seg
+               // SEG_RAW / SEG_MODE registers (MMIO_MAP.md).
                // Reads 0 on earlier bitstreams (a reserved offset).
                16'h0048: r_mmio_read_data_comb = {40'b0, CORE1_EXC_EN, CORE1_EXC_EN,
                                                   1'b1, 1'b1, EN_HMAC, EN_SHA, EN_GCM, EN_AES,
@@ -1503,6 +1508,7 @@ module KlaussCPU #(
                                                  | {38'b0, CORE1_EXC_EN && CORE1_TLB_EN && CORE1_TLB_WALK, 25'b0}
                                                  | {37'b0, CORE1_L2_EN, 26'b0}    // [26] the L2 (HW_PERF_PLAN.md §6)
                                                  | 64'h0800_0000                  // [27] the cache range ops (SD DMA spec v1.2)
+                                                 | 64'h4000_0000                  // [30] SEG_RAW / SEG_MODE (MMIO_MAP.md)
                                                  // [28] user single step, [29] the user watchpoints (MMU_PLAN.md §13)
                                                  | {34'b0, {2{CORE1_EXC_EN && CORE1_UDBG_EN}}, 28'b0};
                16'h0050: r_mmio_read_data_comb = {62'b0, r_int2_en};      // INT2_EN
@@ -1897,11 +1903,18 @@ module KlaussCPU #(
    );
 
 
+   // SEG_RAW mode (MMIO_MAP.md, 7-segment): st.seven_seg_value1/2 hold segment
+   // patterns, not glyph codes.  Set by a SEG_RAW store; cleared by reset, by
+   // SEG_LOW / HIGH / ALL / BLANK and by the loader / HCF states that write the
+   // display.  Read as SEG_MODE[0]; CPU_FEATURES[30].
+   logic r_seg_raw = 1'b0;
+
    Seven_seg_LED_Display_Controller Seven_seg_LED_Display_Controller1 (
        .i_sysclk(i_Clk),
        .i_reset(w_reset_H),
        .i_displayed_number1(st.seven_seg_value1),  // Number to display
        .i_displayed_number2(st.seven_seg_value2),  // Number to display
+       .i_raw(r_seg_raw),                          // SEG_RAW segment patterns
        .o_Anode_Activate(o_Anode_Activate),
        .o_LED_cathode(o_LED_cathode)
    );
@@ -2058,6 +2071,7 @@ rams_sp_nc rams_sp_nc1 (
 
          st.SM <= NO_PROGRAM;
          st.SP <= 32'h800_0000;
+         r_seg_raw <= 1'b0;
          r_boot_active   <= 1'b1;   // arm the resident boot-ROM copy
          r_boot_phase    <= 3'd0;
          r_boot_dw_addr  <= 15'd0;
@@ -2112,6 +2126,11 @@ rams_sp_nc rams_sp_nc1 (
          // block just past the endcase. It was moved there so a converted store's
          // whole-struct `st <= f_x(st)` NBA in OPCODE_EXECUTE cannot clobber the
          // peripheral st fields (esp. st.int_mask) it writes on the same cycle.
+
+         // The states that write the 7-seg with glyph codes leave SEG_RAW mode
+         // (a SEG_RAW store in the MMIO handler below runs later and wins).
+         if (st.SM inside {NO_PROGRAM, LOADING_BYTE, LOAD_COMPLETE, START_WAIT, HCF_2, HCF_4})
+            r_seg_raw <= 1'b0;
 
          case (st.SM)
             NO_PROGRAM: begin
@@ -2843,22 +2862,32 @@ rams_sp_nc rams_sp_nc1 (
                end
                12'h003: begin  // 7-segment display
                   case (w_mmio_addr[15:0])
-                     // SEG_LOW: 4 hex digits → lower display (value2)
-                     16'h0000: st.seven_seg_value2 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
+                     // SEG_LOW: 4 hex digits → lower display (value2).  Leaving
+                     // SEG_RAW mode blanks the other half (it holds patterns).
+                     16'h0000: begin
+                        st.seven_seg_value2 <= {
+                           4'h0, w_mmio_write_data[15:12],
+                           4'h0, w_mmio_write_data[11:8],
+                           4'h0, w_mmio_write_data[7:4],
+                           4'h0, w_mmio_write_data[3:0]
+                        };
+                        if (r_seg_raw) st.seven_seg_value1 <= 32'h22222222;
+                        r_seg_raw <= 1'b0;
+                     end
                      // SEG_HIGH: 4 hex digits → upper display (value1)
-                     16'h0008: st.seven_seg_value1 <= {
-                        4'h0, w_mmio_write_data[15:12],
-                        4'h0, w_mmio_write_data[11:8],
-                        4'h0, w_mmio_write_data[7:4],
-                        4'h0, w_mmio_write_data[3:0]
-                     };
+                     16'h0008: begin
+                        st.seven_seg_value1 <= {
+                           4'h0, w_mmio_write_data[15:12],
+                           4'h0, w_mmio_write_data[11:8],
+                           4'h0, w_mmio_write_data[7:4],
+                           4'h0, w_mmio_write_data[3:0]
+                        };
+                        if (r_seg_raw) st.seven_seg_value2 <= 32'h22222222;
+                        r_seg_raw <= 1'b0;
+                     end
                      // SEG_ALL: 8 hex digits across both displays
                      16'h0010: begin
+                        r_seg_raw <= 1'b0;
                         st.seven_seg_value1 <= {
                            4'h0, w_mmio_write_data[31:28],
                            4'h0, w_mmio_write_data[27:24],
@@ -2876,9 +2905,23 @@ rams_sp_nc rams_sp_nc1 (
                      16'h0018: begin
                         st.seven_seg_value1 <= 32'h22222222;
                         st.seven_seg_value2 <= 32'h22222222;
+                        r_seg_raw <= 1'b0;
                      end
                      default: ;
                   endcase
+                  // SEG_RAW (0x20..0x27): one segment byte per digit, byte i =
+                  // digit i from the right (byte 0 = value2[7:0], AN0).  The byte
+                  // enables are honoured, so a byte / 32-bit store updates only
+                  // its digits.  Decoded on [15:3]: a narrow store keeps [2:0].
+                  if (w_mmio_addr[15:3] == 13'h0004) begin
+                     for (i = 0; i < 4; i = i + 1) begin
+                        if (w_mmio_byte_en[i])
+                           st.seven_seg_value2[8*i +: 8] <= w_mmio_write_data[8*i +: 8];
+                        if (w_mmio_byte_en[i+4])
+                           st.seven_seg_value1[8*i +: 8] <= w_mmio_write_data[32+8*i +: 8];
+                     end
+                     r_seg_raw <= 1'b1;
+                  end
                end
                12'h004: begin  // 16-bit LED bar
                   case (w_mmio_addr[15:0])

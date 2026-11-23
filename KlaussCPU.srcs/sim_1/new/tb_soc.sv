@@ -537,8 +537,16 @@ module tb_soc;
    longint maxi = 0;
    longint idle_max = 600000;
    initial void'($value$plusargs("IDLEMAX=%d", idle_max));
+   // The 7-seg's last cathode pattern under each anode (MMIO_MAP.md SEG_RAW):
+   // reported at HALTED, digit 7 (leftmost) first.
+   logic [7:0] seg_cath [8];
+   initial for (int k = 0; k < 8; k++) seg_cath[k] = 8'hxx;
+   always @(posedge dut.i_Clk)
+      for (int k = 0; k < 8; k++) if (o_Anode_Activate == ~(8'd1 << k)) seg_cath[k] <= o_LED_cathode;
    always @(posedge dut.i_Clk) begin
       if (dut.st.SM == HALTED) begin
+         $display("TB_SOC: SEG raw=%0d cath=%02x %02x %02x %02x %02x %02x %02x %02x", dut.r_seg_raw,
+                  seg_cath[7], seg_cath[6], seg_cath[5], seg_cath[4], seg_cath[3], seg_cath[2], seg_cath[1], seg_cath[0]);
          // the D-cache's memory transactions (its DDR traffic without an L2)
          $display("TB_SOC: DDR reads=%0d writes=%0d", fp_rd, fp_wr);
          $display("TB_SOC: MIG bursts rd=%0d wr=%0d; consistency checks=%0d errors=%0d",
