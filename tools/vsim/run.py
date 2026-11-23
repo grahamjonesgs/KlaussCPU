@@ -93,6 +93,8 @@ def build(rev=None, quiet=True):
         defs.append('+define+HAS_TMG')
     if 'ras_miss' in core:
         defs.append('+define+HAS_RAS')
+    if 'dbg_wpg' in core:
+        defs.append('+define+HAS_DBGWPG')
     if 'st_post_ok' in core:
         defs.append('+define+HAS_POST')
     if 'output logic [1:0]   perf_ic' in core:

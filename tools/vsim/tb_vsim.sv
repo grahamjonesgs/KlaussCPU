@@ -619,6 +619,23 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
          dh_n++;
       end
    end
+   // precise debugger watchpoints (CPU_ARCHITECTURE §15; +define+HAS_DBGWPG):
+   // wpg_irq counts watchpoint hits (dbg_watch_req rising) by an access
+   // behind which a pending IRQ was held off by the hold (dbg_wpg) — the
+   // boundary that, taken, would have run the handler before the halt
+   longint wpg_irq = 0;
+`ifdef HAS_DBGWPG
+   logic   wpg_i = 1'b0, wpg_w = 1'b0;
+   always @(posedge clk) if (!rst) begin
+      wpg_w <= dut.dbg_watch_req;
+      if (dut.dbg_wpg && dut.irq_take && dut.running && !dut.fetch_halt && !dut.irq_active &&
+          !dut.dbg_active)
+         wpg_i <= 1'b1;
+      else if (!dut.dbg_wph)
+         wpg_i <= 1'b0;
+      if (dut.dbg_watch_req && !wpg_w && wpg_i) wpg_irq++;
+   end
+`endif
    string  out_name, trace_name, img;
    longint maxc = 2000000;
 
@@ -719,6 +736,7 @@ module tb_vsim #(parameter bit DEBUG_EN = 1'b0, parameter bit EXC_EN = 1'b1,
                 n_mmio_hold);
       $fdisplay(f, "posted=%0d nopost_dram=%0d zero_lines=%0d", n_post, n_nopost_dram, n_zl);
       $fdisplay(f, "ras_pred=%0d ras_miss=%0d", n_ras_pred, n_ras_miss);
+      $fdisplay(f, "wpg_irq=%0d", wpg_irq);
       $fdisplay(f, "uart_n=%0d lcd_n=%0d lcdrst_n=%0d", uart_n, lcd_n, lcdrst_n);
 `ifdef HAS_EXC
       $fdisplay(f, "ecause=%03x eaddr=%08x um=%0d exc_n=%0d", dut.ecause, dut.eaddr, dut.umode, exc_n);

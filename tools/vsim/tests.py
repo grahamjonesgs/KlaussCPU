@@ -7869,3 +7869,427 @@ def ud_dbl_dm():
         out.append((a, e, plus + ['+DBG_DRV', '+DBG_ATTACHED', '+DBG_NRES=1', '+DBG_RI=20',
                                   f'+DBG_RV={KSP:x}']))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Precise debugger watchpoints (CPU_ARCHITECTURE §15).  With a JTAG
+# watchpoint armed (+WP0WR / +WP0RD, the TB drives dbg_i without a debug
+# module) a load / store that hits it debug-halts (park kind 4, cause WATCH)
+# with the park pc = the accessing instruction's architectural successor:
+# the next instruction, a CALL's target, a RET / LEAVERET's return target.
+# The access completes; nothing younger has any effect (each test's younger
+# instructions write registers that must still be 0).  DEBUG_EN builds only
+# (VSIM_DEBUG_EN=1); without the debug module each program just completes.
+DWP_DBG = _os.environ.get('VSIM_DEBUG_EN') == '1'
+DWP_STK = DATA + 0x380          # stack top (the slots are in the dumped window)
+DWP_STK_X = DATA + 0x388        # ... with ENTER's frame at a line's last dword
+DWP_PLUS = (['+LAT=1'], ['+LAT=3'], ['+LAT=7'], ['+HIT=70', '+LDLY=3'], ['+HIT=100'])
+
+
+def _dwp(a, plain, halt, succ, waddr, kind='wr', plus=(), variants=DWP_PLUS):
+    """plain: the expectation without the debug module (the program parks
+    at a HALT, kind 0); halt: the state at the watch halt (on top of
+    'pc' = succ, cause WATCH, watch_addr = waddr)"""
+    if DWP_DBG:
+        e = {'end': 'park', 'kind': '4', 'dbg_cause': '3', 'watch_addr': '%08x' % waddr, 'pc': succ, 'dh_n': '1'}
+        e.update(halt)
+    else:
+        e = {'end': 'park', 'kind': '0'}
+        e.update(plain)
+    wp = ['+WP0WR=%x' % waddr if kind == 'wr' else '+WP0RD=%x' % (waddr & ~7), '+PARK_HOLD=4']
+    return [(a, e, wp + list(plus) + list(v)) for v in variants]
+
+
+@test
+def dwp_store_call():
+    """the board case: a watched store followed by two loads and a CALL
+    halts right after the store (the loads and the callee not executed)"""
+    a = Asm()
+    a.dword(DATA, 0x41)
+    a.setr(12, DATA)
+    a.ld(64, 4, 12); a.inc(4)
+    a.st(64, 4, 12)
+    succ = a.ld(64, 6, 12)
+    a.ld(64, 7, 12)
+    a.call('f')
+    a.halt()
+    a.label('f')
+    a.setr(9, 1)
+    a.halt()
+    return _dwp(a, {'r4': 0x42, 'r6': 0x42, 'r7': 0x42, 'r9': 1, m(DATA): 0x42},
+                {'r4': 0x42, 'r6': 0, 'r7': 0, 'r9': 0, m(DATA): 0x42}, succ, DATA)
+
+
+@test
+def dwp_store_branch():
+    """a watched store followed by a taken JMP, a taken conditional JMP, a
+    taken fused branch, an indirect JMP: the halt is at the branch (not
+    executed: its target's write is not done).  And a trained loop (BTIC /
+    PHT / early redirects live) whose 4th iteration's store hits: the halt
+    is at the FBR behind it, with the loop counter as the store left it"""
+    out = []
+    for br in ('jmp', 'jcc', 'fbr', 'jmpr'):
+        a = Asm()
+        a.setr(12, DATA + 0x40); a.setr(3, 0x33); a.leapc(11, 'x')
+        a.cmp(3, 3)
+        a.st(64, 3, 12)
+        succ = {'jmp': lambda: a.jmp('x'), 'jcc': lambda: a.jmp('x', cond='eq'),
+                'fbr': lambda: a.fbr('eq', 3, 3, 'x'), 'jmpr': lambda: a.jmpr(11)}[br]()
+        a.setr(8, 8)
+        a.halt()
+        a.label('x')
+        a.setr(9, 9)
+        a.halt()
+        out += _dwp(a, {'r8': 0, 'r9': 9, m(DATA + 0x40): 0x33}, {'r8': 0, 'r9': 0, m(DATA + 0x40): 0x33},
+                    succ, DATA + 0x40)
+    a = Asm()
+    a.setr(12, DATA); a.setr(5, 0)
+    a.label('lp')
+    a.addi_s(12, 12, 8); a.inc(5)
+    a.st(64, 5, 12, -8)
+    succ = a.fbr('ne', 5, 6, 'lp', imm=True)
+    a.setr(9, 9)
+    a.halt()
+    out += _dwp(a, {'r5': 6, 'r9': 9, m(DATA + 0x10): 3, m(DATA + 0x28): 6},
+                {'r5': 3, 'r12': DATA + 0x18, 'r9': 0, m(DATA + 0x10): 3, m(DATA + 0x18): 0}, succ, DATA + 0x10)
+    return out
+
+
+@test
+def dwp_call_slot():
+    """a CALL's return-address push hits: the halt is at the CALL's target
+    (the callee's first instruction not executed) — direct, conditional,
+    absolute and register-indirect CALLs, and a CALL nested one deeper"""
+    out = []
+    for kind in ('call', 'callcc', 'abs', 'reg', 'nested'):
+        a = Asm()
+        a.setr(1, DWP_STK); a.setsp(1)
+        a.leapc(11, 'f'); a.cmp(1, 1)
+        slot = DWP_STK - 8
+        if kind == 'call':
+            a.call('f')
+        elif kind == 'callcc':
+            a.call('f', cond='eq')
+        elif kind == 'abs':
+            a.jmp_abs('f', link=True)
+        elif kind == 'reg':
+            a.jmpr(11, link=True)
+        else:
+            a.call('g')
+            slot = DWP_STK - 16
+        a.setr(8, 8)
+        a.halt()
+        a.label('g')
+        a.setr(7, 7)
+        a.call('f')
+        a.halt()
+        a.label('f')
+        a.setr(9, 9)
+        a.halt()
+        tgt = a.labels['f']
+        plain = {'r8': 0, 'r9': 9}
+        halt = {'r8': 0, 'r9': 0, 'sp': slot}
+        if kind == 'nested':
+            plain['r7'] = 7
+            halt['r7'] = 7
+        out += _dwp(a, plain, halt, tgt, slot)
+    return out
+
+
+@test
+def dwp_push_enter():
+    """PUSH, PUSHV and ENTER's FP push hit: the halt is at the next
+    instruction, SP / R15 as the op left them"""
+    out = []
+    for kind in ('push', 'pushv', 'enter'):
+        a = Asm()
+        a.setr(1, DWP_STK); a.setsp(1)
+        a.setr(3, 0x33); a.setr(15, 0x1515)
+        {'push': lambda: a.push(3), 'pushv': lambda: a.pushv(0x44),
+         'enter': lambda: a.enter(2)}[kind]()
+        succ = a.setr(9, 9)
+        a.getsp(10)
+        a.halt()
+        slot = DWP_STK - 8
+        v = {'push': 0x33, 'pushv': 0x44, 'enter': 0x1515}[kind]
+        sp = DWP_STK - 8 - (16 if kind == 'enter' else 0)
+        plain = {'r9': 9, 'r10': sp, m(slot): v}
+        halt = {'r9': 0, 'r10': 0, 'sp': sp, m(slot): v}
+        if kind == 'enter':
+            plain['r15'] = halt['r15'] = slot
+        out += _dwp(a, plain, halt, succ, slot)
+    return out
+
+
+@test
+def dwp_pop_leave():
+    """read watchpoints: POP and LEAVE (the saved FP) hit: the halt is at
+    the next instruction with the loaded value written"""
+    out = []
+    for kind in ('pop', 'leave'):
+        a = Asm()
+        a.setr(1, DWP_STK); a.setsp(1)
+        a.setr(3, 0x33); a.setr(15, 0x1515)
+        if kind == 'pop':
+            a.push(3)
+            for _ in range(3):
+                a.nop()
+            a.setr(3, 0)
+            a.pop(3)
+        else:
+            a.enter(2)
+            a.setr(15, DWP_STK - 8)       # (a no-op; R15 is the frame)
+            a.leave()
+        succ = a.setr(9, 9)
+        a.halt()
+        plain = {'r9': 9, 'sp': DWP_STK}
+        halt = {'r9': 0, 'sp': DWP_STK}
+        if kind == 'pop':
+            plain['r3'] = halt['r3'] = 0x33
+        else:
+            plain['r15'] = halt['r15'] = 0x1515
+        out += _dwp(a, plain, halt, succ, DWP_STK - 8, kind='rd')
+    return out
+
+
+@test
+def dwp_ret():
+    """read watchpoints on the return-address slot: a predicted RET (the
+    RAS holds the CALL's push), an unpredicted one (an empty RAS: a frame
+    built by hand), a mispredicted one (the slot overwritten): the halt is
+    at the return target, with nothing there executed"""
+    out = []
+    for kind in ('pred', 'unpred', 'mispred'):
+        a = Asm()
+        a.setr(1, DWP_STK); a.setsp(1)
+        if kind == 'unpred':
+            a.leapc(3, 'back'); a.push(3)
+            a.ret()
+            a.setr(8, 8)
+            a.halt()
+        else:
+            a.call('f')
+            a.label('back0')
+            a.setr(8, 8)
+            a.halt()
+        a.label('back')
+        a.setr(9, 9)
+        a.halt()
+        a.label('f')
+        a.setr(7, 7)
+        if kind == 'mispred':
+            a.leapc(3, 'back'); a.getsp(13); a.st(64, 3, 13)
+        a.ret()
+        tgt = a.labels['back0' if kind == 'pred' else 'back']
+        plain = {'r9': 9, 'sp': DWP_STK} if kind != 'pred' else {'r8': 8, 'sp': DWP_STK}
+        halt = {'r8': 0, 'r9': 0, 'sp': DWP_STK}
+        if kind != 'unpred':
+            plain['r7'] = halt['r7'] = 7
+        out += _dwp(a, plain, halt, tgt, DWP_STK - 8, kind='rd')
+    return out
+
+
+@test
+def dwp_leaveret():
+    """read watchpoints on LEAVERET's two reads — the saved FP ([R15]) and
+    the return address ([R15 + 8], its second doubleword, in the same line
+    or the next: a second port read) — predicted (CALL + ENTER) and
+    unpredicted (a frame built by hand, an empty RAS): the halt is at the
+    return target, FP / SP restored, watch_addr = the doubleword read"""
+    out = []
+    for kind in ('pred', 'unpred'):
+        for stk in (DWP_STK, DWP_STK_X):
+            for which in (0, 8):
+                a = Asm()
+                a.setr(1, stk); a.setsp(1); a.setr(15, 0x1515)
+                if kind == 'unpred':
+                    a.leapc(3, 'back'); a.push(3); a.push(15)
+                    a.getsp(15)
+                    a.leaveret()
+                    a.setr(8, 8)
+                    a.halt()
+                else:
+                    a.call('f')
+                    a.label('back0')
+                    a.setr(8, 8)
+                    a.halt()
+                a.label('back')
+                a.setr(9, 9)
+                a.halt()
+                a.label('f')
+                a.enter(1)
+                a.setr(7, 7)
+                a.leaveret()
+                tgt = a.labels['back0' if kind == 'pred' else 'back']
+                plain = {'r15': 0x1515, 'sp': stk}
+                plain.update({'r8': 8} if kind == 'pred' else {'r9': 9})
+                halt = {'r8': 0, 'r9': 0, 'r15': 0x1515, 'sp': stk}
+                if kind == 'pred':
+                    plain['r7'] = halt['r7'] = 7
+                out += _dwp(a, plain, halt, tgt, stk - 16 + which, kind='rd')
+    return out
+
+
+@test
+def dwp_ld32_span():
+    """read watchpoints and MEMGET32: one spanning two doublewords hits a
+    watchpoint on its 2nd (watch_addr = that doubleword) — in the same line
+    and across lines (a 2nd port read); the same load at offset 4 (no
+    span) does not hit it and the program completes"""
+    out = []
+    for base, off in ((DATA + 0x100, 5), (DATA + 0x100, 7), (DATA + 0x118, 6), (DATA + 0x100, 4)):
+        a = Asm()
+        a.dword(DATA + 0x100, 0x8877665544332211); a.dword(DATA + 0x108, 0xFFEEDDCCBBAA9988)
+        a.dword(DATA + 0x118, 0x8877665544332211); a.dword(DATA + 0x120, 0xFFEEDDCCBBAA9988)
+        a.setr(12, base + off)
+        a.ld(32, 6, 12)
+        succ = a.setr(9, 9)
+        a.halt()
+        val = (0xFFEEDDCCBBAA9988 << 64 | 0x8877665544332211) >> (8 * off) & 0xFFFFFFFF
+        w2 = base + 8
+        plain = {'r6': val, 'r9': 9}
+        if off == 4:
+            e = dict(plain, end='park', kind='0', dh_n='0')
+            out += [(a, e, ['+WP0RD=%x' % w2, '+PARK_HOLD=4'] + v) for v in DWP_PLUS]
+        else:
+            out += _dwp(a, plain, {'r6': val, 'r9': 0}, succ, w2, kind='rd')
+    return out
+
+
+@test
+def dwp_te():
+    """TE = 1: a store through DATA's kseg alias hits a write watchpoint on
+    PA DATA, a load through it a read watchpoint: the halt is at the next
+    instruction"""
+    out = []
+    for kind in ('wr', 'rd'):
+        a = Asm()
+        _xsetup(a)
+        _te_on(a)
+        a.setr(12, 0x80000000 | DATA); a.setr(3, 0x31)
+        if kind == 'rd':
+            a.st(64, 3, 12)
+            for _ in range(4):
+                a.nop()
+            a.ld(64, 6, 12)
+        else:
+            a.st(64, 3, 12)
+        succ = a.setr(7, 0x77)
+        a.halt()
+        _mpuhandler(a)
+        plain = {'r7': 0x77, m(DATA): 0x31}
+        halt = {'r7': 0, m(DATA): 0x31}
+        if kind == 'rd':
+            plain['r6'] = halt['r6'] = 0x31
+        out += _dwp(a, plain, halt, succ, DATA, kind=kind)
+    return out
+
+
+@test
+def dwp_resume():
+    """+DBG_DRV: a loop storing to the watched doubleword halts at every
+    store's successor (each halt's pc / cause checked), each resume runs
+    on, and the program's result is the plain run's (the watchpoint stays
+    armed: one instruction in flight throughout)"""
+    out = []
+    for v in DWP_PLUS:
+        a = Asm()
+        a.setr(12, DATA + 0x20); a.setr(5, 0); a.setr(6, 0)
+        a.label('lp')
+        a.inc(5)
+        a.st(64, 5, 12)
+        succ = a.alu('add', 6, 6, 5)
+        a.fbr('ne', 5, 5, 'lp', imm=True)
+        a.setr(9, 9)
+        a.halt()
+        e = {'end': 'park', 'kind': '0', 'r5': 5, 'r6': 15, 'r9': 9, m(DATA + 0x20): 5}
+        if DWP_DBG:
+            e['dh_n'] = '5'
+            for k in range(5):
+                e[f'dh{k}'] = f'{succ:08x}:3'
+        out.append((a, e, ['+WP0WR=%x' % (DATA + 0x20), '+DBG_DRV', '+PARK_HOLD=4'] + v))
+    return out
+
+
+@test
+def dwp_irq():
+    """an IRQ pending while the watched store is in flight: the debug halt
+    still comes first, at the store's successor (the IRQ boundary is held
+    off until the store has left MEM); each resume then takes the IRQ.  A
+    loop of watched stores under a fast timer (+DBG_DRV, every halt's pc /
+    cause checked); wpg_irq (TB) counts hits with an IRQ held behind them"""
+    out = []
+    for per, v in ((97, ['+LAT=1']), (131, ['+LAT=3']), (173, ['+LAT=7']), (108, ['+HIT=70', '+LDLY=3'])):
+        a = Asm()
+        a.set_int_mask(1)
+        a.setr(12, DATA + 0x20); a.setr(5, 0); a.setr(6, 0)
+        a.label('lp')
+        a.inc(5)
+        a.st(64, 5, 12)
+        succ = a.alu('add', 6, 6, 5)
+        a.nop(); a.nop()
+        a.fbr('ne', 5, 7, 'lp', imm=True)
+        a.set_int_mask(0)
+        a.setr(9, 9)
+        a.halt()
+        e = {'end': 'park', 'kind': '0', 'r5': 7, 'r6': 28, 'r9': 9, m(DATA + 0x20): 7}
+        if DWP_DBG:
+            e['m00180000'] = 'nonzero'      # (without the halts the loop ends before a tick)
+            e['dh_n'] = '7'
+            for k in range(7):
+                e[f'dh{k}'] = f'{succ:08x}:3'
+            e['wpg_irq'] = 'nonzero'
+        out.append((a, e, ['+WP0WR=%x' % (DATA + 0x20), '+DBG_DRV', f'+IRQ_PERIOD={per}', '+PARK_HOLD=4'] + v))
+    return out
+
+
+@test
+def dwp_ustep():
+    """§13.2 user single step with a debugger watchpoint (attached): the
+    stepped store / CALL hits; the debug halt comes before its STEP entry,
+    at its successor (the CALL's: its target).  Without a resume the log
+    holds the entries of the instructions before it; with one (+DBG_DRV,
+    +DBG_NRES=1) the STEP entry follows and the log is the plain one (the
+    handler's HALT then debug-halts, attached)"""
+    if not DWP_DBG or NOEXC:
+        return []
+    out = []
+    for which in ('st', 'call'):
+        for v in (['+LAT=1'], ['+LAT=3'], ['+HIT=70']):
+            for res in (False, True):
+                P = {}
+
+                def body(a):
+                    P['s1'] = a.setr(9, DATA + 0x3B0)
+                    P['st'] = a.st(64, 9, 9)
+                    P['s2'] = a.setr(10, 0x55)
+                    P['call'] = a.call('F')
+                    P['s3'] = a.setr(11, 0x66)
+                    a.jmp('E')
+                    a.label('F')
+                    P['inc'] = a.inc(10)
+                    P['ret'] = a.ret()
+                    a.label('E')
+                    return P
+
+                def ents(a, P, hp):
+                    s = lambda at, nx: (X_STEP | SSTEP, at, nx, 3)
+                    full = [s(P['s1'], P['st']), s(P['st'], P['s2']), s(P['s2'], P['call']),
+                            s(P['call'], P['inc']), s(P['inc'], P['ret']), s(P['ret'], P['s3']),
+                            s(P['s3'], P['s3'] + 8), s(P['s3'] + 8, hp), (X_PRIV, HALT_W, hp, 3)]
+                    if res:
+                        return full
+                    return full[:1] if which == 'st' else full[:3]
+                slot = USP - 8
+                a, e, p = _udprog(body, entries=ents)
+                succ = P['s2'] if which == 'st' else a.labels['F']
+                e.update({'kind': '4', 'dh0': f'{succ:08x}:3'})
+                if res:
+                    e.update({'dh_n': '2', 'r10': 0x56, 'r11': 0x66})
+                else:
+                    e.update({'pc': succ, 'dbg_cause': '3', 'dh_n': '1', 'r10': 0x55 if which == 'call' else 0,
+                              'r11': 0, 'watch_addr': '%08x' % (DATA + 0x3B0 if which == 'st' else slot)})
+                wp = '+WP0WR=%x' % (DATA + 0x3B0 if which == 'st' else slot)
+                p = p + [wp, '+DBG_ATTACHED', '+PARK_HOLD=4'] + v + (['+DBG_DRV', '+DBG_NRES=1'] if res else [])
+                out.append((a, e, p))
+    return out

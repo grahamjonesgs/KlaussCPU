@@ -597,6 +597,18 @@ module pipeline_core
    logic        id_bp;           // ID instruction matched a breakpoint
    logic        dbg_watch_req;   // a watchpoint fired: halt at the next boundary
    logic [31:0] dbg_watch_addr;
+   // Precise watchpoints (CPU_ARCHITECTURE §15): while a debugger
+   // watchpoint is armed, one instruction is in flight at a time — a new
+   // one latches into ID only once ID / EX / MEM are empty, so the access's
+   // compare (at MEM issue) has set dbg_watch_req before anything younger
+   // is latched, and the dbg_stop boundary parks at its successor.
+   // dbg_wph: an instruction has been latched since ID / EX / MEM were last
+   // empty (kept whether or not armed); dbg_wpa: a watchpoint is armed
+   // (registered).  dbg_wpg = both, two registers: it holds off the latch,
+   // the IRQ and the user-STEP boundaries (an IRQ / STEP taken behind the
+   // access would run before the halt).
+   logic        dbg_wph, dbg_wpa;
+   wire         dbg_wpg    = DEBUG_EN && dbg_wph && dbg_wpa;
    logic        dbg_mx;          // debugger memory access in flight
    logic        dbg_mem_done;
    logic [63:0] dbg_mem_rdata;
@@ -3040,6 +3052,10 @@ module pipeline_core
    // LEAVERET: [R15+8] not in the same line -> second read (same path)
    wire lr_need2     = mem_valid && mem_lvrq && !m_next_valid;
    wire mem_need2    = ld32_need2 || lr_need2;
+   // (DEBUG_EN watchpoints) the 2nd doubleword of LEAVERET / a spanning
+   // MEMGET32: its PA (as the 2nd read's m_addr) and the bytes read there
+   wire [28:0] mem_dw2 = mem_xpg ? {mem_pa2hi, 13'h0000} : mem_iaddr[31:3] + 29'd1;
+   wire [7:0]  mem_be2 = mem_lvrq ? 8'hFF : (8'hFF >> (4'd12 - {1'b0, mem_eaddr[2:0]}));
    // EN_ST1: the store issues this edge onto a completely idle port (no
    // chaining — registers only) and leaves MEM with it
    wire st_spec_now  = EN_ST1 && EN_POST_ST && mem_valid && mem_port_wr && !mem_misal &&
@@ -4034,6 +4050,7 @@ module pipeline_core
          dbg_active <= 1'b0; dbg_cause_q <= '0; dbg_cause <= '0;
          dbg_stepping <= 1'b0; dbg_step_done <= 1'b0; dbg_skip <= 1'b0; id_bp <= 1'b0;
          dbg_watch_req <= 1'b0; dbg_watch_addr <= '0;
+         dbg_wph <= 1'b0; dbg_wpa <= 1'b0;
          dbg_mx <= 1'b0; dbg_mem_done <= 1'b0; dbg_mem_rdata <= '0;
          us_arm <= 1'b0; us_lat <= 1'b0; us_ret <= 1'b0; us_ent <= 1'b0; wp_ent <= 1'b0;
          wb_ussa <= 1'b0; mem_wph <= 1'b0; exc_ux_q <= '0;
@@ -4088,6 +4105,7 @@ module pipeline_core
                dbg_skip      <= !start;   // don't re-break on the resume instruction
                dbg_watch_req <= 1'b0;
                dbg_active    <= 1'b0;
+               dbg_wph       <= 1'b0;   // (the pipe is flushed)
             end
             // §13.2: a debugger resume with a user step armed — its
             // instruction counts again unless it retired before the halt
@@ -4118,6 +4136,15 @@ module pipeline_core
             end else if (dbg_i.halt_req) begin
                park_kind <= 3'd4;  dbg_cause <= DBG_CAUSE_REQ;  running <= 1'b0;
             end
+         end
+
+         // Precise watchpoints: the hold ends once ID / EX / MEM are empty
+         // (the access has issued, and any redirect it makes — EX, a
+         // mispredicted or unpredicted return — has been applied to pc; a
+         // latch on this edge sets it again, below: last write wins)
+         if (DEBUG_EN) begin
+            dbg_wpa <= |(dbg_i.wp_en & (dbg_i.wp_rd | dbg_i.wp_wr));
+            if (!id_valid && !ex_valid && !mem_valid) dbg_wph <= 1'b0;
          end
 
          // Debug halt: the boundary was taken (dbg_active); park once drained.
@@ -4629,8 +4656,9 @@ module pipeline_core
                                  !(id_valid && (f_dweq(id_pc[31:3], smc_dw, mzl) || f_dweq(id_last_dw, smc_dw, mzl))) &&
                                  !(ex_valid && (f_dweq(ex_pc[31:3], smc_dw, mzl) || f_dweq(ex_last_dw, smc_dw, mzl)));
                   // Watchpoints: compare this access at issue; the halt is
-                  // taken at the next dispatch boundary (the instruction
-                  // completes; at most the two younger ones in EX/ID too).
+                  // taken at the next dispatch boundary.  The instruction
+                  // completes; nothing younger has been latched (dbg_wpg),
+                  // so the park pc is its successor.
                   if (DEBUG_EN) begin
                      for (int w = 0; w < 2; w++)
                         if (dbg_i.wp_en[w] && f_dweq(mem_iaddr[31:3], dbg_i.wp_dw[w], mzl) &&
@@ -4708,6 +4736,22 @@ module pipeline_core
                   mem_xc    <= 2'd0;
                end
             endcase
+         end
+         // Watchpoints, the second doubleword of a two-doubleword read
+         // (LEAVERET's return address at [R15 + 8], a MEMGET32 spanning a
+         // doubleword): compared in MEM on registers — the 2nd dword's PA
+         // is next to the 1st, or (TE = 1, crossing a page) the start of
+         // mem_pa2hi's frame, as the 2nd read's m_addr.  Not tied to a port
+         // read: the line lookahead serves it without one.  An op in MEM
+         // completes (an access fault, mem_xsq, makes no access); the compare
+         // may repeat while it stays there.
+         if (DEBUG_EN && mem_valid && !mem_xsq && !sq_spec && (mem_lvrq || ld32_span)) begin
+            for (int w = 0; w < 2; w++)
+               if (dbg_i.wp_en[w] && dbg_i.wp_rd[w] && mem_dw2 == dbg_i.wp_dw[w] &&
+                   (mem_be2 & dbg_i.wp_be[w]) != 8'h00) begin
+                  dbg_watch_req  <= 1'b1;
+                  dbg_watch_addr <= {mem_dw2, 3'b000};
+               end
          end
 
          // ---------------- debugger memory access (debug-halted only) ----------
@@ -5425,7 +5469,7 @@ module pipeline_core
                                   : dbg_step_done ? DBG_CAUSE_STEP : DBG_CAUSE_REQ;
                      id_valid    <= 1'b0;
                   end else if (EN_UDBG && us_lat && running && !fetch_halt && !irq_active
-                               && !(DEBUG_EN && dbg_active)) begin
+                               && !(DEBUG_EN && dbg_active) && !dbg_wpg) begin
                      // MMU_PLAN.md §13.2: the stepped instruction has been
                      // latched (and dispatches now, or did): take the STEP
                      // boundary — no further latch, no interrupt first
@@ -5433,7 +5477,7 @@ module pipeline_core
                      us_ent     <= 1'b1;
                      id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
-                               && !(DEBUG_EN && dbg_active) && irq_take) begin
+                               && !(DEBUG_EN && dbg_active) && irq_take && !dbg_wpg) begin
                      // take the IRQ at this boundary instead of fetching; the
                      // instruction in ID (older) dispatched above and drains.
                      // (irq_sel_q / irq_vec_q latch at the drain boundary in
@@ -5441,12 +5485,15 @@ module pipeline_core
                      irq_active <= 1'b1;
                      id_valid   <= 1'b0;
                   end else if (running && !fetch_halt && !irq_active
-                               && !(DEBUG_EN && dbg_active) && fetch_ok) begin
+                               && !(DEBUG_EN && dbg_active) && fetch_ok && !dbg_wpg) begin
+                     // (dbg_wpg: a debugger watchpoint is armed and the
+                     // last instruction latched has not left MEM — a bubble)
                      id_valid <= 1'b1;
                      // §13.2: with a step armed (or being armed by the IRET
                      // committing on this edge) this is the stepped one
                      if (EN_UDBG && (us_arm || (wb_valid && wb_ussa))) us_lat <= 1'b1;
                      if (DEBUG_EN) begin
+                        dbg_wph       <= 1'b1;
                         id_bp         <= dbg_bp_hit;
                         dbg_skip      <= 1'b0;
                         dbg_step_done <= dbg_stepping;   // its one instruction
@@ -6434,6 +6481,24 @@ module pipeline_core
          assert (wb_park_kind == 3'd2) else $fatal(1, "walker: TLB miss parks as kind %0d", wb_park_kind);
       if (irq_xc && wk) assert (m_read_DV && !m_write_DV && m_addr[31:27] == 5'b0)
          else $fatal(1, "walker read: %h", m_addr);
+   end
+   // Precise debugger watchpoints (CPU_ARCHITECTURE §15): dbg_wph is off
+   // only with ID / EX / MEM empty (every latch sets it); with the hold on
+   // (dbg_wpg) nothing is latched into ID — an op there now was there, the
+   // same one, before the edge
+   logic        wpg_q = 1'b0, wpg_idv_q = 1'b0;
+   logic [31:0] wpg_idpc_q = '0;
+   always_ff @(posedge clk) if (DEBUG_EN) begin
+      wpg_q      <= !rst && ce && dbg_wpg && !start;
+      wpg_idv_q  <= id_valid;
+      wpg_idpc_q <= id_pc;
+      if (!rst) begin
+         assert (dbg_wph || !(id_valid || ex_valid || mem_valid))
+            else $fatal(1, "dbg watch hold off with an op in flight: id %b ex %b mem %b", id_valid, ex_valid, mem_valid);
+         if (wpg_q && id_valid)
+            assert (wpg_idv_q && id_pc == wpg_idpc_q)
+               else $fatal(1, "dbg watch hold: an op latched into ID: pc=%h", id_pc);
+      end
    end
 `endif
 

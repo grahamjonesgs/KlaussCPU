@@ -47,6 +47,20 @@ loads and a CALL: the halt is at the callee) — the documented non-precise
 stop ("next instruction boundary"), one instruction later than the
 2026-10-26 build since stores post through the store queue.
 
+**Precise watchpoints** (branch `dbgwprec`, RTL only — not yet built): a
+debugger watchpoint now halts with the PC at the accessing instruction's
+architectural successor (the next instruction, a CALL's target, a RET /
+LEAVERET's return target) and nothing younger executed, as the emulator
+does.  While any watchpoint is armed the core keeps one instruction in
+flight (`dbg_wph` / `dbg_wpa`: the next one latches into ID only once
+ID / EX / MEM are empty), and holds off the IRQ and user-STEP boundaries
+behind it, so the existing `dbg_stop` boundary parks at the successor;
+about 2x slower while armed (randprog, LAT = 3), unchanged when not.  A read
+watchpoint now also sees LEAVERET's return-address slot and a spanning
+MEMGET32's second doubleword (CPU_ARCHITECTURE §15).  A watchpoint armed
+while the core runs is precise from the first instruction latched after it.
+tools/vsim `dwp_*` tests (DEBUG_EN builds).
+
 ---
 
 ## 1. Decisions

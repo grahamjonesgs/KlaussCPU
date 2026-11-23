@@ -884,8 +884,16 @@ watchpoints (doubleword + byte mask, read/write), and read and write
 registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
 
 - A breakpoint stops *before* the matching instruction executes.
-- A watchpoint stops at the next instruction boundary after the access (the
-  access itself completes).
+- A watchpoint is precise: the accessing instruction completes, nothing
+  younger has any effect, and the halt's PC is the instruction's
+  architectural successor — the next instruction, a CALL's target (its
+  return-address push can hit), a RET / LEAVERET's return target. While any
+  watchpoint is armed the core keeps one instruction in flight: the next
+  one enters decode only once the last has left MEM (its access compared,
+  any redirect it makes applied), and a pending interrupt or user-step
+  boundary waits for that too, so the debug halt comes first. Code runs
+  about half as fast while a watchpoint is armed (random test programs in
+  the simulator); nothing changes while none is.
 - HALT, TRAP and illegal instructions become debug halts while a debugger
   is attached.
 - A halt request stops a WAIT in place. A single step completes the WAIT as
@@ -899,9 +907,10 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
 - While a read watchpoint is armed (attached or not, until the next plain
   program load clears it), loads skip the D-cache hit pipe and store-to-load
   forwarding: same results, a few cycles slower per load.
-- Known gap: a read watchpoint is compared on an access's first doubleword
-  only, so LEAVERET's second read (the return-address slot) and the second
-  doubleword of a MEMGET32 that spans two never fire it.
+- A read watchpoint also sees the second doubleword of a two-doubleword
+  read: LEAVERET's return-address slot (`[R15 + 8]`) and the second
+  doubleword of a MEMGET32 that spans two (only the bytes it really reads).
+  The halt's watch address is then that doubleword's.
 - The kernel-usable user single step and watchpoints (§13.5) are separate:
   while the debugger is attached the user watchpoints are off, and the
   debugger's halt, step and breakpoints take priority over a user step
