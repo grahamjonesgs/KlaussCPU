@@ -916,8 +916,8 @@ registers (R0–R15, SP, resume PC, flags, INT_MASK) and memory while halted.
 - Resume refetches through the start path, so code patched while halted
   takes effect.
 - While a read watchpoint is armed (attached or not, until the next plain
-  program load clears it), loads skip the D-cache hit pipe and store-to-load
-  forwarding: same results, a few cycles slower per load.
+  program load clears it), loads skip the D-cache hit pipe, store-to-load
+  forwarding and early issue: same results, a few cycles slower per load.
 - A read watchpoint also sees the second doubleword of a two-doubleword
   read: LEAVERET's return-address slot (`[R15 + 8]`) and the second
   doubleword of a MEMGET32 that spans two (only the bytes it really reads).

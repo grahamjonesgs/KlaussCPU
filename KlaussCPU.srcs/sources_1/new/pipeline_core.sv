@@ -3232,7 +3232,10 @@ module pipeline_core
    wire w_early_ld   = EN_EARLY_LD && ex_valid && !ex_busy && !mem_busy && ex_rd_op && !(EN_DC_H && ex_hld) && !wb_hmiss &&
                        !(EN_DC_H && mem_valid && mem_h) &&   // its miss is not known yet
                        !mem_port_op && mem_xc == 2'd0 && !if_xc && !st_post && !sq_v && !irq_xc &&
-                       !ld_out && !fbr_taken && !mem_ysq_go && !(DEBUG_EN && dbg_mx) &&
+                       !ld_out && !fbr_taken && !mem_ysq_go && !(DEBUG_EN && (dbg_mx || dbg_rwp)) &&
+                       // (DEBUG_EN: none with a read watchpoint armed — compared at MEM
+                       // issue on the registered mem_iaddr, not on exo_iaddr behind the
+                       // EA adder: -0.18 ns to dbg_watch_addr, build dbg_e8e8825)
                        // (stage 2: no early issue with the MPU on — its
                        // decision must not reach the EX->MEM enables)
                        !xlt_q;
@@ -3909,11 +3912,9 @@ module pipeline_core
    // squash: the op is refetched and would send again.)
    assign lcd_dv   = ex_is_lcd && lcd_ready && !mem_busy && !fbr_taken && !ras_miss && !sq_ex &&
                      !mem_ysq_go && !sq_spec;
-   // A load's EX-side watchpoint compare (early issue; the hit pipe is off
-   // while a read watchpoint is armed, dbg_rwp) fires only
-   // for a load that really leaves EX: not one an older op kills this edge,
-   // nor one with an access fault (it never reads)
-   wire ex_wp_ok   = !fbr_taken && !ras_miss && !sq_ex && !mem_ysq_go && !sq_spec && !ex_ufault;
+   // (no EX-side debugger watchpoint compares: with a read watchpoint armed
+   // neither the hit pipe nor early issue is used, dbg_rwp — every access is
+   // compared in MEM on registers)
 
    // ---------------- MMU_PLAN.md §13.3: the user watchpoints' EX compare ----
    // Each data access of the EX op against WPn, from the EA's dispatch-time
@@ -4603,8 +4604,8 @@ module pipeline_core
          // read: the line lookahead serves it without one.  An op in MEM
          // completes (an access fault, mem_xsq, makes no access).  Once a
          // hit is pending (!dbg_watch_req) it is not compared again, and a
-         // doubleword-0 hit on the same edge (the MEM-issue compare below;
-         // the early-load one at EX -> MEM came first) wins: watch_addr is
+         // doubleword-0 hit on the same edge (the MEM-issue compare below)
+         // wins: watch_addr is
          // doubleword 0's when both hit.
          if (DEBUG_EN && mem_valid && !mem_xsq && !sq_spec && !dbg_watch_req && (mem_lvrq || ld32_span)) begin
             for (int w = 0; w < 2; w++)
@@ -5257,16 +5258,8 @@ module pipeline_core
                   m_read_DV  <= 1'b1;
                   rdy_armed  <= !m_ready;
                   mem_xc     <= 2'd1;
-                  if (DEBUG_EN && ex_wp_ok) begin
-                     for (int w = 0; w < 2; w++)
-                        // (the bytes it reads: ex_wm0, from ex_tlo3 — not
-                        // behind the EA adder as exo_be, which is FF here)
-                        if (dbg_i.wp_en[w] && exo_iaddr[31:3] == dbg_i.wp_dw[w] &&
-                            (ex_wm0 & dbg_i.wp_be[w]) != 8'h00 && dbg_i.wp_rd[w]) begin
-                           dbg_watch_req  <= 1'b1;
-                           dbg_watch_addr <= exo_iaddr;
-                        end
-                  end
+                  // (no watchpoint compare: early issue is off while a
+                  // debugger read watchpoint is armed, dbg_rwp)
                end
                mem_mage   <= 2'd0;
                mem_lkq    <= (ex_d.uop == U_LOAD || ex_d.uop == U_LOAD32 || ex_d.uop == U_POP ||
