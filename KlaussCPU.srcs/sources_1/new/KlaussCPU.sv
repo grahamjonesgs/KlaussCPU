@@ -367,6 +367,17 @@ module KlaussCPU #(
    //  instance, declared near the bus_splitter instantiation below.)
 
    wire        w_mmio_write_DV;
+   // (dbgtmg timing) the write strobe of the whole 0xF region, the Ethernet
+   // bridge's window included: = cpu_mem.write_DV && the region decode,
+   // assigned beside w_bus_io below.  Every write SIDE EFFECT decodes its
+   // device id ([27:16], never 006-008) itself, so it takes this strobe
+   // instead of w_mmio_write_DV, whose Ethernet exclusion (the 006-008
+   // compare on the core's m_addr, then the region mux) sat in series in
+   // front of every device: dbg_aa8505a's worst, m_addr -> that decode ->
+   // o_mmio_write_DV -> sd_spi -> its IOB registers, 11 levels.  The write
+   // ACK (r_mmio_write_dv_d) keeps w_mmio_write_DV.  Equal per device
+   // (asserted at the device strobes).
+   wire        w_io_write_DV;
    wire        w_mmio_read_DV;
    wire [31:0] w_mmio_addr;
    wire [63:0] w_mmio_write_data;
@@ -424,7 +435,7 @@ module KlaussCPU #(
    // CACHE_CTRL bit 0 self-clearing: a 1-cycle pulse on the cycle the CPU
    // writes 0xF005_0000 with bit 0 set, fed straight into mem_read_write's
    // i_stat_clear (which zeros all counters on the next edge).
-   wire        w_cache_stat_clear = w_mmio_write_DV
+   wire        w_cache_stat_clear = w_io_write_DV
                                   && (w_mmio_addr[27:16] == 12'h005)
                                   && (w_mmio_addr[15:0]  == 16'h0000)
                                   && w_mmio_write_data[0];
@@ -469,13 +480,13 @@ module KlaussCPU #(
       if (w_reset_H) begin
          r_cop_addr <= '0;
          r_cop_len  <= '0;
-      end else if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h005) begin
+      end else if (w_io_write_DV && w_mmio_addr[27:16] == 12'h005) begin
          if (w_mmio_addr[15:0] == 16'h0030) r_cop_addr <= w_mmio_write_data[31:5];
          if (w_mmio_addr[15:0] == 16'h0038) r_cop_len  <= w_mmio_write_data[31:0];
       end
       r_cop_n <= 28'(({1'b0, r_cop_len} + 33'd31) >> 5);
    end
-   wire        w_cc_dec = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h005) &&
+   wire        w_cc_dec = w_io_write_DV && (w_mmio_addr[27:16] == 12'h005) &&
                           (w_mmio_addr[15:0] == 16'h0000) && w_mmio_byte_en[0];
    logic       r_cc_dec = 1'b0;
    always_ff @(posedge i_Clk) r_cc_dec <= w_cc_dec;
@@ -509,7 +520,7 @@ module KlaussCPU #(
    // L2_CTRL (0xF005_0028, HW_PERF_PLAN.md §6): [0] EN, [1] WBINV; a write
    // (first cycle of the store's DV, byte 0 enabled) goes to the L2, which
    // ignores it while BUSY.  CPU reset and program load re-enable it.
-   wire        w_l2_ctrl_dec = w_mmio_write_DV
+   wire        w_l2_ctrl_dec = w_io_write_DV
                              && (w_mmio_addr[27:16] == 12'h005)
                              && (w_mmio_addr[15:0]  == 16'h0028)
                              && w_mmio_byte_en[0];
@@ -581,7 +592,7 @@ module KlaussCPU #(
    localparam PC_OTHER=3'd0, PC_ALU=3'd1, PC_LOAD=3'd2, PC_STORE=3'd3,
               PC_BRANCH=3'd4, PC_JUMP=3'd5, PC_CALL=3'd6, PC_INDIRECT=3'd7;
    // PERF_CTRL bit 0 self-clearing — same pattern as w_cache_stat_clear.
-   wire        w_perf_stat_clear = w_mmio_write_DV
+   wire        w_perf_stat_clear = w_io_write_DV
                                  && (w_mmio_addr[27:16] == 12'h00D)
                                  && (w_mmio_addr[15:0]  == 16'h0000)
                                  && w_mmio_write_data[0];
@@ -589,7 +600,7 @@ module KlaussCPU #(
    // like the counters, untouched by CPU reset / program load.
    logic r_perf_excl = 1'b0;
    always_ff @(posedge i_Clk)
-      if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h00D && w_mmio_addr[15:0] == 16'h0000)
+      if (w_io_write_DV && w_mmio_addr[27:16] == 12'h00D && w_mmio_addr[15:0] == 16'h0000)
          r_perf_excl <= w_mmio_write_data[1];
 
    logic  [63:0] r_mmio_read_data_comb;  // combinational decode (driven by always_comb)
@@ -647,7 +658,7 @@ module KlaussCPU #(
    // access (which comes 2 cycles after that access's DV), keeping the
    // low-ready cycle the ready-edge protocol above needs.  Every other
    // register (SDM_FIFO / the data PIO included) keeps its latency.
-   wire        w_sdie_wr = w_mmio_write_DV && w_mmio_addr[27:16] == 12'h000 &&
+   wire        w_sdie_wr = w_io_write_DV && w_mmio_addr[27:16] == 12'h000 &&
                            w_mmio_addr[15:3] == 13'h0026;      // 0x130..0x137
    logic [4:0] r_sdie_q = '0;
    always_ff @(posedge i_Clk) r_sdie_q <= {r_sdie_q[3:0], w_sdie_wr};
@@ -814,6 +825,20 @@ module KlaussCPU #(
    wire        w_bus_io   = r_pipe_owns_dec ? pip_m_io : w_st_io;
    wire        w_bus_eth  = r_pipe_owns_dec ? (pip_m_io && f_eth_rgn(pip_m_addr))
                                             : (w_st_io && f_eth_rgn(st.mem_addr));
+   // (dbgtmg timing) the region's write strobe, see its declaration: the
+   // ownership muxes of the DV and of the region bit, and the AND — one
+   // LUT6 of registers (r_pipe_owns, the core's m_write_DV / m_io, the
+   // FSM's), with no address compare in series
+   assign      w_io_write_DV = cpu_mem.write_DV && w_bus_io;
+`ifndef SYNTHESIS
+   // it differs from the splitter's peripheral strobe only on a write into
+   // the Ethernet window, whose device ids (006-008) no side effect decodes
+   always_ff @(posedge i_Clk)
+      if (!$isunknown({w_io_write_DV, w_mmio_write_DV}) && w_io_write_DV != w_mmio_write_DV)
+         assert (!w_mmio_write_DV && f_eth_rgn(w_mmio_addr))
+            else $fatal(1, "w_io_write_DV %b != w_mmio_write_DV %b outside the Ethernet window (addr %h)",
+                        w_io_write_DV, w_mmio_write_DV, w_mmio_addr);
+`endif
 `ifndef SYNTHESIS
    always_ff @(posedge i_Clk)
       assert (w_pip_ready == (w_pipe_owns && (pip_m_io ? w_split_ready_q : dram_mem.ready)))
@@ -861,7 +886,7 @@ module KlaussCPU #(
    wire         pip_perf_itlb;
    // int_mask MMIO write (0xF00F_0000) mirrored into the core — the
    // "MMIO store wins" ordering is preserved inside pipeline_core.
-   wire         w_pip_mask_wr = w_mmio_write_DV && (w_mmio_addr[27:16] == 12'h00F)
+   wire         w_pip_mask_wr = w_io_write_DV && (w_mmio_addr[27:16] == 12'h00F)
                                                 && (w_mmio_addr[15:0]  == 16'h0000);
 
    // ---- on-chip debugger (DEBUG_EN): debug_module + JTAG transport ----
@@ -997,7 +1022,7 @@ module KlaussCPU #(
    // intended for it. addr[15:0] is the offset within the device's window.
    // -------------------------------------------------------------------------
    wire        w_sd_sel       = (w_maddr[0][27:16] == 12'h000);
-   wire        w_sd_write_DV  = w_mmio_write_DV & w_sd_sel;
+   wire        w_sd_write_DV  = w_io_write_DV & w_sd_sel;
    wire        w_sd_read_DV   = w_mmio_read_DV  & w_sd_sel;
    wire [63:0] w_sd_read_data;
 
@@ -1041,7 +1066,7 @@ module KlaussCPU #(
    always_ff @(posedge i_Clk) begin
       if (w_reset_H || r_load_pulse)
          r_int2_en <= 2'b01;
-      else if (w_mmio_write_DV && w_mmio_addr[27:16] == 12'h00F && w_mmio_addr[15:0] == 16'h0050)
+      else if (w_io_write_DV && w_mmio_addr[27:16] == 12'h00F && w_mmio_addr[15:0] == 16'h0050)
          r_int2_en <= w_mmio_write_data[1:0];
    end
    (* KEEP_HIERARCHY = "yes" *)
@@ -1082,7 +1107,7 @@ module KlaussCPU #(
    // refused in hardware.  CCLK only reaches the pin through STARTUPE2.
    // -------------------------------------------------------------------------
    wire        w_qspi_sel      = (w_maddr[1][27:16] == 12'h012);
-   wire        w_qspi_write_DV = w_mmio_write_DV & w_qspi_sel;
+   wire        w_qspi_write_DV = w_io_write_DV & w_qspi_sel;
    wire        w_qspi_read_DV  = w_mmio_read_DV  & w_qspi_sel;
    wire [63:0] w_qspi_read_data;
    wire        w_qspi_sck;
@@ -1132,7 +1157,7 @@ module KlaussCPU #(
    // Crypto AES — device id 0x00A. See CRYPTO_PLAN.md §4 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
    wire        w_aes_sel      = (w_maddr[2][27:16] == 12'h00A);
-   wire        w_aes_write_DV = w_mmio_write_DV & w_aes_sel;
+   wire        w_aes_write_DV = w_io_write_DV & w_aes_sel;
    wire        w_aes_read_DV  = w_mmio_read_DV  & w_aes_sel;
    wire [63:0] w_aes_read_data;
 
@@ -1165,7 +1190,7 @@ module KlaussCPU #(
    // Crypto SHA-256 — device id 0x00B. See CRYPTO_PLAN.md §6 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
    wire        w_sha_sel      = (w_maddr[2][27:16] == 12'h00B);
-   wire        w_sha_write_DV = w_mmio_write_DV & w_sha_sel;
+   wire        w_sha_write_DV = w_io_write_DV & w_sha_sel;
    wire        w_sha_read_DV  = w_mmio_read_DV  & w_sha_sel;
    wire [63:0] w_sha_read_data;
 
@@ -1192,7 +1217,7 @@ module KlaussCPU #(
    // Crypto TRNG — device id 0x00C. See CRYPTO_PLAN.md §7 and MMIO_MAP.md.
    // -------------------------------------------------------------------------
    wire        w_trng_sel      = (w_maddr[2][27:16] == 12'h00C);
-   wire        w_trng_write_DV = w_mmio_write_DV & w_trng_sel;
+   wire        w_trng_write_DV = w_io_write_DV & w_trng_sel;
    wire        w_trng_read_DV  = w_mmio_read_DV  & w_trng_sel;
    wire [63:0] w_trng_read_data;
 
@@ -1219,7 +1244,7 @@ module KlaussCPU #(
    // BLITTER_IMPLEMENTATION_PLAN.md and blitter-fpga-handoff.md.
    // -------------------------------------------------------------------------
    wire        w_blit_sel      = (w_maddr[3][27:16] == 12'h00E);
-   wire        w_blit_write_DV = w_mmio_write_DV & w_blit_sel;
+   wire        w_blit_write_DV = w_io_write_DV & w_blit_sel;
    wire        w_blit_read_DV  = w_mmio_read_DV  & w_blit_sel;
    wire [63:0] w_blit_read_data;
 
@@ -1268,7 +1293,7 @@ module KlaussCPU #(
    // vga_ctrl.sv and VGA_PLAN.md.
    // -------------------------------------------------------------------------
    wire        w_vga_sel      = (w_maddr[4][27:16] == 12'h011);
-   wire        w_vga_write_DV = w_mmio_write_DV & w_vga_sel;
+   wire        w_vga_write_DV = w_io_write_DV & w_vga_sel;
    wire        w_vga_read_DV  = w_mmio_read_DV  & w_vga_sel;
    wire [63:0] w_vga_read_data;
    // (w_vga_irq declared near the IRQ source gating at the top of the module)
@@ -1320,9 +1345,19 @@ module KlaussCPU #(
    // AMP_CORE2_PLAN.md and core2_subsys.sv for the register map.
    // -------------------------------------------------------------------------
    wire        w_c2_sel      = (w_maddr[5][27:16] == 12'h010);
-   wire        w_c2_write_DV = w_mmio_write_DV & w_c2_sel;
+   wire        w_c2_write_DV = w_io_write_DV & w_c2_sel;
    wire        w_c2_read_DV  = w_mmio_read_DV  & w_c2_sel;
    wire [63:0] w_c2_read_data;
+`ifndef SYNTHESIS
+   // (dbgtmg) every device's write strobe off w_io_write_DV is the one off
+   // the splitter's peripheral strobe (its id is not Ethernet's)
+   always_ff @(posedge i_Clk) if (!$isunknown(w_mmio_addr))
+      assert ({w_sd_write_DV, w_qspi_write_DV, w_aes_write_DV, w_sha_write_DV,
+               w_trng_write_DV, w_blit_write_DV, w_vga_write_DV, w_c2_write_DV} ===
+              ({8{w_mmio_write_DV}} & {w_sd_sel, w_qspi_sel, w_aes_sel, w_sha_sel,
+                                       w_trng_sel, w_blit_sel, w_vga_sel, w_c2_sel}))
+         else $fatal(1, "a device write strobe != w_mmio_write_DV & its select (addr %h)", w_mmio_addr);
+`endif
 
    // DDR master-C wires (to mem_read_write's arbiter, instantiated below).
    wire         w_c2_ddr_req, w_c2_ddr_done;
@@ -2838,7 +2873,7 @@ rams_sp_nc rams_sp_nc1 (
          // same cycle. Running after the case makes the MMIO write win (correct: a
          // memory-mapped store must take effect). Boot/HCF display-override states issue
          // no MMIO stores, so nothing legitimate is overridden.
-         if (w_mmio_write_DV) begin
+         if (w_io_write_DV) begin   // (the items: 001-004, 00F; never Ethernet's 006-008)
             case (w_mmio_addr[27:16])
                12'h001: begin  // UART TX
                   case (w_mmio_addr[15:0])

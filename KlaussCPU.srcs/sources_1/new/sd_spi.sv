@@ -152,25 +152,31 @@ module sd_spi (
                        && !r_byte_busy;
 
     // SCK's and MOSI's next values: exactly the FSM's assignments below
-    // (it registers them; the pads take them)
-    logic nx_sck_spi, nx_mosi;
+    // (it registers them; the pads take them).  MOSI's for both values of
+    // the kick (nx_mosi_n: none, nx_mosi_k: one), so the pads can take the
+    // kick last (see nx_pad below); SCK's does not depend on it.
+    logic nx_sck_spi, nx_mosi, nx_mosi_n, nx_mosi_k;
     always_comb begin
         nx_sck_spi = o_sd_sck_spi;
-        nx_mosi    = o_sd_mosi;
+        nx_mosi_n  = o_sd_mosi;
+        nx_mosi_k  = o_sd_mosi;
         if (w_soft_rst) begin
             nx_sck_spi = 1'b0;
-            nx_mosi    = 1'b1;
+            nx_mosi_n  = 1'b1;
+            nx_mosi_k  = 1'b1;
         end else if (r_byte_sm == BYTE_IDLE) begin
             nx_sck_spi = 1'b0;
-            if (w_kick_byte) nx_mosi = mmio.write_data[7];
+            nx_mosi_k  = mmio.write_data[7];
         end else if (r_phase_count >= r_clk_div) begin
             if (r_sck_phase == 1'b0) begin
                 nx_sck_spi = 1'b1;
             end else begin
                 nx_sck_spi = 1'b0;
-                nx_mosi    = (r_bit_idx == 3'd0) ? 1'b1 : r_tx_shift[6];
+                nx_mosi_n  = (r_bit_idx == 3'd0) ? 1'b1 : r_tx_shift[6];
+                nx_mosi_k  = (r_bit_idx == 3'd0) ? 1'b1 : r_tx_shift[6];
             end
         end
+        nx_mosi = w_kick_byte ? nx_mosi_k : nx_mosi_n;
     end
 
     always_ff @(posedge i_Clk or negedge i_Rst_L) begin
@@ -372,12 +378,53 @@ module sd_spi (
     wire [3:0] w_ref_dat    = {4{w_on}} & (r_sd_mode ? w_nat_dat : {o_sd_cs_n, 1'b1, 1'b1, 1'b1});
     wire [3:0] w_ref_dat_oe = {4{~w_on}} | (r_sd_mode ? w_nat_dat_oe : 4'b1110);
 
-    wire       nx_on        = nx_pwr_en;
-    wire       nx_sck       = nx_on & (nx_sd_mode ? w_nat_clk_nx : nx_sck_spi);
-    wire       nx_cmd       = nx_on & (nx_sd_mode ? w_nat_cmd_nx : nx_mosi);
-    wire       nx_cmd_oe    = ~nx_on | (nx_sd_mode ? w_nat_cmd_oe_nx : 1'b1);
-    wire [3:0] nx_dat       = {4{nx_on}} & (nx_sd_mode ? w_nat_dat_nx : {nx_cs_n, 1'b1, 1'b1, 1'b1});
-    wire [3:0] nx_dat_oe    = {4{~nx_on}} | (nx_sd_mode ? w_nat_dat_oe_nx : 4'b1110);
+    // The pads' next values: the mux above on SD_CTRL's and the SPI
+    // shifter's next values, {SCK, CMD, CMD_OE, DAT[3:0], DAT_OE[3:0]}.
+    function automatic logic [10:0] f_pads(input logic on, mode, cs_n, sck_spi, mosi,
+                                           input logic n_clk, n_cmd, n_cmd_oe,
+                                           input logic [3:0] n_dat, n_dat_oe);
+        return {on & (mode ? n_clk : sck_spi),
+                on & (mode ? n_cmd : mosi),
+                ~on | (mode ? n_cmd_oe : 1'b1),
+                {4{on}} & (mode ? n_dat : {cs_n, 3'b111}),
+                {4{~on}} | (mode ? n_dat_oe : 4'b1110)};
+    endfunction
+    // (dbgtmg timing) The MMIO write enters LAST: the core's m_addr -> the
+    // SD select and offset decode -> w_ctrl_wr / w_kick_byte reached the
+    // IOB registers (at the pads, a long route away) through four more
+    // LUTs (dbg_aa8505a's worst: +0.019, r_cmd_o / r_cmd_t).  The value is
+    // built for each of the three cases — an SD_CTRL write (offset 0x000),
+    // an SD_DATA kick (0x008), neither; exclusive, the offsets differ — from
+    // registers and the write data only, and the decoded strobes select.
+    // Cycle-identical: = the formula on nx_pwr_en / nx_sd_mode / nx_cs_n /
+    // nx_sck_spi / nx_mosi (asserted below).
+    wire        w_pw_r = !w_soft_rst && r_pwr_en;
+    wire        w_md_r = !w_soft_rst && r_sd_mode;
+    wire        w_cs_r =  w_soft_rst || o_sd_cs_n;
+    wire        w_pw_w = !w_soft_rst && mmio.write_data[17];
+    wire        w_md_w = !w_soft_rst && mmio.write_data[18];
+    wire        w_cs_w =  w_soft_rst || mmio.write_data[16];
+    wire [10:0] w_pad_n = f_pads(w_pw_r, w_md_r, w_cs_r, nx_sck_spi, nx_mosi_n, w_nat_clk_nx,
+                                 w_nat_cmd_nx, w_nat_cmd_oe_nx, w_nat_dat_nx, w_nat_dat_oe_nx);
+    wire [10:0] w_pad_k = f_pads(w_pw_r, w_md_r, w_cs_r, nx_sck_spi, nx_mosi_k, w_nat_clk_nx,
+                                 w_nat_cmd_nx, w_nat_cmd_oe_nx, w_nat_dat_nx, w_nat_dat_oe_nx);
+    wire [10:0] w_pad_c = f_pads(w_pw_w, w_md_w, w_cs_w, nx_sck_spi, nx_mosi_n, w_nat_clk_nx,
+                                 w_nat_cmd_nx, w_nat_cmd_oe_nx, w_nat_dat_nx, w_nat_dat_oe_nx);
+    wire [10:0] nx_pad  = w_ctrl_wr ? w_pad_c : w_kick_byte ? w_pad_k : w_pad_n;
+    wire       nx_sck, nx_cmd, nx_cmd_oe;
+    wire [3:0] nx_dat, nx_dat_oe;
+    assign {nx_sck, nx_cmd, nx_cmd_oe, nx_dat, nx_dat_oe} = nx_pad;
+`ifndef SYNTHESIS
+    // (sampled on the rising edge, as the registers take it: the unit
+    // testbenches drive the MMIO bus on the falling edge)
+    wire [10:0] w_pad_chk = f_pads(nx_pwr_en, nx_sd_mode, nx_cs_n, nx_sck_spi, nx_mosi, w_nat_clk_nx,
+                                   w_nat_cmd_nx, w_nat_cmd_oe_nx, w_nat_dat_nx, w_nat_dat_oe_nx);
+    always_ff @(posedge i_Clk)
+        if (i_Rst_L === 1'b1 && !$isunknown({nx_pad, w_pad_chk}))
+            assert (nx_pad == w_pad_chk)
+                else $fatal(1, "sd_spi: the pads' next values (strobes last) %b != the SD_CTRL / SPI mux %b",
+                            nx_pad, w_pad_chk);
+`endif
 
     // CMD / DAT: OLOGIC output and tristate flip-flops (T = 1: released).
     // Reset (CPU_RESETN, asynchronous as SD_CTRL): every line driven low, as

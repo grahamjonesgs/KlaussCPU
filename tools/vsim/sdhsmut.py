@@ -81,7 +81,7 @@ MUTS = [
      "                    D_WR_DATA: nx_dat = r_d_w4 ? r_d_sh[63:60] : {3'b111, r_d_sh[63]};",
      "                    D_WR_DATA: nx_dat = r_d_w4 ? r_d_sh[59:56] : {3'b111, r_d_sh[62]};"),
     ('nx_spi', "the SPI MOSI next value ignores a kick", SS, 'compat',
-     "            if (w_kick_byte) nx_mosi = mmio.write_data[7];", ""),
+     "            nx_mosi_k  = mmio.write_data[7];", ""),
     ('caps_hs', 'SDM_CAPS[9] (high speed) reads 0', SN, 'native',
      "64'h0000_0000_0008_0B01", "64'h0000_0000_0008_0901"),
     ('st_rdy', 'SDM_STATUS[6] (IDELAY_RDY) reads 0', SN, 'native',
