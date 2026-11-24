@@ -76,6 +76,26 @@ callee, 0x260), a read watch at 0x1920 (after the load), `next` over a
 watched store reports "watchpoint 1"; breakpoints, locals, backtrace,
 `next`, continue, detach unchanged.
 
+**Debugger in the QSPI release (2026-11-24, branch `dbgtmg`).**  Graham
+asked for a release-grade DEBUG_EN = 1 image, so the debugger is always
+there after power-up.  The DEBUG_EN build sat at tier 1 WNS -0.005 to
+-0.129 depending on placement (the debug module's ~1.5k LUTs spread the
+core).  Cycle-identical RTL fixes: `aa8505a` (id_b_imm / id_b_one /
+id_privop from flat per-candidate predecode functions, exhaustively
+checked; t1_* / mem_pa2hi with enables that can't matter; `t_pahi`'s PFN
+select last; `wbz_cap` for the load-bypass `ex_b_zero`) and `fd9008b`
+(the MMIO write strobe without the Ethernet-window compare — every
+consumer decodes its own device id; sd_spi's pad next-values take the
+write last).  Tried and reverted: a pblock moving the debug module to a
+corner (tier 1 -0.129).  `fd9008b` standard flow: tier 1 WNS +0.146 / WHS
++0.013.  Reviews (Opus) of both: no blocker / major.  Board: SRAM all_tests
+33/33, the tools/board tests, board-check --boot 19/19, mmio-test; QSPI =
+`~/.cache/kbuild/debug_release_fd9008b.bit` (rollback entry in
+~/.cache/kbuild/rollback/README.txt), the flash-boot checks the same.
+Release images are now built as the debug build above (git-archive copy
+plus `debug_module.sv`, `dm_jtag.xdc`, generic `DEBUG_EN=1`); the
+checked-in project still elaborates DEBUG_EN = 0.
+
 ---
 
 ## 1. Decisions
