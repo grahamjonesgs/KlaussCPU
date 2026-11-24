@@ -451,8 +451,10 @@ pattern: letters, a decimal point on any digit, blank leading digits.
   digits** (they held segment patterns); outside raw mode they leave them
   alone as before. The loader's states clear it too: `NO_PROGRAM` (the first
   state after a reset, which also blanks the display), loading, a program
-  load (`LOAD_COMPLETE`), the boot ROM's own display, and an HCF crash
-  display. While `CPU_RESETN` is held the display is left as it was. `HALT`
+  load (`LOAD_COMPLETE`) and an HCF crash display. (The boot ROM copy
+  just after a reset shows "b00t" in raw segments; `SEG_MODE` reads 1
+  then, but no program is running, and the state after the copy clears
+  it.) While `CPU_RESETN` is held the display is left as it was. `HALT`
   does not clear it: a halted program's raw display stays up. A program that never
   writes `SEG_RAW` sees no change from earlier bitstreams (apart from the
   `0x0B` / `0x0D` glyphs).

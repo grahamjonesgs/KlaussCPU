@@ -2174,8 +2174,14 @@ rams_sp_nc rams_sp_nc1 (
                if (r_boot_active) begin
                   // ---- Resident boot-ROM → DDR copy (sub-FSM in r_boot_phase) ----
                   // Marker on the upper display so a stuck copy is distinguishable
-                  // from a blank idle board ("b00t").
-                  st.seven_seg_value1 <= 32'h0B000704;
+                  // from a blank idle board: "b00t" in raw segments (the glyph
+                  // table has no "t"; 0x0B000704 showed "b074").  Bytes, leftmost
+                  // digit first: b = c d e f g, 0, 0, t = d e f g; the lower half
+                  // blank.  RAW overrides the clear above; the copy's next state
+                  // (idle NO_PROGRAM, or LOAD_COMPLETE) clears it again.
+                  st.seven_seg_value1 <= 32'h7C3F3F78;
+                  st.seven_seg_value2 <= 32'h00000000;
+                  r_seg_raw           <= 1'b1;
                   case (r_boot_phase)
                      3'd0: begin
                         // Wait for DDR calibration, then present word 0.
