@@ -94,7 +94,10 @@ corner (tier 1 -0.129).  `fd9008b` standard flow: tier 1 WNS +0.146 / WHS
 ~/.cache/kbuild/rollback/README.txt), the flash-boot checks the same.
 Release images are now built as the debug build above (git-archive copy
 plus `debug_module.sv`, `dm_jtag.xdc`, generic `DEBUG_EN=1`); the
-checked-in project still elaborates DEBUG_EN = 0.
+checked-in project still elaborates DEBUG_EN = 0.  JTAG lldb on the flash-boot
+image (after `openFPGALoader -r`, no bitstream load; runtime session): the
+t1–t3 transcripts equal the emulator's line for line (write watch at
+0x1928, read watch at 0x1920, `next` over a watched store reports it).
 
 ---
 
