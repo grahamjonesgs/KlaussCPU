@@ -608,24 +608,6 @@ module pipeline_core
    // the IRQ and the user-STEP boundaries (an IRQ / STEP taken behind the
    // access would run before the halt).
    logic        dbg_wph, dbg_wpa;
-   // (timing, build dbg_aa8505a: the debugger's breakpoint / watchpoint
-   // configuration, registered here, so the debug module can be placed apart
-   // from the core — dm_jtag.xdc pb_dm.  It is written only over JTAG (DMI),
-   // many cycles before a resume; one cycle of lag changes nothing.)
-   logic [3:0]       dq_bp_en;
-   logic [3:0][31:0] dq_bp_addr;
-   logic [1:0]       dq_wp_en, dq_wp_rd, dq_wp_wr;
-   logic [1:0][28:0] dq_wp_dw;
-   logic [1:0][7:0]  dq_wp_be;
-   always_ff @(posedge clk) begin
-      dq_bp_en   <= DEBUG_EN ? dbg_i.bp_en   : '0;
-      dq_bp_addr <= DEBUG_EN ? dbg_i.bp_addr : '0;
-      dq_wp_en   <= DEBUG_EN ? dbg_i.wp_en   : '0;
-      dq_wp_rd   <= DEBUG_EN ? dbg_i.wp_rd   : '0;
-      dq_wp_wr   <= DEBUG_EN ? dbg_i.wp_wr   : '0;
-      dq_wp_dw   <= DEBUG_EN ? dbg_i.wp_dw   : '0;
-      dq_wp_be   <= DEBUG_EN ? dbg_i.wp_be   : '0;
-   end
    wire         dbg_wpg    = DEBUG_EN && dbg_wph && dbg_wpa;
    logic        dbg_mx;          // debugger memory access in flight
    logic        dbg_mem_done;
@@ -639,8 +621,8 @@ module pipeline_core
    // still wakes on irq_ok, WFI-style, so "DI; test; WAIT" cannot deadlock.
    wire irq_take   = irq_ok && !(EN_DIEI && irq_dis);
    wire dbg_bp_hit = DEBUG_EN && !dbg_skip &&
-                     |(dq_bp_en & {dq_bp_addr[3] == pc, dq_bp_addr[2] == pc,
-                                      dq_bp_addr[1] == pc, dq_bp_addr[0] == pc});
+                     |(dbg_i.bp_en & {dbg_i.bp_addr[3] == pc, dbg_i.bp_addr[2] == pc,
+                                      dbg_i.bp_addr[1] == pc, dbg_i.bp_addr[0] == pc});
    assign dbg_o.halted     = dbg_halted;
    assign dbg_o.cause      = dbg_cause;
    assign dbg_o.watch_addr = dbg_watch_addr;
@@ -3345,7 +3327,7 @@ module pipeline_core
    // (DEBUG_EN: no hit pipe while a debugger read watchpoint is armed —
    // the loads issue to MEM, whose registered mem_iaddr is compared there;
    // a compare on h_addr, behind the TLB PFN, missed timing by 1.4 ns)
-   wire        dbg_rwp    = DEBUG_EN && |(dq_wp_en & dq_wp_rd);
+   wire        dbg_rwp    = DEBUG_EN && |(dbg_i.wp_en & dbg_i.wp_rd);
    wire        h_base     = EN_DC_H && ex_valid && ex_hld && !ex_misal && !ex_hmmio &&
                             !(DEBUG_EN && (dbg_mx || dbg_rwp));
    wire        h_fwd      = EN_STLF && h_base && (sf_a || sf_b || sf_c) && sf_cov;
@@ -4298,8 +4280,8 @@ module pipeline_core
          // mispredicted or unpredicted return — has been applied to pc; a
          // latch on this edge sets it again, below: last write wins)
          if (DEBUG_EN) begin
-            dbg_wpa <= |(dq_wp_en & (dq_wp_rd | dq_wp_wr) &
-                         {|dq_wp_be[1], |dq_wp_be[0]});   // (no byte lanes: never hits)
+            dbg_wpa <= |(dbg_i.wp_en & (dbg_i.wp_rd | dbg_i.wp_wr) &
+                         {|dbg_i.wp_be[1], |dbg_i.wp_be[0]});   // (no byte lanes: never hits)
             if (!id_valid && !ex_valid && !mem_valid) dbg_wph <= 1'b0;
          end
 
@@ -4759,8 +4741,8 @@ module pipeline_core
          // doubleword 0's when both hit.
          if (DEBUG_EN && mem_valid && !mem_xsq && !sq_spec && !dbg_watch_req && (mem_lvrq || ld32_span)) begin
             for (int w = 0; w < 2; w++)
-               if (dq_wp_en[w] && dq_wp_rd[w] && mem_dw2 == dq_wp_dw[w] &&
-                   (mem_dwm1 & dq_wp_be[w]) != 8'h00) begin
+               if (dbg_i.wp_en[w] && dbg_i.wp_rd[w] && mem_dw2 == dbg_i.wp_dw[w] &&
+                   (mem_dwm1 & dbg_i.wp_be[w]) != 8'h00) begin
                   dbg_watch_req  <= 1'b1;
                   dbg_watch_addr <= {mem_dw2, 3'b000};
                end
@@ -4842,9 +4824,9 @@ module pipeline_core
                      for (int w = 0; w < 2; w++)
                         // (a read: the bytes it reads, mem_dwm0 — its
                         // port enables are FF; a write: its enables)
-                        if (dq_wp_en[w] && f_dweq(mem_iaddr[31:3], dq_wp_dw[w], mzl) &&
-                            ((dq_wp_rd[w] && mem_port_rd && (mem_dwm0 & dq_wp_be[w]) != 8'h00) ||
-                             (dq_wp_wr[w] && mem_port_wr && (mem_be & dq_wp_be[w]) != 8'h00))) begin
+                        if (dbg_i.wp_en[w] && f_dweq(mem_iaddr[31:3], dbg_i.wp_dw[w], mzl) &&
+                            ((dbg_i.wp_rd[w] && mem_port_rd && (mem_dwm0 & dbg_i.wp_be[w]) != 8'h00) ||
+                             (dbg_i.wp_wr[w] && mem_port_wr && (mem_be & dbg_i.wp_be[w]) != 8'h00))) begin
                            dbg_watch_req  <= 1'b1;
                            dbg_watch_addr <= mem_iaddr;
                         end
