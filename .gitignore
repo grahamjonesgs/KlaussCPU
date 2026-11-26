@@ -8,6 +8,7 @@
 *.str
 .claud/
 .claude/settings.local.json
+.claude/worktrees/
 
 # Vivado log/journal files
 *.jou
